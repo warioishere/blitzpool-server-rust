@@ -1,21 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Shared apply-distribution ledger primitives.
-//!
-//! The per-engine `apply_distribution` orchestrators (PPLNS signed
-//! credit/debit, Group-Solo unsigned pending) build mode-specific audit
-//! rows, but the row-type discriminator, the result counts, and the
-//! error type are identical — hoisted here so the wire strings the DB
-//! column + UI depend on stay one source of truth.
+//! Apply-distribution primitives shared by both engines, so the row-type
+//! strings the DB column and UI depend on have one source of truth.
 
 use bp_db::DbError;
 use thiserror::Error;
 
-/// Row-type discriminator for the payout-history tables.
-///
-/// Single source of truth for the wire value: the strings
-/// (`coinbase` | `pending` | `dust-sweep`), the schema columns
-/// are `varchar(16)`, and the UI styles + filters on the literal.
+/// Row-type discriminator for the payout-history tables. The columns are
+/// `varchar(16)` and the UI filters on the literal strings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PayoutRowType {
     /// Paid on-chain via the block's coinbase tx.
@@ -38,8 +30,6 @@ impl PayoutRowType {
     }
 
     /// Inverse of [`Self::as_wire`]. `None` for an unrecognised string.
-    /// Used when reconstructing a frozen distribution (e.g. a
-    /// confirmation-gated block-found) from its serialized wire form.
     pub fn from_wire(s: &str) -> Option<Self> {
         match s {
             "coinbase" => Some(Self::Coinbase),
@@ -57,19 +47,10 @@ pub enum LedgerError {
     Db(#[from] DbError),
     #[error("sqlx: {0}")]
     Sqlx(#[from] sqlx::Error),
-    /// Height `block_height` already carries payout rows that do NOT match
-    /// what this apply would write — so a DIFFERENT block was booked at
-    /// this height and a reorg replaced it with the one being applied now.
-    ///
-    /// `pplns_payout_history` has no `blockHash` column and is UNIQUE on
-    /// `(blockHeight, address)`, so the ledger cannot hold both. This apply
-    /// books nothing, and it must be an error: an `Ok` with zero counts
-    /// reads as success to the confirmation watcher, which would then drop
-    /// the parked block.
-    ///
-    /// Terminal by nature: the recorded rows will not change on a retry.
-    /// The caller parks the block in the unbookable store instead, where
-    /// the frozen distribution survives for an operator reprocess.
+    /// A different block (reorged out) is already booked at this height, and
+    /// history is UNIQUE on `(blockHeight, address)`. Must be an error, not a
+    /// zero-count `Ok`, or the confirmation watcher would drop the parked block.
+    /// Terminal: the caller parks it for an operator reprocess.
     #[error(
         "block height {block_height} already carries {booked_rows} payout rows from a different \
          block; this apply would have written {incoming_rows} — the ledger keys payout history by \
@@ -83,11 +64,8 @@ pub enum LedgerError {
 }
 
 impl LedgerError {
-    /// Would retrying this ever succeed?
-    ///
-    /// Only [`Self::HeightBookedByAnotherBlock`] is a verdict; the rest are
-    /// infrastructure and clear on their own. Kept here rather than in each
-    /// engine's `is_terminal` so the two cannot disagree about it.
+    /// True when a retry can never succeed. Lives here so the two engines
+    /// cannot disagree about it.
     pub fn is_terminal(&self) -> bool {
         match self {
             LedgerError::HeightBookedByAnotherBlock { .. } => true,

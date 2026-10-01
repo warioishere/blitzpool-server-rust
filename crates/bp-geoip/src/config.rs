@@ -4,14 +4,12 @@ use std::time::Duration;
 
 use crate::error::GeoIpError;
 
-/// 10 minute TTL on the whole-cache wipe.
 pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(600);
 
-/// 2-second HTTP timeout.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// `http://ip-api.com`. NOT configurable: `boot.rs` builds
-/// `GeoIpConfig::default()`; a self-hosted mirror needs a TOML key first.
+/// NOT configurable: `boot.rs` builds `GeoIpConfig::default()`, so a
+/// self-hosted mirror needs a TOML key first.
 pub const DEFAULT_BASE_URL: &str = "http://ip-api.com";
 
 #[derive(Clone, Debug)]

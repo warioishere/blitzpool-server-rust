@@ -1,19 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `NotificationDispatcher` construction.
-//!
-//! Builds the single `Arc<NotificationDispatcher>` that fans
-//! engine-side events (`block_found`, `best_diff`, `device_status`)
-//! out across whichever transport adapters are live. The adapters are
-//! the already-built singletons, so each has one state:
-//!
-//! - **FCM** + **Web-Push** from [`crate::hooks::ProductionHooks`]
-//!   (also used by the API push-register paths).
-//! - **Telegram** + **ntfy** from [`crate::listeners::ListenerHandles`]
-//!   (also driving the long-poll + SSE listener loops).
-//!
-//! Returns `None` when none of the four adapters are configured, so
-//! callers skip building event payloads nobody receives.
+//! `NotificationDispatcher` construction. It reuses the adapter singletons from
+//! [`crate::hooks::ProductionHooks`] and [`crate::listeners::ListenerHandles`],
+//! so each transport has one state; `None` when no transport is configured, so
+//! callers skip building payloads nobody receives.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,8 +17,6 @@ use crate::boot::FoundationHandles;
 use crate::hooks::ProductionHooks;
 use crate::listeners::ListenerHandles;
 
-/// Build the dispatcher Arc when any of `[notifications.*]` is wired;
-/// `None` when every transport is absent.
 pub(crate) fn build(
     foundation: &FoundationHandles,
     hooks: &ProductionHooks,
@@ -48,9 +36,8 @@ pub(crate) fn build(
         return None;
     }
 
-    // The command handler's per-chat language map, shared so /deutsch /
-    // /english apply to outbound Telegram notifications too. Empty when
-    // no listeners are configured.
+    // Shared with the command handler so /deutsch and /english apply to
+    // outbound Telegram notifications too.
     let chat_languages: ChatLanguageMap = listeners
         .chat_languages()
         .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));

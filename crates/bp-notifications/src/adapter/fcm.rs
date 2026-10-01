@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Firebase Cloud Messaging (FCM) v1 HTTP API adapter.
-//!
-//! Authenticates with the FCM endpoint via OAuth-2 access tokens
-//! exchanged from a service-account JWT (RS256). Tokens are cached
-//! in-process until 60 s before expiry, then transparently refreshed
-//! on the next send.
+//! Firebase Cloud Messaging (FCM) v1 HTTP API adapter. OAuth-2 access tokens
+//! come from a service-account JWT and are cached until shortly before expiry.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

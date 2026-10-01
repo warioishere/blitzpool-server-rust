@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Notification subscriptions across Telegram, ntfy, and Web-Push / FCM.
-//!
-//! - `telegram_subscriptions_entity` — bot chats subscribed to a BTC address
-//! - `ntfy_subscriptions_entity` — ntfy.sh + UnifiedPush mirrors
-//! - `push_subscription_entity` — Web-Push (VAPID) + FCM tokens
+//! Notification subscriptions across Telegram, ntfy, and Web-Push / FCM
+//! (`telegram_subscriptions_entity`, `ntfy_subscriptions_entity`,
+//! `push_subscription_entity`).
 
 use bp_common::AddressId;
 use sqlx::{postgres::PgPool, FromRow};
@@ -94,8 +92,6 @@ pub async fn find_telegram_subscriptions_by_address(
 
 /// All Telegram subscriptions where the hourly cron should fire —
 /// either `hourlyStatsEnabled` OR `hourlyWorkersEnabled` is true.
-/// Used by `crate::cron::hourly_stats` to drive the per-chat
-/// per-address hourly update loop.
 pub async fn find_telegram_subscriptions_with_hourly_enabled(
     pool: &PgPool,
 ) -> Result<Vec<TelegramSubscriptionRow>, DbError> {
@@ -393,10 +389,8 @@ pub async fn update_push_subscription_last_notification(
 }
 
 /// Idempotent upsert keyed by the `(address, endpoint, subscriptionType)`
-/// UNIQUE index: on conflict only `platform` + `updatedAt` are touched
-/// (the flags keep whatever the caller previously configured); on new row, all
-/// four notification flags default to `true`. A soft-deleted row for
-/// the same triple is reactivated (clears `deletedAt`).
+/// UNIQUE index. A conflict keeps the caller's flags and reactivates a
+/// soft-deleted row; a new row starts with all four flags `true`.
 pub async fn upsert_push_subscription(
     pool: &PgPool,
     address: &AddressId,
@@ -494,9 +488,8 @@ pub async fn delete_push_subscriptions_by_address(
 }
 
 /// Soft-delete every push subscription for `address` of a given type.
-/// Used by `/api/push/fcm/unregister` without
-/// a `token` field to wipe every FCM row for the address while keeping
-/// any UnifiedPush rows intact.
+/// Lets an FCM unregister without a token wipe FCM rows while keeping
+/// UnifiedPush rows intact.
 pub async fn delete_push_subscriptions_by_address_and_type(
     pool: &PgPool,
     address: &AddressId,
@@ -520,10 +513,8 @@ pub async fn delete_push_subscriptions_by_address_and_type(
 }
 
 /// Update the four notification-preference flags for the row keyed by
-/// `(address, endpoint)`. Each flag is `Option<bool>` — `None` means
-/// "leave as-is" (a partial update that skips the unset fields).
-/// Touches `updatedAt`. Returns the
-/// number of rows affected; 0 when no matching active row exists.
+/// `(address, endpoint)`; `None` leaves a flag as-is. Returns the rows
+/// affected, 0 when no matching active row exists.
 pub async fn update_push_subscription_preferences(
     pool: &PgPool,
     address: &AddressId,
@@ -950,11 +941,8 @@ pub async fn find_addresses_with_push_subscription(
     Ok(rows.into_iter().map(|r| r.address).collect())
 }
 
-/// Weekly cleanup: hard-DELETE push subscriptions that have had no
-/// activity for the given epoch-ms cutoff — subscriptions whose
-/// `lastNotificationAt` is older than the cutoff, or whose
-/// `lastNotificationAt` is NULL and whose `createdAt` is older than
-/// the cutoff.
+/// Weekly cleanup: hard-DELETE push subscriptions with no activity since
+/// the epoch-ms cutoff (last notification, or creation if never notified).
 pub async fn delete_stale_push_subscriptions(
     pool: &PgPool,
     cutoff_ms: i64,
@@ -973,9 +961,8 @@ pub async fn delete_stale_push_subscriptions(
 
 /// Topic set for the inbound ntfy SSE listener: the union of every
 /// active mining-client address and every active ntfy subscription.
-/// Clients give actively-mining users a listened topic for their first
-/// `/subscribe`; the ntfy side keeps explicit subscribers (incl.
-/// non-clients) heard. Both filter `deletedAt IS NULL`.
+/// Clients get a listened topic for their first `/subscribe`; explicit
+/// subscribers stay heard even when they are not mining.
 pub async fn find_addresses_for_ntfy_listener(pool: &PgPool) -> Result<Vec<AddressId>, DbError> {
     let rows = sqlx::query!(
         r#"SELECT address AS "address!: AddressId"
@@ -991,13 +978,9 @@ pub async fn find_addresses_for_ntfy_listener(pool: &PgPool) -> Result<Vec<Addre
 }
 
 /// Every address with a live subscription on ANY transport that carries
-/// best-difficulty notifications: Telegram, ntfy or push. The best-difficulty
-/// cron scans exactly these.
-///
-/// Deliberately NOT filtered on `bestDiffNotificationsEnabled`. The flag is
-/// honoured per transport at send time; the scan also keeps each address's
-/// tracker baseline current, so a user who switches best-diff back on is not
-/// greeted with a stale "new best" for work done while it was off.
+/// best-difficulty notifications. Deliberately NOT filtered on
+/// `bestDiffNotificationsEnabled` (honoured at send time): the scan keeps the
+/// tracker baseline current, so re-enabling does not fire a stale "new best".
 pub async fn find_best_difficulty_scan_addresses(pool: &PgPool) -> Result<Vec<AddressId>, DbError> {
     let rows = sqlx::query!(
         r#"SELECT address AS "address!: AddressId"
@@ -1019,12 +1002,9 @@ pub async fn find_best_difficulty_scan_addresses(pool: &PgPool) -> Result<Vec<Ad
 }
 
 /// Every address that has at least one **device-status** subscriber, on
-/// either transport that carries the notification (Telegram and push;
-/// ntfy is deliberately not routed for device status).
-///
-/// The device-status gate uses this to decide which devices are worth
-/// tracking at all, so the sweeper does not look up subscriptions for
-/// messages nobody would receive.
+/// Telegram or push (ntfy deliberately carries no device status). The
+/// device-status gate tracks only these, so nobody-would-receive-it
+/// messages cost no subscription lookups.
 pub async fn find_device_notification_addresses(pool: &PgPool) -> Result<Vec<AddressId>, DbError> {
     let rows = sqlx::query!(
         r#"SELECT address AS "address!: AddressId"

@@ -1,25 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Buffered share-touch flusher.
-//!
-//! The share hot path collects per-session updates (best-diff sample,
-//! current vardiff target, channel count, last-seen) in a shared
-//! [`TouchBuffer`] and flush them every [`flush_interval`](super::config)
-//! into the per-session `client:live:*` Redis hashes (see
-//! [`crate::live_store`]), instead of N synchronous writes per second on
-//! a busy pool. Postgres holds only the birth row; nothing here touches
-//! it.
-//!
-//! Buffer collapses duplicates per `(address, clientName, sessionId)` —
-//! the latest sample wins for `current_difficulty`/`channel_count`/
-//! `updated_at`, the maximum wins for `best_difficulty`. On flush
-//! failure, the snapshot is folded back into the live buffer for retry
-//! on the next tick.
-//!
-//! `hash_rate` is **not** handled here — it's owned by the
-//! [`crate::hashrate_sampler`], which writes a self-zeroing 2-min moving
-//! average on its own cadence. Writing it from both paths would let the
-//! 30s touch flush clobber the sampler's value every other tick.
+//! Coalesces per-session share updates in a [`TouchBuffer`] and flushes them
+//! periodically into the `client:live:*` Redis hashes ([`crate::live_store`])
+//! instead of a write per share. `hash_rate` is not written here: it belongs
+//! to [`crate::hashrate_sampler`], and a second writer would clobber it.
 
 use std::sync::Mutex;
 
@@ -30,8 +14,7 @@ use tracing::{debug, warn};
 
 use crate::live_store::LiveSessionStore;
 
-/// Buffer key: the session row's natural key
-/// (address + clientName + sessionId).
+/// The session's natural key (address + clientName + sessionId).
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub(crate) struct TouchKey {
     pub address: String,
@@ -39,13 +22,9 @@ pub(crate) struct TouchKey {
     pub session_id: String,
 }
 
-/// Borrowed view of a [`TouchKey`] for allocation-free map lookups. The
-/// share hot path builds one of these (three `&str`, no heap) and passes
-/// it to both the touch buffer and the hashrate sampler; an owned
-/// `TouchKey` is materialised only when a session is first inserted.
-///
-/// Relies on `hashbrown`'s [`Equivalent`] lookup (std's `Borrow`-based
-/// lookup can't express a borrowed composite key without allocating).
+/// Borrowed [`TouchKey`] for allocation-free lookups on the share hot path;
+/// an owned key is built only on first insert. Needs `hashbrown`'s
+/// [`Equivalent`]: std's `Borrow` cannot express a borrowed composite key.
 #[derive(Clone, Copy)]
 pub(crate) struct TouchKeyRef<'a> {
     pub address: &'a str,
@@ -54,7 +33,6 @@ pub(crate) struct TouchKeyRef<'a> {
 }
 
 impl TouchKeyRef<'_> {
-    /// Materialise the owned key — called only on the cold insert path.
     pub(crate) fn to_key(self) -> TouchKey {
         TouchKey {
             address: self.address.to_string(),
@@ -64,12 +42,9 @@ impl TouchKeyRef<'_> {
     }
 }
 
-// `Hash` must feed the hasher the same bytes as `TouchKey`'s derived
-// `Hash` so a `TouchKeyRef` lookup lands on a `TouchKey`-inserted entry:
-// derive(Hash) on the struct hashes address, client_name, session_id in
-// declaration order, and `str`/`String` hash identically, so this hashes
-// the same three in the same order. The `hashbrown_lookup_matches_owned_key`
-// test pins this invariant.
+// Must hash exactly like `TouchKey`'s derived `Hash` (same fields, same
+// order) or a ref lookup misses the owned entry; pinned by
+// `hashbrown_lookup_matches_owned_key`.
 impl std::hash::Hash for TouchKeyRef<'_> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.address.hash(state);
@@ -97,13 +72,8 @@ pub(crate) struct TouchEntry {
     pub updated_at_ms: i64,
 }
 
-/// Shared buffer. Cloning the `Arc<TouchBuffer>` is the standard pattern
-/// — the sink writes into it on every share, the flusher drains it on
-/// every tick.
-///
-/// Locking is a plain `std::sync::Mutex`: no critical section here spans an
-/// `.await` (record merges into the map; the flusher drains before the DB
-/// round-trip), so an async mutex would be pure overhead on the hot path.
+/// Shared between the share sink and the flusher. A plain `std::sync::Mutex`
+/// because no critical section spans an `.await`.
 pub(crate) struct TouchBuffer {
     inner: Mutex<HashMap<TouchKey, TouchEntry>>,
 }
@@ -117,20 +87,14 @@ impl Default for TouchBuffer {
 }
 
 impl TouchBuffer {
-    /// Lock the map, recovering the guard if a previous holder panicked
-    /// (poisoning), so a stray poison cannot turn every subsequent
-    /// accepted share into a panic.
+    /// Recovers from poisoning so one panic cannot make every later share panic.
     fn guard(&self) -> std::sync::MutexGuard<'_, HashMap<TouchKey, TouchEntry>> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Insert or merge a sample. `share_diff` takes the running max,
-    /// the optionals overwrite only when `Some`, `updated_at_ms` takes
-    /// the max (out-of-order shares mustn't roll the timestamp back).
-    ///
-    /// Takes a borrowed [`TouchKeyRef`] and allocates an owned key only on
-    /// the first insert: after a session's first share in a flush window,
-    /// every subsequent share is a zero-allocation `get_mut` lookup.
+    /// Insert or merge a sample: `share_diff` and `updated_at_ms` take the
+    /// max (out-of-order shares must not roll the timestamp back), the
+    /// optionals overwrite only when `Some`.
     pub(crate) fn record(
         &self,
         key: TouchKeyRef<'_>,
@@ -139,9 +103,8 @@ impl TouchBuffer {
         channel_count: i32,
         updated_at_ms: i64,
     ) {
-        // Keep non-finite values out of the buffer (as the hashrate
-        // sampler does): stored as "inf"/"NaN" in Redis, a reader's
-        // `parse::<f64>()` turns them into values that poison every sum.
+        // Stored as "inf"/"NaN" in Redis, non-finite values would poison
+        // every sum a reader builds.
         if !share_diff.is_finite() {
             return;
         }
@@ -154,8 +117,7 @@ impl TouchBuffer {
             if current_diff.is_some() {
                 e.current_diff = current_diff;
             }
-            // Latest sample wins: a rejoin/leave changes the channel
-            // count, the freshest share reflects the current bundle size.
+            // Latest wins: the freshest share reflects the current channel count.
             e.channel_count = channel_count;
             if updated_at_ms > e.updated_at_ms {
                 e.updated_at_ms = updated_at_ms;
@@ -173,19 +135,14 @@ impl TouchBuffer {
         }
     }
 
-    /// Drain everything currently buffered. Empties the buffer in one
-    /// lock-pass. Returns the owned snapshot.
+    /// Take the whole buffer in one lock pass.
     fn drain(&self) -> HashMap<TouchKey, TouchEntry> {
         let mut guard = self.guard();
         std::mem::take(&mut *guard)
     }
 
-    /// Fold a previously-drained snapshot back into the live buffer
-    /// after a failed flush. Live writes (concurrent shares that landed
-    /// after the drain) are newer than the snapshot, so for the
-    /// "latest-wins" fields they win unconditionally — the snapshot
-    /// only fills `None` slots. `share_diff` takes the running max, which
-    /// is commutative.
+    /// Fold a drained snapshot back after a failed flush. Live writes are
+    /// newer, so for latest-wins fields the snapshot only fills `None` slots.
     fn rebuffer(&self, snap: HashMap<TouchKey, TouchEntry>) {
         let mut guard = self.guard();
         for (k, v) in snap {
@@ -213,14 +170,9 @@ impl TouchBuffer {
     }
 }
 
-/// One flush pass. Drains the buffer, writes the snapshot into the
-/// `client:live:*` Redis hashes, and rebuffers it if the write fails
-/// (the merge rules are commutative, so folding back and retrying next
-/// tick loses nothing). Returns the number of sessions written.
-///
-/// Without a live store there is nothing to write TO: the snapshot is
-/// dropped with a warning rather than rebuffered — a buffer nobody ever
-/// drains would grow without bound.
+/// One flush pass; rebuffers on a failed write and returns sessions written.
+/// Without a live store the snapshot is dropped, not rebuffered, or the
+/// buffer would grow without bound.
 pub(crate) async fn flush_once(buffer: &TouchBuffer, live: Option<&LiveSessionStore>) -> u64 {
     let snapshot = buffer.drain();
     if snapshot.is_empty() {
@@ -251,9 +203,7 @@ pub(crate) async fn flush_once(buffer: &TouchBuffer, live: Option<&LiveSessionSt
     }
 }
 
-/// Spawned 30s flush loop. Returns when `shutdown_rx` resolves; before
-/// returning it executes a final flush so a graceful shutdown drains
-/// the residual buffer.
+/// Flush loop; flushes once more on shutdown to drain the residual buffer.
 pub(crate) async fn run_flush_loop(
     buffer: std::sync::Arc<TouchBuffer>,
     live: Option<std::sync::Arc<LiveSessionStore>>,
@@ -366,9 +316,7 @@ mod tests {
         assert_eq!(buf.len(), 0);
     }
 
-    /// Non-finite samples never enter the buffer: they would reach
-    /// Redis as "inf"/"NaN", which a reader's `parse::<f64>()` turns
-    /// into values that poison every sum they land in.
+    /// Pins that non-finite samples never enter the buffer.
     #[test]
     fn non_finite_samples_are_dropped_at_the_door() {
         let b = TouchBuffer::default();
@@ -399,9 +347,7 @@ mod tests {
             client_name: "rig1",
             session_id: sid,
         };
-        // Two shares, same identity: the second must find the entry the
-        // first inserted (borrowed-ref lookup lands on the owned key) and
-        // coalesce, not duplicate.
+        // The second share must find the first's entry via the borrowed ref.
         buf.record(r("abc123"), 42.0, Some(8.0), 1, 1000);
         buf.record(r("abc123"), 99.0, None, 1, 2000);
         assert_eq!(buf.len(), 1, "same identity must coalesce, not duplicate");
@@ -409,8 +355,7 @@ mod tests {
         buf.record(r("zzz999"), 1.0, None, 1, 3000);
         assert_eq!(buf.len(), 2, "distinct identity is a separate entry");
 
-        // The coalesced entry is retrievable by the equivalent OWNED key —
-        // proves TouchKeyRef and TouchKey hash + compare identically.
+        // Retrievable by the owned key: both hash and compare identically.
         let snap = buf.drain();
         let owned = TouchKey {
             address: "bc1qxyz".into(),

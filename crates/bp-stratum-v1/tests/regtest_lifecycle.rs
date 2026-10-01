@@ -1,27 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! End-to-end regtest test for the SV1 server.
-//!
-//! Spawns a real `bitcoin-node v31` via `bp_regtest_harness`, attaches
-//! `bp_template_distribution::TdpHandle` to its IPC socket, runs an
-//! [`bp_stratum_v1::StratumV1Server`] driven by the TDP broadcast, and
-//! exercises the full SV1 handshake + share-submission path against a
-//! fake miner connected over a real `TcpStream`.
-//!
-//! Covers (in one test):
-//!   1. Translator pairs `NewTemplate` + `SetNewPrevHash` from real
-//!      bitcoin-core IPC traffic into an `ActiveSV1Template`.
-//!   2. `accept_connection` boots the per-connection task; subscribe +
-//!      authorize cycle works end-to-end on a real socket.
-//!   3. A `mining.notify` frame arrives within the handshake window.
-//!   4. A `mining.submit` against a deliberately-trivial session
-//!      difficulty produces a `result: true` success reply (the entire
-//!      header-assembly / hash / target-check / `effective_job_difficulty`
-//!      clamp / dedup-set path fires).
-//!   5. `shutdown()` cleanly cancels the translator + the connection task.
-//!
-//! Skipped (with a printed warning) when `bitcoin-node` is not installed
-//! at the host's default location or via `BITCOIN_NODE_PATH`.
+//! Regtest: the SV1 server driven by real TDP traffic completes subscribe,
+//! authorize, notify and an accepted submit over a real socket, then shuts
+//! down cleanly. Skipped when `bitcoin-node` is not installed.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,8 +18,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
-/// Regtest bech32 address — `address_to_script(Network::Regtest, …)`
-/// accepts this. Used by the fake miner's `mining.authorize` call.
+/// A valid regtest address for the fake miner's `mining.authorize`.
 const REGTEST_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -51,25 +31,15 @@ async fn sv1_server_end_to_end_against_regtest() {
     }
 
     // ── Bring up bitcoin-core + mine past IBD ─────────────────────────
-    //
-    // 101 blocks: exits IBD AND matures the genesis-coinbase so the
-    // wallet can produce more blocks without "Spending genesis is not
-    // allowed". Same boot sequence the TDP / JDP e2e tests use.
+    // 101 blocks: exit IBD and mature a coinbase.
     let node = RegtestNode::start_with(cfg).await.expect("regtest start");
     node.generate_to_self(101)
         .await
         .expect("mine 101 blocks for IBD-exit + coinbase maturity");
 
     // ── Spawn TDP, subscribe FIRST, then force a template emission ────
-    //
-    // `tokio::sync::broadcast` does not replay messages sent before
-    // any receiver existed. Subscribe BEFORE mining the template-forcing
-    // block, otherwise the `TemplateUpdate` can be dropped before the
-    // `subscribe()` call wires a receiver, leaving the server with no
-    // template and the test hanging until timeout.
-    //
-    // Low fee threshold + 1s interval makes regtest's empty mempool emit
-    // a fresh NewTemplate roughly every block change.
+    // The broadcast does not replay to late receivers, so subscribing after
+    // the template-forcing block would leave the server without a template.
     let tdp = TdpHandle::spawn(
         TdpConfig::new(node.ipc_socket_path())
             .with_fee_threshold(1)
@@ -78,32 +48,22 @@ async fn sv1_server_end_to_end_against_regtest() {
     .expect("TdpHandle::spawn against regtest IPC");
     let updates_rx = tdp.subscribe();
 
-    // Mine one more block to force a NewTemplate + SetNewPrevHash pair
-    // through the broadcast — the assembler then pairs them as soon as
-    // the server starts, so the first miner's `subscribe` lands a
-    // `mining.notify` immediately.
     node.generate_to_self(1)
         .await
         .expect("mine 1 more to force TDP emit");
     let mut server_config = ServerConfig::defaults_for(Network::Regtest);
-    // Lower the difficulty-check interval so the test can observe the
-    // pipeline without waiting for the production 60 s timer.
     server_config.difficulty_check_interval_ms = 200;
     assert_eq!(server_config.pool_identifier, DEFAULT_POOL_IDENTIFIER);
     let server = StratumV1Server::spawn(
         server_config,
         updates_rx,
         bp_template_distribution::TemplateSnapshot::default(),
-        // No alt streams — this test exercises the default-stream lifecycle only.
         Vec::new(),
         ServerHooks::no_op(),
         SharedExtranonce::new(),
         std::sync::Arc::new(bp_mining_job::MiningJobCache::new()),
     );
 
-    // Wait until the translator has paired its first template. 5 s is
-    // generous — the broadcast already has the messages queued from the
-    // mine-1 call above.
     wait_until(Duration::from_secs(5), || {
         server.current_template().is_some()
     })
@@ -114,32 +74,23 @@ async fn sv1_server_end_to_end_against_regtest() {
     );
 
     // ── Bind a TCP port + accept loop on a dedicated task ─────────────
-    //
-    // Bind to port 0 so the OS picks a free one — avoids collisions on
-    // CI runners.
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind 127.0.0.1:0");
     let addr = listener.local_addr().expect("local_addr");
 
-    // Deliberately-trivial port: initial_difficulty = 1e-18 → vardiff
-    // target saturates to all-FFs in `bp_share::difficulty_to_target`, so
-    // any submission hash trivially meets it: a fixed nonce is accepted
-    // without brute-forcing.
+    // Difficulty 1e-18 saturates the target, so a fixed nonce is accepted.
     let port_config = PortConfig {
         target_shares_per_minute: 6.0,
         ..PortConfig::new(addr.port(), 1.0e-18)
     };
 
-    // Accept exactly one connection then return. The SV1 server's
-    // accept_connection consumes the socket; the resulting JoinHandle is
-    // discarded (the cancel token attached to the server cleans it up
-    // on shutdown).
+    // Accept exactly one connection; the server's cancel token cleans up
+    // the connection task on shutdown.
     let server_clone = server.clone();
     let port_config_clone = port_config.clone();
     let accept_handle = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.expect("accept");
-        // Disable Nagle so test frames don't sit in TCP buffers.
         socket.set_nodelay(true).ok();
         server_clone.accept_connection(socket, port_config_clone);
     });
@@ -167,10 +118,7 @@ async fn sv1_server_end_to_end_against_regtest() {
     let extranonce1_hex = result[1].as_str().expect("extranonce1 hex").to_string();
     assert_eq!(result[2].as_u64(), Some(8), "extranonce2_size must be 8");
 
-    // Step 2: authorize. The miner connected after the template-forcing
-    // block, so the server already has a template and this authorize MAY
-    // also produce an immediate fresh notify; frames are read
-    // opportunistically.
+    // Step 2: authorize.
     write
         .write_all(
             format!(
@@ -181,10 +129,8 @@ async fn sv1_server_end_to_end_against_regtest() {
         .await
         .expect("write authorize");
 
-    // Step 3: drain frames until both the authorize response AND a
-    // mining.notify are in hand. The order isn't fixed: the server may
-    // emit set_difficulty + mining.notify (init-flush after subscribe)
-    // BEFORE the authorize response. Budget 5 s.
+    // Step 3: drain until both the authorize response and a notify are in;
+    // the notify may arrive before the response.
     let mut notify_frame: Option<Value> = None;
     let mut authorize_resp: Option<Value> = None;
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
@@ -194,7 +140,6 @@ async fn sv1_server_end_to_end_against_regtest() {
                 Some("mining.notify") => notify_frame = Some(frame),
                 Some("mining.set_difficulty") => continue, // not needed for the test
                 _ => {
-                    // Has `id` and `result`/`error` → it's a response.
                     if frame.get("id").and_then(|v| v.as_u64()) == Some(2) {
                         authorize_resp = Some(frame);
                     }
@@ -227,8 +172,7 @@ async fn sv1_server_end_to_end_against_regtest() {
     let job_id_hex = params[0].as_str().expect("jobId hex").to_string();
     let ntime_hex = params[7].as_str().expect("ntime hex").to_string();
 
-    // Step 4: submit. Fixed nonce / extranonce2 — diff is 1e-18 so any
-    // hash will hit. version_mask = "00000000" (no version-rolling).
+    // Step 4: submit a fixed nonce without version rolling.
     let submit_line = format!(
         "{{\"id\":3,\"method\":\"mining.submit\",\"params\":[\"{REGTEST_ADDR}.fake\",\"{job_id_hex}\",\"0000000000000000\",\"{ntime_hex}\",\"01020304\",\"00000000\"]}}\n"
     );
@@ -237,8 +181,7 @@ async fn sv1_server_end_to_end_against_regtest() {
         .await
         .expect("write submit");
 
-    // Step 5: read frames until the submit response (id=3) arrives,
-    // skipping any interleaved frames. Budget 5 s.
+    // Step 5: read until the submit response, skipping interleaved frames.
     let mut submit_resp: Option<Value> = None;
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -247,8 +190,6 @@ async fn sv1_server_end_to_end_against_regtest() {
                 submit_resp = Some(frame);
                 return;
             }
-            // Otherwise ignore (could be another mining.notify if the
-            // chain advanced again, or a set_difficulty from vardiff).
         }
     })
     .await;
@@ -266,23 +207,15 @@ async fn sv1_server_end_to_end_against_regtest() {
     );
 
     // ── Clean teardown ────────────────────────────────────────────────
-    //
-    // 1. Drop the miner side first so the server's connection task gets
-    //    EOF and exits its read loop.
+    // Drop the miner first so the connection task sees EOF.
     drop(write);
     drop(reader);
-    // 2. Cancel + join translator.
     server.shutdown().await;
-    // 3. Drop TDP worker.
     tdp.shutdown().expect("TDP clean shutdown");
-    // 4. Stop bitcoin-node.
     node.shutdown().await.expect("regtest clean shutdown");
 
-    // Sanity: the accept-loop task should have exited by now.
     let _ = accept_handle.await;
 
-    // Sanity: the registry held at least one template + one job from
-    // the handshake.
     let registry = server.job_registry().clone();
     assert!(registry.template_count() >= 1, "expected ≥ 1 template");
     assert!(registry.job_count() >= 1, "expected ≥ 1 job");

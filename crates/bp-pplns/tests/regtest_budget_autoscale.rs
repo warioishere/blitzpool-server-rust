@@ -1,35 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Regtest: the coinbase-budget autoscaler's **race-safe core/trimmer
-//! coupling**, proven end-to-end against a real `bitcoin-node v31` regtest.
-//!
-//! Unit tests cover the control state machine + the budget→reservation
-//! derivation in isolation. What they *cannot* prove — and what this test
-//! does — is that the coupling actually matters at the consensus layer:
-//!
-//! 1. Fill the regtest mempool to ~3.85 MWU so bitcoin-core's
-//!    `block_reserved_weight` (set from the IPC coinbase-output constraint)
-//!    becomes the *binding* limit on coinbase size.
-//! 2. With a SMALL reservation (`B0`) and a coinbase larger than it, submit →
-//!    bitcoin-core **rejects** (block weight > 4 MWU): the chain must NOT
-//!    advance. This is exactly the catastrophic case the coupling prevents.
-//! 3. Re-advertise a LARGER reservation (`B1`) via
-//!    `TdpHandle::set_coinbase_constraints` — the autoscaler's INCREASE action
-//!    — using the binary's own `tdp_constraint_for_budget` derivation
-//!    (`f(N) = N.div_ceil(4) + 256`). bitcoin-core's next template then leaves
-//!    room for the same coinbase.
-//! 4. Submit the same-sized coinbase → bitcoin-core **accepts**: the chain
-//!    advances by 1.
-//!
-//! The differential — identical coinbase, only the reservation changed — is
-//! the proof: raising core's reservation FIRST (what `apply_budget` does on an
-//! increase) is what keeps a found block valid.
-//!
-//! The autoscaler's control INPUT is asserted here too: the same demand
-//! built at the small budget reports `utilization ≥ 1.0` +
-//! `trimmed_count > 0` (the SV2 ext 0x0003 §4 blockspace cut fired), and
-//! at the generous budget reports `utilization < 1.0` with no cut — the
-//! signal pair the controller steers the reservation by.
+//! Pins that core's coinbase reservation decides block validity: with a full
+//! mempool the same coinbase is rejected under a small reservation and
+//! accepted once the autoscaler raises it, which is why `apply_budget` raises
+//! core's reservation first. Also pins the cut telemetry the autoscaler reads.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -55,33 +29,24 @@ use tokio::sync::broadcast;
 
 const FEE_ADDR: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
 const TEST_NETWORK: Network = Network::Bitcoin;
-/// Regtest subsidy at the test height (50 BTC). The §4 revenue the
-/// coinbase is evaluated at, and the reference revenue for the weight
-/// build (no balance/bonus boosts in play — it only has to be non-zero).
+/// Regtest subsidy at the test height; the §4 revenue the coinbase is
+/// evaluated at.
 const REGTEST_BLOCK_REWARD_SATS: u64 = 5_000_000_000;
 
-/// SMALL initial reservation — the coinbase below exceeds it by MORE than one
-/// filler-tx weight, so the granularity gap left below core's tx-selection cap
-/// can't absorb the overflow. Mirrors a pool whose budget lags its payout
-/// count.
+/// Small reservation; the coinbase exceeds it by more than one filler tx, so
+/// the gap below core's tx-selection cap cannot absorb the overflow.
 const B0_BUDGET: u32 = 50_000;
 /// LARGER reservation the autoscaler steps up to — big enough for the coinbase.
 const B1_BUDGET: u32 = 280_000;
-/// Budget used to BUILD the published distribution: generous so all
-/// `MINER_COUNT` outputs survive the §4 blockspace cut, yielding a ~249 kWU
-/// coinbase that lands strictly between core's `B0` (~51 kWU) and `B1`
-/// (~281 kWU) reservations.
+/// Budget the distribution is built at: no output is cut, so the coinbase
+/// lands strictly between the `B0` and `B1` reservations.
 const DIST_BUDGET: u32 = 350_000;
-/// P2WPKH payout outputs in the coinbase (~124 WU each → ~249 kWU; ~62 kB,
-/// under the 64 kB `B064K` submit limit).
+/// P2WPKH outputs in the coinbase; stays under the 64 kB `B064K` submit limit.
 const MINER_COUNT: usize = 2_000;
-/// Mempool fill target in virtual bytes. Block limit is 1 M vbytes (4 MWU);
-/// fill above core's `B0` tx-selection cap (~987 k vbytes) so it binds.
+/// Mempool fill target, above core's `B0` tx-selection cap so it binds.
 const MEMPOOL_TARGET_VBYTES: u64 = 990_000;
 
-/// `f(N)` — identical derivation to `bin/blitzpool`'s
-/// `boot::tdp_constraint_for_budget` (kept in sync; the production path is the
-/// single source, this mirrors it for the test).
+/// Must match `boot::tdp_constraint_for_budget` in `bin/blitzpool`.
 fn tdp_constraint_for_budget(weight_budget: u32) -> TdpCoinbaseConstraints {
     TdpCoinbaseConstraints {
         max_additional_size: weight_budget.div_ceil(4).saturating_add(256),
@@ -101,17 +66,14 @@ async fn autoscale_reservation_raise_turns_rejected_block_into_accepted() {
         return;
     }
 
-    // `-fallbackfee` so wallet `sendmany` works without fee estimation
-    // (regtest has no fee history); `-spendzeroconfchange`/large mempool
-    // limits aren't needed because each fill tx spends a mature coinbase.
+    // Regtest has no fee history, so `sendmany` needs `-fallbackfee`.
     let node = RegtestNode::start_with(
         RegtestConfig::default().with_extra_args(["-fallbackfee=0.0002".to_string()]),
     )
     .await
     .expect("regtest start");
     node.ensure_wallet().await.expect("wallet");
-    // Mature coinbases to fund the mempool-fill txs (each fill tx ideally
-    // spends an independent mature coinbase to avoid mempool-chain limits).
+    // Independent mature coinbases fund the fill txs without mempool-chain limits.
     node.generate_to_self(140)
         .await
         .expect("mine 140 for maturity + funding");
@@ -120,9 +82,7 @@ async fn autoscale_reservation_raise_turns_rejected_block_into_accepted() {
     let miners = generate_p2wpkh_miners(MINER_COUNT);
     let fee_addr = AddressId::new(FEE_ADDR.to_string()).expect("fee addr");
 
-    // Built at the SMALL budget the demand (~249 kWU desired for 2 000
-    // P2WPKH outputs) dwarfs the effective budget: the §4 cut fires and
-    // the telemetry reports it — the autoscaler's INCREASE signal.
+    // At the small budget the §4 cut fires: the autoscaler's increase signal.
     let pressured = build_distribution(&miners, &fee_addr, B0_BUDGET);
     assert!(
         pressured.budget_telemetry.utilization() >= 1.0,
@@ -134,8 +94,7 @@ async fn autoscale_reservation_raise_turns_rejected_block_into_accepted() {
         "under-budget build must report a firing cut"
     );
 
-    // Built at the generous budget every output survives and the same
-    // telemetry reports headroom — the autoscaler's steady-state signal.
+    // At the generous budget nothing is cut: the steady-state signal.
     let dist = build_distribution(&miners, &fee_addr, DIST_BUDGET);
     assert!(
         dist.budget_telemetry.utilization() < 1.0,
@@ -151,20 +110,15 @@ async fn autoscale_reservation_raise_turns_rejected_block_into_accepted() {
         MINER_COUNT,
         "all miners must survive the generous budget"
     );
-    // Same demand, different budgets: desired_weight is budget-independent.
     assert_eq!(
         pressured.budget_telemetry.desired_weight, dist.budget_telemetry.desired_weight,
         "desired_weight is a property of the demand, not the budget"
     );
 
     // ── The §4 payout vector the coinbase is built from ────────────────
-    // Evaluated once at the SUBSIDY, not per-template: the B0 and B1
-    // templates carry different mempool fee totals, and the differential
-    // proof needs the coinbase byte-identical across both submissions.
-    // Σ == subsidy ≤ each template's allowed value — consensus permits a
-    // coinbase claiming less than its due (unclaimed fees are burned),
-    // so the block stays valid on the amount axis and only the WEIGHT
-    // axis (the reservation) decides accept vs reject.
+    // Evaluated once at the subsidy so the coinbase is byte-identical under
+    // both templates; claiming less than the due is valid, so only the
+    // reservation decides accept vs reject.
     let entries = dist
         .payout_entries_at(REGTEST_BLOCK_REWARD_SATS)
         .expect("§4 payout vector");
@@ -194,9 +148,7 @@ async fn autoscale_reservation_raise_turns_rejected_block_into_accepted() {
     )
     .expect("TdpHandle::spawn");
 
-    // Capture the bootstrap prev-hash (current tip). `SetNewPrevHash` is only
-    // emitted on a tip change, not on mempool deltas, and nothing is mined
-    // here, so this prev-hash stays valid for every template built below.
+    // Nothing is mined below, so this prev-hash stays valid for every template.
     let mut rx = tdp.subscribe();
     let (_boot, prev) = wait_for_paired_template(&mut rx).await;
 
@@ -204,9 +156,7 @@ async fn autoscale_reservation_raise_turns_rejected_block_into_accepted() {
     fill_mempool(&node, MEMPOOL_TARGET_VBYTES).await;
 
     // ── Template under B0 (mempool full) → coinbase → expect REJECT ─────
-    // Subscribe fresh AFTER the fill, then nudge: the emission triggered by the
-    // nudge happens *after* the subscription, so the captured template reflects
-    // the now-full mempool (an earlier template would carry too few txs).
+    // Subscribe after the fill, then nudge, so the template reflects the full mempool.
     let mut rx0 = tdp.subscribe();
     nudge_template(&node).await;
     let tpl0 = wait_for_new_template(&mut rx0).await;
@@ -239,9 +189,7 @@ async fn autoscale_reservation_raise_turns_rejected_block_into_accepted() {
     eprintln!("[autoscale] B0: block correctly REJECTED (chain held at {before})");
 
     // ── Autoscaler INCREASE: raise core's reservation to B1 ─────────────
-    // Raise the reservation, THEN subscribe + nudge so the captured template is
-    // built under the new (B1) reservation — fewer mempool txs, more coinbase
-    // room. Tip is unchanged (no block mined) → reuse `prev`.
+    // Raise first, then subscribe + nudge so the template is built under B1.
     let c1 = tdp_constraint_for_budget(B1_BUDGET);
     tdp.set_coinbase_constraints(c1.max_additional_size, c1.max_additional_sigops)
         .await
@@ -272,8 +220,7 @@ async fn autoscale_reservation_raise_turns_rejected_block_into_accepted() {
 
 // ── helpers ─────────────────────────────────────────────────────────────
 
-/// Build the §4 weight distribution for `miners` (1 share each) at the
-/// given coinbase weight budget.
+/// Build the §4 weight distribution, one share per miner.
 fn build_distribution(
     miners: &[AddressId],
     fee_addr: &AddressId,
@@ -306,8 +253,7 @@ fn reserved_weight(budget: u32) -> u32 {
         .saturating_mul(4)
 }
 
-/// Build the SV1 mining job from a TDP template + payout list; return
-/// `(job, coinbase_weight_wu)`.
+/// Returns `(job, coinbase_weight_wu)`.
 fn build_job(
     payouts: &[PayoutEntry],
     tpl: &NewTemplate,
@@ -364,8 +310,7 @@ async fn submit(
         &target,
     )
     .expect("find nonce on regtest");
-    // submit_solution may surface a rejected block as an Err; for the reject
-    // assertion the height check is authoritative, so ignore the result.
+    // The height check is authoritative, not the submit result.
     let _ = tdp
         .submit_solution(
             tpl.template_id,
@@ -377,11 +322,9 @@ async fn submit(
         .await;
 }
 
-/// Fill the mempool with large multi-output txs until its virtual size reaches
-/// `target_vbytes`. Each tx pays many distinct addresses a tiny amount.
+/// Fill the mempool with large multi-output txs up to `target_vbytes`.
 #[allow(clippy::print_stderr)]
 async fn fill_mempool(node: &RegtestNode, target_vbytes: u64) {
-    // Generate a reusable pool of recipient addresses (unique within a tx).
     const OUTPUTS_PER_TX: usize = 1_000;
     let mut recipients = serde_json::Map::with_capacity(OUTPUTS_PER_TX);
     for _ in 0..OUTPUTS_PER_TX {
@@ -404,9 +347,8 @@ async fn fill_mempool(node: &RegtestNode, target_vbytes: u64) {
         match node.wallet_call("sendmany", json!(["", amounts])).await {
             Ok(_) => {}
             Err(e) => {
-                // Out of funds / chain-limit: mining a block to free UTXOs
-                // would empty the mempool, so stop and let the assertion
-                // report an under-fill.
+                // Mining to free UTXOs would empty the mempool; let the
+                // assertion report an under-fill instead.
                 eprintln!("[autoscale] sendmany stopped after {iterations} txs: {e}");
                 break;
             }
@@ -419,9 +361,7 @@ async fn fill_mempool(node: &RegtestNode, target_vbytes: u64) {
     }
 }
 
-/// Send one small wallet tx so the mempool changes and the TDP emits a fresh
-/// template (the worker re-templates on mempool/fee deltas, not on a fixed
-/// timer that would fire on a quiescent mempool).
+/// Send one small tx: the TDP worker re-templates on mempool deltas only.
 async fn nudge_template(node: &RegtestNode) {
     let addr = node.new_address("bech32").await.expect("nudge addr");
     let _ = node
@@ -429,12 +369,8 @@ async fn nudge_template(node: &RegtestNode) {
         .await;
 }
 
-/// Wait for the first `NewTemplate` emitted on a freshly-subscribed receiver.
-/// Used after a mempool nudge / reservation change: on a fresh subscription the
-/// first template the worker emits reflects the current mempool + reservation
-/// (mempool-driven updates carry no fresh `SetNewPrevHash`, so there is no
-/// pairing by id here; the caller reuses the bootstrap prev-hash, valid until
-/// a block is mined). Tolerates one broadcast lag.
+/// First `NewTemplate` on a fresh subscription. Mempool-driven updates carry
+/// no `SetNewPrevHash`, so there is no pairing; the caller reuses its prev-hash.
 async fn wait_for_new_template(rx: &mut broadcast::Receiver<TemplateUpdate>) -> NewTemplate {
     let deadline = std::time::Instant::now() + Duration::from_secs(12);
     while std::time::Instant::now() < deadline {
@@ -482,8 +418,6 @@ fn generate_p2wpkh_miners(n: usize) -> Vec<AddressId> {
         .collect()
 }
 
-/// Tiny extension trait: `Option::unwrap_or_else_panic(msg)` reads better than
-/// `.unwrap_or_else(|| panic!(msg))` at the call site.
 trait UnwrapOrPanic<T> {
     fn unwrap_or_else_panic(self, msg: &str) -> T;
 }

@@ -1,18 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `GroupSoloEngineConfig` — engine-wide tunables.
-//!
-//! Per-group settings (`finder_bonus_ppm`, `round_reset_preset`,
-//! `round_reset_timezone`, `round_reset_interval_days`) live in the
-//! `pplns_group` DB row keyed by `groupId` and are read on demand at
-//! distribution-build / round-reset time. Only knobs that apply across
-//! *all* groups live here.
-//!
-//! The fee/min-payout/weight-budget knobs mirror
-//! `bp_pplns_engine::config::PplnsEngineConfig` on purpose but are separate
-//! values: `[group_fees]` feeds this engine, `[pplns]` the other, and they
-//! may differ. Only the fee **address** falls back from
-//! `[group_fees].address` to `[pplns].fee_address`.
+//! `GroupSoloEngineConfig`: knobs that apply to all groups; per-group settings
+//! live in the `pplns_group` row. The fee knobs mirror `PplnsEngineConfig` but
+//! are separate values (`[group_fees]` vs `[pplns]`); only the fee address
+//! falls back to `[pplns].fee_address`.
 
 use bp_common::{AddressId, Sats};
 use bp_pplns::{
@@ -24,39 +15,30 @@ use bp_pplns::{
 #[derive(Debug, Clone)]
 pub struct GroupSoloEngineConfig {
     /// Coinbase output that receives the pool fee and the §4 residual
-    /// `pay_P`. **Required**: [`Self::try_new`] refuses without it, via the
-    /// check shared with the PPLNS engine (`bp_pplns::validate_fee_payout_budget`).
-    ///
-    /// Resolved from `[group_fees].address` with a fallback to
-    /// `[pplns].fee_address`; a pool that sets neither cannot pay a
-    /// Group-Solo block correctly and will not boot.
+    /// `pay_P`. Required: [`Self::try_new`] refuses without it, because a
+    /// Group-Solo block cannot be paid correctly without a pool output.
     pub fee_address: Option<AddressId>,
 
     /// Pool fee % as f64 (`[0.0, 100.0]`).
     pub fee_percent: f64,
 
-    /// Operational minimum on-chain payout. A member below this gets NO
-    /// output, and their share falls into the §4 residual, i.e. to the pool
-    /// (`WithheldValue::ToPool`). No group ledger and no carry-forward: that
-    /// holds only while `GroupService` caps membership at coinbase capacity.
-    /// Clamped upward to `DUST_LIMIT_SATS` (546).
+    /// Minimum on-chain payout (at least `DUST_LIMIT_SATS`). A member below it
+    /// gets no output and their share goes to the pool (`WithheldValue::ToPool`);
+    /// no carry-forward, which holds only while `GroupService` caps membership
+    /// at coinbase capacity.
     pub min_payout_sats: Sats,
 
-    /// Coinbase weight budget (WU). Handed straight to bitcoin-core
-    /// over the Group-Solo TDP IPC stream, so no `bitcoin.conf` knob
-    /// needs to match. `[group_fees] coinbase_weight_budget`;
-    /// floored at `bp_pplns::MIN_COINBASE_WEIGHT_BUDGET`.
+    /// Coinbase weight budget (WU), handed to bitcoin-core over the TDP IPC
+    /// stream so no `bitcoin.conf` knob needs to match.
     pub coinbase_weight_budget: u32,
 
-    /// Per-(group, finder) snapshot TTL in seconds. Defaults to 1h.
+    /// Per-(group, finder) snapshot TTL in seconds.
     pub snapshot_ttl_secs: u32,
 
-    /// Blocks between subsidy halvings on the network this pool runs
-    /// on, the input to the settlement gate's floor
-    /// (`bp_share::block_subsidy_sats`). NOT an operator knob: it is
-    /// derived from the configured network at boot, since regtest halves
-    /// every 150 blocks and the mainnet 210 000 would make every regtest
-    /// block past height 150 look like it burned part of its subsidy.
+    /// Blocks between subsidy halvings, the input to the settlement gate's
+    /// floor. Derived from the network at boot, not an operator knob: regtest
+    /// halves every 150 blocks, and the mainnet value would make later regtest
+    /// blocks look like they burned subsidy.
     pub subsidy_halving_interval: u32,
 }
 
@@ -74,11 +56,9 @@ impl Default for GroupSoloEngineConfig {
 }
 
 impl GroupSoloEngineConfig {
-    /// Validate field-level invariants, the same way
-    /// `PplnsEngineConfig::try_new` does.
+    /// Validate field-level invariants.
     pub fn try_new(self) -> Result<Self, ConfigError> {
-        // The fee / min-payout / coinbase-budget checks live in bp-pplns,
-        // shared with the PPLNS engine, and map into ConfigError via `From`.
+        // Shared with the PPLNS engine so both refuse the same configs.
         validate_fee_payout_budget(
             self.fee_address.as_ref().map(|a| a.as_str()),
             self.fee_percent,
@@ -111,9 +91,8 @@ mod tests {
     use super::*;
     const TEST_FEE_ADDRESS: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
 
-    /// A config that differs from [`GroupSoloEngineConfig::default`] only in having a
-    /// usable pool-output recipient. The default deliberately does NOT —
-    /// see `the_default_config_is_refused_because_it_has_no_fee_address`.
+    /// [`GroupSoloEngineConfig::default`] plus a usable pool-output recipient,
+    /// which the default deliberately lacks.
     fn valid() -> GroupSoloEngineConfig {
         GroupSoloEngineConfig {
             fee_address: Some(AddressId::new(TEST_FEE_ADDRESS).expect("valid")),
@@ -121,8 +100,7 @@ mod tests {
         }
     }
 
-    /// The pool output is structural under §4, so no config without a fee
-    /// address is usable.
+    /// A config without a fee address is refused.
     #[test]
     fn the_default_config_is_refused_because_it_has_no_fee_address() {
         assert_eq!(
@@ -131,8 +109,7 @@ mod tests {
         );
     }
 
-    /// Shape-valid but unparseable is the same failure with a likelier
-    /// cause (a typo), and `AddressId` does not catch it.
+    /// A shape-valid but unparseable fee address is refused.
     #[test]
     fn a_typo_in_the_fee_address_is_refused() {
         let typo = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLX";
@@ -238,7 +215,6 @@ mod tests {
         );
     }
 
-    /// A non-zero fee validates.
     #[test]
     fn a_non_zero_fee_validates() {
         GroupSoloEngineConfig {

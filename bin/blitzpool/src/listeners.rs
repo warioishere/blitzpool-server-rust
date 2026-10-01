@@ -2,17 +2,8 @@
 
 //! Telegram long-poll + ntfy SSE listener wiring.
 //!
-//! For each configured `[notifications.telegram]` / `[notifications.ntfy]`
-//! block this builds the outbound adapter ([`TelegramAdapter`] /
-//! [`NtfyAdapter`]), shared by the listener's reply path and the
-//! `hourly_stats` cron (via [`ListenerHandles::telegram_adapter`] +
-//! [`ListenerHandles::ntfy_adapter`]); builds one [`CommandHandler`] with
-//! both engine readers so read-side commands answer with live data; and
-//! spawns the loops, each stopped by `send(true)` on its `watch::Sender`.
-//!
-//! With neither block configured the result is
-//! [`ListenerHandles::disabled`]: `shutdown` is a no-op, the adapter
-//! accessors return `None`, and the `hourly_stats` cron is skipped.
+//! Each configured transport gets one outbound adapter, shared by the
+//! listener's replies and the `hourly_stats` cron, and one [`CommandHandler`].
 
 use std::sync::Arc;
 
@@ -57,22 +48,18 @@ impl ListenerHandles {
         Self { inner: None }
     }
 
-    /// Clone of the outbound Telegram adapter, when configured. The
-    /// `hourly_stats` cron passes this to
-    /// `bp_notifications::cron::hourly_stats::spawn_hourly_stats_cron`.
+    /// Outbound Telegram adapter for the `hourly_stats` cron, when configured.
     pub(crate) fn telegram_adapter(&self) -> Option<Arc<TelegramAdapter>> {
         self.inner.as_ref().and_then(|i| i.telegram_adapter.clone())
     }
 
-    /// Clone of the outbound ntfy adapter, when configured. Same use
-    /// as [`Self::telegram_adapter`].
+    /// Outbound ntfy adapter for the `hourly_stats` cron, when configured.
     pub(crate) fn ntfy_adapter(&self) -> Option<Arc<NtfyAdapter>> {
         self.inner.as_ref().and_then(|i| i.ntfy_adapter.clone())
     }
 
-    /// The shared per-chat Telegram language map, when listeners are
-    /// configured. The `hourly_stats` cron passes this to
-    /// `spawn_hourly_stats_cron` so digests honour each chat's language.
+    /// Shared per-chat language map, so the hourly digest honours each
+    /// chat's language.
     pub(crate) fn chat_languages(&self) -> Option<ChatLanguageMap> {
         self.inner.as_ref().map(|i| i.chat_languages.clone())
     }
@@ -94,8 +81,6 @@ impl ListenerHandles {
         }
     }
 
-    /// Send `true` on each listener's shutdown channel. The loops
-    /// observe it on their next `select!` iteration and exit cleanly.
     pub(crate) async fn shutdown(mut self) {
         let Some(inner) = self.inner.take() else {
             return;
@@ -117,10 +102,6 @@ pub(crate) enum ListenerSpawnError {
     Ntfy(AdapterError),
 }
 
-/// Build adapters from `[notifications.telegram]` + `[notifications.ntfy]`,
-/// wire them into a single [`CommandHandler`], and spawn the matching
-/// listener loops. Returns the aggregate handle (adapters exposed for
-/// the cron-wiring + shutdown signals retained).
 pub(crate) fn spawn(
     cfg: &AppConfig,
     foundation: &FoundationHandles,
@@ -143,9 +124,8 @@ pub(crate) fn spawn(
     // /subscribe or /remove refreshes its SSE topic set immediately.
     let ntfy_reconnect = Arc::new(Notify::new());
 
-    // One handler for both listeners; it replies over the transport a
-    // command arrived on, and the engine readers feed live data into the
-    // read-side commands.
+    // One handler for both listeners; it replies over the transport the
+    // command arrived on.
     let handler = Arc::new(
         CommandHandler::new(pool.clone(), telegram_adapter.clone(), ntfy_adapter.clone())
             .with_redis(Some(foundation.redis.clone()))

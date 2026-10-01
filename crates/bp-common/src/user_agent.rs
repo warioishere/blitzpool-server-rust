@@ -4,10 +4,9 @@
 //! (SetupConnection `vendor`) and the API downstream report so the same
 //! firmware is recorded under the same name whichever way it connects.
 
-/// Take the first space-/`/`-/`V`-bounded token, then collapse known
-/// firmware tags ("bosminer", "bOS" → "Braiins OS"; "cpuminer" →
-/// "cpuminer"). Case-sensitive. An empty input yields an empty string; the
-/// caller decides what to record for it.
+/// First space-/`/`-/`V`-bounded token, with known firmware tags collapsed
+/// (case-sensitive).
+/// Empty input yields an empty string; the caller decides what to record.
 pub fn normalize_user_agent(raw: &str) -> String {
     let first_token = raw
         .split(' ')

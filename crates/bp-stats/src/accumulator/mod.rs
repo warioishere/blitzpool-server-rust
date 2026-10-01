@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Domain-specific accumulators built on top of the generic buffers.
-//!
-//! Each accumulator owns a `Mutex<Buffer>` so the hot-path mutation
-//! happens under a short lock with no `.await`. All `add_*` methods are
-//! infallible (the share path must not throw) — over-range or non-finite
-//! inputs are silently discarded with the calling layer responsible for
-//! its own observability.
+//! Domain accumulators on top of the generic buffers. Each holds a short,
+//! await-free `Mutex`; `add_*` is infallible because the share path must not
+//! fail, so out-of-range or non-finite inputs are dropped silently.
 
 mod best_difficulty;
 mod client_rejected;
@@ -50,34 +46,24 @@ pub(crate) fn flushed_max(buffered: f64, flushed: f64) -> f64 {
     }
 }
 
-/// Categorisation of a rejected share. The string forms are written
-/// verbatim to the `reason` column on `pool_rejected_statistics_entity`
-/// and `client_rejected_statistics_entity` — they match the values the
-/// frontend expects to see in `/api/info/rejected` per-slot counts.
+/// Why a share was rejected. The string forms are stored verbatim in the
+/// `reason` columns and read by the frontend, so they must not change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum RejectedReason {
     JobNotFound,
     DuplicateShare,
     LowDifficulty,
-    /// Job entry existed but was retired past the network-jitter
-    /// grace window. Distinct from `JobNotFound` (entry GC'd / never
-    /// existed) so operators can tell normal block-transition churn
-    /// from a real miner bug.
+    /// Job was retired past the network-jitter grace window. Kept apart from
+    /// `JobNotFound` so block-transition churn is distinguishable from a miner bug.
     Stale,
-    /// Miner changed block-header version bits outside the mask it
-    /// negotiated (BIP-310: "If a miner changes bits with mask value 0,
-    /// the server will reject the submit").
-    ///
-    /// Its own bucket rather than folded into `LowDifficulty`: the share's
-    /// proof-of-work may be perfectly good, and the two point at different
-    /// causes — a difficulty miss is normal churn, this is a miner ignoring
-    /// what it negotiated.
+    /// Version bits rolled outside the negotiated BIP-310 mask. Its own bucket
+    /// because the proof-of-work may be fine: this is a miner ignoring what it
+    /// negotiated, not a difficulty miss.
     VersionRollingNotAllowed,
 }
 
 impl RejectedReason {
-    /// Wire-form name as written to PG and emitted in the UI's
-    /// per-reason chart series.
+    /// Name as stored in PG and shown in the UI's per-reason series.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::JobNotFound => "JobNotFound",

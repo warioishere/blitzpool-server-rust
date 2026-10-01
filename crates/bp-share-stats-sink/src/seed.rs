@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Boot-time one-shot seeding of `worker_shares_entity` from existing
-//! `client_statistics_entity` rows.
-//!
-//! ## When it fires
-//!
-//! Only when `worker_shares_entity` is empty. The check + the seed
-//! INSERT run in the same transaction so two simultaneous engine
-//! spawns can't both populate (the second sees the row count and bails).
-//! On a populated database it never fires; on a fresh one it bootstraps
-//! the table so per-worker chart endpoints aren't blank.
+//! Seeds an empty `worker_shares_entity` from `client_statistics_entity` at
+//! boot, so per-worker charts are not blank on a fresh database.
 
 use bp_db::{count_worker_shares, seed_worker_shares_from_client_statistics};
 use sqlx::{PgConnection, PgPool};
@@ -17,8 +9,7 @@ use tracing::{info, instrument};
 
 use crate::error::SinkError;
 
-/// Check + seed under a caller-supplied connection / transaction. Used
-/// by integration tests that wrap the call in a TX-rollback for isolation.
+/// Check + seed on a caller-supplied connection, so tests can roll it back.
 pub async fn seed_if_empty_with_executor(
     conn: &mut PgConnection,
 ) -> Result<Option<u64>, SinkError> {
@@ -31,9 +22,8 @@ pub async fn seed_if_empty_with_executor(
     Ok(Some(inserted))
 }
 
-/// Returns `Some(rows_inserted)` if the seed fired (table was empty),
-/// `None` if no-op (table was already populated). Wrapped in a tx so the
-/// "check + insert" pair stays atomic across concurrent spawns.
+/// `Some(rows_inserted)` if the table was empty, else `None`. Check and
+/// insert share one transaction so concurrent spawns cannot both seed.
 #[instrument(skip(pool), name = "stats_sink.seed_if_empty")]
 pub async fn seed_if_empty(pool: &PgPool) -> Result<Option<u64>, SinkError> {
     let mut tx = pool

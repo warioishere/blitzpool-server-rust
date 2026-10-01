@@ -3,14 +3,8 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! End-to-end orchestration test: spawn `ShareStatsEngine` with a tight
-//! flush interval, push data via the shared `Accumulators` handle (the
-//! same handle the share hooks mutate), wait for the cron task to
-//! tick, verify PG, then shutdown and confirm final-drain.
-//!
-//! The hook impls (which translate `record_accepted` / `record_rejected`
-//! into accumulator deltas) are covered by `hooks_unit.rs` and
-//! `flush_integration.rs`.
+//! End-to-end `ShareStatsEngine` tests: data pushed through the shared
+//! `Accumulators` reaches PG on a tick, and shutdown drains the rest.
 
 use std::time::Duration;
 
@@ -73,12 +67,8 @@ async fn cleanup(pool: &PgPool, slot_time_ms: i64, prefix: &str) {
     }
 }
 
-/// Read the flushed `accepted` for one slot, retrying until the engine's
-/// background flush has committed it or `timeout` elapses. Returns `None` on
-/// timeout so the caller can fail with its own message.
-///
-/// The flush is asynchronous, so a fixed sleep would depend on how fast the
-/// runner is.
+/// Polls the flushed `accepted` for one slot until it appears or `timeout`
+/// elapses (`None`); a fixed sleep would depend on how fast the runner is.
 async fn poll_accepted(pool: &PgPool, slot_ms: i64, timeout: Duration) -> Option<f32> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -109,9 +99,8 @@ async fn engine_spawn_tick_flushes_to_pg_then_shutdown_drains() {
     let prefix = "test_engine_e2e_";
     cleanup(&pool, slot.as_millis(), prefix).await;
 
-    // Spawn engine with tight interval. `seed_on_spawn=false` because
-    // the seed migration touches the whole table and would conflict
-    // with parallel tests — covered separately by seed_integration.
+    // The seed touches the whole table and would collide with parallel
+    // tests; `seed_integration` covers it.
     let cfg = StatsSinkConfig {
         flush_interval: Duration::from_millis(80),
         client_stats_batch_size: 1000,
@@ -123,8 +112,7 @@ async fn engine_spawn_tick_flushes_to_pg_then_shutdown_drains() {
         .await
         .expect("spawn engine");
 
-    // Push data via the shared accumulators handle, the same path the
-    // share hooks take.
+    // Same path the share hooks take.
     let accs = handle.accumulators();
     accs.pool_shares.add_accepted(slot, 50.0, 50.0);
     accs.pool_rejected
@@ -150,10 +138,8 @@ async fn engine_spawn_tick_flushes_to_pg_then_shutdown_drains() {
         50.0,
     );
 
-    // Wait for the flush to land, rather than for a fixed number of tick
-    // durations: a loaded runner can take far longer than two 80 ms ticks to
-    // get the write committed, and a plain sleep turns that into a false
-    // failure.
+    // Poll instead of sleeping a few ticks: a loaded runner can take far
+    // longer to commit.
     let accepted = poll_accepted(&pool, slot.as_millis(), Duration::from_secs(10))
         .await
         .expect("engine tick should have flushed within 10s");
@@ -195,8 +181,6 @@ async fn engine_reader_exposes_pending_residuals_before_flush() {
         seed_on_spawn: false,
         startup_offset: Duration::ZERO,
     };
-    // Construct without spawning, so the accumulators can be mutated
-    // before the reader's view is checked.
     let engine = ShareStatsEngine::new(cfg, pool).expect("new engine");
     let reader = engine.reader();
     let accs = engine.accumulators();
@@ -205,15 +189,14 @@ async fn engine_reader_exposes_pending_residuals_before_flush() {
     accs.pool_shares
         .add_accepted(TimeSlot::from_millis(32_503_680_011_001), 25.0, 25.0);
     assert_eq!(reader.pending_pool_shares(), 1);
-    // Cheap clone semantics: clones see the same backing state.
+    // Clones share the backing state.
     let reader_clone = reader.clone();
     assert_eq!(reader_clone.pending_pool_shares(), 1);
 }
 
 #[tokio::test]
 async fn engine_handle_shutdown_is_idempotent_against_dropped_handle() {
-    // Dropping the handle without an explicit shutdown must not panic, for
-    // call sites that never go through the drain.
+    // Dropping the handle without an explicit shutdown must not panic.
     let _guard = ENGINE_TEST_LOCK.lock().await;
     let Some(pool) = connect_or_skip().await else {
         return;
@@ -231,12 +214,9 @@ async fn engine_handle_shutdown_is_idempotent_against_dropped_handle() {
         )
         .await
         .expect("spawn");
-        // Drop scope exits here — handle.shutdown_tx and handle.join
-        // are still set, but Drop is a no-op on this type. The
-        // background task continues until something else cancels it.
+        // Dropping detaches the task; it drains and exits on its own.
     }
-    // Give the detached task a moment to run; a panic there would be
-    // logged by tokio.
+    // Let the detached task run; tokio would log a panic there.
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
 

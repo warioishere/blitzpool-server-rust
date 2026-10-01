@@ -1,23 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Public, owned, `Send`-able wrappers around the
-//! `stratum_core::parsers_sv2::TemplateDistribution` payloads.
-//!
-//! Why a local wrap instead of re-exporting `TemplateDistributionOwned`
-//! directly:
-//!
-//! - **API stability.** The upstream `stratum-core` library is pinned to whatever
-//!   `bitcoin_core_sv2` pins, and its majors move. A local public API
-//!   shields downstream crates (`bp-stratum-v1`, `bp-stratum-v2`,
-//!   `bp-api`) from breaking changes there.
-//! - **Owned bytes.** Upstream payloads come in a borrowed `'decoder` flavour and
-//!   an `*Owned` flavour; plain `Vec<u8>` fields keep the payloads trivially
-//!   clonable so `broadcast::Sender` can fan out without reference-counting
-//!   tricks.
-//! - **Surface area.** Pool consumers only ever care about the four payloads
-//!   below — there is no need to expose the `CoinbaseOutputConstraints` /
-//!   `RequestTransactionData` / `SubmitSolution` variants on the *outbound*
-//!   channel.
+//! Owned wrappers around the `stratum_core` TDP payloads, instead of
+//! re-exporting `TemplateDistributionOwned`: they shield downstream crates
+//! from `stratum-core` major bumps, clone plainly for `broadcast` fan-out,
+//! and expose only the four payloads that travel from bitcoin-core.
 
 use stratum_core::parsers_sv2::TemplateDistributionOwned;
 
@@ -57,45 +43,24 @@ pub struct SetNewPrevHash {
     pub target: [u8; 32],
 }
 
-/// Latest-known TDP state for read-only consumers (e.g. the
-/// `/api/info/block-template` REST endpoint). Built by
-/// [`apply_to_snapshot`] from each [`TemplateUpdate`] the worker
-/// broadcasts; the bp-api layer reads it through
-/// [`crate::TdpHandle::current_snapshot`].
-///
-/// Both fields are `Option` because the snapshot starts empty at
-/// process boot — bitcoin-core's first NewTemplate + SetNewPrevHash
-/// pair arrives within a few ms of TDP attach, so callers should treat
-/// `None` as "not ready yet" rather than an error.
-///
-/// The `prev_hash` field can lag the latest template by one tick under
-/// normal operation (bitcoin-core sends NewTemplate first, then
-/// SetNewPrevHash for the same `template_id`). Callers that need a
-/// coherent pair should check `template_id` equality:
-/// `snapshot.new_template?.template_id == snapshot.set_new_prev_hash?.template_id`.
+/// Latest-known TDP state for read-only consumers, built by
+/// [`apply_to_snapshot`] and read via [`crate::TdpHandle::current_snapshot`].
+/// `None` fields mean "not ready yet". The two halves can be one update apart;
+/// a caller needing a coherent pair must compare their `template_id`s.
 #[derive(Debug, Default, Clone)]
 pub struct TemplateSnapshot {
     pub new_template: Option<NewTemplate>,
     pub set_new_prev_hash: Option<SetNewPrevHash>,
-    /// Wall-clock epoch-ms when the live snapshot last absorbed a
-    /// fresh NewTemplate or SetNewPrevHash. `None` until the first
-    /// update arrives. NOT touched by [`apply_to_snapshot`] (which
-    /// stays a pure, clock-free replay primitive) — only the live
-    /// snapshot-tap in [`crate::TdpHandle::spawn`] stamps it, since
-    /// staleness is a property of the running connection, not of a
-    /// replayed stream. Read by `/api/health` to flag a prolonged
-    /// bitcoin-core outage (templates no longer arriving).
+    /// Epoch-ms of the last absorbed update, for `/api/health`'s staleness
+    /// check. Stamped only by the live tap in [`crate::TdpHandle::spawn`], not
+    /// by [`apply_to_snapshot`]: staleness belongs to the running connection,
+    /// not to a replayed stream.
     pub last_update_at: Option<i64>,
 }
 
-/// Apply one [`TemplateUpdate`] to a [`TemplateSnapshot`] in-place.
-/// Inbound-only variants (the two `RequestTransactionData*` payloads)
-/// are intentionally ignored — they're per-call responses, not pool
-/// state.
-///
-/// Used by the snapshot-tap task in [`crate::TdpHandle::spawn`] and
-/// exposed publicly so consumers + tests can replay TDP streams
-/// without holding the handle.
+/// Apply one [`TemplateUpdate`] to a [`TemplateSnapshot`] in place. The
+/// `RequestTransactionData*` responses are per-call, not pool state, so they
+/// are ignored. Public so a TDP stream can be replayed without the handle.
 pub fn apply_to_snapshot(snapshot: &mut TemplateSnapshot, update: &TemplateUpdate) {
     match update {
         TemplateUpdate::NewTemplate(t) => snapshot.new_template = Some(t.clone()),
@@ -105,12 +70,9 @@ pub fn apply_to_snapshot(snapshot: &mut TemplateSnapshot, update: &TemplateUpdat
     }
 }
 
-/// Mirror of `template_distribution_sv2::RequestTransactionDataSuccess`.
-///
-/// `transaction_list` is the ordered list of raw, witness-serialised
-/// transactions, exactly as bitcoin-core delivered them. `excess_data` is
-/// the opaque blob the SV2 spec reserves for "anything else the validator
-/// needs"; in practice it carries the SegWit commitment.
+/// Mirror of `template_distribution_sv2::RequestTransactionDataSuccess`;
+/// `transaction_list` holds raw witness-serialised transactions in
+/// bitcoin-core's order.
 #[derive(Debug, Clone)]
 pub struct RequestTransactionDataSuccess {
     pub template_id: u64,
@@ -126,11 +88,8 @@ pub struct RequestTransactionDataError {
 }
 
 impl TemplateUpdate {
-    /// Convert from the upstream `TemplateDistribution` enum to the owned
-    /// wrap. Returns `None` for inbound-only variants
-    /// (`CoinbaseOutputConstraints`, `RequestTransactionData`,
-    /// `SubmitSolution`) which never travel outbound and so should never
-    /// reach this code path; the worker logs and drops them instead.
+    /// Convert from the upstream enum; `None` for the variants that only ever
+    /// travel towards bitcoin-core, which the worker logs and drops.
     pub fn from_upstream(msg: &TemplateDistributionOwned) -> Option<Self> {
         match msg {
             TemplateDistributionOwned::NewTemplate(t) => Some(Self::NewTemplate(NewTemplate {

@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! SPIKE: can TWO concurrent TDP/IPC connections to ONE bitcoind each hold
-//! their own template (with their own `block_reserved_weight`)?
-//!
-//! The per-mode multi-stream coinbase reservation depends on it: a TDP
-//! connection holds exactly one template client, so N reservations means N TDP
-//! connections to the same node. This test pins that bitcoin-core's IPC serves
-//! two concurrent template clients.
+//! Pins that bitcoin-core's IPC serves two concurrent template clients, each
+//! with its own `block_reserved_weight`. The per-mode coinbase reservation
+//! depends on it: one TDP connection holds one template client.
 
 use std::time::Duration;
 
@@ -90,10 +86,8 @@ async fn two_concurrent_tdp_connections_both_get_templates() {
     let mut acc_solo = PairAcc::default();
     let mut acc_pplns = PairAcc::default();
 
-    // Each connection emits a startup pair for the PRE-generate tip as soon as
-    // it attaches, and whether it lands before or after `subscribe()` is a
-    // scheduler race. Collect it up front so the skip path below runs every
-    // time. Bounded: a pair emitted before `subscribe()` is simply gone.
+    // The startup pair may land before or after `subscribe()`; collect it up
+    // front so the skip path below runs every time.
     let _ = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             tokio::select! {
@@ -113,9 +107,7 @@ async fn two_concurrent_tdp_connections_both_get_templates() {
         .await
         .expect("mine 1 for fresh template");
 
-    // Read from both until they agree on a tip that is NOT the startup one.
-    // The chain is static after the generate, so both converge on the
-    // post-generate tip and any stale startup pair is passed over.
+    // Read from both until they agree on a tip that is not the startup one.
     let converged = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             if let (Some(a), Some(b)) = (acc_solo.tip(), acc_pplns.tip()) {
@@ -166,8 +158,6 @@ async fn two_concurrent_tdp_connections_both_get_templates() {
         t_solo.template_id, p_solo.template_id, t_pplns.template_id, p_pplns.template_id
     );
 
-    // Both connections produced a usable template concurrently → bitcoin-core
-    // IPC serves multiple template clients. Both must build on the same tip.
     assert_eq!(
         p_solo.prev_hash, p_pplns.prev_hash,
         "both streams must build on the same chain tip"

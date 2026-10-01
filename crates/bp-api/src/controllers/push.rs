@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `/api/push/*` — register/configure/unregister UnifiedPush + FCM push
-//! subscriptions.
-//!
-//! All addresses must have an `address_settings_entity` row (the
-//! "address has mined on this pool" gate) before they can register.
-//! The status endpoint is the only un-gated read and is a passthrough
-//! to `bp_db::find_push_subscriptions_by_address`.
+//! `/api/push/*` — UnifiedPush + FCM push subscriptions. Registering needs an
+//! `address_settings_entity` row, i.e. the address has mined on this pool.
 
 use axum::{
     extract::{Path, State},
@@ -46,12 +41,8 @@ where
 
 // ─── GET /api/push/info ──────────────────────────────────────────
 
-/// Static operator-documentation endpoint returning a deeply nested
-/// JSON literal listing notification types, the HTTP method/body
-/// catalogue, UnifiedPush + FCM setup instructions, examples and
-/// rate-limit text. The UI uses this primarily to discover which
-/// notification kinds and channels are supported. Lives as a single
-/// inline `serde_json::Value` — no struct gain at this size.
+/// Static self-documentation of the push API; the UI reads it to discover
+/// the supported notification kinds and channels.
 async fn info() -> Json<Value> {
     Json(json!({
         "success": true,

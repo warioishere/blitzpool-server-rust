@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Helpers for the `DeclareMiningJob` → `ProvideMissingTransactions` round-trip.
-//!
-//! The JDS needs the raw bytes of every declared wtxid to rebuild the block on
-//! `PushSolution`; whatever the template lacks is requested from the JDC.
-//! All wtxids are in wire byte order.
+//! The `DeclareMiningJob` → `ProvideMissingTransactions` round-trip: the JDS
+//! needs every declared transaction to rebuild the block on `PushSolution`,
+//! so whatever the template lacks is requested. wtxids are in wire byte order.
 
 use std::collections::HashMap;
 

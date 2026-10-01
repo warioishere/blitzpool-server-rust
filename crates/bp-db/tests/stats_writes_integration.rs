@@ -3,22 +3,8 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! Integration tests for the 8 stats-coordinator bulk-write primitives
-//! in `stats_writes.rs`. Mirrors `pplns_bulk_writes.rs`
-//! pattern: each test wraps in TX-rollback for isolation.
-//!
-//! Coverage:
-//!
-//! - 5 slot-bucketed bulk-upserts (`pool_share_statistics_entity`,
-//!   `pool_mode_hashrate`, `pool_rejected_statistics_entity`,
-//!   `client_statistics_entity`, `client_rejected_statistics_entity`):
-//!   first-call inserts, second-call ON-CONFLICT-INCREMENT, empty-slice
-//!   no-op.
-//! - 2 lifetime-totals writes (`address_settings_entity` — one upsert
-//!   folds the `shares` increment AND the `bestDifficulty` GREATEST —
-//!   plus `worker_shares_entity` composite-PK upsert).
-//! - 2 seed-bootstrap functions (`count_worker_shares` +
-//!   `seed_worker_shares_from_client_statistics`).
+//! Integration tests for the bulk-write primitives in `stats_writes.rs`;
+//! each test runs inside a rolled-back transaction.
 
 use bp_db::{
     bulk_upsert_address_settings, bulk_upsert_client_rejected_statistics_entity,
@@ -56,11 +42,9 @@ async fn connect_or_skip() -> Option<PgPool> {
     }
 }
 
-/// Generate a slot end timestamp unique enough not to collide across
-/// parallel tests in the same TX-isolation suite. Use the test name's
-/// hash as a deterministic offset.
+/// A slot end far from real or fixture data (year 3000), offset per test so
+/// parallel tests do not collide.
 fn unique_slot(seed: i64) -> i64 {
-    // Year-3000 epoch, far from any real or fixture data.
     32_503_680_000_000 + seed
 }
 
@@ -572,9 +556,8 @@ async fn address_settings_shares_increment_and_create_missing_rows() {
     tx.rollback().await.expect("rollback");
 }
 
-/// One upsert lands BOTH the share increment and
-/// the best-difficulty GREATEST, and `"updatedAt"` moves only when the best
-/// actually grows.
+/// One upsert lands both the share increment and the best, and
+/// `"updatedAt"` moves only when the best grows.
 #[tokio::test]
 async fn address_settings_upsert_folds_shares_and_best_in_one_write() {
     let Some(pool) = connect_or_skip().await else {
@@ -675,13 +658,8 @@ async fn read_all_time(
     )
 }
 
-/// `/bestdiff_reset` clears what the miner sees and leaves the pool's
-/// public record standing.
-///
-/// Asserts BOTH directions in one test, so it cannot pass on a
-/// precondition that silently did not hold: the reset must actually
-/// zero the personal value (otherwise "the all-time survived" proves
-/// nothing), and the all-time value must not move.
+/// `/bestdiff_reset` zeroes the personal best and leaves the public record;
+/// both directions are asserted so a no-op reset cannot pass.
 #[tokio::test]
 async fn a_reset_zeroes_the_personal_best_and_leaves_the_public_record() {
     let Some(pool) = connect_or_skip().await else {
@@ -804,9 +782,8 @@ async fn best_difficulty_upsert_inserts_then_climbs_via_greatest() {
     tx.rollback().await.expect("rollback");
 }
 
-/// After a best-difficulty reset zeroes the row (out of band, via the
-/// UI/Telegram reset), the very next accepted-share flush re-establishes
-/// the best via GREATEST — even with a share LOWER than the old high.
+/// After a reset, the next flush re-establishes the best even with a share
+/// lower than the old high.
 #[tokio::test]
 async fn best_difficulty_recovers_after_a_reset() {
     let Some(pool) = connect_or_skip().await else {

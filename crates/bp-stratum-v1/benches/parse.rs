@@ -1,16 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #![allow(unsafe_code)] // dev-only bench: a counting global allocator needs `unsafe impl GlobalAlloc`.
 #![allow(clippy::print_stdout)] // dev-only bench: reporting alloc counts to stdout is the point.
-//
-//! Hot-path micro-benchmark for the SV1 JSON-RPC parser
-//! ([`bp_stratum_v1::parse_request`]).
-//!
-//! Reports two numbers per message shape:
-//!   - **allocations per parse** — the figure that matters on the submit hot
-//!     path, which is meant to borrow from the input rather than allocate.
-//!   - **ns/op** (criterion) — wall-clock per parse with warmup + outlier
-//!     detection.
-//!
+//! Micro-benchmark of [`bp_stratum_v1::parse_request`]: allocations per parse
+//! (submit is meant to borrow, not allocate) and ns/op per message shape.
 //! Run: `cargo bench -p bp-stratum-v1 --bench parse`
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -20,10 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use bp_stratum_v1::parse_request;
 use criterion::{Criterion, Throughput};
 
-// ── Counting allocator: tallies every `alloc` call to read the
-//    allocation count around a single isolated parse. Wraps the System
-//    allocator (criterion's own allocations are not measured — only the
-//    counter delta across one parse_request call is read). ──
+// ── Counting allocator: only the delta across one parse is read ──
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
 struct Counting;
@@ -45,8 +34,7 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
-/// The realistic hot-path lines. The `submit` ones dominate steady-state
-/// traffic (one per accepted share); the others fire only at session open.
+/// Submit dominates steady-state traffic; the others fire at session open.
 const SUBMIT_MASK: &str = r#"{"id":5,"method":"mining.submit","params":["bc1qaddr.worker1","1a2b","1122334455667788","65a1b2c3","deadbeef","1fffe000"]}"#;
 const SUBMIT_NOMASK: &str = r#"{"id":5,"method":"mining.submit","params":["bc1qaddr.worker1","1a2b","1122334455667788","65a1b2c3","deadbeef"]}"#;
 const AUTHORIZE: &str =
@@ -60,9 +48,7 @@ const CASES: &[(&str, &str)] = &[
     ("subscribe", SUBSCRIBE),
 ];
 
-/// Allocations during exactly one `parse_request` of `line`. The result is
-/// dropped AFTER the second read so its destructor's deallocs don't matter
-/// (allocs are counted, not net).
+/// Allocations during exactly one `parse_request` of `line`.
 fn allocs_for(line: &str) -> usize {
     let before = ALLOCS.load(Ordering::Relaxed);
     let parsed = parse_request(black_box(line));

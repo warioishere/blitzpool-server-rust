@@ -1,21 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! SV2 Extended-channel block submit must produce a coinbase that
-//! bitcoin-core accepts.
-//!
-//! `validate_submit_extended` builds the submitted coinbase itself, a
-//! different path from `MiningJob::witness_coinbase_with_extranonce`, and
+//! SV2 Extended-channel block submit must produce a coinbase bitcoin-core accepts.
+//! `validate_submit_extended` builds that coinbase on its own path and
 //! `TdpHandle::submit_solution` is fire-and-forget, so only a real node shows
-//! whether the bytes are valid. End to end:
-//!
-//! 1. Boot a `bitcoin-node v31` regtest instance and attach `TdpHandle`.
-//! 2. Build a `MiningJob` from a fresh TDP template and wrap it in an
-//!    `ExtendedJob` the way the channel code does.
-//! 3. Brute-force a nonce against the coinbase the miner reconstructs.
-//! 4. Run `validate_submit_extended` and submit its `witness_coinbase` via
-//!    `TdpHandle::submit_solution`.
-//! 5. Assert the chain tip advances by one block (or, for the rejection
-//!    cases, that it does not and why).
+//! whether the bytes are valid; the chain tip is the verdict.
 
 use std::time::Duration;
 
@@ -41,84 +29,59 @@ use smallvec::SmallVec;
 /// script is needed.
 const MINER_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
-/// nVersion bits 5–12 — the eight bits BIP-323 adds on top of BIP-320's
-/// sixteen. Rolling exactly these and nothing else is the one case that
-/// separates "needs BIP-323" from "already legal under BIP-320".
+/// nVersion bits 5–12, the eight bits BIP-323 adds on top of BIP-320's
+/// sixteen; rolling only these separates "needs BIP-323" from BIP-320.
 const BIP323_ONLY_VERSION_BITS: u32 = 0x0000_1fe0;
 
 /// How long core gets to act on a submitted block. The reject path uses the
 /// same budget so a slow acceptance cannot pass as "rejected".
 const CORE_ACCEPT_BUDGET: Duration = Duration::from_secs(20);
 
-/// Default case — 8-byte miner extranonce → total 4+8=12 matches
-/// the pool default `EXTRANONCE_SLOT_LEN`.
+/// 8-byte miner extranonce: total 12 matches the pool's `EXTRANONCE_SLOT_LEN`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::print_stderr)]
 async fn sv2_extended_8byte_miner_extranonce_block_is_accepted_by_bitcoin_core() {
     run_block_submit_case(8, 0, true).await;
 }
 
-/// BitAxe case — 6-byte miner extranonce → total 4+6=10 ≠ 12. The
-/// per-channel `MiningJob` is built with a 10-byte slot so the scriptSig
-/// length varint matches the wire bytes; otherwise share hashes diverge and
-/// core fails the parse with `OversizedVarInt`.
+/// 6-byte miner extranonce (total 10): the job's scriptSig length varint must
+/// match the wire bytes, or core fails the parse with `OversizedVarInt`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::print_stderr)]
 async fn sv2_extended_6byte_miner_extranonce_block_is_accepted_by_bitcoin_core() {
     run_block_submit_case(6, 0, true).await;
 }
 
-/// A block rolling the eight nVersion bits BIP-323 adds over BIP-320 is
-/// accepted by **bitcoin-core v31** (which predates BIP-323 masking), the
-/// tip advances and the bits survive into the stored header. This gates
-/// widening the advertised `version-rolling.mask`; the pool does not
-/// validate rolled bits, so such shares already reach Core.
-///
-/// It does NOT prove Core never warns about unknown soft forks: that warning
-/// is threshold-based over a retarget window, so one block only shows that
-/// a single such block raises nothing on its own.
+/// bitcoin-core accepts a block rolling the BIP-323-only bits and stores them;
+/// this gates widening the advertised `version-rolling.mask`. One block cannot
+/// trip the threshold-based unknown-softfork warning, so that is not proven.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::print_stderr)]
 async fn sv2_block_rolling_bip323_version_bits_is_accepted_by_bitcoin_core() {
     run_block_submit_case(8, BIP323_ONLY_VERSION_BITS, true).await;
 }
 
-/// A miner's rolling lands the header version **below the consensus
-/// floor**, and bitcoin-core rejects the block with `bad-version`.
-///
-/// With this harness's template version of `0x20000000`, rolling bit 31
-/// yields `0xA0000000` — negative as an `i32`, so below
-/// `bp_mining_job::MIN_CONSENSUS_BLOCK_VERSION`.
-///
-/// Backs the `scope="unsubmittable"` metric bucket: the share is valid
-/// proof-of-work and the pool **accepts** it (asserted below), while
-/// `TdpHandle::submit_solution` is fire-and-forget, so such a block is lost
-/// without anything reporting it.
-///
-/// ⚠️ The rule is about the **resulting version**, not about which bits
-/// were rolled; see `sv2_block_rolling_bit_30_stays_submittable`.
+/// Rolling bit 31 makes the version negative as an `i32`, below the consensus
+/// floor: the pool accepts the share, core rejects the block `bad-version`.
+/// Backs the `scope="unsubmittable"` metric, since the fire-and-forget submit
+/// would lose such a block silently.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::print_stderr)]
 async fn sv2_block_below_consensus_version_floor_is_rejected_by_bitcoin_core() {
     run_block_submit_case(8, 1 << 31, false).await;
 }
 
-/// Rolling bit 30 against this template yields `0x60000000`, a positive
-/// version, and bitcoin-core **accepts** the block. Pins that
-/// submittability cannot be classified from the rolled bits alone.
+/// Rolling bit 30 keeps the version positive and core accepts the block:
+/// submittability depends on the resulting version, not the rolled bits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::print_stderr)]
 async fn sv2_block_rolling_bit_30_stays_submittable() {
     run_block_submit_case(8, 1 << 30, true).await;
 }
 
-/// `rolled_version_bits` is XOR'd into the template version to form the
-/// header version the miner submits — i.e. exactly the `version_mask` that
-/// `validate_submit_extended` derives. `0` means no version rolling.
-///
-/// `expect_block_accepted` selects which half of the assertion set runs:
-/// the tip must rise and keep the rolled bits, or the tip must stay put
-/// while the node proves it is still willing to accept blocks.
+/// `rolled_version_bits` is XOR'd into the template version (`0` = no rolling).
+/// `expect_block_accepted`: the tip rises and keeps the bits, or it stays put
+/// while the node proves it still accepts blocks.
 async fn run_block_submit_case(
     miner_extranonce_size: u8,
     rolled_version_bits: u32,
@@ -126,7 +89,6 @@ async fn run_block_submit_case(
 ) {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
-        // `tracing::warn!` rather than a print, to satisfy clippy's print lints.
         tracing::warn!(
             reason = %cfg.unavailable_reason(),
             "skipping SV2 Extended block-submit regtest"
@@ -163,10 +125,7 @@ async fn run_block_submit_case(
     let (template, prev_hash) = wait_for_paired_template(&mut rx).await;
 
     // ── Build the per-channel MiningJob the pool would issue ────────
-    //
-    // The Extended channel's total extranonce is
-    // `extranonce_prefix.len + miner_extranonce_size`, and the mining job is
-    // built with exactly that slot size in the scriptSig.
+    // Its scriptSig slot is `extranonce_prefix.len + miner_extranonce_size`.
     let extranonce_prefix: Vec<u8> = vec![0xC0, 0xDE, 0xBA, 0xBE];
     let channel_id: u32 = 1;
     let job_id: u32 = 1;
@@ -235,11 +194,8 @@ async fn run_block_submit_case(
     channel.extended_jobs.insert(job_id, ext_job.clone());
 
     // ── Brute-force a nonce against the regtest target ───────────────
-    //
-    // The miner reconstructs the coinbase as
-    //   tx_prefix + channel.extranonce_prefix + miner_extranonce + tx_suffix
-    // so the brute-forced hash matches what `validate_submit_extended`
-    // computes.
+    // Over the coinbase as the miner rebuilds it, so the hash matches what
+    // `validate_submit_extended` computes.
     let miner_extranonce: SmallVec<[u8; 16]> =
         SmallVec::from_iter(std::iter::repeat_n(0u8, miner_extranonce_size as usize));
     let mut miner_coinbase = Vec::with_capacity(
@@ -259,9 +215,7 @@ async fn run_block_submit_case(
     let header_version = template.version ^ rolled_version_bits;
 
     // Pin which side of the consensus floor this case is on, so the
-    // expectation is stated in terms of the rule core enforces. The
-    // validator takes `submission.version` verbatim; the accept branch reads
-    // the stored version back out of the chain.
+    // expectation is stated in terms of the rule core enforces.
     assert_eq!(
         version_meets_consensus_floor(header_version),
         expect_block_accepted,
@@ -336,11 +290,8 @@ async fn run_block_submit_case(
     .expect("submit_solution IPC call");
 
     // ── What bitcoin-core did with it ────────────────────────────────
-    //
-    // submit_solution is fire-and-forget, so the tip is its only signal.
-    // That proves acceptance but not a rejection *reason*, so the reject
-    // branch re-submits the identical block over `submitblock`, which
-    // answers with core's reason string.
+    // The tip shows acceptance but no rejection reason, so the reject branch
+    // re-submits the same block over `submitblock` to read core's reason.
     if !expect_block_accepted {
         // Same budget as the accept path, see `CORE_ACCEPT_BUDGET`.
         let reached = poll_for_height(&node, before_height + 1, CORE_ACCEPT_BUDGET).await;
@@ -407,10 +358,7 @@ async fn run_block_submit_case(
         assert_eq!(after, before_height + 1);
 
         // ── The version bits must have survived into the chain ───────
-        //
-        // If anything on the path replaced the header version with the
-        // template's, the block would still be accepted; this pins that the
-        // rolled bits reached the chain.
+        // A path that swapped in the template's version would still be accepted.
         let block_hash = node
             .rpc_call("getblockhash", json!([after]))
             .await
@@ -433,10 +381,7 @@ async fn run_block_submit_case(
         );
 
         // ── ...and core must not have flagged them ───────────────────
-        //
-        // One block cannot trip a threshold-based versionbits warning, so a
-        // clean result means only that a single such block raises nothing
-        // on its own.
+        // Only shows one such block raises nothing; the warning is threshold-based.
         let warnings = node
             .rpc_call("getblockchaininfo", json!([]))
             .await

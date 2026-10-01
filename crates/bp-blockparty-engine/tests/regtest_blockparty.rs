@@ -3,29 +3,10 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! E2E: what a Blockparty admin's coinbase pays at each party state, against
-//! a live bitcoin-core 31 regtest.
-//!
-//! A party moves DRAFT → CONFIRMING → READY, and the money question is
-//! different on either side of that line. Both tests here mine a real block
-//! and make bitcoin-core validate it, so neither can pass on a coinbase that
-//! only looks right:
-//!
-//!   * **READY** — [`blockparty_ready_party_pays_members_and_history_is_idempotent`]
-//!     takes the split from the live service, proves the outputs sum to the
-//!     reward exactly, and proves replaying `on_block_found` writes one
-//!     history row, not two.
-//!   * **CONFIRMING** — [`pending_party_admin_routes_block_to_pool_fee_accepted_by_core`]
-//!     proves the admin cannot pocket a full block reward before the members
-//!     sign off: the coinbase goes to the pool-fee address instead. Then it
-//!     confirms the member and proves the guard turns itself off — both
-//!     directions, so it cannot pass on a precondition that silently held.
-//!
-//! The two share `bp_test_support::mine_and_submit_payouts`: everything from
-//! "here are the payout entries" to "bitcoin-core extended the chain" is the
-//! same work, and the party state under test is the only thing that differs.
-//!
-//! Skipped (with a printed warning) when `bitcoin-node` / Postgres are absent.
+//! E2E regtest: what a Blockparty admin's coinbase pays before and after the
+//! party is ready, with bitcoin-core validating each mined block so a coinbase
+//! that only looks right cannot pass. Skipped when `bitcoin-node` or Postgres
+//! is absent.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,8 +24,7 @@ use bp_test_support::{
 };
 use sqlx::PgPool;
 
-/// Hook that returns a canned email for every address — the verified-
-/// email check is a cross-cut, not part of what these tests exercise.
+/// Every address has a verified email; the email gate is not under test.
 struct AllVerified;
 
 #[async_trait]
@@ -68,11 +48,8 @@ async fn blockparty_ready_party_pays_members_and_history_is_idempotent() {
         return;
     };
 
-    // ── Deterministic regtest addresses ──────────────────────────
-    //
-    // Distinct from the pending-guard test's: the two run in parallel as
-    // siblings in this binary and share one Postgres, so each owns its own
-    // rows and cleans only those.
+    // Distinct from the pending-guard test's: both run in parallel against
+    // one Postgres, so each cleans only its own rows.
     let addr_admin = deterministic_p2wpkh_regtest([0xa1; 32]);
     let addr_bob = deterministic_p2wpkh_regtest([0xb2; 32]);
     let addr_fee = deterministic_p2wpkh_regtest([0xfe; 32]);
@@ -234,8 +211,8 @@ async fn pending_party_admin_routes_block_to_pool_fee_accepted_by_core() {
     let (node, tdp, template, prev_hash) = boot_node_and_template(regtest_cfg).await;
     let payouts = vec![PayoutEntry {
         address: route.fee_address.into_inner(),
-        // The guard sends the whole block, so pay the template's own value
-        // rather than a hardcoded subsidy — anything else is `bad-cb-amount`.
+        // The template's own value, not a hardcoded subsidy, or core rejects
+        // it as `bad-cb-amount`.
         sats: template.coinbase_tx_value_remaining,
     }];
     let _ = mine_and_submit_payouts(

@@ -1,30 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Group management — pure logic for tokens, validators, lifecycle
-//! predicates, and status transitions.
-//!
-//! ## Scope
-//!
-//! Everything in this crate is **synchronous, side-effect-free, and
-//! database-unaware.** The service-wiring layer reads rows from PG,
-//! consults the validators here, and writes back.
-//!
-//! ## Modules
-//!
-//! - [`constants`] — bounds, TTLs, and threshold defaults.
-//! - [`token`] — admin-token + invitation-token generation, SHA-256
-//!   hashing, and constant-time verification.
-//! - [`group`] — group-name validation, [`group::MemberRole`],
-//!   active-threshold predicate, kick-eligibility check, round-reset
-//!   config validator.
-//! - [`invitation`] — invitation [`invitation::InvitationStatus`] /
-//!   [`invitation::InvitationKind`] enums and transition validators.
-//! - [`join_request`] — join-request [`join_request::JoinRequestStatus`]
-//!   enum, message validator, and staleness check.
-//!
-//! DB-coupled operations (group/member lifecycle, address lookup, expiry
-//! crons) and IANA timezone validation live in the service-wiring layer;
-//! this crate only enforces the timezone's non-empty shape.
+//! Group management pure logic: tokens, validators, lifecycle predicates
+//! and status transitions. Synchronous, side-effect-free and DB-unaware;
+//! DB work and IANA timezone validation live in the service layer, this
+//! crate only checks the timezone is non-empty.
 
 pub mod constants;
 pub mod group;

@@ -194,11 +194,8 @@ impl TelegramAdapter {
             return Ok(response);
         }
 
-        // Telegram returns JSON with `ok: false` + `description` +
-        // `error_code` on permanent failures. 401 = bad token,
-        // 403 = bot blocked by user (permanently invalid chat),
-        // 400 = bad request (often "chat not found" — also
-        // permanently invalid). Other codes are transient.
+        // 403 (bot blocked) and 400 (usually "chat not found") mean the chat
+        // is permanently invalid; 401 is a bad token; anything else is transient.
         let code = status.as_u16();
         let snippet = response
             .text()

@@ -1,27 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! End-to-end regtest for the SV1 job/template lifecycle wiring.
-//!
-//! The translator drives `JobRegistry::cleanup_for_tip` on every
-//! broadcast it emits. This test proves, against a real `bitcoin-node`
-//! chain tip, that the wiring produces the full ckpool-style lifecycle
-//! a real miner observes:
-//!
-//!   1. A share on the CURRENT job is accepted (`Active`).
-//!   2. After an on-chain block, a prompt share on the PREVIOUS job is
-//!      still accepted (`StaleCreditable` — inside the grace window).
-//!   3. Past the grace window the same job is rejected as stale
-//!      (wire code 21, reason "stale") — NOT silently credited.
-//!   4. A share on the current-tip job keeps working regardless.
-//!   5. Retired entries age out of the registry after retention — the
-//!      maps stay bounded across block changes instead of growing
-//!      monotonically.
-//!
-//! Grace/retention are shortened (1.5s / 3s) so the test observes the
-//! transitions without production-scale waits.
-//!
-//! Skipped (with a printed warning) when `bitcoin-node` is not installed
-//! at the host's default location or via `BITCOIN_NODE_PATH`.
+//! Regtest: across real block changes an old job is credited inside the
+//! grace window, rejected as stale (code 21) after it, and retired jobs age
+//! out so the registry stays bounded. Skipped when `bitcoin-node` is not
+//! installed.
 
 use std::time::Duration;
 
@@ -185,8 +167,6 @@ async fn sv1_job_lifecycle_stale_and_pruning_against_regtest() {
     );
 
     // ── 5. Aging bounds the registry across block changes ────────────
-    // Three more blocks → three more clean-jobs notifies (each registers
-    // a job + template row and retires the previous tip's).
     for _ in 0..3 {
         height = generate_and_assert_height(&node, height).await;
         let _ = wait_for_notify(&mut reader, true).await;
@@ -230,18 +210,15 @@ async fn sv1_job_lifecycle_stale_and_pruning_against_regtest() {
     node.shutdown().await.expect("regtest clean shutdown");
 }
 
-/// Mine one block and assert bitcoin-core's tip actually advanced —
-/// every lifecycle transition in this test is anchored to a real
-/// on-chain block, not a simulated broadcast.
+/// Mine one block and assert the tip actually advanced.
 async fn generate_and_assert_height(node: &RegtestNode, before: u32) -> u32 {
     let after = node.generate_to_self(1).await.expect("generate 1 block");
     assert_eq!(after, before + 1, "chain tip must advance by one");
     after
 }
 
-/// Read frames until a `mining.notify` arrives; when `require_clean` is
-/// set, skip refresh notifies until one with `clean_jobs = true` (a real
-/// block change) shows up. Returns `(job_id, ntime)`.
+/// `(job_id, ntime)` of the next notify; with `require_clean`, of the next
+/// `clean_jobs = true` one (a real block change).
 async fn wait_for_notify(
     reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
     require_clean: bool,

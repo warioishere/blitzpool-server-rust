@@ -16,8 +16,7 @@ use uuid::Uuid;
 
 const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
 
-/// Coinbase member ceiling — high enough to stay out of the way here.
-/// The cap itself is exercised in `group_service.rs`.
+/// Coinbase ceiling high enough to stay out of the way here.
 const TEST_COINBASE_CAP: u64 = 10_000;
 
 async fn connect_or_skip() -> Option<PgPool> {
@@ -74,8 +73,7 @@ async fn seed_verified_email(pool: &PgPool, address: &str, email: &str) {
     .expect("seed email");
 }
 
-/// Seed a verified signature ownership proof (no email) — the unified gate's
-/// second path.
+/// Seed a verified signature ownership proof without an email.
 async fn seed_signature_verified(pool: &PgPool, address: &str) {
     let now = 1_700_000_000_000_i64;
     sqlx::query(
@@ -224,8 +222,7 @@ async fn accept_open_invite_creates_member_via_signature() {
     let (group_svc, inv_svc) = build_services(pool.clone());
     let creator = format!("bc1qcr{}", Uuid::new_v4().simple());
     let joiner = format!("bc1qjoin{}", Uuid::new_v4().simple());
-    // NO verified email — only a signature ownership proof. The unified gate
-    // must still admit the joiner.
+    // No verified email, only a signature proof: must still be admitted.
     seed_signature_verified(&pool, &joiner).await;
     let g = group_svc
         .create_group(&format!("ojs-{}", Uuid::new_v4()), &creator)

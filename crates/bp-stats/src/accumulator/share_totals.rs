@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Lifetime share totals — per address (lands in `address_settings`) and
-//! per worker (lands in `worker_shares_entity`).
-//!
-//! Two independent buffers because the flush destinations are different
-//! tables.
+//! Lifetime share totals per address and per worker, in two buffers because
+//! they flush to different tables.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -44,17 +41,14 @@ impl ShareTotalsAccumulator {
 
     // ─── Hot path ────────────────────────────────────────────────────
 
-    /// Increment the per-address lifetime share-diff total.
     pub fn add_address(&self, address: AddressId, diff: f64) {
         self.address.lock().add(address, diff);
     }
 
-    /// Increment the per-worker lifetime share-diff total.
     pub fn add_worker(&self, key: WorkerKey, diff: f64) {
         self.worker.lock().add(key, diff);
     }
 
-    /// Convenience: increment both totals from a single share.
     pub fn add(&self, address: AddressId, client_name: String, diff: f64) {
         self.add_address(address.clone(), diff);
         self.add_worker(
@@ -86,7 +80,7 @@ impl ShareTotalsAccumulator {
 
     // ─── Maintenance ────────────────────────────────────────────────
 
-    /// Drop an address (and all its workers) — used on account deletion.
+    /// Drop an address and all its workers, on account deletion.
     pub fn forget_address(&self, address: &AddressId) {
         let mut addr = self.address.lock();
         addr.forget(address);

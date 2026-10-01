@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Uniform JSON error body for every endpoint.
-//!
-//! Response shape: `{"code": "string", "message": "human"}` plus an HTTP
-//! status code. The UI maps `code` to localised text, so the error code
-//! strings are kept stable for UI localisation.
+//! Uniform JSON error body `{"code", "message"}` for every endpoint. The UI
+//! maps `code` to localised text, so the code strings must stay stable.
 
 use axum::{
     http::StatusCode,
@@ -103,19 +100,10 @@ impl ApiError {
     }
 }
 
-/// Serve the durable half of a response when the live store is merely
-/// unreachable.
-///
-/// The live session fields live in Redis and every one of these endpoints
-/// reads them; failing the whole document over one unavailable field would
-/// turn a Redis blip into a full read-API outage. So a transient fault
-/// falls back to "no live data" — the same state an evicted key produces —
-/// while the rest of the document is served.
-///
-/// [`bp_client_live::LiveReadError::NotConfigured`] is deliberately NOT
-/// degraded: that is a process without a Redis handle, i.e. a
-/// misconfiguration, and it has to fail loudly instead of quietly
-/// reporting a pool with no hashrate.
+/// Serve the durable half of a response when Redis is merely unreachable,
+/// so a Redis blip is not a full read-API outage. `NotConfigured` is NOT
+/// degraded: a process without a Redis handle is misconfigured and must fail
+/// loudly instead of reporting a pool with no hashrate.
 pub fn or_degraded<T>(
     result: Result<T, bp_client_live::LiveReadError>,
     fallback: impl FnOnce() -> T,
@@ -162,8 +150,6 @@ impl IntoResponse for ApiError {
 impl From<bp_group_mgmt_engine::GroupServiceError> for ApiError {
     fn from(e: bp_group_mgmt_engine::GroupServiceError) -> Self {
         use bp_group_mgmt_engine::GroupServiceError as G;
-        // Leak the &str — the wire-codes are static; this is a one-time
-        // conversion per request.
         let code: &'static str = match e.code() {
             "missing-token" => "missing-token",
             "not-found" => "not-found",
@@ -276,9 +262,7 @@ mod degrade_tests {
     use super::*;
     use bp_client_live::LiveReadError;
 
-    /// A process without a Redis handle is a misconfiguration, not a
-    /// blip: it must fail loudly rather than report a pool with no
-    /// hashrate.
+    /// A missing Redis handle fails loudly instead of degrading.
     #[test]
     fn a_missing_handle_is_not_degraded() {
         let out = or_degraded(Err::<f64, _>(LiveReadError::NotConfigured), || 0.0);
@@ -286,9 +270,7 @@ mod degrade_tests {
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    /// A transient fault serves the durable half instead of failing the
-    /// whole document — otherwise one unreachable field turns a Redis
-    /// blip into a full read-API outage.
+    /// A transient Redis fault serves the fallback instead of failing.
     #[test]
     fn transient_faults_serve_the_fallback() {
         let timeout = LiveReadError::Timeout(std::time::Duration::from_secs(5));

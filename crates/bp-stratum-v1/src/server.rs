@@ -1,34 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Server handle, TDP translator task, per-connection driver.
-//!
-//! Three pieces wired together:
-//!
-//! 1. **`StratumV1Server`** — the public handle. Holds the shared
-//!    [`ServerConfig`] + [`JobRegistry`] + [`ServerHooks`], owns the
-//!    translator task, exposes `accept_connection(socket, port_config)`
-//!    + `shutdown()`.
-//!
-//! 2. **Translator task** — consumes
-//!    [`bp_template_distribution::TemplateUpdate`] from a
-//!    `broadcast::Receiver` (= `TdpHandle::subscribe()` in production),
-//!    feeds them to a [`TemplateAssembler`], and re-broadcasts the
-//!    resulting `(ActiveSV1Template, TemplateChange)` pairs to every
-//!    per-connection task. Also maintains a `Mutex<Option<ActiveSV1Template>>`
-//!    snapshot so freshly-accepted connections can boot from the current
-//!    state without waiting for the next TDP update.
-//!
-//! 3. **Per-connection task** — owns the `TcpStream`, the
-//!    [`SessionState`], and a `broadcast::Receiver<TemplateBroadcast>`.
-//!    Drives the protocol via `tokio::select!` on four sources:
-//!    inbound line, template broadcast, vardiff-check timer, cancel
-//!    token. Each iteration translates the resulting [`HandlerOutcome`]
-//!    into socket writes + hook calls.
-//!
-//! All three pieces share a single [`CancellationToken`] — `shutdown()`
-//! cancels the token, the translator + all connections notice on their
-//! next `select`, drop their writers (the FIN goes out on socket-close),
-//! and exit.
+//! SV1 server: a translator task per template stream turns TDP updates into
+//! [`ActiveSV1Template`] broadcasts plus a snapshot for new connections, and one
+//! task per connection drives its [`SessionState`]. One [`CancellationToken`]
+//! stops them all.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -41,11 +16,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
-/// Hard cap on a single Stratum-V1 line (newline-delimited JSON-RPC).
-/// Real requests are well under 1 KiB (the largest is a `mining.configure`
-/// with version-rolling); 16 KiB leaves ample headroom for any legitimate
-/// miner while bounding the read buffer per connection. On overflow only
-/// that connection is dropped.
+/// Bounds the per-connection read buffer; real requests stay well under 1 KiB.
+/// On overflow only that connection is dropped.
 const MAX_STRATUM_LINE_BYTES: usize = 16 * 1024;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -64,25 +36,16 @@ use bp_mining_job::{MiningJobCache, ResolvedPayouts};
 use bp_template_distribution::{TemplateAssembler, TemplateChange};
 use bp_vardiff::{Clock, SystemClock};
 
-/// Pool-wide (across every SV1 port) collision-free extranonce1 allocator
-/// plus its per-connection key counter. Constructed once by the binary
-/// and shared into every [`StratumV1Server`] so two miners — even on
-/// different ports — can never be handed the same extranonce1.
-///
-/// Cheap to clone. Each connection calls
-/// [`allocate`](Self::allocate) exactly once at accept time; the returned
-/// `PrefixGuard` releases the prefix back to the pool when the
-/// connection task ends (any exit path — EOF, cancel, IO error).
+/// Extranonce1 allocator shared by every SV1 port, so two miners, even on
+/// different ports, never get the same extranonce1.
 #[derive(Clone)]
 pub struct SharedExtranonce {
-    /// One key per connection: SV1 holds exactly one prefix per connection.
     shared: SharedExtranonceAllocator,
 }
 
 impl SharedExtranonce {
-    /// Build a fresh SV1 allocator on [`bp_common::extranonce::SV1_WORKER_ID`]
-    /// (disjoint from SV2's worker 0). Call once in the binary and clone
-    /// into every port.
+    /// On [`bp_common::extranonce::SV1_WORKER_ID`], disjoint from SV2's partition.
+    /// Build once and clone into every port.
     pub fn new() -> Self {
         Self {
             shared: SharedExtranonceAllocator::new_default_on_worker(
@@ -91,11 +54,7 @@ impl SharedExtranonce {
         }
     }
 
-    /// Allocate a pool-wide-unique 4-byte extranonce1. The returned guard
-    /// releases the prefix on drop, covering every connection-exit path.
-    /// `PrefixGuard::prefix` is `None` only when the (16.7M-slot) space
-    /// is exhausted — the caller then keeps the session-id-derived
-    /// extranonce1.
+    /// The guard releases the prefix on drop, covering every connection-exit path.
     pub fn allocate(&self) -> PrefixGuard {
         let key = self.shared.next_key();
         let prefix = self.shared.allocate(key).ok();
@@ -106,8 +65,6 @@ impl SharedExtranonce {
         }
     }
 
-    /// Number of extranonce1 prefixes currently checked out (one per live
-    /// connection). Exposed for tests + potential metrics.
     pub fn allocated_count(&self) -> usize {
         self.shared.allocated_count()
     }
@@ -119,8 +76,7 @@ impl Default for SharedExtranonce {
     }
 }
 
-/// RAII claim on one extranonce1 prefix. Dropping it returns the prefix
-/// to the shared allocator (idempotent for the exhausted/`None` case).
+/// Claim on one extranonce1 prefix, returned to the allocator on drop.
 pub struct PrefixGuard {
     key: u64,
     prefix: Option<[u8; 4]>,
@@ -128,8 +84,8 @@ pub struct PrefixGuard {
 }
 
 impl PrefixGuard {
-    /// The allocated prefix, or `None` when the partition was exhausted
-    /// (caller falls back to the session-id-derived extranonce1).
+    /// `None` when the partition is exhausted; the caller then keeps the
+    /// session-id-derived extranonce1.
     pub fn prefix(&self) -> Option<[u8; 4]> {
         self.prefix
     }
@@ -144,24 +100,15 @@ impl Drop for PrefixGuard {
 /// Broadcast payload from translator → per-connection tasks.
 #[derive(Clone, Debug)]
 pub(crate) struct TemplateBroadcast {
-    /// `Arc` so the tokio broadcast channel hands each of the N connected
-    /// sessions a refcount bump rather than a full deep copy of the
-    /// template (merkle path + hex branches + coinbase buffers) on every
-    /// NewBlock/Refresh.
+    /// `Arc` so each connected session gets a refcount bump, not a deep copy.
     pub template: Arc<ActiveSV1Template>,
     pub change: TemplateChange,
 }
 
-/// Capacity for the translator → connection broadcast channel. Lagged
-/// subscribers receive `broadcast::error::RecvError::Lagged` and the
-/// per-connection task treats it as "use the snapshot on next loop". The
-/// default `32` is well above the expected drift between TDP arrival
-/// and the per-connection select firing.
+/// A lagged connection skips the missed broadcasts and continues with the next one.
 const TEMPLATE_BROADCAST_CAPACITY: usize = 32;
 
-/// Public handle for the server. Cheap to clone (internal `Arc`); the
-/// last clone holds the translator task's `JoinHandle`. Calling
-/// [`Self::shutdown`] is the only way to stop the translator cleanly.
+/// Cheap to clone. [`Self::shutdown`] is the only clean way to stop the translators.
 #[derive(Clone)]
 pub struct StratumV1Server {
     inner: Arc<Inner>,
@@ -171,61 +118,36 @@ struct Inner {
     server_config: Arc<ServerConfig>,
     registry: Arc<JobRegistry>,
     hooks: ServerHooks,
-    // PPLNS stream (PPLNS-autoscaled reservation) — every connection boots
-    // here before its payout mode is resolved.
+    // PPLNS stream: every connection boots here before its payout mode resolves.
     template_tx: broadcast::Sender<TemplateBroadcast>,
     current_template: Arc<Mutex<Option<Arc<ActiveSV1Template>>>>,
-    // Fixed-reservation alt streams (Solo / GroupSolo / Blockparty) keyed by
-    // StreamKind — a connection switches onto one at `mining.authorize` when
-    // its address resolves to that mode. Each is fed by its own translator off
-    // the matching TDP handle.
+    // Fixed-reservation streams; a connection switches onto one at
+    // `mining.authorize` when its address resolves to that mode.
     alt_streams: HashMap<StreamKind, AltStream>,
-    /// Pool-wide extranonce1 allocator, shared across every SV1 port so
-    /// no two connections are ever handed the same prefix.
     extranonce: SharedExtranonce,
-    /// Pool-wide memoization of built `MiningJob`s, shared across every
-    /// SV1 port (the ports ride the same TDP streams, so their templates
-    /// — and thus cache keys — are identical). One PPLNS coinbase build
-    /// per template instead of one per connection.
+    /// Shared across ports: they ride the same TDP streams, so cache keys match
+    /// and a coinbase is built once per template, not once per connection.
     job_cache: Arc<MiningJobCache>,
     cancel: CancellationToken,
     translator_join: Mutex<Option<JoinHandle<()>>>,
     alt_translator_joins: Mutex<Vec<JoinHandle<()>>>,
 }
 
-/// One fixed-reservation alt template stream: the broadcast sender per-connection
-/// tasks subscribe to + the current-template snapshot a freshly-routed connection
-/// boots from. Mirrors the PPLNS stream's `template_tx` / `current_template`.
 struct AltStream {
     template_tx: broadcast::Sender<TemplateBroadcast>,
     current_template: Arc<Mutex<Option<Arc<ActiveSV1Template>>>>,
 }
 
-/// A single connection's claim on one alt stream — its own broadcast receiver
-/// plus the snapshot to boot from. The per-connection task holds a
-/// `HashMap<StreamKind, AltStreamHandle>` and `remove`s the matching entry when
-/// it swaps onto that stream.
+/// One connection's receiver plus boot snapshot for an alt stream.
 struct AltStreamHandle {
     rx: broadcast::Receiver<TemplateBroadcast>,
     initial: Option<Arc<ActiveSV1Template>>,
 }
 
 impl StratumV1Server {
-    /// Spawn the server. `updates_rx` is typically
-    /// `tdp_handle.subscribe()`; the translator drives an internal
-    /// [`TemplateAssembler`] and re-broadcasts pair-completed
-    /// templates.
-    ///
-    /// `initial_snapshot` should be the result of
-    /// `tdp_handle.current_snapshot()` taken right around the same time
-    /// as `subscribe()`. The translator applies it to its assembler
-    /// before entering the main loop so the very first connection sees
-    /// a non-empty `current_template` even when the bitcoin-core
-    /// bootstrap pair was sent before the broadcast subscription
-    /// existed (subscribe-after-send race).
-    ///
-    /// Returns immediately — the translator runs on a Tokio task tied to
-    /// the shared cancel token.
+    /// `initial_snapshot` is taken alongside `subscribe()` and seeds the assembler,
+    /// because bitcoin-core's bootstrap pair may have gone out before the
+    /// subscription existed.
     pub fn spawn(
         server_config: ServerConfig,
         updates_rx: broadcast::Receiver<TemplateUpdate>,
@@ -254,10 +176,8 @@ impl StratumV1Server {
             job_cache.clone(),
             cancel.clone(),
         ));
-        // One translator per alt stream, each off its own TDP handle.
-        // They all drive the SAME shared registry's lifecycle — safe
-        // because `cleanup_for_tip` is prev-hash-conditioned and thus
-        // order-independent across streams.
+        // All translators drive the same registry; safe because `cleanup_for_tip`
+        // is keyed on prev-hash and thus order-independent across streams.
         let mut alt_map = HashMap::with_capacity(alt_streams.len());
         let mut alt_joins = Vec::with_capacity(alt_streams.len());
         for (kind, alt_updates_rx, alt_initial_snapshot) in alt_streams {
@@ -302,10 +222,8 @@ impl StratumV1Server {
         &self.inner.registry
     }
 
-    /// Snapshot of the latest assembled template, or `None` if the
-    /// translator hasn't paired a `NewTemplate` + `SetNewPrevHash` yet.
-    /// Lets a caller gate accepting connections on a non-empty snapshot so
-    /// every new miner receives a `mining.notify` right after handshake.
+    /// Lets a caller gate accepting connections on a template being ready, so
+    /// every new miner gets a `mining.notify` right after the handshake.
     pub fn current_template(&self) -> Option<Arc<ActiveSV1Template>> {
         self.inner
             .current_template
@@ -314,12 +232,6 @@ impl StratumV1Server {
             .clone()
     }
 
-    /// Spawn a per-connection task. Returns once the task is scheduled;
-    /// the connection runs until the socket closes, the cancel token
-    /// fires, or the session signals `Disconnect`.
-    ///
-    /// The TCP-accept loop in `bin/blitzpool` calls this for each socket
-    /// its first-byte detection has classified as SV1.
     pub fn accept_connection(&self, socket: TcpStream, port_config: PortConfig) -> JoinHandle<()> {
         let server_config = self.inner.server_config.clone();
         let registry = self.inner.registry.clone();
@@ -331,9 +243,6 @@ impl StratumV1Server {
             .lock()
             .expect("current_template mutex poisoned")
             .clone();
-        // Per-connection handle on every alt stream: a fresh broadcast
-        // subscription + the current-template snapshot. The connection swaps
-        // onto exactly one of these (if any) once its mode resolves.
         let alt_streams: HashMap<StreamKind, AltStreamHandle> = self
             .inner
             .alt_streams
@@ -367,12 +276,7 @@ impl StratumV1Server {
         ))
     }
 
-    /// Cancel the translator + every running connection. Idempotent.
-    /// Waits for the translator to finish on the first call; later
-    /// calls are no-ops.
-    ///
-    /// Connections drop their writers on cancel — the FIN goes out via
-    /// the normal `TcpStream::shutdown` path.
+    /// Cancels translators and connections; idempotent.
     pub async fn shutdown(&self) {
         self.inner.cancel.cancel();
         let handle = self
@@ -403,13 +307,6 @@ impl StratumV1Server {
 
 // ── Translator task ──────────────────────────────────────────────────
 
-/// Consume TDP updates, feed a `TemplateAssembler`, and re-broadcast
-/// the resulting `(template, change)` pairs. Maintains
-/// `current_template` so freshly-accepted connections can boot from the
-/// most recent state without waiting for the next TDP message.
-///
-/// Exits cleanly on `cancel` OR when `updates_rx` closes (= upstream
-/// `TdpHandle` dropped).
 async fn run_translator(
     mut updates_rx: broadcast::Receiver<TemplateUpdate>,
     initial_snapshot: bp_template_distribution::TemplateSnapshot,
@@ -421,14 +318,9 @@ async fn run_translator(
 ) {
     let mut assembler = TemplateAssembler::<ActiveSV1Template>::new();
 
-    // Bootstrap the assembler from the TdpHandle snapshot. The handle's
-    // internal tap catches bitcoin-core's startup NewTemplate +
-    // SetNewPrevHash pair, which this broadcast subscriber usually misses
-    // because the pair goes out before it is installed. Without the
-    // bootstrap, current_template stays None until the next block.
+    // Without this, current_template stays None until the next block: the
+    // startup pair usually goes out before this subscriber exists.
     if let Some((active, change)) = assembler.bootstrap_from_snapshot(initial_snapshot) {
-        // Wrap once; the snapshot store and every broadcast subscriber
-        // then share this allocation via Arc refcounting.
         let active = Arc::new(active);
         {
             let mut guard = current_template
@@ -436,8 +328,6 @@ async fn run_translator(
                 .expect("current_template mutex poisoned");
             *guard = Some(active.clone());
         }
-        // Registry lifecycle (no-op on the empty boot registry; kept for
-        // symmetry with the loop below).
         registry.cleanup_for_tip(&active.prev_hash, SystemClock.now_ms());
         let _ = template_tx.send(TemplateBroadcast {
             template: active,
@@ -455,10 +345,7 @@ async fn run_translator(
                 let update = match update {
                     Ok(u) => u,
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        // Lagging the upstream channel means something
-                        // upstream is malfunctioning. Logged + recovered:
-                        // the next NewTemplate/SetNewPrevHash pair gets
-                        // through.
+                        // Recovers with the next NewTemplate/SetNewPrevHash pair.
                         warn!("sv1 translator lagged {n} TDP updates");
                         continue;
                     }
@@ -470,32 +357,19 @@ async fn run_translator(
                 if let Some(change) = assembler.apply(&update) {
                     if let Some(active) = assembler.current().cloned() {
                         let active = Arc::new(active);
-                        // Update the snapshot under the lock and drop it
-                        // BEFORE the broadcast send, so the mutex is never
-                        // held across an await point.
                         {
                             let mut guard = current_template
                                 .lock()
                                 .expect("current_template mutex poisoned");
                             *guard = Some(active.clone());
                         }
-                        // Registry lifecycle, BEFORE the send so a fast
-                        // subscriber can't register a job that a
-                        // trailing pass would then race. On a block
-                        // change this retires every previous-tip entry
-                        // (their shares classify stale from here on);
-                        // on a refresh (same tip) it only ages retired
-                        // entries out past retention. This is what keeps
-                        // the registry bounded.
+                        // Before the send, so a fast subscriber's new job is
+                        // never raced by a trailing pass. This keeps the registry bounded.
                         registry.cleanup_for_tip(&active.prev_hash, SystemClock.now_ms());
-                        // Job-cache aging heartbeat: prune also runs on
-                        // lookups, but the translator fires even when no
-                        // miner is connected, so stale entries do not sit
-                        // in RAM until the next lookup.
+                        // Runs even with no miner connected, so stale entries
+                        // do not wait for the next lookup.
                         job_cache.prune_expired();
-                        // Broadcast::send errors only when there are no
-                        // subscribers; freshly-accepted connections pick
-                        // up the snapshot.
+                        // Errors only without subscribers; new connections use the snapshot.
                         let _ = template_tx.send(TemplateBroadcast {
                             template: active,
                             change,
@@ -509,16 +383,9 @@ async fn run_translator(
 
 // ── Per-connection task ──────────────────────────────────────────────
 
-/// Drive a single SV1 connection from accept-to-close. Uses
-/// [`SystemClock`] in production; tests drive the pure handlers
-/// directly via `client::dispatch`.
-///
-/// Returns nothing on purpose. Every route out of the loop below has to
-/// reach the teardown at the end — a session that exits without
-/// `deregister_session` stays in the front's live-session set for the
-/// life of the process, and the device can never be reported offline
-/// again. With no error type, a `?` that would skip the teardown does not
-/// compile.
+/// Returns nothing on purpose: every exit must reach the teardown, or the session
+/// stays in the live-session set and the device is never reported offline. With
+/// no error type, a `?` that would skip it does not compile.
 #[allow(clippy::too_many_arguments)]
 async fn run_connection(
     server_config: Arc<ServerConfig>,
@@ -534,8 +401,7 @@ async fn run_connection(
     job_cache: Arc<MiningJobCache>,
 ) {
     let (read_half, mut write_half) = socket.into_split();
-    // Length-capped line framing: a peer that never sends a newline cannot
-    // grow the read buffer without bound (see MAX_STRATUM_LINE_BYTES).
+    // A peer that never sends a newline cannot grow the buffer without bound.
     let mut lines = FramedRead::new(
         read_half,
         LinesCodec::new_with_max_length(MAX_STRATUM_LINE_BYTES),
@@ -547,11 +413,8 @@ async fn run_connection(
         &port_config,
         random_session_id_hex(),
     );
-    // Assign a pool-wide collision-free extranonce1 from the shared
-    // allocator, separate from the random session id (which stays the
-    // identity for UI / DB / device notifications). The guard releases the
-    // prefix when this task ends, on every exit path. If the partition is
-    // exhausted, the session-id-derived extranonce1 stays.
+    // Extranonce1 is allocated separately from the random session id, which
+    // stays the identity for UI, DB and device notifications.
     let extranonce_guard = extranonce.allocate();
     match extranonce_guard.prefix() {
         Some(prefix) => state.extranonce1 = prefix,
@@ -562,16 +425,12 @@ async fn run_connection(
         ),
     }
     let mut current_template = initial_template;
-    // `alt_streams` holds one receiver+snapshot per fixed-reservation stream;
-    // at `mining.authorize` the connection `remove`s the entry for its resolved
-    // mode (if any) and swaps `template_rx`/`current_template` onto it.
 
     let mut vardiff_tick = tokio::time::interval(std::time::Duration::from_millis(
         server_config.difficulty_check_interval_ms,
     ));
     vardiff_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Skip the first immediate tick — wait a full interval before the
-    // first vardiff check.
+    // Wait a full interval before the first vardiff check.
     vardiff_tick.tick().await;
 
     loop {
@@ -579,10 +438,6 @@ async fn run_connection(
             biased;
             _ = cancel.cancelled() => break,
             frame = lines.next() => {
-                // Map the codec item back to the `io::Result<Option<String>>`
-                // shape the rest of the loop expects. An over-length line is
-                // not an IO error — it's a misbehaving/garbage peer, so drop
-                // just this connection rather than propagating.
                 let line: std::io::Result<Option<String>> = match frame {
                     Some(Ok(l)) => Ok(Some(l)),
                     Some(Err(LinesCodecError::MaxLineLengthExceeded)) => {
@@ -598,11 +453,8 @@ async fn run_connection(
                 };
                 let line = match line {
                     Ok(line) => line,
-                    // A miner that vanishes without closing — power cut,
-                    // yanked cable, NAT timeout — resets the connection,
-                    // and the read fails rather than reporting EOF. That
-                    // is a normal way for a session to end, not a reason
-                    // to skip the teardown below.
+                    // A vanished miner resets the connection instead of EOF;
+                    // a normal end, which must still reach the teardown.
                     Err(err) => {
                         debug!(
                             session_id = %state.session_id_hex,
@@ -615,13 +467,8 @@ async fn run_connection(
                 match line {
                     None => break,                       // EOF
                     Some(line) => {
-                        // Mark when the inbound line became available — used to
-                        // measure pool-internal submit→ack latency (gated by
-                        // `log_submit_latency`, emitted after the response write).
                         let recv_at = std::time::Instant::now();
                         if server_config.protocol_debug {
-                            // Received JSON-RPC line dump, at DEBUG (not
-                            // INFO) under the protocol_debug gate.
                             debug!(
                                 session_id = %state.session_id_hex,
                                 "📨 RX: {line}"
@@ -637,27 +484,19 @@ async fn run_connection(
                             &line,
                             now,
                         );
-                        // One-time stream routing at `mining.authorize`: resolve
-                        // the address's payout mode → template stream. A non-PPLNS
-                        // connection swaps onto its fixed-reservation stream BEFORE
-                        // the first `mining.notify` is built in apply_outcome below,
-                        // so its very first job already rides the right template.
-                        // `state.stream` is set ONLY when the swap succeeds, so the
-                        // block-submit handle (driven by `state.stream`) can never
-                        // route to a stream whose template_id the job doesn't carry.
+                        // Stream routing happens before the first `mining.notify`, so the
+                        // first job rides the right template. `state.stream` is set only
+                        // on a successful swap, so block submit never targets a stream
+                        // whose template_id the job does not carry.
                         if outcome
                             .events
                             .iter()
                             .any(|e| matches!(e, SessionEvent::Authorized { .. }))
                         {
-                            // Publish the address's mode into the mode-gate
-                            // BEFORE the one-time stream routing below.
-                            // `resolve_stream` reads the gate, so the publish
-                            // must precede it — otherwise the lookup misses and
-                            // the connection defaults to the Solo stream
-                            // regardless of port / group membership.
-                            // `apply_outcome` does not register again (that
-                            // would double the gate refcount).
+                            // Register before routing: `resolve_stream` reads the
+                            // mode-gate this publishes, and would otherwise default to
+                            // Solo. `apply_outcome` must not register again (double
+                            // gate refcount).
                             let authd = state.authorization.as_ref().map(|auth| {
                                 (
                                     auth.address.clone(),
@@ -697,9 +536,6 @@ async fn run_connection(
                                             );
                                         }
                                     } else {
-                                        // PPLNS resolves to the boot stream → no
-                                        // swap. Logged for symmetry so PPLNS
-                                        // routing is visible too.
                                         debug!(
                                             session_id = %state.session_id_hex,
                                             stream = resolved.as_label(),
@@ -709,16 +545,13 @@ async fn run_connection(
                                 }
                             }
                         }
-                        // Fire apply_vardiff_check immediately when an accepted
-                        // share is at the current session difficulty and the
-                        // cooldown has elapsed — not just on the 60s timer tick.
+                        // Retarget inline once the cooldown has elapsed, not only
+                        // on the timer tick.
                         let run_inline_vardiff = outcome.events.iter().any(|e| {
                             matches!(e, SessionEvent::ShareAccepted(a)
                                 if a.effective_difficulty == state.session_difficulty)
                         }) && now.saturating_sub(state.last_difficulty_check_ms)
                             >= server_config.difficulty_check_interval_ms;
-                        // Did this line carry a share submit? (Yields an
-                        // accept/reject event.) Decides whether to log latency.
                         let was_submit = outcome.events.iter().any(|e| {
                             matches!(
                                 e,
@@ -740,10 +573,7 @@ async fn run_connection(
                         {
                             break;
                         }
-                        // Pool-internal submit→ack latency: from the inbound
-                        // mining.submit line being read to its response being
-                        // written (incl. validate). Isolates pool processing
-                        // from network / miner / measurement.
+                        // From line read to response written: pool processing only.
                         if server_config.log_submit_latency && was_submit {
                             info!(
                                 session_id = %state.session_id_hex,
@@ -782,10 +612,8 @@ async fn run_connection(
                                 break;
                             }
                         }
-                        // diag: full processing time of this line, including
-                        // the inline vardiff retarget that `latency_us` does
-                        // not cover. A large value blocked the loop and
-                        // delays the next line's read.
+                        // Includes the inline retarget; a large value delays the
+                        // next line's read.
                         if server_config.log_submit_latency && was_submit {
                             let iter_us = recv_at.elapsed().as_micros();
                             if iter_us >= 50_000 {
@@ -803,18 +631,12 @@ async fn run_connection(
                 let payload = match broadcast {
                     Ok(p) => p,
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Drained at next iteration via the snapshot
-                        // (current_template is updated continuously by
-                        // the translator).
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
                 current_template = Some(payload.template.clone());
                 let clean_jobs = matches!(payload.change, TemplateChange::NewBlock);
-                // Async-resolve payouts BEFORE calling apply_new_template
-                // so the per-template MiningJob carries the correct
-                // mode-aware coinbase distribution.
                 let payouts = resolve_payouts_for_state(&state, &hooks, &payload.template).await;
                 let outcome = apply_new_template(
                     &mut state,
@@ -844,9 +666,7 @@ async fn run_connection(
                 }
             }
             _ = vardiff_tick.tick() => {
-                // Resolve payouts once for the tick. The handler only builds
-                // a notify when the diff actually ratchets, but the resolver
-                // is cheap and keeps the handler synchronous.
+                // Resolved even if no ratchet follows: cheap, and keeps the handler synchronous.
                 let payouts = match current_template.as_deref() {
                     Some(t) => resolve_payouts_for_state(&state, &hooks, t).await,
                     None => ResolvedPayouts::unsnapshotted(vec![]),
@@ -880,27 +700,16 @@ async fn run_connection(
         }
     }
 
-    // Best-effort cleanup. `deregister_session` covers the device-offline
-    // notification + the `client` row delete on teardown.
     hooks
         .session_persistence
         .deregister_session(&state.session_id_hex)
         .await;
-    // Half-close the socket so the miner sees a FIN.
     let _ = write_half.shutdown().await;
 }
 
-/// Flush outbound frames + process events. Returns `false` when the
-/// session has signaled disconnect **or** when the socket can no longer
-/// be written — both mean the connection is over, and the caller breaks
-/// the loop either way.
-///
-/// On `SessionEvent::Authorized` this also async-resolves payouts
-/// for the freshly-authorized address against the current template
-/// and re-fires [`apply_new_template`] so the miner immediately
-/// receives a `mining.notify` with the correct per-mode coinbase
-/// distribution. This keeps the async hook call out of the synchronous
-/// handler layer.
+/// `false` when the session disconnected or the socket is gone. On `Authorized`
+/// it resolves payouts and re-fires [`apply_new_template`] here, keeping the
+/// async hook call out of the synchronous handler layer.
 #[allow(clippy::too_many_arguments)]
 async fn apply_outcome(
     outcome: HandlerOutcome,
@@ -915,10 +724,6 @@ async fn apply_outcome(
 ) -> bool {
     for frame in &outcome.outbound_frames {
         if server_config.protocol_debug {
-            // Outbound JSON-RPC line dump (mining.notify,
-            // mining.set_difficulty, share-accept/reject responses,
-            // vardiff ratchet, etc.). The trailing `\n` is part of
-            // the wire frame; trim it for a tidy log line.
             let pretty = trim_trailing_newline(frame);
             debug!(
                 session_id = %state.session_id_hex,
@@ -936,9 +741,7 @@ async fn apply_outcome(
             keep_alive = false;
         }
         if is_authorized {
-            // Post-authorize: deliver the first mining.notify with the
-            // resolved payouts. Without a `current_template` yet, the next
-            // template-broadcast arm fires the same path.
+            // Without a template yet, the next broadcast delivers the first notify.
             if let Some(template) = current_template {
                 let payouts = resolve_payouts_for_state(state, hooks, template).await;
                 let post = apply_new_template(
@@ -964,8 +767,7 @@ async fn apply_outcome(
                         return false;
                     }
                 }
-                // `apply_new_template` doesn't currently emit session
-                // events; if that changes, propagate them here.
+                // If `apply_new_template` ever emits events, propagate them here.
                 debug_assert!(post.events.is_empty());
             }
         }
@@ -973,14 +775,8 @@ async fn apply_outcome(
     keep_alive
 }
 
-/// Write one frame, reporting `true` when the socket is gone.
-///
-/// A failed write means the peer is no longer reachable, which is the
-/// same thing as the session ending — so it is folded into
-/// [`apply_outcome`]'s "keep alive?" answer rather than propagated. The
-/// connection loop must reach its teardown on this path: a session that
-/// exits without deregistering stays in the live-session set forever,
-/// and the device can never be reported offline again.
+/// `true` when the socket is gone. Folded into [`apply_outcome`]'s answer, not
+/// propagated, so the connection loop still reaches its teardown.
 async fn write_failed(
     write_half: &mut tokio::net::tcp::OwnedWriteHalf,
     frame: &[u8],
@@ -995,9 +791,7 @@ async fn write_failed(
     }
 }
 
-/// Async-resolve the coinbase payout list for the session's
-/// authorized address. Returns an empty list when the session is not
-/// yet authorized; callers MUST treat empty as "no notify".
+/// Empty before authorize; callers MUST treat empty as "no notify".
 async fn resolve_payouts_for_state<C: bp_vardiff::Clock>(
     state: &SessionState<C>,
     hooks: &ServerHooks,
@@ -1012,11 +806,7 @@ async fn resolve_payouts_for_state<C: bp_vardiff::Clock>(
         .await
 }
 
-/// Translate a [`SessionEvent`] into the relevant hook calls. Returns
-/// `false` on `Disconnect`.
-///
-/// Generic over the clock and free of any socket, so unit tests drive it
-/// with a `SessionState<Arc<TestClock>>` + recording hooks.
+/// Fans a [`SessionEvent`] out to the hooks; `false` on `Disconnect`.
 pub(crate) async fn process_event<C: bp_vardiff::Clock>(
     event: SessionEvent,
     state: &SessionState<C>,
@@ -1025,18 +815,13 @@ pub(crate) async fn process_event<C: bp_vardiff::Clock>(
     match event {
         SessionEvent::Subscribed => true,
         SessionEvent::DifficultyChanged => {
-            // Retarget counter. Without it the vardiff controller is
-            // invisible in production: nothing else on either protocol
-            // reports that a difficulty moved, so there is no way to tell a
-            // healthy session apart from one being walked up and down.
+            // The only signal on either protocol that a difficulty moved.
             bp_metrics::record_stratum_difficulty_adjustment();
             true
         }
         SessionEvent::Authorized { address, worker } => {
-            // `register_session` (mode-gate publish + client_entity write)
-            // runs in the connection loop's authorize block, BEFORE stream
-            // routing; here it would come too late and double the gate
-            // refcount. Only the device-online event is emitted here.
+            // `register_session` runs in the connection loop before stream
+            // routing; here it would be too late and double the gate refcount.
             let user_agent = state.subscription.as_ref().map(|s| s.user_agent.as_str());
             hooks
                 .device_status_sink
@@ -1108,9 +893,6 @@ pub(crate) async fn process_event<C: bp_vardiff::Clock>(
     }
 }
 
-/// Strip the trailing `\n` (and stray `\r`) from a JSON-RPC wire
-/// frame for log formatting. Falls back to lossy UTF-8 if the line
-/// isn't valid UTF-8 (handlers always emit UTF-8, but defensive).
 fn trim_trailing_newline(frame: &[u8]) -> std::borrow::Cow<'_, str> {
     let mut end = frame.len();
     while end > 0 && (frame[end - 1] == b'\n' || frame[end - 1] == b'\r') {
@@ -1123,15 +905,9 @@ fn trim_trailing_newline(frame: &[u8]) -> std::borrow::Cow<'_, str> {
 mod tests {
     use super::*;
 
-    /// The line-length cap drops only the offending peer: a legitimate
-    /// request decodes fine, while a peer that streams bytes without a
-    /// newline past the cap yields `MaxLineLengthExceeded` (mapped to a
-    /// disconnect in the connection loop) instead of growing the buffer
-    /// without bound.
+    /// Pins that an over-cap line errors while a normal one decodes.
     #[tokio::test]
     async fn line_codec_caps_oversized_lines_but_passes_normal_ones() {
-        // A normal subscribe line (well under the cap), then an over-length
-        // line: MAX_STRATUM_LINE_BYTES+1 non-newline bytes.
         let normal = br#"{"id":1,"method":"mining.subscribe","params":[]}"#;
         let mut input = Vec::new();
         input.extend_from_slice(normal);
@@ -1350,11 +1126,7 @@ mod tests {
             .unwrap();
     }
 
-    /// The translator drives the shared registry's lifecycle: a block
-    /// change retires previous-tip entries (→ stale classification), a
-    /// later same-tip pass (another stream's translator) never touches
-    /// fresh new-tip jobs. Pins the registry bound AND the multi-stream
-    /// order-independence.
+    /// Pins that a block change retires old-tip jobs and a later same-tip pass spares new ones.
     #[tokio::test]
     async fn translator_retires_previous_tip_entries_on_new_block() {
         use crate::jobs::JobClassification;
@@ -1410,8 +1182,7 @@ mod tests {
             "previous-tip job must be retired by the block-change broadcast"
         );
 
-        // A fresh job on the new tip survives a LATER same-tip pass (the
-        // race an unconditional retire would lose against alt streams).
+        // A fresh new-tip job survives a later same-tip pass.
         let tid2 = registry.add_template_shared(payload2.template.clone(), SystemClock.now_ms());
         let jid2 = registry.add_job(dummy_mining_job(), tid2, SystemClock.now_ms());
         registry.cleanup_for_tip(&payload2.template.prev_hash, SystemClock.now_ms());
@@ -1496,10 +1267,8 @@ mod tests {
 
     #[tokio::test]
     async fn authorize_event_fans_out_to_device_status() {
-        // `register_session` (mode-gate publish) runs in the connection
-        // loop's authorize block, BEFORE stream routing, so the Authorized
-        // arm here only emits the device-online event; registration is
-        // covered end-to-end by the connection-loop / regtest paths.
+        // Registration happens in the connection loop; this arm only emits
+        // the device-online event.
         let port = port_cfg();
         let state = fresh_state(&port);
         let rec = RecordingHooks::new();
@@ -1662,8 +1431,7 @@ mod tests {
         let g2 = ex.allocate();
         let p1 = g1.prefix().expect("first prefix allocated");
         let p2 = g2.prefix().expect("second prefix allocated");
-        // Both live in SV1's worker-1 partition (top byte 0x01) — never the
-        // SV2 worker-0 space — and are never equal to each other.
+        // Both in SV1's worker-1 partition, never SV2's, and distinct.
         assert_eq!(p1[0], 0x01, "SV1 prefix must start 0x01: {p1:?}");
         assert_eq!(p2[0], 0x01, "SV1 prefix must start 0x01: {p2:?}");
         assert_ne!(p1, p2, "two connections must never share extranonce1");
@@ -1684,10 +1452,7 @@ mod tests {
         );
     }
 
-    /// Two SV1 connections on the same server (one shared allocator) must
-    /// receive distinct extranonce1 values in their subscribe responses.
-    /// No bitcoin-core needed: the subscribe response is emitted
-    /// immediately after the handshake.
+    /// Pins distinct extranonce1 values in two connections' subscribe responses.
     #[tokio::test]
     async fn two_connections_get_distinct_worker1_extranonce1() {
         use tokio::net::TcpListener;

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! ntfy SSE listener.
-//!
-//! Subscribes to `GET {server}/{topics}/sse` (Server-Sent Events).
-//! Each message-event JSON carries `topic` + `message` + `tags`. The
-//! pool's own echo is ignored by checking `tags` for `"bot"` (the
-//! [`crate::adapter::NtfyAdapter`] sets `Tags: bot` on every outbound).
-//!
-//! The topic IS the user's mining address (after stripping the
-//! deployment-wide prefix), so the originating [`Transport::Ntfy`] is
-//! built directly from it.
+//! ntfy SSE listener on `GET {server}/{topics}/sse`. The pool's own echo is
+//! skipped via the `bot` tag [`crate::adapter::NtfyAdapter`] sets on every
+//! outbound. The topic (minus the prefix) IS the mining address, so it
+//! becomes the [`Transport::Ntfy`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,12 +43,10 @@ impl NtfyListenerConfig {
     }
 }
 
-/// Spawn the SSE listener loop. The topic set is read fresh from the DB
-/// on every (re)connect via [`find_addresses_for_ntfy_listener`] (active
-/// clients ∪ active ntfy subscriptions). `reconnect` lets the command
-/// handler force an immediate reconnect — it fires on an ntfy
-/// `/subscribe` or `/remove` so a newly subscribed topic is picked up at
-/// once instead of waiting for the next stream break.
+/// Spawn the SSE listener loop. Topics are re-read via
+/// [`find_addresses_for_ntfy_listener`] on every (re)connect; `reconnect`
+/// fires on an ntfy `/subscribe` or `/remove` so a new topic is picked up at
+/// once instead of at the next stream break.
 pub fn spawn_ntfy_listener(
     config: NtfyListenerConfig,
     pool: sqlx::PgPool,
@@ -127,24 +119,15 @@ pub fn spawn_ntfy_listener(
     shutdown_tx
 }
 
-/// Longest comma-joined topic path put in one SSE URL.
-///
-/// ntfy answers **HTTP 400** once the path gets long enough: the server
-/// accepts a 14 830-character path and rejects a 15 980-character one. The
-/// budget sits at roughly half the known-good value, since the topic list
-/// grows with the miner count.
-///
-/// It bounds the PATH, not the topic count, because addresses differ in length
-/// (42 characters for a bech32 v0, 62 for the longest seen) and a count-based
-/// split would drift with the address mix.
+/// Longest comma-joined topic path put in one SSE URL. ntfy answers HTTP 400
+/// once the path gets too long (somewhere past 14 830 characters); this sits
+/// at about half that. It bounds the path, not the topic count, because
+/// address lengths differ and a count-based split would drift with the mix.
 const MAX_TOPIC_PATH_LEN: usize = 8_000;
 
 /// Split `topics` so each chunk's comma-joined path stays within
-/// `max_path_len`. Order is preserved; no topic is dropped or duplicated.
-///
-/// A single topic longer than the budget still gets its own chunk: an
-/// oversized path fails visibly, a dropped topic would not. ntfy's own topic
-/// grammar (`[-_A-Za-z0-9]{1,64}`) makes it unreachable in practice.
+/// `max_path_len`, preserving order. A single oversized topic still gets its
+/// own chunk: an oversized path fails visibly, a dropped topic would not.
 fn chunk_topics(topics: &[String], max_path_len: usize) -> Vec<Vec<String>> {
     let mut chunks: Vec<Vec<String>> = Vec::new();
     let mut current: Vec<String> = Vec::new();
@@ -173,11 +156,8 @@ fn chunk_topics(topics: &[String], max_path_len: usize) -> Vec<Vec<String>> {
     chunks
 }
 
-/// Hold one SSE connection per chunk and return as soon as ANY of them ends.
-///
-/// Any break re-reads the topic list and rebuilds every chunk, so there is
-/// one place that decides when the topic set is refreshed. With a handful of
-/// chunks that is cheap.
+/// Hold one SSE connection per chunk and return as soon as ANY of them ends,
+/// so the caller's loop is the one place that refreshes the topic set.
 async fn stream_all_chunks(
     client: &Client,
     config: &NtfyListenerConfig,
@@ -228,11 +208,8 @@ async fn stream_until_break(
                 break;
             }
         };
-        // ntfy's `/sse` endpoint is Server-Sent Events: each event is a
-        // `data: {json}` line, framed by `event:` / `id:` / comment (`:`) /
-        // blank separator lines. Only the `data:` field carries the ntfy
-        // message JSON; the rest is skipped. Partial chunks accumulate
-        // until `\n`.
+        // Partial chunks accumulate until `\n`; only SSE `data:` lines carry
+        // the ntfy message JSON.
         if let Ok(text) = std::str::from_utf8(&bytes) {
             buffer.push_str(text);
             while let Some(idx) = buffer.find('\n') {
@@ -248,9 +225,8 @@ async fn stream_until_break(
 }
 
 /// Extract the JSON payload from an SSE `data:` line, or `None` for any other
-/// line (`event:`, `id:`, comments starting `:`, blank separators). Per the SSE
-/// spec a single optional space after the colon is stripped. ntfy emits each
-/// event's JSON as one `data:` line, so the returned value is a complete object.
+/// line. Per the SSE spec one optional space after the colon is stripped;
+/// ntfy emits each event as one `data:` line, so the value is a whole object.
 fn sse_data_field(line: &str) -> Option<&str> {
     let value = line.strip_prefix("data:")?;
     let value = value.strip_prefix(' ').unwrap_or(value);
@@ -304,9 +280,7 @@ struct NtfyEvent {
 mod tests {
     use super::{chunk_topics, sse_data_field, MAX_TOPIC_PATH_LEN};
 
-    /// Only `data:` lines carry the ntfy message JSON; the SSE framing
-    /// (`event:` / `id:` / comments / blanks) must be skipped, and the one
-    /// optional space after `data:` stripped.
+    /// Only `data:` lines yield a payload, with one optional space stripped.
     #[test]
     fn sse_data_field_extracts_only_data_lines() {
         assert_eq!(
@@ -321,17 +295,14 @@ mod tests {
         assert_eq!(sse_data_field(":keepalive comment"), None);
         assert_eq!(sse_data_field(""), None);
         assert_eq!(sse_data_field("data:"), None);
-        // A leading space belongs to data content only after the first space is
-        // consumed — a second space is preserved.
+        // Only the first space is framing; a second one is data.
         assert_eq!(sse_data_field("data:  x"), Some(" x"));
     }
 
     // ── Topic chunking ───────────────────────────────────────────────
-    //
-    // ntfy answers 400 once one comma-joined path is long enough: 14 830
-    // characters are accepted, 15 980 are not.
+    // ntfy accepts a 14 830-character path and rejects a 15 980 one.
 
-    /// A realistic topic: the longest address shape seen is 62 chars.
+    /// A topic of exactly `len` characters.
     fn topic(i: usize, len: usize) -> String {
         let seed = format!("bc1q{i:0>8}");
         let mut t = seed.clone();
@@ -346,8 +317,8 @@ mod tests {
         chunk.iter().map(|t| t.len()).sum::<usize>() + chunk.len().saturating_sub(1)
     }
 
-    /// ⚠️ Every count here is above the server's failure point; a count just
-    /// under it would pass with the chunking removed and prove nothing.
+    /// Every chunk stays within the budget; counts sit above the server's
+    /// failure point so the test cannot pass with chunking removed.
     #[test]
     fn every_chunk_stays_within_the_path_budget() {
         for count in [372usize, 500, 1_000] {
@@ -371,8 +342,7 @@ mod tests {
         }
     }
 
-    /// Splitting must not lose or duplicate a topic: a dropped one is a miner
-    /// whose commands silently stop arriving.
+    /// Splitting keeps every topic exactly once, in order.
     #[test]
     fn chunking_preserves_every_topic_exactly_once() {
         let topics: Vec<String> = (0..500).map(|i| topic(i, 62)).collect();
@@ -383,8 +353,7 @@ mod tests {
         assert_eq!(flattened, topics, "order and membership must both survive");
     }
 
-    /// Mixed lengths, because a count-based split would drift with the address
-    /// mix: bech32 v0 is 42 characters, the longest seen is 62.
+    /// Mixed address lengths still respect the path budget.
     #[test]
     fn a_mixed_address_length_list_still_respects_the_budget() {
         let topics: Vec<String> = (0..600)
@@ -395,8 +364,7 @@ mod tests {
         }
     }
 
-    /// Below the budget a list stays one chunk, one connection; splitting a
-    /// small pool would pay connection overhead for nothing.
+    /// A list below the budget stays one chunk, one connection.
     #[test]
     fn a_short_list_is_left_as_one_chunk() {
         let topics: Vec<String> = (0..50).map(|i| topic(i, 62)).collect();
@@ -404,9 +372,7 @@ mod tests {
         assert!(chunk_topics(&[], MAX_TOPIC_PATH_LEN).is_empty());
     }
 
-    /// A single topic wider than the budget gets its own chunk rather than
-    /// being dropped. Unreachable under ntfy's own grammar
-    /// (`[-_A-Za-z0-9]{1,64}`), asserted so the loop cannot silently discard.
+    /// A single topic wider than the budget gets its own chunk, never dropped.
     #[test]
     fn an_oversized_single_topic_is_kept_not_dropped() {
         let huge = topic(1, 200);
@@ -414,8 +380,7 @@ mod tests {
         assert_eq!(chunks, vec![vec![huge]]);
     }
 
-    /// 358 topics of the longest observed shape exceed what the server
-    /// accepts and must come out as more than one chunk.
+    /// A list past the last known-good path length is split.
     #[test]
     fn the_measured_production_list_gets_split() {
         let topics: Vec<String> = (0..358).map(|i| topic(i, 62)).collect();

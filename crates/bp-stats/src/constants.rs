@@ -4,30 +4,20 @@
 
 use std::time::Duration;
 
-/// Width of one time slot. The pool buckets all per-slot stats by their
-/// **end timestamp**: a slot ending at `X` contains every event in
-/// `[X - SLOT_DURATION_MS, X)`.
+/// Width of one time slot; a slot ending at `X` covers `[X - SLOT_DURATION_MS, X)`.
 pub const SLOT_DURATION_MS: i64 = 10 * 60 * 1_000;
 
-/// Safety buffer between slot-end and chart visibility. A slot is not shown
-/// on charts until `now > slot_end + CHART_VISIBILITY_BUFFER_MS`, so that
-/// the flush has had a chance to commit the slot's data to PG before
-/// downstream readers can see a partial datapoint.
+/// Delay after slot end before charts show the slot, so readers never see a
+/// partial datapoint the flush has not committed yet.
 pub const CHART_VISIBILITY_BUFFER_MS: i64 = 60_000;
 
-/// Same buffer as a [`Duration`] for callers that prefer the typed form.
+/// Same buffer as a [`Duration`].
 pub const CHART_VISIBILITY_BUFFER: Duration = Duration::from_millis(60_000);
 
-/// Defense-in-depth ceiling on per-share difficulty values. PG columns
-/// `pool_share_statistics.accepted` and `.rejected` are `real` (≈3.4e38),
-/// so a single ingested diff above ~1e15 is implausible for real miners
-/// and almost certainly a corrupted SV2 frame or a misconfigured probe.
-/// Shares above this limit are silently discarded by the accumulator —
-/// see `PoolSharesAccumulator::add_accepted`.
+/// Ceiling on a single share's difficulty. Anything above is implausible for a
+/// real miner (a corrupted frame or a probe) and is dropped by the accumulator.
 pub const MAX_REASONABLE_DIFFICULTY: f64 = 1.0e15;
 
-/// Once a flusher reports this many consecutive failures, the health
-/// monitor flips to "warning" so the caller can emit a single
-/// `tracing::warn!`: enough slack that one slow query does not spam the
-/// log, quick enough that a real outage is visible before memory grows.
+/// Consecutive flush failures before the health monitor warns once: one slow
+/// query does not spam the log, a real outage shows before memory grows.
 pub const FLUSH_FAILURE_WARN_THRESHOLD: u32 = 3;

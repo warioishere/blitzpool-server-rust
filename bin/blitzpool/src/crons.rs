@@ -1,27 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Background crons, split into two groups by process role.
-//!
-//! Maintenance (`payout`/accounting role):
-//! - **`kill_dead_clients`** (60 s): soft-deletes `client_entity` rows past
-//!   the birth grace whose session no front holds any more, and revives
-//!   rows that kept mining through a soft-delete.
-//! - **`old_stats_cleanup`** (hourly), **`old_blocks_cleanup`** (daily),
-//!   **`stale_push_cleanup`** (weekly): table retention.
-//! - **`invitation_expiry`** (hourly) and **`join_request_expiry`** (daily),
-//!   in `bp_group_mgmt_engine::cron`.
-//!
-//! Notifications (`notify` role):
-//! - **`network_difficulty`** (10 min): persists the network difficulty and
-//!   pushes changes when a push adapter is configured.
-//! - **`hourly_stats`**: Telegram / ntfy digests; spawned only when one of
-//!   those adapters exists ([`crate::listeners::ListenerHandles`]).
-//! - **`best_difficulty`** (60 s): pushes a new per-address best via the
-//!   [`bp_notifications::dispatcher::NotificationDispatcher`]; its baseline
-//!   is seeded at spawn so a restart does not re-notify every cached best.
-//!
-//! [`CronHandles::shutdown`] signals every loop; each loop exits on the
-//! shutdown branch of its `tokio::select!`, so the delay is not a full tick.
+//! Background crons, split by process role: maintenance (`payout` role: dead
+//! sessions, table retention, group invitation/join expiry) and notifications
+//! (`notify` role: network difficulty, digests, per-address best difficulty,
+//! whose baseline is seeded at spawn so a restart does not re-notify).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -214,11 +196,8 @@ impl CronHandles {
     }
 }
 
-/// Spawn the background crons. Ticks and cutoffs are constants, not config.
-///
-/// `run_maintenance` (the `payout`/accounting role) gates the DB-upkeep and
-/// group lifecycle crons; `run_notifications` (the `notify` role) gates the
-/// push/digest crons.
+/// Spawn the background crons. Ticks and cutoffs are constants, not config;
+/// `run_maintenance` and `run_notifications` gate the two role groups.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn(
     foundation: &FoundationHandles,
@@ -352,13 +331,9 @@ pub(crate) async fn spawn(
     }
 }
 
-/// Dead-session sweep, 60 s tick; the first tick waits one interval so a
-/// just-spawned session is never raced.
-///
-/// `updatedAt` is only stamped at birth/re-register/soft-delete, so age
-/// alone means "past the birth grace", not "dead"; the verdict is in
-/// [`sweep_dead_sessions_once`]. ⚠️ Fail-open on Redis trouble: "cannot
-/// ask" skips the tick and never sweeps, or connected miners get retired.
+/// Dead-session sweep; age alone only means "past the birth grace", the
+/// verdict is in [`sweep_dead_sessions_once`]. Fail-open on Redis trouble:
+/// "cannot ask" skips the tick, or connected miners get retired.
 fn spawn_kill_dead_clients_loop(
     pool: PgPool,
     redis: redis::aio::ConnectionManager,
@@ -425,23 +400,10 @@ impl SweepOutcome {
     }
 }
 
-/// One reconcile pass between the birth rows and the live hashes.
-///
-/// **Kill half.** Candidates come from PG (past the birth grace). A session
-/// a front still holds (`crate::live_sessions`) is alive whatever its share
-/// flow says, so a miner paused with its connection open is kept. Where no
-/// front publishes sessions, the live key decides, and only a key missing
-/// on TWO consecutive passes sweeps: after a Redis restart the keyspace is
-/// legitimately empty (live hashes are not backed up) until the next touch
-/// flush, and a single observation in that window would retire every miner.
-///
-/// **Repair half.** A session soft-deleted within [`REVIVE_LOOKBACK`] whose
-/// live hash was written after the soft-delete kept mining through it, so
-/// the soft-delete is undone. A cleanly disconnected session stops
-/// touching, so its `updated_at_ms` stays older than its `deletedAt`.
-///
-/// Any error aborts the pass without sweeping: "cannot ask Redis" and
-/// "no key" must never collapse into the same answer.
+/// One reconcile pass: a session a front holds is alive; otherwise only a live
+/// key missing on TWO passes sweeps, since the keyspace is empty after a Redis
+/// restart. A row whose live hash postdates its soft-delete is revived. Any
+/// error aborts the pass: "cannot ask" and "no key" must never collapse.
 async fn sweep_dead_sessions_once(
     pool: &PgPool,
     redis: &redis::aio::ConnectionManager,
@@ -482,11 +444,9 @@ async fn sweep_kill_half(
     let mut client_names = Vec::new();
     let mut session_ids = Vec::new();
     for (c, alive) in candidates.iter().zip(alive) {
-        // A front holding this session under this very device needs no
-        // second observation: the socket is open. The device has to
-        // match, not only the id — an SV1 connection may re-authorize
-        // under another worker name, and the row of the name it left
-        // must still go.
+        // A front holding this session under this very device needs no second
+        // observation. The device must match, not only the id: an SV1 connection
+        // may re-authorize under another worker name, and the old row must go.
         let held_by_a_front = held.as_ref().is_some_and(|h| {
             h.get(c.session_id.as_str())
                 .is_some_and(|(a, w)| a == c.address.as_str() && *w == c.client_name)
@@ -572,12 +532,9 @@ const STALE_PUSH_SUBSCRIPTION_TTL: Duration = Duration::from_secs(90 * 24 * 60 *
 /// 14-day cutoff for the per-(address, worker, session, slot) detail
 /// tables — UI charts only render 1d/3d/7d windows.
 const STATS_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
-/// 2-hour cutoff for soft-deleted clients before hard-delete.
-///
-/// Nothing reads them longer: the device-status gate's restart seed looks
-/// back `SEED_LOOKBACK` = 1 h, and "known device" lives in Redis (7-day
-/// TTL). Keeping them longer bloats the table and scatters the live rows
-/// over many heap pages that every bulk writer re-logs.
+/// Cutoff for soft-deleted clients before hard-delete. Nothing reads them
+/// longer (the device-status seed looks back 1 h, "known device" lives in
+/// Redis), and keeping them scatters live rows that every bulk writer re-logs.
 const CLIENT_HARD_DELETE_RETENTION: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// Hourly cron: purge stats older than `STATS_RETENTION`, hard-delete

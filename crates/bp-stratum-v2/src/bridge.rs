@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Cross-server (JDP → Mining) registry of declared jobs, allocate tokens and
-//! published payout distributions.
-//!
-//! A JDC declares on its JDP connection ([`crate::jdp::client`]) and sends
-//! `SetCustomMiningJob` on its mining connection ([`crate::mining::client`]);
-//! [`JdpDeclaredJobRegistry`] carries the record between them. No locking of
-//! its own; the IO layer shares it behind an `Arc<RwLock<_>>`. Entries die with
-//! their JDP session ([`JdpDeclaredJobRegistry::evict_for_jdp_session`]).
+//! payout distributions: a JDC declares on its JDP connection and sends
+//! `SetCustomMiningJob` on its mining connection, and [`JdpDeclaredJobRegistry`]
+//! carries the record between them. Entries die with their JDP session.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -102,13 +98,10 @@ impl DistributionReference {
     }
 }
 
-/// Which distribution a `SetCustomMiningJob` is judged against, decided once
-/// for both the IO layer and
-/// [`crate::mining::client::handle_set_custom_mining_job`] so they cannot diverge.
-///
-/// **It takes no stream, and must not.** A Solo connection may hold a
-/// declaration bound to the pool-wide plan; skipping the check there would pay
-/// the PPLNS window from its coinbase while booking Solo, paying claims twice.
+/// Which distribution a `SetCustomMiningJob` is judged against, shared by the
+/// IO layer and [`crate::mining::client::handle_set_custom_mining_job`]. It
+/// must take no stream: a Solo connection's declaration may be bound to the
+/// pool-wide plan, and skipping the check would pay PPLNS claims twice.
 pub fn resolve_distribution_reference(
     frame_tlv: Option<u64>,
     bridge_job: Option<&BridgeJobRef>,
@@ -134,11 +127,9 @@ pub fn resolve_distribution_reference(
     })
 }
 
-/// What the pool has on file for a `SetCustomMiningJob`'s token: the
-/// SV2 JDP/Job Declaration Modes as the mining side sees them.
-///
-/// This is the token's authority, not its payout coverage; that is
-/// [`crate::jdp::dynamic_outputs::CandidateBacking`]. Do not collapse the two.
+/// What the pool has on file for a `SetCustomMiningJob`'s token (SV2 JDP/Job
+/// Declaration Modes). The token's authority, not its payout coverage, which is
+/// [`crate::jdp::dynamic_outputs::CandidateBacking`]; do not collapse the two.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TokenBacking<'a> {
     /// Full-Template: held to the declaration (address, declared tip, and
@@ -155,12 +146,10 @@ pub enum TokenBacking<'a> {
     DistributionAllocation(&'a AllocatedTokenRef),
 }
 
-/// Classify a token; `None` means no record (unknown / expired / evicted) and
-/// the handler fails closed.
-///
-/// The frame's TLV never rescues an unknown token: only an issued token is
-/// rate-limited, TTL-bound and session-evicted. `Declared` wins a clash, since
-/// the node validated its transaction set (SV2 JDP/Job Declarator Server).
+/// `None` (no record) fails closed; the frame's TLV never rescues an unknown
+/// token, since only an issued one is rate-limited, TTL-bound and evicted.
+/// `Declared` wins a clash: the node validated its transaction set (SV2
+/// JDP/Job Declarator Server).
 pub fn classify_backing<'a>(
     bridge_job: Option<&'a BridgeJobRef>,
     allocation: Option<&'a AllocatedTokenRef>,

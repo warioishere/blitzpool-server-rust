@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! `GroupService` — group lifecycle, membership, admin-token auth.
-//!
-//! Pure logic + token generation is delegated to `bp-group-mgmt`;
-//! DB writes to `bp-db`; Redis cleanup + cron scheduling to the
-//! [`GroupServiceHooks`] trait. The service owns one [`AddressCache`]
-//! (rebuilt on every membership change).
+//! Pure logic lives in `bp-group-mgmt`, DB writes in `bp-db`, Redis cleanup
+//! and cron scheduling behind [`GroupServiceHooks`]. The owned
+//! [`AddressCache`] is rebuilt on every membership change.
 
 use std::sync::Arc;
 
@@ -62,42 +60,25 @@ pub struct GroupService<H: GroupServiceHooks> {
     hooks: Arc<H>,
     address_cache: AddressCache,
     kick_inactivity_days: u32,
-    /// How many payout outputs the Group-Solo coinbase weight budget
-    /// can carry — the HARD member ceiling, above the operator's own
-    /// optional `maxMembers`.
-    ///
-    /// Past it the blockspace cut silently drops members from the coinbase
-    /// and they are paid nothing for that block; refusing the join keeps
-    /// that unreachable, which is what lets Group-Solo run without a
-    /// ledger. Derived from the fixed `[group_fees].coinbase_weight_budget`,
-    /// so a cap checked against it cannot go stale.
+    /// HARD member ceiling: how many payout outputs the Group-Solo coinbase
+    /// can carry. Past it the blockspace cut silently drops members from the
+    /// coinbase, so refusing the join is what lets Group-Solo run without a
+    /// ledger. Derived from the fixed `[group_fees].coinbase_weight_budget`.
     coinbase_max_members: u64,
-    /// Cross-mode collision reader. When wired, `create_group` and
-    /// `add_member_without_admin` refuse addresses already in a
-    /// Blockparty. Deployments without Blockparty leave it unset
-    /// and the check short-circuits. `OnceLock` so the reader can be
-    /// attached after construction via `&self` (the chicken-and-egg
-    /// with the Blockparty service rules out passing it to `new`).
+    /// When set, `create_group` and `add_member_without_admin` refuse
+    /// addresses already in a Blockparty. `OnceLock` so it attaches via
+    /// `&self`: the Blockparty service cannot be passed to `new`.
     blockparty_reader: Arc<std::sync::OnceLock<Arc<dyn crate::hooks::BlockpartyMembershipReader>>>,
-    /// Optional cross-process cache-invalidation notifier. Attached after
-    /// construction (same `OnceLock` rationale as `blockparty_reader`). When
-    /// set, every membership mutation publishes a `"group"` invalidation so a
-    /// separate Stratum Front rebuilds its routing cache. Unset where no
-    /// cross-process notification is needed (e.g. tests).
+    /// When set, every membership mutation publishes a `"group"`
+    /// invalidation so a separate Stratum Front rebuilds its routing cache.
     change_notifier: Arc<std::sync::OnceLock<Arc<dyn crate::hooks::MembershipChangeNotifier>>>,
 }
 
 impl<H: GroupServiceHooks> GroupService<H> {
-    /// Wire a fresh service. The caller should call [`Self::rebuild_cache`]
-    /// once at startup so the in-memory cache is hot before the stratum
-    /// layer starts serving share submits.
-    ///
-    /// `coinbase_max_members` is the ceiling derived from the Group-Solo
-    /// coinbase weight budget (`bp_pplns::max_coinbase_outputs`). It is a
-    /// constructor argument rather than a setter on purpose: a group that
-    /// can outgrow its coinbase is the one thing the ledger-free payout
-    /// model has no answer for, so there must be no way to wire the
-    /// service without it.
+    /// Call [`Self::rebuild_cache`] once at startup, before share submits.
+    /// `coinbase_max_members` (`bp_pplns::max_coinbase_outputs`) is a
+    /// constructor argument, not a setter, so the service cannot be wired
+    /// without the cap the ledger-free Group-Solo payout depends on.
     pub fn new(
         pool: PgPool,
         hooks: Arc<H>,
@@ -121,11 +102,9 @@ impl<H: GroupServiceHooks> GroupService<H> {
         self.coinbase_max_members
     }
 
-    /// The cap that actually applies to a group: the operator's own
-    /// `maxMembers` when set, never above what the coinbase can carry.
-    ///
-    /// `NULL` means "no operator limit", not "no limit" — the coinbase
-    /// ceiling still applies.
+    /// The cap that applies to a group: the operator's `maxMembers` when set,
+    /// never above what the coinbase can carry. `NULL` means "no operator
+    /// limit", not "no limit".
     fn effective_member_cap(&self, group_max_members: Option<i32>) -> i64 {
         let coinbase_cap = self.coinbase_max_members.min(i64::MAX as u64) as i64;
         match group_max_members {
@@ -239,12 +218,10 @@ impl<H: GroupServiceHooks> GroupService<H> {
         Ok(bp_db::find_pplns_group_members_for_group(&self.pool, group_id).await?)
     }
 
-    /// Last-active timestamp (epoch-ms) for a member, using the same
-    /// Redis-first / PG-fallback policy as the kick-inactivity guard
-    /// ([`Self::remove_member`]). The live Redis hash is stamped on every
-    /// accepted share, whereas the durable balance is only stamped at
-    /// block-found — so this reports active miners as active before their
-    /// group's first block. `None` if the member has never submitted a share.
+    /// Last-active epoch-ms, Redis-first / PG-fallback like the kick guard in
+    /// [`Self::remove_member`]. Redis is stamped on every share, PG only at
+    /// block-found, so miners show active before their group's first block.
+    /// `None` if the member never submitted a share.
     pub async fn member_last_active(&self, group_id: Uuid, address: &AddressId) -> Option<i64> {
         self.hooks.last_active_for_member(group_id, address).await
     }
@@ -363,15 +340,10 @@ impl<H: GroupServiceHooks> GroupService<H> {
         }
         self.assert_not_in_blockparty(&normalized).await?;
 
-        // Member cap — the single chokepoint every add path funnels through
-        // (directed invite, open invite link, approved join request).
-        // Enforced server-side so a UI-only block can't be bypassed.
-        //
-        // Two ceilings, and the lower one wins: the operator's own
-        // `maxMembers` (optional) and how many outputs the Group-Solo
-        // coinbase can carry (always). The second is not a preference —
-        // past it the blockspace cut drops members from the coinbase and
-        // they earn nothing for that block.
+        // Member cap, server-side: every add path funnels through here. The
+        // lower of the operator's `maxMembers` and the coinbase ceiling wins;
+        // past the latter the blockspace cut drops members and they earn
+        // nothing.
         let max_members = self.effective_member_cap(
             bp_db::find_group(&self.pool, group_id)
                 .await?
@@ -546,15 +518,10 @@ impl<H: GroupServiceHooks> GroupService<H> {
             }
         }
 
-        // maxMembers: null clears the OPERATOR's cap, a positive integer >= 2
-        // (the group member floor) sets it. Setting below the current count is
-        // allowed — no one is kicked, growth is just frozen.
-        //
-        // The upper bound is the coinbase ceiling, not a round number: a
-        // `maxMembers` above it would be a promise the coinbase cannot keep,
-        // and clearing the field does not lift it either (see
-        // `effective_member_cap`). The UI reads the same number from
-        // `GET /api/pplns/groups/coinbase-capacity`.
+        // maxMembers must be >= 2 and at most the coinbase ceiling, which a
+        // cleared field does not lift either. Below the current count is
+        // allowed: no one is kicked, growth is frozen. The UI reads the same
+        // ceiling from `GET /api/pplns/groups/coinbase-capacity`.
         if let PatchField::Set(v) = &settings.max_members {
             if *v < 2 || (*v as i64) > self.effective_member_cap(None) {
                 return Err(GroupServiceError::InvalidMaxMembers);

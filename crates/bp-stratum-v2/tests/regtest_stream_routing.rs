@@ -1,29 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Regtest: SV2 per-mode stream routing — Solo, Group-Solo and Blockparty
-//! through ONE driver.
-//!
-//! The SV2 counterpart of `bp-stratum-v1/tests/regtest_stream_routing.rs`:
-//! here the stream swap is triggered by `OpenStandardMiningChannel` in
-//! `run_mining_connection` (over Noise-XK), not by `mining.authorize`.
-//!
-//! Two independent guards:
-//!   1. A recording block-sink captures the `StreamKind` of every submit. The
-//!      mode's own kind proves the OpenChannel swap fired; without it the sink
-//!      would record `Pplns`, the stream every connection boots on.
-//!   2. The chain advancing proves the mode's handle knew the job's
-//!      `template_id` (template ids collide across streams, so a mis-routed
-//!      submit would be rejected).
-//!
-//! The modes differ only in reservation and coinbase output count, so they
-//! share [`run_scenario`], which classifies every `SubmitShares*` response:
-//!
-//!   * **Solo** pays one output, against a tiny fixed reservation.
-//!   * **Group-Solo** additionally proves a ~50-member P2TR coinbase fits the
-//!     production 10 000-WU reservation through the SV2 coinbase builder.
-//!   * **Blockparty** routes at the production 8 000-WU reservation.
-//!
-//! Skipped (with a printed warning) when `bitcoin-node` is not installed.
+//! Regtest: SV2 per-mode stream routing (Solo, Group-Solo, Blockparty) through
+//! one driver, [`run_scenario`]. The recorded `StreamKind` proves the
+//! OpenChannel swap fired (else `Pplns`); the chain advancing proves the mode's
+//! handle knew the `template_id`, since template ids collide across streams.
 
 #![allow(clippy::print_stderr)]
 
@@ -57,8 +37,7 @@ use common::{read_any_message, wait_until, write_any_message, REGTEST_ADDR};
 const SRI_TEST_PUB: &str = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72";
 const SRI_TEST_PRV: &str = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n";
 
-/// The per-mode inputs of one scenario. Everything else in [`run_scenario`] is
-/// identical across the three, which is why they share it.
+/// The per-mode inputs of one scenario.
 #[derive(Clone, Copy)]
 struct ModeCase {
     /// The stream the connection must be routed onto.
@@ -69,32 +48,28 @@ struct ModeCase {
     label: &'static str,
 }
 
-/// Solo pays a single output, so a tiny reservation is all it needs.
 const SOLO: ModeCase = ModeCase {
     stream: StreamKind::Solo,
     reservation_bytes: 1_000,
     label: "solo",
 };
 
-/// ≈ `tdp_constraint_for_budget(10_000 WU)`: 10_000/4 + 256. The production
-/// Group-Solo reservation. Holds ~50 P2TR member outputs (50 × 43 B = 2150 B).
+/// The production Group-Solo reservation, `tdp_constraint_for_budget(10_000 WU)`.
 const GROUP_SOLO: ModeCase = ModeCase {
     stream: StreamKind::GroupSolo,
     reservation_bytes: 2_756,
     label: "group-solo",
 };
 
-/// ≈ `tdp_constraint_for_budget(8_000 WU)`: 8_000/4 + 256. The production
-/// Blockparty reservation.
+/// The production Blockparty reservation, `tdp_constraint_for_budget(8_000 WU)`.
 const BLOCKPARTY: ModeCase = ModeCase {
     stream: StreamKind::Blockparty,
     reservation_bytes: 2_256,
     label: "blockparty",
 };
 
-/// Routes every address to `stream` and splits the block's OWN revenue across
-/// `addresses`, so the payout vector consumes the template value exactly
-/// whatever the subsidy and fees happen to be.
+/// Routes every address to `stream` and splits the block's OWN revenue, so the
+/// payouts consume the template value exactly.
 struct FixedResolver {
     stream: StreamKind,
     addresses: Vec<String>,
@@ -115,8 +90,7 @@ impl PayoutResolver for FixedResolver {
     }
 }
 
-/// Split `reward_sats` evenly across `addresses`, the remainder onto the first.
-/// The sum is `reward_sats` exactly — anything else is `bad-cb-amount`.
+/// Even split, remainder onto the first; any other sum is `bad-cb-amount`.
 fn split_reward(addresses: &[String], reward_sats: u64) -> Vec<PayoutEntry> {
     let n = addresses.len() as u64;
     let each = reward_sats / n;
@@ -131,14 +105,12 @@ fn split_reward(addresses: &[String], reward_sats: u64) -> Vec<PayoutEntry> {
         .collect()
 }
 
-/// Records the routed stream and submits the solution through the handle that
-/// stream owns — the test-side mirror of production's `select_handle`.
+/// Records the routed stream and submits through that stream's handle.
 struct RecordingSink {
     tdp_default: TdpHandle,
     tdp_alt: TdpHandle,
-    /// The one stream this scenario gave a dedicated handle to. Held as a
-    /// value and compared, not matched as a mode: a fourth `StreamKind` cannot
-    /// silently fall through to the default handle here.
+    /// The one stream with a dedicated handle, compared rather than matched so
+    /// a new `StreamKind` cannot silently fall through to the default handle.
     alt: StreamKind,
     recorded: Arc<Mutex<Vec<StreamKind>>>,
 }
@@ -200,10 +172,8 @@ async fn sv2_group_solo_connection_routes_to_group_solo_stream_and_block_accepte
     assert_routed_and_landed(GROUP_SOLO, &outcome);
 }
 
-/// ~50 distinct P2TR (bech32m) members — the worst-case 172-WU output type.
-/// 50 × 43 B = 2150 B of coinbase outputs, which must fit the production
-/// 10 000-WU reservation (2756 B). Validity proof for the documented
-/// "~50 members" capacity over the SV2 coinbase builder.
+/// 50 P2TR members, the worst-case output type, fit the production Group-Solo
+/// reservation through the SV2 coinbase builder.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sv2_group_solo_max_size_multi_output_coinbase_accepted() {
     let Some(node) = start_node_or_skip(GROUP_SOLO, "max-size multi-output").await else {
@@ -232,8 +202,7 @@ async fn sv2_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
 
 // ── driver ──────────────────────────────────────────────────────────────
 
-/// What one scenario observed. The submit tallies are carried out so a failing
-/// assertion can say *why* no block landed instead of only that none did.
+/// What one scenario observed; the submit tallies say why no block landed.
 struct Outcome {
     recorded: Vec<StreamKind>,
     before: u32,
@@ -242,8 +211,7 @@ struct Outcome {
     errors: Vec<String>,
 }
 
-/// Start a regtest node + mine 101 for IBD-exit + maturity, or return `None`
-/// (and print a skip line) when bitcoin-node isn't installed.
+/// Start a regtest node past IBD, or `None` when bitcoin-node isn't installed.
 async fn start_node_or_skip(case: ModeCase, what: &str) -> Option<RegtestNode> {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
@@ -263,7 +231,6 @@ async fn start_node_or_skip(case: ModeCase, what: &str) -> Option<RegtestNode> {
     Some(node)
 }
 
-/// Mint `n` distinct P2TR (bech32m) addresses from the node's wallet.
 async fn mint_p2tr_members(node: &RegtestNode, n: usize) -> Vec<String> {
     let mut members = Vec::with_capacity(n);
     for _ in 0..n {
@@ -307,10 +274,8 @@ fn assert_routed_and_landed(case: ModeCase, outcome: &Outcome) {
     );
 }
 
-/// Spin up two TDP streams (default + `case.stream` at its own reservation),
-/// the SV2 server with a `FixedResolver` plus a recording sink, and drive one
-/// Noise miner through SetupConnection / OpenStandardMiningChannel / submit
-/// until a block lands.
+/// Two TDP streams (default + `case.stream`), the SV2 server, and one Noise
+/// miner submitting until a block lands.
 async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>) -> Outcome {
     let tdp_default = TdpHandle::spawn(
         TdpConfig::new(node.ipc_socket_path())
@@ -497,15 +462,12 @@ async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>
                         errors.push(String::from_utf8_lossy(e.error_code.as_bytes()).to_string());
                     }
                     AnyMessageOwned::Mining(MiningOwned::SubmitSharesSuccess(_)) => successes += 1,
-                    // Track job refreshes so submits never use a stale id.
                     // A future job keeps the previous ntime until its
-                    // SetNewPrevHash arrives (handled below).
+                    // SetNewPrevHash arrives.
                     AnyMessageOwned::Mining(MiningOwned::NewMiningJob(j)) => {
                         let nt = j.min_ntime.clone().into_inner().unwrap_or(nt);
                         latest_job = (j.channel_id, j.job_id, j.version, nt);
                     }
-                    // Future-job activation supplies the ntime for the
-                    // just-received job.
                     AnyMessageOwned::Mining(MiningOwned::SetNewPrevHash(p)) => {
                         let (cid, jid, ver, _) = latest_job;
                         latest_job = (cid, jid, ver, p.min_ntime);

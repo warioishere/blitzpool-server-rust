@@ -30,15 +30,9 @@ impl Db {
         Ok(Db { pool })
     }
 
-    /// Apply pending schema migrations from the embedded `migrations/`
-    /// directory (`crates/bp-db/migrations`).
-    ///
-    /// sqlx tracks applied migrations in `_sqlx_migrations` and takes a
-    /// Postgres advisory lock for the duration, so every process in the
-    /// Core/Satellite split can call this at boot: the first to win the lock
-    /// applies the pending set, the rest see them already done. On an empty
-    /// database `0000_baseline.sql` builds the base tables first; on one
-    /// that already has them it changes nothing.
+    /// Apply pending migrations from `crates/bp-db/migrations`. sqlx holds an
+    /// advisory lock while it runs, so every process may call this at boot;
+    /// the first one applies the pending set.
     pub async fn run_migrations(&self) -> Result<(), DbError> {
         with_boot_policy(sqlx::migrate!()).run(&self.pool).await?;
         Ok(())
@@ -49,23 +43,16 @@ impl Db {
         &self.pool
     }
 
-    /// Close the pool, draining all open connections. Useful for clean
-    /// shutdown — callers should `await db.close()` before exit.
+    /// Close the pool, draining all open connections.
     pub async fn close(&self) {
         self.pool.close().await
     }
 }
 
-/// How every process treats the migration table at boot: a migration it does
-/// not know is fine. The processes of the Core/Satellite split are deployed
-/// one at a time, so the api can apply a migration while core still runs the
-/// previous image. Without this, that older core would refuse to boot
-/// (`VersionMissing`) on its next restart and the Stratum port would stay
-/// closed until someone redeploys it.
-///
-/// The price is a rule for every migration: it must not break a binary that
-/// is one release older. Add, don't rename; drop a column only once no
-/// running image reads it.
+/// Unknown applied migrations are ignored at boot: processes are deployed one
+/// at a time, so a binary one release older must still start after a newer one
+/// migrated. Hence every migration must not break that older binary: add,
+/// don't rename; drop a column only once no running image reads it.
 pub fn with_boot_policy(mut migrator: sqlx::migrate::Migrator) -> sqlx::migrate::Migrator {
     migrator.set_ignore_missing(true);
     migrator

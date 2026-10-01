@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! User-initiated request to join a *public* group. The complement to
-//! invitations:
-//!
-//! - **Invitation**: admin → specific address (directed) or shareable
-//!   link (open). Admin-initiated.
-//! - **Join request**: user → group. Admin reviews + approves/rejects.
-//!
-//! Trust anchor is the same as for invitations — the requesting
-//! address must be verified by email or a signature ownership proof.
-//! A verified email is snapshotted on the request row so approve/reject
-//! mail reaches the right inbox even if the user later rebinds.
+//! User-initiated request to join a *public* group; the admin approves or
+//! rejects. Like invitations, the address must be verified by email or a
+//! signature proof. The verified email is snapshotted on the row so the
+//! decision mail reaches the right inbox even after a rebind.
 
 use std::sync::Arc;
 
@@ -86,38 +79,28 @@ impl<H: GroupServiceHooks, M: EmailHooks> JoinRequestService<H, M> {
         }
     }
 
-    /// Create a join request. Public — no admin token. Multi-step
-    /// validation:
-    ///
-    /// 1. Group exists, is public, not dissolved.
-    /// 2. Address shape valid + verified (email or signature proof).
-    /// 3. Address isn't already a member of any group.
-    /// 4. Address isn't over the global pending cap.
-    /// 5. No (group, address) row currently in cooldown.
-    /// 6. The DB unique partial index on `(groupId, address) WHERE
-    ///    status='pending'` does the final consistency check; a 23505
-    ///    is surfaced as [`JoinRequestServiceError::RequestPending`].
+    /// Create a join request (public, no admin token). The DB unique partial
+    /// index on `(groupId, address) WHERE status='pending'` is the final
+    /// guard against a concurrent duplicate; its 23505 surfaces as
+    /// [`JoinRequestServiceError::RequestPending`].
     pub async fn create_join_request(
         &self,
         group_id: Uuid,
         address: &str,
         message: Option<&str>,
     ) -> Result<PplnsGroupJoinRequestRow, JoinRequestServiceError> {
-        // (1) Group must exist, be public, not dissolved. Private and
-        // not-found answer the same, so a private group's existence
-        // does not leak.
+        // Private and not-found answer the same, so a private group's
+        // existence does not leak.
         let group = bp_db::find_group(&self.pool, group_id).await?;
         let group = match group {
             Some(g) if g.dissolved_at.is_none() && g.is_public => g,
             _ => return Err(JoinRequestServiceError::NotFound),
         };
 
-        // (2) Validate + normalize address shape.
         let normalized =
             normalize_address(address).map_err(|_| JoinRequestServiceError::InvalidAddress)?;
-        // Unified onboarding gate: verified by email OR a signature ownership
-        // proof. The email (if any) is snapshotted for the approval notification;
-        // a signature-only joiner has none and simply won't be emailed on the decision.
+        // Verified by email OR a signature ownership proof; a signature-only
+        // joiner has no email and is not mailed on the decision.
         let email = bp_db::find_address_email(&self.pool, &normalized)
             .await?
             .filter(|b| b.verified_at.is_some())
@@ -127,7 +110,6 @@ impl<H: GroupServiceHooks, M: EmailHooks> JoinRequestService<H, M> {
             return Err(JoinRequestServiceError::EmailNotVerified);
         }
 
-        // (3) Already a member?
         if let Some(existing) = bp_db::find_group_member_by_address(&self.pool, &normalized).await?
         {
             return Err(if existing.group_id == group_id {
@@ -137,7 +119,6 @@ impl<H: GroupServiceHooks, M: EmailHooks> JoinRequestService<H, M> {
             });
         }
 
-        // (4) Global pending cap.
         let pending =
             bp_db::count_pplns_group_join_requests_pending_for_address(&self.pool, &normalized)
                 .await?;
@@ -145,8 +126,6 @@ impl<H: GroupServiceHooks, M: EmailHooks> JoinRequestService<H, M> {
             return Err(JoinRequestServiceError::TooManyPending);
         }
 
-        // (5) Reject cooldown — block if the same (group, address)
-        // was rejected within `reject_cooldown_hours`.
         let recent_reject = bp_db::find_pplns_group_join_request_most_recent_rejected(
             &self.pool,
             group_id,
@@ -165,7 +144,7 @@ impl<H: GroupServiceHooks, M: EmailHooks> JoinRequestService<H, M> {
             }
         }
 
-        // (6) Trim + cap message. An over-long body is silently truncated.
+        // An over-long message is silently truncated.
         let trimmed = message
             .map(|m| m.trim())
             .filter(|m| !m.is_empty())
@@ -249,9 +228,8 @@ impl<H: GroupServiceHooks, M: EmailHooks> JoinRequestService<H, M> {
         let admin_hash = TokenHash::of_str(admin_token.unwrap_or(""));
         let now = now_ms();
 
-        // Last-mile membership check: address might have joined
-        // another group between request + approval. Mark rejected
-        // (audit) so the admin doesn't keep seeing it.
+        // The address may have joined another group since the request;
+        // mark it rejected so the admin stops seeing it.
         let existing = bp_db::find_group_member_by_address(&self.pool, &address).await?;
         if let Some(m) = &existing {
             if m.group_id != group_id {

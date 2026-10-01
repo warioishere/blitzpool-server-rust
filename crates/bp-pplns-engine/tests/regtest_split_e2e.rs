@@ -2,22 +2,9 @@
 
 #![allow(clippy::print_stderr)]
 
-//! T4 — Core/Satellite split, end-to-end against a real regtest
-//! `bitcoin-node`: the **split** path yields a coinbase bitcoin-core accepts.
-//!
-//! 1. The three miners' shares flow through the real Core→Satellite
-//!    transport: Core producer `XADD`s → the Satellite consumer drains into
-//!    the PPLNS engine's accept sink.
-//! 2. **A Satellite restart mid-stream** with a crash-after-apply-before-ack:
-//!    the un-acked entry is replayed on restart and the engine's per-`share_id`
-//!    dedup makes the re-apply a no-op — exactly-once accounting survives the
-//!    restart.
-//! 3. The coinbase built from *that* (stream-fed, restart-survived)
-//!    distribution is submitted to bitcoin-core, which must accept it (the
-//!    chain tip advances).
-//! 4. `on_block_found` applies the ledger.
-//!
-//! Skips cleanly when the `bitcoin-node` binary / Redis / PG aren't present.
+//! Core/Satellite split end-to-end against regtest: shares fed through the
+//! stream, with a Satellite crash between apply and ack, are counted exactly
+//! once, and the resulting coinbase is accepted by bitcoin-core and booked.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,7 +27,6 @@ use bp_test_support::{
     mine_and_submit_payouts, redis_db, wait_for_paired_template,
 };
 
-/// Logical DB for this test — distinct from the other regtest + window tests.
 const REDIS_TEST_DB: u8 = 0;
 const STREAM_KEY: &str = "t4:split:accepted";
 
@@ -88,8 +74,7 @@ async fn split_path_distribution_block_accepted_with_satellite_restart() {
     let addr_charlie = deterministic_p2wpkh_regtest([0xc3; 32]);
     let addr_fee = deterministic_p2wpkh_regtest([0xfe; 32]);
 
-    // The Satellite's PPLNS engine — full spawn (the satellite runs the
-    // accounting + crons); its window is fed only through the stream.
+    // The Satellite's engine; its window is fed only through the stream.
     let net_diff = NetworkDifficulty::new(1_000.0);
     let engine = PplnsEngine::spawn(
         test_engine_config(&addr_fee),
@@ -115,20 +100,18 @@ async fn split_path_distribution_block_accepted_with_satellite_restart() {
         Arc::new(PplnsAcceptedShareSink::new(engine.clone()));
     let fan_out = AcceptedShareFanOut::new(vec![sink.clone()]);
 
-    // First Satellite run: drain + apply + ack the first two shares.
     let c1 = StreamConsumer::accepted(redis_conn.clone(), STREAM_KEY, "money", "c1");
     c1.ensure_group().await.expect("ensure_group");
     let n = c1.drain_new(&fan_out, 2, 2000).await.expect("drain_new");
     assert_eq!(n, 2, "first run consumes Alice + Bob");
 
-    // Crash simulation: deliver the third share (Charlie) and APPLY it to the
-    // engine, but die before the XACK — so it stays in the pending list.
+    // Crash after apply, before XACK: Charlie stays in the pending list.
     let pending = c1.read_new(10, 2000).await.expect("read_new charlie");
     assert_eq!(pending.len(), 1, "Charlie delivered to the PEL");
     for cs in &pending {
         sink.record_accepted(cs.value.as_view()).await;
     }
-    drop(c1); // the "crash" — no ack issued
+    drop(c1);
 
     // ── Satellite restart: same group+consumer replays the unacked entry ──
     let c2 = StreamConsumer::accepted(redis_conn.clone(), STREAM_KEY, "money", "c1");
@@ -138,7 +121,6 @@ async fn split_path_distribution_block_accepted_with_satellite_restart() {
         replayed, 1,
         "the unacked Charlie share is replayed on restart"
     );
-    // Nothing new left after the replay.
     let leftover = c2.read_new(10, 500).await.expect("read_new drained");
     assert!(leftover.is_empty(), "no entries left after restart-resume");
 
@@ -228,8 +210,7 @@ async fn split_path_distribution_block_accepted_with_satellite_restart() {
     let after = accepted.height;
     let submitted_coinbase = accepted.witness_coinbase;
 
-    // ── Satellite applies the block-found ledger from the REAL
-    //    coinbase (weight-model settlement) ─────────────────────────
+    // ── Book the block from the coinbase actually submitted ───────
     let coinbase_tx = <bitcoin::Transaction as bitcoin::consensus::Decodable>::consensus_decode(
         &mut submitted_coinbase.as_slice(),
     )

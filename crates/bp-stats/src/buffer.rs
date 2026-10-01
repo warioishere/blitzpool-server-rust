@@ -1,59 +1,32 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Generic "hot-path writes, periodic bulk-flush" primitives.
-//!
-//! Every buffer flavour has the same conceptual API:
-//!
-//! ```text
-//! buf.add*  /  buf.set  — hot path, synchronous, non-throwing
-//! buf.len()             — count of unflushed keys
-//! buf.drain()           — start a flush; returns a snapshot
-//! buf.confirm(snap)     — flush succeeded; subtract / clear the snapshot
-//! ```
-//!
-//! Two semantic models, depending on the data shape:
-//!
-//! - [`SwapBuffer`] — latest-wins-by-key. `drain` clears the buffer and
-//!   returns the previous contents.
-//! - [`NumberDeltaBuffer`] / [`NestedDeltaBuffer`] / [`RecordDeltaBuffer`] —
-//!   additive numeric deltas. `drain` snapshots without clearing; `confirm`
-//!   subtracts the flushed amounts so concurrent writes during the flush
-//!   are preserved.
-//!
-//! Locking is the caller's responsibility — each accumulator wraps the
-//! appropriate buffer in a `Mutex` so the hot-path lock is held only for
-//! the HashMap mutation itself.
+//! Hot-path write buffers that a periodic flush drains in bulk.
+//! [`SwapBuffer`] is latest-wins and `drain` clears it; the delta buffers only
+//! snapshot on `drain` and subtract on `confirm`, so writes made during a flush
+//! survive it. Locking is the caller's job (each accumulator holds a `Mutex`).
 
 use std::collections::HashMap;
 use std::hash::Hash;
 
 // ─── BufferRecord trait ─────────────────────────────────────────────────────
 
-/// A record of named numeric fields suitable for use as the value in
-/// [`RecordDeltaBuffer`]. The trait drives the drain/confirm machinery:
-/// `is_zero` filters out empty buckets from snapshots, `add_assign` is the
-/// hot-path increment, `sub_assign_clamped` is the confirm-time
-/// subtraction that clamps each field at zero so under-flow from
-/// concurrent residuals can't surface as negative numbers.
+/// A record of numeric fields used as the value in [`RecordDeltaBuffer`].
 pub trait BufferRecord: Default + Clone {
-    /// True iff every field is zero (or negative). Used to skip empty
-    /// buckets in `drain` snapshots.
+    /// True iff every field is zero (or negative); such buckets are left out
+    /// of `drain` snapshots.
     fn is_zero(&self) -> bool;
 
-    /// Add every field of `rhs` to `self`.
     fn add_assign(&mut self, rhs: &Self);
 
-    /// Subtract every field of `rhs` from `self`, clamping each field at
-    /// zero. Returns `true` if every field is ≤ 0 after the subtraction
-    /// (so the bucket can be removed from the buffer's map).
+    /// Subtract field-wise, clamping at zero so a residual never turns
+    /// negative. Returns `true` when the bucket is empty and can be removed.
     fn sub_assign_clamped(&mut self, rhs: &Self) -> bool;
 }
 
 // ─── SwapBuffer ─────────────────────────────────────────────────────────────
 
-/// Latest-wins-by-key buffer. `drain` swaps in a fresh empty map and
-/// returns the previous one. Concurrent writes after `drain` go to the
-/// new map and survive the flush automatically.
+/// Latest-wins-by-key buffer. `drain` swaps in a fresh map, so writes made
+/// during the flush land in the new one.
 pub struct SwapBuffer<K, V> {
     map: HashMap<K, V>,
 }
@@ -88,15 +61,12 @@ where
         self.map.is_empty()
     }
 
-    /// Snapshot the buffer and replace with a fresh empty one. New writes
-    /// go to the new buffer.
     pub fn drain(&mut self) -> HashMap<K, V> {
         std::mem::take(&mut self.map)
     }
 
-    /// Merge a previously-drained snapshot back into the live buffer after
-    /// a flush failure. **Existing entries win** — anything written during
-    /// the flush is preserved.
+    /// Put a snapshot back after a failed flush. Existing entries win, since
+    /// they were written after the snapshot and are newer.
     pub fn rebuffer(&mut self, snapshot: HashMap<K, V>) {
         for (k, v) in snapshot {
             self.map.entry(k).or_insert(v);
@@ -106,12 +76,8 @@ where
 
 // ─── NumberDeltaBuffer ──────────────────────────────────────────────────────
 
-/// Additive numeric deltas keyed by `K`. Internally an `f64` accumulator;
-/// use [`NumberDeltaBuffer::add`] to increment.
-///
-/// `drain` returns a snapshot of all keys with **positive** values. Zero
-/// or negative entries are filtered out so the flusher never emits no-op
-/// rows.
+/// Additive `f64` deltas keyed by `K`. `drain` returns only positive values
+/// so the flusher never writes no-op rows.
 pub struct NumberDeltaBuffer<K> {
     map: HashMap<K, f64>,
 }
@@ -142,8 +108,7 @@ impl<K> NumberDeltaBuffer<K>
 where
     K: Clone + Eq + Hash,
 {
-    /// Add `delta` to the value for `key`. Treats `0.0` and non-finite
-    /// inputs (NaN, ±Inf) as no-ops.
+    /// Zero and non-finite deltas are ignored so one NaN cannot poison a key.
     pub fn add(&mut self, key: K, delta: f64) {
         if delta == 0.0 || !delta.is_finite() {
             return;
@@ -166,8 +131,7 @@ where
         out
     }
 
-    /// Subtract a previously-drained snapshot. Keys whose residual is ≤ 0
-    /// are removed.
+    /// Subtract a drained snapshot; keys left at ≤ 0 are removed.
     pub fn confirm(&mut self, snapshot: &HashMap<K, f64>) {
         for (k, flushed) in snapshot {
             if let Some(current) = self.map.get_mut(k) {
@@ -187,9 +151,7 @@ where
 
 // ─── NestedDeltaBuffer ──────────────────────────────────────────────────────
 
-/// Nested map `outer → inner → f64` with additive semantics. Used for
-/// `slot → mode → diff` (pool-mode-hashrate) and `slot → reason → count`
-/// (pool-rejected).
+/// Additive nested map `outer → inner → f64`, e.g. `slot → mode → diff`.
 pub struct NestedDeltaBuffer<O, I> {
     map: HashMap<O, HashMap<I, f64>>,
 }
@@ -229,8 +191,7 @@ where
         *entry.entry(inner).or_insert(0.0) += delta;
     }
 
-    /// Deep snapshot: each inner map is cloned, filtering positive entries.
-    /// Outer keys with empty inner maps after filtering are skipped.
+    /// Deep snapshot of positive entries; does not clear the buffer.
     pub fn drain(&self) -> HashMap<O, HashMap<I, f64>> {
         let mut out = HashMap::with_capacity(self.map.len());
         for (o, inner) in &self.map {
@@ -247,8 +208,7 @@ where
         out
     }
 
-    /// Subtract a previously-drained snapshot. Outer keys whose inner map
-    /// becomes empty are removed.
+    /// Subtract a drained snapshot; emptied keys are removed.
     pub fn confirm(&mut self, snapshot: &HashMap<O, HashMap<I, f64>>) {
         for (o, inner_snap) in snapshot {
             let Some(current_inner) = self.map.get_mut(o) else {
@@ -271,9 +231,7 @@ where
 
 // ─── RecordDeltaBuffer ──────────────────────────────────────────────────────
 
-/// Map of key → multi-field record, additive per field. Used for
-/// pool-share (2 fields), client-statistics (10 fields), client-rejected
-/// (2 fields).
+/// Map of key → multi-field record, additive per field.
 pub struct RecordDeltaBuffer<K, R: BufferRecord> {
     map: HashMap<K, R>,
 }
@@ -305,10 +263,7 @@ where
     K: Clone + Eq + Hash,
     R: BufferRecord,
 {
-    /// Merge `delta` into the bucket for `key`. Creates a zero-initialised
-    /// bucket on miss; never panics.
     pub fn add(&mut self, key: K, delta: &R) {
-        // If the incoming record is all-zero, skip the allocation entirely.
         if delta.is_zero() {
             return;
         }
@@ -326,8 +281,7 @@ where
         out
     }
 
-    /// Subtract a previously-drained snapshot. Buckets that go all-zero
-    /// after subtraction are removed from the map.
+    /// Subtract a drained snapshot; emptied buckets are removed.
     pub fn confirm(&mut self, snapshot: &HashMap<K, R>) {
         for (k, snap) in snapshot {
             let Some(current) = self.map.get_mut(k) else {
@@ -492,8 +446,7 @@ mod tests {
 
     #[test]
     fn record_buffer_drain_skips_all_zero_buckets() {
-        // Two-step: write something, then write its negation. End state
-        // has the bucket allocated but all-zero. drain must skip it.
+        // A write and its negation leave an allocated all-zero bucket.
         let mut buf: RecordDeltaBuffer<&'static str, TwoField> = RecordDeltaBuffer::new();
         buf.add("k", &TwoField { a: 5.0, b: 3.0 });
         buf.add("k", &TwoField { a: -5.0, b: -3.0 });

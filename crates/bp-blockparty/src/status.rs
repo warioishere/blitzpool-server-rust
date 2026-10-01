@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `BlockpartyStatus` — the party lifecycle FSM.
-//!
-//! Wire format matches the kebab-strings stored in the `status`
-//! column: `draft` → `confirming` → `ready` → `active` → `dissolved`.
+//! Party lifecycle: `draft` → `confirming` → `ready` → `active` →
+//! `dissolved`, stored as these strings in the `status` column.
 
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
@@ -30,23 +28,19 @@ impl BlockpartyStatus {
         }
     }
 
-    /// `true` for the two statuses that route shares into a Blockparty
-    /// coinbase. Shares from any other status fall through to whatever
-    /// mode resolves next (member can still mine in their own mode).
+    /// Shares go into the Blockparty coinbase; otherwise they fall through
+    /// to the next mode.
     pub const fn is_routable(self) -> bool {
         matches!(self, Self::Ready | Self::Active)
     }
 
-    /// `true` for the two statuses where admin-side shares route 100%
-    /// to the pool-fee address instead of falling through to solo. Keeps
-    /// the admin from pocketing the entire reward via the solo fallback
-    /// before all members confirm the split.
+    /// The admin's blocks pay 100 % to the pool fee, so the admin cannot
+    /// pocket the reward via solo before all members confirm the split.
     pub const fn is_pending_fee_route(self) -> bool {
         matches!(self, Self::Draft | Self::Confirming)
     }
 
-    /// `true` for the three statuses where the admin may add/remove
-    /// members or change splits.
+    /// The admin may change members or splits.
     pub const fn is_editable(self) -> bool {
         matches!(self, Self::Draft | Self::Confirming | Self::Ready)
     }

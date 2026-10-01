@@ -5,28 +5,9 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! Integration tests for the PPLNS bulk-write primitives.
-//!
-//! Gated on a local docker-PG at
-//! `postgres://postgres:postgres@localhost:15433/public_pool` (override
-//! with `BP_PG_URL`). Tests skip cleanly via `eprintln!` + early return
-//! if the instance isn't reachable.
-//!
-//! Each test wraps its writes in a transaction it then ROLLBACKs, so
-//! parallel test runs don't interfere and the production-schema-loaded
-//! container stays clean.
-//!
-//! Spin up the container with:
-//!
-//! ```sh
-//! docker run -d --name blitzpool-rust-pg --rm \
-//!     -p 15433:5432 \
-//!     -e POSTGRES_DB=public_pool \
-//!     -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
-//!     postgres:18
-//! ```
-//! and build the schema with
-//! `cargo sqlx migrate run --source crates/bp-db/migrations`.
+//! Integration tests for the PPLNS bulk-write primitives, against the local
+//! test PG on port 15433 (override with `BP_PG_URL`); they skip when it is
+//! unreachable. Each test rolls its transaction back.
 
 use bp_db::{
     bulk_insert_pplns_payout_history, bulk_update_pplns_last_accepted_share_at,
@@ -260,10 +241,8 @@ async fn bulk_insert_payout_history_idempotent_on_unique_collision() {
 
 #[tokio::test]
 async fn bulk_insert_payout_history_handles_negative_block_height_for_sweep() {
-    // The dust-sweep cron writes audit rows with synthetic
-    // `blockHeight = -unix_seconds` so the UNIQUE constraint catches
-    // intra-sweep replays without colliding with real blocks. Verify the
-    // primitive accepts negative heights.
+    // Dust-sweep audit rows use `blockHeight = -unix_seconds` so they never
+    // collide with real blocks.
     let pool = match connect_or_skip().await {
         Some(p) => p,
         None => return,
@@ -288,9 +267,7 @@ async fn bulk_insert_payout_history_handles_negative_block_height_for_sweep() {
 
 #[tokio::test]
 async fn apply_distribution_tx_atomicity_rollback_undoes_both_writes() {
-    // Verifies the contract bp-pplns-engine relies on: a TX that
-    // wraps a balance-upsert + a history-insert rolls BOTH back if the
-    // caller aborts.
+    // A balance upsert and a history insert in one TX roll back together.
     let pool = match connect_or_skip().await {
         Some(p) => p,
         None => return,

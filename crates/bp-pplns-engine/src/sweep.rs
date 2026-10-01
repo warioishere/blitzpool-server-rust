@@ -1,42 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Daily 03:00 UTC dust-sweep — pair-cancel abandoned credits against open
-//! debits in the PPLNS signed ledger. The inactivity window judges the credit
-//! side only; step 1 below says why.
-//!
-//! Algorithm:
-//!
-//! 1. Load every open row (`bp_db::find_pplns_balances_with_open_balance`,
-//!    the same read the distribution builder uses) and keep, on the
-//!    credit side, only rows whose `lastAcceptedShareAt` is older than
-//!    `abandoned_days`. Debits stay whatever their age: a debit is the
-//!    counterparty, and it belongs by construction to someone who was
-//!    mining when the credit was withheld. That filter lives in
-//!    `sweep_pairs` and nowhere else — the query does not repeat it.
-//! 2. Split: credits (balance > 0, desc) ↔ debits (balance < 0,
-//!    abandoned first, then by absolute value desc).
-//! 3. Walk greedy: for each pair `amount = min(credit, |debit|)`.
-//!    Write 2 audit rows to `pplns_payout_history` (same `blockHeight`
-//!    so an operator can group them) + update both balance rows, down to
-//!    0 where a side cancels out. Rows are never deleted — see
-//!    `apply_pair_tx` for why. One PG transaction per pair; on failure,
-//!    skip and let the next sweep retry.
-//! 4. Σ balances stays 0: each pair cancels `+X` ↔ `-X`. No silent
-//!    drift toward fee or other miners — the pool is non-custodial,
-//!    the physical sats already live on-chain.
-//!
-//! `blockHeight` slot: synthetic `-now_unix_seconds`. Two reasons:
-//! - audit rows aren't associated with a real block; a negative value
-//!   can't be confused with a real block height
-//! - the `UNIQUE(blockHeight, address)` index would otherwise reject
-//!   the second pair-cancel of the same address (e.g. if a debit pairs
-//!   against two smaller credits across iterations). Sweep keeps a
-//!   monotonic counter so sub-second re-triggers stay unique too.
-//!
-//! PPLNS only: Group-Solo keeps no ledger, so it has nothing to sweep.
-//!
-//! Clock abstraction lets `TestClock` step time deterministically in
-//! unit tests, same pattern as `bp-vardiff::Clock`.
+//! Daily 03:00 UTC dust-sweep: pair-cancel abandoned PPLNS credits against open
+//! debits, one transaction per pair, so Σ balances stays 0 and nothing drifts
+//! to the fee or other miners. Audit rows get a synthetic negative, unique
+//! `blockHeight`. PPLNS only: Group-Solo keeps no ledger.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,11 +22,9 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-// Re-exported so callers can take the cron primitives from
-// `bp_pplns_engine::sweep`.
 pub use bp_cron_utils::{next_3am_utc, Clock, SystemClock, TestClock};
 
-/// Wire string for the `rowType` column on sweep-emitted history rows.
+/// `rowType` of sweep-emitted history rows.
 pub const ROW_TYPE_SWEEP: &str = "dust-sweep";
 
 // ── Errors + stats ──────────────────────────────────────────────────
@@ -72,24 +37,18 @@ pub enum SweepError {
     Sqlx(#[from] sqlx::Error),
 }
 
-/// Result of one sweep run.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SweepStats {
-    /// Number of balance rows that participated in a successful pair
-    /// (typically 2 × number of pairs; 1 per side).
+    /// Balance rows touched by a successful pair: two per pair.
     pub pairs_closed: u32,
-    /// Σ paired amount in sats (one side, not double-counted).
+    /// Counted on one side only.
     pub sats_paired: i64,
-    /// Remaining credit rows that didn't find a counterparty this run.
     pub unpaired_credits: u32,
-    /// Remaining debit rows.
     pub unpaired_debits: u32,
 }
 
 // ── Runner ──────────────────────────────────────────────────────────
 
-/// Daily-sweep orchestrator. Cheap-clone (each field is an `Arc` or
-/// `Clone`-cheap config).
 #[derive(Clone)]
 pub struct DustSweepRunner<C: Clock> {
     pool: PgPool,
@@ -113,8 +72,6 @@ impl<C: Clock> DustSweepRunner<C> {
         crate::config::abandoned_cutoff_ms(now_ms, self.abandoned_days)
     }
 
-    /// Run one sweep. Public so tests + admin endpoints can trigger
-    /// without waiting for the daily cron.
     pub async fn sweep(&self) -> Result<SweepStats, SweepError> {
         let now = self.clock.now();
         let now_ms = now.timestamp_millis();
@@ -123,10 +80,7 @@ impl<C: Clock> DustSweepRunner<C> {
         self.sweep_pairs(candidates, now_ms, now).await
     }
 
-    /// Algorithm split out so tests can feed synthetic candidates. Public
-    /// because an integration test cannot reach a private item, and a
-    /// candidate list that is already stale when the pairing runs is only
-    /// reachable by supplying the list.
+    /// Public so a test can feed a candidate list that is already stale.
     pub async fn sweep_pairs(
         &self,
         candidates: Vec<PplnsBalanceRow>,
@@ -138,14 +92,9 @@ impl<C: Clock> DustSweepRunner<C> {
             .filter(|r| r.balance_sats.0 != 0)
             .partition(|r| r.balance_sats.0 > 0);
 
-        // Credits: largest first. Filtered below, before anything is written.
         credits.sort_by_key(|r| std::cmp::Reverse(r.balance_sats.0));
-        // Debits: ABANDONED ones first, then most-negative, so a credit
-        // closes a dead debit before a still-mining miner's larger one.
-        //
-        // A live row is still touched when the dead ones cannot absorb the
-        // whole credit. That is correct: the debt is owed either way, and
-        // leaving the credit open would defeat the run.
+        // Abandoned debits first, so a credit closes a dead debit before a
+        // live miner's; a live debit is still used when needed, it is owed anyway.
         let cutoff_ms = self.cutoff_ms(now_ms);
         let is_abandoned = |r: &PplnsBalanceRow| {
             r.last_accepted_share_at
@@ -153,10 +102,8 @@ impl<C: Clock> DustSweepRunner<C> {
         };
         debits.sort_by_key(|r| (!is_abandoned(r), r.balance_sats.0));
 
-        // Writing off a claim needs the owner to be gone, and this is the
-        // ONE place that is checked: the read hands over every open row,
-        // live credits included. A debit needs no such test — it is the
-        // counterparty, not the claim being written off.
+        // The ONE place the owner of a written-off credit is checked to be
+        // gone; the read returns live credits too. Debits are the counterparty.
         credits.retain(is_abandoned);
 
         if credits.is_empty() || debits.is_empty() {
@@ -201,8 +148,7 @@ impl<C: Clock> DustSweepRunner<C> {
                 )
                 .await
             {
-                // A row moved since the run started — the pair rolled back
-                // whole. Leave both alone; the next run reads fresh values.
+                // A row moved since the read; the next run sees fresh values.
                 Ok(false) => {
                     warn!(
                         credit = credit_addr.as_str(),
@@ -251,22 +197,10 @@ impl<C: Clock> DustSweepRunner<C> {
         Ok(stats)
     }
 
-    /// One pair-cancel TX: insert 2 audit rows + update both balance rows.
-    /// Both writes commit or both roll back.
-    ///
-    /// Returns `Ok(false)` when a row no longer holds the value this pair
-    /// was computed from — the whole transaction rolls back and the caller
-    /// leaves the pair alone.
-    ///
-    /// **Why the guard.** `sweep_pairs` reads its candidates ONCE per run,
-    /// so its view of every not-yet-processed row can be stale. Writing the
-    /// computed absolute anyway would undo whatever moved the row (the
-    /// block-found settlement targets the same balance-only rows), and a
-    /// stale `amount` could drive a shrunken credit negative.
-    ///
-    /// **Lock order.** Both rows are touched smallest-address-first, the
-    /// same order `bp_db::find_pplns_balances_for_addresses_locked` takes
-    /// them in, so two transactions on the same two rows cannot deadlock.
+    /// One pair-cancel: two audit rows plus both balances, all or nothing.
+    /// `Ok(false)` if a row moved since the read: a stale write would undo a
+    /// settlement or drive a credit negative. Rows are locked smallest address
+    /// first, like `bp_db::find_pplns_balances_for_addresses_locked`, so no deadlock.
     #[allow(clippy::too_many_arguments)] // scalar args are tightly coupled; grouping struct adds boilerplate
     async fn apply_pair_tx(
         &self,
@@ -305,25 +239,19 @@ impl<C: Clock> DustSweepRunner<C> {
         )
         .await?;
 
-        // Ascending address order — see the lock-order note above.
         let mut sides = [
             (credit_addr, old_credit, new_credit),
             (debit_addr, old_debit, new_debit),
         ];
         sides.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
         for (addr, expected, new_balance) in sides {
-            // Always an UPDATE, including down to 0, never a DELETE: the row
-            // is the only home of `totalPaidSats` (and `lastAcceptedShareAt`),
-            // and nothing would restore that lifetime payout. A zero row is
-            // inert — the candidate query filters `balanceSats <> 0` and the
-            // distribution build skips a zero balance.
+            // UPDATE to 0, never DELETE: the row is the only home of
+            // `totalPaidSats` and `lastAcceptedShareAt`; a zero row is inert.
             let applied =
                 update_pplns_balance_sats_if_unchanged(&mut *tx, addr, expected, new_balance)
                     .await?;
             if !applied {
-                // Someone settled this row since the run started. Roll the
-                // pair back whole — including its two audit rows, which
-                // would otherwise claim a cancel that did not happen.
+                // Roll back the audit rows too: the cancel did not happen.
                 drop(tx);
                 return Ok(false);
             }
@@ -336,22 +264,8 @@ impl<C: Clock> DustSweepRunner<C> {
 
 // ── Daily 03:00-UTC loop ────────────────────────────────────────────
 
-/// Spawn the daily-sweep background task.
-///
-/// Loop body:
-/// 1. compute `next_3am_utc` from the clock's current `now()`
-/// 2. `tokio::time::sleep_until(next_3am)` (or watch the cancel
-///    channel — whichever fires first)
-/// 3. run `runner.sweep()`; log result; loop
-///
-/// On cancel: drops without running a final sweep. The next process
-/// start will pick up at the next 3am tick.
-///
-/// Note: this uses wall-clock sleep, NOT clock-trait sleep. The
-/// `Clock` parameter only feeds the *cutoff math* inside `sweep()`.
-/// For tests that want to step the cron tick, call `runner.sweep()`
-/// directly with a `TestClock`. Spawning the real background task is
-/// covered by an `--ignored`-or-skip integration test.
+/// Spawn the daily-sweep task. It sleeps on the wall clock; the `Clock` only
+/// feeds the cutoff math, so tests call `runner.sweep()` with a `TestClock`.
 pub fn spawn_daily_task<C: Clock>(
     runner: DustSweepRunner<C>,
     enabled: bool,
@@ -391,6 +305,3 @@ pub fn spawn_daily_task<C: Clock>(
         }
     })
 }
-
-// Clock / TestClock / next_3am_utc / BlockHeightGen are tested in
-// `bp-cron-utils`.

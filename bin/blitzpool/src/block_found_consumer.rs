@@ -1,25 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Satellite-side block-found stream consumer.
-//!
-//! The Core submits the block + writes the durable `blocks_entity` record, then
-//! publishes a [`BlockFoundEvent`] onto the block-found stream. Two independent
-//! consumers drain it, each on its own group (see [`BlockFoundAction`]):
-//!
-//! - `Ledger` (the `payout` role) runs [`BlockFoundApplier::apply_block_found`]
-//!   — the per-mode engine ledger-write + PPLNS confirmation-gate. The event is
-//!   fully Core-stamped (mode / group_id / height), so it needs no mode gate
-//!   and no bitcoin RPC.
-//! - `Notify` (the `notify` role) runs [`BlockFoundApplier::notify_block_found`]
-//!   — the dispatcher fan-out only. Split out so a notification change redeploys
-//!   `notify` without restarting `payout`. A back holding both roles consumes
-//!   both groups; the front produces the event and consumes neither.
-//!
-//! Block-found is rare + both sides are idempotent (the ledger via PG `UNIQUE`
-//! constraints + the PPLNS pending store keyed by block hash; the notify via a
-//! duplicate push being cosmetic), so a single consumer per group with
-//! at-least-once delivery is enough: a crash before `XACK` redelivers and the
-//! reprocess is harmless.
+//! Satellite-side consumer of the Core's [`BlockFoundEvent`] stream, one
+//! group per [`BlockFoundAction`]. The event is fully Core-stamped, so no mode
+//! gate or RPC is needed. Delivery is at-least-once: the ledger is idempotent
+//! (PG `UNIQUE`, pending store keyed by hash), a duplicate push is cosmetic.
 
 use async_trait::async_trait;
 use bp_share_stream::{
@@ -144,8 +128,7 @@ mod tests {
         }
     }
 
-    /// `notify_block_found` with no dispatcher is a no-op — the `payout` ledger
-    /// applier (dispatcher = None) must never try to notify. Pure, no I/O.
+    /// `notify_block_found` without a dispatcher is a no-op.
     #[tokio::test]
     async fn notify_is_noop_without_dispatcher() {
         let ledger = BlockFoundApplier::new(None, None, None, None, None, None);
@@ -185,9 +168,7 @@ mod tests {
         got
     }
 
-    /// Over real Redis + PG: one block-found event is delivered to and acked
-    /// on both groups independently, `notify` running the dispatcher fan-out
-    /// and `satellite` the ledger apply (Solo → no-op).
+    /// One event is delivered to and acked on both groups independently.
     #[tokio::test]
     async fn block_found_dual_group_routes_ledger_and_notify() {
         let Some(redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 10).await else {

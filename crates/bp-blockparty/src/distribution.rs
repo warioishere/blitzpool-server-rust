@@ -1,25 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Pure-function payout split for Blockparty groups.
-//!
-//! Phases:
-//!   1. `basePoolFee = floor(reward * poolFeePercent / 100)`
-//!   2. `minerCut    = reward − basePoolFee`
-//!   3. per member   `floor(minerCut * percentBp / 10000)`
-//!   4. sub-threshold members (nominal < max(min_payout, DUST)) →
-//!      `sats=0`, `trimmed=true`; their nominal share rolls into the
-//!      pool-fee output (no carry-forward, no dust pending).
-//!   5. rounding leftover (`reward − Σ paid`) → folded into the pool-
-//!      fee output so total outputs == reward exactly.
-//!
-//! Inputs are trusted: the service layer enforces `Σ percentBp == 10000`.
-//! A mis-summed input under/over-pays; the residual lands in pool-fee.
+//! Blockparty payout split. Members get `floor(minerCut * percentBp / 10000)`
+//! of the reward minus the base fee; a share below the dust floor is trimmed
+//! into the pool-fee output (no carry-forward), as is the rounding leftover,
+//! so outputs sum to the reward exactly. `Σ percentBp == 10000` is trusted.
 
 use bp_common::{AddressId, Sats, DUST_LIMIT_SATS};
 use serde::{Deserialize, Serialize};
 
-/// One coinbase output of a party's split: address + on-chain sats +
-/// percent of the block reward.
+/// One coinbase output of a party's split.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CoinbaseDistributionEntry {
     pub address: AddressId,
@@ -27,16 +16,14 @@ pub struct CoinbaseDistributionEntry {
     pub sats: Sats,
 }
 
-/// One member's split contribution to a block. Persisted as-is into
-/// the `blockparty_block_history.splits` JSONB column.
+/// Persisted as-is into `blockparty_block_history.splits` (JSONB).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockpartySplitSnapshot {
     pub address: String,
     pub percent_bp: i32,
     pub sats: i64,
-    /// `true` when this member's nominal share fell below the dust
-    /// floor and was rolled into pool-fee. `sats` is then 0.
+    /// Below the dust floor and rolled into the pool fee; `sats` is 0.
     #[serde(default, skip_serializing_if = "is_false")]
     pub trimmed: bool,
 }
@@ -45,9 +32,6 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// One member's input to the distribution. Borrowed `address` so the
-/// caller's `BlockpartyMemberRow.address: AddressId` can be passed
-/// without cloning.
 #[derive(Copy, Clone, Debug)]
 pub struct BlockpartyMemberInput<'a> {
     pub address: &'a AddressId,
@@ -62,15 +46,15 @@ pub struct BlockpartyDistributionInput<'a> {
     pub pool_fee_address: Option<&'a AddressId>,
     /// Decimal percent, e.g. `2.0` for 2 %.
     pub pool_fee_percent: f64,
-    /// Operational dust floor. Clamped to ≥ `DUST_LIMIT_SATS` at runtime.
+    /// Clamped to at least `DUST_LIMIT_SATS`.
     pub min_payout_sats: Sats,
 }
 
 #[derive(Clone, Debug)]
 pub struct BlockpartyDistributionResult {
-    /// Per-member breakdown — one entry per input member, same order.
+    /// One entry per input member, same order.
     pub splits: Vec<BlockpartySplitSnapshot>,
-    /// Final pool-fee output sats (base fee + trimmed amounts + rounding).
+    /// Base fee plus trimmed amounts plus rounding.
     pub pool_fee_sats: Sats,
     /// Coinbase outputs, pool fee first then non-trimmed members.
     pub payouts: Vec<CoinbaseDistributionEntry>,
@@ -88,7 +72,6 @@ pub fn build_blockparty_distribution(
         };
     }
 
-    // Empty members → whole reward to pool fee. Skip output if no addr.
     if input.members.is_empty() {
         let payouts = match input.pool_fee_address {
             Some(addr) => vec![CoinbaseDistributionEntry {
@@ -107,14 +90,11 @@ pub fn build_blockparty_distribution(
 
     let dust = input.min_payout_sats.0.max(DUST_LIMIT_SATS as i64);
 
-    // Phase 1+2 — base fee + miner cut. f64 floor stays accurate at
-    // canonical reward sizes (≤ 51.2 BTC = 5.12e9 sats) since the
-    // product fits well within f64's 53-bit integer window.
+    // The f64 floor stays accurate: at real reward sizes the product fits
+    // well inside f64's 53-bit integer range.
     let base_pool_fee = ((reward as f64 * input.pool_fee_percent) / 100.0).floor() as i64;
     let miner_cut = reward - base_pool_fee;
 
-    // Phase 3+4 — per-member floor. i128 multiply is integer-exact and
-    // free since miner_cut * percent_bp ≤ 5.12e9 * 10_000 = 5.12e13.
     let mut splits = Vec::with_capacity(input.members.len());
     let mut paid_to_members: i64 = 0;
     for m in input.members {
@@ -135,7 +115,6 @@ pub fn build_blockparty_distribution(
 
     let pool_fee = reward - paid_to_members;
 
-    // Reserve worst-case: fee + every member non-trimmed.
     let mut payouts = Vec::with_capacity(input.members.len() + 1);
     if pool_fee > 0 {
         if let Some(addr) = input.pool_fee_address {
@@ -293,9 +272,8 @@ mod tests {
 
     #[test]
     fn uses_dust_limit_as_effective_floor_when_min_payout_is_lower() {
-        // minPayout=100 but DUST=546. A 490-sat output must still trim
-        // (Bitcoin relay policy floor). reward=50_000, fee=2% → miner_cut=49_000,
-        // 1% of that = 490 < 546.
+        // 1% of a 49_000 miner cut is 490 sats: above min_payout=100 but
+        // below the 546-sat relay dust floor, so it must still trim.
         let reward = 50_000i64;
         let a = addr("bc1qaaaaa");
         let b = addr("bc1qbbbbb");
@@ -324,8 +302,7 @@ mod tests {
             percent_bp: 10_000,
         }];
         let r = build_blockparty_distribution(input(&members, None, reward, 2.0, 5_000));
-        // No fee output emitted; sum of payouts < reward (the 2% base
-        // fee is silently absorbed by the caller).
+        // No fee output; the caller absorbs the base fee.
         assert_eq!(r.payouts.len(), 1);
         assert_eq!(r.payouts[0].address, a);
     }

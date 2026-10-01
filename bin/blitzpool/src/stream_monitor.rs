@@ -2,11 +2,8 @@
 
 //! Core-side consumer-lag monitor for the Core→Satellite streams.
 //!
-//! Runs on the always-on producing front, because a Satellite that is behind
-//! or down cannot reliably monitor itself. Each consumer group's `lag`
-//! (entries added but not yet delivered) is sampled; over budget it warns,
-//! so an operator can act before the stream's `MAXLEN` trims entries that
-//! were never consumed.
+//! Runs on the producing front, because a Satellite that is behind or down
+//! cannot monitor itself; it warns before `MAXLEN` trims unconsumed entries.
 
 use std::time::Duration;
 
@@ -17,14 +14,12 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-/// How often to sample the streams. New entries arrive at the share rate;
-/// a 30s sample is plenty to catch a sustained backlog without polling churn.
+/// Enough to catch a sustained backlog without polling churn.
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Per-group lag (undelivered entries) for one stream at one sample. `lag` is
-/// `None` when Redis can't compute it — which happens exactly when the stream
-/// was trimmed below the group's last-read id (the probable-entry-loss case),
-/// so `None` is treated as alarming, not as `0`.
+/// Per-group lag for one stream. `lag` is `None` when the stream was trimmed
+/// below the group's last-read id (probable entry loss), so it is alarming,
+/// never `0`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LagReport {
     pub(crate) stream: String,
@@ -33,20 +28,16 @@ pub(crate) struct LagReport {
     pub(crate) pending: usize,
 }
 
-/// Classification of one lag sample against the budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LagStatus {
-    /// Lag known and within budget.
     Ok,
-    /// Lag known and over budget — the satellite is behind or down.
+    /// The satellite is behind or down.
     OverBudget,
-    /// Lag unavailable — the stream was trimmed below the group offset, which
-    /// means entries were almost certainly lost. Alarming precisely because the
-    /// plain lag number would read `0` here.
+    /// Stream trimmed below the group offset: entries were almost certainly
+    /// lost, while a plain lag number would read `0`.
     Unknown,
 }
 
-/// Classify a lag sample. `None` → [`LagStatus::Unknown`] (never silently `0`).
 pub(crate) fn classify(lag: Option<usize>, budget: usize) -> LagStatus {
     match lag {
         None => LagStatus::Unknown,
@@ -55,7 +46,6 @@ pub(crate) fn classify(lag: Option<usize>, budget: usize) -> LagStatus {
     }
 }
 
-/// Live monitor task + its cancel token.
 pub(crate) struct StreamMonitorHandle {
     task: JoinHandle<()>,
     cancel: CancellationToken,
@@ -70,8 +60,6 @@ impl StreamMonitorHandle {
     }
 }
 
-/// Spawn the lag monitor over the given stream keys, warning when any
-/// group's lag exceeds `lag_budget`.
 pub(crate) fn spawn(
     redis: ConnectionManager,
     keys: Vec<&'static str>,
@@ -89,9 +77,8 @@ pub(crate) fn spawn(
                 _ = task_cancel.cancelled() => break,
                 _ = tick.tick() => {
                     for report in collect_lag(&redis, &keys).await {
-                        // Export before classifying: the gauges must reflect
-                        // every sample, and `lag = None` drops the
-                        // `_computable` gauge to 0 (the alertable blind spot).
+                        // Every sample is exported: `lag = None` drops the
+                        // `_computable` gauge to 0, which is what alerts fire on.
                         bp_metrics::set_stream_consumer_lag(
                             &report.stream,
                             &report.group,
@@ -129,9 +116,7 @@ pub(crate) fn spawn(
     StreamMonitorHandle { task, cancel }
 }
 
-/// Sample every consumer group's lag across the given streams. A stream
-/// with no entries / no groups yet (`XINFO GROUPS` errors with no-such-key,
-/// or returns no groups) simply contributes nothing this round.
+/// A stream with no entries or no groups yet contributes nothing.
 pub(crate) async fn collect_lag(redis: &ConnectionManager, keys: &[&str]) -> Vec<LagReport> {
     let mut out = Vec::new();
     for key in keys {
@@ -146,9 +131,7 @@ pub(crate) async fn collect_lag(redis: &ConnectionManager, keys: &[&str]) -> Vec
             out.push(LagReport {
                 stream: (*key).to_string(),
                 group: g.name,
-                // `None` when the stream was trimmed below the group's
-                // last-read id. Not coerced to 0: it is the entry-loss
-                // signal, see [`classify`].
+                // Not coerced to 0: `None` is the entry-loss signal.
                 lag: g.lag,
                 pending: g.pending,
             });
@@ -192,8 +175,7 @@ mod tests {
         assert_eq!(reports[0].lag, Some(4), "all 4 entries are undelivered");
     }
 
-    /// `lag = None` (stream trimmed below the group offset, probable entry
-    /// loss) classifies as `Unknown`, never as ok.
+    /// `lag = None` classifies as `Unknown`, never as ok.
     #[test]
     fn classify_treats_none_as_unknown_not_ok() {
         assert_eq!(classify(None, 100), LagStatus::Unknown);

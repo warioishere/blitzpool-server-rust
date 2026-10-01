@@ -111,11 +111,8 @@ pub async fn find_best_difficulty_trackers_for_addresses(
     .map_err(DbError::from)
 }
 
-/// Bulk-upsert tracker rows in one statement. `addresses[i]` pairs with
-/// `best_difficulties[i]`; `now_ms` is written to `lastCheckedAt` (and,
-/// for new rows, `createdAt`/`updatedAt`). On conflict the best, the
-/// check-timestamp, and `updatedAt` are overwritten — `createdAt` is
-/// preserved.
+/// Bulk-upsert tracker rows in one statement; `addresses[i]` pairs with
+/// `best_difficulties[i]`. On conflict `createdAt` is preserved.
 pub async fn upsert_best_difficulty_trackers(
     pool: &PgPool,
     addresses: &[String],
@@ -152,13 +149,9 @@ pub struct HighScoreRow {
     pub best_difficulty_user_agent: Option<String>,
 }
 
-/// Top-10 by `allTimeBestDifficulty DESC` from `address_settings_entity`.
-///
-/// Deliberately NOT `"bestDifficulty"`: that column is the miner's own,
-/// resettable value, and a reset must not remove the miner's public entry.
-/// The all-time column is written by the same upsert (see
-/// [`crate::bulk_upsert_address_settings`]) and is never lowered by any
-/// reset or delete path.
+/// Top-10 by `allTimeBestDifficulty`, deliberately not `"bestDifficulty"`:
+/// that one is resettable, and a reset must not remove the public entry.
+/// Written by [`crate::bulk_upsert_address_settings`], never lowered.
 pub async fn find_high_scores(pool: &PgPool) -> Result<Vec<HighScoreRow>, DbError> {
     #[derive(FromRow)]
     struct Raw {
@@ -198,21 +191,10 @@ fn epoch_ms_to_iso(ms: i64) -> Option<String> {
         .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
-/// Reset a miner's own best difficulty to zero: the
-/// `address_settings_entity` value, its user-agent hint, and the
-/// notification dedup baseline in `best_difficulty_tracker_entity`.
-/// Idempotent: a missing row returns `affected = 0`, a missing tracker
-/// row deletes nothing.
-///
-/// `"allTimeBestDifficulty"` is deliberately NOT touched — that is the
-/// pool's public record (`/api/info` → `highScores`), and it survives
-/// every reset by design.
-///
-/// The tracker delete lives here so the API endpoint and the
-/// `/bestdiff_reset` bot command leave the same state behind. Callers must
-/// also clear the live session bests
-/// (`bp_client_live::clear_address_best_difficulty`), which stays outside
-/// because it needs Redis.
+/// Reset a miner's own best difficulty and its notification baseline, so the
+/// API and the bot command leave the same state. `"allTimeBestDifficulty"`
+/// (the public record) is never touched. Callers must also clear the Redis
+/// session bests (`bp_client_live::clear_address_best_difficulty`).
 pub async fn reset_address_settings_best_difficulty(
     pool: &PgPool,
     address: &AddressId,

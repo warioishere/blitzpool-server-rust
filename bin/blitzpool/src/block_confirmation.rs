@@ -1,18 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Confirmation watcher for confirmation-gated block-founds (PPLNS + Group-Solo).
-//!
-//! A found block parks its frozen payout in the Redis pending-store
-//! ([`crate::pending_blocks`], one shape for both modes). This task applies
-//! each parked block once it is `confirmation_depth` deep and discards one
-//! that orphaned, so the internal ledger never books a block the chain
-//! dropped. The on-chain coinbase payment is unaffected; only the internal
-//! accounting is gated. Blockparty is exempt: its payouts are fixed
-//! per-member percentages recomputed from the DB, so an orphan drifts nothing.
-//!
-//! [`classify_block`] and [`collect_confirmed`] are shared by both modes.
-//! Triggered by the TDP `SetNewPrevHash` broadcast plus a slow fallback
-//! timer; the per-block status comes from `getblockheader <hash>`.
+//! Confirmation watcher: applies a block parked in [`crate::pending_blocks`]
+//! (PPLNS and Group-Solo) once it is `confirmation_depth` deep and discards an
+//! orphan, so the ledger never books a block the chain dropped. Blockparty is
+//! exempt: its fixed percentages are recomputed from the DB, so orphans drift nothing.
 
 use std::time::Duration;
 
@@ -52,11 +43,9 @@ impl BlockConfirmationHandle {
     }
 }
 
-/// Spawn the confirmation watcher for whichever engines are present.
-///
-/// With a TDP feed, `SetNewPrevHash` wakes the watcher on a new tip. A
-/// Satellite passes `None` and relies on the fallback timer alone, which is
-/// correct, just coarser-grained.
+/// Spawn the confirmation watcher for whichever engines are present. A TDP
+/// `SetNewPrevHash` wakes it on a new tip; without a feed (Satellite) the
+/// fallback timer alone drives it.
 pub(crate) fn spawn(
     tdp: Option<TdpHandle>,
     bitcoin_rpc: BitcoinRpc,
@@ -201,11 +190,7 @@ async fn collect_confirmed(
 }
 
 /// Publish how deep the two parking stores are, and log when the unbookable
-/// one CHANGES.
-///
-/// The gauge is the standing signal for blocks whose miners are owed a ledger
-/// entry. Logging only on a change keeps a standing non-zero count from
-/// becoming a line every pass, which is how a real one gets ignored.
+/// one CHANGES: a standing non-zero count logged every pass gets ignored.
 async fn report_parked_depths(conn: &mut ConnectionManager, last_unbookable: &mut Option<u64>) {
     let pending = count_pending_at(conn, PENDING_KEY).await;
     let unbookable = count_pending_at(conn, UNBOOKABLE_KEY).await;
@@ -416,15 +401,9 @@ impl SettleError {
 }
 
 // ── Regtest: a declared block books what its coinbase actually paid ──
-//
-// The JDP sink, the engines and the confirmation watcher only meet inside
-// this binary (the hook traits keep `bp-stratum-v2` and the engines apart),
-// so this is where `book_declared_block_found`, the `emit_block_found`
-// fan-out and `reconcile` are driven together.
-//
-// It drives the PRODUCTION path: with Redis wired a block-found FREEZES the
-// distribution and parks it, and the ledger stays empty until the block is
-// `confirmation_depth` deep and `reconcile` applies it.
+// The JDP sink, the engines and the watcher only meet in this binary, so
+// `book_declared_block_found`, `emit_block_found` and `reconcile` are driven
+// together here, on the production park-then-confirm path.
 #[cfg(test)]
 mod declared_block_booking_regtest {
     use crate::block_sink::TdpBlockSubmissionSink;
@@ -1203,11 +1182,9 @@ mod declared_block_booking_regtest {
         c.teardown().await;
     }
 
-    /// A solution the pool could not hand to bitcoin-core never reached the
-    /// chain, so it must not be reported as a found block: no pending park,
-    /// no found-block row, no push. `submit_solution` fails when the TDP
-    /// worker is gone. Negative control first: with the worker alive the same
-    /// call DOES park the block.
+    /// A solution that never reached bitcoin-core (TDP worker gone) is not a
+    /// found block: no park, no row, no push. Negative control first: with the
+    /// worker alive the same call parks the block.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_solution_that_never_reached_core_is_not_reported_found() {
         let Some(c) = Chain::setup(DB_LOST_SUBMIT).await else {
@@ -1270,17 +1247,9 @@ mod declared_block_booking_regtest {
     }
 
     // ── Group-Solo: the same door, a different ledger ────────────────
-    //
-    // Group-Solo goes through the SAME `book_declared_block_found`, but
-    // diverges where the PPLNS tests put their assertions, so it has its own
-    // fixture:
-    //
-    // - it needs a group + members in PG
-    // - the mode gate must answer `group_solo(group_id)`, not `pplns()`
-    // - the builder takes `(group_id, reward, finder)` instead of `(reward)`
-    // - it writes `pplns_group_block_history` and **no ledger, no balances**:
-    //   Group-Solo pays what the coinbase pays and owes nothing afterwards,
-    //   so a double-apply has no balance to move.
+    // Same `book_declared_block_found`, own fixture: it needs a group in PG, a
+    // `group_solo` gate answer, and it writes `pplns_group_block_history` with
+    // no ledger and no balances.
 
     /// A real regtest chain with an accepted block whose coinbase pays a real
     /// Group-Solo distribution — everything up to, but not including, the
@@ -1722,13 +1691,8 @@ mod declared_block_booking_regtest {
     }
 
     /// Replay safety: a second apply never adds, removes or moves a booked row.
-    ///
-    /// What stops the replay is the SNAPSHOT LIFECYCLE, not the
-    /// `ON CONFLICT ... DO NOTHING` on the history insert: Group-Solo consumes
-    /// its weight snapshot at apply (PPLNS does not), so the second attempt
-    /// finds no settlement inputs and is refused before any row is written.
-    /// The test pins the OUTCOME rather than one mechanism, and carries a
-    /// genuinely different coinbase so an overwrite would be visible.
+    /// Pins the outcome, not the mechanism (the consumed weight snapshot), with
+    /// a different coinbase so an overwrite would be visible.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_second_apply_of_the_same_group_block_cannot_overwrite_it() {
         let Some(c) = GroupChain::setup(DB_GROUP_NO_OVERWRITE).await else {

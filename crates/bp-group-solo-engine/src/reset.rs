@@ -1,24 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Scheduled round-reset cron — fires per `pplns_group.roundResetPreset`
-//! + `roundResetTimezone` + `roundResetIntervalDays`.
-//!
-//! Presets (all fire at **00:00 in the group's TZ**):
-//! - `daily`     — every day
-//! - `weekly`    — Monday
-//! - `monthly`   — 1st of month
-//! - `custom`    — daily fire, gated by `roundResetIntervalDays`
-//!
-//! On fire, the runner wipes the full round state (total, by-address,
-//! rejected-shares, best-share, last-accepted-share-at, window keys and
-//! all per-finder snapshots; the dedup set survives) and stamps
-//! `lastRoundResetAt` to now. A 60-second guard on `lastRoundResetAt`
-//! prevents a double fire.
-//!
-//! `chrono-tz` ships the IANA TZ database compiled into the binary,
-//! so the calendar-boundary math is OS-independent. DST handling for
-//! `custom` uses a 12 h tolerance to absorb 23 h / 25 h daily-fire
-//! skew.
+//! Scheduled round-reset cron: fires at 00:00 in the group's TZ per
+//! `roundResetPreset` (daily, weekly on Monday, monthly on the 1st, or
+//! `custom` gated by `roundResetIntervalDays`). Wipes the full round except
+//! the dedup set and stamps `lastRoundResetAt`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,14 +22,12 @@ use uuid::Uuid;
 use crate::round::snapshot::delete_all_for_group;
 use crate::round::{GroupRoundStore, RoundError};
 
-/// 60-second anti-double-fire guard: a scheduled reset is skipped if
-/// the group was already reset within this window. Enforced via the
-/// `lastRoundResetAt` gate.
+/// A scheduled reset is skipped if `lastRoundResetAt` is this recent,
+/// so a double fire cannot wipe twice.
 pub const RESET_DEBOUNCE_MS: i64 = 60_000;
 
-/// DST-tolerance window for the `custom` preset elapsed-check. Across a
-/// DST transition a day is 23 h or 25 h, so without tolerance a
-/// 7-day-interval cron could miss its 7th daily fire.
+/// Slack on the `custom` elapsed-check: across DST a day is 23 h or 25 h,
+/// so without it an N-day cron could miss its Nth daily fire.
 pub const DST_TOLERANCE_MS: i64 = 12 * 60 * 60 * 1000;
 
 #[derive(Debug, Error)]
@@ -92,8 +75,7 @@ pub struct ResetSchedule {
     pub group_id: Uuid,
     pub preset: Preset,
     pub timezone: Tz,
-    /// Only meaningful for `Custom` preset. `None` for the calendar
-    /// presets.
+    /// Only meaningful for `Custom`.
     pub interval_days: Option<u32>,
 }
 
@@ -131,12 +113,8 @@ impl ResetSchedule {
 
 // ── Next-fire computation ───────────────────────────────────────────
 
-/// Compute the wall-clock UTC instant of the next scheduled reset
-/// strictly after `now`. `now` is in UTC; the calendar boundaries
-/// are computed in the schedule's TZ + converted back to UTC.
-///
-/// For calendar presets the result is the exact next calendar
-/// boundary. For `custom`, it's the first daily-fire at or after
+/// Next reset strictly after `now`, computed in the schedule's TZ. For
+/// `custom`, the first daily fire at or after
 /// `last_reset_at + interval - DST_TOLERANCE`.
 pub fn compute_next_fire(
     schedule: &ResetSchedule,
@@ -149,7 +127,6 @@ pub fn compute_next_fire(
         if let Some(last_ms) = last_reset_at_ms {
             let interval_ms = schedule.interval_days.unwrap_or(0) as i64 * 86_400_000;
             let earliest_ms = last_ms + interval_ms - DST_TOLERANCE_MS;
-            // Step through daily fires until one is ≥ earliest_ms.
             for _ in 0..(schedule.interval_days.unwrap_or(1) as i64 + 2) {
                 if candidate.timestamp_millis() >= earliest_ms {
                     break;
@@ -234,8 +211,7 @@ fn next_month_first_midnight(now: DateTime<Tz>) -> DateTime<Tz> {
 
 // ── Reset action ────────────────────────────────────────────────────
 
-/// Composes the reset operation across Redis + PG. NOT a single TX
-/// (Redis + PG can't be transactional together): the Redis state is
+/// Resets across Redis + PG, which cannot share a transaction: Redis is
 /// wiped first and the PG stamp comes last.
 pub struct GroupResetRunner<C: Clock> {
     pool: PgPool,
@@ -248,16 +224,14 @@ impl<C: Clock> GroupResetRunner<C> {
         Self { pool, round, clock }
     }
 
-    /// Run one scheduled reset for `group_id`. Returns `Ok(true)`
-    /// when the reset fired, `Ok(false)` when it was skipped by the
-    /// 60 s debounce guard.
+    /// Run one scheduled reset; `Ok(false)` when debounced or the custom
+    /// interval has not elapsed.
     pub async fn reset_scheduled(&self, group_id: Uuid) -> Result<bool, ResetError> {
         let group = find_group(&self.pool, group_id)
             .await?
             .ok_or(ResetError::GroupNotFound { group_id })?;
         let now_ms = self.clock.now().timestamp_millis();
 
-        // Debounce: a recent scheduled reset wins.
         if let Some(last) = group.last_round_reset_at {
             if now_ms - last < RESET_DEBOUNCE_MS {
                 debug!(
@@ -297,13 +271,10 @@ impl<C: Clock> GroupResetRunner<C> {
 
         let group_key = group_id.to_string();
 
-        // 1. Redis: wipe all round state INCLUDING last-accepted-share-at.
         self.round.reset_full(&group_key).await?;
-        // 2. Redis: drop every per-finder snapshot for this group.
         let mut conn = self.round.connection_for_snapshot();
         delete_all_for_group(&mut conn, &group_key).await?;
-        // 3. PG: stamp lastRoundResetAt so the 60s debounce on the
-        //    next cron tick reads the fresh value.
+        // Stamp last so the debounce on the next tick reads the fresh value.
         update_pplns_group_last_reset_at(&self.pool, group_id, now_ms).await?;
 
         info!(%group_id, "group-solo scheduled round-reset applied");
@@ -311,8 +282,7 @@ impl<C: Clock> GroupResetRunner<C> {
     }
 }
 
-// Manual Clone because the derive would require `C: Clone`; the Arc<C>
-// is cloned instead.
+// Manual Clone: the derive would require `C: Clone`.
 impl<C: Clock> Clone for GroupResetRunner<C> {
     fn clone(&self) -> Self {
         Self {
@@ -325,10 +295,8 @@ impl<C: Clock> Clone for GroupResetRunner<C> {
 
 // ── Background cron task ────────────────────────────────────────────
 
-/// Spawn a per-group cron task. The task sleeps until the next
-/// scheduled fire (calendar-aligned in the group's TZ), runs the
-/// reset, then loops. The schedule is captured at spawn time, so a
-/// group config change re-spawns the task (`reschedule_group`).
+/// Spawn a per-group cron that sleeps to the next fire, resets, loops. The
+/// schedule is captured at spawn, so a config change re-spawns the task.
 pub fn spawn_per_group_task<C: Clock>(
     runner: GroupResetRunner<C>,
     schedule: ResetSchedule,
@@ -344,8 +312,7 @@ pub fn spawn_per_group_task<C: Clock>(
             "spawned group-solo round-reset cron"
         );
         loop {
-            // Look up the latest lastResetAt so the next-fire calc
-            // matches the runner's debounce + custom-elapsed gates.
+            // Fresh lastResetAt so the next fire matches the runner's gates.
             let last_ms = match find_group(&runner.pool, group_id).await {
                 Ok(Some(g)) => g.last_round_reset_at,
                 Ok(None) => {
@@ -503,9 +470,7 @@ mod tests {
     #[test]
     fn next_fire_daily_in_zurich_tz() {
         let s = schedule(Preset::Daily, Zurich, None);
-        // Zurich is UTC+1 in winter, UTC+2 in summer (CET/CEST). On
-        // 2026-05-16 (CEST), 22:00 UTC = 00:00 next day local. So the
-        // next 00:00 local strictly after 12:00 UTC = today's 22:00 UTC.
+        // CEST: 00:00 local is 22:00 UTC the day before.
         let now = at_utc(2026, 5, 16, 12, 0);
         let next = compute_next_fire(&s, None, now);
         assert_eq!(next, at_utc(2026, 5, 16, 22, 0));
@@ -542,12 +507,8 @@ mod tests {
     fn next_fire_custom_with_recent_last_reset_skips_until_interval_elapsed() {
         let s = schedule(Preset::Custom, UTC, Some(7));
         let now = at_utc(2026, 5, 16, 12, 0);
-        // Last reset 2 days ago — must wait until 7d (minus 12h DST tolerance) elapses.
         let last_ms = (now - ChronoDuration::days(2)).timestamp_millis();
         let next = compute_next_fire(&s, Some(last_ms), now);
-        // Earliest fire ≈ last + 7d - 12h. Daily candidates step
-        // forward from next-midnight (2026-05-17 00:00) until they
-        // cross the threshold.
         let last_dt = now - ChronoDuration::days(2);
         let earliest = last_dt + ChronoDuration::days(7) - ChronoDuration::hours(12);
         assert!(
@@ -556,10 +517,8 @@ mod tests {
         );
     }
 
-    /// Chile springs forward at 24:00, so 2026-09-06 has no 00:00 in
-    /// America/Santiago (the clock jumps to 01:00). Asked on that very day,
-    /// the next fire is the following midnight. Precondition pinned first so
-    /// the test cannot pass on a tz database where that midnight exists.
+    /// On a day without 00:00 (Chile springs forward at 24:00) the next fire
+    /// is the following midnight; the precondition pins the gap exists.
     #[test]
     fn next_fire_on_a_day_without_midnight_does_not_panic() {
         use chrono_tz::America::Santiago;

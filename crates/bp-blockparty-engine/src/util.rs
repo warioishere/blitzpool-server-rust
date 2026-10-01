@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Service-private helpers. The address normalizer is a local wrapper so
-//! it can return a typed `BlockpartyServiceError` directly without a
-//! `.map_err` roundtrip at every call site; the rule itself is
-//! [`bp_common::normalize_btc_address`].
+//! Service-private helpers.
 
 use bp_common::AddressId;
 
@@ -19,8 +16,7 @@ mod tests {
     use super::normalize_address;
     use crate::error::BlockpartyServiceError;
 
-    /// The rule itself is tested in `bp_common`; this pins the wrapper's
-    /// own job — the normalized value comes through, a rejection becomes
+    /// Pins the wrapper: the normalized value passes, a rejection becomes
     /// this crate's error.
     #[test]
     fn wraps_the_shared_normalizer_in_this_crates_error() {

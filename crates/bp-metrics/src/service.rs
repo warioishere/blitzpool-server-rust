@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Spawn the Prometheus exporter HTTP listener + install the global
-//! recorder.
-//!
-//! # Lifecycle
-//!
-//! Exactly **one** `MetricsService::spawn` per process — the `metrics`
-//! crate uses a single global recorder, and the HTTP listener lives for
-//! the rest of the process.
+//! Prometheus exporter listener + global recorder. Exactly one
+//! `MetricsService::spawn` per process: the recorder is global and the
+//! listener lives for the rest of the process.
 
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tracing::{info, warn};
@@ -34,9 +29,7 @@ impl MetricsService {
     }
 }
 
-/// Handle to the running exporter. The HTTP listener task is detached
-/// and lives for the process lifetime (the global recorder is
-/// install-once anyway), so nothing needs dropping manually.
+/// Handle to the running exporter; the listener is detached and outlives it.
 #[derive(Clone, Debug)]
 pub struct MetricsServiceHandle {
     pub bind_addr: String,

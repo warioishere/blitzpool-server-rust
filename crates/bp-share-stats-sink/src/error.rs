@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Crate error type. Distinguishes DB-layer errors (`DbError` flowing
-//! up from `bp_db`) from configuration mistakes and the one-shot
-//! seed-bootstrap path's specific failure mode.
+//! Crate error type.
 
 use thiserror::Error;
 

@@ -3,27 +3,10 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! E2E: `GroupSoloEngine::build_distribution()` → multi-output coinbase
-//! (incl. finder bonus) → `bitcoin-node` accepts the block → the
-//! weight-model settlement books exactly what that coinbase paid.
-//!
-//! Companion to the PPLNS e2e in `bp-pplns-engine`. Verifies that the
-//! group-solo distribution (finder bonus folded into the finder's single
-//! §4 weight on top of the share-weighted split) produces a coinbase
-//! whose outputs sum to the block reward and pass consensus checks.
-//!
-//! What this covers beyond the PG-only integration tests:
-//!   - §4 projection drift (the payout vector not consuming exactly the
-//!     template revenue → `bad-cb-amount`)
-//!   - finder-bonus fold drift (bonus double-counted or lost in the
-//!     finder's single weight)
-//!   - a settlement that books a split the accepted coinbase did not pay
-//!
-//! Sequence: boot regtest, seed group row + three members in PG, seed
-//! round shares in Redis, build distribution for the finder address,
-//! feed the §4 payout vector into MiningJob, submit, assert tip
-//! advances, then book from the accepted coinbase and assert
-//! history == coinbase.
+//! E2E: a Group-Solo distribution with a folded finder bonus becomes a
+//! coinbase that bitcoin-node accepts, and the history books exactly what
+//! it paid. Catches §4 projection drift (`bad-cb-amount`), a lost or
+//! double-counted finder bonus, and a booked split the coinbase did not pay.
 
 use std::time::Duration;
 
@@ -72,13 +55,10 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
     let addr_fee = deterministic_p2wpkh_regtest([0x99; 32]);
 
     // ── Seed group row + members in PG ──────────────────────────
-    //
-    // `pplns_group_member` has UNIQUE(address), and a failed run can
-    // leave rows behind, so clean these deterministic addresses first.
+    // `pplns_group_member.address` is UNIQUE and a failed run can leave
+    // rows behind, so clean these deterministic addresses first.
     cleanup_member_rows(&pg, &[&addr_alice, &addr_bob, &addr_charlie]).await;
     let group_id = Uuid::new_v4();
-    // 3 200 ppm (0.32 %) finder bonus. A proportion, so the block's own
-    // revenue decides the amount and every payer arrives at the same number.
     let finder_bonus_ppm: i32 = 3_200;
     seed_group(&pg, group_id, &addr_alice, finder_bonus_ppm).await;
     seed_member(&pg, group_id, &addr_alice).await;
@@ -137,8 +117,6 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
         .expect("mine 1 more to force fresh NewTemplate");
     let (template, prev_hash) = wait_for_paired_template(&mut rx).await;
 
-    // ── Pick a finder (Alice in this test). build_distribution uses
-    //    the finder both for bonus crediting and for the cache key. ──
     let finder = AddressId::new(addr_alice.clone()).expect("finder addr valid");
     let reward_sats = template.coinbase_tx_value_remaining;
     let dist = engine
@@ -146,14 +124,8 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
         .await
         .expect("build_distribution");
     let fingerprint = dist.payouts_fingerprint();
-    // ── Exact-shape assertion (§4 evaluation at this revenue) ────
-    //
-    // For (group of 3 active members, fee_address set, finder bonus
-    // > min_payout), the §4 payout vector emits:
-    //   1× pool output first (fee_address)
-    //   3× share outputs (one per kept active member)
-    //   → 4 total entries. The finder bonus is FOLDED into Alice's
-    //     single weight; there is no dedicated bonus output.
+    // Pool output first, then one output per member: the finder bonus is
+    // folded into Alice's weight, never a separate output.
     let entries = dist
         .distribution
         .payout_entries_at(reward_sats)
@@ -183,9 +155,7 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
             "member {member} must appear in exactly one output (got {n})"
         );
     }
-    // The folded bonus must lift Alice (100 of 600 shares)
-    // visibly above pro-rata: without it she'd sit at exactly half of
-    // Bob's (200-share) output.
+    // Without the bonus Alice (100 shares) would get exactly half of Bob (200).
     let sats_of = |addr: &str| {
         entries
             .iter()
@@ -201,9 +171,7 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
          (alice={alice_sats}, bob={bob_sats}, bonus_ppm={finder_bonus_ppm})"
     );
 
-    // Bit-exact: the §4 vector must consume exactly the revenue
-    // (pay_P absorbs rounding). Less burns satoshis every block; more
-    // is rejected by bitcoin-core as `bad-cb-amount`.
+    // Less than the revenue burns sats; more is `bad-cb-amount`.
     let total_payout_sats: u64 = entries.iter().map(|(_, s)| *s).sum();
     assert_eq!(
         total_payout_sats, reward_sats,
@@ -219,8 +187,6 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
             sats: *s,
         })
         .collect();
-    // The job carries the distribution's settlement identity — the
-    // fingerprint a block found on it books through.
     let accepted = mine_and_submit_payouts(
         &node,
         &tdp,
@@ -235,9 +201,6 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
     let witness_coinbase = accepted.witness_coinbase;
 
     // ── Book from the REAL accepted coinbase ─────────────────────
-    //
-    // The history is written from the coinbase the chain accepted,
-    // resolved by the job's weights fingerprint.
     use bitcoin::consensus::Decodable;
     let coinbase_tx = bitcoin::Transaction::consensus_decode(&mut witness_coinbase.as_slice())
         .expect("submitted coinbase must decode");
@@ -309,9 +272,6 @@ async fn seed_group(pool: &PgPool, group_id: Uuid, creator: &str, finder_bonus_p
 }
 
 async fn seed_member(pool: &PgPool, group_id: Uuid, address: &str) {
-    // `pplns_group_member`: integer `id` is a serial, `joinedAt` has a
-    // default. Address is UNIQUE across the table (one membership per
-    // address at a time), hence `cleanup_member_rows` before seeding.
     sqlx::query(
         r#"INSERT INTO pplns_group_member ("groupId", address, role)
            VALUES ($1, $2, 'member')"#,
@@ -342,13 +302,9 @@ async fn cleanup_member_rows(pool: &PgPool, addrs: &[&str]) {
 
 fn test_engine_config(fee_addr: &str) -> GroupSoloEngineConfig {
     GroupSoloEngineConfig {
-        // Match production: a fee address (the §4 pool-output
-        // recipient) and a non-zero fee percent.
         fee_address: Some(AddressId::new(fee_addr.to_string()).expect("fee addr valid")),
         fee_percent: 1.5,
         min_payout_sats: Sats(DEFAULT_MIN_PAYOUT_SATS as i64),
         ..GroupSoloEngineConfig::default()
     }
 }
-
-// ── TDP + brute-force helpers (mirrored from sibling regtests) ──────

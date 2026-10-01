@@ -6,10 +6,7 @@
 const SUFFIXES: [&str; 11] = ["", "k", "M", "G", "T", "P", "E", "Z", "Y", "R", "Q"];
 
 /// Format `value` with a SI-style 1000-step suffix and 2 decimals.
-///
-/// - Negative / NaN inputs become `"0"`.
-/// - `value < 1000` returns `"<value>.00"` (no suffix).
-/// - Saturates at the largest known suffix (`Q` = quetta = 1e30).
+/// Negative / non-finite inputs become `"0"`; saturates at `Q` (1e30).
 pub fn format_number_suffix(value: f64) -> String {
     if !value.is_finite() || value < 0.0 {
         return "0".to_string();

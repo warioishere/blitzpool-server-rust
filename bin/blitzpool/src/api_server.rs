@@ -2,12 +2,8 @@
 
 //! bp-api HTTP listener.
 //!
-//! Builds the production [`AppState`] from the live foundation +
-//! engine + hook aggregates, then binds an `axum::serve` task on
-//! `[api] port`. `InvitationService` and `JoinRequestService` are
-//! constructed here (not in `engines::spawn`) because they compose
-//! the engine hooks for the API layer rather than being long-lived
-//! background services.
+//! `InvitationService` and `JoinRequestService` are built here, not in
+//! `engines::spawn`, because they only compose engine hooks for the API.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -35,18 +31,12 @@ pub(crate) enum ApiServerError {
     },
 }
 
-/// Long-lived handle returned by [`spawn`] — drop to cancel the
-/// listener task, or `await` the inner `JoinHandle` to surface a
-/// panic from inside the server.
 pub(crate) struct ApiServerHandle {
     pub(crate) addr: SocketAddr,
     pub(crate) join: JoinHandle<()>,
 }
 
-/// Bind the bp-api HTTP server on `cfg.api.port` and start serving.
-/// The task lives until the listener errors out or the JoinHandle is
-/// aborted. Returns immediately after the TCP listener binds — every
-/// caller awaits the join handle separately.
+/// Returns as soon as the listener binds; the caller awaits the join handle.
 pub(crate) async fn spawn(
     cfg: &AppConfig,
     foundation: &FoundationHandles,
@@ -71,10 +61,8 @@ pub(crate) async fn spawn(
         .map_err(|source| ApiServerError::Bind { addr, source })?;
     info!(%addr, "bp-api: listening");
 
-    // Per-connection peer-address info gives the rate-limiter's IP key
-    // extractor a fallback when no `x-forwarded-for` / `x-real-ip` /
-    // `Forwarded` header is present; without it rate-limited routes answer
-    // 500 `Unable To Extract Key!`.
+    // Peer-address info is the rate-limiter's key when no forwarding header
+    // is present; without it rate-limited routes answer 500.
     let make_service = router.into_make_service_with_connect_info::<SocketAddr>();
     let join = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, make_service).await {
@@ -86,7 +74,6 @@ pub(crate) async fn spawn(
     Ok(ApiServerHandle { addr, join })
 }
 
-/// Construct the AppState from the live aggregates.
 fn build_app_state(
     cfg: &AppConfig,
     foundation: &FoundationHandles,

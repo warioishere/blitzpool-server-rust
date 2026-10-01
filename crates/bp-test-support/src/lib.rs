@@ -16,45 +16,26 @@ use redis::Client;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use tokio::sync::broadcast;
 
-/// Default local test-service endpoints. Override with `BP_REDIS_URL` /
-/// `BP_PG_URL`.
+/// Overridden by `BP_REDIS_URL` / `BP_PG_URL`.
 pub const REDIS_DEFAULT_URL: &str = "redis://127.0.0.1:16379";
 pub const PG_DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
 
-/// Set this to turn every Redis/Postgres skip into a **failure**.
-///
-/// The skip default suits CI-without-services and a contributor who has not
-/// started the containers. It is wrong for a run meant as evidence: a
-/// skipped test passes, so neither the exit code nor the passed-count can
-/// tell a suite that exercised Postgres from one that never reached it, and
-/// a service that dies mid-run is invisible. With this set, an unreachable
-/// service fails the test, naming the service and the URL.
+/// Turns every Redis/Postgres skip into a failure. A skipped test passes, so
+/// a run meant as evidence sets this to prove the services were reached.
 pub const REQUIRE_SERVICES_ENV: &str = "BP_REQUIRE_TEST_SERVICES";
 
-/// Whether an unreachable service must fail rather than skip.
 fn services_required() -> bool {
     value_requires_services(std::env::var(REQUIRE_SERVICES_ENV).ok().as_deref())
 }
 
-/// Does this [`REQUIRE_SERVICES_ENV`] value ask for failures?
-///
-/// Split from the env read so the rule is testable: the workspace sets
-/// `unsafe_code = "deny"` and Rust 1.85 made `set_var` unsafe, so a test
-/// cannot mutate the environment to reach it (same constraint as
-/// `bp_regtest_harness::config`).
-///
-/// Any value other than empty or `0` counts, so `=1` and `=true` both work
-/// while `=0` stays an explicit opt-out — a half-set variable must not read
-/// as "required" and then quietly fail a contributor's whole suite.
+/// Any value but empty or `0` asks for failures. Split from the env read
+/// because `set_var` is unsafe and the workspace denies unsafe code, so tests
+/// cannot reach the rule through the environment.
 fn value_requires_services(value: Option<&str>) -> bool {
     matches!(value, Some(v) if !v.is_empty() && v != "0")
 }
 
-/// Report an unreachable service: skip by default, panic under
-/// [`REQUIRE_SERVICES_ENV`].
-///
-/// Returns `None` so callers stay a one-line `?`/`else` at the top of a
-/// test; it only ever returns in the skip case.
+/// Skip by default, panic under [`REQUIRE_SERVICES_ENV`].
 fn skip_or_fail<T>(reason: String) -> Option<T> {
     if let Some(line) = skip_decision(services_required(), reason) {
         eprintln!("{line}");
@@ -62,12 +43,8 @@ fn skip_or_fail<T>(reason: String) -> Option<T> {
     None
 }
 
-/// [`skip_or_fail`] with the decision passed in, so both branches can be
-/// exercised without mutating the environment.
-///
-/// Returns the skip line rather than printing it: a healthy run must count
-/// **0** for `grep -c skipping`, so a unit test of this function must not
-/// print one. Printing stays in [`skip_or_fail`], which no test calls.
+/// [`skip_or_fail`] with the decision passed in. Returns the skip line instead
+/// of printing it, so its own unit tests don't add to `grep -c skipping`.
 fn skip_decision(required: bool, reason: String) -> Option<String> {
     assert!(
         !required,
@@ -78,8 +55,7 @@ fn skip_decision(required: bool, reason: String) -> Option<String> {
     Some(format!("{reason} — skipping"))
 }
 
-/// Deterministic regtest P2WPKH address from a 32-byte secret-key seed —
-/// a valid bech32 string with a correct checksum, no live `getnewaddress`.
+/// A valid regtest P2WPKH address without a live `getnewaddress`.
 pub fn deterministic_p2wpkh_regtest(seed: [u8; 32]) -> String {
     use bitcoin::secp256k1::{Secp256k1, SecretKey};
     use bitcoin::{Address, CompressedPublicKey, Network};
@@ -89,9 +65,7 @@ pub fn deterministic_p2wpkh_regtest(seed: [u8; 32]) -> String {
     Address::p2wpkh(&pk, Network::Regtest).to_string()
 }
 
-/// Grind a header nonce (0..1M) until its double-SHA256 meets `target`.
-/// Returns `None` if no nonce in range works (regtest target is trivial,
-/// so a hit is found almost immediately).
+/// Tries the first 1M nonces; enough for the trivial regtest target.
 pub fn brute_force_nonce(
     version: u32,
     prev_hash: &[u8; 32],
@@ -117,8 +91,6 @@ pub fn brute_force_nonce(
     None
 }
 
-/// Poll the node's tip until it reaches `target_height` or `budget`
-/// elapses.
 pub async fn poll_for_height(
     node: &RegtestNode,
     target_height: u32,
@@ -138,32 +110,18 @@ pub async fn poll_for_height(
 
 /// A block bitcoin-core accepted, and the bytes it accepted.
 pub struct AcceptedBlock {
-    /// The tip after acceptance — always `height_before + 1`.
     pub height: u32,
-    /// Exactly the coinbase transaction core validated. Settlement tests
-    /// read their expectations out of THIS, never out of what the pool
-    /// intended to pay.
+    /// The coinbase core validated: settlement tests read expectations from
+    /// this, never from what the pool intended to pay.
     pub witness_coinbase: Vec<u8>,
-    /// Big-endian hex, the same shape the production block-sink computes.
+    /// Big-endian hex, the shape the production block-sink computes.
     pub block_hash_hex: String,
 }
 
-/// Assemble the coinbase paying exactly `payouts` over `template`,
-/// brute-force a nonce that meets the regtest target, submit it through
-/// `tdp`, and require bitcoin-core to extend the chain by one.
-///
-/// `submit_solution` is fire-and-forget, so a coinbase whose outputs do not
-/// sum to the template value, or that carries a dust output or a malformed
-/// script, is rejected with no error the pool ever sees: the tip simply
-/// does not move. The panic message names those causes.
-///
-/// `fingerprint` is the distribution's settlement identity, carried in the
-/// job so a block found on it books through the distribution it actually
-/// paid. Pass `[0u8; 32]` where the test does not settle.
-///
-/// Uses zero extranonces. Callers that need to vary them, that assert on
-/// the assembled job before submitting, or that expect core to REJECT
-/// (`regtest_budget_autoscale`) drive the pieces themselves.
+/// Mines `payouts` over `template` and requires the tip to move by one: a
+/// rejected solution raises no error, the tip just stays. `fingerprint` is the
+/// distribution's settlement identity (`[0u8; 32]` when the test does not
+/// settle). Zero extranonces; tests expecting a reject drive the pieces themselves.
 pub async fn mine_and_submit_payouts(
     node: &RegtestNode,
     tdp: &bp_template_distribution::TdpHandle,
@@ -257,8 +215,7 @@ fn hex_lower(bytes: &[u8]) -> String {
     })
 }
 
-/// Wait for a paired **future** `NewTemplate` + matching `SetNewPrevHash`
-/// (the strict variant — what fires on a tip change). Panics on timeout.
+/// Waits for a future `NewTemplate` and its `SetNewPrevHash`, i.e. a tip change.
 pub async fn wait_for_paired_template(
     rx: &mut broadcast::Receiver<TemplateUpdate>,
 ) -> (NewTemplate, SetNewPrevHash) {
@@ -286,11 +243,8 @@ pub async fn wait_for_paired_template(
     res.expect("TDP must emit a paired NewTemplate + SetNewPrevHash within 10s")
 }
 
-/// Wait for ANY paired `NewTemplate` + matching `SetNewPrevHash`, without
-/// requiring `future_template` (the loose variant used by the
-/// mempool-delta / autoscale tests that re-template without a tip change).
-/// Drop-in for the strict variant (same `(rx)` signature) — callers alias
-/// it as `wait_for_paired_template`. 15s budget.
+/// Like [`wait_for_paired_template`] without requiring `future_template`, for
+/// tests that re-template without a tip change.
 pub async fn wait_for_any_paired_template(
     rx: &mut broadcast::Receiver<TemplateUpdate>,
 ) -> (NewTemplate, SetNewPrevHash) {
@@ -317,26 +271,12 @@ pub async fn wait_for_any_paired_template(
     res.expect("TDP must emit a paired NewTemplate + SetNewPrevHash before the timeout")
 }
 
-/// Clear every trace of a Blockparty admin address, so a test that owns
-/// `addrs` can re-create its group from scratch.
-///
-/// Deletes from `blockparty_group` by admin address, NOT from
-/// `blockparty_member` — `blockparty_member` has
-/// `ON DELETE CASCADE` from `blockparty_group`, so removing the parent is
-/// strictly more thorough than removing the child, and removing only the
-/// child leaves the parent behind. The blockparty regtests use a fixed
-/// admin address and `blockparty_group` has
-/// `UQ_blockparty_group_admin_address`, so an orphaned group row from an
-/// interrupted run would fail every later `create_group` with
-/// `AdminAddressTaken`.
-///
-/// The member address is still worth passing: a non-admin address may hold
-/// `UQ_blockparty_member_address` under a group whose own admin is not in
-/// `addrs`, which no `blockparty_group` delete would reach.
+/// Deletes the group by admin address (cascading to its children), or a
+/// leftover group from an interrupted run fails every later `create_group`
+/// with `AdminAddressTaken`. The member delete covers addresses held in a
+/// group whose admin is not in `addrs`.
 pub async fn cleanup_blockparty_rows(pool: &PgPool, addrs: &[&str]) {
     for a in addrs {
-        // Parent first — cascades to blockparty_member, _invitation,
-        // _join_link and _block_history for that group.
         let _ = sqlx::query(r#"DELETE FROM blockparty_group WHERE "adminAddress" = $1"#)
             .bind(*a)
             .execute(pool)
@@ -348,18 +288,11 @@ pub async fn cleanup_blockparty_rows(pool: &PgPool, addrs: &[&str]) {
     }
 }
 
-/// Per-test-binary logical-DB ranges.
-///
-/// `connect_redis_or_skip` **flushes** the DB it opens, so two tests
-/// sharing one wipe each other's state mid-run. Isolation has to hold
-/// across the whole workspace, not just per file.
-///
-/// Each test binary owns `RANGE` consecutive databases and keeps its
-/// own 0-based numbering inside them. A binary needs a distinct base
-/// here; a test needs a number no sibling in the SAME binary uses.
+/// Per-test-binary logical-DB ranges: connecting flushes the DB, so tests
+/// sharing one wipe each other. A binary needs its own base here; a test needs
+/// a number no sibling in the same binary uses.
 pub mod redis_db {
-    /// Databases per test binary. Wide enough for the largest one
-    /// (`bp-group-solo-engine`'s `engine_integration`, 22 connects).
+    /// Wide enough for the largest binary's number of connects.
     pub const RANGE: u16 = 32;
 
     pub const BLITZPOOL_BIN: u16 = 0;
@@ -374,43 +307,26 @@ pub mod redis_db {
     pub const PPLNS_STREAM_EQUIV: u16 = 9 * RANGE;
     pub const PPLNS_WINDOW: u16 = 10 * RANGE;
 
-    // The regtest binaries get their own ranges too: `cargo test` runs
-    // binaries one after another, but `cargo-nextest` runs them concurrently,
-    // so a shared index would be wiped by a neighbour's flush.
+    // Regtest binaries get their own ranges too: `cargo-nextest` runs binaries
+    // concurrently, so a shared index would be wiped by a neighbour's flush.
     pub const RT_PPLNS_BLOCK_SUBMIT: u16 = 11 * RANGE;
     pub const RT_SPLIT_E2E: u16 = 12 * RANGE;
     pub const RT_POOL_NEUTRAL_PAYOUT: u16 = 13 * RANGE;
     pub const RT_GROUP_SOLO_BLOCK_SUBMIT: u16 = 14 * RANGE;
 
-    /// `bp-session-persistence`'s `live_store_integration`.
-    ///
-    /// ⚠️ Index **31** of this range is lent to TWO `bp-api` test
-    /// binaries — `smoke.rs` and `custom_extranonce_guard.rs` — both
-    /// NO-FLUSH and write-free, since their endpoints need a live
-    /// store to answer at all. Don't claim it for a session-persistence
-    /// test, and don't add a write to either borrower without moving
-    /// them apart first.
+    /// Index 31 of this range is lent to the no-flush, write-free `bp-api`
+    /// binaries `smoke.rs` and `custom_extranonce_guard.rs`: don't claim it
+    /// here, and don't add a write to either without moving them apart.
     pub const SESSION_PERSISTENCE: u16 = 15 * RANGE;
 
-    /// `bp-api`'s unit tests (the `lib` test binary). ⚠️ This is the LAST
-    /// 32-slice of the 544-DB test container (`16 * 32 + 31 = 543`) — the
-    /// next binary that needs a base must recreate `bp-test-redis` with
-    /// `--databases` raised past 544.
+    /// The last slice of the 544-DB test container: the next binary needs
+    /// `bp-test-redis` recreated with a larger `--databases`.
     pub const API: u16 = 16 * RANGE;
 }
 
-/// How many logical databases this Redis actually has.
-///
-/// Read once per process, because it decides where every test in it
-/// lands. The local test container runs `valkey-server --databases 544`;
-/// a stock server has 16, and **GitHub Actions service containers cannot
-/// override a container's command**, so CI's Valkey has 16 and there is
-/// no way to pass `--databases` to it as a service.
-///
-/// Rather than let that difference turn into a `SELECT` failure, which
-/// `connect_redis_or_skip` would report as "Redis unreachable" and silently
-/// **skip**, the index is folded into whatever the server offers. On 544
-/// every binary is isolated; on 16 tests share databases again.
+/// CI's Valkey service has only 16 databases and cannot be given
+/// `--databases`. Indexes are folded into what the server offers, because a
+/// failed `SELECT` would read as "Redis unreachable" and silently skip.
 async fn redis_database_count() -> u16 {
     static COUNT: tokio::sync::OnceCell<u16> = tokio::sync::OnceCell::const_new();
     *COUNT
@@ -426,7 +342,6 @@ async fn redis_database_count() -> u16 {
             else {
                 return fallback;
             };
-            // `CONFIG GET databases` answers `["databases", "<n>"]`.
             match redis::cmd("CONFIG")
                 .arg("GET")
                 .arg("databases")
@@ -444,28 +359,15 @@ async fn redis_database_count() -> u16 {
         .await
 }
 
-/// Connect to this binary's `test_db`-th logical database and `FLUSHDB`
-/// it — see [`redis_db`] for why the base matters.
-///
-/// `base` is the binary's constant from [`redis_db`]; `test_db` is the
-/// test's own number within it, which only has to be unique among that
-/// binary's tests.
+/// Flushes the DB. `base` is the binary's constant from [`redis_db`];
+/// `test_db` only has to be unique among that binary's tests.
 pub async fn connect_redis_in_range_or_skip(base: u16, test_db: u8) -> Option<ConnectionManager> {
     connect_redis_or_skip_raw(redis_db_in_range(base, test_db).await).await
 }
 
-/// Like [`connect_redis_in_range_or_skip`] but WITHOUT the `FLUSHDB`.
-///
-/// For the narrow case of sibling tests in one binary that deliberately
-/// share an index: each namespaces its keys (by front id, by prefix) and
-/// asserts only on its own, so flushing would buy no isolation and would
-/// wipe whatever a sibling is halfway through.
-///
-/// Sharing is only safe *within* one binary, and only when every test on
-/// that index agrees not to flush. Reach for [`connect_redis_in_range_or_skip`]
-/// unless the sharing is deliberate — a flush arriving mid-test reads as an
-/// impossible result (a key that was just written coming back missing), which
-/// is a genuinely hard failure to place.
+/// Like [`connect_redis_in_range_or_skip`] without the flush, for sibling tests
+/// in one binary that deliberately share an index with namespaced keys. Safe
+/// only while every test on that index skips the flush.
 pub async fn connect_redis_in_range_no_flush(base: u16, test_db: u8) -> Option<ConnectionManager> {
     let index = redis_db_in_range(base, test_db).await;
     let url_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_DEFAULT_URL.to_string());
@@ -481,19 +383,13 @@ pub async fn connect_redis_in_range_no_flush(base: u16, test_db: u8) -> Option<C
     }
 }
 
-/// The raw logical-DB index for `test_db` inside `base`'s range, folded
-/// into what this server actually has. For harnesses that build their own
-/// connection and only need the number.
+/// For harnesses that build their own connection and only need the index.
 pub async fn redis_db_in_range(base: u16, test_db: u8) -> u16 {
     (base + test_db as u16) % redis_database_count().await
 }
 
-/// Connect to a Redis logical DB and `FLUSHDB` it. Returns `None`
-/// (with a skip message) when Redis isn't reachable.
-///
-/// Prefer [`connect_redis_in_range_or_skip`]: this takes a RAW database
-/// index, so two callers passing the same number wipe each other however
-/// many databases the server has.
+/// Prefer [`connect_redis_in_range_or_skip`]: this flushes a raw index, so two
+/// callers passing the same number wipe each other.
 pub async fn connect_redis_or_skip(test_db: u8) -> Option<ConnectionManager> {
     connect_redis_or_skip_raw(test_db as u16).await
 }
@@ -520,8 +416,6 @@ async fn connect_redis_or_skip_raw(test_db: u16) -> Option<ConnectionManager> {
     Some(conn)
 }
 
-/// Connect to the test Postgres. Returns `None` (with a skip message)
-/// when PG isn't reachable.
 pub async fn connect_pg_or_skip() -> Option<PgPool> {
     let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_DEFAULT_URL.to_string());
     match tokio::time::timeout(
@@ -543,8 +437,7 @@ pub async fn connect_pg_or_skip() -> Option<PgPool> {
 mod tests {
     use super::*;
 
-    /// The skip path must stay the default, or a contributor without the
-    /// containers gets a wall of failures instead of skips.
+    /// Skipping stays the default for an unset or `0` value.
     #[test]
     fn an_unset_or_zero_value_still_skips() {
         for value in [None, Some(""), Some("0")] {
@@ -561,9 +454,7 @@ mod tests {
         }
     }
 
-    /// With the knob set, an unreachable service is a FAILURE. Asserted
-    /// through `skip_decision` so a decision function that skips no matter
-    /// what cannot pass.
+    /// With the variable set, an unreachable service fails the test.
     #[test]
     #[should_panic(expected = "BP_REQUIRE_TEST_SERVICES")]
     fn a_set_value_turns_an_unreachable_service_into_a_failure() {
@@ -577,8 +468,7 @@ mod tests {
         );
     }
 
-    /// Any truthy spelling demands services, so a value that looks set
-    /// never silently means "skip".
+    /// Any truthy spelling demands services.
     #[test]
     fn truthy_spellings_other_than_one_also_count() {
         for value in ["true", "yes", "always"] {

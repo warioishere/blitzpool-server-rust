@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Buffered per-slot max-difficulty writes.
-//!
-//! `client_difficulty_statistics_entity` holds one row per `(address, worker,
-//! hour-slot)` with the highest share difficulty seen in that slot. Shares
-//! merge into an in-memory map and one bulk upsert per tick drains it, because
-//! an inline upsert per new max bursts after a restart and at every hour
-//! rollover, where every miner's first shares keep raising the max.
-//!
-//! Same shape as [`crate::touch_buffer`] (record/drain/rebuffer). A failed
-//! flush is rebuffered, so a slot's max is never lost to a write error.
+//! Buffered per-`(address, worker, hour-slot)` max-difficulty writes: an
+//! inline upsert per new max would burst after a restart and at every hour
+//! rollover. A failed flush is rebuffered, so a slot's max is never lost.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -20,9 +13,8 @@ use sqlx::PgPool;
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
-/// Buffer key — the table's conflict target, so a duplicate is impossible by
-/// construction. That matters: a multi-row `ON CONFLICT DO UPDATE` that would
-/// touch the same row twice is a hard Postgres error, not a merge.
+/// The table's conflict target, so a batch cannot hold a duplicate: a
+/// multi-row `ON CONFLICT DO UPDATE` touching one row twice is a hard error.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct DiffStatKey {
     pub(crate) address: String,
@@ -30,11 +22,8 @@ pub(crate) struct DiffStatKey {
     pub(crate) slot_ms: i64,
 }
 
-/// Borrowed key for allocation-free lookups — the share hot path builds one of
-/// these (two `&str` + an `i64`, no heap) and only the cold insert path
-/// materialises an owned [`DiffStatKey`]. Relies on `hashbrown`'s
-/// [`Equivalent`]; std's `Borrow`-based lookup cannot express a borrowed
-/// composite key without allocating.
+/// Borrowed key for allocation-free hot-path lookups via `hashbrown`'s
+/// [`Equivalent`]; std's `Borrow` cannot express a borrowed composite key.
 #[derive(Clone, Copy)]
 pub(crate) struct DiffStatKeyRef<'a> {
     pub(crate) address: &'a str,
@@ -43,7 +32,6 @@ pub(crate) struct DiffStatKeyRef<'a> {
 }
 
 impl DiffStatKeyRef<'_> {
-    /// Materialise the owned key — cold insert path only.
     fn to_key(self) -> DiffStatKey {
         DiffStatKey {
             address: self.address.to_string(),
@@ -53,10 +41,8 @@ impl DiffStatKeyRef<'_> {
     }
 }
 
-// Must feed the hasher exactly what `DiffStatKey`'s derived `Hash` feeds it, or
-// a ref lookup would never land on an owned-key entry: derive(Hash) hashes the
-// fields in declaration order, and `str`/`String` hash identically. The
-// `a_borrowed_lookup_finds_the_owned_key` test pins this.
+// Must hash exactly like `DiffStatKey`'s derived `Hash` (fields in declaration
+// order), or a ref lookup never lands on an owned-key entry.
 impl std::hash::Hash for DiffStatKeyRef<'_> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.address.hash(state);
@@ -79,28 +65,22 @@ pub(crate) struct DiffStatEntry {
     pub(crate) updated_at_ms: i64,
 }
 
-/// Shared buffer. The sink writes into it per accepted share, the flusher
-/// drains it per tick.
-///
-/// Plain `std::sync::Mutex`: no critical section spans an `.await` — record
-/// merges into the map, the flusher drains before the DB round-trip.
+/// Shared buffer: the sink records per share, the flusher drains per tick.
+/// A `std::sync::Mutex` suffices because no critical section spans an `.await`.
 #[derive(Default)]
 pub(crate) struct DiffStatBuffer {
     inner: Mutex<HashMap<DiffStatKey, DiffStatEntry>>,
 }
 
 impl DiffStatBuffer {
-    /// Lock, recovering the guard if a previous holder panicked. A stray
-    /// poison must not turn every subsequent accepted share into a panic.
+    /// Recovers from poison so one panic does not turn every later share
+    /// into a panic.
     fn guard(&self) -> std::sync::MutexGuard<'_, HashMap<DiffStatKey, DiffStatEntry>> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Merge one sample: `max_difficulty` takes the running max, `updated_at_ms`
-    /// the max (an out-of-order share must not roll the timestamp back).
-    ///
-    /// Both merges are commutative and idempotent, which is what makes
-    /// [`Self::rebuffer`] trivially correct.
+    /// Merge one sample; both fields take the max, so an out-of-order share
+    /// cannot roll the timestamp back and [`Self::rebuffer`] is order-free.
     pub(crate) fn record(
         &self,
         key: DiffStatKeyRef<'_>,
@@ -128,15 +108,13 @@ impl DiffStatBuffer {
         true
     }
 
-    /// Drain everything buffered, in one lock pass.
     fn drain(&self) -> HashMap<DiffStatKey, DiffStatEntry> {
         let mut guard = self.guard();
         std::mem::take(&mut *guard)
     }
 
-    /// Fold a drained snapshot back after a failed flush. Both fields take the
-    /// max, so merge order does not matter and a live write that landed after
-    /// the drain cannot be lowered by the older snapshot.
+    /// Fold a drained snapshot back after a failed flush; taking the max means
+    /// a live write that landed after the drain is never lowered.
     fn rebuffer(&self, snap: HashMap<DiffStatKey, DiffStatEntry>) {
         let mut guard = self.guard();
         for (k, v) in snap {
@@ -160,8 +138,7 @@ impl DiffStatBuffer {
     }
 }
 
-/// One flush pass: drain, bulk-upsert, rebuffer on failure. Returns the rows
-/// the DB reported affected.
+/// One flush pass: drain, bulk-upsert, rebuffer on failure.
 async fn flush_once(buffer: &DiffStatBuffer, pool: &PgPool) -> u64 {
     let snapshot = buffer.drain();
     if snapshot.is_empty() {
@@ -196,9 +173,8 @@ async fn flush_once(buffer: &DiffStatBuffer, pool: &PgPool) -> u64 {
             rows
         }
         Err(e) => {
-            // Unlike a hashrate sample, a per-slot max is NOT ephemeral: drop
-            // it and the slot under-reports until a higher share happens to
-            // arrive. So it goes back into the buffer.
+            // A per-slot max is not ephemeral: dropped, the slot would
+            // under-report for good.
             warn!(error = %e, buffered = n, "diff-stat buffer: flush failed; rebuffering");
             buffer.rebuffer(snapshot);
             0
@@ -206,21 +182,15 @@ async fn flush_once(buffer: &DiffStatBuffer, pool: &PgPool) -> u64 {
     }
 }
 
-/// Spawned flush loop. Ticks every `interval`, and drains once more on
-/// shutdown so a graceful stop does not discard the current window.
+/// Flush loop; drains once more on shutdown so a graceful stop keeps the window.
 pub(crate) async fn run_flush_loop(
     buffer: std::sync::Arc<DiffStatBuffer>,
     pool: PgPool,
     interval: Duration,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
-    // `interval_at`, not `interval`: the latter fires its first tick
-    // immediately, flushing whatever was buffered before the task was first
-    // polled, which also makes "the loop writes, not the share path"
-    // untestable. Same choice as `touch_buffer::run_flush_loop`.
+    // `interval_at`: `interval` would fire its first tick immediately.
     let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
-    // Skip missed ticks rather than burst-firing them: after a stall, catching
-    // up would just drain an already-empty buffer several times over.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
@@ -247,15 +217,12 @@ mod tests {
         }
     }
 
-    /// The whole point of the buffer: N shares of one slot collapse to ONE
-    /// row, carrying the highest difficulty — not the last one seen.
+    /// N shares of one slot collapse to one row carrying the highest difficulty.
     #[test]
     fn record_keeps_the_max_and_collapses_to_one_entry() {
         let b = DiffStatBuffer::default();
         assert!(b.record(key("a1", "w", 3_600_000), 100.0, 10));
         assert!(b.record(key("a1", "w", 3_600_000), 900.0, 11));
-        // A LOWER share must not lower the stored max, and must report that
-        // it raised nothing.
         assert!(!b.record(key("a1", "w", 3_600_000), 50.0, 12));
         assert_eq!(b.len(), 1, "one slot, one buffered row");
 
@@ -268,11 +235,7 @@ mod tests {
         );
     }
 
-    /// The manual `Hash` for the borrowed key must produce the same bytes as
-    /// the derived one for the owned key, or every hot-path lookup would miss
-    /// and each share would insert a fresh entry — silently turning the
-    /// coalescing buffer into an unbounded append log with duplicate conflict
-    /// keys, which the bulk upsert then rejects outright.
+    /// The borrowed key's manual `Hash` matches the owned key's derived one.
     #[test]
     fn a_borrowed_lookup_finds_the_owned_key() {
         let mut map: HashMap<DiffStatKey, u8> = HashMap::new();
@@ -294,9 +257,7 @@ mod tests {
         assert!(map.get(&key("bc1qexample", "rig1", 7_200_000)).is_none());
     }
 
-    /// The slot is part of the key, so an hour rollover is a NEW row rather
-    /// than an overwrite — otherwise the previous hour's max would be lost
-    /// before it was ever flushed.
+    /// An hour rollover is a new row, not an overwrite of the previous hour.
     #[test]
     fn a_slot_rollover_is_a_separate_row() {
         let b = DiffStatBuffer::default();
@@ -305,8 +266,7 @@ mod tests {
         assert_eq!(b.len(), 2);
     }
 
-    /// A failed flush must not lose the window, and must not lower a value a
-    /// concurrent share raised in the meantime.
+    /// A rebuffered snapshot never lowers a value raised after the drain.
     #[test]
     fn rebuffer_never_lowers_a_live_write() {
         let b = DiffStatBuffer::default();

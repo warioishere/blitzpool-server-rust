@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Cross-cutting axum middleware for `bp-api`.
-//!
-//! `x-admin-token` validation is a single [`admin_auth::require_admin`]
-//! tower middleware that injects an [`admin_auth::AdminAuth`] request
-//! extension on success. Handlers mounted behind it can rely on the token
-//! having been validated and do not read the header themselves.
+//! Cross-cutting axum middleware for `bp-api`. Handlers behind
+//! [`admin_auth::require_admin`] rely on the token being validated and do not
+//! read the header themselves.
 
 pub mod admin_auth;
 pub mod rate_limit;

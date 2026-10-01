@@ -1,12 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Read-only views consumed by `bp-api` HTTP routes.
-//!
-//! Endpoints:
-//! - `/api/pplns/groups/:groupId/round-stats` ⇒
-//!   [`ReaderView::round_stats`]
-//! - `/api/pplns/groups/:groupId/best-difficulty` ⇒
-//!   [`ReaderView::best_difficulty`]
 
 use bp_db::find_group;
 use bp_group_mgmt::group::PayoutMode;
@@ -63,11 +57,8 @@ impl ReaderView<'_> {
         Ok(best)
     }
 
-    /// Per-bucket sliding-window timeline for a `Window`-mode group (drives the
-    /// window-timeline chart). Resolves the group's window length, trims, and
-    /// returns per-bucket per-address contribution oldest→newest. A non-window
-    /// group (or unknown id) yields an empty timeline — the caller renders
-    /// nothing for it.
+    /// Per-bucket per-address contribution of a `Window`-mode group, trimmed,
+    /// oldest first. A non-window group or unknown id yields an empty timeline.
     pub async fn window_timeline(&self, group_id: Uuid) -> Result<WindowTimeline, EngineError> {
         let (mode, window_ms) = match find_group(self.engine.pool(), group_id).await? {
             Some(g) => crate::engine::group_mode_from_row(&g),

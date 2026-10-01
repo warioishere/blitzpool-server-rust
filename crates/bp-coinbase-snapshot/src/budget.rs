@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Durable persistence of the live coinbase weight budget.
-//!
-//! The coinbase-budget autoscaler steps `coinbase_weight_budget` up/down at
-//! runtime. That live value MUST survive a restart — otherwise a reboot resets
-//! to the TOML floor and the autoscaler re-climbs from scratch (and bitcoin-
-//! core's reservation snaps back down), which is itself a form of hopping.
-//!
-//! Stored as a plain Redis STRING (`SET key <u32>`), **no TTL** — it persists
-//! until the next change overwrites it. A missing or unparseable value reads
-//! back as `None` so the boot path falls back to the configured seed.
+//! Durable live coinbase weight budget, a Redis STRING with no TTL. It must
+//! survive a restart, or a reboot drops to the config floor and the autoscaler
+//! re-climbs from scratch. Missing or unparseable reads as `None` (config seed).
 
 use redis::{aio::ConnectionManager, AsyncCommands, RedisError};
 use tracing::warn;
@@ -28,15 +21,12 @@ pub async fn write_coinbase_budget(
     Ok(())
 }
 
-/// Read the persisted live budget. `Ok(None)` when the key is missing (first
-/// boot) or holds a non-`u32` payload (logged, treated as missing so the
-/// caller seeds from config rather than failing).
+/// Read the persisted live budget. `Ok(None)` when missing or not a `u32`,
+/// so the caller seeds from config rather than failing.
 pub async fn read_coinbase_budget(
     conn: &mut ConnectionManager,
     key: &str,
 ) -> Result<Option<u32>, RedisError> {
-    // Fetch as an optional string so a missing key isn't an error and a
-    // wrong-typed key can be downgraded to "missing" with a warning.
     let raw: Option<String> = match conn.get(key).await {
         Ok(v) => v,
         Err(e) if is_wrongtype(&e) => {
@@ -57,8 +47,6 @@ pub async fn read_coinbase_budget(
     }
 }
 
-/// `WRONGTYPE` guard — a key that exists under a non-STRING type (e.g. a stale
-/// Hash) is reported as missing rather than crashing the read.
 fn is_wrongtype(e: &RedisError) -> bool {
     matches!(
         e.kind(),
@@ -70,17 +58,12 @@ fn is_wrongtype(e: &RedisError) -> bool {
 mod tests {
     use super::*;
 
-    /// Connect to the local dev Redis (docker `blitzpool-rust-redis`). Skips
-    /// the test body with a clear message if Redis isn't reachable, so the
-    /// suite stays green on machines without the container.
+    /// Local dev Redis, or `None` (test skips) when unreachable.
     async fn conn() -> Option<ConnectionManager> {
-        // Default to the docker dev Redis port (`:16379`), mirroring the
-        // PG tests' `:15433` convention. Override via `REDIS_URL`.
         let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:16379".into());
         let client = redis::Client::open(url).ok()?;
-        // `ConnectionManager::new` retries internally and hangs on an
-        // unreachable host instead of erroring; the timeout lets the test
-        // skip cleanly.
+        // `ConnectionManager::new` hangs on an unreachable host instead of
+        // erroring.
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
             ConnectionManager::new(client),

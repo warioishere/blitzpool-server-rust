@@ -3,20 +3,8 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! Integration tests for `bp_blockparty_engine::BlockpartyService`
-//! against the local docker-PG (`bp-test-pg` on :15433).
-//!
-//! Coverage:
-//! - `create_group` + DRAFT initial status (+ cache hit)
-//! - `add_member` auto-flips DRAFT → CONFIRMING (+ cache sync)
-//! - `mark_member_confirmed` promotes CONFIRMING → READY and the
-//!   load-bearing routing-cache invariant: routable + pending-fee
-//!   guards both flip in lockstep with the DB
-//! - `on_share_accepted` promotes READY → ACTIVE (and ONLY from READY)
-//! - dissolve cooldown gates ACTIVE within the 7-day silence window
-//! - dissolve frees member and admin addresses for the next party
-//! - `on_block_found` is idempotent on duplicate (groupId, blockHash)
-//! - name collision rejects second create
+//! `BlockpartyService` against the test Postgres: lifecycle transitions and
+//! the routing cache staying in lockstep with the DB.
 
 use std::sync::Arc;
 
@@ -54,7 +42,7 @@ async fn connect_or_skip() -> Option<PgPool> {
     }
 }
 
-// ── Test hooks: every address binds to the same canned email. ──
+// Every address binds to the same canned email.
 struct AllVerified;
 
 #[async_trait]
@@ -68,8 +56,7 @@ fn addr(s: &str) -> AddressId {
     AddressId::new(s).expect("test address")
 }
 
-/// Records every `ensure_capacity_for_members` call so a test can assert the
-/// `→ Ready` transition sizes the coinbase reservation to the exact roster.
+/// Records every `ensure_capacity_for_members` call.
 struct RecordingReservation {
     calls: Arc<std::sync::Mutex<Vec<usize>>>,
 }
@@ -98,8 +85,7 @@ fn svc(pool: &PgPool) -> BlockpartyService<AllVerified> {
     )
 }
 
-// ── Test hook: NO address has a verified email — forces the gate onto the
-//    signature-ownership branch (or the reject branch when neither is present). ──
+// No address has a verified email, forcing the signature-ownership branch.
 struct NoEmail;
 
 #[async_trait]
@@ -118,8 +104,8 @@ fn svc_no_email(pool: &PgPool) -> BlockpartyService<NoEmail> {
     )
 }
 
-/// Seed a verified signature-ownership proof for `address`, stored VERBATIM
-/// (case-preserved) exactly as the `/api/address/ownership/verify` path writes it.
+/// Seeds a signature-ownership proof stored verbatim (case-preserved), as the
+/// ownership-verify endpoint writes it.
 async fn seed_signature(pool: &PgPool, address: &str) {
     let now = 1_700_000_000_000_i64;
     let _ = sqlx::query(
@@ -141,8 +127,7 @@ async fn delete_signature(pool: &PgPool, address: &str) {
         .await;
 }
 
-/// Best-effort row cleanup. Addresses and names are unique per test so
-/// concurrent runs don't collide; not every test reaches dissolve.
+/// Best-effort cleanup; addresses and names are unique per test.
 async fn cleanup(pool: &PgPool, name: &str, admin_addr: &str) {
     let _ = sqlx::query(r#"DELETE FROM blockparty_group WHERE name = $1"#)
         .bind(name)
@@ -251,8 +236,7 @@ async fn join_via_link_adds_unconfirmed_member_and_mints_token() {
     assert_eq!(group_id, create.group.id);
     assert!(!member_token.is_empty());
 
-    // Member exists, UNCONFIRMED (must still confirm the split the admin sets),
-    // 0 % placeholder, cached; group flipped DRAFT → CONFIRMING.
+    // Unconfirmed, 0 % placeholder, cached; group now confirming.
     let members = svc.list_members(create.group.id).await.unwrap();
     let carol_row = members
         .iter()
@@ -286,9 +270,8 @@ async fn join_via_link_adds_unconfirmed_member_and_mints_token() {
 
 #[tokio::test]
 async fn join_via_link_admits_signature_verified_email_less_base58_address() {
-    // An address with NO verified email but a valid signature-ownership proof
-    // may join. The mixed-case legacy Base58 address pins that the gate does
-    // not lowercase it (the proof is stored verbatim `1BvBM…`).
+    // A signature proof admits an email-less address; the mixed-case Base58
+    // address pins that the gate does not lowercase it.
     let Some(pool) = connect_or_skip().await else {
         return;
     };
@@ -302,8 +285,7 @@ async fn join_via_link_admits_signature_verified_email_less_base58_address() {
         .await;
     delete_signature(&pool, carol).await;
     seed_signature(&pool, carol).await;
-    // The admin must itself clear the create gate (email OR signature); the
-    // NoEmail hook gives no email, so seed the admin's signature proof too.
+    // The admin must clear the create gate too.
     delete_signature(&pool, admin).await;
     seed_signature(&pool, admin).await;
 
@@ -317,8 +299,6 @@ async fn join_via_link_admits_signature_verified_email_less_base58_address() {
         )
         .await
         .expect("create_join_link");
-    // NoEmail hook → email.is_none() is true → the gate falls through to the
-    // signature-ownership lookup, which must find the verbatim Base58 row.
     let (member_token, group_id) = svc
         .join_via_link(&link, carol)
         .await
@@ -346,7 +326,6 @@ async fn join_via_link_admits_signature_verified_email_less_base58_address() {
 
 #[tokio::test]
 async fn join_via_link_rejects_unverified_address() {
-    // Neither a verified email nor a signature proof → the gate must reject.
     let Some(pool) = connect_or_skip().await else {
         return;
     };
@@ -359,8 +338,7 @@ async fn join_via_link_rejects_unverified_address() {
         .execute(&pool)
         .await;
     delete_signature(&pool, dave).await;
-    // The admin must clear the create gate; only the join target (dave) is
-    // left unverified so the join — not the create — is what gets rejected.
+    // Only dave is unverified, so the join, not the create, is rejected.
     delete_signature(&pool, admin).await;
     seed_signature(&pool, admin).await;
 
@@ -393,8 +371,7 @@ async fn join_via_link_rejects_unverified_address() {
         .await;
 }
 
-/// The create gate itself: a signature-verified but email-less admin can open
-/// a party, and the admin member row stores an empty email (badge = signature).
+/// A signature-verified, email-less admin can create; its row stores "".
 #[tokio::test]
 async fn create_group_admits_signature_verified_email_less_admin() {
     let Some(pool) = connect_or_skip().await else {
@@ -422,8 +399,7 @@ async fn create_group_admits_signature_verified_email_less_admin() {
     delete_signature(&pool, admin).await;
 }
 
-/// The create gate rejects an admin with neither a verified email nor a
-/// signature proof — the party is never inserted.
+/// An admin with neither email nor signature proof cannot create a party.
 #[tokio::test]
 async fn create_group_rejects_unverified_admin() {
     let Some(pool) = connect_or_skip().await else {
@@ -457,8 +433,7 @@ async fn create_group_rejects_unverified_admin() {
     cleanup(&pool, name, admin).await;
 }
 
-/// The admin "members may confirm now" signal: unset at creation, admin-gated,
-/// stamps `confirmationRequestedAt` on success.
+/// `confirmationRequestedAt` is unset at creation and stamped only by the admin.
 #[tokio::test]
 async fn request_member_confirmation_stamps_flag_and_is_admin_gated() {
     let Some(pool) = connect_or_skip().await else {
@@ -471,7 +446,6 @@ async fn request_member_confirmation_stamps_flag_and_is_admin_gated() {
     let svc = svc(&pool);
     let create = svc.create_group(name, admin, 10_000).await.expect("create");
 
-    // Unset at creation — a freshly-joined member must not be nagged yet.
     let g = svc.get_group(create.group.id).await.unwrap().unwrap();
     assert!(g.confirmation_requested_at.is_none());
 
@@ -517,8 +491,7 @@ async fn mark_member_confirmed_promotes_to_ready_and_unblocks_routing() {
     let admin_addr = addr(admin);
     assert!(svc.pending_party_fee_route(&admin_addr).await.is_some());
 
-    // Confirm bob. Status should flip to READY because all members
-    // (admin auto-confirmed at creation, bob now) have confirmedAt.
+    // The admin is confirmed at creation, so bob's confirm makes it ready.
     let r = svc
         .mark_member_confirmed(create.group.id, &addr(bob))
         .await
@@ -528,7 +501,6 @@ async fn mark_member_confirmed_promotes_to_ready_and_unblocks_routing() {
     let g = svc.get_group(create.group.id).await.unwrap().unwrap();
     assert_eq!(g.status, "ready");
 
-    // Cache sync — the load-bearing invariant.
     assert!(
         svc.pending_party_fee_route(&admin_addr).await.is_none(),
         "READY cancels pending-fee guard"
@@ -560,7 +532,7 @@ async fn on_share_accepted_promotes_ready_to_active_only() {
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
     let admin_addr = addr(admin);
 
-    // Pre-confirm: share in DRAFT should NOT promote (defensive).
+    // A share in draft must not promote.
     svc.on_share_accepted(&admin_addr)
         .await
         .expect("share-noop");
@@ -806,7 +778,6 @@ async fn ready_transition_sizes_coinbase_reservation_to_roster() {
         .execute(&pool)
         .await;
 
-    // Service with a recording reservation hook.
     let calls = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
     let svc = BlockpartyService::new(
         pool.clone(),
@@ -823,15 +794,13 @@ async fn ready_transition_sizes_coinbase_reservation_to_roster() {
         .await
         .expect("add_member");
 
-    // Still CONFIRMING (bob unconfirmed) → the reservation hook must NOT have
-    // fired yet (only fires at → Ready).
+    // Still confirming: the hook fires only at ready.
     assert!(
         calls.lock().unwrap().is_empty(),
         "reservation hook must not fire before the party is Ready"
     );
 
-    // Confirm bob → all members confirmed → READY → hook fires with the exact
-    // roster (admin auto-confirmed at create + bob = 2 members).
+    // Ready with admin + bob: the hook gets exactly 2 members.
     svc.mark_member_confirmed(create.group.id, &addr(bob))
         .await
         .expect("mark_confirmed");
@@ -890,7 +859,6 @@ async fn update_splits_confirms_admin_and_resets_non_admin() {
     .await
     .expect("update_splits");
 
-    // Verify member rows directly.
     let members = bp_db::list_blockparty_members_for_group(&pool, create.group.id)
         .await
         .expect("list members");

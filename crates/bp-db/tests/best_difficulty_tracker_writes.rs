@@ -2,12 +2,9 @@
 
 #![allow(clippy::print_stderr)]
 
-//! Integration tests for the best-difficulty tracker write/read
-//! primitives consumed by the best-difficulty cron:
-//! `upsert_best_difficulty_trackers` (bulk INSERT ... ON CONFLICT) and
-//! `find_best_difficulty_trackers_for_addresses` (bulk read). Test rows
-//! use a dedicated address prefix and are deleted before and after each
-//! test for isolation against the shared local PG.
+//! Integration tests for the best-difficulty tracker bulk upsert and bulk
+//! read. Test rows use a dedicated address prefix and are deleted before and
+//! after each test.
 
 use std::collections::HashMap;
 

@@ -1,20 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Extranonce-prefix release paths on the SV2 mining server.
-//!
-//! A prefix is taken out of the pool-wide allocator when a channel opens
-//! and must go back when the channel goes away — otherwise the allocator's
-//! `used` set only ever grows and prefixes are stranded until the process
-//! restarts.
-//!
-//! `CloseChannel` covers the graceful case. This file pins the one that
-//! isn't graceful: a miner that drops its TCP connection (power-cut, crash,
-//! network blip) never sends `CloseChannel`, so the release has to happen on
-//! connection teardown.
-//!
-//! Needs no bitcoin-core: a channel allocates its prefix at open time,
-//! independent of whether a template ever arrives, so the server runs here
-//! on an empty template snapshot.
+//! Extranonce-prefix release on the SV2 mining server: a miner that drops its
+//! TCP connection never sends `CloseChannel`, so teardown must return the
+//! prefix or it stays stranded until restart. No bitcoin-core needed: prefixes
+//! are allocated at channel open, so an empty template snapshot suffices.
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -70,8 +59,7 @@ async fn ungraceful_disconnect_releases_extranonce_prefix() {
         "open Extended channel must hold exactly one prefix"
     );
 
-    // ── The point of the test: drop the socket. No CloseChannel, no ──
-    // ── shutdown handshake — exactly what a power-cut miner does.   ──
+    // Drop the socket without CloseChannel, as a power-cut miner does.
     drop(reader);
     drop(writer);
 
@@ -89,10 +77,8 @@ async fn ungraceful_disconnect_releases_extranonce_prefix() {
     server.shutdown().await;
 }
 
-/// The binary builds one SV2 server per port, all on one allocator. Their
-/// first channels must get distinct prefixes: two PPLNS ports hash the same
-/// coinbase, so a shared prefix there means two miners searching the same
-/// space.
+/// Two ports on one allocator hand out distinct prefixes: two PPLNS ports hash
+/// the same coinbase, so a shared prefix would duplicate search space.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_ports_hand_out_distinct_prefixes() {
     let extranonce = sv2_extranonce();

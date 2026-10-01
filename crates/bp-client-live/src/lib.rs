@@ -1,24 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Readers for the per-session live hashes (`client:live:*`).
-//!
-//! The write side lives in `bp-session-persistence` (touch flush +
-//! hashrate sampler); the key/field schema both sides share is
-//! [`bp_common::live_client_key`]. This crate is the ONE
-//! implementation of "sum the live hashrate" — `bp-api` and
-//! `bp-notifications` both call it, so the two can't drift apart.
-//!
-//! Reading rules (the schema module explains why):
-//!
-//! - Every key has a TTL and prod Redis runs `volatile-lru`, so any key
-//!   can be missing at any moment. A missing key or field is "no live
-//!   data" and contributes 0 to a sum — but a derived 0 must never be
-//!   written back to durable storage.
-//! - A hash can be partial (only `hash_rate`): the sampler recreates an
-//!   expired key with just that field.
-//! - `NotConfigured` (no Redis handle) is an error, not a silent 0 —
-//!   the caller decides whether its surface degrades to 0, an error
-//!   text, or a 500.
+//! The one reader of the live session hashes (`client:live:*`, schema in
+//! [`bp_common::live_client_key`]). Any key or field can be missing (TTL,
+//! eviction) and counts as 0, but a derived 0 must never be written back to
+//! durable storage. No Redis handle is an error, never a silent 0.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -34,20 +19,13 @@ use redis::aio::ConnectionManager;
 /// `HGET`s per pipeline round trip.
 const FETCH_CHUNK: usize = 500;
 
-/// Upper bound for ONE Redis round-trip. A `ConnectionManager` whose
-/// connection is mid-reconnect makes every caller await its full retry
-/// ladder (minutes on redis-rs defaults) before erroring. A
-/// reader must fail fast instead — "no answer" is already a handled
-/// state everywhere this crate is consumed, and a minutes-long hang on
-/// `/api/pool` or the liveness sweep is strictly worse than an error.
-///
-/// Public because the front's live-session reader in the binary reads
-/// under the same bound, for the same cron.
+/// Upper bound for one Redis round-trip. A reconnecting `ConnectionManager`
+/// would otherwise make callers wait out its retry ladder (minutes); every
+/// consumer already handles "no answer", a hang is strictly worse.
 pub const ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Run one Redis round-trip under [`ROUND_TRIP_TIMEOUT`]. The one
-/// implementation of "fail fast on a dead connection" for every live
-/// read — this crate's and the binary's live-session reader alike.
+/// Run one Redis round-trip under [`ROUND_TRIP_TIMEOUT`]; used by every
+/// live read, including the binary's.
 pub async fn bounded<T>(
     fut: impl Future<Output = Result<T, redis::RedisError>>,
 ) -> Result<T, LiveReadError> {
@@ -59,16 +37,12 @@ pub async fn bounded<T>(
 
 #[derive(thiserror::Error, Debug)]
 pub enum LiveReadError {
-    /// The process has no Redis handle. Configuration state, not a
-    /// runtime fault — but still an error so no caller can mistake
-    /// "cannot know" for "zero hashrate".
+    /// An error so no caller mistakes "cannot know" for zero hashrate.
     #[error("live store not configured (no Redis handle)")]
     NotConfigured,
     #[error("redis: {0}")]
     Redis(#[from] redis::RedisError),
-    /// One round-trip exceeded the reader's timeout (the `Duration` it
-    /// carries) — the connection is down or mid-reconnect. Same handling
-    /// as any Redis error.
+    /// Connection down or mid-reconnect; handle like any Redis error.
     #[error("redis round-trip exceeded {0:?}")]
     Timeout(Duration),
 }
@@ -79,10 +53,8 @@ fn address_of(key: &str) -> Option<&str> {
     key.strip_prefix(CLIENT_LIVE_PREFIX)?.split(KEY_SEP).next()
 }
 
-/// Cursor-complete `SCAN MATCH pattern`. The sum readers pass
-/// [`SCAN_PATTERN_ALL`] — one pass regardless of how many addresses the
-/// caller filters on afterwards, which at pool scale (~10³ sessions)
-/// beats one `SCAN` per address.
+/// Cursor-complete `SCAN MATCH pattern`. The sum readers scan everything
+/// once and filter afterwards, which beats one `SCAN` per address.
 async fn scan_keys(
     conn: &mut ConnectionManager,
     pattern: &str,
@@ -143,9 +115,7 @@ async fn accumulate_rates(
     Ok(())
 }
 
-/// Sum of the live hashrate across every session in the pool. "Active"
-/// means the live key exists: its TTL is the pool's 5-minute liveness
-/// clock.
+/// Live hashrate of the whole pool; the key's TTL is the liveness clock.
 pub async fn pool_hashrate(redis: Option<&ConnectionManager>) -> Result<f64, LiveReadError> {
     let mut conn = redis.ok_or(LiveReadError::NotConfigured)?.clone();
     let keys = scan_live_keys(&mut conn).await?;
@@ -154,9 +124,7 @@ pub async fn pool_hashrate(redis: Option<&ConnectionManager>) -> Result<f64, Liv
     Ok(acc.values().sum())
 }
 
-/// Live hashrate per address for the supplied list. Every requested
-/// address is present in the result (0.0 when it has no live session),
-/// so callers can render a full member roster without re-checking.
+/// Every requested address is in the result, 0.0 without a live session.
 pub async fn hashrate_by_address(
     redis: Option<&ConnectionManager>,
     addresses: &[AddressId],
@@ -179,8 +147,7 @@ pub async fn hashrate_by_address(
     Ok(acc)
 }
 
-/// Sum of the live hashrate across the supplied addresses. Empty input
-/// returns `0.0` without touching Redis.
+/// Empty input returns `0.0` without touching Redis.
 pub async fn hashrate_for_addresses(
     redis: Option<&ConnectionManager>,
     addresses: &[AddressId],
@@ -191,11 +158,8 @@ pub async fn hashrate_for_addresses(
     Ok(hashrate_by_address(redis, addresses).await?.values().sum())
 }
 
-/// Delete every live hash under `address`. Returns the number of keys
-/// removed. The delete-all endpoint calls this so a purged miner does
-/// not keep reporting hashrate for up to the TTL — best-effort by
-/// nature (a concurrent flush can rewrite a key moments later; that
-/// one then ages out on its TTL like any other).
+/// So a purged miner stops reporting hashrate before the TTL. Best-effort:
+/// a concurrent flush may rewrite a key, which then ages out normally.
 pub async fn delete_address_live_keys(
     redis: Option<&ConnectionManager>,
     address: &AddressId,
@@ -218,20 +182,10 @@ pub async fn delete_address_live_keys(
     Ok(deleted)
 }
 
-/// Clear the `best_difficulty` field of every live hash under `address`,
-/// leaving hashrate, current difficulty and channel count in place.
-/// Returns the number of fields removed.
-///
-/// This is the session half of a best-difficulty reset: the per-address
-/// total alone would leave the old value on every worker row.
-///
-/// `HDEL` rather than `HSET .. 0`: the touch script treats a missing field
-/// as "no sample yet", while a literal 0 would render as a best of zero
-/// rather than none.
-///
-/// Best-effort, like [`delete_address_live_keys`]: a share landing
-/// mid-clear re-establishes the field at that share's difficulty, which
-/// is the correct post-reset value anyway.
+/// Session half of a best-difficulty reset, else every worker row keeps the
+/// old value. `HDEL`, not `HSET 0`: a missing field means "no sample yet",
+/// a 0 would render as a best of zero. A share landing mid-clear sets the
+/// correct post-reset value anyway.
 pub async fn clear_address_best_difficulty(
     redis: Option<&ConnectionManager>,
     address: &AddressId,
@@ -254,11 +208,8 @@ pub async fn clear_address_best_difficulty(
     Ok(cleared)
 }
 
-/// Pipelined `EXISTS` for the given `(address, worker, session_id)`
-/// triples, positionally aligned. The liveness sweep uses this to tell
-/// a silently-dead session (stale birth row, no live hash) from an
-/// active one — which is why an error here must make the sweep SKIP,
-/// never sweep: "cannot ask Redis" and "no key" are different answers.
+/// Pipelined `EXISTS`, positionally aligned. The liveness sweep must SKIP
+/// on an error, never sweep: "cannot ask Redis" is not "no key".
 pub async fn live_keys_exist<S: SessionKey>(
     redis: Option<&ConnectionManager>,
     sessions: &[S],
@@ -279,12 +230,8 @@ pub async fn live_keys_exist<S: SessionKey>(
     Ok(out)
 }
 
-/// The live half of one session, composed next to its PG birth row.
-///
-/// Absence semantics: `hash_rate` / `best_difficulty` default to 0, the
-/// optionals to `None`. A session whose whole hash is missing comes back
-/// as `None` from
-/// [`live_fields_for_sessions`] — no shares inside the TTL, or evicted.
+/// The live half of one session. Missing fields default to 0 / `None`; a
+/// wholly missing hash is `None` from [`live_fields_for_sessions`].
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LiveFields {
     pub hash_rate: f64,
@@ -314,10 +261,8 @@ fn parse_live_fields(pairs: Vec<(String, String)>) -> Option<LiveFields> {
     Some(lf)
 }
 
-/// Batch-fetch the live fields for the given `(address, worker,
-/// session_id)` triples. Positional result aligned with the input;
-/// `None` = no live hash for that session. This is the ONE composition
-/// point every "PG birth row + Redis live fields" reader goes through.
+/// Live fields per session, positionally aligned; `None` = no live hash.
+/// Every "PG birth row + live fields" reader goes through here.
 pub async fn live_fields_for_sessions<S: SessionKey>(
     redis: Option<&ConnectionManager>,
     sessions: &[S],
@@ -338,9 +283,7 @@ pub async fn live_fields_for_sessions<S: SessionKey>(
     Ok(out)
 }
 
-/// One active-session row as the user-agent aggregation consumes it —
-/// the PG side supplies (userAgent, key triple), the live side supplies
-/// the numbers.
+/// The PG half of a session for the user-agent aggregation.
 #[derive(Clone, Debug)]
 pub struct UserAgentSessionRow {
     pub user_agent: Option<String>,
@@ -361,8 +304,7 @@ impl SessionKey for UserAgentSessionRow {
     }
 }
 
-/// One `GROUP BY userAgent` output row — the shape both `/api/info`'s
-/// `userAgents` and `/api/pplns`'s variant serialize.
+/// One `GROUP BY userAgent` row, as `/api/info` and `/api/pplns` serialize.
 #[derive(Clone, Debug)]
 pub struct UserAgentAgg {
     pub user_agent: Option<String>,
@@ -371,13 +313,8 @@ pub struct UserAgentAgg {
     pub total_hash_rate: f64,
 }
 
-/// Group sessions by user agent and aggregate their live numbers — the
-/// ONE implementation behind `/api/info` and `/api/pplns`. Ordered by
-/// `count` descending.
-///
-/// The NULL-user-agent group reports `count = 0` while still carrying its
-/// sums (`COUNT("userAgent")` semantics). Consumers render that; changing
-/// it is a display decision.
+/// Ordered by `count` descending. The NULL-user-agent group reports
+/// `count = 0` but keeps its sums (`COUNT("userAgent")` semantics).
 pub async fn aggregate_by_user_agent(
     redis: Option<&ConnectionManager>,
     rows: &[UserAgentSessionRow],
@@ -386,16 +323,13 @@ pub async fn aggregate_by_user_agent(
     Ok(group_user_agents(rows, &live))
 }
 
-/// The same grouping with NO live data — what a reader shows while the
-/// live store is unreachable: who is connected is known from Postgres,
-/// what they are hashing is not.
+/// The same grouping without live data, for when Redis is unreachable.
 pub fn aggregate_offline(rows: &[UserAgentSessionRow]) -> Vec<UserAgentAgg> {
     let none: Vec<Option<LiveFields>> = vec![None; rows.len()];
     group_user_agents(rows, &none)
 }
 
-/// The pure grouping half of [`aggregate_by_user_agent`], split out so
-/// the count/NULL/max semantics are testable without a Redis server.
+/// Pure half of [`aggregate_by_user_agent`], testable without Redis.
 fn group_user_agents(
     rows: &[UserAgentSessionRow],
     live: &[Option<LiveFields>],

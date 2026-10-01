@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Shared HTML helpers + color palette for the email templates.
-//!
-//! Inline-styled HTML — email clients strip `<style>` tags so colour /
-//! font definitions live on every element. Card stays on the dashboard
-//! `mdc-dark-indigo` palette (dark card on light page) so the email
-//! reads as "themed app", not "phishing template" — ML spam classifiers
-//! (Gmail in particular) treat fully-dark `<body>` as a mild risk
-//! signal; light page + dark card is the safe shape.
+//! Shared HTML helpers + palette for the email templates. Styles are inline
+//! because email clients strip `<style>`. Light page with a dark card,
+//! because spam classifiers treat a fully dark `<body>` as a risk signal.
 
 use chrono::{DateTime, Utc};
 

@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Trait-object surface for the bp-api crate.
-//!
-//! `BlockpartyService<H>` is generic over its hook trait; storing it in
-//! `bp_api::AppState<H, M>` directly would give every handler a third
-//! generic param. The object-safe `#[async_trait]` trait hides it: the api
-//! crate stores `Option<Arc<dyn BlockpartyApi>>`, and the dynamic dispatch
-//! cost is invisible next to the JSON / SQL roundtrips per request.
+//! Object-safe surface of `BlockpartyService<H>`, so `bp_api::AppState` can
+//! hold a `dyn BlockpartyApi` instead of giving every handler a third
+//! generic parameter.
 
 use std::sync::Arc;
 
@@ -31,9 +27,8 @@ pub trait BlockpartyApi: Send + Sync {
     async fn pending_party_fee_route(&self, address: &AddressId) -> Option<PendingPartyFeeRoute>;
     async fn member_group_id(&self, address: &AddressId) -> Option<Uuid>;
 
-    /// Rebuild the in-memory routing cache from the DB. Used by the Front's
-    /// cross-process cache-sync consumer to pick up status changes made on
-    /// another process (e.g. the api).
+    /// For the Front's cache-sync consumer, to pick up changes made in
+    /// another process.
     async fn rebuild_cache(&self) -> Result<(), BlockpartyServiceError>;
 
     /// Attach the cross-process cache-invalidation notifier (writer process).
@@ -131,16 +126,13 @@ pub trait BlockpartyApi: Send + Sync {
         address: &AddressId,
         member_token: Option<&str>,
     ) -> Result<(), BlockpartyServiceError>;
-    /// Admin-token gate for read paths that show the admin more (the full
-    /// member addresses in `GET /:id`). Same errors as every admin action.
+    /// Gate for reads that show the admin more, e.g. full member addresses.
     async fn verify_admin_token(
         &self,
         group_id: Uuid,
         token: Option<&str>,
     ) -> Result<(), BlockpartyServiceError>;
-    /// Member-token gate for `GET /:id/member-view/:address`. Returns
-    /// `Ok(())` when the token verifies; surfaces the typed errors
-    /// otherwise.
+    /// Gate for `GET /:id/member-view/:address`.
     async fn verify_member_token(
         &self,
         group_id: Uuid,
@@ -148,12 +140,9 @@ pub trait BlockpartyApi: Send + Sync {
         member_token: Option<&str>,
     ) -> Result<(), BlockpartyServiceError>;
 
-    // ── Share / block hooks (called from stratum, not from bp-api,
-    //    but exposed here so the same trait covers all integration
-    //    points) ──
-    /// Build the coinbase payout distribution for the next block.
-    /// `Ok(None)` for an unknown group_id; the resolver falls back to
-    /// solo payouts in that case.
+    // ── Share / block hooks (called from stratum) ──
+    /// `Ok(None)` for an unknown group; the resolver then falls back to
+    /// solo payouts.
     async fn build_payouts(
         &self,
         group_id: Uuid,

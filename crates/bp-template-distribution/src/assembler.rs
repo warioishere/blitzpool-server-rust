@@ -1,26 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! The TDP template state machine, shared by the SV1 and SV2 servers:
-//! pair each `NewTemplate` with its activating `SetNewPrevHash` into the
-//! template the pool mines on, and report whether a change moved the tip.
-//!
-//! ## Pairing rules (SV2 TDP wire pattern)
-//!
-//! - `NewTemplate(future_template=true)` is sent in advance for an upcoming
-//!   block. The assembler caches it keyed by `template_id`.
-//! - `SetNewPrevHash(template_id=X)` arrives when bitcoin-core detects a new
-//!   tip. The assembler looks up the cached template X, pairs the two, and
-//!   emits [`TemplateChange::NewBlock`].
-//! - `NewTemplate(future_template=false)` for the *current* tip (fee/mempool
-//!   refresh) replaces the active template's coinbase fields in place,
-//!   emitting [`TemplateChange::Refresh`].
-//! - `RequestTransactionDataSuccess` / `Error` are responses to explicit
-//!   `RequestTransactionData` calls; the pool's block-submission path
-//!   consumes those separately.
-//!
-//! What each protocol derives from the paired template on top (SV1's
-//! pre-encoded `mining.notify` hex) is its own [`ActiveFromTemplate`]
-//! implementation; the pairing itself exists only here.
+//! The TDP template state machine, shared by the SV1 and SV2 servers: a
+//! future `NewTemplate` is cached until its `SetNewPrevHash` activates it, a
+//! non-future one refreshes the active template in place. What a protocol
+//! derives on top is its own [`ActiveFromTemplate`]; the pairing exists only here.
 
 use std::collections::HashMap;
 
@@ -41,13 +24,9 @@ pub enum TemplateChange {
     Refresh,
 }
 
-/// A `NewTemplate` joined with its activating `SetNewPrevHash`. One per
-/// active block height. The block-found gate reads the network target from
-/// `n_bits` (`bp_mining_job::meets_network_target`).
-///
-/// `prev_hash` stays in Bitcoin internal LE order, as bitcoin-core delivers
-/// it and as SV2's `SetNewPrevHash` carries it; SV1 word-swaps it for
-/// `mining.notify`.
+/// A `NewTemplate` joined with its activating `SetNewPrevHash`. `prev_hash`
+/// stays in Bitcoin internal LE order, as bitcoin-core and SV2 carry it; SV1
+/// word-swaps it for `mining.notify`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActiveTemplate {
     pub template_id: u64,
@@ -111,12 +90,9 @@ impl ActiveFromTemplate for ActiveTemplate {
 }
 
 /// Combines `NewTemplate` + `SetNewPrevHash` pairs into the active template
-/// `A`. Owned `&mut` by the translator task that drives a
-/// [`crate::TdpHandle::subscribe`] receiver.
-///
-/// Future templates are bounded by the natural cadence (bitcoin-core has at
-/// most 1–2 cached at once) and the cache is cleared on every pairing, so
-/// the map stays effectively `O(1)`.
+/// `A`, owned by the translator task that drives a
+/// [`crate::TdpHandle::subscribe`] receiver. The future cache is cleared on
+/// every pairing, so it stays small.
 pub struct TemplateAssembler<A> {
     future_templates: HashMap<u64, NewTemplate>,
     active: Option<A>,
@@ -159,13 +135,9 @@ impl<A: ActiveFromTemplate> TemplateAssembler<A> {
         }
     }
 
-    /// Replay a [`TemplateSnapshot`] so a late subscriber recovers the
-    /// bootstrap state the broadcast missed. Returns the active template
-    /// and its change when both halves of the pair are present and apply
-    /// cleanly; `None` otherwise.
-    ///
-    /// The caller owns the side-effects (its own current-template mutex,
-    /// its outbound broadcast), since their shape varies per protocol.
+    /// Replay a [`TemplateSnapshot`] so a late subscriber recovers the state
+    /// the broadcast missed; `None` unless both halves of the pair apply.
+    /// Side effects stay with the caller, since they vary per protocol.
     pub fn bootstrap_from_snapshot(
         &mut self,
         snapshot: TemplateSnapshot,
@@ -183,11 +155,9 @@ impl<A: ActiveFromTemplate> TemplateAssembler<A> {
             self.future_templates.insert(t.template_id, t.clone());
             return None;
         }
-        // Non-future: a fee/mempool refresh for the current prev-hash.
-        // With no active template yet (out-of-order delivery — should not
-        // happen in steady state with bitcoin-core SV2) it is stashed as if
-        // it were a future template and picked up on the next
-        // SetNewPrevHash.
+        // Non-future: a fee/mempool refresh for the current prev-hash. With
+        // no active template yet it is stashed like a future one and picked
+        // up on the next SetNewPrevHash.
         match self.active.as_mut() {
             Some(active) => {
                 active.refresh(t);
@@ -204,9 +174,7 @@ impl<A: ActiveFromTemplate> TemplateAssembler<A> {
         // No matching NewTemplate (out-of-order or first-startup race):
         // nothing to broadcast yet — wait for it to arrive.
         let template = self.future_templates.remove(&p.template_id)?;
-        // Any other cached futures are obsolete now — a fresh prev-hash
-        // invalidates templates for the previous tip. Clear them so memory
-        // stays bounded if bitcoin-core ever spams futures.
+        // A fresh prev-hash makes every other cached future obsolete.
         self.future_templates.clear();
         self.active = Some(A::activate(template, p));
         Some(TemplateChange::NewBlock)
@@ -352,9 +320,7 @@ mod tests {
 
     // ── Refresh ─────────────────────────────────────────────────────
 
-    /// Non-future NewTemplate for the current tip replaces coinbase fields
-    /// in place + emits `Refresh`. prev_hash / n_bits / header_timestamp are
-    /// NOT touched.
+    /// A non-future NewTemplate refreshes coinbase fields but not the header fields.
     #[test]
     fn non_future_new_template_refreshes_coinbase_in_place() {
         let mut a = assembler();

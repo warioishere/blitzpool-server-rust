@@ -1,21 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `DistributionBuilder` — the Group-Solo side of the shared
-//! build-and-snapshot path.
-//!
-//! Reads the group's round state from Redis (`by-address` hash) and
-//! the group's per-group config row (`finder_bonus_ppm`) from the
-//! `pplns_group` table, calls the shared weight builder with
-//! [`WithheldValue::ToPool`], then persists a per-(group, finder)
-//! snapshot.
-//!
-//! There is no ledger read: Group-Solo owes nothing between blocks.
-//!
-//! Concurrent callers for the same `(group_id, block_reward_sats,
-//! finder_address)` triple share one compute via the in-flight cache
-//! (30s TTL by default). Different finders within the same group
-//! compute independently, since every miner's session builds with its
-//! own address as the prospective finder.
+//! `DistributionBuilder`: the Group-Solo side of the shared build-and-snapshot
+//! path, built with [`WithheldValue::ToPool`] and no ledger read, since
+//! Group-Solo owes nothing between blocks. Builds are cached per
+//! `(group, reward, finder)` because each session is its own prospective finder.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -69,12 +57,8 @@ type CacheKey = (Uuid, u64, String);
 pub struct DistributionResult {
     pub group_id: Uuid,
     pub finder_address: AddressId,
-    /// The weight-native distribution (SV2 ext 0x0003 model): entries
-    /// with settlement inputs + published wire weights, `weight_P`, the
-    /// finder bonus recorded for settlement, and the weights
-    /// fingerprint. Concrete satoshis come from
-    /// [`WeightDistribution::payout_entries_at`] at the caller's
-    /// revenue.
+    /// The weight-native distribution; concrete satoshis come from
+    /// [`WeightDistribution::payout_entries_at`] at the caller's revenue.
     pub distribution: WeightDistribution,
     /// Did the weight snapshot under the fingerprint actually get
     /// written (after retries)? `false` → the distribution still
@@ -212,10 +196,7 @@ async fn compute_distribution(
         "group-solo distribution: skipping invalid address in round state",
     );
 
-    // 3-5. No ledger to read: Group-Solo carries no balances (see the
-    //      crate docs), so the balance map is empty. Sanitize, project
-    //      onto weights and persist the snapshot is the path both payout
-    //      engines share.
+    // 3. Group-Solo carries no balances, so the balance map is empty.
     let fee_address = config
         .fee_address
         .as_ref()
@@ -232,17 +213,13 @@ async fn compute_distribution(
             coinbase_weight_budget: config.coinbase_weight_budget,
             finder_bonus_ppm,
             finder_address: Some(finder_address),
-            // The prospective finder claims the block if the round is
-            // empty, which is routine here since every reset path DELs
-            // the by-address hash. Builds and the in-flight cache are
-            // per-finder, so a bootstrap distribution is never served to
-            // a different member.
+            // An empty round is routine (every reset DELs the hash); builds
+            // are per-finder, so a bootstrap distribution never reaches
+            // another member.
             bootstrap_claimant: Some(finder_address),
             reference_revenue_sats: block_reward_sats,
-            // Group-Solo: a member the coinbase cannot pay forfeits this
-            // block and their share falls to the pool output. Nothing has
-            // to be remembered until the next block, which is what lets
-            // this mode run without a ledger.
+            // A member the coinbase cannot pay forfeits to the pool output,
+            // so nothing carries to the next block and no ledger is needed.
             withheld_value: WithheldValue::ToPool,
             scope: "group-solo",
         },

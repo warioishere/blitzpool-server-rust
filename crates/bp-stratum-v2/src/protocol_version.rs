@@ -1,16 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Which SV2 protocol versions this pool speaks, and how a
-//! `SetupConnection` version range is negotiated against them.
-//!
-//! One place, because the answer is a property of the POOL and not of a
-//! sub-protocol: the mining listener and the JDP listener must not be able to
-//! speak different SV2 versions. `stratum_core` ships no constant for this,
-//! so the pool holds the numbers.
-//!
-//! What stays per sub-protocol is the REFUSAL (the `SetupConnection.Error`
-//! each handler sends); this module only decides whether the ranges
-//! intersect.
+//! The SV2 protocol versions this pool speaks and the `SetupConnection` range
+//! negotiation. One place, so the mining and JDP listeners cannot speak
+//! different versions; each sub-protocol still sends its own refusal.
 
 /// Minimum SV2 protocol version served. SV2 Overview/SetupConnection pins
 /// `min_version`/`max_version` at 2 for the current specification.
@@ -20,13 +12,9 @@ pub const MIN_PROTOCOL_VERSION: u16 = 2;
 /// this pool supports.
 pub const MAX_PROTOCOL_VERSION: u16 = 2;
 
-/// Negotiate a client's advertised `[min_version, max_version]` against what
-/// this pool serves.
-///
-/// `Some(used_version)` when the ranges intersect — the highest version both
-/// sides speak, which is what `SetupConnection.Success.used_version` carries.
-/// `None` when they do not; the caller sends its own sub-protocol's
-/// `SetupConnection.Error` and closes.
+/// Negotiate a client's `[min_version, max_version]` against what this pool
+/// serves: the highest version both speak, or `None` when the ranges do not
+/// intersect (the caller then sends its own `SetupConnection.Error`).
 pub fn negotiate_version(min_version: u16, max_version: u16) -> Option<u16> {
     negotiate_against(
         min_version,
@@ -36,32 +24,24 @@ pub fn negotiate_version(min_version: u16, max_version: u16) -> Option<u16> {
     )
 }
 
-/// The rule itself, with the served range as parameters.
-///
-/// Split from [`negotiate_version`] so it can be exercised against a range
-/// WIDER than one version. With `MIN_PROTOCOL_VERSION == MAX_PROTOCOL_VERSION`
-/// the two bounds are interchangeable, so a test that only passes the real
-/// constants cannot tell a wrong-bound comparison or clamp from a correct
-/// one; those mistakes would surface only once `MAX` is raised.
+/// The rule with the served range as parameters, split from
+/// [`negotiate_version`] so tests can use a range wider than one version:
+/// with `MIN == MAX` a swapped bound would go unnoticed.
 fn negotiate_against(
     client_min: u16,
     client_max: u16,
     serve_min: u16,
     serve_max: u16,
 ) -> Option<u16> {
-    // A client that names a minimum above its own maximum has named no range
-    // at all. Without this the two comparisons below can both pass — take
-    // `client 4–2` against `serve 2–4` — and the result is `2`, a version the
-    // client said was beneath it.
+    // An inverted range is no range; without this, `client 4–2` against
+    // `serve 2–4` would pass both checks below and negotiate 2.
     if client_min > client_max {
         return None;
     }
     if client_min > serve_max || client_max < serve_min {
         return None;
     }
-    // Clamping against the upper bound alone is enough: the check above
-    // already established `client_max >= serve_min`, so the result cannot
-    // fall below the minimum.
+    // `client_max >= serve_min` holds here, so clamping the top suffices.
     Some(client_max.min(serve_max))
 }
 
@@ -69,9 +49,7 @@ fn negotiate_against(
 mod tests {
     use super::*;
 
-    /// A served range wider than one version. Every rule test below runs
-    /// against THIS rather than the real constants — see
-    /// [`negotiate_against`].
+    /// A served range wider than one version; see [`negotiate_against`].
     const SERVE_MIN: u16 = 2;
     const SERVE_MAX: u16 = 4;
 
@@ -101,16 +79,14 @@ mod tests {
         assert_eq!(negotiate(5, 9), None);
     }
 
-    /// Touching at exactly one end still negotiates — the boundary the two
-    /// comparisons are written around.
+    /// Ranges touching at exactly one end still negotiate.
     #[test]
     fn touching_at_either_end_is_enough() {
         assert_eq!(negotiate(0, SERVE_MIN), Some(SERVE_MIN));
         assert_eq!(negotiate(SERVE_MAX, 9), Some(SERVE_MAX));
     }
 
-    /// A range whose minimum sits above its maximum is no range and
-    /// negotiates nothing.
+    /// An inverted client range negotiates nothing.
     #[test]
     fn an_inverted_range_negotiates_nothing() {
         assert_eq!(negotiate_against(4, 2, SERVE_MIN, SERVE_MAX), None);
@@ -118,12 +94,10 @@ mod tests {
         assert_eq!(negotiate_version(4, 2), None);
     }
 
-    /// Whatever comes back is a version BOTH sides named. Swept over every
-    /// client range in and around the served one.
+    /// Any negotiated version lies in both ranges, swept over all client ranges.
     #[test]
     fn a_negotiated_version_is_one_both_sides_named() {
-        // Every ordered pair, INVERTED ONES INCLUDED, so the
-        // `used >= client_min` assertion meets the case that can break it.
+        // Inverted pairs included: they are what can break `used >= client_min`.
         for client_min in 0u16..8 {
             for client_max in 0u16..8 {
                 let got = negotiate(client_min, client_max);
@@ -148,8 +122,7 @@ mod tests {
         }
     }
 
-    /// The wiring, separately from the rule: the public entry point really
-    /// does hand the pool's own constants to it.
+    /// The public entry point passes the pool's own constants to the rule.
     #[test]
     fn the_public_entry_point_uses_the_pools_own_range() {
         assert_eq!(

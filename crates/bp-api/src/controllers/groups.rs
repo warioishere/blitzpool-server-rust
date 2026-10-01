@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `/api/pplns/groups/*` — group reader + writer endpoints.
-//!
-//! Routes that always require an admin token sit behind
-//! [`crate::middleware::admin_auth::require_admin`] on a dedicated
-//! sub-router; the service-level `require_admin_token` check stays as
-//! defence-in-depth. Where the token is optional (`by_id`,
-//! `open_invite_active`, `list_join_requests`) it shapes the response
-//! rather than gating access, so those handlers check it inline.
+//! `/api/pplns/groups/*`. Admin-only routes sit behind
+//! [`crate::middleware::admin_auth::require_admin`], with the service check
+//! kept as defence-in-depth; where the token only shapes the response, the
+//! handler checks it inline.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -40,7 +36,6 @@ where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
 {
-    // Routes that always require a valid `x-admin-token` header.
     // `route_layer` applies only to routes registered before it, so every
     // admin route must be added above the layer call.
     let admin_routes = Router::new()
@@ -52,8 +47,6 @@ where
         )
         .route("/api/pplns/groups/:id", delete(dissolve::<H, M>))
         .route(
-            // POST is rate-limited (5/min); DELETE sibling shares the path
-            // but is added without the layer.
             "/api/pplns/groups/:id/invitations/open",
             post(create_open_invite::<H, M>)
                 .layer(rate_limit::per_minute_layer(5))
@@ -139,9 +132,7 @@ where
             "/api/pplns/groups/public/:id/join-request",
             post(create_join_request::<H, M>).layer(rate_limit::per_minute_layer(10)),
         )
-        // NB: this must come LAST so the more specific paths above
-        // (`/public`, `/by-address/:addr`, `/join-requests/...`) win
-        // the route-match.
+        // Last, so the more specific paths above win the route-match.
         .route("/api/pplns/groups/:id", get(by_id::<H, M>));
 
     admin_routes.merge(public_routes)
@@ -149,10 +140,7 @@ where
 
 // ─── cache invalidation helpers ──────────────────────────────────
 
-/// Drop every cached `/api/groups/*` entry whose key references
-/// `id` or the list / public-list pages. Called by every mutating
-/// endpoint so the next read sees fresh data without waiting for
-/// the TTL to roll.
+/// Called by every mutating endpoint so the next read is fresh, not TTL-old.
 async fn invalidate_group_cache<H, M>(state: &SharedState<H, M>, id: Uuid)
 where
     H: GroupServiceHooks + 'static,
@@ -177,19 +165,15 @@ where
         let full = format!("{prefix}{id_str}");
         state.cache.invalidate_prefix(&full).await;
     }
-    // The round-reset cadence doubles as the Window payout length; drop the
-    // engine's per-share mode cache so an edit takes effect immediately instead
-    // of letting the record-path trim run on the stale (possibly smaller)
-    // window length for up to its TTL.
+    // The round-reset cadence doubles as the Window payout length, so the
+    // engine's mode cache is dropped too; otherwise the trim would run on a
+    // stale window length until its TTL.
     if let Some(engine) = state.group_solo.as_ref() {
         engine.invalidate_mode_cache(id);
     }
 }
 
-/// Drop the address-keyed group entries for the supplied address.
-/// Used when membership changes (transfer / remove_member / approve
-/// join-request) so `GET /api/groups/by-address/:addr` and
-/// `.../join-requests/by-address/:addr` re-resolve immediately.
+/// For membership changes, so the by-address lookups re-resolve immediately.
 async fn invalidate_address_group_cache<H, M>(state: &SharedState<H, M>, address: &AddressId)
 where
     H: GroupServiceHooks + 'static,
@@ -208,8 +192,7 @@ where
 struct CreateGroupBody {
     name: String,
     creator_address: String,
-    /// Payout mode, chosen once at creation and immutable thereafter:
-    /// `"prop"` (default) or `"window"`. Absent ⇒ `"prop"`.
+    /// `"prop"` (default) or `"window"`; immutable after creation.
     #[serde(default)]
     mode: Option<String>,
 }
@@ -226,9 +209,7 @@ struct InitialMember {
 struct CreateGroupResponse {
     #[serde(flatten)]
     summary: GroupSummary,
-    /// Plaintext admin token — shown to the creator exactly once. The
-    /// hash is stored on the group row; this string never goes back
-    /// across the wire after the initial response.
+    /// Shown exactly once; only its hash is stored.
     admin_token: String,
     members: Vec<InitialMember>,
 }
@@ -242,7 +223,7 @@ where
     M: EmailHooks + 'static,
 {
     let svc = require_group_service(&state)?;
-    // Mode is immutable (no edit path) — validate it up front. Absent ⇒ prop.
+    // Immutable, so validated up front.
     let mode = match body.mode.as_deref() {
         None => bp_group_mgmt::group::PayoutMode::Prop,
         Some(s) => bp_group_mgmt::group::PayoutMode::parse(s)
@@ -307,9 +288,8 @@ where
     }))
 }
 
-/// PATCH body: an absent field is untouched. `deny_unknown_fields`
-/// makes an unknown key (e.g. the retired `finderBonusSats`) a 400
-/// instead of a 200 that silently changed nothing.
+/// `deny_unknown_fields`: an unknown key is a 400, not a 200 that silently
+/// changed nothing.
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateSettingsBody {
@@ -383,11 +363,8 @@ where
     Ok(Json(GroupSummary::from(row)))
 }
 
-/// Block subsidy in sats for `height` on `network`.
-///
-/// Maps the network to its halving interval and delegates to
-/// [`bp_share::block_subsidy_sats`], the same function settlement gates on,
-/// so there is one halving rule. Heights beyond `i32` clamp (subsidy 0).
+/// Delegates to [`bp_share::block_subsidy_sats`], the function settlement
+/// gates on, so there is one halving rule. Heights beyond `i32` clamp.
 pub(crate) fn block_subsidy_sats(height: u64, network: bitcoin::Network) -> u64 {
     let interval = match network {
         bitcoin::Network::Regtest => bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL,
@@ -399,24 +376,18 @@ pub(crate) fn block_subsidy_sats(height: u64, network: bitcoin::Network) -> u64 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GroupCoinbaseCapacity {
-    /// Worst-case max members that fit in the group-solo coinbase weight
-    /// budget. Pessimistic: assumes every output is the heaviest standard
-    /// type (P2TR, 172 WU) and reserves the pool-fee output slot — real
-    /// P2WPKH-heavy groups fit more. The UI shows a group's member count
-    /// against this ceiling.
+    /// Worst case: every output the heaviest standard type, plus the pool
+    /// output slot.
     max_members: u64,
-    /// The fixed group-solo coinbase weight budget (WU) the ceiling derives
-    /// from. Engine-wide, identical for every group.
+    /// Engine-wide, identical for every group.
     weight_budget: u32,
-    /// Whether a pool fee output is reserved (it consumes one member slot).
+    /// The pool output consumes one member slot.
     has_fee_output: bool,
 }
 
-/// `GET /api/pplns/groups/coinbase-capacity` — how many members fit in the
-/// engine-wide group-solo coinbase weight budget. Uses
-/// [`max_coinbase_outputs`](bp_pplns_engine::max_coinbase_outputs), the same
-/// ceiling `GroupService` refuses a join against. The PPLNS budget autoscales
-/// and is not this one (see `maxMinerOutputsAdaptive` on `/api/pplns/fees`).
+/// Uses [`max_coinbase_outputs`](bp_pplns_engine::max_coinbase_outputs), the
+/// same ceiling `GroupService` refuses a join against. The autoscaled PPLNS
+/// budget is a different one.
 async fn coinbase_capacity<H, M>(
     State(state): State<SharedState<H, M>>,
 ) -> Result<Json<GroupCoinbaseCapacity>, ApiError>
@@ -432,8 +403,7 @@ where
     Ok(Json(GroupCoinbaseCapacity {
         max_members: bp_pplns_engine::max_coinbase_outputs(cfg.coinbase_weight_budget),
         weight_budget: cfg.coinbase_weight_budget,
-        // The pool output is structural, so a slot is reserved at every fee
-        // (0 % included). Kept on the wire because the UI declares it.
+        // The pool output is structural, so reserved even at 0 % fee.
         has_fee_output: true,
     }))
 }
@@ -588,8 +558,7 @@ where
         .await
         .map_err(jr_to_api_error)?;
     invalidate_group_cache(&state, id).await;
-    // Approver doesn't know the requester's address — broad-invalidate
-    // any address-keyed join-request entries.
+    // The requester's address is unknown here, so invalidate broadly.
     state
         .cache
         .invalidate_prefix("GROUP_JOIN_REQUESTS_BY_ADDR_")
@@ -705,20 +674,13 @@ where
         .ok_or(ApiError::Unavailable("join-request-service not wired"))
 }
 
-/// Pluck the admin token from the `x-admin-token` header. Returns
-/// `None` if absent — callers decide whether that's fatal (admin-only
-/// endpoints) or just affects response shape (group lookups where
-/// admins see unmasked emails).
 fn admin_token(headers: &HeaderMap) -> Option<&str> {
     headers.get("x-admin-token").and_then(|v| v.to_str().ok())
 }
 
-/// The admin token from `x-admin-token`, checked against the group — `None`
-/// when the header is absent, an error when it is present and wrong.
-///
-/// Call this BEFORE a response-cache lookup whose key carries the admin
-/// flag. A check inside the cached computation only runs on a miss, so any
-/// token would read the admin body a real admin just cached.
+/// `None` without the header, an error when it is wrong. Call BEFORE a cache
+/// lookup keyed on the admin flag: a check inside the cached computation runs
+/// only on a miss, so any token would read a real admin's cached body.
 async fn verified_admin_token<'h, H, M>(
     state: &SharedState<H, M>,
     id: Uuid,
@@ -744,31 +706,24 @@ where
 struct GroupSummary {
     id: Uuid,
     name: String,
-    /// The creator's payout address. Present on authenticated/address-scoped
-    /// views (drives the "created by" line + the isCreator/admin gate), but
-    /// nulled on the public directory shapes (`list_public` / `public_one`) so
-    /// the creator's on-chain address is never exposed to anonymous viewers.
+    /// Nulled on the public directory shapes, so anonymous viewers never see
+    /// the creator's on-chain address.
     #[serde(skip_serializing_if = "Option::is_none")]
     creator_address: Option<String>,
     active: bool,
-    /// ISO-8601 (`Date.toISOString()` shape).
     created_at: String,
     round_reset_preset: Option<String>,
     round_reset_interval_days: Option<i32>,
     round_reset_timezone: Option<String>,
     finder_bonus_ppm: i32,
     last_round_reset_at: Option<String>,
-    /// Computed next-reset wall-clock (ISO), derived from the preset +
-    /// timezone + interval by [`next_reset_at`]. `None` when the
-    /// group has no preset / no timezone (UI tiles then render a neutral
-    /// "no schedule" state).
+    /// See [`next_reset_at`]; `None` without a usable schedule.
     next_reset_at: Option<String>,
     is_public: bool,
     reset_round_on_block: bool,
-    /// Hard member cap; null = no limit. UI shows `current/max` when set.
+    /// Null = no limit.
     max_members: Option<i64>,
-    /// Payout mode — `"prop"` or `"window"`. Immutable; the UI shows it
-    /// read-only in the edit form and offers it only at creation.
+    /// `"prop"` or `"window"`; immutable.
     mode: String,
 }
 
@@ -800,11 +755,9 @@ impl From<bp_db::PplnsGroupRow> for GroupSummary {
     }
 }
 
-/// The next scheduled round reset as epoch milliseconds — the instant the
-/// engine's reset cron will fire, computed by that same cron's
-/// [`compute_next_fire`](bp_group_solo_engine::reset::compute_next_fire).
-/// `None` when the group has no usable schedule (no preset, no timezone, an
-/// unknown preset or timezone, or a custom preset without an interval).
+/// Computed by the reset cron's own
+/// [`compute_next_fire`](bp_group_solo_engine::reset::compute_next_fire), so
+/// the advertised instant is the one it fires at.
 fn next_reset_at(r: &bp_db::PplnsGroupRow) -> Option<i64> {
     use bp_group_solo_engine::reset::{compute_next_fire, ResetSchedule};
     let schedule = ResetSchedule::from_row_fields(
@@ -879,10 +832,8 @@ where
                 } else {
                     &[][..]
                 };
-                // Roster first, then ONE live-hashrate read for the whole
-                // page: each read is a cursor-complete SCAN of the Redis
-                // keyspace, so per-group calls would multiply a full walk
-                // by the page size (up to 100).
+                // ONE live-hashrate read for the page: each read SCANs the
+                // whole Redis keyspace, so per-group calls would multiply it.
                 let mut rosters = Vec::with_capacity(slice.len());
                 for g in slice {
                     rosters.push((g, svc.list_members(g.id).await?));
@@ -940,9 +891,8 @@ struct RecentBlock {
     id: i32,
     group_id: Uuid,
     block_height: i32,
-    /// ISO-8601.
     created_at: String,
-    /// Masked payout address (never the full address).
+    /// Masked; the full address is never sent.
     address_label: String,
     paid_sats: i64,
     #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
@@ -1013,8 +963,7 @@ where
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ViewerQuery {
-    /// The viewer's own address (already in the UI route). Only used to flag
-    /// that member's row `isSelf` — never echoed back for other members.
+    /// Only flags the viewer's own row `isSelf`; never echoed for others.
     viewer: Option<String>,
 }
 
@@ -1033,42 +982,30 @@ struct GroupDetailResponse {
 struct MemberEntry {
     /// Opaque stable join key; the full address is never sent.
     member_id: String,
-    /// Masked address for display (first 4 + last 5, unique within the group).
+    /// Masked, unique within the group.
     address_label: String,
-    /// Full payout address — included ONLY for an admin-token-authenticated
-    /// caller (the creator managing members). Absent for anonymous / member
-    /// viewers, so a group id can't harvest member addresses.
+    /// Admin-token callers only, so a group id cannot harvest member addresses.
     #[serde(skip_serializing_if = "Option::is_none")]
     address: Option<String>,
-    /// True only for the row matching `?viewer=` — the UI uses it to link the
-    /// viewer's own row to their address dashboard (it already knows the address
-    /// from the route).
+    /// True only for the row matching `?viewer=`.
     is_self: bool,
     role: String,
-    /// ISO-8601.
     joined_at: String,
     #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     hashrate: f64,
-    /// All-time best difficulty for the member, served here so the UI never
-    /// needs a member's full address to fetch it.
+    /// Served here so the UI never needs a member's full address.
     #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     best_difficulty: f64,
-    /// Earliest worker start (uptime basis), ISO-8601; None when offline.
+    /// Earliest worker start (uptime basis); None when offline.
     #[serde(skip_serializing_if = "Option::is_none")]
     start_time: Option<String>,
-    /// Most recent worker heartbeat, ISO-8601; None when never seen.
     #[serde(skip_serializing_if = "Option::is_none")]
     last_seen: Option<String>,
     last_accepted_share_at: Option<String>,
-    /// `None` when caller isn't admin OR when the address has no
-    /// verified email binding; otherwise masked-or-unmasked depending
-    /// on auth.
+    /// Admin-only and masked.
     #[serde(skip_serializing_if = "Option::is_none")]
     email: Option<String>,
-    /// How the member proved address ownership — `"email"` or `"signature"`.
-    /// Admin-only (like `email`); `None` for non-admin callers or a member
-    /// with no verification on record. Lets the admin roster show a
-    /// "verified via signature" badge for email-less members.
+    /// `"email"` or `"signature"`; admin-only, like `email`.
     #[serde(skip_serializing_if = "Option::is_none")]
     verified_via: Option<&'static str>,
 }
@@ -1083,12 +1020,9 @@ where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
 {
-    // The cache key includes the `admin` flag so admin + non-admin views
-    // are stored separately.
+    // Admin flag and viewer are both in the cache key, so neither view leaks
+    // into the other.
     let is_admin = verified_admin_token(&state, id, &headers).await?.is_some();
-    // Viewer's own address (from the UI route) — only ever used to flag their
-    // own row `isSelf`; never echoed back for other members. Keyed into the
-    // cache so the self-flag is per-viewer (anonymous viewers share "none").
     let viewer = q
         .viewer
         .as_deref()
@@ -1115,8 +1049,6 @@ where
             let total_hashrate: f64 = per_addr_hashrate.values().sum();
             let addr_strings: Vec<String> = addrs.iter().map(|a| a.as_str().to_string()).collect();
             let labels = build_member_labels(&addr_strings);
-            // Signature-ownership lookup for the admin-only verified-via
-            // badge, batched into one query for the whole roster.
             let owned_signatures = if is_admin {
                 bp_db::addresses_with_ownership_proof(&s.pool, &addr_strings).await?
             } else {
@@ -1149,20 +1081,15 @@ where
             let mut entries = Vec::with_capacity(members.len());
             for m in members {
                 let addr_str = m.address.as_str();
-                // Redis-first / PG-fallback — same policy as the kick-inactivity
-                // guard, so an actively-mining member doesn't read "never mined"
-                // before the group's first block-found stamps the durable balance.
+                // Same policy as the kick-inactivity guard, so an active member
+                // does not read "never mined" before the group's first block.
                 let last_active = svc.member_last_active(id, &m.address).await;
                 let email = bp_db::find_address_email(&s.pool, &m.address).await?;
-                // Admin sees a masked email (enough to tell "verified email
-                // present" from "none"); non-admins get no email field.
                 let email_out = match (is_admin, email.as_ref()) {
                     (true, Some(b)) => Some(crate::utils::mask_email(&b.email)),
                     _ => None,
                 };
-                // Verification method for the admin roster badge: a verified
-                // email binding wins; otherwise a signature ownership proof.
-                // Admin-only, same as `email`.
+                // A verified email binding wins over a signature proof.
                 let verified_via: Option<&'static str> = if is_admin {
                     if email.as_ref().and_then(|b| b.verified_at).is_some() {
                         Some("email")
@@ -1175,8 +1102,6 @@ where
                     None
                 };
                 let hashrate = per_addr_hashrate.get(addr_str).copied().unwrap_or(0.0);
-                // Per-member worker stats (best-diff / uptime / last-seen) are
-                // served here so the UI never needs a member's full address.
                 let start_time = start_times.get(addr_str).copied();
                 let last_seen = last_seen_by_address.get(addr_str).copied().or(start_time);
                 let best_difficulty = bp_db::find_address_settings(&s.pool, &m.address)
@@ -1204,9 +1129,8 @@ where
             }
             let mut summary = GroupSummary::from(group);
             if !is_admin {
-                // The creator is pseudonymised in `entries` like every member;
-                // only an admin-token caller sees the full address. The UI
-                // derives isCreator / "created by" from the roster instead.
+                // Pseudonymised like every member; the UI derives the creator
+                // from the roster.
                 summary.creator_address = None;
             }
             Ok(GroupDetailResponse {
@@ -1219,8 +1143,7 @@ where
     Ok(JsonBytes(bytes))
 }
 
-/// Every requested address at zero — the shape `hashrate_by_address`
-/// returns when nothing is live, used as the degraded fallback.
+/// Degraded fallback in the shape `hashrate_by_address` returns.
 fn zeroed(addrs: &[AddressId]) -> HashMap<String, f64> {
     addrs
         .iter()
@@ -1243,8 +1166,7 @@ where
     let member = bp_db::find_group_member_by_address(&state.pool, &addr)
         .await?
         .ok_or(ApiError::NotFound)?;
-    // The looked-up address is the viewer here (a member opening their own
-    // group), so flag its row `isSelf`.
+    // The looked-up address is the viewer here.
     let viewer = Query(ViewerQuery {
         viewer: Some(addr.as_str().to_string()),
     });
@@ -1253,11 +1175,8 @@ where
 
 // ─── GET /api/pplns/groups/membership/:address ───────────────────
 
-/// `{ groupId, groupName, role }` for a member, `{ groupId: null }` otherwise
-/// — the Blockparty `by-address` shape minus its status FSM (a Group-Solo
-/// member's group is never dissolved: the dissolve deletes the members).
-/// A yes/no answer without the roster, hashrate and sessions that
-/// `by-address` computes.
+/// A cheap yes/no without the roster `by-address` computes. No status field:
+/// a dissolve deletes the members, so a member's group is never dissolved.
 #[derive(Serialize)]
 #[serde(untagged)]
 enum MembershipResponse {
@@ -1269,7 +1188,7 @@ enum MembershipResponse {
         role: String,
     },
     None {
-        // Always `None` — emits `{ "groupId": null }`.
+        // Always `None`, so the body is `{ "groupId": null }`.
         #[serde(rename = "groupId")]
         group_id: Option<Uuid>,
     },
@@ -1430,9 +1349,8 @@ where
                     .as_deref()
                     .ok_or(ApiError::Unavailable("group-solo-engine not wired"))?;
                 let stats = engine.reader().round_stats(id).await?;
-                // Rejected shares are round-scoped — read from the same round
-                // store as the accepted shares so both describe the current
-                // round (or the same sliding window), not an all-time total.
+                // Rejects come from the same round store, so both describe the
+                // current round or window, not an all-time total.
                 Ok(DistributionResponse {
                     total_shares: stats.per_address.values().sum(),
                     total_rejected: stats.total_rejected,
@@ -1448,11 +1366,8 @@ where
     Ok(JsonBytes(bytes))
 }
 
-/// One row per address the round store knows, accepted OR rejected.
-///
-/// An address with only rejects this round gets a zero-share row, so the
-/// group-wide `total_rejected` reconciles against the table. Sorted by
-/// shares, descending.
+/// A reject-only address gets a zero-share row, so `total_rejected`
+/// reconciles against the table.
 fn distribution_entries(
     group_id: Uuid,
     per_address: HashMap<String, f64>,
@@ -1498,21 +1413,17 @@ fn distribution_entries(
 
 // ─── GET /api/pplns/groups/:id/window-timeline ──────────────────
 //
-// Per-day, per-member contribution across the live sliding window. Drives the
-// Window-mode "sliding window" chart (area / bar / heatmap) + the per-member
-// share card. Non-Window groups return an empty timeline (`windowDays: 0`) so
-// the UI simply renders nothing.
+// Non-Window groups return an empty timeline, so the UI renders nothing.
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WindowTimelineResponse {
-    /// Sliding-window length in days; 0 for a non-Window group.
+    /// 0 for a non-Window group.
     window_days: i64,
-    /// Every contributor in the window, biggest total first (stable stacking +
-    /// colour order). Pseudonymised — memberId is the series key, addressLabel
-    /// the legend text; the full address is never sent.
+    /// Biggest total first, for a stable stacking and colour order;
+    /// pseudonymised.
     contributors: Vec<TimelineContributor>,
-    /// One entry per calendar day that has data, oldest→newest.
+    /// Days with data only, oldest first.
     days: Vec<TimelineDay>,
 }
 
@@ -1526,15 +1437,14 @@ struct TimelineContributor {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TimelineDay {
-    /// ISO-8601 day-start (UTC).
+    /// Day start, UTC.
     date: String,
-    /// Diff-weighted contribution per address, index-aligned to `addresses`.
+    /// Index-aligned to `contributors`.
     #[serde(serialize_with = "crate::time_range::ser_vec_f64_jsnum")]
     values: Vec<f64>,
 }
 
-/// Fold the per-hour-bucket timeline into per-day, per-address sums and shape
-/// the response. Pure (no I/O) so it unit-tests without Redis.
+/// Folds hour buckets into per-day sums; pure, so it tests without Redis.
 fn build_window_timeline_response(
     group_id: Uuid,
     timeline: WindowTimeline,
@@ -1573,7 +1483,6 @@ fn build_window_timeline_response(
         })
         .collect();
 
-    // Pseudonymise the series identity (index-aligned to each day's `values`).
     let labels = build_member_labels(&addresses);
     let contributors = addresses
         .iter()
@@ -1627,10 +1536,9 @@ where
 #[serde(rename_all = "camelCase")]
 struct BestDifficultyResponse {
     best_difficulty: u64,
-    /// Masked submitter address (never the full address).
+    /// Masked; the full address is never sent.
     address_label: Option<String>,
-    /// ISO-8601 wall-clock of the share; `None` when the current
-    /// round has no recorded best yet (post-block-found reset state).
+    /// `None` while the current round has no best yet.
     time: Option<String>,
 }
 
@@ -1654,8 +1562,7 @@ where
                     .group_solo
                     .as_deref()
                     .ok_or(ApiError::Unavailable("group-solo-engine not wired"))?;
-                // Empty round returns the zero / null shape (NOT 404) so the
-                // UI doesn't surface an error tile right after a reset.
+                // Zero shape, not 404, so the UI shows no error after a reset.
                 let Some(best) = engine.reader().best_difficulty(id).await? else {
                     return Ok(BestDifficultyResponse {
                         best_difficulty: 0,
@@ -1688,9 +1595,8 @@ struct HistoryEntry {
     id: i32,
     group_id: Uuid,
     block_height: i32,
-    /// ISO-8601 timestamp the history row was written.
     created_at: String,
-    /// Masked payout address (never the full address).
+    /// Masked; the full address is never sent.
     address_label: String,
     paid_sats: i64,
     #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
@@ -1962,8 +1868,7 @@ fn jr_to_api_error(e: bp_group_mgmt_engine::JoinRequestServiceError) -> ApiError
 
 // ─── GET /api/groups/:id/chart + /accepted + /rejected ───────────
 //
-// Aggregations across the group's current members, binned into the same
-// slot grid the per-address endpoints use.
+// Over the group's current members, on the per-address slot grid.
 
 use crate::controllers::info::{rejected_by_reason_slots, RejectSlotsResponse};
 use crate::time_range::{
@@ -2012,9 +1917,7 @@ where
             let since = now - range.window_ms();
             let cutoff = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
             let addrs = collect_group_member_addresses(&s, id).await?;
-            // Sparse per-slot emission — sum each slot's shares across
-            // member rows, emit one ChartPoint per slot that actually
-            // received shares.
+            // Sparse: only slots that received shares get a point.
             let mut slot_shares: std::collections::BTreeMap<i64, f64> =
                 std::collections::BTreeMap::new();
             for a in &addrs {
@@ -2060,9 +1963,8 @@ where
                     bp_db::find_client_statistics_since_for_address(&s.pool, a, since).await?,
                 );
             }
-            // Diff-1-weighted accepted shares (sum of share difficulty),
-            // matching the per-client `/accepted` endpoint — tracks work,
-            // not raw share count, so it stays flat at constant hashrate.
+            // Difficulty-weighted like the per-client endpoint, so it stays
+            // flat at constant hashrate.
             Ok(accepted_slot_data(
                 &chart_slot_boundaries(since),
                 rows.iter().map(|r| (r.time, r.shares as f64)),
@@ -2072,8 +1974,6 @@ where
     Ok(JsonBytes(bytes))
 }
 
-/// The highest share difficulty any member of the group reached in each
-/// 10-minute slot.
 async fn group_max_difficulty<H, M>(
     State(state): State<SharedState<H, M>>,
     Path(id): Path<Uuid>,
@@ -2149,9 +2049,7 @@ mod slot_json_tests {
         serde_json::to_string(v).unwrap()
     }
 
-    /// `/api/groups/:id/accepted` — rows of several members, one member's
-    /// slot rows adding up, a row at the visibility cutoff dropped. The
-    /// handler's boundaries all lie below the cutoff.
+    /// Members' rows add up per slot; a row at the visibility cutoff is dropped.
     #[test]
     fn group_accepted_json_is_unchanged() {
         let cutoff = T0 + 2 * S;
@@ -2197,8 +2095,7 @@ mod tests {
         s.map(|v| v == "1" || v == "true").unwrap_or(false)
     }
 
-    /// A settings PATCH carrying the retired `finderBonusSats` is refused,
-    /// not accepted as an all-untouched no-op.
+    /// An unknown `finderBonusSats` key is refused, not a silent no-op.
     #[test]
     fn settings_patch_refuses_the_retired_finder_bonus_sats() {
         let old_ui = r#"{"finderBonusSats": 50000000}"#;
@@ -2266,8 +2163,7 @@ mod tests {
         const DAY_MS: i64 = 24 * HOUR_MS;
         let a = "bc1qaaa".to_string();
         let b = "bc1qbbb".to_string();
-        // Buckets 100 & 101 fall in day 4 (100/24 = 101/24 = 4); bucket 130 in
-        // day 5. B contributes less than A overall.
+        // Buckets 100 and 101 fall in day 4, bucket 130 in day 5.
         let timeline = WindowTimeline {
             window_ms: 30 * DAY_MS,
             buckets: vec![
@@ -2279,8 +2175,7 @@ mod tests {
         let resp = build_window_timeline_response(Uuid::nil(), timeline);
 
         assert_eq!(resp.window_days, 30);
-        // A total 37 > B total 8 → A stacked/coloured first. The short test
-        // addresses are below the mask threshold so their labels are verbatim.
+        // A (37) before B (8); short addresses are below the mask threshold.
         let labels: Vec<&str> = resp
             .contributors
             .iter()
@@ -2292,10 +2187,8 @@ mod tests {
             "every contributor gets an opaque memberId"
         );
         assert_eq!(resp.days.len(), 2, "two distinct calendar-day buckets");
-        // Same-day hours summed; values index-aligned to [A, B].
         assert_eq!(resp.days[0].values, vec![30.0, 5.0]);
         assert_eq!(resp.days[1].values, vec![7.0, 3.0]);
-        // Days are the two day-starts, oldest→newest.
         assert_eq!(
             resp.days[0].date,
             crate::time_range::format_iso_ms(4 * DAY_MS)
@@ -2397,11 +2290,9 @@ mod tests {
             max_members: None,
             mode: "prop".into(),
         };
-        // Authenticated/address-scoped views keep the creator address.
         let authed: Value = serde_json::to_value(&summary).unwrap();
         assert_eq!(authed["creatorAddress"], "bc1qcreator");
 
-        // The public directory shape nulls it → the key must be absent entirely.
         summary.creator_address = None;
         let entry = PublicGroupEntry {
             summary,
@@ -2413,7 +2304,6 @@ mod tests {
             v.get("creatorAddress").is_none(),
             "public group entry must not expose creatorAddress, got: {v}"
         );
-        // Other public fields are still present.
         assert_eq!(v["name"], "g");
         assert_eq!(v["memberCount"], 3);
         assert_eq!(v["isPublic"], true);
@@ -2437,7 +2327,6 @@ mod tests {
         assert_eq!(rows[1].total_shares, 0.0);
         assert_eq!(rows[1].percent, 0.0);
         assert_eq!(rows[1].total_rejected, 9.0);
-        // Sum of the rows is the figure the mini-card shows, in both columns.
         let rejected_sum: f64 = rows.iter().map(|r| r.total_rejected).sum();
         assert_eq!(rejected_sum, 14.0);
     }
@@ -2467,7 +2356,6 @@ mod tests {
         assert_eq!(v["memberId"], "abc123");
         assert_eq!(v["addressLabel"], "bc1q...12345");
 
-        // Admin variant (address = Some) carries the full address.
         let admin = MemberEntry {
             address: Some("bc1qfulladdr".into()),
             ..e
@@ -2478,9 +2366,6 @@ mod tests {
 
     #[test]
     fn group_detail_hides_creator_address_from_non_admin() {
-        // Mirrors by_id: the flattened summary's creatorAddress is nulled for
-        // non-admin callers (the creator is a pseudonymised member in the
-        // roster), and present only for an admin-token caller.
         fn summary(creator: Option<String>) -> GroupSummary {
             GroupSummary {
                 id: Uuid::nil(),

@@ -1,27 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! End-to-end regtest test for the SV2 mining server — Standard channel.
-//!
-//! Spawns a real `bitcoin-node v31` via `bp_regtest_harness`, attaches
-//! `bp_template_distribution::TdpHandle`, runs a [`StratumV2MiningServer`]
-//! driven by the TDP broadcast, and exercises the full Noise + SV2 wire
-//! handshake against a fake miner connected over a real `TcpStream`.
-//!
-//! Covers:
-//!   1. Noise-XK handshake succeeds with the test key-pair.
-//!   2. SV2 `SetupConnection` (protocol=0 Mining) → `SetupConnectionSuccess`
-//!      wire roundtrip with `parse_message_frame_with_tlvs` +
-//!      `encode_mining_outbound`.
-//!   3. `OpenStandardMiningChannel` → `OpenStandardMiningChannelSuccess`
-//!      with pool-allocated extranonce-prefix.
-//!   4. `current_template` snapshot is populated after `generate_to_self`.
-//!
-//! Block acceptance is proven elsewhere: `regtest_stream_routing.rs` drives
-//! a real `SubmitSharesStandard` to an accepted block and asserts the tip
-//! rises. This test owns the wire contract of the handshake itself.
-//!
-//! Skipped (with a printed warning) when `bitcoin-node` is not installed
-//! at the host's default location or via `BITCOIN_NODE_PATH`.
+//! Regtest e2e for a Standard channel: Noise-XK + `SetupConnection` +
+//! `OpenStandardMiningChannel` over a real socket against a real
+//! `bitcoin-node`, through to the first `NewMiningJob`. Block acceptance is
+//! covered by `regtest_stream_routing.rs`; skipped without `bitcoin-node`.
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -64,10 +46,8 @@ async fn sv2_standard_channel_end_to_end_against_regtest() {
         .expect("mine 101 blocks for IBD-exit + coinbase maturity");
 
     // ── Spawn TDP, subscribe FIRST, then force a template emission ────
-    //
-    // `tokio::sync::broadcast` does not replay messages sent before any
-    // receiver existed, so a template forced before `subscribe()` can be
-    // lost. Order: spawn → subscribe → generate → wait.
+    // `broadcast` does not replay to late receivers, so a template forced
+    // before `subscribe()` would be lost.
     let tdp = TdpHandle::spawn(
         TdpConfig::new(node.ipc_socket_path())
             .with_fee_threshold(1)

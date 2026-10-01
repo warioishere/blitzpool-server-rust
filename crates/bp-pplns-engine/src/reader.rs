@@ -1,21 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Read-only views consumed by `bp-api` HTTP routes.
-//!
-//! Each `ReaderView::*` method composes a Redis-window read with a
-//! Postgres ledger read into a typed response struct. `bp-api`
-//! serializes the struct to JSON; field names match the wire API the UI
-//! consumes.
-//!
-//! Endpoints served:
-//!
-//! - `/api/pplns/status` ⇒ [`ReaderView::window_stats`]
-//! - `/api/pplns/distribution` ⇒ [`ReaderView::current_distribution`]
-//! - `/api/pplns/fees` ⇒ [`ReaderView::fee_config`]
-//! - `/api/pplns/ledger` ⇒ [`ReaderView::ledger_summary`]
-//! - `/api/pplns/:address` ⇒ [`ReaderView::address_status`]
-//!
-//! `/api/pplns/:address/history` is not served here.
+//! Read-only views behind the `/api/pplns/*` routes: each method joins a
+//! Redis window read with a Postgres ledger read. Field names match the
+//! wire API the UI consumes.
 
 use bp_common::{AddressId, Sats};
 use bp_db::find_pplns_balance;
@@ -24,14 +11,11 @@ use chrono::Utc;
 use crate::engine::{EngineError, PplnsEngine};
 
 impl PplnsEngine {
-    /// Returns a borrowed reader view. Cheap to construct; the
-    /// underlying engine handles still live in `Arc`.
     pub fn reader(&self) -> ReaderView<'_> {
         ReaderView { engine: self }
     }
 }
 
-/// Read-only view-builder. Lifetime-bound to the engine handle.
 pub struct ReaderView<'a> {
     engine: &'a PplnsEngine,
 }
@@ -47,8 +31,8 @@ pub struct WindowStats {
     pub window_size: f64,
     /// Distinct addresses currently contributing.
     pub miner_count: u32,
-    /// Current network difficulty (engine's view; the source of truth
-    /// is the TDP template stream).
+    /// Engine's view of network difficulty; the TDP template stream is
+    /// the source of truth.
     pub network_difficulty: f64,
 }
 
@@ -78,14 +62,11 @@ impl ReaderView<'_> {
 pub struct AddressShare {
     pub address: String,
     pub total_shares: f64,
-    /// `total_shares / Σ total_shares × 100`. `NaN`-safe (zero-share
-    /// pool returns 0.0 for every address).
+    /// `total_shares / Σ total_shares × 100`; 0.0 on an empty window.
     pub percent: f64,
 }
 
 impl ReaderView<'_> {
-    /// All addresses with current-window contribution, sorted by
-    /// share-count descending. Empty Vec if the window is empty.
     pub async fn current_distribution(&self) -> Result<Vec<AddressShare>, EngineError> {
         let by_addr = self.engine.window().read_window_by_address().await?;
         let total: f64 = by_addr.values().sum();
@@ -104,9 +85,7 @@ impl ReaderView<'_> {
                 }
             })
             .collect();
-        // Descending by total_shares; addresses with identical share
-        // counts get stable alphabetic ordering as a tie-break so
-        // dashboards don't flap.
+        // Address tie-break so equal shares do not flap on dashboards.
         out.sort_by(|a, b| {
             b.total_shares
                 .partial_cmp(&a.total_shares)
@@ -137,10 +116,8 @@ impl ReaderView<'_> {
         &self,
         address: &str,
     ) -> Result<Option<AddressStatus>, EngineError> {
-        // Per-address reads only need this address's share + the
-        // pool-wide total for the percent denominator. Avoid the full
-        // `HGETALL` (~30 KB transfer for a 600-miner pool) — single
-        // `HGET` + the cached `GET` total are O(1).
+        // One `HGET` plus the cached total instead of a full `HGETALL`
+        // of the window.
         let window = self.engine.window();
         let current_window_shares = window.read_window_share_for_address(address).await?;
         let total = window.current_total().await?;
@@ -150,12 +127,9 @@ impl ReaderView<'_> {
             0.0
         };
 
-        // Try to parse + look up the balance row. Invalid-address-format
-        // input from the API just returns `Ok(None)` rather than 4xx —
-        // permissive get-or-default behaviour.
         let Ok(addr_id) = AddressId::new(address.to_string()) else {
-            // Malformed: no balance row can exist. Surface as Some with
-            // zeros if the window has it, None otherwise.
+            // A malformed address cannot have a balance row; answer from
+            // the window alone instead of a 4xx.
             return Ok(if current_window_shares > 0.0 {
                 Some(AddressStatus {
                     address: address.to_string(),
@@ -210,16 +184,11 @@ pub struct LedgerSummary {
     /// to close, and its counterparty pool is [`Self::total_debit_sats`] —
     /// **every** open debit, not the abandoned slice below.
     pub abandoned_credit_sats: i64,
-    /// Σ of |negative balances| in the abandoned bucket.
-    ///
-    /// ⚠️ Informational only: the sweep does **not** pair against this
-    /// figure. A credit's counterparty is by construction someone who was
-    /// mining when the credit was withheld, so debits of any age qualify.
-    /// This says how much outstanding debt belongs to miners who are gone;
-    /// a 0 here does not mean the sweep will pair nothing.
+    /// Σ of |negative balances| in the abandoned bucket. Informational only:
+    /// the sweep pairs credits against debits of any age, so a 0 here does
+    /// not mean it pairs nothing.
     pub abandoned_debit_sats: i64,
-    /// `abandoned_balance_days` configured for this engine — exposed
-    /// so dashboards can render the cutoff age.
+    /// Exposed so dashboards can render the cutoff age.
     pub abandoned_balance_days: u32,
     /// Σ of `totalPaidSats` across every miner row (open + closed),
     /// i.e. the pool's lifetime on-chain payout.
@@ -232,9 +201,8 @@ impl ReaderView<'_> {
         let now_ms = Utc::now().timestamp_millis();
         let cutoff_ms = crate::config::abandoned_cutoff_ms(now_ms, cfg.abandoned_balance_days);
 
-        // One PG round-trip: sums, row counts, abandoned buckets and
-        // lifetime payout are computed in SQL, so no balance rows are
-        // fetched into Rust however many accumulate.
+        // Aggregated in SQL so no balance rows are fetched however many
+        // accumulate.
         let agg = bp_db::aggregate_pplns_balances(self.engine.pool(), cutoff_ms).await?;
 
         Ok(LedgerSummary {

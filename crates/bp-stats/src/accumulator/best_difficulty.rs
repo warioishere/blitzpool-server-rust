@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Per-address all-time best-difficulty accumulator.
-//!
-//! MAX-semantic (not delta): tracks the highest `submission_difficulty`
-//! seen per address in the current flush window, plus the firmware/vendor
-//! string of the share that set it. The flush folds it into
-//! `address_settings_entity."bestDifficulty"` via `GREATEST`, so the
-//! persisted all-time best self-corrects every tick and no long-lived
-//! cache can diverge from it after an out-of-band reset of the row.
+//! Per-address best difficulty of the current flush window, plus the user
+//! agent that set it. The flush merges it with `GREATEST`, so the stored
+//! all-time best is the only source of truth and no in-process cache can
+//! diverge from it after the row is reset out of band.
 
 use std::collections::HashMap;
 
@@ -35,11 +31,9 @@ impl BestDifficultyAccumulator {
         Self::default()
     }
 
-    /// Record a candidate. Keeps the running max per address (+ the
-    /// user-agent that set it). Non-finite / non-positive candidates are
-    /// silently discarded — the share path must not throw. Takes the
-    /// address by reference and only clones it on the insert miss, so the
-    /// steady-state hot path (address already present) allocates nothing.
+    /// Keep the running max per address. Non-finite or non-positive values are
+    /// dropped. The address is cloned only on insert, so the steady-state hot
+    /// path allocates nothing.
     pub fn add(&self, address: &AddressId, candidate: f64, user_agent: Option<&str>) {
         if !candidate.is_finite() || candidate <= 0.0 {
             return;
@@ -63,17 +57,14 @@ impl BestDifficultyAccumulator {
         }
     }
 
-    /// Snapshot the current per-address maxima WITHOUT clearing — mirrors
-    /// the drain/confirm contract of the sibling accumulators: an entry is
-    /// only dropped once [`Self::confirm`] has seen it persisted.
+    /// Snapshot WITHOUT clearing; an entry is only dropped once
+    /// [`Self::confirm`] has seen it persisted.
     pub fn drain(&self) -> BestDifficultySnapshot {
         self.inner.lock().clone()
     }
 
-    /// Drop the entries the flush persisted. An address whose live max
-    /// grew past the confirmed snapshot (a higher share arrived mid-flush)
-    /// is KEPT so the next tick folds the higher value in. `GREATEST` makes
-    /// re-persisting a confirmed value a no-op, so this stays idempotent.
+    /// Drop persisted entries, but keep one whose max grew mid-flush so the
+    /// next tick writes the higher value.
     pub fn confirm(&self, snapshot: &BestDifficultySnapshot) {
         let mut guard = self.inner.lock();
         for (address, confirmed) in snapshot {

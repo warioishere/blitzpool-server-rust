@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
-//! Chain-observed reconciliation: did every block the pool actually mined
-//! reach the ledger?
-//!
-//! The booking paths start from something the pool was *told* (an accepted
-//! share, a pushed JDP solution), and each can be missed. This check starts
-//! from the chain: a block whose coinbase pays the pool is the pool's, and
-//! without a ledger record it is a payout somebody is owed.
-//!
-//! **Reports, never books.** Booking needs the distribution behind a
-//! coinbase, which the chain does not carry. The output is the operator's
-//! list of blocks to reprocess.
+//! Chain-observed reconciliation: a block whose coinbase pays the pool but has
+//! no ledger record is a payout somebody is owed, however the booking paths
+//! missed it. Reports, never books: booking needs the distribution behind a
+//! coinbase, which the chain does not carry.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -65,13 +58,10 @@ pub(crate) enum Gap {
     RegisteredButUnbooked,
 }
 
-/// The addresses whose presence in a coinbase marks a block as the pool's.
-///
-/// The pool fee output is the marker because it is in every coinbase the pool
-/// builds and in every payout set it hands a JD-client, and no other party
-/// pays it. A zero-fee deployment emits no such output and cannot be
-/// recognised this way — [`PoolMarkers::new`] refuses to build one rather than
-/// running a check that silently finds nothing.
+/// The addresses whose presence in a coinbase marks a block as the pool's: the
+/// fee output, which every pool and JD-client coinbase carries and nobody else
+/// pays. A zero-fee deployment has none, so [`PoolMarkers::new`] refuses rather
+/// than run a check that silently finds nothing.
 #[derive(Clone, Debug)]
 pub(crate) struct PoolMarkers {
     addresses: HashSet<String>,
@@ -132,14 +122,10 @@ pub(crate) fn pool_outputs_of_coinbase(
         .collect()
 }
 
-/// Value-bearing coinbase outputs paying somebody who is neither the pool
-/// nor the miner the block was registered under.
-///
-/// The Solo exemption reads the miner's address mode, but a job-declaring
-/// client with a Solo-gated address can mine a coinbase that pays a shared
-/// distribution, and those miners are owed a ledger entry. The coinbase
-/// says who was actually paid. A genuine Solo coinbase pays the miner plus
-/// at most a fee marker, so this comes out empty and the exemption stands.
+/// Value-bearing coinbase outputs paying neither the pool nor the registered
+/// miner. A JD-client with a Solo-gated address can mine a coinbase paying a
+/// shared distribution, whose miners are owed a ledger entry; a genuine Solo
+/// coinbase comes out empty here, so the Solo exemption stands only then.
 pub(crate) fn third_party_outputs_of_coinbase(
     coinbase: &bp_bitcoin::DecodedTransaction,
     markers: &PoolMarkers,
@@ -282,11 +268,9 @@ pub(crate) async fn run_once(
     })
 }
 
-/// Where the next pass starts.
-///
-/// Always re-walks the last [`REORG_OVERLAP`] blocks: a height checked while
-/// one block sat there, then replaced by a reorg, would otherwise never be
-/// looked at again — and the replacement is the block that actually pays.
+/// Where the next pass starts. Always re-walks the last [`REORG_OVERLAP`]
+/// blocks, or a block a reorg put at an already-checked height (the one that
+/// actually pays) is never looked at.
 fn scan_start(checked_through: Option<u64>, tip: u64, lookback: u64) -> u64 {
     let start = match checked_through {
         Some(h) => h.saturating_add(1).min(tip.saturating_sub(REORG_OVERLAP)),
@@ -297,12 +281,8 @@ fn scan_start(checked_through: Option<u64>, tip: u64, lookback: u64) -> u64 {
     start.max(1)
 }
 
-/// How far this pass may claim to have checked.
-///
-/// Stops below the first height it could not read. A transient RPC failure
-/// must cost a retry, not the block: advancing past it would leave a height
-/// nothing ever looks at again, which is the failure this whole check exists
-/// to catch.
+/// How far this pass may claim to have checked: below the first height it
+/// could not read, so a transient RPC failure costs a retry, not the block.
 fn next_watermark(tip: u64, first_error: Option<u64>) -> u64 {
     match first_error {
         Some(h) => h.saturating_sub(1),

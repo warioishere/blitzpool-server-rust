@@ -1,24 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Share-validation hot path.
-//!
-//! Given a parsed `mining.submit` request + the session's vardiff/ratchet
-//! state + the shared [`JobRegistry`], compute one of:
-//!
-//! - [`ShareValidation::Accepted`] — header met the effective target.
-//!   Carries the assembled header, the share's submission difficulty,
-//!   the clamp-aware effective difficulty (for accounting), and the
-//!   [`MiningJob`] + [`ActiveSV1Template`] snapshot the caller needs
-//!   for downstream side-effects (block-found bookkeeping if
-//!   `is_block_candidate`).
-//! - [`ShareValidation::Rejected`] — exactly one of the four wire-
-//!   visible reject classes (`DuplicateShare`, `JobNotFound`, `Stale`,
-//!   `LowDifficulty`).
-//!
-//! This module is pure logic: no I/O, no broadcasting, no DB. The
-//! per-share stats fan-out (PPLNS / group-solo share recording, share-totals
-//! cache, best-diff update) is the caller's job in `client.rs`, on top of
-//! the trait boundaries in `hooks.rs`.
+//! Share validation for `mining.submit`: pure logic against the session state and
+//! the shared [`JobRegistry`], no I/O. Share accounting is the caller's job.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -39,25 +22,16 @@ use bp_vardiff::effective_job_difficulty;
 
 // ── Reject classification ────────────────────────────────────────────
 
-/// One of the four wire-visible reject reasons.
-///
-/// `Stale` shares the wire code with `JobNotFound` (SV1 has no separate
-/// stale code) but reports a different `wire_message` (`"stale"`) and is
-/// tracked under a distinct internal counter so operators can tell the
-/// two failure modes apart in the rejection breakdown.
+/// Wire-visible reject reasons. `Stale` shares the wire code with `JobNotFound`
+/// (SV1 has no stale code) but keeps its own message and counter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RejectReason {
     DuplicateShare,
     JobNotFound,
     Stale,
     LowDifficulty,
-    /// Miner changed version bits outside the mask it negotiated. BIP-310
-    /// on the `version-rolling.mask` return value: "Bits set to 1 are
-    /// allowed to be changed by the miner. **If a miner changes bits with
-    /// mask value 0, the server will reject the submit.**"
-    ///
-    /// SV1 has no dedicated wire code for this, so it goes out as
-    /// [`ERR_OTHER_UNKNOWN`] with its own message.
+    /// Version bits changed outside the negotiated mask, which BIP-310 says the
+    /// server rejects. No dedicated SV1 code, so it goes out as [`ERR_OTHER_UNKNOWN`].
     VersionRollingNotAllowed,
 }
 
@@ -72,8 +46,7 @@ impl RejectReason {
         }
     }
 
-    /// JSON-RPC `error[1]` human-readable message — standard wire format.
-    /// Some monitoring tooling parses these; do not paraphrase.
+    /// JSON-RPC `error[1]`. Monitoring tooling parses these; do not paraphrase.
     pub(crate) fn wire_message(self) -> &'static str {
         match self {
             RejectReason::DuplicateShare => REJECT_DUPLICATE,
@@ -87,53 +60,28 @@ impl RejectReason {
 
 // ── Validation result ────────────────────────────────────────────────
 
-/// Accepted-share details. Carried back to the caller so it can build the
-/// `mining.submit` success reply, fan out share-stats, and (if
-/// `is_block_candidate`) trigger the TDP `SubmitSolution` path.
+/// Accepted share, with what the block-found path needs to rebuild the coinbase
+/// and submit the solution.
 #[derive(Clone, Debug)]
 pub struct ShareAccept {
-    /// `Active` or `StaleCreditable`. Both credit the share; the caller
-    /// may want to bookkeep them separately for diagnostics.
+    /// `Active` or `StaleCreditable`; both are credited.
     pub classification: JobClassification,
-    /// Difficulty the share is **credited at**: post-ckpool-clamp value,
-    /// used by PPLNS / group-solo accounting and the accepted-share
-    /// accumulators. May be lower than the session's current diff when
-    /// the share was issued before a vardiff ratchet.
+    /// Difficulty the share is credited at: the ratchet-clamped value, which can be
+    /// below the current session diff for work issued before a vardiff ratchet.
     pub effective_difficulty: f64,
-    /// Difficulty the **share actually solved for**, derived from the
-    /// hash via `bp_share::calculate_difficulty`. Drives the best-diff
-    /// tracker; the block-found gate compares the hash itself against the
-    /// network target.
+    /// Difficulty the hash actually reached; drives best-diff.
     pub submission_difficulty: f64,
-    /// 80-byte block header that produced the hash. The block-submit path
-    /// assembles a found block from it.
     pub header: [u8; 80],
-    /// sha256d of the header — the share's identity.
     pub hash: [u8; 32],
-    /// True when the submission difficulty meets or exceeds the network
-    /// difficulty derived from `n_bits`. bitcoind is the authoritative
-    /// validator — this only triggers the SubmitSolution path.
+    /// Hash meets the template's network target. bitcoind stays the authoritative
+    /// validator; this only triggers the submit path.
     pub is_block_candidate: bool,
-    /// Shared handle to the job. Needed for `witness_coinbase_with_extranonce`
-    /// in the block-found path. `Arc` so the per-share accept carries a
-    /// refcount bump, not a deep copy of the coinbase buffers.
     pub mining_job: Arc<MiningJob>,
-    /// Shared handle to the template. Needed for the TDP
-    /// `submit_solution(template_id, version, timestamp, nonce, …)` call
-    /// in the block-found path.
     pub template: Arc<ActiveSV1Template>,
-    /// Per-session 4-byte extranonce1 (allocated by the server at
-    /// `mining.subscribe`). Combined with `extranonce2` it lets the
-    /// `BlockSubmissionSink` rebuild the witness coinbase via
-    /// `MiningJob::witness_coinbase_with_extranonce(&enonce1, &enonce2)`
-    /// when `is_block_candidate` triggers a TDP `submit_solution`.
     pub enonce1: [u8; 4],
-    /// 8-byte extranonce2 as parsed from the `mining.submit` request.
     pub extranonce2: [u8; 8],
 }
 
-/// Rejected-share details. Bundles the reason with its on-the-wire form
-/// so the caller writes the error frame without re-deriving them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ShareReject {
     pub reason: RejectReason,
@@ -160,54 +108,35 @@ pub(crate) enum ShareValidation {
 
 // ── Per-session state passed into the validator ──────────────────────
 
-/// Per-session inputs that don't live in the [`JobRegistry`]. Owned by
-/// the client task; passed by reference into [`validate_submit`] so the
-/// validator stays pure.
+/// Per-session inputs to [`validate_submit`].
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SessionContext<'a> {
-    /// 4-byte extranonce1 — pinned at subscribe time, never changes for
-    /// the life of the session (ckpool-style fixed enonce1).
     pub extranonce1: &'a [u8; 4],
-    /// Current session difficulty as advertised in the latest
-    /// `mining.set_difficulty`.
     pub session_difficulty: f64,
-    /// Difficulty before the most recent vardiff ratchet. Equal to
-    /// `session_difficulty` when no ratchet has happened.
+    /// Difficulty before the last vardiff ratchet.
     pub old_session_difficulty: f64,
-    /// Boundary id — jobs allocated before this id were issued at
-    /// `old_session_difficulty`. `None` means no ratchet has happened
-    /// since the session started.
+    /// Jobs allocated before this id were issued at `old_session_difficulty`.
     pub diff_change_job_id: Option<u64>,
-    /// Per-share diagnostic logging toggle (server-level
-    /// `stratum_share_logs`). Gates the `🎯 Share difficulty` +
-    /// `✅ Share accepted` traces below; rejections always log at WARN
-    /// regardless.
+    /// Gates the per-share debug traces; rejections always log.
     pub share_logs: bool,
-    /// BIP-310 `last_mask` — which version bits this session may change.
-    /// The pool's advertised mask until `mining.configure` narrows it to the
-    /// intersection with what the miner asked for. See
-    /// `SessionState::version_rolling_mask` for why it does not start at
-    /// zero.
+    /// BIP-310 `last_mask`: the pool's advertised mask until `mining.configure`
+    /// narrows it (see `SessionState::version_rolling_mask` for why not zero).
     pub version_rolling_mask: u32,
 }
 
 // ── Duplicate-share cache (per session) ──────────────────────────────
 
-/// Per-session dedup cache for share inputs, keyed on (`versionMask`,
-/// `nonce`, `extraNonce2`, `ntime`, `jobId`) and cleared on every
-/// `clean_jobs=true` notify.
+/// Per-session duplicate-share cache, cleared on every `clean_jobs=true` notify.
 #[derive(Default)]
 pub(crate) struct SessionShareCache {
     seen: HashSet<DedupKey>,
-    /// Target memo for the per-share accept check. The effective
-    /// difficulty takes at most two values per session (current vs
-    /// ckpool-clamped), changing only on a vardiff ratchet.
+    /// Effective difficulty takes at most two values per session (current vs
+    /// ratchet-clamped), so memoizing the target pays off.
     target_memo: TargetMemo,
 }
 
-/// Parsed-integer dedup key: no heap allocation per share. Two submits
-/// with the same numeric values are the same share regardless of hex
-/// formatting, which is the correct identity.
+/// Keyed on parsed integers: the same numeric values are the same share
+/// regardless of hex formatting.
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
 struct DedupKey {
     job_id: u64,
@@ -238,11 +167,8 @@ impl SessionShareCache {
         Self::default()
     }
 
-    /// Test whether this submit is a duplicate; if not, record it and
-    /// return `false`. Returns `true` if the same `(jobId, nonce, ntime,
-    /// versionMask, extranonce2)` tuple has been seen before in this
-    /// session. A malformed submit (unparseable fields) can't form a key
-    /// and returns `false` — it is rejected at the parse step regardless.
+    /// `true` if seen before in this session; otherwise records it. A malformed
+    /// submit returns `false` and is rejected at the parse step.
     pub(crate) fn record(&mut self, submit: &SubmitRequest) -> bool {
         match DedupKey::from_submit(submit) {
             Some(key) => !self.seen.insert(key),
@@ -250,10 +176,8 @@ impl SessionShareCache {
         }
     }
 
-    /// Drop all accumulated keys. Called when a `clean_jobs=true` notify
-    /// goes out: old shares can no longer collide with anything acceptable
-    /// now, and the set would otherwise grow unbounded across a long-lived
-    /// session.
+    /// Called on a `clean_jobs=true` notify: old shares can no longer collide
+    /// with anything acceptable, and the set would otherwise grow unbounded.
     pub(crate) fn clear(&mut self) {
         self.seen.clear();
     }
@@ -266,20 +190,9 @@ impl SessionShareCache {
 
 // ── validate_submit ──────────────────────────────────────────────────
 
-/// Validate a `mining.submit` request against the registry + session
-/// state. See module docstring for the contract.
-///
-/// Order of checks:
-///   1. Duplicate-share cache (cheapest; bails before any hash work).
-///   2. Registry lookup → `None` ⇒ `JobNotFound`.
-///   3. `StaleRejected` classification ⇒ `Stale`.
-///   4. Hex-parse submit fields → malformed ⇒ `LowDifficulty` (the
-///      hash will never match anyway; a garbled header produces the
-///      same end-state).
-///   5. Assemble header → hash → submission difficulty.
-///   6. Apply [`effective_job_difficulty`] clamp; compare hash against
-///      the session's memoized target for `effective_diff`.
-///   7. `meets_target` ⇒ `Accepted`; else `LowDifficulty`.
+/// Checks run cheapest first: duplicate, job lookup, stale, field parse, version
+/// mask, then the hash against the [`effective_job_difficulty`] target.
+/// Malformed fields reject as `LowDifficulty`, the same end state as a garbled header.
 pub(crate) fn validate_submit(
     submit: &SubmitRequest,
     session: &SessionContext<'_>,
@@ -317,8 +230,6 @@ pub(crate) fn validate_submit(
         return ShareValidation::Rejected(RejectReason::Stale.into());
     }
 
-    // 4. Parse the wire-hex fields. The frame layer checked string-ness;
-    // this checks semantic well-formedness.
     let Some((version_bits, nonce, ntime, extranonce2)) = parse_submit_fields(submit) else {
         tracing::warn!(
             worker = %submit.worker,
@@ -328,19 +239,8 @@ pub(crate) fn validate_submit(
         return ShareValidation::Rejected(RejectReason::LowDifficulty.into());
     };
 
-    // 4a. BIP-310 calls the sixth `mining.submit` parameter `version_bits`,
-    // and binds it to the mask this session negotiated (`last_mask`):
-    //
-    //     version_bits & ~last_mask == 0
-    //
-    // "Bits set to 1 are allowed to be changed by the miner. If a miner
-    // changes bits with mask value 0, the server will reject the submit."
-    //
-    // `last_mask` is the pool's advertised mask until `mining.configure`
-    // replaces it, so a miner that never configured is held to the same
-    // bits ckpool holds it to rather than to none — see
-    // `SessionState::version_rolling_mask`. A zero `version_bits`, what a
-    // non-rolling miner sends, passes under every mask.
+    // BIP-310: `version_bits & ~last_mask` must be zero, else the server rejects.
+    // A non-rolling miner sends zero, which passes under every mask.
     let last_mask = session.version_rolling_mask;
     if version_bits & !last_mask != 0 {
         tracing::warn!(
@@ -353,17 +253,9 @@ pub(crate) fn validate_submit(
         return ShareValidation::Rejected(RejectReason::VersionRollingNotAllowed.into());
     }
 
-    // 5. Assemble header.
-    //
-    // ⚠️ Deliberately NOT BIP-310's reconstruction
-    // `(job_version & ~last_mask) | (version_bits & last_mask)`: with a
-    // non-rolling miner (`version_bits = 0`) and a template that signals
-    // inside the mask (regtest bit 28, any deployment on bits 13-28), it
-    // clears that bit, so the pool would hash a header it never published
-    // and reject every share. XOR keeps the template's bits at
-    // `version_bits = 0` (as ckpool's `job_version | version_bits` does)
-    // and also lets a miner clear a bit it was granted. The formulas agree
-    // while the template sets no bit inside the mask.
+    // XOR, not BIP-310's `(job_version & ~mask) | (bits & mask)`: that clears a
+    // template bit signalling inside the mask when a miner rolls nothing, so the
+    // pool would hash a header it never published and reject every share.
     let n_version = lookup.template.version ^ version_bits;
     let coinbase_hash = lookup
         .mining_job
@@ -381,7 +273,6 @@ pub(crate) fn validate_submit(
     let submission_difficulty = scored.submission_difficulty.as_f64();
     let hash = scored.submission_hash;
 
-    // 6. Effective-diff clamp + target check.
     let job_id_int = u64::from_str_radix(submit.job_id, 16).ok();
     let effective_diff = effective_job_difficulty(
         job_id_int,
@@ -391,9 +282,7 @@ pub(crate) fn validate_submit(
     );
     let effective_target = dedup.target_memo.target_for(Difficulty(effective_diff));
 
-    // Per-share diff trace, gated by `stratum_share_logs` (still DEBUG, so
-    // it also needs `RUST_LOG=...,bp_stratum_v1=debug`). Same format as
-    // the SV2 trace.
+    // DEBUG level, so it also needs `RUST_LOG=...,bp_stratum_v1=debug`.
     if session.share_logs {
         tracing::debug!(
             worker = %submit.worker,
@@ -405,10 +294,7 @@ pub(crate) fn validate_submit(
     }
 
     if !effective_target.is_met_by_le(&hash) {
-        // `hash_prefix_be` is for cross-checking against the miner's own
-        // debug trace when both disagree on the hash. The hex fields are
-        // lazy `as_hex()` views, so this per-reject path pays nothing when
-        // the log level discards the line.
+        // `hash_prefix_be` is for cross-checking against the miner's own trace.
         tracing::warn!(
             worker = %submit.worker,
             job_id = %submit.job_id,
@@ -422,13 +308,9 @@ pub(crate) fn validate_submit(
         return ShareValidation::Rejected(RejectReason::LowDifficulty.into());
     }
 
-    // 7. Accepted. Block-find gate checks the hash itself against the
-    // template's network target, independent of the clamped share
-    // difficulty — a stale-creditable hit during a reorg can still find a
-    // valid alternative tip.
+    // Against the network target, independent of the clamped share diff: a
+    // stale-creditable hit during a reorg can still find a valid alternative tip.
     let is_block_candidate = meets_network_target(&hash, lookup.template.n_bits);
-    // Block-found marker at INFO, always on: block events are too
-    // important to gate.
     if is_block_candidate {
         tracing::info!(
             worker = %submit.worker,
@@ -439,7 +321,6 @@ pub(crate) fn validate_submit(
             submission_difficulty
         );
     } else if session.share_logs {
-        // Per-share accept trace, gated by `stratum_share_logs`.
         tracing::debug!(
             worker = %submit.worker,
             job_id = %submit.job_id,
@@ -462,15 +343,10 @@ pub(crate) fn validate_submit(
     }))
 }
 
-/// Parse the four numeric / byte fields from a [`SubmitRequest`]. Returns
-/// `None` on any malformed value: invalid hex, wrong byte length for
-/// extranonce2, hex value out of u32 range for the numerics.
 fn parse_submit_fields(submit: &SubmitRequest) -> Option<(u32, u32, u32, [u8; 8])> {
     let version_mask = u32::from_str_radix(submit.version_mask_hex, 16).ok()?;
     let nonce = u32::from_str_radix(submit.nonce_hex, 16).ok()?;
     let ntime = u32::from_str_radix(submit.ntime_hex, 16).ok()?;
-    // extranonce2 is fixed at 8 bytes (16 hex chars); decode into a stack
-    // buffer to avoid a per-share Vec allocation.
     let hex_bytes = submit.extranonce2_hex.as_bytes();
     if hex_bytes.len() != 16 {
         return None;
@@ -482,10 +358,7 @@ fn parse_submit_fields(submit: &SubmitRequest) -> Option<(u32, u32, u32, [u8; 8]
 
 #[cfg(test)]
 mod tests {
-    /// The reject-path log renders `hash_prefix_be` / `extranonce2` with
-    /// `as_hex()`. It is cross-checked against miner debug traces, so it
-    /// must be lowercase with leading-zero nibbles kept, as per-byte
-    /// `{b:02x}` formatting gives.
+    /// Pins that the reject log's `as_hex()` matches per-byte `{b:02x}` formatting.
     #[test]
     fn reject_log_hex_matches_the_per_byte_format() {
         use bitcoin::hex::DisplayHex;
@@ -596,8 +469,6 @@ mod tests {
             old_session_difficulty: 0.0,
             diff_change_job_id: None,
             share_logs: false,
-            // A session that ran `mining.configure` normally — what the
-            // tests below assume unless they say otherwise.
             version_rolling_mask: crate::config::VERSION_ROLLING_MASK,
         }
     }
@@ -610,8 +481,6 @@ mod tests {
             old_session_difficulty: 1.0e30,
             diff_change_job_id: None,
             share_logs: false,
-            // A session that ran `mining.configure` normally — what the
-            // tests below assume unless they say otherwise.
             version_rolling_mask: crate::config::VERSION_ROLLING_MASK,
         }
     }
@@ -694,9 +563,6 @@ mod tests {
 
     #[test]
     fn dedup_malformed_submit_is_not_recorded() {
-        // A submit with an unparseable field can't form an integer key —
-        // record() returns false (not a duplicate) and stores nothing;
-        // the share is rejected at the parse step regardless.
         let mut cache = SessionShareCache::new();
         let bad = SubmitRequest {
             extranonce2_hex: "xyz", // not valid hex / wrong length
@@ -726,12 +592,7 @@ mod tests {
         }
     }
 
-    /// BIP-310 on the `version-rolling.mask` return value: "Bits set to 1
-    /// are allowed to be changed by the miner. **If a miner changes bits
-    /// with mask value 0, the server will reject the submit.**"
-    ///
-    /// Both directions in one test, so it cannot pass on a precondition
-    /// that quietly did not hold.
+    /// Pins BIP-310's reject of bits outside the mask, with the inside case as control.
     #[test]
     fn bits_outside_the_negotiated_mask_are_rejected() {
         let (reg, jid) = populated_registry(DIFF_ONE_N_BITS);
@@ -768,8 +629,7 @@ mod tests {
         }
     }
 
-    /// Narrowing is the only direction `mining.configure` moves the mask,
-    /// and a miner is held to what it was actually answered with.
+    /// Pins that a miner is held to the narrowed mask it was answered with.
     #[test]
     fn a_negotiated_subset_is_what_the_miner_is_held_to() {
         let (reg, jid) = populated_registry(DIFF_ONE_N_BITS);
@@ -790,9 +650,7 @@ mod tests {
         );
         assert!(matches!(inside, ShareValidation::Accepted(_)));
 
-        // Inside the POOL's mask but outside the one this session was
-        // answered with. BIP-310: the miner may only set bits from the mask
-        // it received, here 0x00c00000.
+        // Inside the pool's mask but outside the session's.
         let outside = validate_submit(
             &submit_rolling(&jid, "00002000"),
             &session,
@@ -809,13 +667,8 @@ mod tests {
         ));
     }
 
-    /// The header version must equal what the miner was handed in
-    /// `mining.notify` when it rolls nothing — including on a template that
-    /// signals inside the advertised mask.
-    ///
-    /// BIP-310's masked OR would clear the template's in-mask bit at
-    /// `version_bits = 0`; see the comment at the reconstruction. The test
-    /// drives `validate_submit`, so switching to that formula fails it.
+    /// Pins that a non-rolling miner hashes the template's version even when it
+    /// signals inside the mask (BIP-310's masked OR would fail this).
     #[test]
     fn a_non_rolling_miner_keeps_the_templates_in_mask_bits() {
         // Template signalling on bit 28, as core's regtest does once
@@ -856,8 +709,7 @@ mod tests {
             DIRTY_TEMPLATE & !crate::config::VERSION_ROLLING_MASK
         );
 
-        // Negative control: a miner that DOES roll still moves the version,
-        // so the assertion above is not passing on a dead code path.
+        // Negative control: rolling still moves the version.
         let rolled = match validate_submit(
             &submit_rolling(&jid, "00002000"),
             &session,
@@ -996,13 +848,8 @@ mod tests {
         let v = validate_submit(&submit(&jid, "deadbeef"), &session, &mut cache, &reg, 1_500);
         match v {
             ShareValidation::Accepted(a) => {
-                // session_difficulty=0 → effective_diff=0; the clamp
-                // didn't activate because diff_change_job_id is None.
                 assert_eq!(a.effective_difficulty, 0.0);
                 assert_eq!(a.classification, JobClassification::Active);
-                // Hash + submission_difficulty are deterministic given
-                // the fixed extranonce/nonce/timestamp; just sanity-check
-                // they're populated.
                 assert!(a.submission_difficulty >= 0.0);
                 assert_eq!(a.hash.len(), 32);
                 assert_eq!(a.header.len(), 80);
@@ -1039,11 +886,8 @@ mod tests {
 
     #[test]
     fn pre_ratchet_share_validates_against_clamped_diff() {
-        // Setup: add ONE job (id=1) before the ratchet, then signal a
-        // ratchet to id=2 with new_diff=high (impossible to hit) +
-        // old_diff=0 (easy). For job_id=1 (< 2) the validator must
-        // clamp to MIN(high, 0) = 0 → accepts. Without the clamp this
-        // would be a LowDifficulty reject.
+        // Job 1 predates the ratchet at id 2, so it is clamped to the old diff 0;
+        // without the clamp this would be a LowDifficulty reject.
         let (reg, jid) = populated_registry(DIFF_ONE_N_BITS);
         let session = SessionContext {
             extranonce1: &[0x12, 0x34, 0x56, 0x78],
@@ -1066,9 +910,7 @@ mod tests {
 
     #[test]
     fn post_ratchet_share_validates_against_current_diff() {
-        // Same registry, but session says boundary=jobId 1 → job_id 1
-        // is "at or after" the boundary (current diff applies). With
-        // session=1e30 the share fails the target check → LowDifficulty.
+        // Job 1 is at the ratchet boundary, so the impossible current diff applies.
         let (reg, jid) = populated_registry(DIFF_ONE_N_BITS);
         let session = SessionContext {
             extranonce1: &[0x12, 0x34, 0x56, 0x78],

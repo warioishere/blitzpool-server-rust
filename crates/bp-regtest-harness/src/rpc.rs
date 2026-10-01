@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Minimal cookie-auth JSON-RPC helper for test orchestration. Intentionally
-//! decoupled from `bp-bitcoin`, which only exposes auxiliary read-only RPCs;
-//! this helper additionally needs `createwallet`, `getnewaddress`,
-//! `generatetoaddress`, and `getblockchaininfo` — all wallet/control RPCs
-//! that don't belong on the production-shape `BitcoinRpc` surface.
+//! Minimal cookie-auth JSON-RPC helper for test orchestration, separate from
+//! `bp-bitcoin` because wallet/control RPCs don't belong on the production
+//! `BitcoinRpc` surface.
 
 use std::path::Path;
 use std::time::Duration;

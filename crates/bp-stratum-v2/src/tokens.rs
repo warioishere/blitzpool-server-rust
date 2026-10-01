@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Per-connection JDP-token store for `AllocateMiningJobToken`.
-//!
-//! A token is a big-endian u32 counter (from 1) plus 12 CSPRNG bytes, so a JDC
-//! cannot forge another connection's token. TTL is 1 h (pool policy); allocation
-//! is rate-limited to one per second with a burst of [`ALLOCATE_BURST`]
-//! (SV2 JDP/AllocateMiningJobToken). One allocated token authorises exactly one
-//! declaration attempt.
+//! Per-connection JDP-token store for `AllocateMiningJobToken`. A token is a
+//! BE u32 counter plus 12 CSPRNG bytes, so a JDC cannot forge another
+//! connection's; allocation is rate-limited with a burst of [`ALLOCATE_BURST`]
+//! (SV2 JDP/AllocateMiningJobToken), and one token buys one declaration.
 
 use std::collections::HashMap;
 
@@ -140,11 +137,9 @@ impl TokenStore {
         self.allocated.is_empty()
     }
 
-    /// Mint the `new_mining_job_token` of a `DeclareMiningJobSuccess`.
-    ///
-    /// Not rate-limited: the limit is the client's budget, and a JDC that
-    /// allocates and declares within one second must still get an answer.
-    /// Not stored, so it is never accepted as a later declaration's token.
+    /// Mint the `new_mining_job_token` of a `DeclareMiningJobSuccess`. Not
+    /// rate-limited (a JDC declaring within a second of allocating must still
+    /// get an answer) and not stored, so it never passes as a declaration token.
     pub fn mint_for_declaration(&mut self) -> Result<Token, TokenAllocError> {
         self.next_token()
     }

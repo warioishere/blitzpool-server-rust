@@ -1,46 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! ckpool-style job / template lifecycle registry.
-//!
-//! 1. **Two maps** keyed by integer ids (lowercase hex on the wire):
-//!    `jobs` (per-miner `MiningJob` + the template-id it belongs to) and `templates`
-//!    (the assembled [`ActiveSV1Template`] each batch of jobs was built
-//!    against).
-//!
-//! 2. **Retire-then-age** lifecycle: on every broadcast the stream
-//!    translator runs [`JobRegistry::cleanup_for_tip`], which stamps
-//!    `retired_at` on entries built on a DIFFERENT previous-block hash
-//!    without deleting them (so late shares for the previous tip can
-//!    still resolve to a real job, not be reported as `JobNotFound`).
-//!    Aging then removes entries whose retirement is past
-//!    [`bp_jobs_lifecycle::LifecycleConfig::retention_ms`], subject to
-//!    the [`bp_jobs_lifecycle::LifecycleConfig::min_retained`] floor.
-//!    The retire is prev-hash-conditioned (not a blanket
-//!    `cleanup(true)`) because the registry is shared across the port's
-//!    template streams — see [`JobRegistry::cleanup_for_tip`].
-//!
-//! 3. **Three-way share classification** ([`JobClassification`]
-//!    re-exported from [`bp_jobs_lifecycle`]):
-//!    - `Active` — the job has not been retired.
-//!    - `StaleCreditable` — retired ≤
-//!      [`bp_jobs_lifecycle::LifecycleConfig::grace_ms`] ago. The work
-//!      was valid at the moment it was issued, so it is credited as if
-//!      current (network-jitter absorption).
-//!    - `StaleRejected` — retired beyond the grace window. Reject with
-//!      a distinct internal counter (wire code 21, same as JobNotFound,
-//!      because SV1 has no separate "stale" code).
-//!
-//! The lifecycle math itself (`classify`, `age_entries`) lives in
-//! [`bp_jobs_lifecycle`] so it stays in lock-step with the per-channel
-//! Extended-job lifecycle in `bp-stratum-v2::mining::jobs`. This module
-//! keeps the SV1-specific storage shape (integer ids shown as hex,
-//! template-indirection, single `Mutex<Inner>` for the global registry)
-//! and delegates the math.
-//!
-//! All state lives behind a single `std::sync::Mutex` — concurrent
-//! callers serialize on registry mutations but the per-call work
-//! (insert / classify / cleanup) is microseconds. The hot share path
-//! takes the lock once per submission. No `Arc<Mutex<…>>`-of-many.
+//! SV1 job/template registry: a tip change retires entries instead of deleting them, so
+//! a late share within the grace window is still credited and a later one is stale, not
+//! `JobNotFound`. The lifecycle math lives in [`bp_jobs_lifecycle`] so SV1 and SV2 stay
+//! in lock-step; SV1 has no stale code, so a rejected stale share goes out as code 21.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -53,22 +16,15 @@ use crate::notify::ActiveSV1Template;
 
 pub(crate) use bp_jobs_lifecycle::JobClassification;
 
-/// Snapshot returned by [`JobRegistry::classify`] when a job is found.
-/// Holds `Arc` handles to the shared [`MiningJob`] and
-/// [`ActiveSV1Template`] so the caller can release the registry lock
-/// and continue work — including building a block-submission coinbase
-/// — without holding it. Cloning a lookup out of the lock is a pair of
-/// refcount bumps, not a deep copy of the coinbase/merkle buffers.
+/// Result of [`JobRegistry::classify`]. Holds `Arc` handles so the caller can
+/// drop the registry lock before building a block coinbase.
 #[derive(Clone, Debug)]
 pub struct JobLookup {
     pub classification: JobClassification,
     pub mining_job: Arc<MiningJob>,
     pub template: Arc<ActiveSV1Template>,
-    /// The numeric template id. The registry keys on `u64`, not on the hex
-    /// string: the hex form exists only for the wire
-    /// (`mining.notify[0]` / `mining.submit[1]`), so keeping ids numeric
-    /// internally keeps **all** allocation and string hashing out of the
-    /// registry's critical section.
+    /// Numeric id; the hex form exists only on the wire, which keeps allocation
+    /// and string hashing out of the registry's critical section.
     pub template_id: u64,
 }
 
@@ -77,8 +33,7 @@ pub struct JobLookup {
 #[derive(Clone, Debug)]
 struct JobEntry {
     mining_job: Arc<MiningJob>,
-    /// See [`JobLookup::template_id`] — a plain `u64`, so cloning this
-    /// entry out of the registry (once per share) copies no heap data.
+    /// See [`JobLookup::template_id`].
     template_id: u64,
     creation_ms: u64,
     retired_at_ms: Option<u64>,
@@ -94,13 +49,8 @@ struct TemplateEntry {
 struct Inner {
     jobs: HashMap<u64, JobEntry>,
     templates: HashMap<u64, TemplateEntry>,
-    /// Monotonic counter for `jobs` keys. Hex form is what miners see in
-    /// the `mining.notify[0]` field and echo back in `mining.submit[1]`,
-    /// but it is rendered OUTSIDE the lock — the map itself is keyed on
-    /// the integer.
+    /// The hex form miners see is rendered outside the lock.
     next_job_id: u64,
-    /// Monotonic counter for `templates` keys. Stored on each `JobEntry`
-    /// so submit lookup can chase job → template in one hop.
     next_template_id: u64,
 }
 
@@ -132,9 +82,8 @@ impl JobRegistry {
         self.config
     }
 
-    /// Peek the next job-id WITHOUT bumping the counter. The vardiff
-    /// race-clamp in the client records it as the ratchet boundary; the
-    /// next `add_job` call commits it.
+    /// Next job id without bumping the counter; the vardiff race-clamp uses it
+    /// as its ratchet boundary.
     pub fn peek_next_job_id(&self) -> u64 {
         self.inner
             .lock()
@@ -142,27 +91,18 @@ impl JobRegistry {
             .next_job_id
     }
 
-    /// Insert a template under a freshly-allocated hex id. Returns the
-    /// id the caller should reference in subsequent `add_job` calls.
-    /// Convenience wrapper that takes ownership and wraps in `Arc` —
-    /// used by tests. The hot broadcast path uses
-    /// [`Self::add_template_shared`] to register the already-shared Arc
-    /// without a deep copy.
+    /// Test convenience over [`Self::add_template_shared`].
     pub fn add_template(&self, template: ActiveSV1Template, now_ms: u64) -> u64 {
         self.add_template_shared(Arc::new(template), now_ms)
     }
 
-    /// Insert an already-`Arc`-shared template under a freshly-allocated
-    /// hex id. Each connection registers per broadcast, so taking the
-    /// shared `Arc` here turns those N registrations into refcount bumps
-    /// instead of N deep copies of the merkle path / coinbase buffers.
+    /// Takes a shared `Arc` because every connection registers on every
+    /// broadcast; N registrations stay refcount bumps, not N deep copies.
     pub fn add_template_shared(&self, template: Arc<ActiveSV1Template>, now_ms: u64) -> u64 {
         let mut inner = self.inner.lock().expect("job-registry mutex poisoned");
         let id = inner.next_template_id;
         inner.next_template_id += 1;
-        // Integer key: no `format!`, no key allocation, no string hashing
-        // inside the critical section. Every connection registers here on
-        // every broadcast, so this section is contended N-ways per block.
+        // Integer key: this section is contended by every connection on every broadcast.
         inner.templates.insert(
             id,
             TemplateEntry {
@@ -174,20 +114,13 @@ impl JobRegistry {
         id
     }
 
-    /// Insert a mining job linked to a template, under a freshly-allocated
-    /// hex id. Returns the id the SV1 wire layer should put in
-    /// `mining.notify[0]`. Convenience wrapper that takes ownership and
-    /// wraps in `Arc` — used by tests. The hot broadcast path uses
-    /// [`Self::add_job_shared`] to register the pool-wide memoized job
-    /// without a deep copy.
+    /// Test convenience over [`Self::add_job_shared`].
     pub fn add_job(&self, mining_job: MiningJob, template_id: u64, now_ms: u64) -> String {
         self.add_job_shared(Arc::new(mining_job), template_id, now_ms)
     }
 
-    /// Insert an already-`Arc`-shared mining job under a freshly-allocated
-    /// hex id. With the pool-wide `MiningJobCache`, every same-payout
-    /// connection registers the SAME job allocation per broadcast — a
-    /// refcount bump each instead of N copies of the coinbase buffers.
+    /// Returns the hex id for `mining.notify[0]`. Takes a shared `Arc` because
+    /// same-payout connections register the same cached job on every broadcast.
     pub fn add_job_shared(
         &self,
         mining_job: Arc<MiningJob>,
@@ -198,8 +131,6 @@ impl JobRegistry {
             let mut inner = self.inner.lock().expect("job-registry mutex poisoned");
             let id = inner.next_job_id;
             inner.next_job_id += 1;
-            // Integer key — the critical section allocates nothing and
-            // hashes an integer, not a string.
             inner.jobs.insert(
                 id,
                 JobEntry {
@@ -211,26 +142,14 @@ impl JobRegistry {
             );
             id
         };
-        // Wire form rendered AFTER the lock is released.
         format!("{id:x}")
     }
 
-    /// Classify a share-submit's referenced job against the lifecycle
-    /// state. Returns:
-    ///
-    /// - `None` — neither the job nor its template is currently
-    ///   recoverable. Caller emits `JobNotFound`. Orphan job entries
-    ///   (the job is there but its template was GC'd) self-prune here.
-    /// - `Some(lookup)` — job + template are present and the
-    ///   classification reports the wire-result the caller should send.
+    /// `None` means `JobNotFound` (unknown, malformed, or its template is gone;
+    /// such an orphan job self-prunes here).
     pub fn classify(&self, job_id_hex: &str, now_ms: u64) -> Option<JobLookup> {
-        // Parse the wire id BEFORE taking the lock. A malformed id (a miner
-        // echoing garbage) resolves to `None` here — the same outcome the
-        // caller already handled for an unknown id (`JobNotFound`).
-        //
-        // The digit check is not redundant: `from_str_radix` accepts a
-        // leading `+`, so a bare parse would let `"+1"` alias job `1`.
-        // Requiring pure hex digits keeps the wire id canonical.
+        // `from_str_radix` accepts a leading `+`, so without the digit check
+        // `"+1"` would alias job `1`.
         if job_id_hex.is_empty() || !job_id_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
@@ -242,8 +161,6 @@ impl JobRegistry {
         let template_entry = match inner.templates.get(&job_entry.template_id) {
             Some(t) => t.clone(),
             None => {
-                // Orphan job — its template aged out. Self-prune so the
-                // same dead reference is not classified again.
                 inner.jobs.remove(&job_id);
                 return None;
             }
@@ -260,23 +177,9 @@ impl JobRegistry {
         })
     }
 
-    /// Run the ckpool-style lifecycle with an UNCONDITIONAL retire.
-    ///
-    /// - `clear_jobs = true` stamps `retired_at = now_ms` on every entry
-    ///   that doesn't already have one (idempotent — already-retired
-    ///   entries keep their original timestamp).
-    /// - `clear_jobs = false` is a periodic age-only tick.
-    ///
-    /// Both paths then run `age_entries`, which deletes retired entries
-    /// past the retention window and (defense-in-depth) non-retired
-    /// entries past 2× retention, while always preserving the newest
-    /// [`bp_jobs_lifecycle::LifecycleConfig::min_retained`] entries.
-    ///
-    /// Production does NOT call this on block changes — the registry is
-    /// shared by every template stream of a port, and a blanket retire
-    /// races the other streams' fresh jobs. The translator drives
-    /// [`Self::cleanup_for_tip`] instead; this method remains for tests
-    /// and for callers that genuinely mean "retire everything".
+    /// `clear_jobs` retires every entry unconditionally, then ages. Not for block
+    /// changes: the registry is shared by all streams of a port and a blanket
+    /// retire would hit other streams' fresh jobs; use [`Self::cleanup_for_tip`].
     pub fn cleanup(&self, clear_jobs: bool, now_ms: u64) {
         let mut inner = self.inner.lock().expect("job-registry mutex poisoned");
         let cfg = self.config;
@@ -310,25 +213,10 @@ impl JobRegistry {
         );
     }
 
-    /// Tip-conditioned lifecycle pass — the production wiring, driven by
-    /// each stream's translator on every broadcast it emits.
-    ///
-    /// Retires (idempotently) every entry whose template was built on a
-    /// previous-block hash OTHER than `tip_prev_hash`, plus orphan jobs
-    /// whose template row is already gone, then runs the same aging pass
-    /// as [`Self::cleanup`].
-    ///
-    /// Why prev-hash-conditioned instead of `cleanup(true)`: the registry
-    /// is shared by ALL template streams of a port (PPLNS + Solo +
-    /// Group-Solo + Blockparty), and each stream's translator observes a
-    /// block change at a slightly different instant. A blanket retire
-    /// from whichever stream fires LAST would stamp the fresh jobs the
-    /// earlier streams' connections already registered for the new tip —
-    /// after the grace window every share on them would be rejected as
-    /// stale until the next refresh. Keying the retire on the template's
-    /// `prev_hash` makes the pass idempotent and order-independent
-    /// across streams: new-tip entries are never touched, and refresh
-    /// broadcasts (same tip) retire nothing and only age.
+    /// Retires entries built on a prev-hash other than `tip_prev_hash` (and orphan
+    /// jobs), then ages. Keyed on prev-hash because all streams of a port share the
+    /// registry and see a block change at different instants: the pass must be
+    /// order-independent and never retire jobs already registered for the new tip.
     pub fn cleanup_for_tip(&self, tip_prev_hash: &[u8; 32], now_ms: u64) {
         let mut guard = self.inner.lock().expect("job-registry mutex poisoned");
         let cfg = self.config;
@@ -339,10 +227,8 @@ impl JobRegistry {
                 t.retired_at_ms = Some(now_ms);
             }
         }
-        // Jobs chase their template's prev_hash. A job whose template row
-        // is already gone (aged out first) is retired too — `classify`
-        // would self-prune it on lookup, but a late share should see a
-        // proper stale classification instead of racing the GC.
+        // A job whose template is already gone is retired too, so a late share
+        // gets a stale classification instead of racing the self-prune.
         let templates = &inner.templates;
         for j in inner.jobs.values_mut() {
             if j.retired_at_ms.is_some() {
@@ -486,9 +372,7 @@ mod tests {
 
     // ── classify: 3 outcomes + None ────────────────────────────────────
 
-    /// The registry keys on the numeric id; the hex string exists only for
-    /// the wire. This pins the job -> template linkage survives that split:
-    /// the id `classify` reports is the one `add_template` handed out.
+    /// Pins that `classify` reports the template id `add_template` handed out.
     #[test]
     fn classify_reports_the_registering_template_id() {
         let reg = JobRegistry::new(cfg());
@@ -499,9 +383,7 @@ mod tests {
         assert_eq!(lookup.template_id, tid);
     }
 
-    /// `add_job*` returns the id in the hex form the wire uses, and
-    /// `classify` must accept exactly that form back — the round-trip
-    /// across the integer/hex boundary.
+    /// Pins that `classify` accepts the hex id `add_job` returned.
     #[test]
     fn job_id_hex_round_trips_through_classify() {
         let reg = JobRegistry::new(cfg());
@@ -519,9 +401,7 @@ mod tests {
         );
     }
 
-    /// A miner echoing a non-hex job id must resolve to `None` (the caller
-    /// emits `JobNotFound`) rather than panicking; the id is parsed before
-    /// the registry lock is taken.
+    /// Pins that a malformed or non-canonical job id resolves to `None`.
     #[test]
     fn classify_rejects_malformed_job_id() {
         let reg = JobRegistry::new(cfg());
@@ -531,8 +411,7 @@ mod tests {
         assert!(reg.classify("not-hex", 1_500).is_none());
         assert!(reg.classify("", 1_500).is_none());
         assert!(reg.classify("zzzz", 1_500).is_none());
-        // Discriminating case: `from_str_radix` accepts a leading `+`, so a
-        // bare parse would resolve `"+1"` to job 1, which must not happen.
+        // `from_str_radix` alone would resolve `"+1"` to job 1.
         assert!(
             reg.classify("1", 1_500).is_some(),
             "sanity: job 1 exists, so the +1 assertion below is meaningful"
@@ -644,8 +523,6 @@ mod tests {
 
         reg.cleanup(true, 10_000);
 
-        // Nothing deleted (4 entries < some threshold; also under
-        // MIN_RETAINED floor protection).
         assert_eq!(reg.template_count(), 2);
         assert_eq!(reg.job_count(), 2);
 
@@ -665,10 +542,7 @@ mod tests {
         // their original retired_at (only stamp if not already set).
         reg.cleanup(true, 20_000);
 
-        // Verify by classifying at a time that's between 10_000 + grace
-        // and 20_000 + grace: if retired_at had bumped to 20_000, this
-        // would still be creditable. With original retired_at=10_000,
-        // it's rejected at 17_000.
+        // Rejected at 17_000 only if retired_at stayed at 10_000.
         let cls = reg.classify(&jid, 17_000).unwrap().classification;
         assert_eq!(cls, JobClassification::StaleRejected);
     }
@@ -678,14 +552,11 @@ mod tests {
     fn template_with_prev(prev: u8) -> ActiveSV1Template {
         let mut active = dummy_active_template();
         active.template.prev_hash = [prev; 32];
-        // The base fixture's prev_hash_hex is for the OLD prev_hash — re-sync
-        // now that prev_hash changed.
         active.recompute_notify_header_hex();
         active
     }
 
-    /// Entries built on the OLD tip get retired; entries already on the
-    /// new tip are untouched (stay `Active`).
+    /// Pins that only old-tip entries are retired.
     #[test]
     fn cleanup_for_tip_retires_only_entries_from_other_tips() {
         let reg = JobRegistry::new(cfg());
@@ -708,10 +579,7 @@ mod tests {
         );
     }
 
-    /// A second call with the SAME tip (another stream's translator
-    /// firing later) neither touches new-tip entries nor bumps the
-    /// original `retired_at` of already-retired ones. This pins the
-    /// multi-stream order-independence the method exists for.
+    /// Pins that a later same-tip pass from another stream changes nothing.
     #[test]
     fn cleanup_for_tip_is_idempotent_and_order_independent() {
         let reg = JobRegistry::new(cfg());
@@ -732,17 +600,14 @@ mod tests {
             JobClassification::Active,
             "a later same-tip pass must never retire fresh new-tip jobs"
         );
-        // The old job keeps its ORIGINAL retired_at (10_000): at 17_000
-        // it is past the 5s grace → rejected. Had the second pass bumped
-        // it to 12_000 this would still be creditable.
+        // Rejected at 17_000 only if retired_at stayed at 10_000.
         assert_eq!(
             reg.classify(&j_old, 17_000).unwrap().classification,
             JobClassification::StaleRejected
         );
     }
 
-    /// A refresh broadcast (same tip as every live entry) retires
-    /// nothing — the pass is age-only.
+    /// Pins that a same-tip refresh retires nothing.
     #[test]
     fn cleanup_for_tip_same_tip_is_age_only() {
         let reg = JobRegistry::new(cfg());
@@ -757,9 +622,7 @@ mod tests {
         );
     }
 
-    /// A job whose template row is gone gets retired by the pass (a late
-    /// share then sees a proper stale classification instead of racing
-    /// the orphan self-prune in `classify`).
+    /// Pins that a job whose template is gone is retired by the pass.
     #[test]
     fn cleanup_for_tip_retires_orphan_jobs() {
         let reg = JobRegistry::new(cfg());
@@ -768,16 +631,12 @@ mod tests {
 
         reg.cleanup_for_tip(&[0xAB; 32], 10_000);
 
-        // classify chases the missing template → None + self-prune; the
-        // retire itself is observable via the entry count staying 1
-        // until classify prunes it.
         assert_eq!(reg.job_count(), 1);
         assert!(reg.classify(&jid, 10_000).is_none());
         assert_eq!(reg.job_count(), 0);
     }
 
-    /// Entries retired by a tip change age out after retention on a
-    /// LATER pass — the end-to-end memory-bound this wiring exists for.
+    /// Pins that tip-retired entries age out on a later pass past retention.
     #[test]
     fn cleanup_for_tip_ages_out_retired_entries_past_retention() {
         let reg = JobRegistry::new(cfg());
@@ -838,10 +697,7 @@ mod tests {
             reg.add_template(dummy_active_template(), 10_000 + i * 1_000);
         }
 
-        // Cleanup at t = 3_000 + retention - 1 → older retired entries are
-        // STILL within retention window. None should be deleted (MIN_RETAINED
-        // would also save them; verify the retention-window condition is
-        // hit correctly).
+        // The older retired entries are still within retention.
         reg.cleanup(false, 3_000 + cfg().retention_ms - 1);
         assert_eq!(reg.template_count(), 4);
     }

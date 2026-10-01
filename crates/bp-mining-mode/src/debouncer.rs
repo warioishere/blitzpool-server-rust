@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! In-process debouncer for live-marker writes.
-//!
-//! The stratum layer marks the active mining mode on every accepted share,
-//! but the marker's Redis TTL is 5 min, so refreshing it once a minute is
-//! plenty. The stratum layer consults this gate before the Redis write:
-//!
-//! - **Same mode within the refresh interval** → debounced (no write).
-//! - **Mode change** → always allowed (port-switch detection is the
-//!   whole point of the marker).
-//! - **Refresh interval elapsed** → allowed.
+//! Debouncer for the live mining-mode marker written on every accepted share.
+//! The marker's Redis TTL is 5 min, so a same-mode refresh once a minute is
+//! enough; a mode change always writes, since detecting it is the marker's point.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -17,8 +10,7 @@ use std::time::{Duration, Instant};
 
 use bp_common::{AddressId, MiningMode};
 
-/// 60 s refresh interval. A 4-minute safety margin under the 5-minute Redis
-/// TTL of the marker itself.
+/// Well under the marker's 5-minute Redis TTL.
 pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 pub struct MarkDebouncer {
@@ -51,14 +43,9 @@ impl MarkDebouncer {
         self
     }
 
-    /// Atomically check whether a marker write should happen and, if so,
-    /// record the new mark. Returns `true` if the caller should proceed
-    /// with the actual Redis write, `false` if the same-mode write was
-    /// debounced.
-    ///
-    /// Concurrent calls for the same address are linearised by the inner
-    /// mutex — at most one caller per address-mode pair will see `true`
-    /// within any `refresh_interval` window.
+    /// `true` if the caller should write the marker, recording the mark
+    /// atomically: at most one caller per address-mode pair gets `true`
+    /// within a `refresh_interval`.
     pub fn try_acquire(&self, address: &AddressId, mode: MiningMode) -> bool {
         let now = Instant::now();
         let mut last = self.last_mark.lock().expect("debouncer mutex poisoned");
@@ -75,8 +62,7 @@ impl MarkDebouncer {
         allow
     }
 
-    /// Forget the last-mark record for `address` (e.g. when a session
-    /// disconnects, so the next reconnect's first share writes).
+    /// Forget `address`, so the first share after a reconnect writes.
     pub fn forget(&self, address: &AddressId) {
         let mut last = self.last_mark.lock().expect("debouncer mutex poisoned");
         last.remove(address);
@@ -107,14 +93,10 @@ mod tests {
 
     #[test]
     fn mode_change_always_acquires_even_within_interval() {
-        // Port-switch detection is the whole point of the marker; debounce
-        // must NOT swallow mode changes.
         let d = MarkDebouncer::new();
         assert!(d.try_acquire(&addr("bc1qalice"), MiningMode::Pplns));
         assert!(d.try_acquire(&addr("bc1qalice"), MiningMode::Solo));
         assert!(d.try_acquire(&addr("bc1qalice"), MiningMode::GroupSolo));
-        // Same mode after the changes is now debounced against the
-        // most-recent mark.
         assert!(!d.try_acquire(&addr("bc1qalice"), MiningMode::GroupSolo));
     }
 
@@ -123,7 +105,6 @@ mod tests {
         let d = MarkDebouncer::new();
         assert!(d.try_acquire(&addr("bc1qalice"), MiningMode::Pplns));
         assert!(d.try_acquire(&addr("bc1qbob"), MiningMode::Pplns));
-        // Each address has its own slot.
         assert!(!d.try_acquire(&addr("bc1qalice"), MiningMode::Pplns));
         assert!(!d.try_acquire(&addr("bc1qbob"), MiningMode::Pplns));
     }
@@ -139,7 +120,6 @@ mod tests {
 
     #[tokio::test]
     async fn interval_elapsed_re_acquires() {
-        // Tiny interval to keep the test fast.
         let d = MarkDebouncer::new().with_refresh_interval(Duration::from_millis(10));
         assert!(d.try_acquire(&addr("bc1qalice"), MiningMode::Pplns));
         assert!(!d.try_acquire(&addr("bc1qalice"), MiningMode::Pplns));

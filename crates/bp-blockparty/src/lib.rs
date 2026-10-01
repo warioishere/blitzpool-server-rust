@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Blockparty mining mode — pure math, no I/O.
-//!
-//! Fixed-percent loot-split for pooled hashpower rentals: each block
-//! found while the party is `ready` or `active` pays out to members in
-//! admin-configured basis-point shares of the miner cut (= reward minus
-//! base pool fee). No shares tracked, no ledger, no carry-forward.
+//! Blockparty mining mode, pure math. A block found while the party is ready
+//! or active pays members fixed basis-point shares of the miner cut; no
+//! shares tracked, no ledger, no carry-forward.
 
 mod constants;
 mod distribution;

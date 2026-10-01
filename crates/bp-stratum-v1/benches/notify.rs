@@ -1,21 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #![allow(unsafe_code)] // dev-only bench: a counting global allocator needs `unsafe impl GlobalAlloc`.
 #![allow(clippy::print_stdout)] // dev-only bench: reporting alloc counts to stdout is the point.
-//
-//! Hot-path micro-benchmark for the SV1 `mining.notify` builder
-//! ([`bp_stratum_v1::build_notify_frame`]) — the per-client broadcast run once
-//! for every connection on every new job (new block / template refresh).
-//!
-//! `build_notify_frame` borrows all its hex from caches: the header-constant
-//! fields (prev_hash, version, n_bits, header_timestamp) from the template, and
-//! the coinbase (coinb1/coinb2) from the shared `MiningJob`, because each is
-//! identical for all clients on a template. The output frame Vec is pre-sized
-//! to an upper bound, so serde_json writes it without a realloc — that Vec is
-//! the builder's only allocation. The bench reports:
-//!   - **allocations per build** — asserts a single alloc, and shows the 6
-//!     per-client hex encodings the caches avoid.
-//!   - **ns/op** (criterion).
-//!
+//! Micro-benchmark of [`bp_stratum_v1::build_notify_frame`], run once per
+//! connection on every new job. Asserts the pre-sized output Vec is its only
+//! allocation, shows the hex encodings the caches avoid, and reports ns/op.
 //! Run: `cargo bench -p bp-stratum-v1 --bench notify`
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -29,8 +17,7 @@ use bp_mining_job::{
 use bp_stratum_v1::{build_notify_frame, swap_endian_words, ActiveSV1Template};
 use criterion::{Criterion, Throughput};
 
-// ── Counting allocator: tallies every alloc/realloc to read the
-//    allocation count across one isolated call. ──
+// ── Counting allocator: tallies every alloc/realloc ──
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
 struct Counting;
@@ -103,9 +90,8 @@ fn allocs_for_notify(t: &ActiveSV1Template, job: &MiningJob) -> usize {
     n
 }
 
-/// The hex encodings the caches keep out of every per-client build — 4 on the
-/// template (prev_hash + version + n_bits + ntime) and 2 on the shared
-/// `MiningJob` (coinb1 + coinb2) — i.e. what an uncached build would pay per call.
+/// What an uncached build would allocate per call: the four template and two
+/// coinbase hex encodings the caches keep out of the per-client path.
 fn allocs_for_removed_encodes(t: &ActiveSV1Template, job: &MiningJob) -> usize {
     let before = ALLOCS.load(Ordering::Relaxed);
     let a = hex::encode(swap_endian_words(&t.prev_hash));
@@ -125,10 +111,8 @@ fn report_allocs() {
     let _ = allocs_for_notify(&t, &job); // warm
     let cached = allocs_for_notify(&t, &job);
     let removed = allocs_for_removed_encodes(&t, &job);
-    // Hard floor: the builder must make exactly one allocation — the single
-    // pre-sized output frame Vec. Anything above means the `with_capacity`
-    // upper bound in `build_notify_frame` was too small and the buffer
-    // reallocated; widen it.
+    // Exactly one allocation; more means the `with_capacity` bound in
+    // `build_notify_frame` was too small.
     assert_eq!(
         cached, 1,
         "build_notify_frame regressed above 1 alloc/call — output buffer reallocated; \

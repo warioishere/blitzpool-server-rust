@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Email-template rendering — pure functions producing
-//! [`EmailContent`] triples (`subject`, `html`, `text`).
-//!
-//! Template families for outbound email:
-//!
-//! - [`render_verification`] — email-binding confirmation
-//! - [`render_invitation`] — payout-group invitation
-//! - [`render_join_decision`] — public join-request approval / rejection
-//! - [`render_binding_change`] — K1-lock attempted-takeover notice
-//!
-//! The render functions are pure: same context → same bytes. Recipient
-//! email is **not** part of the context structs (the adapter layer
-//! supplies `to:` when calling SMTP). The shell HTML, branding, and
-//! escaping helpers are private to this module so the template surface
-//! stays small and uniform.
+//! Email-template rendering: pure functions producing [`EmailContent`].
+//! The recipient is not part of any context; the SMTP adapter supplies `to:`.
 
 mod binding_change;
 mod content;

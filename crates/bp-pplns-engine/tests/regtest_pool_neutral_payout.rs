@@ -3,27 +3,10 @@
 // Test-tooling skip messages + the measured-figures summary need print_stderr.
 #![allow(clippy::print_stderr)]
 
-//! E2E: the pool is paid its fee and nothing else, over two consecutive
-//! real blocks against a `bitcoin-node`.
-//!
-//! When the coinbase has no room for every miner, the withheld entry is
-//! dropped from the published set: the §4 split hands its share to the
-//! published miners, settlement books their overpayment as debt against the
-//! withheld miner's credit, and the pool output stays at exactly `fee·T`.
-//! Every satoshi checked comes from a coinbase bitcoin-core accepted, every
-//! balance from the `pplns_balance` rows the engine wrote.
-//!
-//! Sequence:
-//! 1. Three miners at 3 000 000 / 1 000 000 / 60 diff-weighted shares,
-//!    pool fee 1.5 %.
-//! 2. The coinbase weight budget holds exactly two miner outputs, so the
-//!    smallest miner is withheld while its payout stays far above
-//!    `min_payout`, making the budget the demonstrable cause.
-//! 3. Block 1 is mined and settled against its actual coinbase.
-//! 4. The budget is widened and block 2 is mined on the same window: the
-//!    withheld miner's credit flows on-chain and the two debts clear.
-//!
-//! Skips when the `bitcoin-node` binary, Redis or PG are not reachable.
+//! E2E over two real regtest blocks: a miner withheld by the coinbase budget
+//! is funded by the other miners as debt, never by the pool, which takes
+//! exactly `fee·T`; a wider budget on block 2 pays the credit and clears the
+//! debts. Skips without `bitcoin-node`, Redis or PG.
 
 use std::time::Duration;
 
@@ -50,12 +33,10 @@ use bp_test_support::{
     mine_and_submit_payouts, redis_db, wait_for_paired_template,
 };
 
-/// Redis logical DB for this test; must not be shared with another test in
-/// this binary.
+/// Must not be shared with another test in this binary.
 const REDIS_TEST_DB: u8 = 0;
 
-/// Diff-1-weighted window shares. The third miner is small enough for the
-/// blockspace cut to drop, yet its share of a 50-BTC block is more than ten
+/// The third miner is small enough for the blockspace cut, yet earns over ten
 /// times `min_payout`, so the budget is what withholds it.
 const SHARES_ALICE: f64 = 3_000_000.0;
 const SHARES_BOB: f64 = 1_000_000.0;
@@ -65,9 +46,8 @@ const SHARES_CHARLIE: f64 = 60.0;
 /// seeded 4 000 060, or the window trimmer eats the fixture.
 const NETWORK_DIFFICULTY: f64 = 10_000_000.0;
 
-/// Blocks mined before the test's own two: past IBD/maturity, at heights no
-/// other regtest books (so no leftover payout row trips the already-booked
-/// guard), and below the 150-block halving so both pay the full subsidy.
+/// Past IBD and maturity, at heights no other regtest books, and below the
+/// 150-block halving so both blocks pay the full subsidy.
 const WARMUP_BLOCKS: u32 = 120;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -104,11 +84,7 @@ async fn withheld_miner_is_funded_by_the_other_miners_not_by_the_pool() {
     // Leftovers from an aborted run would be read back as opening balances.
     delete_balances(&pg, &miners).await;
 
-    // ── The weight budget, computed from the constants ────────────
-    //
-    // The trimmer reserves the structural coinbase, safety margin, witness
-    // commitment and pool output first, then keeps miner outputs greedily,
-    // so sizing for exactly two (three) outputs follows from the constants.
+    // ── The weight budget: fixed overhead first, then miner outputs ──
     let output_weight = output_weight_for_address(&addr_alice);
     for addr in [&addr_bob, &addr_charlie] {
         assert_eq!(
@@ -191,9 +167,7 @@ async fn withheld_miner_is_funded_by_the_other_miners_not_by_the_pool() {
     let weights_1 = &dist_1.distribution;
     let fingerprint_1 = dist_1.payouts_fingerprint();
 
-    // Precondition: the budget cut exactly the intended miner. A third
-    // published entry means the budget math is off or foreign open balances
-    // in the shared ledger competed for the two slots.
+    // Precondition: the budget cut exactly the intended miner.
     let published_1: Vec<String> = weights_1
         .published()
         .map(|e| e.address.as_str().to_string())
@@ -257,8 +231,7 @@ async fn withheld_miner_is_funded_by_the_other_miners_not_by_the_pool() {
     };
     let paid_1 = |address: &str| actual_1.paid_by_address.get(address).copied().unwrap_or(0) as i64;
 
-    // The withheld payout must clear `min_payout`, or the threshold rather
-    // than the budget would be what keeps it out of the coinbase.
+    // Above `min_payout`, so the budget, not the threshold, withheld it.
     let withheld_claim = claim_1(&addr_charlie);
     assert!(
         withheld_claim > DEFAULT_MIN_PAYOUT_SATS as i64,
@@ -268,9 +241,8 @@ async fn withheld_miner_is_funded_by_the_other_miners_not_by_the_pool() {
 
     // ── (2) The pool output is the fee, and only the fee ──────────
     //
-    // The withheld weight must not be folded into `weight_P`: the pool
-    // would take `fee·T + withheld_claim` while the ledger still owes that
-    // claim, to be repaid out of the other miners' cut.
+    // Withheld weight folded into `weight_P` would pay the pool a claim the
+    // ledger still owes the miner.
     let fee_only_1 = (t_1 as i64 * fee_ppm as i64) / 1_000_000;
     let pool_pay_1 = actual_1.pool_paid_sats as i64;
     let rounding_slack_1 = 1 + published_1.len() as i64;
@@ -303,7 +275,6 @@ async fn withheld_miner_is_funded_by_the_other_miners_not_by_the_pool() {
         .await
         .expect("the mined job's own distribution must resolve for booking");
 
-    // Read the written state: `pplns_balance` is the ledger.
     let [bal_alice_1, bal_bob_1, bal_charlie_1] =
         read_balances(&pg, &[&addr_alice, &addr_bob, &addr_charlie]).await;
     assert_eq!(
@@ -313,9 +284,7 @@ async fn withheld_miner_is_funded_by_the_other_miners_not_by_the_pool() {
 
     // ── (4) The published miners were overpaid, pro rata, and owe it ──
     //
-    // The §4 split spreads the withheld share over the published miners
-    // pro rata and settlement books the matching debt. Both halves are
-    // checked, since either alone would hold if the money went elsewhere.
+    // Both halves are checked: either alone holds if the money went elsewhere.
     let score_alice = entry_for(weights_1, &addr_alice).score_weight as i128;
     let score_bob = entry_for(weights_1, &addr_bob).score_weight as i128;
     let published_score = score_alice + score_bob;
@@ -355,8 +324,7 @@ async fn withheld_miner_is_funded_by_the_other_miners_not_by_the_pool() {
 
     // ═══ Block 2 — the same window, room for everyone ═════════════
     //
-    // Widening the budget (what the autoscaler does on `trimmed_count > 0`)
-    // is the only change between the two blocks.
+    // The wider budget is the only change between the two blocks.
     engine.coinbase_budget().set(budget_three_outputs);
     engine.invalidate_distribution_cache();
 
@@ -418,9 +386,6 @@ async fn withheld_miner_is_funded_by_the_other_miners_not_by_the_pool() {
         .expect("the second block's distribution must resolve for booking");
 
     // ── (6) The credit is paid on-chain and the debts are gone ────
-    //
-    // The withheld miner receives its claim plus its credit, and the two
-    // miners who pre-funded that payout come out square.
     let expected_charlie_2 = claim_2(&addr_charlie) + bal_charlie_1;
     assert!(
         (paid_2(&addr_charlie) - expected_charlie_2).abs() <= ROUNDING_SLACK_SATS,
@@ -481,8 +446,7 @@ async fn withheld_miner_is_funded_by_the_other_miners_not_by_the_pool() {
     delete_balances(&pg, &miners).await;
 }
 
-/// Satoshi slack on the "everything settles" assertions: every §4 amount,
-/// claim and balance boost is an integer floor. Beyond this is a leak.
+/// Every amount, claim and boost is an integer floor; beyond this is a leak.
 const ROUNDING_SLACK_SATS: i64 = 4;
 
 fn test_engine_config(fee_addr: &str, coinbase_weight_budget: u32) -> PplnsEngineConfig {
@@ -499,8 +463,6 @@ fn test_engine_config(fee_addr: &str, coinbase_weight_budget: u32) -> PplnsEngin
     }
 }
 
-/// The distribution's entry for `address`; panics naming the address if the
-/// build dropped the miner entirely.
 fn entry_for<'a>(distribution: &'a WeightDistribution, address: &str) -> &'a WeightEntry {
     distribution
         .entries
@@ -509,8 +471,6 @@ fn entry_for<'a>(distribution: &'a WeightDistribution, address: &str) -> &'a Wei
         .unwrap_or_else(|| panic!("{address} must be an entry of the distribution"))
 }
 
-/// The §4 payout vector at `reward`, lowered into the coinbase builder's
-/// input type.
 fn payout_entries(distribution: &WeightDistribution, reward: u64) -> Vec<PayoutEntry> {
     distribution
         .payout_entries_at(reward)
@@ -523,7 +483,7 @@ fn payout_entries(distribution: &WeightDistribution, reward: u64) -> Vec<PayoutE
         .collect()
 }
 
-/// Current `balanceSats` per address, `0` for an address with no row.
+/// `0` for an address with no row.
 async fn read_balances<const N: usize>(pool: &PgPool, addresses: &[&str; N]) -> [i64; N] {
     let mut out = [0i64; N];
     for (slot, address) in out.iter_mut().zip(addresses) {

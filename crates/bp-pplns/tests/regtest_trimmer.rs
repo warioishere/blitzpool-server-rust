@@ -1,62 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Verifies the PPLNS **coinbase blockspace cut** (SV2 ext 0x0003 §4
-//! weight model) end-to-end against a real `bitcoin-node v31` regtest
-//! validator.
-//!
-//! It covers three layers:
-//!
-//! 1. **Cut math** (`bp_pplns::build_weight_distribution`) — orders the
-//!    candidates in the §4 coinbase order (wire weight desc, address
-//!    asc), then greedily keeps outputs while the real serialized
-//!    coinbase weight (structural base + safety margin + witness
-//!    commitment + one worst-case pool output + *actual per-address
-//!    output weights*: 124 WU P2WPKH, 172 WU P2TR) fits the configured
-//!    `coinbase_weight_budget`. Cut miners leave the published set:
-//!    they get no on-chain output but keep their settlement claim.
-//! 2. **§4 evaluation + bytes assembly** —
-//!    `WeightDistribution::payout_entries_at(T)` yields the concrete
-//!    `(address, sats)` vector (pool output first, `floor(weight·T/W)`
-//!    per kept miner, `pay_P` absorbing rounding + dust so Σ == T
-//!    exactly), which `bp_mining_job::build_mining_job_from_tdp` turns
-//!    into a SegWit-clean coinbase over a real TDP template.
-//! 3. **bitcoin-core acceptance** (`TdpHandle::submit_solution`) —
-//!    proves the assembled coinbase fits within the IPC-advertised
-//!    `CoinbaseOutputConstraints.max_additional_size` and core relays
-//!    the block.
-//!
-//! ## Three scenarios (budget 50 000 WU each):
-//!
-//! The fixed overhead the cut reserves is `328 (base) + 188 (witness
-//! commitment) + 172 (worst-case pool output)` = 688 WU, on top of the
-//! 200 WU safety margin subtracted from the budget → 49 112 WU are
-//! available for miner outputs.
-//!
-//! - **pure P2WPKH ~396/420** — 124 WU per output; floor(49112 / 124) =
-//!   396 max miners. Push 420 → cut 24.
-//! - **pure P2TR ~285/320** — 172 WU per output; floor(49112 / 172) =
-//!   285 max. Push 320 → cut 35.
-//! - **50/50 P2WPKH/P2TR mix lands between the extremes** — equal
-//!   shares → equal wire weights, so the §4 order falls back to address
-//!   asc and every `bc1p…` (P2TR) sorts before every `bc1q…` (P2WPKH):
-//!   175 P2TR (30 100 WU) are kept first, then floor((49112 − 30100) /
-//!   124) = 153 P2WPKH → 328 kept, cut 22.
-//!
-//! ## What this regtest guards that unit tests can't
-//!
-//! - **`max_additional_size` coupling** (bin/blitzpool's
-//!   `coinbase_constraints_from_pplns_budget`) — bitcoin-core reserves
-//!   room based on `coinbase_weight_budget`; the cut's output must
-//!   actually fit, or core rejects the found block.
-//! - **End-to-end SegWit block weight**: `total_block_weight ≤ 4 M`
-//!   including the witness commitment + the coinbase witness.
-//! - **Bytes-acceptance per address type** under realistic mix — the
-//!   cut's per-address weight table (`output_weight_for_address`) must
-//!   match the *actual* serialised output size, or budget accounting
-//!   drifts from reality.
-//!
-//! Skipped (with a printed warning) when `bitcoin-node v31` isn't
-//! installed at the host's default location or via `BITCOIN_NODE_PATH`.
+//! The PPLNS coinbase blockspace cut (ext 0x0003 §4) end to end against a
+//! real `bitcoin-node` regtest: cut math, the §4 payout vector, and core
+//! accepting the coinbase within `max_additional_size`, so the per-address
+//! weight table must match real serialized output sizes.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -77,30 +24,16 @@ use bp_test_support::{brute_force_nonce, poll_for_height};
 /// Default coinbase weight budget used across all three scenarios (50 000 WU).
 const BUDGET: u32 = 50_000;
 
-/// Pool output recipient (P2WPKH). The §4 order always emits the pool
-/// output BEFORE the miner outputs; the cut reserves a worst-case
-/// (172 WU) slot for it in the fixed overhead regardless of its actual
-/// type, so the real (124 WU P2WPKH) coinbase lands strictly under the
-/// budget.
-///
-/// **Mainnet HRP** (not regtest): regtest P2TR addresses are 64 chars
-/// long, which exceeds `AddressId`'s 62-char DB-column limit. P2WPKH +
-/// P2TR scripts are network-independent (`OP_0 <hash>` / `OP_1 <xonly>`,
-/// no hrp encoded in the script bytes), so bitcoin-core regtest
-/// validates them identically to mainnet scripts. The mining-job
-/// builder uses `Network::Bitcoin` for address parsing but the
-/// resulting coinbase bytes are submitted to regtest, which accepts
-/// any well-formed scriptPubKey.
+/// Pool output recipient. Mainnet HRP because regtest P2TR addresses exceed
+/// `AddressId`'s 62-char limit; the scripts carry no HRP, so regtest
+/// validates them like mainnet scripts.
 const FEE_ADDR: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
 
-/// Network used for `build_mining_job_from_tdp` address parsing. See
-/// [`FEE_ADDR`] for why mainnet (not regtest).
+/// Mainnet for address parsing; see [`FEE_ADDR`].
 const TEST_NETWORK: Network = Network::Bitcoin;
 
-/// Bitcoin-core regtest block reward (50 BTC at block 102 = 5_000_000_000
-/// sats). Doubles as the §4 reference revenue the weight build projects
-/// balance/bonus boosts against (none in play here — no balances, no
-/// finder bonus — so it only has to be non-zero).
+/// Regtest block reward; as §4 reference revenue it only has to be non-zero
+/// here, since no balances or finder bonus are in play.
 const REGTEST_BLOCK_REWARD_SATS: u64 = 5_000_000_000;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -119,11 +52,8 @@ async fn pplns_blockspace_cut_pure_p2wpkh_fits_about_396_in_budget_50000() {
     let (kept_count, coinbase_weight_wu) =
         run_trim_scenario(miners, "pure-p2wpkh-pplns", 420).await;
 
-    // Deterministic outcome of the blockspace cut against a fixed
-    // 420-miner P2WPKH input with the production budget (50 000 WU)
-    // and safety margin. A worst-case-only accounting would cap around
-    // 285 — kept_count well above that proves the per-address
-    // 124 WU/output path actually fires.
+    // Worst-case-only accounting would cap near 285; 396 proves the
+    // per-address 124 WU path fires.
     assert_eq!(
         kept_count, 396,
         "pure P2WPKH cut count drifted (expected 396, got {kept_count}) — \
@@ -155,8 +85,6 @@ async fn pplns_blockspace_cut_pure_p2tr_caps_at_about_285_in_budget_50000() {
     let miners = generate_p2tr_miners(320);
     let (kept_count, coinbase_weight_wu) = run_trim_scenario(miners, "pure-p2tr-pplns", 320).await;
 
-    // Deterministic outcome — 320 P2TR miners (172 WU each), 50 000
-    // WU budget less fixed overhead + safety margin.
     assert_eq!(
         kept_count, 285,
         "pure P2TR cut count drifted (expected 285, got {kept_count})"
@@ -186,10 +114,8 @@ async fn pplns_blockspace_cut_mixed_5050_lands_between_extremes() {
     let miners = generate_mixed_p2wpkh_p2tr_miners(350);
     let (kept_count, coinbase_weight_wu) = run_trim_scenario(miners, "mixed-pplns", 350).await;
 
-    // Deterministic outcome — 350 alternating P2WPKH/P2TR miners with
-    // equal shares: the §4 tie-break (address asc) keeps all 175 P2TR
-    // (`bc1p…` < `bc1q…`) plus 153 P2WPKH, between the pure-P2TR floor
-    // and the pure-P2WPKH ceiling.
+    // Equal shares, so the §4 tie-break (address asc) keeps all 175 P2TR
+    // (`bc1p…` < `bc1q…`) before 153 P2WPKH.
     assert_eq!(
         kept_count, 328,
         "mixed cut count drifted (expected 328, got {kept_count})"
@@ -206,19 +132,8 @@ async fn pplns_blockspace_cut_mixed_5050_lands_between_extremes() {
 
 // ── Scenario runner ─────────────────────────────────────────────────────
 
-/// Drive one blockspace-cut scenario end-to-end:
-/// 1. Boot bitcoind regtest + mine past IBD.
-/// 2. Build the §4 `WeightDistributionInput` from the miner list with
-///    1 share each + the configured budget.
-/// 3. Call `build_weight_distribution` → assert the cut fired and the
-///    cut miners kept their settlement entries (wire_weight == 0).
-/// 4. Evaluate `payout_entries_at(T)` for the template's revenue →
-///    `Vec<PayoutEntry>` → TDP+MiningJob.
-/// 5. Brute-force a nonce + submit_solution.
-/// 6. Assert chain advanced + coinbase weight respected the budget.
-///
-/// Returns `(kept_count, coinbase_weight_wu)` for per-scenario assertions.
-/// `kept_count` excludes the pool output.
+/// Runs one cut scenario through to a block core accepts. Returns
+/// `(kept_count, coinbase_weight_wu)`; `kept_count` excludes the pool output.
 #[allow(clippy::print_stderr)]
 async fn run_trim_scenario(
     miners: Vec<AddressId>,
@@ -232,7 +147,6 @@ async fn run_trim_scenario(
         .await
         .expect("mine 101 for IBD-exit + coinbase maturity");
 
-    // Blockspace-cut input — 1 share per miner = even split before the cut.
     let mut address_shares: HashMap<AddressId, f64> = HashMap::with_capacity(miners.len());
     for miner in &miners {
         address_shares.insert(miner.clone(), 1.0);
@@ -254,8 +168,7 @@ async fn run_trim_scenario(
     })
     .expect("build_weight_distribution");
 
-    // The cut must actually have fired — published < pushed, and the
-    // telemetry reports the same pressure the autoscaler would see.
+    // The cut must have fired, and telemetry must report it to the autoscaler.
     let kept_miner_count = dist.published().count();
     assert!(
         kept_miner_count < pushed_count,
@@ -275,8 +188,7 @@ async fn run_trim_scenario(
         "a firing cut implies utilization ≥ 1.0 (got {})",
         dist.budget_telemetry.utilization()
     );
-    // Cut miners get NO output but remain in `entries` with
-    // `wire_weight == 0` and their settlement score intact.
+    // Cut miners get no output but keep their settlement score.
     assert_eq!(
         dist.entries.len(),
         pushed_count,
@@ -321,9 +233,7 @@ async fn run_trim_scenario(
     let (template, prev_hash) = wait_for_paired_template(&mut rx).await;
 
     // ── The §4 evaluation at this template's revenue ────────────────────
-    // Pool output first, `floor(weight·T/W)` per kept miner, `pay_P`
-    // absorbing rounding + dust so Σ == T exactly — anything else would
-    // be `bad-cb-amount` at core.
+    // Σ must equal T exactly, or core rejects with `bad-cb-amount`.
     let reward = template.coinbase_tx_value_remaining;
     let entries = dist.payout_entries_at(reward).expect("§4 payout vector");
     assert_eq!(entries[0].0, fee_addr, "the pool output leads the §4 order");
@@ -364,11 +274,7 @@ async fn run_trim_scenario(
     .expect("build_mining_job_from_tdp must succeed with the cut payouts");
 
     // ── Measure the actual serialised coinbase weight ───────────────────
-    //
-    // BIP-141 weight = (non-witness × 3) + total. The mining-job
-    // `witness_coinbase_with_extranonce` produces the full SegWit bytes
-    // (with witness reserved value), and `decode_non_witness_with_extranonce`
-    // produces the marker-less form (= non-witness bytes).
+    // BIP-141 weight = (non-witness × 3) + total.
     let en1 = [0u8; 4];
     let en2 = [0u8; 8];
     let witness_bytes = job.witness_coinbase_with_extranonce(&en1, &en2);
@@ -431,10 +337,7 @@ async fn run_trim_scenario(
 
 // ── Miner-list generators ───────────────────────────────────────────────
 
-/// Generate `n` deterministic P2WPKH regtest addresses derived from
-/// fixed-byte secret-key seeds. The keys aren't spendable from any
-/// wallet — coinbase output validity only depends on script
-/// well-formedness, not key custody.
+/// Generate `n` deterministic P2WPKH addresses from fixed seeds.
 fn generate_p2wpkh_miners(n: usize) -> Vec<AddressId> {
     use bitcoin::secp256k1::{Secp256k1, SecretKey};
     use bitcoin::{Address, CompressedPublicKey, KnownHrp};
@@ -442,8 +345,7 @@ fn generate_p2wpkh_miners(n: usize) -> Vec<AddressId> {
     (0..n)
         .map(|i| {
             let mut seed = [0u8; 32];
-            // High-entropy seed: index in bytes 0..8 + a fixed tag in 8..32.
-            // Avoids the all-zero secret key (invalid in secp256k1).
+            // The fixed tag avoids the all-zero secret key, invalid in secp256k1.
             seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
             seed[8..16].copy_from_slice(b"p2wpkh01");
             seed[16..24].copy_from_slice(b"pplns-tr");
@@ -495,7 +397,7 @@ fn generate_mixed_p2wpkh_p2tr_miners(n: usize) -> Vec<AddressId> {
     mixed
 }
 
-// ── Helpers (mirror bp-mining-job/tests/regtest_e2e.rs) ─────────────────
+// ── Helpers ─────────────────────────────────────────────────────────────
 
 fn decode_non_witness_with_extranonce(
     job: &bp_mining_job::MiningJob,

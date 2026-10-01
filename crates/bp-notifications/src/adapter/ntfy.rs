@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! ntfy adapter — `POST {server}/{topic}` with `Content-Type:
-//! text/plain` body.
-//!
-//! Topic naming: `{prefix}{address}` — prefix
-//! is configurable (often `blitzpool-`), address is the BTC payout
-//! address used as a stable per-user identifier. Subscribers point
-//! their ntfy app at that topic out-of-band; there is no per-user
-//! subscription row beyond the in-DB `ntfy_subscriptions_entity` that
-//! tracks per-address language / hourly-toggle preferences.
+//! ntfy adapter: plain-text `POST {server}/{topic}` where the topic is
+//! `{prefix}{address}`, the payout address being the stable per-user id.
 
 use reqwest::Client;
 use tracing::warn;

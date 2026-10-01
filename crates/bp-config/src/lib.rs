@@ -1,26 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Typed application configuration for `bin/blitzpool`.
-//!
-//! The pool reads a single TOML file at startup (`--config <PATH>`
-//! on the binary). Field names use `snake_case`; grouping uses TOML tables.
-//!
-//! ## Design choices
-//!
-//! - **TOML-only, no env-var override layer** (apart from `--roles` /
-//!   `BLITZPOOL_ROLES`). `blitzpool.example.toml` in the repo is the
-//!   template; the operator's copy is the one source of truth.
-//! - **`deny_unknown_fields` everywhere**. A typo in a key name is a
-//!   load error, not a silent default. Operators see "unknown field
-//!   `pplsn_fee_percent`" up-front.
-//! - **Optional groups are `Option<T>`**, not "empty defaults". An
-//!   absent `[notifications.fcm]` table means FCM is disabled —
-//!   different from FCM enabled-but-misconfigured. The binary checks
-//!   `if let Some(fcm) = &cfg.notifications.fcm { … }`.
-//! - **Engine-specific tuning fields live next to their engine's
-//!   config**, not under a generic `[performance]` block. The wiring
-//!   code reads them by passing the sub-config to the engine's
-//!   `spawn(cfg, …)` builder.
+//! Typed configuration for `bin/blitzpool`, read from one TOML file.
+//! No env-var overrides except `--roles` / `BLITZPOOL_ROLES`.
+//! `deny_unknown_fields` everywhere so a typo is a load error, not a silent
+//! default; an absent optional table (`Option<T>`) means the feature is off.
 
 use std::path::{Path, PathBuf};
 
@@ -45,11 +28,8 @@ pub struct AppConfig {
     pub pool_base_url: Option<String>,
 
     /// The roles this process runs — the single source of deployment topology.
-    /// Required: set it here or, more commonly, via `--roles` /
-    /// `BLITZPOOL_ROLES`, otherwise the binary exits at boot. The front is
-    /// `["front"]` (Stratum + producer + block submit); the back is
-    /// `["api", "payout", "stats", "notify"]`, which can be split into
-    /// per-feature processes (e.g. `["api"]`, `["payout", "stats"]`, `["notify"]`).
+    /// Required here or via `--roles` / `BLITZPOOL_ROLES`; the binary exits at
+    /// boot without it.
     #[serde(default)]
     pub roles: Vec<Role>,
 
@@ -81,37 +61,25 @@ pub struct AppConfig {
     #[serde(default)]
     pub metrics: MetricsConfig,
 
-    /// Optional `[debug]` section. Holds the protocol-level debug
-    /// switches (frame dumps, per-share traces, submit latency).
     #[serde(default)]
     pub debug: DebugConfig,
 }
 
-/// Protocol-level debug logging switches. All default to `false`
-/// because the SV1+SV2 share traces are noisy under production load
-/// — flip to `true` in staging / regtest when diagnosing a miner
-/// rejection rate.
+/// Protocol-level debug logging switches, all off by default because the
+/// share traces are noisy under production load.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct DebugConfig {
-    /// `true` ⇒ protocol *frame* dumps: SV1 `📤 RX:` JSON-RPC lines and
-    /// SV2 `📨 RX` / `📤 TX` wire-frame dumps (message name, type byte,
-    /// payload length). One pair per frame — heavy under load. Does NOT
-    /// cover per-share diagnostics (see [`Self::stratum_share_logs`]).
+    /// Per-frame SV1/SV2 wire dumps — heavy under load. Per-share
+    /// diagnostics are [`Self::stratum_share_logs`].
     #[serde(default)]
     pub stratum_wire_logs: bool,
-    /// `true` ⇒ per-share diagnostic logs: SV1 `🎯 Share difficulty` +
-    /// `✅ Share accepted`, and SV2 `🎯 Extended share difficulty` +
-    /// `📤 SubmitSharesExtended`. One line (or two) per submitted share.
-    /// Independent of share rejections, which always log at WARN
-    /// regardless of this flag.
+    /// Per-share diagnostic logs for accepted shares; rejections always log
+    /// at WARN regardless of this flag.
     #[serde(default)]
     pub stratum_share_logs: bool,
-    /// `true` ⇒ log the pool-internal submit→ack latency for **both**
-    /// SV1 and SV2 (µs from the inbound submit line/frame being read to
-    /// its response being written) at INFO, one line per share.
-    /// Lightweight diagnostic to isolate pool processing time from
-    /// network / miner / measurement latency — leave off normally.
+    /// Log the pool-internal submit→ack latency (SV1 and SV2) per share at
+    /// INFO, to separate pool processing time from network/miner latency.
     #[serde(default)]
     pub submit_latency: bool,
 }
@@ -122,35 +90,16 @@ pub enum Network {
     #[default]
     Mainnet,
     Testnet,
-    /// Bitcoin testnet4 (BIP-94 fork of testnet3 with shorter target
-    /// recalculation + lower difficulty floor). Addresses share the
-    /// `tb` HRP with testnet3 so address parsing maps to the same
-    /// `bitcoin::Network::Testnet` byte set.
+    /// Bitcoin testnet4 (BIP-94). Shares the `tb` HRP with testnet3, so
+    /// address parsing uses the same `bitcoin::Network::Testnet` byte set.
     Testnet4,
     Regtest,
 }
 
-/// Fine-grained deployment role. A process runs one or more roles; the set it
-/// runs (`roles` in config, or `--roles` / `BLITZPOOL_ROLES`) is what gates
-/// each subsystem at boot — and how the back-office splits into per-feature
-/// processes (e.g. `roles = ["api"]` / `["payout"]` / `["stats"]`).
-///
-/// ## Vocabulary (there is no `Satellite` role — it's a derived term)
-///
-/// - **front** / **core**: the [`Role::Front`] process. Holds the Stratum
-///   listeners + share producer + block submit + JDP, and *produces* the
-///   Core→Satellite Redis event streams (accepted / rejected / block-found /
-///   device-status). Always-on.
-/// - **satellite** / **back** / **back-office**: any process that is NOT the
-///   front — it *consumes* those streams instead of holding listeners. Used
-///   interchangeably in the codebase; all mean "a non-front process".
-/// - **accounting**: the [`Role::Payout`] + [`Role::Stats`] subset of the
-///   satellite that drains the engine streams (money + stats), as opposed to
-///   the [`Role::Api`] (read-only) and [`Role::Notify`] (notifications) roles.
-///
-/// The split lets the back-office redeploy/restart without dropping miners: the
-/// front keeps running while a satellite process bounces and resumes from the
-/// stream (at-least-once, dedup on `share_id`).
+/// Deployment role; the set a process runs gates each subsystem at boot.
+/// "Satellite" is any non-[`Role::Front`] process: it consumes the front's
+/// Redis streams (at-least-once, dedup on `share_id`), so it can restart
+/// without dropping miners.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -164,20 +113,17 @@ pub enum Role {
     Payout,
     /// Share statistics + per-session persistence (best-diff / touch / charts).
     Stats,
-    /// Notifications: the dispatcher (FCM / Web-Push / Telegram / ntfy), the
-    /// Telegram + ntfy command listeners, the push/digest crons (network- +
-    /// best-difficulty, hourly stats), and the notify-only fan-out of the
-    /// block-found + device-status streams. Carved out so notification feature
-    /// changes redeploy without restarting the `payout` (PPLNS) process.
+    /// Notifications: dispatcher, command listeners, push/digest crons and the
+    /// block-found + device-status fan-out. Separate so notification changes
+    /// redeploy without restarting the `payout` process.
     Notify,
 }
 
 impl std::str::FromStr for Role {
     type Err = String;
 
-    /// Parse a role name (case-insensitive). Lets the binary accept
-    /// `--roles` / `BLITZPOOL_ROLES=api,payout` so all containers can share
-    /// one config and differ only by an env var.
+    /// Case-insensitive, so all containers can share one config and differ
+    /// only by `BLITZPOOL_ROLES`.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
             "front" => Ok(Role::Front),
@@ -208,29 +154,21 @@ pub struct BitcoinRpcConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TdpConfig {
-    /// Path to the bitcoin-core IPC Unix-domain socket. Templates arrive
-    /// over this socket (TDP), not via ZMQ + RPC `getblocktemplate`;
-    /// `bp-template-distribution::TdpHandle::spawn` connects to it.
+    /// bitcoin-core IPC socket the templates arrive over (TDP).
     pub socket_path: PathBuf,
-    /// Minimum block-reward fee (sats) before a refreshed template
-    /// supersedes the previous one. Lower → more template churn.
-    /// `TdpHandle` default if absent: 1_000_000.
+    /// Minimum block-reward fee (sats) before a refreshed template supersedes
+    /// the previous one. Lower → more template churn. Default 1_000_000.
     #[serde(default)]
     pub fee_threshold_sats: Option<u64>,
-    /// Minimum interval between template refreshes (seconds). Floor
-    /// — Core may emit faster but the worker rate-limits.
+    /// Minimum interval between template refreshes (seconds).
     #[serde(default)]
     pub min_interval_secs: Option<u8>,
-    /// `tokio::sync::broadcast` capacity for the template channel.
-    /// Default if absent: 16.
+    /// Template broadcast channel capacity. Default 16.
     #[serde(default)]
     pub broadcast_capacity: Option<usize>,
-    /// Age (seconds) past which the last-seen template/prev-hash is
-    /// considered stale by `/api/health`. Deliberately generous so a
-    /// brief bitcoin-core restart (the reconnect loop re-attaches in
-    /// ~`reconnect_backoff`) does NOT flip the health status — only a
-    /// prolonged outage where core stops feeding fresh work does.
-    /// Default if absent: 120.
+    /// Age (seconds) past which `/api/health` reports the template stale.
+    /// Generous so a brief bitcoin-core restart does not flip health, only a
+    /// prolonged outage does. Default 120.
     #[serde(default = "default_tdp_staleness_threshold_secs")]
     pub staleness_threshold_secs: u64,
 }
@@ -370,9 +308,8 @@ pub struct ApiCacheConfig {
     #[serde(default = "ttl_30")]
     pub group_join_requests_secs: u64,
 
-    /// Upper bound on total cache entries before LRU eviction kicks
-    /// in. Dominated by per-`(address, range)` client keys; 10k is
-    /// generous for most deployments.
+    /// Total cache entries before LRU eviction; dominated by
+    /// per-`(address, range)` client keys.
     #[serde(default = "default_cache_capacity")]
     pub max_entries: u64,
 }
@@ -458,20 +395,17 @@ pub struct StratumConfig {
     /// High-difficulty SV1 listener port.
     pub solo_high_diff_port: u16,
     pub high_diff_start_difficulty: u64,
-    /// How long a retired job stays stored before aging drops it; a share
-    /// against a dropped job is rejected as an unknown job. Applies to SV1
-    /// and SV2. Defaults to 600 000 (10 min).
+    /// How long a retired job stays stored (SV1 and SV2); a share against a
+    /// dropped job is rejected as unknown. Default 600 000 (10 min).
     #[serde(default = "default_job_retention_ms")]
     pub job_retention_ms: u64,
     pub target_shares_per_minute: u32,
     pub high_diff_target_shares_per_minute: u32,
     pub difficulty_check_interval_ms: u64,
-    /// Let vardiff use elapsed silence as evidence: a session that stops
-    /// submitting has its difficulty walked down along the rate its own
-    /// silence still supports, instead of staying pinned at a target it
-    /// can no longer reach. Bounded (16x max descent, 8x max up-step) and
-    /// paused while rejected shares are still arriving. Off by default —
-    /// switch it on deliberately (staging first).
+    /// Let vardiff walk a silent session's difficulty down to what its silence
+    /// still supports, instead of pinning it at an unreachable target.
+    /// Bounded (16x down, 8x up), paused while rejects still arrive. Off by
+    /// default.
     #[serde(default)]
     pub vardiff_silence_easing_enabled: bool,
 }
@@ -479,70 +413,39 @@ pub struct StratumConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sv2Config {
-    /// 32-byte secp256k1 authority private key in hex. When absent
-    /// a random key is generated on every startup (operators can't
-    /// pin a pool identity that way — fine for staging, not prod).
+    /// 32-byte secp256k1 authority private key in hex. Absent ⇒ a random key
+    /// per startup, so the pool identity cannot be pinned (not for prod).
     #[serde(default)]
     pub authority_privkey_hex: Option<String>,
     #[serde(default)]
     pub jdp_enabled: bool,
     #[serde(default)]
     pub jdp_port: Option<u16>,
-    /// Pool-side block resubmit over JSON-RPC — the ONLY way the pool can
-    /// meet SV2 JDP/PushSolution ("When receiving `PushSolution`, JDS MUST
-    /// attempt to reconstruct and propagate the block") on Bitcoin Core v31.
-    ///
-    /// ⚠️ Core v31's job-declaration IPC has no working solution submit
-    /// (its push-solution handler is a stub); do not route this through it
-    /// before Core v32, the call would silently do nothing.
-    ///
-    /// `true` (default): reconstruct the block and submit it via `bitcoind
-    /// submitblock`. Costs one RPC per found block — the node answers
-    /// "duplicate" when the JDC's copy already arrived, which is the normal
-    /// case and is harmless.
-    /// `false`: log only. The JDC still propagates through its own node, so
-    /// the block travels either way; the pool just stops contributing the
-    /// second path that shrinks the orphan window.
+    /// Reconstruct a pushed solution and `submitblock` it: the only way to meet
+    /// SV2 JDP/PushSolution (JDS MUST propagate) on Core v31, whose IPC
+    /// solution submit is a stub. A "duplicate" answer is normal. `false` logs
+    /// only and leaves propagation to the JDC's own node.
     #[serde(default = "default_true")]
     pub jdp_orphan_submitblock: bool,
-    /// bitcoin-core IPC socket for declared-job validation
-    /// (SV2 JDP/Job Declarator Server). Same shape as `[tdp] socket_path`, and
-    /// normally the SAME socket — validation is a second interface on the one
-    /// node, not a second node.
-    ///
-    /// When set, every declared Custom Job goes to bitcoin-core's
-    /// `job_declaration_protocol` interface for a real `checkBlock` verdict
-    /// instead of being accepted on the JDC's word. Unset (default) keeps
-    /// declarations trusted.
-    ///
-    /// The validation engine takes a data DIRECTORY and derives
-    /// `<dir>/<network>/node.sock` itself (no subdirectory on mainnet), so the
-    /// path given here must be one that derivation can produce. Boot checks it
-    /// and refuses to start on a mismatch — the alternative is connecting
-    /// somewhere else, or nowhere, while the log says validation is on.
+    /// bitcoin-core IPC socket (normally the `[tdp]` one) for `checkBlock`
+    /// validation of declared jobs (SV2 JDP/Job Declarator Server); unset
+    /// trusts the JDC. Must be a `<dir>/<network>/node.sock` path the engine
+    /// can derive, else boot refuses rather than validate against nothing.
     #[serde(default)]
     pub jdp_validation_socket_path: Option<PathBuf>,
-    /// Republish cadence (seconds) for the ext 0x0003 payout
-    /// distribution push (`SetPayoutDistribution`). The publisher also
-    /// fires immediately on settlement invalidation; the timer only
-    /// bounds how stale a published distribution may grow between
-    /// blocks. Default 60.
+    /// Republish cadence (seconds) for the ext 0x0003 `SetPayoutDistribution`
+    /// push. Invalidation also fires it immediately; the timer only bounds
+    /// staleness between blocks. Default 60.
     #[serde(default)]
     pub jdp_payout_distribution_interval_secs: Option<u64>,
 }
 
 impl Default for Sv2Config {
-    /// A config with no `[sv2]` section at all must land on the same values a
-    /// present-but-empty one would. `#[derive(Default)]` would not: serde's
-    /// per-field defaults only run while deserializing a table that exists, so
-    /// every `default = "…"` field would silently fall back to the type's own
-    /// zero. `jdp_orphan_submitblock` is the one where that matters — off means
-    /// the pool stops doing what SV2 JDP/PushSolution asks of a JDS.
+    /// A missing `[sv2]` section must equal an empty one. `#[derive(Default)]`
+    /// would skip serde's per-field defaults and turn `jdp_orphan_submitblock`
+    /// off, breaking SV2 JDP/PushSolution.
     fn default() -> Self {
-        // Deserialize an empty table rather than list fields: "no section" is
-        // then the same answer as "empty section" BY CONSTRUCTION, including
-        // for every field added later. Cannot fail — an empty table is exactly
-        // what a config omitting `[sv2]` hands to serde anyway.
+        // Deserializing an empty table keeps that true for every future field.
         toml::from_str("").expect("empty [sv2] table applies every serde default")
     }
 }
@@ -556,72 +459,52 @@ pub struct PplnsConfig {
     pub high_diff_port: u16,
     pub start_difficulty: u64,
     pub target_shares_per_minute: u32,
-    /// On-chain bitcoin address that receives the pool fee directly
-    /// in every PPLNS-coinbase. Must be parseable as the configured
+    /// Address paid the pool fee in every PPLNS coinbase; must parse for
     /// `network`.
     pub fee_address: String,
-    /// Fee as percent of block reward (`1.5` = 1.5 %). Trimming +
-    /// dust-sweep never pad this — the fee output equals exactly
-    /// this percentage.
+    /// Fee as percent of block reward. Trimming and dust-sweep never pad it:
+    /// the fee output is exactly this percentage.
     pub fee_percent: f64,
-    /// Coinbase weight budget in WU. Handed straight to bitcoin-core
-    /// over the TDP IPC stream (`tdp_constraint_for_budget`) — there is
-    /// no `bitcoin.conf blockreservedweight` to keep in sync. Lower
-    /// budget → fewer payout recipients per block but more tx-fee room;
-    /// floored at `bp_pplns::MIN_COINBASE_WEIGHT_BUDGET`, below which
-    /// nothing is publishable and the pool would take every block.
+    /// Coinbase weight budget (WU), sent to bitcoin-core over TDP. Lower →
+    /// fewer recipients, more tx-fee room. Floored at
+    /// `bp_pplns::MIN_COINBASE_WEIGHT_BUDGET`, below which nothing is
+    /// publishable.
     pub coinbase_weight_budget: u32,
     /// VarDiff floor for the PPLNS port (sub-ASIC hardware gate).
     pub min_difficulty: u64,
-    /// Minimum on-chain payout in sats. Outputs below this stay as
-    /// pending credit in the signed ledger. Always clamped upward
-    /// to `DUST_LIMIT_SATS` (546) by the engine.
+    /// Minimum on-chain payout in sats; smaller amounts stay as pending
+    /// ledger credit. Clamped up to the dust limit by the engine.
     pub min_payout_sats: i64,
-    /// Enable the daily 03:00 UTC PPLNS dust-sweep cron (pair-cancels
-    /// abandoned positive credit against abandoned debit on
-    /// `pplns_balance`). Manual sweeps via admin trigger still work
-    /// when false.
+    /// Daily PPLNS dust-sweep cron (pair-cancels abandoned credit against
+    /// abandoned debit). Manual admin sweeps work regardless.
     #[serde(default = "default_true")]
     pub dust_sweep_enabled: bool,
-    /// Inactivity cutoff (days) at which a `pplns_balance` row becomes
-    /// eligible for the abandoned-pair sweep. Must be > 0 (engine
-    /// rejects 0 to avoid sweeping freshly-credited rows).
+    /// Inactivity (days) before a `pplns_balance` row is sweepable. Must be
+    /// positive so freshly credited rows are never swept.
     #[serde(default = "default_abandoned_days")]
     pub abandoned_balance_days: u32,
-    /// Confirmations a found block must reach before its PPLNS payout
-    /// distribution is written to the ledger. The distribution is frozen
-    /// at block-found time and parked (Redis) until the block is this
-    /// many blocks deep; a block that orphans before then is discarded so
-    /// the pending-balance ledger never drifts. Default 3. The on-chain
-    /// coinbase payment is unaffected — only the internal accounting is
-    /// gated.
+    /// Confirmations before a found block's distribution is booked, so an
+    /// orphaned block never reaches the ledger. The on-chain payment is
+    /// unaffected. Default 3.
     #[serde(default = "default_confirmation_depth")]
     pub confirmation_depth: u32,
-    /// Shares per count-bucket for the sliding window (default 10000). The
-    /// window is stored as per-address buckets of this many shares; bigger =
-    /// less Redis memory + coarser trim, smaller = more memory + finer.
-    ///
-    /// Not safe to raise on a live pool: the bucket id is derived from a Redis
-    /// counter that never resets, so a bigger divisor sends new shares to an
-    /// id below the live window, where the trim discards them. Raise it only
-    /// against an empty window; lowering it is harmless.
+    /// Shares per window bucket. Never raise it on a live window: the bucket
+    /// id comes from a never-resetting counter, so a bigger divisor puts new
+    /// shares below the live window where the trim discards them. Lowering
+    /// is harmless.
     #[serde(default = "default_bucket_shares")]
     pub bucket_shares: u64,
-    /// Coinbase-budget autoscaler. **Absent** ⇒ the budget stays fixed at
-    /// `coinbase_weight_budget`.
-    /// **Present** ⇒ the budget self-adjusts at runtime within
-    /// `[coinbase_weight_budget` (floor)`, max_weight_budget]` — no restart
-    /// needed as the pool grows.
+    /// Coinbase-budget autoscaler. Absent ⇒ the budget stays fixed at
+    /// `coinbase_weight_budget`; present ⇒ it adjusts at runtime between that
+    /// floor and `max_weight_budget`.
     #[serde(default)]
     pub coinbase_autoscale: Option<CoinbaseAutoscaleConfig>,
 }
 
-/// `[pplns.coinbase_autoscale]` — runtime self-tuning of the coinbase weight
-/// budget. The parent's `coinbase_weight_budget` is the **floor** (also the
-/// boot seed when no persisted value exists); `max_weight_budget` is the
-/// **ceiling**. The budget steps multiplicatively within that band with
-/// hysteresis + debounce + cooldown so it never flaps. See
-/// `bp_pplns_engine::autoscale` for the control semantics.
+/// `[pplns.coinbase_autoscale]`: the budget steps multiplicatively between the
+/// parent's `coinbase_weight_budget` (floor, boot seed) and
+/// `max_weight_budget`, with hysteresis, debounce and cooldown so it never
+/// flaps. See `bp_pplns_engine::autoscale`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoinbaseAutoscaleConfig {
@@ -679,10 +562,8 @@ fn default_autoscale_sample_interval_secs() -> u64 {
 }
 
 impl CoinbaseAutoscaleConfig {
-    /// Validate internal invariants (relationships not involving the parent's
-    /// floor — that `floor ≤ ceiling` / `ceiling > min_budget` check happens at
-    /// boot where both values are visible). Returns a human-readable reason on
-    /// failure so the operator sees a pointed config error.
+    /// Checks the section's own invariants; the floor-vs-ceiling check runs
+    /// at boot, where both values are visible.
     pub fn validate(&self) -> Result<(), String> {
         if !self.up_threshold.is_finite() || !(0.0..=1.0).contains(&self.up_threshold) {
             return Err(format!(
@@ -711,9 +592,8 @@ impl CoinbaseAutoscaleConfig {
         if self.sample_interval_secs == 0 {
             return Err("coinbase_autoscale.sample_interval_secs must be > 0".to_string());
         }
-        // Geometry guard against hopping: one up-step from the up-threshold must
-        // not land at/below the down-threshold (else a single jump re-arms the
-        // reverse direction). 0.85/1.15 = 0.739 > 0.50 with defaults.
+        // One up-step from the up-threshold must not land at/below the
+        // down-threshold, else a single jump re-arms the reverse direction.
         if self.up_threshold / self.step_factor <= self.down_threshold {
             return Err(format!(
                 "coinbase_autoscale: step too large for the deadband — up_threshold/step_factor ({:.3}) must exceed down_threshold ({:.3}) or the budget can flap",
@@ -734,19 +614,15 @@ pub struct SoloConfig {
     pub dev_fee_address: Option<String>,
     #[serde(default)]
     pub dev_fee_percent: Option<f64>,
-    /// Coinbase weight reservation (WU) for the **Solo** template stream.
-    /// Solo coinbases are tiny (finder + optional dev-fee = 1–2 outputs), so
-    /// this is small: it lets bitcoin-core fill the rest of the block with fee
-    /// transactions instead of reserving PPLNS-sized space on every Solo block
-    /// (Solo is the bulk of the hashrate). Maps to core's `block_reserved_weight`
-    /// via the TDP IPC constraint; core min-clamps the reservation to 2000 WU.
+    /// Coinbase weight reservation (WU) for the Solo template stream. Solo
+    /// coinbases have 1–2 outputs, so a small value leaves the block to fee
+    /// transactions. Sent to core over TDP; core clamps it to at least 2000 WU.
     #[serde(default = "default_solo_coinbase_weight_budget")]
     pub coinbase_weight_budget: u32,
 }
 
 fn default_solo_coinbase_weight_budget() -> u32 {
-    // ~5 kWU reserved after the headroom factor — comfortable for finder +
-    // dev-fee + cushion, while reclaiming ~145 kWU/block vs the PPLNS budget.
+    // Finder + dev-fee + cushion after the headroom factor.
     4_000
 }
 
@@ -760,13 +636,8 @@ impl Default for SoloConfig {
     }
 }
 
-/// Optional Blockparty section. Presence enables the feature; absence
-/// leaves every Blockparty surface (api routes, payout-resolver arm,
-/// mode gate) on its safe Solo fallback.
-///
-/// **Fee config** is NOT in this section. Group-Solo + Blockparty
-/// share a single `[group_fees]` lane (`group_fees.address` /
-/// `group_fees.percent`) with fallback to `[pplns]`.
+/// Presence enables Blockparty; absence leaves every Blockparty surface on
+/// its Solo fallback. The fee lives in the shared `[group_fees]` section.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlockpartyConfig {
@@ -774,15 +645,10 @@ pub struct BlockpartyConfig {
     /// the pool-fee output. Clamped at runtime to ≥ Bitcoin dust limit.
     #[serde(default = "default_blockparty_min_payout_sats")]
     pub min_payout_sats: i64,
-    /// Coinbase weight reservation (WU) for the **Blockparty** template stream
-    /// (a small fixed reservation against the same bitcoind, separate from the
-    /// PPLNS-autoscaled default). Size it to the largest party you expect:
-    /// each member is one extra coinbase output (~124 WU for P2WPKH, ~172 WU
-    /// for Taproot), plus one pool-fee output. The default fits ~40 members.
-    ///
-    /// **Validity-critical**: if a party grows past what this reserves,
-    /// bitcoin-core rejects the block (the coinbase exceeds the advertised
-    /// `CoinbaseOutputConstraints`). Raise it before onboarding larger parties.
+    /// Coinbase weight reservation (WU) for the Blockparty template stream;
+    /// one output per member (~124–172 WU) plus the fee, default fits ~40.
+    /// Validity-critical: a party past this reservation makes bitcoin-core
+    /// reject the block, so raise it before onboarding larger parties.
     #[serde(default = "default_blockparty_coinbase_weight_budget")]
     pub coinbase_weight_budget: u32,
 }
@@ -801,16 +667,12 @@ fn default_blockparty_min_payout_sats() -> i64 {
 }
 
 fn default_blockparty_coinbase_weight_budget() -> u32 {
-    // ~40 members × ~172 WU (Taproot) + fee output + cushion. Reclaims block
-    // space vs the 50 kWU PPLNS budget while staying safe for the default max
-    // party size.
+    // ~40 Taproot members + fee output + cushion.
     8_000
 }
 
-/// Shared `[group_fees]` lane used by both Group-Solo and Blockparty
-/// (`group_fees.address` / `group_fees.percent`). Both fields are
-/// optional — when absent the boot layer falls
-/// back to the corresponding `[pplns]` values.
+/// Fee settings shared by Group-Solo and Blockparty; absent fields fall back
+/// to the `[pplns]` values at boot.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GroupFeesConfig {
@@ -818,18 +680,10 @@ pub struct GroupFeesConfig {
     pub address: Option<String>,
     #[serde(default)]
     pub percent: Option<f64>,
-    /// Coinbase weight reservation (WU) for the **Group-Solo** template stream
-    /// (a small fixed reservation against the same bitcoind, separate from the
-    /// PPLNS-autoscaled default). Size it to the largest group you expect: each
-    /// member is one extra coinbase output (~124 WU for P2WPKH, ~172 WU for
-    /// Taproot), plus one pool-fee output. The default fits ~50 members.
-    ///
-    /// This value is wired into BOTH the TDP reservation AND the Group-Solo
-    /// engine's distribution trimmer (they must match — boot couples them), so
-    /// blocks are always valid: members beyond what the budget holds have their
-    /// payout rolled into the pool-fee output rather than overflowing the
-    /// reservation. Under-sizing therefore costs *fairness* (trimmed members get
-    /// 0 sats), not validity — raise it before onboarding larger groups.
+    /// Coinbase weight reservation (WU) for the Group-Solo stream, default fits
+    /// ~50 members. Drives both the TDP reservation and the engine's trimmer,
+    /// so blocks stay valid; under-sizing rolls trimmed members' payout into
+    /// the fee output, costing fairness rather than validity.
     #[serde(default = "default_group_solo_coinbase_weight_budget")]
     pub coinbase_weight_budget: u32,
 }
@@ -845,9 +699,7 @@ impl Default for GroupFeesConfig {
 }
 
 fn default_group_solo_coinbase_weight_budget() -> u32 {
-    // ~50 members × ~172 WU (Taproot) + fee output + cushion. Reclaims block
-    // space vs the 50 kWU PPLNS budget while staying safe for the default max
-    // group size.
+    // ~50 Taproot members + fee output + cushion.
     10_000
 }
 
@@ -866,33 +718,19 @@ pub struct NotificationsConfig {
     pub device_status: DeviceStatusConfig,
 }
 
-/// Debounce + coalescing for miner online/offline notifications.
-///
-/// The Stratum servers report every connect and disconnect. Sent
-/// verbatim, a miner on an unstable link produces one push pair per
-/// reconnect, and a rental source whose rigs rotate individually
-/// produces one per rig. These three knobs decide how long a change has
-/// to hold before a subscriber hears about it, and how closely two
-/// messages for the same address may follow one another.
+/// Debounce + coalescing for miner online/offline notifications, so a flaky
+/// link or rotating rental rigs do not produce a push per reconnect.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceStatusConfig {
-    /// How long a device must look gone before "offline" is sent. Long
-    /// enough to swallow a WiFi hiccup, a firmware watchdog reboot or a
-    /// pool restart; short enough that a dead miner is still reported
-    /// promptly.
+    /// How long a device must look gone before "offline" is sent; long enough
+    /// to swallow a WiFi hiccup, reboot or pool restart.
     #[serde(default = "default_offline_grace_secs")]
     pub offline_grace_secs: u64,
     /// How long a device must look present before "back online" is sent.
-    /// Keeps a device that flaps on a slow cycle from producing a
-    /// message every time it briefly reappears.
-    ///
-    /// Keep this comfortably above ~20 s: a session's `client_entity`
-    /// row is born by the session-persistence debounce (15 s + one 5 s
-    /// flush tick), and the gate counts a device without a row as
-    /// absent. Below that margin nothing breaks — a first resolve that
-    /// misses the row re-arms and the notice arrives one grace later —
-    /// but the online message for a brand-new worker is delayed.
+    /// Keep it above ~20 s: the `client_entity` row appears only after the
+    /// session-persistence debounce, and a device without a row counts as
+    /// absent, which delays a new worker's online message by one grace.
     #[serde(default = "default_online_dwell_secs")]
     pub online_dwell_secs: u64,
     /// Hard floor on the spacing between two device messages for one
@@ -900,12 +738,9 @@ pub struct DeviceStatusConfig {
     /// together as a single summary.
     #[serde(default = "default_coalesce_window_secs")]
     pub coalesce_window_secs: u64,
-    /// How often a device that has already settled is re-checked. A
-    /// device is judged against the database rather than against the
-    /// events it happened to send, so a wrong answer — most plausibly
-    /// the dead-client sweep retiring a connected but share-quiet
-    /// session — corrects itself on the next pass instead of standing
-    /// until the miner next reconnects.
+    /// How often a settled device is re-checked against the database, so a
+    /// wrong answer (e.g. the dead-client sweep retiring a quiet session)
+    /// corrects itself instead of standing until the next reconnect.
     #[serde(default = "default_recheck_interval_secs")]
     pub recheck_interval_secs: u64,
 }
@@ -986,20 +821,13 @@ pub struct SmtpConfig {
     pub from: String,
 }
 
-/// Prometheus `/metrics` exporter configuration.
-///
-/// Default `enabled = false`. Flip `[metrics] enabled = true` in the TOML
-/// to spawn the `:9000` HTTP listener. It serves what the pool emits: the
-/// Core→Satellite stream-consumer lag, the parked-block depths, vardiff
-/// adjustments and the lost-accepted-share counter.
+/// Prometheus `/metrics` exporter; `enabled = true` spawns the listener.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// Override the default `0.0.0.0:9000` bind. Useful when the
-    /// pool runs alongside another Prometheus exporter on the same
-    /// host.
+    /// Overrides the default `0.0.0.0:9000` bind.
     #[serde(default)]
     pub bind: Option<String>,
 }
@@ -1059,9 +887,7 @@ pub enum ConfigError {
 }
 
 impl AppConfig {
-    /// The roles this process runs — what the binary gates every subsystem on
-    /// at boot. Empty means none were configured; the binary treats that as a
-    /// fatal misconfiguration (see the boot-time roles check in `main`).
+    /// The roles this process runs. Empty is fatal at boot (checked in `main`).
     pub fn effective_roles(&self) -> Vec<Role> {
         self.roles.clone()
     }
@@ -1071,9 +897,7 @@ impl AppConfig {
         self.effective_roles().contains(&role)
     }
 
-    /// Read + parse a TOML config file. The path is captured in any
-    /// error so an operator sees which file failed (matters when
-    /// `--config` is used to point at a non-default location).
+    /// Read + parse a TOML config file; errors carry the path.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
@@ -1086,8 +910,7 @@ impl AppConfig {
         })
     }
 
-    /// Parse a TOML string directly (without touching the filesystem).
-    /// Used by tests + by anyone who already has the bytes in hand.
+    /// Parse a TOML string without touching the filesystem.
     pub fn from_toml_str(text: &str) -> Result<Self, toml::de::Error> {
         toml::from_str::<AppConfig>(text)
     }
@@ -1097,10 +920,7 @@ impl AppConfig {
 mod tests {
     use super::*;
 
-    /// The repo-committed `blitzpool.example.toml` MUST stay in sync
-    /// with the schema — otherwise an operator copying it gets a
-    /// load-time error. The path is relative to the workspace root
-    /// because cargo runs tests from there.
+    /// `blitzpool.example.toml` parses against the current schema.
     #[test]
     fn example_toml_parses() {
         let bytes = include_str!("../../../blitzpool.example.toml");
@@ -1147,8 +967,7 @@ mod tests {
         difficulty_check_interval_ms = 60000
     "#;
 
-    /// A missing `[notifications]` block, or one without
-    /// `device_status` keys, yields the documented debounce defaults.
+    /// Missing or partial `device_status` keys fall back to the defaults.
     #[test]
     fn device_status_debounce_defaults_without_a_config_block() {
         let cfg: AppConfig = toml::from_str(&format!("roles = [\"notify\"]\n{MINIMAL_CFG}"))
@@ -1291,9 +1110,7 @@ mod tests {
         assert_eq!(c.abandoned_balance_days, 45);
     }
 
-    /// Group-Solo has no ledger and therefore no dust sweep. `[group_fees]`
-    /// is `deny_unknown_fields`, so a config carrying sweep keys fails the
-    /// boot instead of quietly ignoring them.
+    /// Sweep keys on `[group_fees]` fail the load: Group-Solo has no ledger.
     #[test]
     fn group_fees_rejects_the_retired_sweep_keys() {
         assert!(toml::from_str::<GroupFeesConfig>("dust_sweep_enabled = false").is_err());
@@ -1453,9 +1270,7 @@ mod tests {
         assert_eq!(cfg.stratum.job_retention_ms, 600_000);
         // [tdp] staleness threshold defaults to 120s when unset.
         assert_eq!(cfg.tdp.staleness_threshold_secs, 120);
-        // SV2 JDP/PushSolution makes propagating a pushed solution a MUST for
-        // the JDS, and JSON-RPC is the only route Core v31 offers, so a
-        // config that says nothing must leave it ON.
+        // SV2 JDP/PushSolution: propagation is a MUST, so the default is on.
         assert!(
             cfg.sv2.jdp_orphan_submitblock,
             "pool-side block propagation must default to on"

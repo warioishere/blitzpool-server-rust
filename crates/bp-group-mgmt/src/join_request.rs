@@ -1,17 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Join-request lifecycle. Mirrors `pplns_group_join_request` (DB).
-//!
-//! User-initiated request to join a public group. Lifecycle:
-//!
-//! ```text
-//! Pending -> Approved   (admin clicks approve; membership created)
-//!         -> Rejected   (admin clicks reject)
-//!         -> Expired    (cron sweeps after PENDING_EXPIRY_DAYS)
-//! ```
-//!
-//! The TTL is much longer than directed-invitation TTL (30 d vs 7 d)
-//! because admins may not check the panel often.
+//! Join-request lifecycle for `pplns_group_join_request`: `Pending` →
+//! `Approved` | `Rejected` | `Expired`. The expiry is far longer than an
+//! invitation's because admins may not check the panel often.
 
 use crate::constants::{
     JOIN_REQUEST_PENDING_EXPIRY_DAYS, MAX_JOIN_REQUEST_MESSAGE_LEN, MS_PER_DAY,
@@ -62,11 +53,8 @@ pub enum JoinRequestMessageError {
     TooLong(usize),
 }
 
-/// Validate the optional admin-facing message that the requester
-/// attaches when creating a join-request. `None` is always OK; `Some`
-/// strings are bounded to [`MAX_JOIN_REQUEST_MESSAGE_LEN`]. Empty
-/// strings are accepted as "no message" — the service layer can choose
-/// whether to store them as `NULL` or empty.
+/// The optional requester message is bounded to
+/// [`MAX_JOIN_REQUEST_MESSAGE_LEN`]; empty counts as no message.
 pub fn validate_message(message: Option<&str>) -> Result<(), JoinRequestMessageError> {
     if let Some(m) = message {
         if m.len() > MAX_JOIN_REQUEST_MESSAGE_LEN {
@@ -76,21 +64,16 @@ pub fn validate_message(message: Option<&str>) -> Result<(), JoinRequestMessageE
     Ok(())
 }
 
-/// Cutoff used by the cron sweeper: rows created before
-/// `now - PENDING_EXPIRY_DAYS` should be moved to `Expired`.
+/// Rows created at or before this cutoff are stale.
 pub fn stale_cutoff_ms(now_ms: i64) -> i64 {
     now_ms - JOIN_REQUEST_PENDING_EXPIRY_DAYS as i64 * MS_PER_DAY
 }
 
-/// `true` if a row created at `created_at_ms` is past the staleness
-/// window at `now_ms`.
 pub fn is_stale(created_at_ms: i64, now_ms: i64) -> bool {
     created_at_ms <= stale_cutoff_ms(now_ms)
 }
 
-/// Validate that a join-request in state `current` can be moved to
-/// `Approved` or `Rejected`. Both transitions have the same
-/// preconditions (still pending, not stale).
+/// Approve and reject share one precondition: still pending, not stale.
 pub fn can_decide(
     current: JoinRequestStatus,
     created_at_ms: i64,

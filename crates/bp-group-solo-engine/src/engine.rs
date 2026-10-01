@@ -1,26 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `GroupSoloEngine` — top-level wiring of the Group-Solo
-//! service-engine.
-//!
-//! Owns the Postgres pool, Redis-backed `GroupRoundStore`,
-//! `DistributionBuilder` (with its in-flight cache), and
-//! `GroupResetRunner` plus its per-group calendar-aligned cron
-//! tasks.
-//!
-//! Public API:
-//!
-//! - `record_share` / `record_reject` — hot-path; called per
-//!   accepted / rejected share after the stratum layer has resolved
-//!   mode = Group-Solo + group_id for the address.
-//! - `build_distribution` — called by the template-build path with
-//!   the prospective finder's address.
-//! - `on_block_found` — called when a Group-Solo finder wins a block.
-//!   Writes the payout history from the block's OWN coinbase, resets
-//!   the round (keeping `lastAcceptedShareAt`), drops the consumed
-//!   snapshots, invalidates the distribution cache.
-//! - `manual_reset` — admin-triggerable wrapper.
-//! - `shutdown` — flips the cancel watch so background tasks exit.
+//! `GroupSoloEngine`: wires the round store, distribution builder and
+//! per-group reset crons. `on_block_found` books the payout history from the
+//! block's OWN coinbase, never from what the pool intended to pay.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -98,16 +80,9 @@ pub enum EngineError {
 }
 
 impl EngineError {
-    /// Would retrying this ever succeed?
-    ///
-    /// The confirmation watcher re-applies a pending block on every tick
-    /// until the apply returns `Ok`. An expired snapshot, a coinbase below
-    /// its own subsidy or an unparseable address fail the same way forever,
-    /// so they are terminal: surfaced once instead of retried endlessly.
-    ///
-    /// Terminal does not mean the block is lost, only that no automatic
-    /// path can book it; the operator reprocess reads the block's own
-    /// coinbase off the chain.
+    /// Errors that fail the same way on every retry, so the confirmation
+    /// watcher surfaces them once instead of re-applying forever. The block
+    /// is not lost: the operator reprocess books it from its own coinbase.
     pub fn is_terminal(&self) -> bool {
         match self {
             EngineError::Config(_)
@@ -140,25 +115,18 @@ struct Inner {
     reset_runner: GroupResetRunner<SystemClock>,
     config: GroupSoloEngineConfig,
     cancel_tx: watch::Sender<bool>,
-    /// Live per-group round-reset cron tasks, keyed by group id. Each has its
-    /// own cancel channel so [`GroupSoloEngine::reschedule_group`] can tear
-    /// down + re-arm a single group on a settings change without touching the
-    /// others. `shutdown` signals all of them.
+    /// Per-group reset crons, each with its own cancel channel so
+    /// [`GroupSoloEngine::reschedule_group`] can re-arm one group alone.
     reset_tasks: StdMutex<HashMap<Uuid, ResetTask>>,
-    /// Per-group `on_block_found` re-entrancy guard. `tokio::sync::Mutex`
-    /// because the hot path awaits PG + Redis inside the critical
-    /// section.
+    /// Per-group `on_block_found` re-entrancy guard; async mutex because the
+    /// critical section awaits PG + Redis.
     block_found_in_progress: TokioMutex<HashSet<Uuid>>,
-    /// Hot-path cache of each group's payout mode + window length, so
-    /// `record_share` doesn't hit Postgres per accepted share. The mode is
-    /// immutable (set at creation); the window length is editable, so the
-    /// entry carries a short TTL ([`MODE_CACHE_TTL`]) and is re-read on expiry.
+    /// Keeps Postgres off the per-share path. The mode is immutable but the
+    /// window length is editable, hence the short [`MODE_CACHE_TTL`].
     mode_cache: StdMutex<HashMap<Uuid, CachedGroupMode>>,
-    /// Per-group highest time-bucket for which a windowed `record_share`
-    /// already triggered a trim. The window only sheds whole buckets at hour
-    /// boundaries, so the record path trims only when a share opens a *new*
-    /// bucket. The payout read path still trims with wall-clock time, so this
-    /// only bounds Redis between reads and never affects correctness.
+    /// Highest bucket already trimmed by the record path; buckets only age out
+    /// whole, so trimming once per new bucket suffices. The payout read
+    /// re-trims anyway, so this only bounds Redis and never affects correctness.
     window_trim_watermark: StdMutex<HashMap<Uuid, i64>>,
 }
 
@@ -171,16 +139,12 @@ struct CachedGroupMode {
     expires_at: Instant,
 }
 
-/// TTL for [`Inner::mode_cache`]. Short enough that a window-length edit takes
-/// effect within a minute (and the mode never changes), cheap enough that the
-/// hot share path almost always hits the cache.
+/// TTL for [`Inner::mode_cache`]: a window-length edit takes effect within a
+/// minute while the share path almost always hits the cache.
 const MODE_CACHE_TTL: Duration = Duration::from_secs(60);
 
-/// Decide whether a windowed share in `bucket_id` should trigger a trim, given
-/// the highest bucket already trimmed (`watermark`, `None` if never). Trim on
-/// the first share of a group (cold start catches up any aging) and whenever a
-/// share opens a strictly-newer bucket; skip same-bucket and out-of-order older
-/// shares. Pure so the boundary logic is unit-testable without Redis.
+/// Trim on a group's first share (cold start catches up any aging) and when a
+/// share opens a strictly newer bucket; skip same-bucket and older shares.
 fn should_trim_on_bucket(watermark: Option<i64>, bucket_id: i64) -> bool {
     match watermark {
         Some(last) => bucket_id > last,
@@ -188,11 +152,9 @@ fn should_trim_on_bucket(watermark: Option<i64>, bucket_id: i64) -> bool {
     }
 }
 
-/// `(PayoutMode, window_ms)` to use when the per-share mode lookup hits a DB
-/// error. The mode is immutable, so a cached entry, even an expired one,
-/// still carries the correct mode; reusing it keeps a `Window` group's shares
-/// out of the PROP keys, where the window read never sees them. `Prop` is only
-/// the cold fallback for a group never resolved.
+/// Mode to use when the lookup hits a DB error. The mode is immutable, so even
+/// an expired cache entry is right, and reusing it keeps a `Window` group's
+/// shares out of the PROP keys the window read never sees.
 fn mode_on_lookup_error(cached: Option<CachedGroupMode>) -> (PayoutMode, i64) {
     match cached {
         Some(c) => (c.mode, c.window_ms),
@@ -247,12 +209,8 @@ impl GroupSoloEngine {
         Self::spawn_inner(config, redis, pool, true).await
     }
 
-    /// Core-mode constructor: same wiring, but *without* the per-group
-    /// round-reset cron. The Core only reads the round window and builds
-    /// distributions (`build_distribution`, which still writes the
-    /// snapshot key); the round-resetting cron runs on the Satellite.
-    /// `record_share` is unaffected and unused on the Core (the share
-    /// path produces to the stream instead).
+    /// Core-mode constructor without the reset crons: the Core only builds
+    /// distributions, and mutating rounds is the Satellite's job.
     pub async fn spawn_core(
         config: GroupSoloEngineConfig,
         redis: ConnectionManager,
@@ -276,14 +234,8 @@ impl GroupSoloEngine {
 
         let (cancel_tx, _cancel_rx) = watch::channel(false);
 
-        // Core mode (`background_tasks == false`) skips the cron: the
-        // per-group round-reset mutates rounds, which is the Satellite's
-        // job. `reset_tasks` then starts empty.
         let mut reset_tasks: HashMap<Uuid, ResetTask> = HashMap::new();
         if background_tasks {
-            // Spawn a per-group reset cron for every active group with a
-            // configured preset, retaining each task (with its own cancel) so a
-            // later `reschedule_group` can re-arm a single group at runtime.
             for schedule in load_active_schedules(&pool).await? {
                 let group_id = schedule.group_id;
                 reset_tasks.insert(group_id, spawn_reset_task(reset_runner.clone(), schedule));
@@ -313,29 +265,22 @@ impl GroupSoloEngine {
         })
     }
 
-    /// (Re-)schedule a single group's round-reset cron from its current row —
-    /// the runtime entry point bin/blitzpool's `apply_round_reset_config` hook
-    /// calls on a `PATCH /settings` save: tear down any existing task, then arm
-    /// a fresh one unless the group is dissolved/inactive or has no (valid)
-    /// preset. Cheap + synchronous (the work is a watch-signal + a `tokio::spawn`).
+    /// Re-arm one group's reset cron from its current row after a settings
+    /// save; the old task is always torn down first.
     pub fn reschedule_group(&self, group: &PplnsGroupRow) {
         let mut tasks = self
             .inner
             .reset_tasks
             .lock()
             .expect("reset_tasks mutex poisoned");
-        // Always tear down the old task first (handles preset/TZ/interval change).
         if let Some(old) = tasks.remove(&group.id) {
             let _ = old.cancel.send(true);
         }
-        // Don't re-arm for dissolved / inactive groups.
         if group.dissolved_at.is_some() || !group.active {
             info!(group_id = %group.id, "round-reset cron unscheduled (group dissolved/inactive)");
             return;
         }
-        // Window-mode groups never calendar-reset (the window self-trims); the
-        // reset config is reinterpreted as the window length, so leave the cron
-        // unscheduled regardless of preset.
+        // A Window group's reset config is its window length, never a cron.
         match PayoutMode::parse_or_default(&group.payout_mode) {
             PayoutMode::Window => {
                 info!(group_id = %group.id, "round-reset cron unscheduled (window payout mode)");
@@ -364,7 +309,6 @@ impl GroupSoloEngine {
                     "round-reset cron (re)scheduled from settings change"
                 );
             }
-            // No preset (cleared) → stay unscheduled.
             Ok(None) => {
                 info!(group_id = %group.id, "round-reset cron unscheduled (no preset)");
             }
@@ -376,13 +320,9 @@ impl GroupSoloEngine {
         }
     }
 
-    /// Resolve a group's `(PayoutMode, window_ms)`, caching the result for the
-    /// hot share path. A cache miss reads the `pplns_group` row once. On a DB
-    /// error the last cached entry is reused **even if expired**: the mode is
-    /// immutable, and a stale `window_ms` only mis-trims the record path (the
-    /// read path re-trims with a fresh one). Routing a Window group's shares to
-    /// the PROP keys would drop them from the window for good, so PROP is only
-    /// the cold fallback for a never-resolved group. Neither fallback is cached.
+    /// Resolve a group's `(PayoutMode, window_ms)` through the cache. On a DB
+    /// error the last entry is reused even if expired (see
+    /// `mode_on_lookup_error`); neither fallback is cached.
     async fn resolve_group_mode(&self, group_id: Uuid) -> (PayoutMode, i64) {
         let cached = {
             let cache = self.inner.mode_cache.lock().expect("mode_cache poisoned");
@@ -397,9 +337,6 @@ impl GroupSoloEngine {
             Ok(Some(g)) => group_mode_from_row(&g),
             Ok(None) => (PayoutMode::Prop, 0),
             Err(e) => {
-                // Prefer the last-known (immutable) mode over PROP so a transient
-                // DB error can't misroute a Window group's shares into the PROP
-                // aggregate, where they'd be invisible to the window payout.
                 if cached.is_some() {
                     warn!(%group_id, error = %e,
                         "group payout-mode lookup failed — reusing last-known mode (not re-cached)");
@@ -425,11 +362,9 @@ impl GroupSoloEngine {
         (mode, window_ms)
     }
 
-    /// Drop the cached `(PayoutMode, window_ms)` for a group so the next share
-    /// re-reads it from Postgres. Call this after a settings edit that changes
-    /// the round-reset cadence: the cadence is reinterpreted as the window
-    /// length, and on a window *grow* a stale shorter length would make the
-    /// record-path trim permanently drop a bucket the larger window must keep.
+    /// Call after a reset-cadence edit: on a window grow, a stale shorter
+    /// length would make the record-path trim drop a bucket the larger window
+    /// must keep.
     pub fn invalidate_mode_cache(&self, group_id: Uuid) {
         self.inner
             .mode_cache
@@ -438,10 +373,7 @@ impl GroupSoloEngine {
             .remove(&group_id);
     }
 
-    /// Record-path trim gate for a windowed share: returns `true` (and bumps
-    /// the watermark) only when `timestamp_ms` falls in a strictly-newer
-    /// hour-bucket than the last one trimmed for this group (see
-    /// [`should_trim_on_bucket`]).
+    /// Bumps the watermark and returns `true` per [`should_trim_on_bucket`].
     fn advance_trim_watermark(&self, group_id: Uuid, timestamp_ms: i64) -> bool {
         let bucket_id = timestamp_ms.div_euclid(WINDOW_BUCKET_MS);
         let mut marks = self
@@ -457,10 +389,7 @@ impl GroupSoloEngine {
         }
     }
 
-    /// After a windowed append at `now_ms`: trim the group's window once per
-    /// hour-bucket (gated by [`Self::advance_trim_watermark`]), for both
-    /// lanes. The payout read path trims with wall-clock time regardless, so
-    /// this only bounds Redis between reads.
+    /// Trim once per new bucket; only bounds Redis between payout reads.
     async fn trim_window_at_bucket_boundary(
         &self,
         group_id: Uuid,
@@ -487,9 +416,6 @@ impl GroupSoloEngine {
         timestamp_ms: i64,
     ) -> Result<(), EngineError> {
         let group_key = group_id.to_string();
-        // PROP appends to the single round aggregate; Window appends into the
-        // share's time bucket and self-trims (using the share's own accept
-        // time as "now" so an idle group still bounds its window).
         let (mode, window_ms) = self.resolve_group_mode(group_id).await;
         let applied = match mode {
             PayoutMode::Prop => {
@@ -504,6 +430,8 @@ impl GroupSoloEngine {
                     .round
                     .record_share_windowed(share_id, &group_key, address, difficulty, timestamp_ms)
                     .await?;
+                // Trim against the share's own accept time so an idle group
+                // still bounds its window.
                 if applied {
                     self.trim_window_at_bucket_boundary(group_id, timestamp_ms, window_ms)
                         .await?;
@@ -512,12 +440,10 @@ impl GroupSoloEngine {
             }
         };
         if !applied {
-            // Deduped redelivery: the round already counts this share, so
-            // the best-share check + cache-invalidate would be redundant.
+            // Deduped redelivery: the round already counts this share.
             return Ok(());
         }
-        // Best-share update is best-effort; the round wipes on
-        // block-found, so a missed update is cosmetic.
+        // Best-effort: a missed best-share update is cosmetic.
         if let Err(e) = self
             .inner
             .round
@@ -537,14 +463,9 @@ impl GroupSoloEngine {
         Ok(())
     }
 
-    /// Per-rejected-share counter. PROP adds to the round's running tally
-    /// (wiped with the round); Window appends into the reject lane of the
-    /// sliding window and self-trims like [`Self::record_share`], so the
-    /// round-stats rate divides rejects by accepted work of the same period.
-    ///
-    /// Bucketed on wall-clock time: a rejected share carries no accept time,
-    /// and the lane feeds only the stats view, so stream lag moving a reject
-    /// into the neighbouring hour-bucket changes nothing a payout depends on.
+    /// Count a rejected share. Window mode buckets it on wall-clock time: a
+    /// reject carries no accept time, and the lane feeds only the stats view,
+    /// so landing in a neighbouring bucket changes no payout.
     pub async fn record_reject(
         &self,
         group_id: Uuid,
@@ -601,18 +522,10 @@ impl GroupSoloEngine {
             .map_err(EngineError::Distribution)
     }
 
-    /// Look up the WEIGHT snapshot the found block's coinbase was built
-    /// from, so the Core can stamp it into the block-found event.
-    ///
-    /// `weights_fingerprint` is the identity of the winning job's payout
-    /// list, carried on the job the share was built on. The build that
-    /// produced that list stored its snapshot under it, and nothing else
-    /// writes that key.
-    ///
-    /// It must NOT rebuild the distribution: a single share landing between
-    /// job issue and block-found moves the round, and a rebuild would book a
-    /// split the coinbase did not pay. Missing snapshot → typed error, so
-    /// the block is booked by an operator rather than booked wrong.
+    /// Look up the weight snapshot stored under the winning job's
+    /// `weights_fingerprint`. Never rebuilds: one share after job issue moves
+    /// the round, and a rebuild would book a split the coinbase did not pay.
+    /// Missing → typed error, so an operator books the block rather than it being booked wrong.
     pub async fn weight_snapshot_for_block_found(
         &self,
         group_id: Uuid,
@@ -634,19 +547,10 @@ impl GroupSoloEngine {
         })
     }
 
-    /// Apply a Group-Solo found block: write its payout history from the
-    /// block's OWN coinbase, then move the round on.
-    ///
-    /// There is no settlement step. Group-Solo publishes every member it
-    /// can pay and lets the rest fall to the pool output
-    /// ([`bp_pplns::WithheldValue::ToPool`]), so a published member is
-    /// paid exactly their claim and a withheld one is owed nothing. What
-    /// the coinbase paid is the whole truth, and these rows record it.
-    ///
-    /// `snapshot` is therefore only used for the sanity checks below —
-    /// the amounts come from `actual`. Per-group re-entrancy guard;
-    /// idempotent across restarts via the
-    /// `(groupId, blockHeight, address)` UNIQUE constraint.
+    /// Book a found block from its OWN coinbase, then move the round on. No
+    /// settlement: withheld value goes to the pool ([`bp_pplns::WithheldValue::ToPool`]),
+    /// so what the coinbase paid is the whole truth and `snapshot` only feeds
+    /// sanity checks. Idempotent via the `(groupId, blockHeight, address)` UNIQUE key.
     pub async fn on_block_found(
         &self,
         group_id: Uuid,
@@ -745,9 +649,8 @@ impl GroupSoloEngine {
                 subsidy,
             });
         }
-        // 2. Mode + reset gate (one row read), and the round state for
-        //    the sharesInRound audit fields. Read BEFORE any reset wipes
-        //    it; in Window mode this trims + reads the sliding window.
+        // 2. Mode + reset gate, and the round state for the audit fields,
+        //    read BEFORE any reset wipes it.
         let now_ms = chrono::Utc::now().timestamp_millis();
         let (mode, window_ms, reset_on_block) = match find_group(&self.inner.pool, group_id).await {
             Ok(Some(g)) => {
@@ -834,17 +737,10 @@ impl GroupSoloEngine {
     }
 }
 
-/// Transcribe one block's coinbase into payout-history rows.
-///
-/// The amounts come from `actual` — the block's own coinbase — and
-/// nothing else. The snapshot contributes only the fee address (whose
-/// output is the pool's, not a member's) and the member list used to
-/// flag a payment the pool cannot account for. `round_by_addr` supplies
-/// the PROP-round detail the UI shows next to each amount.
-///
-/// One row per paid address. A member the coinbase did not pay gets no
-/// row: under [`bp_pplns::WithheldValue::ToPool`] they are owed nothing,
-/// so there is nothing to record.
+/// One history row per address the coinbase paid; amounts come only from
+/// `actual`. The snapshot supplies just the fee address and the member list
+/// for flagging strays. An unpaid member gets no row: under
+/// [`bp_pplns::WithheldValue::ToPool`] they are owed nothing.
 fn history_rows_from_coinbase(
     group_id: Uuid,
     snapshot: &bp_coinbase_snapshot::StoredWeightSnapshot,
@@ -856,9 +752,7 @@ fn history_rows_from_coinbase(
 
     for (addr_str, paid) in &actual.paid_by_address {
         if *paid == 0 || *addr_str == snapshot.fee_address {
-            // The pool output is the pool's fee plus whatever the
-            // distribution withheld. It is not a member payout and does
-            // not belong in a member's payout history.
+            // The pool output (fee plus withheld value) is not a member payout.
             continue;
         }
         let Ok(address) = AddressId::new(addr_str.clone()) else {
@@ -871,9 +765,8 @@ fn history_rows_from_coinbase(
             continue;
         };
         if !snapshot.entries.iter().any(|e| &e.address == addr_str) {
-            // Cannot happen for value outputs under positional
-            // validation. Record it anyway — the chain paid it, so the
-            // history has to show it — but say so loudly.
+            // Positional validation rules this out; the chain paid it, so
+            // record it anyway, loudly.
             warn!(
                 %group_id,
                 address = %addr_str,
@@ -894,9 +787,7 @@ fn history_rows_from_coinbase(
         });
     }
 
-    // `paid_by_address` iterates a map; the history table is keyed
-    // `(groupId, blockHeight, address)` and a caller comparing two runs
-    // should see the same order.
+    // `paid_by_address` is a map; sort so two runs yield the same order.
     rows.sort_by(|a, b| a.address.as_str().cmp(b.address.as_str()));
     rows
 }
@@ -937,9 +828,7 @@ impl GroupSoloEngine {
         }
     }
 
-    /// Number of live per-group round-reset cron tasks currently armed.
-    /// Lets callers (and integration tests) observe `reschedule_group` /
-    /// startup arming + teardown.
+    /// Number of armed per-group reset crons.
     pub fn reset_task_count(&self) -> usize {
         self.inner.reset_tasks.lock().map(|t| t.len()).unwrap_or(0)
     }
@@ -958,17 +847,14 @@ impl GroupSoloEngine {
     }
 }
 
-/// One `pplns_group` row's reset-config fields. Named to keep the
-/// `query_as` row type from triggering `clippy::type_complexity`.
+/// One `pplns_group` row's reset-config fields.
 type ResetConfigRow = (Uuid, Option<String>, Option<String>, Option<i32>);
 
-/// Read every active group with a configured reset preset and
-/// turn its `pplns_group` row into a `ResetSchedule`. Skips rows
-/// with invalid TZ / preset (logs + continues).
+/// Reset schedules of every active PROP group with a preset; invalid rows
+/// are logged and skipped.
 async fn load_active_schedules(pool: &PgPool) -> Result<Vec<ResetSchedule>, EngineError> {
     let rows: Vec<ResetConfigRow> = sqlx::query_as(
-        // Window-mode groups reinterpret the reset config as a window length
-        // and never calendar-reset — exclude them so no reset cron is armed.
+        // A Window group's reset config is its window length, never a cron.
         r#"SELECT id, "roundResetPreset", "roundResetTimezone", "roundResetIntervalDays"
            FROM pplns_group
            WHERE active = true
@@ -1020,22 +906,16 @@ mod tests {
 
     #[test]
     fn trim_watermark_gates_to_new_buckets_only() {
-        // Cold start (no watermark) always trims — catches up aging on restart.
         assert!(should_trim_on_bucket(None, 100));
-        // Same bucket → skip (the common per-share case within an hour).
         assert!(!should_trim_on_bucket(Some(100), 100));
-        // Strictly-newer bucket → trim once for the boundary crossing.
         assert!(should_trim_on_bucket(Some(100), 101));
-        // Out-of-order older share never lowers the watermark / re-trims.
         assert!(!should_trim_on_bucket(Some(100), 7));
     }
 
     #[test]
     fn lookup_error_reuses_cached_mode_never_misroutes_window() {
-        // No cached entry → cold fallback is PROP (the default mode).
         assert_eq!(mode_on_lookup_error(None), (PayoutMode::Prop, 0));
-        // A cached Window entry (even expired) is reused on a DB error, so the
-        // group's shares keep flowing into the window — NOT the PROP keys.
+        // An expired Window entry is still reused, never the PROP keys.
         let win = CachedGroupMode {
             mode: PayoutMode::Window,
             window_ms: 7 * 24 * 60 * 60 * 1000,
@@ -1045,7 +925,6 @@ mod tests {
             mode_on_lookup_error(Some(win)),
             (PayoutMode::Window, 7 * 24 * 60 * 60 * 1000)
         );
-        // A cached PROP entry resolves to PROP, as expected.
         let prop = CachedGroupMode {
             mode: PayoutMode::Prop,
             window_ms: 0,

@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Coordinator-tick flush: drain 7 accumulators, write 7 tables,
-//! confirm on success, update [`FlushHealthMonitor`]. The share-total
-//! and best-difficulty accumulators share one destination table
-//! (`address_settings_entity`) and are folded into a single upsert.
-//!
-//! **Per-flusher failure isolation**: one flusher's PG error doesn't abort the tick.
-//! The accumulator-drain/confirm contract preserves un-confirmed
-//! deltas for the next tick.
+//! Coordinator-tick flush: drain each accumulator, upsert its table, confirm
+//! on success. One flusher's PG error does not abort the tick; unconfirmed
+//! deltas carry over to the next one.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,9 +23,8 @@ use bp_stats::{
 use sqlx::PgPool;
 use tracing::warn;
 
-/// One identifier per flush-path the coordinator owns. Keyed in
-/// [`FlushHealthMonitor`] so a sustained per-table outage surfaces a
-/// single WARN per flusher.
+/// Flush-path key in [`FlushHealthMonitor`], so a sustained per-table outage
+/// warns once per flusher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Flusher {
     PoolShares,
@@ -42,9 +36,7 @@ pub enum Flusher {
     WorkerTotals,
 }
 
-/// The seven accumulators the sink owns + the health monitor it updates
-/// at the end of each tick. `Arc`-shared with the hook impls so the
-/// share path can mutate without going through the engine handle.
+/// The accumulators, shared with the hook impls on the share path.
 pub struct Accumulators {
     pub pool_shares: PoolSharesAccumulator,
     pub pool_mode_hashrate: PoolModeHashrateAccumulator,
@@ -69,10 +61,8 @@ impl Default for Accumulators {
     }
 }
 
-/// Drives one full coordinator tick. Drain + bulk-upsert +
-/// confirm are sequenced **per flusher** so a failure on one table
-/// leaves its accumulator un-confirmed (next tick re-includes the
-/// snapshot) while other flushers proceed.
+/// One coordinator tick, sequenced per flusher so a failed table stays
+/// unconfirmed while the others proceed.
 pub async fn flush_once(
     pool: &PgPool,
     accs: &Accumulators,
@@ -82,9 +72,7 @@ pub async fn flush_once(
     flush_pool_shares(pool, accs, health).await;
     flush_pool_mode_hashrate(pool, accs, health).await;
     flush_pool_rejected(pool, accs, health).await;
-    // Sequenced: capture the per-worker rejected-diff fan-out from the
-    // client_statistics snapshot so the worker_totals step can apply it
-    // alongside the accepted-share totals in one upsert, keeping the
+    // The rejected-diff fan-out rides the worker_totals upsert, keeping
     // `worker_shares_entity` writes serial (no row-lock contention).
     let worker_rejected_fanout = flush_client_statistics(pool, accs, health, batch_size).await;
     flush_client_rejected(pool, accs, health).await;
@@ -197,11 +185,8 @@ async fn flush_pool_rejected(
     }
 }
 
-/// Returns the per-worker rejected-diff fan-out derived from the
-/// successfully-flushed `client_statistics` snapshot — sum of all three
-/// `rejected*Diff1` columns per `(address, clientName)` key. The caller
-/// passes this into [`flush_worker_totals`] so the same `worker_shares_entity`
-/// upsert that lands accepted-share totals also increments `rejectedShares`.
+/// Returns the rejected difficulty per `(address, clientName)` from the
+/// confirmed rows, for [`flush_worker_totals`] to add to `rejectedShares`.
 async fn flush_client_statistics(
     pool: &PgPool,
     accs: &Accumulators,
@@ -256,8 +241,7 @@ async fn flush_client_statistics(
     }
     let mut worker_rejected: HashMap<(String, String), f64> = HashMap::new();
     if !confirmed_keys.is_empty() {
-        // Build the per-worker rejected fan-out from the confirmed slice
-        // only, so unwritten data never reaches worker_shares.
+        // Confirmed slice only, so unwritten data never reaches worker_shares.
         for key in &confirmed_keys {
             if let Some(rec) = snapshot.get(*key) {
                 let total = rec.rejected_diff_total();
@@ -314,12 +298,8 @@ async fn flush_client_rejected(
     }
 }
 
-/// Merged lifetime-per-address flush: drains BOTH the share-total deltas
-/// and the best-difficulty window maxima, then folds them into
-/// `address_settings_entity` with one upsert per address — a single
-/// row-write per flush instead of a separate shares-UPDATE and
-/// best-difficulty-upsert. Both accumulators are confirmed only on
-/// success, so a PG error re-includes both snapshots on the next tick.
+/// Folds share totals and best difficulty into one `address_settings_entity`
+/// upsert per address; both accumulators are confirmed only on success.
 async fn flush_address_settings(
     pool: &PgPool,
     accs: &Accumulators,
@@ -332,10 +312,8 @@ async fn flush_address_settings(
         return;
     }
 
-    // Union the two snapshots by address. A share fans into both
-    // accumulators, but the drain/confirm cycles are independent, so an
-    // address can surface in the share side, the best side, or both on
-    // any given tick — key on the address string and merge.
+    // Union by address: the two drain/confirm cycles are independent, so an
+    // address may appear on either side or both.
     let mut merged: HashMap<String, (f64, f64, Option<String>)> = HashMap::new();
     for (addr, delta) in &shares_snapshot {
         merged.insert(addr.as_str().to_string(), (*delta, 0.0, None));
@@ -386,10 +364,7 @@ async fn flush_worker_totals(
         record_success(health, Flusher::WorkerTotals);
         return;
     }
-    // Merge accepted-side share totals with the rejected-side fan-out
-    // from the client_statistics flush, keying on (address, clientName).
-    // Workers that only have rejected shares need an upsert too (so the
-    // row exists), even when delta_shares is 0.
+    // A worker with only rejected shares still gets an upsert so its row exists.
     let mut merged: HashMap<(String, String), (f64, f64)> = HashMap::new();
     for (key, delta) in &snapshot {
         merged

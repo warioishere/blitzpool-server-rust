@@ -3,13 +3,8 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! Integration tests for the group-mgmt service-layer write primitives
-//! (consumed by `bp-group-mgmt-engine` GroupService /
-//! InvitationService / JoinRequestService).
-//!
-//! Gated on docker-PG at `postgres://postgres:postgres@localhost:15433/public_pool`.
-//! Each test runs inside its own TX which rolls back at end so the
-//! container's seeded schema stays clean between runs.
+//! Integration tests for the group-management write primitives, against the
+//! local test PG; each test rolls its transaction back.
 
 use bp_common::AddressId;
 use bp_db::{
@@ -86,10 +81,8 @@ async fn insert_group_returns_row_with_defaults() {
     )
     .await
     .expect("insert");
-    // The bp-db helper opens its own connection from the pool, so the
-    // resulting row sits outside `tx`. Clean it up manually before the
-    // TX rolls back (and unrelated rows that the in-pool ops below
-    // create stay isolated in their own TXs).
+    // The helper writes on its own pool connection, outside `tx`, so the row
+    // is cleaned up by hand.
     sqlx::query("DELETE FROM pplns_group WHERE id = $1")
         .bind(id)
         .execute(&mut *tx)
@@ -852,13 +845,9 @@ async fn expire_join_requests_flips_old_pending() {
     .await
     .expect("f");
 
-    // `expire_pending_…` is GLOBAL (`WHERE status='pending' AND createdAt < cutoff`,
-    // no group filter — it's a cron). On the shared test DB it would also
-    // sweep pending rows other tests created concurrently. Keep the cutoff
-    // just above this test's own `old` row (createdAt=1) so its blast radius
-    // is exactly that row — `join_request_lifecycle` uses createdAt=100 and
-    // must stay pending. Don't raise this without making other tests' pending
-    // rows use createdAt ≥ the new cutoff.
+    // The expiry is global (no group filter), so the cutoff sits just above
+    // this test's `old` row (createdAt=1): other tests' pending rows, e.g.
+    // `join_request_lifecycle` at createdAt=100, must not be swept.
     expire_pending_pplns_group_join_requests(&pool, 2)
         .await
         .expect("exp");

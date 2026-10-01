@@ -56,10 +56,8 @@ impl PoolSharesAccumulator {
         }
     }
 
-    /// Hot-path: record an accepted share against the given slot — its
-    /// credited `diff` into the sum, the difficulty it actually solved into
-    /// the slot's maximum. Non-finite or out-of-range values are silently
-    /// discarded.
+    /// The credited `diff` goes into the sum, the difficulty actually solved
+    /// into the slot maximum. Non-finite or out-of-range values are dropped.
     pub fn add_accepted(&self, slot: TimeSlot, diff: f64, submission_difficulty: f64) {
         if !diff.is_finite() || diff <= 0.0 || diff > MAX_REASONABLE_DIFFICULTY {
             return;

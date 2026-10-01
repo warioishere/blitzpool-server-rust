@@ -3,13 +3,8 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! Integration tests for `bp_group_mgmt_engine::GroupService`.
-//!
-//! Each test seeds + cleans up its own group/member rows against the
-//! local docker-PG. The service is wired with a per-test
-//! [`TestHooks`] stub so the kick-inactivity flow + dissolve-cleanup +
-//! round-reset-applyConfig callbacks can be inspected without standing
-//! up the full Redis stack.
+//! Integration tests for `bp_group_mgmt_engine::GroupService` against the
+//! local docker-PG, with a recording hooks stub instead of Redis.
 
 use bp_common::now_ms;
 use std::sync::{Arc, Mutex};
@@ -26,9 +21,7 @@ use uuid::Uuid;
 
 const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
 
-/// Coinbase member ceiling for tests that are not about the ceiling —
-/// high enough to stay out of the way. The cap itself is exercised by
-/// the dedicated tests below.
+/// Coinbase ceiling high enough to stay out of tests not about it.
 const TEST_COINBASE_CAP: u64 = 10_000;
 
 async fn connect_or_skip() -> Option<PgPool> {
@@ -172,8 +165,7 @@ async fn create_group_with_window_mode_persists_window() {
         .expect("create");
     assert_eq!(result.group.payout_mode, "window");
 
-    // Persisted: a fresh read-back from the DB also reports window. The mode
-    // has no edit path, so this is the only place it's ever set.
+    // The mode has no edit path, so creation is the only place it is set.
     let row = svc
         .get_group(result.group.id)
         .await
@@ -771,9 +763,7 @@ async fn address_cache_reflects_membership_changes() {
     cleanup_group(&pool, g.group.id).await;
 }
 
-/// A single corrupt member address (here: an embedded space) must NOT fail
-/// the whole rebuild — the bad row is skipped, every good member still
-/// routes to its group.
+/// A corrupt member address is skipped without failing the cache rebuild.
 #[tokio::test]
 async fn address_cache_rebuild_skips_invalid_address_member() {
     let pool = match connect_or_skip().await {
@@ -831,16 +821,10 @@ async fn address_cache_rebuild_skips_invalid_address_member() {
 
 // ─── coinbase member ceiling ─────────────────────────────────────────────
 //
-// Group-Solo pays every member a coinbase output and carries no ledger to
-// settle what the coinbase could not pay. So the ceiling is not a policy
-// knob: past it the distribution's blockspace cut drops members and they
-// earn nothing for that block, with nothing left to record the difference.
-// These tests pin that the join path — not the UI — is where that is
-// refused.
+// Group-Solo has no ledger, so a member past the coinbase ceiling would
+// earn nothing; these pin that the join path itself refuses that.
 
-/// A group with `maxMembers = NULL` is NOT uncapped. The column expresses
-/// only the operator's own, tighter limit; the coinbase ceiling applies
-/// regardless.
+/// `maxMembers = NULL` still stops at the coinbase ceiling.
 #[tokio::test]
 async fn null_max_members_still_stops_at_the_coinbase_ceiling() {
     let pool = match connect_or_skip().await {
@@ -873,8 +857,7 @@ async fn null_max_members_still_stops_at_the_coinbase_ceiling() {
     cleanup_group(&pool, g.group.id).await;
 }
 
-/// The operator's own `maxMembers` still wins when it is the tighter of
-/// the two — the ceiling raises no limit, it only lowers.
+/// A tighter operator `maxMembers` binds below the coinbase ceiling.
 #[tokio::test]
 async fn operator_max_members_still_binds_below_the_ceiling() {
     let pool = match connect_or_skip().await {
@@ -912,8 +895,7 @@ async fn operator_max_members_still_binds_below_the_ceiling() {
     cleanup_group(&pool, g.group.id).await;
 }
 
-/// `maxMembers` above the coinbase ceiling is refused: such a cap would be a
-/// promise the coinbase cannot keep, noticed only on a found block.
+/// `maxMembers` one past the coinbase ceiling is refused, exactly at it accepted.
 #[tokio::test]
 async fn max_members_above_the_coinbase_ceiling_is_refused() {
     let pool = match connect_or_skip().await {

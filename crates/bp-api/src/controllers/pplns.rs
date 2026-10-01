@@ -326,11 +326,9 @@ where
                 let raw_cfg = engine.config();
                 let coinbase_weight_budget =
                     live_pplns_budget(&s, cfg.coinbase_weight_budget).await;
-                // Exactly as many miners as the blockspace cut publishes at
-                // this budget — the shared worst-case ceiling (every output
-                // P2TR, pool output and safety margin reserved). The adaptive
-                // field has no mixed-address-type estimate behind it and
-                // reports the same ceiling.
+                // The blockspace cut's worst-case ceiling at this budget. The
+                // adaptive field has no mixed-type estimate behind it and
+                // reports the same value.
                 let max_miner_outputs =
                     u32::try_from(max_coinbase_outputs(coinbase_weight_budget)).unwrap_or(u32::MAX);
                 let max_miner_outputs_adaptive = max_miner_outputs;
@@ -361,11 +359,9 @@ where
     Ok(JsonBytes(bytes))
 }
 
-/// The PPLNS coinbase weight budget in force. With the autoscaler on, that is
-/// the live value it persists in Redis — the process that runs it is not this
-/// one, so the engine config here only knows the floor. Falls back to the
-/// config budget when the autoscaler is off (a leftover key would be stale),
-/// the key is missing, or Redis cannot answer.
+/// The PPLNS coinbase weight budget in force: with the autoscaler on, the live
+/// value another process persists in Redis. Otherwise, or when the key is
+/// missing or unreadable, the config budget (a leftover key would be stale).
 async fn live_pplns_budget<H, M>(state: &AppState<H, M>, config_budget: u32) -> u32
 where
     H: GroupServiceHooks + 'static,
@@ -640,11 +636,7 @@ mod tests {
         );
     }
 
-    /// The fees endpoint reports the live autoscaled budget only while the
-    /// autoscaler is on. Both directions against the same stored value: with
-    /// the flag off a leftover key must NOT leak into
-    /// the answer, with it on the key wins, and without a key the config
-    /// budget stands.
+    /// The fees endpoint reports the live budget only while the autoscaler is on.
     #[tokio::test]
     async fn live_budget_is_read_only_while_the_autoscaler_is_on() {
         use bp_group_mgmt_engine::{NoopEmailHooks, NoopHooks};

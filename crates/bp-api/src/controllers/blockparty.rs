@@ -28,11 +28,10 @@ use bp_group_mgmt_engine::OpenInviteTtl;
 
 // ─── DTOs (camelCase JSON, ms-epoch i64 timestamps) ───────────────
 
-/// Canonical public-facing group shape.
-/// No `updatedAt`, no admin-token hash; `dissolvedAt` stays null until dissolve.
+/// Public group shape, without `updatedAt` or the admin-token hash.
 /// `adminAddress` stays public on purpose: the party mines on it and members
-/// point rented hashrate at it, so it is shared anyway. Member payout
-/// addresses are what the roster pseudonymises.
+/// point rented hashrate at it. Member payout addresses are what the roster
+/// pseudonymises.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GroupPublicView {
@@ -66,13 +65,10 @@ impl GroupPublicView {
     }
 }
 
-/// Member shape of `GET /:id` and `member-view`. Same pseudonymisation as the
-/// Group-Solo roster (`crate::utils::member_id`): an opaque `memberId` plus a
-/// masked `addressLabel`; the full payout address only for an admin-token
-/// caller, who needs it to edit the splits. A BTC address is public on-chain,
-/// so one known member address would otherwise open the whole roster via
-/// `by-address`. `confirmed: bool` is the only confirmation-state surface —
-/// `confirmedAt` is never returned (UI binds on the bool).
+/// Member shape of `GET /:id` and `member-view`, pseudonymised like the
+/// Group-Solo roster: opaque `memberId` + masked `addressLabel`, the full
+/// address only for an admin-token caller. Otherwise one known on-chain member
+/// address would open the whole roster via `by-address`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MemberPublicView {
@@ -88,9 +84,8 @@ struct MemberPublicView {
     percent_bp: i32,
     role: String,
     confirmed: bool,
-    /// How the member proved ownership — `"email"` or `"signature"`. Lets the
-    /// admin roster show a "verified via signature" badge for email-less
-    /// members. `None` only for the (legacy) case of no verification on record.
+    /// How the member proved ownership: `"email"` or `"signature"`; `None`
+    /// when no verification is on record.
     #[serde(skip_serializing_if = "Option::is_none")]
     verified_via: Option<&'static str>,
 }
@@ -143,9 +138,8 @@ fn member_views(
         .collect()
 }
 
-/// Batch the signature-ownership lookup for a roster into a single query: the
-/// set of email-less member addresses that have an ownership proof. Avoids an
-/// N+1 fan-out (one query per member) on the roster read paths.
+/// The email-less member addresses that have an ownership proof, in one
+/// query instead of one per member.
 async fn ownership_set_for_members<H, M>(
     state: &SharedState<H, M>,
     members: &[BlockpartyMemberRow],
@@ -319,9 +313,7 @@ where
 // ─── Read handlers ─────────────────────────────────────────────────
 
 /// `{ groupId: null }` when no party found for this address;
-/// `{ groupId, groupName, status, role }` when matched. `untagged`
-/// means serde picks the variant by the present fields rather than
-/// inserting a discriminator.
+/// `{ groupId, groupName, status, role }` when matched.
 #[derive(Serialize)]
 #[serde(untagged)]
 enum ByAddressResponse {

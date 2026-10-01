@@ -1,18 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Web-Push / UnifiedPush adapter — VAPID-signed plain POST.
-//!
-//! End-to-end-encrypted Web-Push (which requires per-subscription
-//! `p256dh` + `auth` keys) is not used; the `push_subscription_entity`
-//! row only carries `endpoint`. Instead it ships a plain-text
-//! `title|body|tag` body and authenticates the sender to the push
-//! service via a VAPID JWT in the
-//! `Authorization: vapid t=<jwt>,k=<pubkey>` header — that's what
-//! UnifiedPush and ntfy.sh endpoints accept.
-//!
-//! If no VAPID keys are configured the adapter falls back to a
-//! header-less plain POST (still works for self-hosted /
-//! UnifiedPush distributors but loses authenticity).
+//! Web-Push / UnifiedPush adapter: a plain-text `title|body|tag` POST signed
+//! with a VAPID JWT. Encrypted Web-Push is not possible because the stored
+//! subscription carries only `endpoint`, no `p256dh`/`auth` keys. Without
+//! VAPID keys it sends an unauthenticated plain POST.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -27,10 +18,8 @@ use super::payload::PushPayload;
 
 #[derive(Debug, Clone)]
 pub struct VapidConfig {
-    /// ECDSA P-256 private key as raw base64url-encoded bytes (32-byte
-    /// scalar, no PEM wrapper) — the same format accepted by the
-    /// web-push npm library and produced by standard VAPID key
-    /// generators.
+    /// ECDSA P-256 private key as a raw base64url 32-byte scalar, no PEM
+    /// wrapper, as standard VAPID key generators produce it.
     pub private_key_b64url: String,
     /// Public key as base64url-encoded uncompressed point
     /// (65 bytes, leading `0x04`). Goes verbatim into the
@@ -148,11 +137,9 @@ impl WebPushAdapter {
     }
 }
 
-/// VAPID errors that should degrade to an unauthenticated plain POST
-/// (UnifiedPush / ntfy accept it) rather than abort the send: a rejected
-/// or unsupported JWT (`Auth` / `Server`) or a local minting failure
-/// (`Encoding` — e.g. a bad key or endpoint). A `Transport` failure is a
-/// genuine network error, surfaced so the caller can retry later.
+/// VAPID errors that degrade to an unauthenticated plain POST (UnifiedPush /
+/// ntfy accept it): a rejected JWT or a local minting failure. A `Transport`
+/// failure is a real network error and is surfaced instead.
 fn vapid_failure_falls_back(e: &AdapterError) -> bool {
     matches!(
         e,
@@ -227,11 +214,9 @@ fn mint_vapid_jwt(vapid: &VapidKey, audience: &str) -> AdapterResult<String> {
         .map_err(|e| AdapterError::Encoding(format!("JWT encode: {e}")))
 }
 
-/// Build a usable [`VapidKey`] from raw base64url config, or fail with a
-/// reason string. Encodes the key as PKCS#8 (what `jsonwebtoken` / ring
-/// require — a bare SEC1 key is rejected at sign time) and proves it can
-/// actually sign before returning, so a bad key degrades to plain POST
-/// instead of silently failing every live send.
+/// Build a usable [`VapidKey`] from raw base64url config. It test-signs
+/// before returning, so a bad key degrades to plain POST at boot instead of
+/// failing every live send.
 fn build_vapid_key(cfg: VapidConfig) -> Result<VapidKey, String> {
     let der = raw_vapid_to_pkcs8_der(&cfg.private_key_b64url, &cfg.public_key_b64url)?;
     let key = VapidKey {
@@ -243,13 +228,10 @@ fn build_vapid_key(cfg: VapidConfig) -> Result<VapidKey, String> {
     Ok(key)
 }
 
-/// Encode a raw base64url P-256 VAPID key pair (32-byte private scalar +
-/// 65-byte uncompressed public point, the `web-push`-tool format) as a
-/// PKCS#8 v1 `PrivateKeyInfo` DER, which is what `jsonwebtoken` hands to
-/// ring's `EcdsaKeyPair::from_pkcs8`. ring requires the public key to be
-/// embedded (it verifies it against the private scalar), so both halves
-/// are encoded. All lengths are fixed for P-256, so the framing is a
-/// constant prefix / mid / suffix around the two key blobs.
+/// Encode a raw base64url P-256 VAPID key pair as PKCS#8 v1 DER, the form
+/// ring's `EcdsaKeyPair::from_pkcs8` takes. ring checks the embedded public
+/// key against the scalar, so both halves go in; P-256 lengths are fixed, so
+/// the framing is constant bytes around the two key blobs.
 fn raw_vapid_to_pkcs8_der(priv_b64url: &str, pub_b64url: &str) -> Result<Vec<u8>, String> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let priv_raw = URL_SAFE_NO_PAD
@@ -270,18 +252,8 @@ fn raw_vapid_to_pkcs8_der(priv_b64url: &str, pub_b64url: &str) -> Result<Vec<u8>
             pub_raw.len()
         ));
     }
-    // PKCS#8 PrivateKeyInfo for P-256:
-    //   SEQUENCE(135) {
-    //     INTEGER 0,
-    //     SEQUENCE { OID ecPublicKey, OID prime256v1 },
-    //     OCTET STRING(109) {            -- wraps the SEC1 ECPrivateKey
-    //       SEQUENCE(107) {
-    //         INTEGER 1,
-    //         OCTET STRING(32) <priv>,
-    //         [1] EXPLICIT { BIT STRING(66) 00 <65-byte pub> }
-    //       }
-    //     }
-    //   }
+    // PKCS#8 PrivateKeyInfo whose OCTET STRING wraps the SEC1 ECPrivateKey
+    // (version 1, private scalar, [1] public point).
     let mut der = Vec::with_capacity(138);
     der.extend_from_slice(&[
         0x30, 0x81, 0x87, // SEQUENCE, 135 bytes
@@ -340,11 +312,8 @@ mod tests {
 
     #[test]
     fn invalid_vapid_key_disables_vapid_instead_of_erroring() {
-        // All-zero private scalar with an otherwise well-formed 65-byte
-        // public point: the lengths pass framing, but the private key
-        // doesn't match the public key, so ring rejects it at the
-        // boot-time test-sign — exactly the failure that must degrade to
-        // plain POST rather than abort the build.
+        // Well-formed lengths, but the zero scalar does not match the public
+        // point, so the boot-time test-sign fails and must degrade to plain POST.
         let zero = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 32]);
         let cfg = VapidConfig {
             private_key_b64url: zero,
@@ -368,10 +337,8 @@ mod tests {
 
     #[test]
     fn valid_webpush_vapid_key_can_sign() {
-        // A real P-256 pair in `web-push`-tool format (raw 32-byte
-        // base64url private scalar + 65-byte uncompressed public point).
-        // Guards the SEC1-DER construction: if it regresses, a valid
-        // operator key silently degrades to plain POST.
+        // A real P-256 pair: guards the DER construction, whose regression
+        // would silently degrade a valid operator key to plain POST.
         let cfg = VapidConfig {
             private_key_b64url: "D3nWYHTrLXSWv94_WqRmfahAFMablsFixufvCNjc_Bc".to_string(),
             public_key_b64url:

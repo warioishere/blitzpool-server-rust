@@ -1,68 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Shared retire-not-clear job lifecycle math used by both
-//! `bp-stratum-v1` (`JobRegistry` — global, hex-string keys, with
-//! template-indirection) and `bp-stratum-v2` (per-channel
-//! `extended_jobs: HashMap<u32, ExtendedJob>`).
-//!
-//! The storage shapes differ between the protocols, the pattern does not.
-//! This crate carries the **math + constants + classifier + aging
-//! algorithm**, so both protocols keep their lifecycle constants in
-//! lock-step; each consumer keeps its own storage struct and API.
-//!
-//! | Field | Set by | Default | Reason |
-//! |---|---|---|---|
-//! | `grace_ms` | not configurable | `5000` | Network-jitter absorption — shares against jobs retired ≤ 5 s ago are still credited |
-//! | `retention_ms` | `[stratum] job_retention_ms` | `600000` | Retired entries past 10 min are GC-eligible |
-//! | `min_retained` | not configurable | `3` | Floor to protect the newest 3 entries from aging — guards startup-window where everything is fresh |
-//!
-//! Why retire-not-clear: on a block change, in-flight shares for the old
-//! job must still find it, so SV2 answers `stale-share` rather than
-//! `invalid-job-id` (the spec distinguishes the two) and SV1 can credit
-//! shares that arrive just after the block change.
-//!
-//! ## Two primitives
-//!
-//! - [`classify`] — given a job's `retired_at` timestamp (or `None`),
-//!   the current wall-clock, and a [`LifecycleConfig`], decide whether
-//!   the job is `Active`, `StaleCreditable` (retired ≤ grace), or
-//!   `StaleRejected` (retired > grace). Pure function, no allocation.
-//!
-//! - [`age_entries`] — generic over the storage map's key + value type,
-//!   threads two closures (`get_creation` + `get_retired`) so the
-//!   caller's value type can name the fields anything (SV1 uses
-//!   `creation_ms` / `retired_at_ms`; SV2 uses `created_at` / `retired_at`).
-//!   Two-tier deletion — primary (retired AND past retention) +
-//!   defense-in-depth (non-retired AND past 2× retention) — both gated
-//!   by the [`LifecycleConfig::min_retained`] floor.
-//!
-//! ## Why no retire helper
-//!
-//! Stamping `retired_at = Some(now)` on every unretired entry is a
-//! 3-line loop; a generic two-closure helper would cost more boilerplate
-//! than it saves, so each consumer writes the loop with its own fields.
+//! Retire-not-clear job lifecycle shared by SV1 and SV2, so both keep their
+//! lifecycle constants in lock-step. On a block change, in-flight shares for
+//! the old job must still find it: SV2 answers `stale-share` rather than
+//! `invalid-job-id`, and SV1 can credit shares arriving just after the change.
 
 use std::collections::HashMap;
 use std::hash::Hash;
 
 // ── JobClassification ────────────────────────────────────────────────
 
-/// Three-way share-validation outcome.
-///
-/// - `Active` — the job has not been retired; validate normally.
-/// - `StaleCreditable` — retired ≤ [`LifecycleConfig::grace_ms`] ago;
-///   validate normally + record as accepted.
-/// - `StaleRejected` — retired beyond the grace window; reject.
-///
-/// SV1 wire-mapping (caller's job): `Active` / `StaleCreditable` →
-/// success, `StaleRejected` → `mining.submit` error code 21
-/// `Stale share`. SV2 wire-mapping: `Active` / `StaleCreditable` →
-/// `SubmitSharesSuccess`, `StaleRejected` → `SubmitSharesError` with
-/// code `stale-share` (NOT `invalid-job-id` — the job *was* known).
-///
-/// A genuinely missing entry (`HashMap::get` returns `None`) is the
-/// caller's `invalid-job-id` case — only reachable after [`age_entries`]
-/// has GC'd the entry.
+/// Share-validation outcome. `StaleCreditable` (retired within
+/// [`LifecycleConfig::grace_ms`]) is credited; `StaleRejected` maps to SV2
+/// `stale-share`, not `invalid-job-id`, because the job was known. Only an
+/// entry GC'd by [`age_entries`] is `invalid-job-id`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobClassification {
     Active,
@@ -72,26 +23,21 @@ pub enum JobClassification {
 
 // ── LifecycleConfig ──────────────────────────────────────────────────
 
-/// Lifecycle parameters. Consumers either use [`LifecycleConfig::DEFAULT`]
-/// or build their own from a server config struct (SV1 reads them out of
-/// `ServerConfig`, SV2 out of its per-port `PortConfig`; the binary fills
-/// `retention_ms` from `[stratum] job_retention_ms` for both).
+/// Lifecycle parameters; only `retention_ms` is operator-set
+/// (`[stratum] job_retention_ms`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LifecycleConfig {
-    /// Shares against a job retired ≤ this many ms ago are
-    /// `StaleCreditable`.
+    /// Shares against a job retired at most this many ms ago are credited,
+    /// absorbing network jitter.
     pub grace_ms: u64,
     /// Retired entries past this window are eligible for GC by
-    /// [`age_entries`]. Subject to the [`Self::min_retained`] floor.
+    /// [`age_entries`], subject to [`Self::min_retained`].
     pub retention_ms: u64,
-    /// Newest-first floor: never delete below this many entries
-    /// regardless of retired-status / age. Defends against the
-    /// startup-window where everything is fresh and aging shouldn't fire.
+    /// The newest this-many entries are never aged out.
     pub min_retained: usize,
 }
 
 impl LifecycleConfig {
-    /// Default values: 5 s grace / 10 min retention / 3 entry floor.
     pub const DEFAULT: Self = Self {
         grace_ms: 5_000,
         retention_ms: 600_000,
@@ -107,12 +53,8 @@ impl Default for LifecycleConfig {
 
 // ── classify ─────────────────────────────────────────────────────────
 
-/// Classify a stored job by its `retired_at` timestamp. Pure function.
-///
-/// - `retired_at = None` → [`JobClassification::Active`]
-/// - `now_ms - retired_at <= grace_ms` → [`JobClassification::StaleCreditable`]
-///   (boundary inclusive)
-/// - else → [`JobClassification::StaleRejected`]
+/// Classify a stored job by its `retired_at` timestamp; the grace boundary is
+/// inclusive.
 pub fn classify(retired_at: Option<u64>, now_ms: u64, cfg: &LifecycleConfig) -> JobClassification {
     match retired_at {
         None => JobClassification::Active,
@@ -129,29 +71,10 @@ pub fn classify(retired_at: Option<u64>, now_ms: u64, cfg: &LifecycleConfig) -> 
 
 // ── age_entries ──────────────────────────────────────────────────────
 
-/// Generic two-tier age-out helper for any storage that holds entries
-/// with a `created_at` and an optional `retired_at` timestamp.
-///
-/// The two `get_*` closures decouple this from any particular value
-/// type so SV1 (`JobEntry`/`TemplateEntry` with `creation_ms` /
-/// `retired_at_ms`) and SV2 (`ExtendedJob` with `created_at` /
-/// `retired_at`) both call the same algorithm.
-///
-/// Algorithm:
-///
-/// 1. If `map.len() <= cfg.min_retained`, return — nothing eligible.
-/// 2. Sort all keys newest-first by `get_creation`. Skip the first
-///    `cfg.min_retained` (always protected).
-/// 3. For each remaining candidate:
-///    - **Primary**: if `get_retired(entry)` returns `Some(retired_at)`
-///      AND `now_ms - retired_at > cfg.retention_ms` → delete.
-///    - **Defense-in-depth**: else if `now_ms - get_creation(entry) >
-///      2 * cfg.retention_ms` → delete. Catches clock jumps or missed
-///      retire signals where a non-retired entry piles up far past
-///      retention.
-///
-/// Cost: `O(N log N)` on the sort. N is typically `< 30` (a few minutes
-/// of jobs per channel / per session).
+/// Age out entries retired longer than `retention_ms` ago, keeping the newest
+/// `min_retained`. Entries never retired go after twice the retention, which
+/// catches clock jumps and missed retire signals. The closures let SV1 and SV2
+/// value types share the algorithm.
 pub fn age_entries<K, E, FCreation, FRetired>(
     map: &mut HashMap<K, E>,
     now_ms: u64,
@@ -307,8 +230,7 @@ mod tests {
         assert_eq!(map.len(), cfg().min_retained);
     }
 
-    /// Custom config to confirm the algorithm honours non-default values
-    /// (a SV1 caller might tune via ServerConfig).
+    /// The algorithm honours non-default config values.
     #[test]
     fn age_entries_honours_custom_config() {
         let cfg = LifecycleConfig {

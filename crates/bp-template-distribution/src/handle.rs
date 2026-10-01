@@ -14,9 +14,7 @@ use crate::error::TdpError;
 use crate::message::{apply_to_snapshot, TdpRequest, TemplateSnapshot, TemplateUpdate};
 use crate::worker::spawn_worker;
 
-/// Cheap-to-clone handle. Internally `Arc`-wraps the shared state and the
-/// thread join-handle. Dropping the **last** clone cancels the worker and
-/// joins the OS thread.
+/// Dropping the last clone cancels the worker and joins its OS thread.
 #[derive(Clone)]
 pub struct TdpHandle {
     inner: Arc<Inner>,
@@ -27,28 +25,20 @@ struct Inner {
     submit_tx: mpsc::Sender<TdpRequest>,
     cancel: CancellationToken,
     join: Mutex<Option<std::thread::JoinHandle<()>>>,
-    /// Latest-known TDP state, refreshed by an internal tap task that
-    /// subscribes to `templates_tx` before the worker is spawned.
-    /// Consumers read it via [`TdpHandle::current_snapshot`] without
-    /// having to manage their own broadcast subscription.
+    /// Latest-known TDP state, kept current by an internal tap task.
     snapshot: Arc<Mutex<TemplateSnapshot>>,
 }
 
 impl TdpHandle {
-    /// Spawn the TDP worker on a dedicated OS thread. Returns once the
-    /// worker has connected to bitcoin-core's IPC socket and sent the
-    /// initial `CoinbaseOutputConstraints` — i.e. when it is ready to
-    /// receive subscriptions.
+    /// Returns once the worker has connected to bitcoin-core's IPC socket and
+    /// sent the initial `CoinbaseOutputConstraints`.
     pub fn spawn(config: TdpConfig) -> Result<Self, TdpError> {
         let cancel = CancellationToken::new();
         let (submit_tx, submit_rx) = mpsc::channel::<TdpRequest>(config.submit_capacity);
         let (templates_tx, _) = broadcast::channel::<TemplateUpdate>(config.broadcast_capacity);
 
-        // Snapshot tap — subscribe BEFORE spawning the worker so the
-        // startup NewTemplate+SetNewPrevHash pair is not missed (broadcast
-        // does not replay). The tap task lives on the multi-thread tokio
-        // runtime, not the LocalSet, and exits when `templates_tx` is
-        // dropped (i.e. when the worker thread terminates).
+        // Subscribe before spawning the worker: broadcast does not replay the
+        // startup NewTemplate + SetNewPrevHash pair.
         let snapshot: Arc<Mutex<TemplateSnapshot>> =
             Arc::new(Mutex::new(TemplateSnapshot::default()));
         let mut snapshot_rx = templates_tx.subscribe();
@@ -59,10 +49,8 @@ impl TdpHandle {
                     Ok(update) => {
                         if let Ok(mut guard) = snapshot_handle.lock() {
                             apply_to_snapshot(&mut guard, &update);
-                            // Stamp freshness only on the two state-bearing
-                            // variants — the RequestTransactionData responses
-                            // are replies to the pool's own calls, not core pushing
-                            // new work, so they don't reset the staleness clock.
+                            // RequestTransactionData replies answer the pool's own
+                            // calls, not new work, so they don't reset staleness.
                             if matches!(
                                 update,
                                 TemplateUpdate::NewTemplate(_) | TemplateUpdate::SetNewPrevHash(_)
@@ -72,9 +60,7 @@ impl TdpHandle {
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Slow tap (process busy on shutdown) — ignore
-                        // the missed update; the next NewTemplate /
-                        // SetNewPrevHash will reset the relevant slot.
+                        // The next NewTemplate / SetNewPrevHash resets the slot.
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -95,16 +81,8 @@ impl TdpHandle {
         })
     }
 
-    /// Snapshot of the latest-known TDP state. Cheap clone — the
-    /// internal lock is held only for the duration of the copy. Used
-    /// by the `bp-api` `/info/block-template` + per-address
-    /// `/client/:address/block-template` endpoints to render the
-    /// current template without standing up a broadcast subscription.
-    ///
-    /// Returns the empty default ([`TemplateSnapshot::default`]) for
-    /// the brief window between handle creation and the first TDP
-    /// update from bitcoin-core; callers should treat `None` fields
-    /// as "not ready yet" rather than an error.
+    /// Latest-known TDP state. Empty until bitcoin-core's first update, so
+    /// callers treat `None` fields as "not ready yet", not as an error.
     pub fn current_snapshot(&self) -> TemplateSnapshot {
         self.inner
             .snapshot
@@ -113,17 +91,12 @@ impl TdpHandle {
             .unwrap_or_default()
     }
 
-    /// Subscribe to outbound template updates. The returned `Receiver` is
-    /// independent — each subscriber sees its own copy of every update from
-    /// the moment it subscribed. Slow subscribers receive
-    /// `broadcast::error::RecvError::Lagged` if they fall behind the
-    /// configured capacity.
+    /// Each subscriber sees every update from the moment it subscribed; one
+    /// that falls behind the configured capacity gets `RecvError::Lagged`.
     pub fn subscribe(&self) -> broadcast::Receiver<TemplateUpdate> {
         self.inner.templates_tx.subscribe()
     }
 
-    /// Send an inbound request to the worker. Returns
-    /// `TdpError::WorkerChannelClosed` if the worker has already shut down.
     pub async fn submit(&self, req: TdpRequest) -> Result<(), TdpError> {
         self.inner
             .submit_tx
@@ -132,7 +105,6 @@ impl TdpHandle {
             .map_err(|_| TdpError::WorkerChannelClosed)
     }
 
-    /// Convenience: re-advertise coinbase output constraints to bitcoin-core.
     pub async fn set_coinbase_constraints(
         &self,
         max_additional_size: u32,
@@ -145,15 +117,12 @@ impl TdpHandle {
         .await
     }
 
-    /// Convenience: request the full transaction list of a known template.
-    /// The response arrives asynchronously over the `subscribe()` channel
-    /// as a `TemplateUpdate::RequestTransactionDataSuccess` or `…Error`.
+    /// The response arrives over `subscribe()`, not as a return value.
     pub async fn request_transaction_data(&self, template_id: u64) -> Result<(), TdpError> {
         self.submit(TdpRequest::RequestTransactionData { template_id })
             .await
     }
 
-    /// Convenience: submit a found block solution to bitcoin-core.
     pub async fn submit_solution(
         &self,
         template_id: u64,
@@ -172,9 +141,7 @@ impl TdpHandle {
         .await
     }
 
-    /// Explicitly cancel and join the worker thread. Equivalent to dropping
-    /// the last `TdpHandle` clone, but lets the caller surface join errors
-    /// and wait synchronously. Idempotent.
+    /// Like dropping the last clone, but surfaces join errors to the caller.
     pub fn shutdown(&self) -> Result<(), TdpError> {
         self.inner.cancel.cancel();
         let mut guard = self
@@ -193,9 +160,7 @@ impl TdpHandle {
     }
 }
 
-/// Epoch-ms now via the system clock. Used to stamp `last_update_at`
-/// on the live snapshot; a clock skew before UNIX_EPOCH falls back to
-/// 0 (treated as "very stale" by health, which is the safe direction).
+/// A clock before UNIX_EPOCH yields 0, which health reads as stale: the safe side.
 fn epoch_ms_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

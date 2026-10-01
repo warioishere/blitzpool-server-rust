@@ -1,50 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Debounce + coalescing stage in front of the device-status fan-out.
-//!
-//! The Stratum servers emit device events on **edges** (SV1 authorize /
-//! disconnect, SV2 channel open / close). Forwarded raw, those turn
-//! flapping WiFi, multi-rig workers and front restarts into push storms.
-//!
-//! ## The rule
-//!
-//! Notify on transitions of the **reported** state. Each
-//! `(address, worker)` carries a [`Notified`] value (what the subscriber
-//! was last told). An event only schedules a re-evaluation; at the due
-//! instant the gate asks what is actually connected and emits only when
-//! that differs from `notified`. Comparing against what was sent, not
-//! against the previous event, means a device that returns inside the
-//! grace never reports "online" without an "offline" before it.
-//!
-//! ## The reported state is persisted; the schedule is not
-//!
-//! `notified` records what a *human* was last told, which no table knows,
-//! so it goes through a [`ReportedStateStore`] and outlives the in-memory
-//! supervision entry. Deadlines and the coalescing buffer are rebuilt via
-//! [`seed`](DeviceStatusGate::seed); a confirmed-but-unsent transition is
-//! re-derived on the next sweep.
-//!
-//! ## Level-triggered, not edge-triggered
-//!
-//! A resolution re-arms a slow re-check instead of ending supervision, so
-//! a single wrong answer is corrected even for a miner that never sends
-//! another Stratum event.
-//!
-//! ## Where liveness comes from
-//!
-//! From the process that holds the sockets: the Stratum front publishes
-//! the `(address, worker)` pairs it has open, and [`DeviceLivenessLookup`]
-//! answers from that union. Not from `client_entity`, whose rows are also
-//! soft-deleted for a slow miner without accepted shares, which would make
-//! slow and dead indistinguishable.
-//!
-//! ## Telling a new device from an old one
-//!
-//! A never-reported device earns an "online" message only when it is
-//! genuinely new, otherwise a restart would announce every miner. The
-//! test is the earliest `COALESCE(firstSeen, startTime)` across the pair's
-//! rows against this gate's start; `startTime` alone is refreshed on every
-//! re-register.
+//! Debounce + coalescing in front of the device-status fan-out, so flapping
+//! Stratum edges do not become push storms. An event only schedules a
+//! re-check; the gate emits when live sessions differ from what the subscriber
+//! was last told ([`Notified`], persisted via [`ReportedStateStore`]).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -57,31 +16,25 @@ use chrono::{DateTime, Utc};
 
 use super::orchestrator::DeviceStatusEvent;
 
-/// Identity a notification is about: `(address, worker)`. Deliberately
-/// not the session id — a session is one TCP connection or one SV2
-/// channel, and the subscriber cares about the device.
+/// `(address, worker)`, not the session id: the subscriber cares about the
+/// device, not one connection or channel.
 pub type DeviceKey = (String, String);
 
-/// A device that has settled at offline and seen no Stratum event for
-/// this long stops being *supervised*. Its reported state is kept (see
-/// [`ReportedStateStore`]) so a later return is still a transition; only
-/// the polling entry is dropped.
+/// A device settled offline with no Stratum event for this long stops being
+/// polled; its reported state is kept so a later return is still a transition.
 const EVICT_AFTER: Duration = Duration::from_secs(60 * 60);
 
-/// Timing knobs. Defaults match `bp_config`'s serde defaults; the
-/// binary passes the configured values through.
+/// Timing knobs. Defaults match `bp_config`'s serde defaults.
 #[derive(Debug, Clone, Copy)]
 pub struct DeviceGateConfig {
     /// How long a device must look gone before "offline" is reported.
     pub offline_grace: Duration,
     /// How long a device must look present before "online" is reported.
     pub online_dwell: Duration,
-    /// Minimum spacing between two messages for the same address.
-    /// Transitions that arrive inside the window are buffered and go out
-    /// together as one [`DeviceNotice::Aggregate`].
+    /// Minimum spacing between two messages for one address; transitions
+    /// inside it go out together as one [`DeviceNotice::Aggregate`].
     pub coalesce_window: Duration,
-    /// How often a device is re-checked once it has settled. This is
-    /// what makes a wrong answer temporary instead of permanent.
+    /// Re-check interval for a settled device, so a wrong answer is temporary.
     pub recheck_interval: Duration,
 }
 
@@ -101,12 +54,8 @@ impl Default for DeviceGateConfig {
 pub(crate) enum Notified {
     /// Nothing has ever been sent for this device.
     Unknown,
-    /// How many sessions the subscriber was last told about. Zero is
-    /// "offline"; anything above is "online with this many rigs".
-    ///
-    /// A count rather than a flag because three rigs under one worker
-    /// name are three rigs to their owner: losing one is news, and only
-    /// the number tells that apart from losing all three.
+    /// Sessions the subscriber was last told about; zero is offline. A count,
+    /// not a flag, so losing one of three rigs is distinguishable from all.
     Sessions(usize),
 }
 
@@ -131,39 +80,29 @@ enum Direction {
 pub struct DeviceLiveness {
     /// How many sessions the fronts hold open for this device.
     pub sessions: usize,
-    /// Earliest `COALESCE(firstSeen, startTime)` across every row for the
-    /// pair — when the pool first saw this worker.
+    /// Earliest `COALESCE(firstSeen, startTime)` across the pair's rows;
+    /// `startTime` alone is refreshed on every re-register.
     pub first_seen_ms: i64,
 }
 
-/// Liveness lookup, abstracted so the gate is unit-testable without a
-/// database.
-///
-/// `None` means **the lookup could not be performed** (e.g. the database
-/// is unreachable). It is not "no live sessions": the caller must draw
-/// no conclusion and retry, otherwise a database blip would fire an
-/// offline notification for every miner on the pool.
+/// Liveness from the sockets the Stratum fronts hold open, not `client_entity`
+/// (which soft-deletes slow miners too). `None` means the lookup failed, not
+/// "no sessions": draw no conclusion, or a blip reports every miner offline.
 #[async_trait]
 pub trait DeviceLivenessLookup: Send + Sync {
     async fn liveness(&self, keys: &[DeviceKey]) -> Option<HashMap<DeviceKey, DeviceLiveness>>;
 }
 
-/// Durable record of what each subscriber was last told.
-///
-/// The only gate state that cannot be reconstructed from the pool's own
-/// tables. Without it a restart re-sends offline messages and swallows the
-/// matching "back online".
+/// Durable record of what each subscriber was last told, the one gate state no
+/// table can rebuild. Without it a restart re-sends offline messages and
+/// swallows the matching "back online".
 #[async_trait]
 pub trait ReportedStateStore: Send + Sync {
-    /// Everything remembered, at startup. A failure should return an
-    /// empty map rather than block the gate; the cost is one restart's
-    /// worth of imprecision, not an outage.
+    /// Everything remembered, at startup. On failure return an empty map
+    /// rather than block the gate.
     async fn load(&self) -> HashMap<DeviceKey, usize>;
-    /// Record what changed in this sweep. Best-effort.
-    ///
-    /// Takes the whole batch because a front restart or a rental ending
-    /// produces it all at once and the messages wait for this call; one
-    /// round-trip per device would delay them.
+    /// Record what changed in this sweep, best-effort. Batched because
+    /// messages wait for this call and a front restart changes many at once.
     async fn store(&self, updates: &[(DeviceKey, usize)]);
 }
 
@@ -193,11 +132,8 @@ pub struct DevicePartial {
     pub timestamp: DateTime<Utc>,
 }
 
-/// Collapsed form of two or more transitions on one address.
-///
-/// The two online lists are kept apart because they say different things
-/// to a subscriber: one device is coming back from an outage they were
-/// told about, the other has never been seen before.
+/// Two or more transitions on one address. Returning and first-seen devices
+/// are kept apart: they tell the subscriber different things.
 #[derive(Debug, Clone)]
 pub struct DeviceAggregate {
     pub address: AddressId,
@@ -230,11 +166,8 @@ struct DeviceState {
     /// An event landed while the lookup was in flight, so the answer
     /// coming back describes a state that has already moved on.
     dirty: bool,
-    /// Backfilled from the database with nothing ever reported for it, so
-    /// the first resolution only records where it stands — it does not
-    /// send. Cleared by that first resolution. Seeding reaches an hour
-    /// back, so without this a restart would announce disconnects that
-    /// happened before anyone was watching.
+    /// Backfilled with nothing ever reported: the first resolution only records
+    /// its state, so a restart does not announce disconnects nobody watched.
     settle_silently: bool,
     /// Most recent raw event — supplies worker name, user agent and the
     /// timestamp the message renders.
@@ -272,19 +205,9 @@ struct Inner {
     reported: HashMap<DeviceKey, Notified>,
 }
 
-/// Debounce + coalescing stage. Feed every raw device event through
-/// [`observe`](Self::observe); drive [`poll_due`](Self::poll_due) from a
-/// periodic task and hand whatever it returns to the dispatcher.
-///
-/// [`observe`](Self::observe) is safe from any number of tasks.
-/// [`poll_due`](Self::poll_due) expects a **single** driver: it marks the
-/// keys it hands to the lookup and clears them on resolution, so two
-/// concurrent calls would evaluate the same device twice and could emit
-/// the same transition twice. The binary runs exactly one sweeper.
-///
-/// A device whose address loses its last subscriber keeps being
-/// re-checked until it settles offline; the message is dropped at
-/// fan-out, so this costs a map entry, not a wrong notification.
+/// Feed raw events through [`observe`](Self::observe) from any task; drive
+/// [`poll_due`](Self::poll_due) from exactly ONE periodic task, since two
+/// concurrent sweeps could emit the same transition twice.
 pub struct DeviceStatusGate<C, L, S> {
     cfg: DeviceGateConfig,
     clock: C,
@@ -323,15 +246,9 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
         }
     }
 
-    /// Populate the watch list from the database at startup. Each entry
-    /// is `(address, worker, user_agent)` for a device whose state could
-    /// still be in flight — connected now, or disconnected recently
-    /// enough that a pending deadline may have been lost with the
-    /// previous process.
-    ///
-    /// Seeded devices inherit whatever was already reported for them, so
-    /// a restart neither re-sends an offline message nor swallows the
-    /// return that was still sitting in a coalescing buffer.
+    /// Rebuild the watch list at startup from `(address, worker, user_agent)`
+    /// of devices whose deadline may have died with the previous process.
+    /// Seeded devices inherit their reported state, so nothing is re-sent or lost.
     pub fn seed(&self, entries: impl IntoIterator<Item = (AddressId, String, Option<String>)>) {
         let now = self.clock.now();
         let mut inner = self.lock();
@@ -348,9 +265,8 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
                 armed_by: None,
                 in_flight: false,
                 dirty: false,
-                // Only when nothing was ever reported for it: a device the
-                // subscriber already heard about still gets its offline
-                // message via the persisted state.
+                // A device the subscriber already heard about still gets
+                // its offline message.
                 settle_silently: notified == Notified::Unknown,
                 meta: DeviceStatusEvent {
                     address,
@@ -390,13 +306,11 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
             armed_by: None,
             in_flight: false,
             dirty: false,
-            // A live event is not a backfill; it gets the normal rules.
             settle_silently: false,
             meta: event.clone(),
             last_event_at: now,
         });
-        // An answer is already on its way for this device and no longer
-        // describes reality. Mark it so the resolution discards it.
+        // An answer already in flight is now stale; discard it.
         if state.in_flight {
             state.dirty = true;
         }
@@ -404,8 +318,7 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
         state.last_event_at = now;
 
         match state.armed_by {
-            // The pending deadline is only the periodic re-check, so this
-            // event may set its own.
+            // Only the periodic re-check is pending, so this event may set its own.
             None => {
                 state.due_at = match dir {
                     Direction::Online => online_deadline,
@@ -413,10 +326,8 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
                 };
                 state.armed_by = Some(dir);
             }
-            // A disconnect always gets the full grace, even when an
-            // earlier reconnect had armed the shorter online dwell.
-            // One-way, so a device flapping faster than the grace still
-            // cannot postpone its own judgement indefinitely.
+            // A disconnect always gets the full grace. One-way, so a device
+            // flapping faster than the grace cannot postpone judgement forever.
             Some(Direction::Online) if dir == Direction::Offline => {
                 state.due_at = state.due_at.max(offline_deadline);
                 state.armed_by = Some(Direction::Offline);
@@ -440,9 +351,8 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
                         self.store.store(&writes).await;
                     }
                 }
-                // Blind: keep every deadline and retry next tick. The
-                // release below still runs — a message that was already
-                // confirmed does not need the database again.
+                // Blind: keep every deadline and retry; already confirmed
+                // messages are still released below.
                 None => self.abandon(&due),
             }
         }
@@ -463,11 +373,8 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
         due
     }
 
-    /// Lookup failed — drop the in-flight marks without drawing any
-    /// conclusion. Deadlines stay as they were, so the next tick retries.
-    ///
-    /// `dirty` is cleared too: it guards against a *stale answer*, and no
-    /// answer arrived. Left set, it would discard the next fresh answer.
+    /// Lookup failed: drop the in-flight marks, keep deadlines. `dirty` is
+    /// cleared too, or it would discard the next fresh answer.
     fn abandon(&self, due: &[DeviceKey]) {
         let mut inner = self.lock();
         for key in due {
@@ -503,9 +410,8 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
             };
             state.in_flight = false;
 
-            // An event landed while this answer was in flight. It could
-            // not arm a deadline (one was pending), so arm it here and
-            // discard the answer rather than act on a stale read.
+            // An event landed mid-lookup and could not arm a deadline: arm it
+            // here and discard the stale answer.
             if state.dirty {
                 state.dirty = false;
                 if state.meta.is_online {
@@ -530,20 +436,13 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
                 None if sessions > 0 => Direction::Online,
                 _ => Direction::Offline,
             };
-            // One-shot, and consumed whatever the answer turns out to be:
-            // a backfilled device settles into whichever state it is
-            // actually in, silently, and is supervised normally from then
-            // on.
+            // One-shot: consumed whatever the answer is.
             let settling = std::mem::replace(&mut state.settle_silently, false);
 
             let previous = state.notified;
-            // A disagreement with what the subscriber was told must
-            // SURVIVE a full dwell before it counts. The dwell is armed
-            // here, not only by the Stratum event, because a miner that
-            // loses power sends no event and only the re-check sees it.
-            // This applies to every change in the count, so rotating
-            // rental rigs stay silent while a lasting loss is reported.
-            // A settling device announces nothing and is exempt.
+            // Any change must survive a full dwell before it counts. Armed
+            // here too, because a miner losing power sends no event and only
+            // the re-check sees it. A settling device is exempt.
             if target != previous && !settling && state.armed_by != Some(direction) {
                 state.armed_by = Some(direction);
                 state.due_at = now + self.dwell(direction);
@@ -553,12 +452,9 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
 
             if target != previous {
                 let before = previous.count();
-                // A never-reported device is announced as online only when
-                // the pool first saw it after this gate started; otherwise
-                // a restart would become a broadcast.
-                //
-                // A count that GREW is never announced, but it is still
-                // remembered so the next loss is measured from it.
+                // A never-reported device is announced only if first seen after
+                // this gate started, or a restart becomes a broadcast. A grown
+                // count is not announced but remembered for the next loss.
                 let grew = before.is_some_and(|b| sessions > b && b > 0);
                 let announce = !settling
                     && !grew
@@ -572,8 +468,7 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
                 if announce {
                     let mut event = state.meta.clone();
                     event.is_online = live;
-                    // A device reported as gone is "back online". Derived
-                    // here, not from the raw event, because a re-check
+                    // Derived here, not from the raw event: a re-check
                     // correction has no online event behind it.
                     let returning = live && before == Some(0);
                     if live {
@@ -585,10 +480,8 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
                         Some(b) if live && b > sessions => Some(b),
                         _ => None,
                     };
-                    // Keep the event's own timestamp when it agrees with
-                    // the answer ("offline since <disconnect>"). A partial
-                    // loss has no event behind it, so it is stamped when
-                    // confirmed.
+                    // Keep the event's timestamp when it agrees with the
+                    // answer; a partial loss has no event, so stamp it now.
                     if state.meta.is_online != live || partial.is_some() {
                         event.timestamp = now;
                     }
@@ -600,9 +493,7 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
                 }
             }
 
-            // Settled at offline with nothing happening: stop polling.
-            // The reported state stays in `reported` (and in the store),
-            // so the device's eventual return is still a transition.
+            // Settled offline and quiet: stop polling, keep `reported`.
             if target == Notified::Sessions(0) && now - state.last_event_at >= evict_after {
                 retire.push(key.clone());
             } else {
@@ -627,8 +518,6 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
         for key in retire {
             inner.devices.remove(&key);
         }
-        // Address slots with nothing pending and no recent emission are
-        // pure overhead.
         inner.addresses.retain(|_, s| {
             !s.buffered.is_empty() || s.last_emit.is_some_and(|l| now - l < evict_after)
         });
@@ -672,12 +561,9 @@ fn chrono_duration(d: Duration) -> chrono::Duration {
     chrono::Duration::from_std(d).unwrap_or_else(|_| chrono::Duration::zero())
 }
 
-/// One transition stays a plain single message; several become an
-/// aggregate so an address can never exceed one message per window.
-///
-/// A worker that flapped inside the window appears more than once in the
-/// batch; only its **last** transition survives, so the message states
-/// where it ended up.
+/// One transition stays single; several become an aggregate, so an address
+/// gets at most one message per window. Per worker only the last transition
+/// survives, so the message states where it ended up.
 fn collapse(batch: Vec<Confirmed>, now: DateTime<Utc>) -> DeviceNotice {
     let mut net: Vec<(String, Confirmed)> = Vec::new();
     for confirmed in batch {
@@ -714,8 +600,7 @@ fn collapse(batch: Vec<Confirmed>, now: DateTime<Utc>) -> DeviceNotice {
     let mut reduced = Vec::new();
     for (worker, confirmed) in net {
         if let Some((remaining, before)) = confirmed.partial {
-            // Still hashing, just with fewer rigs — kept apart from the
-            // outages so one message never claims both about a worker.
+            // Kept apart from outages so one message never claims both.
             reduced.push((worker, remaining, before));
         } else if !confirmed.event.is_online {
             went_offline.push(worker);
@@ -756,8 +641,7 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    /// Liveness answers the test drives directly. `fail` simulates an
-    /// unreachable lookup.
+    /// Test-driven liveness answers; `fail` simulates an unreachable lookup.
     #[derive(Default)]
     struct FakeDb {
         rows: Mutex<HashMap<DeviceKey, DeviceLiveness>>,
@@ -776,7 +660,6 @@ mod tests {
         fn set(&self, worker: &str, live: bool, first_seen_offset_s: i64) {
             self.set_sessions(worker, usize::from(live), first_seen_offset_s)
         }
-        /// The count form — `set` is the boolean shorthand for it.
         fn set_sessions(&self, worker: &str, sessions: usize, first_seen_offset_s: i64) {
             self.rows.lock().expect("lock").insert(
                 Self::key(worker),
@@ -787,11 +670,9 @@ mod tests {
                 },
             );
         }
-        /// Flip what the front reports holding open.
         fn set_live(&self, worker: &str, live: bool) {
             self.set_count(worker, usize::from(live))
         }
-        /// How many sessions the fronts hold for this worker.
         fn set_count(&self, worker: &str, sessions: usize) {
             let mut rows = self.rows.lock().expect("lock");
             if let Some(entry) = rows.get_mut(&Self::key(worker)) {
@@ -809,8 +690,7 @@ mod tests {
     #[async_trait]
     impl DeviceLivenessLookup for Arc<FakeDb> {
         async fn liveness(&self, keys: &[DeviceKey]) -> Option<HashMap<DeviceKey, DeviceLiveness>> {
-            // Snapshot FIRST, then run the hook, so the answer handed back
-            // is genuinely stale and the staleness guard is exercised.
+            // Snapshot before the hook, so the answer is genuinely stale.
             let answer = if *self.fail.lock().expect("lock") {
                 None
             } else {
@@ -821,8 +701,7 @@ mod tests {
                         .collect(),
                 )
             };
-            // Runs on the failure path too — an event can land during a
-            // lookup that then fails.
+            // Also on the failure path: an event can land during a failing lookup.
             let hook = self.on_lookup.lock().expect("lock").take();
             if let Some(hook) = hook {
                 hook();
@@ -831,14 +710,11 @@ mod tests {
         }
     }
 
-    /// Reported state the tests can preload and inspect, standing in
-    /// for the Redis-backed store.
+    /// Preloadable, inspectable stand-in for the Redis-backed store.
     #[derive(Default)]
     struct FakeStore {
         state: Mutex<HashMap<DeviceKey, usize>>,
-        /// Size of each `store` call, in order. The gate must hand a
-        /// sweep's changes over in one go — see
-        /// `a_sweeps_writes_are_persisted_in_one_call`.
+        /// Size of each `store` call, in order.
         batches: Mutex<Vec<usize>>,
     }
 
@@ -885,8 +761,7 @@ mod tests {
             worker_name: Some(worker.to_string()),
             user_agent: Some("cpuminer/2.5".to_string()),
             is_online: online,
-            // The emitters set this from `is_online`, so it carries no
-            // meaning; pinned to one value to prove the gate ignores it.
+            // Pinned to one value to prove the gate ignores it.
             is_returning: false,
             timestamp: at,
         }
@@ -902,10 +777,7 @@ mod tests {
         harness_with(Arc::new(FakeStore::default()))
     }
 
-    /// A gate with custom timings. Needed where the defaults make a
-    /// scenario impossible to construct — the coalescing window is
-    /// shorter than the offline grace, so two transitions for one worker
-    /// can only share a buffer if the grace is turned down.
+    /// A gate with custom timings, for scenarios the defaults cannot build.
     fn harness_cfg(cfg: DeviceGateConfig) -> Harness {
         let clock = TestClock::new(t0());
         let db = Arc::new(FakeDb::default());
@@ -922,8 +794,7 @@ mod tests {
         }
     }
 
-    /// A gate that starts from an existing store — what a restart looks
-    /// like to the second process.
+    /// A gate that starts from an existing store, as after a restart.
     fn harness_with(store: Arc<FakeStore>) -> Harness {
         let clock = TestClock::new(t0());
         let db = Arc::new(FakeDb::default());
@@ -944,8 +815,7 @@ mod tests {
             let now = self.clock.now();
             self.clock.set(now + chrono::Duration::seconds(secs));
         }
-        /// Bring a worker to a reported-online state the way a brand-new
-        /// device does: first seen after the gate started.
+        /// Bring a worker to reported-online as a brand-new device.
         async fn bring_online(&self, worker: &str) {
             self.db.set(worker, true, 10);
             self.advance(10);
@@ -954,16 +824,12 @@ mod tests {
             let out = self.gate.poll_due().await;
             assert_eq!(out.len(), 1, "a first-seen device announces itself");
         }
-        /// Re-open the coalescing window so setup does not interfere with
-        /// what a test measures.
+        /// Re-open the coalescing window so setup does not interfere.
         fn open_window(&self) {
             self.advance(301);
         }
-        /// Resolve a change that no Stratum event announced.
-        ///
-        /// Such a change takes TWO passes: the first spots the
-        /// disagreement and arms the dwell, the second confirms it still
-        /// holds.
+        /// Resolve a change no Stratum event announced: the first pass arms
+        /// the dwell, the second confirms it.
         async fn poll_after_dwell(&self, secs: i64) -> Vec<DeviceNotice> {
             let armed = self.gate.poll_due().await;
             assert!(
@@ -987,10 +853,7 @@ mod tests {
             .collect()
     }
 
-    // ── The debounce ────────────────────────────────────────────────
-
-    /// A miner that drops and returns inside the grace period sends
-    /// nothing: neither offline nor online.
+    /// A drop and return inside the grace sends nothing.
     #[tokio::test]
     async fn a_reconnect_inside_the_grace_sends_nothing() {
         let h = harness();
@@ -1011,8 +874,7 @@ mod tests {
         );
     }
 
-    /// A device that stays gone must still be reported — exactly once,
-    /// even though the re-check keeps asking.
+    /// A device that stays gone is reported offline exactly once.
     #[tokio::test]
     async fn a_device_that_stays_gone_reports_offline_once() {
         let h = harness();
@@ -1033,12 +895,10 @@ mod tests {
         }
     }
 
-    /// Many rigs under one worker name rotating individually: a single rig
-    /// leaving is not the device going offline.
+    /// One rig of many leaving is not the device going offline.
     #[tokio::test]
     async fn one_of_many_sessions_leaving_is_not_an_outage() {
         let h = harness();
-        // The pool knew this source before the gate started.
         h.db.set("mrr", true, -3600);
         h.gate.observe(&event("mrr", true, h.clock.now()));
         h.advance(100);
@@ -1047,7 +907,7 @@ mod tests {
             "a source the pool already knew is not announced"
         );
 
-        // One rig rotates out; others remain, so the DB still says live.
+        // One rig rotates out; others remain.
         h.gate.observe(&event("mrr", false, h.clock.now()));
         h.advance(301);
         assert!(
@@ -1055,7 +915,6 @@ mod tests {
             "the source still has live sessions"
         );
 
-        // The contract ends: nothing left.
         h.db.set_live("mrr", false);
         h.gate.observe(&event("mrr", false, h.clock.now()));
         h.advance(301);
@@ -1065,8 +924,7 @@ mod tests {
         );
     }
 
-    /// A device flapping faster than the grace period must not be able to
-    /// postpone its own evaluation — otherwise it would never resolve.
+    /// Flapping faster than the grace cannot postpone the evaluation.
     #[tokio::test]
     async fn rapid_flapping_still_resolves_on_schedule() {
         let h = harness();
@@ -1091,18 +949,15 @@ mod tests {
         );
     }
 
-    /// A disconnect must always get the full `offline_grace`, even when a
-    /// reconnect had already armed the shorter `online_dwell`.
+    /// A disconnect gets the full `offline_grace` over a pending `online_dwell`.
     #[tokio::test]
     async fn a_disconnect_upgrades_a_pending_online_dwell_to_the_full_grace() {
         let h = harness();
         h.bring_online("axe01").await;
         h.open_window();
 
-        // A reconnect arms the 90 s dwell...
         h.gate.observe(&event("axe01", true, h.clock.now()));
         h.advance(10);
-        // ...and the miner drops again 10 s later.
         h.db.set_live("axe01", false);
         h.gate.observe(&event("axe01", false, h.clock.now()));
 
@@ -1140,10 +995,7 @@ mod tests {
         }
     }
 
-    // ── New vs. already-known ───────────────────────────────────────
-
-    /// The discriminator is when the POOL first saw the worker, not what
-    /// kind of event happened to arm the deadline.
+    /// Newness comes from when the pool first saw the worker, not the event.
     #[tokio::test]
     async fn newness_comes_from_first_start_not_from_the_event() {
         let h = harness();
@@ -1162,9 +1014,7 @@ mod tests {
         );
     }
 
-    /// A fresh gate with every miner reconnecting at once: all predate the
-    /// gate, so none is announced, whether the first event seen is the
-    /// disconnect or the reconnect.
+    /// A reconnect storm after a restart announces nobody.
     #[tokio::test]
     async fn a_reconnect_storm_after_a_restart_announces_nobody() {
         let h = harness();
@@ -1183,8 +1033,7 @@ mod tests {
         );
     }
 
-    /// A device unknown to a fresh gate that disconnects for good is still
-    /// reported offline.
+    /// A device unknown to a fresh gate still gets its offline message.
     #[tokio::test]
     async fn an_unknown_device_going_offline_is_still_reported() {
         let h = harness();
@@ -1197,13 +1046,7 @@ mod tests {
         );
     }
 
-    // ── Seeding + self-healing ──────────────────────────────────────
-
-    /// A miner that dies across a restart never emits another Stratum
-    /// event; seeding still gets its owner the offline message. The store
-    /// is preloaded with "online" (the subscriber was told); an empty
-    /// store is covered by
-    /// `a_backfilled_device_settles_without_announcing_the_past`.
+    /// A device reported online that died across a restart is reported via seeding.
     #[tokio::test]
     async fn a_seeded_dead_device_is_reported_without_any_event() {
         let store = Arc::new(FakeStore::default());
@@ -1222,14 +1065,11 @@ mod tests {
         );
     }
 
-    /// Taking a never-reported device under supervision is not itself a
-    /// message: the seed reaches an hour back, and old disconnects are not
-    /// news. The state IS recorded, so the next real change is still a
-    /// transition.
+    /// A backfilled, never-reported device settles silently but its state is
+    /// recorded, so the next real change is still a transition.
     #[tokio::test]
     async fn a_backfilled_device_settles_without_announcing_the_past() {
         let h = harness();
-        // Dead for half an hour, nothing ever reported for it.
         h.db.set("axe01", false, -7200);
         h.gate
             .seed([(address(), "axe01".to_string(), Some("BitAxe".into()))]);
@@ -1240,8 +1080,6 @@ mod tests {
             "an outage from before we were watching is not news"
         );
 
-        // But it did settle at offline rather than staying unknown, so
-        // the recovery is a transition and does go out.
         h.open_window();
         h.db.set_live("axe01", true);
         h.gate.observe(&event("axe01", true, h.clock.now()));
@@ -1253,8 +1091,7 @@ mod tests {
         );
     }
 
-    /// The silence is one-shot: a device backfilled while running settles
-    /// quietly, and the outage that follows is a normal transition.
+    /// The backfill silence is one-shot.
     #[tokio::test]
     async fn the_backfill_silence_covers_only_the_first_resolution() {
         let h = harness();
@@ -1273,8 +1110,7 @@ mod tests {
         );
     }
 
-    /// A seeded device that is still running settles quietly and stays
-    /// supervised.
+    /// A seeded live device settles quietly and stays supervised.
     #[tokio::test]
     async fn a_seeded_live_device_settles_silently_and_stays_supervised() {
         let h = harness();
@@ -1285,8 +1121,7 @@ mod tests {
         h.advance(20);
         assert!(h.gate.poll_due().await.is_empty());
 
-        // Supervised: a later disconnect is reported with no event at
-        // all — after the grace, which the gate arms itself.
+        // A later disconnect with no event is reported after the grace.
         h.db.set_live("axe01", false);
         h.advance(301);
         assert_eq!(
@@ -1295,15 +1130,13 @@ mod tests {
         );
     }
 
-    /// A wrong "offline" is corrected by the periodic re-check alone: a
-    /// still-connected miner sends no event that could correct it.
+    /// A wrong "offline" is corrected by the re-check alone.
     #[tokio::test]
     async fn a_wrong_offline_is_corrected_by_the_recheck() {
         let h = harness();
         h.bring_online("axe01").await;
         h.open_window();
 
-        // Reaped while still connected.
         h.db.set_live("axe01", false);
         h.gate.observe(&event("axe01", false, h.clock.now()));
         h.advance(301);
@@ -1313,8 +1146,6 @@ mod tests {
             "the wrong offline does go out"
         );
 
-        // Its next accepted share revives the row. No Stratum event, so
-        // the correction has to hold for a dwell before it is believed.
         h.db.set_live("axe01", true);
         h.advance(301);
         assert_eq!(
@@ -1324,8 +1155,7 @@ mod tests {
         );
     }
 
-    /// An event landing while the liveness answer is in flight makes that
-    /// answer stale, so it is discarded rather than acted on.
+    /// An event during the lookup discards the stale answer.
     #[tokio::test]
     async fn an_event_during_the_lookup_discards_the_stale_answer() {
         let h = harness();
@@ -1336,7 +1166,6 @@ mod tests {
         h.gate.observe(&event("axe01", false, h.clock.now()));
         h.advance(301);
 
-        // The miner reconnects while the query is in flight.
         let gate = Arc::clone(&h.gate);
         let db = Arc::clone(&h.db);
         let at = h.clock.now();
@@ -1350,8 +1179,6 @@ mod tests {
             "the stale 'gone' answer must not be acted on"
         );
 
-        // The reconnect armed its own deadline; the device settles back
-        // to online without ever having been reported offline.
         h.advance(400);
         assert!(
             h.gate.poll_due().await.is_empty(),
@@ -1359,12 +1186,10 @@ mod tests {
         );
     }
 
-    /// A device already reported offline returns as "back online", also
-    /// when only the re-check sees the return.
+    /// A return after a reported offline is "back online", even via re-check.
     #[tokio::test]
     async fn a_return_after_a_reported_offline_renders_as_back_online() {
         let h = harness();
-        // The first announcement is a first sighting, not a return.
         h.db.set("axe01", true, 10);
         h.advance(10);
         h.gate.observe(&event("axe01", true, h.clock.now()));
@@ -1389,8 +1214,6 @@ mod tests {
         );
         h.open_window();
 
-        // Comes back with no Stratum event; the re-check must see it
-        // hold for a dwell.
         h.db.set_live("axe01", true);
         h.advance(301);
         match &h.poll_after_dwell(91).await[0] {
@@ -1407,10 +1230,7 @@ mod tests {
         }
     }
 
-    // ── Persistence across a restart ────────────────────────────────
-
-    /// A restart does not re-send an offline message the previous process
-    /// already sent: the persisted reported state says it was told.
+    /// A restart does not repeat an offline message already sent.
     #[tokio::test]
     async fn a_restart_does_not_repeat_an_offline_already_reported() {
         let store = Arc::new(FakeStore::default());
@@ -1428,8 +1248,6 @@ mod tests {
         );
         assert_eq!(store.get("axe01"), Some(0), "state was persisted");
 
-        // Second process: same store, device still gone, seeded because
-        // it disconnected recently.
         let second = harness_with(store);
         second.gate.restore_reported_state().await;
         second.db.set("axe01", false, -7200);
@@ -1443,9 +1261,7 @@ mod tests {
         );
     }
 
-    /// A return still sitting in the coalescing buffer when the process
-    /// stopped is re-derived on the next sweep, because the reported state
-    /// still says "offline".
+    /// A return lost in the coalescing buffer at restart is re-derived.
     #[tokio::test]
     async fn a_restart_re_derives_a_return_that_was_never_sent() {
         let store = Arc::new(FakeStore::default());
@@ -1453,7 +1269,7 @@ mod tests {
 
         let h = harness_with(store);
         h.gate.restore_reported_state().await;
-        // Known for hours: the newness rule alone would keep it silent.
+        // Known for hours, so the newness rule alone would keep it silent.
         h.db.set("axe01", true, -7200);
         h.gate
             .seed([(address(), "axe01".to_string(), Some("BitAxe".into()))]);
@@ -1469,9 +1285,7 @@ mod tests {
         }
     }
 
-    /// Retirement drops the polling entry but keeps what the subscriber
-    /// was told, so an outage longer than the eviction horizon still gets
-    /// its recovery message.
+    /// A return after retirement is still announced.
     #[tokio::test]
     async fn a_return_after_retirement_is_still_announced() {
         let h = harness();
@@ -1489,13 +1303,11 @@ mod tests {
             vec![("axe01".into(), false)]
         );
 
-        // An hour of silence retires the entry.
         h.advance(3601);
         let _ = h.gate.poll_due().await;
         assert!(h.gate.lock().devices.is_empty(), "no longer supervised");
         h.open_window();
 
-        // The miner is fixed and comes back.
         h.db.set_live("axe01", true);
         h.gate.observe(&event("axe01", true, h.clock.now()));
         h.advance(100);
@@ -1506,15 +1318,12 @@ mod tests {
         );
     }
 
-    /// All reported-state changes of one sweep reach the store in a single
-    /// call, since the messages wait for that write.
+    /// One sweep's reported-state changes reach the store in one call.
     #[tokio::test]
     async fn a_sweeps_writes_are_persisted_in_one_call() {
         let store = Arc::new(FakeStore::default());
         let h = harness_with(Arc::clone(&store));
 
-        // Twelve workers the pool has known for hours, all seeded and all
-        // gone — one sweep, twelve reported-state changes.
         let workers: Vec<String> = (0..12).map(|i| format!("axe{i:02}")).collect();
         for worker in &workers {
             h.db.set(worker, false, -7200);
@@ -1528,8 +1337,6 @@ mod tests {
         );
 
         h.advance(20);
-        // Twelve devices, none of which sent a disconnect event, so the
-        // first pass only arms their grace.
         let out = h.poll_after_dwell(301).await;
         assert_eq!(out.len(), 1, "one address, one aggregate");
 
@@ -1543,27 +1350,21 @@ mod tests {
         }
     }
 
-    /// The grace does not depend on the miner announcing its own death: a
-    /// rig that loses power sends no event, and an outage the re-check
-    /// finds still waits out the full grace.
+    /// An outage only the re-check finds still waits out the full grace.
     #[tokio::test]
     async fn an_outage_with_no_event_still_waits_out_the_grace() {
         let h = harness();
         h.bring_online("axe01").await;
         h.open_window();
 
-        // Gone, and it never got to say so.
         h.db.set_live("axe01", false);
 
-        // The re-check lands right after the drop. Nothing may go out:
-        // 300 s of grace have not elapsed, whatever the re-check saw.
         h.advance(301);
         assert!(
             h.gate.poll_due().await.is_empty(),
             "an outage seconds old must not be pushed under a 300 s grace"
         );
 
-        // Still gone once the grace has run: now it is real.
         h.advance(301);
         assert_eq!(
             singles(&h.gate.poll_due().await),
@@ -1571,8 +1372,7 @@ mod tests {
         );
     }
 
-    /// A rig that drops and is back before the grace expires produces
-    /// nothing, even though no event announced either edge.
+    /// An unannounced outage that heals inside the grace sends nothing.
     #[tokio::test]
     async fn an_outage_that_heals_inside_the_grace_says_nothing() {
         let h = harness();
@@ -1583,7 +1383,6 @@ mod tests {
         h.advance(301);
         assert!(h.gate.poll_due().await.is_empty(), "grace armed, not sent");
 
-        // Back before the grace runs out.
         h.db.set_live("axe01", true);
         h.advance(301);
         assert!(
@@ -1591,7 +1390,6 @@ mod tests {
             "it never left as far as the subscriber is concerned"
         );
 
-        // And it is still supervised: a real outage later still lands.
         h.db.set_live("axe01", false);
         h.advance(301);
         assert_eq!(
@@ -1601,8 +1399,7 @@ mod tests {
         );
     }
 
-    /// Three rigs under one worker name, one dies for good: a partial-loss
-    /// message, NOT an outage, since two are still hashing.
+    /// One of three rigs dying is a partial loss, not an outage.
     #[tokio::test]
     async fn one_of_three_rigs_dying_is_a_partial_loss_not_an_outage() {
         let h = harness();
@@ -1622,16 +1419,13 @@ mod tests {
                 assert_eq!(p.remaining, 2);
                 assert_eq!(p.before, 3);
                 assert_eq!(p.worker_name.as_deref(), Some("mrr"));
-                // Stamped at confirmation: no event stands behind a
-                // partial loss, so the meta timestamp is stale.
                 assert_eq!(p.timestamp, h.clock.now(), "stamped at confirmation");
             }
             other => panic!("a worker that is still hashing is not offline: {other:?}"),
         }
     }
 
-    /// A count drop healed inside the grace (a rotated rental rig, a
-    /// hiccup) sends nothing.
+    /// A count drop healed inside the grace sends nothing.
     #[tokio::test]
     async fn a_rig_replaced_inside_the_grace_says_nothing() {
         let h = harness();
@@ -1642,11 +1436,9 @@ mod tests {
         assert_eq!(h.gate.poll_due().await.len(), 1);
         h.open_window();
 
-        // Rig leaves...
         h.db.set_count("braiins", 39);
         h.advance(301);
         assert!(h.gate.poll_due().await.is_empty(), "grace armed, not sent");
-        // ...replacement arrives before the grace runs out.
         h.db.set_count("braiins", 40);
         h.advance(301);
         assert!(
@@ -1655,8 +1447,7 @@ mod tests {
         );
     }
 
-    /// The rental ends: every rig leaves. THAT is an outage, and it is
-    /// the only message a rental produces besides its first online.
+    /// A rental reports offline only when its last rig leaves.
     #[tokio::test]
     async fn a_rental_reports_offline_only_when_the_last_rig_leaves() {
         let h = harness();
@@ -1676,8 +1467,7 @@ mod tests {
         );
     }
 
-    /// A count that GREW sends nothing but moves the reference, so the rig
-    /// that joined cannot later die unnoticed.
+    /// Growth is silent but becomes the reference for the next loss.
     #[tokio::test]
     async fn a_rig_joining_is_silent_but_becomes_the_new_reference() {
         let h = harness();
@@ -1688,14 +1478,12 @@ mod tests {
         assert_eq!(h.gate.poll_due().await.len(), 1);
         h.open_window();
 
-        // A third rig joins: silent.
         h.db.set_count("mrr", 3);
         h.advance(301);
         assert!(h.gate.poll_due().await.is_empty(), "arming, not announcing");
         h.advance(301);
         assert!(h.gate.poll_due().await.is_empty(), "growth is not news");
 
-        // It dies again — measured against 3, not against the original 2.
         h.db.set_count("mrr", 2);
         h.advance(301);
         match &h.poll_after_dwell(301).await[0] {
@@ -1706,15 +1494,13 @@ mod tests {
         }
     }
 
-    /// A share-quiet miner is not gone: the front reports what it holds
-    /// open, and the dead-client sweep has no say here.
+    /// A share-quiet but connected miner stays online.
     #[tokio::test]
     async fn a_share_quiet_but_connected_miner_stays_online() {
         let h = harness();
         h.bring_online("axe01").await;
         h.open_window();
 
-        // Hours of re-checks with no Stratum event and no share.
         for cycle in 0..20 {
             h.advance(301);
             assert!(
@@ -1724,9 +1510,7 @@ mod tests {
         }
     }
 
-    // ── Failure handling, coalescing, memory ────────────────────────
-
-    /// A database blip must not be read as "everyone is offline".
+    /// A failed lookup holds the deadline instead of guessing offline.
     #[tokio::test]
     async fn a_failed_lookup_holds_the_deadline_instead_of_guessing() {
         let h = harness();
@@ -1748,8 +1532,7 @@ mod tests {
         );
     }
 
-    /// An event landing during a lookup that then FAILS costs no extra
-    /// dwell: the staleness mark is cleared, since no answer arrived.
+    /// An event during a failed lookup costs no extra dwell.
     #[tokio::test]
     async fn an_event_during_a_failed_lookup_does_not_delay_the_next_answer() {
         let h = harness();
@@ -1760,7 +1543,6 @@ mod tests {
         h.gate.observe(&event("axe01", false, h.clock.now()));
         h.advance(301);
 
-        // The lookup fails, and a further disconnect lands while it is out.
         let gate = Arc::clone(&h.gate);
         let at = h.clock.now();
         *h.db.on_lookup.lock().expect("lock") = Some(Box::new(move || {
@@ -1769,7 +1551,6 @@ mod tests {
         h.db.fail(true);
         assert!(h.gate.poll_due().await.is_empty(), "no guess while blind");
 
-        // The very next successful sweep must decide it.
         h.db.fail(false);
         h.advance(1);
         assert_eq!(
@@ -1779,20 +1560,17 @@ mod tests {
         );
     }
 
-    /// A confirmed message waiting for the coalescing window must not be
-    /// hostage to the database — it needs no further lookup to go out.
+    /// A buffered, confirmed message is released during a database outage.
     #[tokio::test]
     async fn a_buffered_message_is_released_during_a_database_outage() {
         let h = harness();
         h.bring_online("a").await; // opens the window
 
-        // `b` resolves inside the window and is held.
         h.db.set("b", true, 5);
         h.gate.observe(&event("b", true, h.clock.now()));
         h.advance(95);
         assert!(h.gate.poll_due().await.is_empty(), "held by the window");
 
-        // The database goes away, and something else is due every tick.
         h.db.set("c", false, -7200);
         h.gate.observe(&event("c", false, h.clock.now()));
         h.db.fail(true);
@@ -1805,8 +1583,7 @@ mod tests {
         );
     }
 
-    /// Several workers of one address settling together must cost one
-    /// message, not one per worker.
+    /// Simultaneous transitions on one address collapse into one message.
     #[tokio::test]
     async fn simultaneous_transitions_collapse_into_one_message() {
         let h = harness();
@@ -1835,9 +1612,7 @@ mod tests {
         }
     }
 
-    /// The coalescing window is a hard ceiling: a transition that resolves
-    /// while the window is closed is held, and goes out when it reopens.
-    /// Both halves are asserted.
+    /// A transition inside a closed window is held, then released on reopen.
     #[tokio::test]
     async fn a_transition_inside_the_window_is_held_then_released() {
         let h = harness();
@@ -1855,7 +1630,7 @@ mod tests {
         assert_eq!(singles(&h.gate.poll_due().await), vec![("b".into(), true)]);
     }
 
-    /// Two transitions held together must leave as one message.
+    /// Two transitions held together leave as one message.
     #[tokio::test]
     async fn transitions_held_across_the_window_leave_together() {
         let h = harness();
@@ -1883,9 +1658,7 @@ mod tests {
         }
     }
 
-    /// A device settled at offline with no further events stops being
-    /// supervised, so a pool whose worker names churn cannot grow the map
-    /// without bound.
+    /// Settled offline devices are retired, so churning names cannot grow the map.
     #[tokio::test]
     async fn settled_offline_devices_stop_being_supervised() {
         let h = harness();
@@ -1906,8 +1679,7 @@ mod tests {
         );
     }
 
-    /// A worker whose rows have aged out of `client_entity` entirely
-    /// resolves to offline and then retires.
+    /// A worker missing from the liveness answer resolves offline, then retires.
     #[tokio::test]
     async fn a_worker_whose_rows_vanish_is_retired() {
         let h = harness();
@@ -1925,8 +1697,7 @@ mod tests {
         assert!(h.gate.lock().devices.is_empty());
     }
 
-    /// A live device is supervised indefinitely, so its eventual
-    /// disconnect is always caught — eviction must never reach it.
+    /// A live device is never retired, so its eventual disconnect is caught.
     #[tokio::test]
     async fn a_live_device_is_never_retired() {
         let h = harness();
@@ -1947,13 +1718,10 @@ mod tests {
         );
     }
 
-    /// A worker that flaps inside one coalescing window appears twice in
-    /// the batch; only where it ended up is reported.
+    /// A worker flapping inside one window is reported once, as its end state.
     #[tokio::test]
     async fn a_worker_that_flaps_across_the_window_is_reported_once() {
-        // Short dwells so both of `b`'s transitions resolve while the
-        // address's window is still closed; with the defaults the window
-        // reopens between them and the batch never holds two.
+        // Short dwells, so both transitions resolve inside one closed window.
         let h = harness_cfg(DeviceGateConfig {
             offline_grace: Duration::from_secs(30),
             online_dwell: Duration::from_secs(10),
@@ -1961,8 +1729,7 @@ mod tests {
             recheck_interval: Duration::from_secs(300),
         });
 
-        // `b` is known and reported online; `a` is announced, which is
-        // what closes the window.
+        // `b` is known; announcing `a` closes the window.
         h.db.set("b", true, -7200);
         h.gate.observe(&event("b", true, h.clock.now()));
         h.advance(15);
@@ -1972,7 +1739,6 @@ mod tests {
         h.advance(15);
         assert_eq!(h.gate.poll_due().await.len(), 1, "`a` opens the window");
 
-        // `b` drops...
         h.db.set_live("b", false);
         h.gate.observe(&event("b", false, h.clock.now()));
         h.advance(35);
@@ -1980,7 +1746,6 @@ mod tests {
             h.gate.poll_due().await.is_empty(),
             "buffered, window closed"
         );
-        // ...and returns, both inside the same window.
         h.db.set_live("b", true);
         h.gate.observe(&event("b", true, h.clock.now()));
         h.advance(15);
@@ -1990,8 +1755,6 @@ mod tests {
         let out = h.gate.poll_due().await;
         assert_eq!(out.len(), 1, "one address, one message");
         match &out[0] {
-            // Only `b` moved and its net state is online, so this is a
-            // single notice.
             DeviceNotice::Single(e) => {
                 assert_eq!(e.worker_name.as_deref(), Some("b"));
                 assert!(e.is_online, "net state is online");
@@ -2004,9 +1767,7 @@ mod tests {
         }
     }
 
-    /// A proxy that rotates worker names produces genuine transitions on
-    /// both sides, so the debounce cannot silence it; the coalescing
-    /// window is what bounds it.
+    /// A name-rotating proxy is bounded by the coalescing window, not the debounce.
     #[tokio::test]
     async fn a_name_rotating_proxy_is_bounded_by_the_coalescing_window() {
         let h = harness();
@@ -2031,8 +1792,7 @@ mod tests {
         }
 
         assert_eq!(transitions, 119, "the simulation really does churn");
-        // 11 against a ceiling of 3600/300 = 12, pinned exactly so any
-        // per-event leak shows up as a changed number.
+        // Pinned exactly (ceiling 3600/300 = 12) so any per-event leak shows.
         assert_eq!(
             messages, 11,
             "119 transitions must collapse to one message per coalescing window"

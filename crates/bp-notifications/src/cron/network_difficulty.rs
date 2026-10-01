@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Mempool-space network-difficulty poller.
-//!
-//! Every 10 min it polls `https://mempool.space/api/v1/mining/hashrate/3d`,
-//! compares the `currentDifficulty` field to the persisted singleton row,
-//! and on a relative change exceeding 0.01% persists it and emits a
-//! network-difficulty push to all FCM and UnifiedPush subscribers.
+//! Mempool-space network-difficulty poller: on a relative change above
+//! `DIFF_CHANGE_THRESHOLD` it persists the value and pushes it to all FCM
+//! and UnifiedPush subscribers.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,8 +32,7 @@ const DIFF_CHANGE_THRESHOLD: f64 = 0.0001;
 pub struct NetworkDifficultyCronConfig {
     pub tick_interval: Duration,
     /// Phase offset applied to the first tick so this cron doesn't
-    /// fire on the same boot-relative instant as other periodic jobs
-    /// that share the same `tick_interval`.
+    /// align with other periodic jobs of the same period.
     pub startup_offset: Duration,
 }
 

@@ -2,12 +2,9 @@
 
 use bp_common::MiningMode;
 
-/// Outcome of a mining-mode resolution for a single BTC address.
-///
-/// `group_id` is populated only for the group modes (Group-Solo and
-/// Blockparty). The string carries the canonical UUID of the group (as
-/// written in the `pplns_group` table) and matches the JSON contract
-/// surfaced by the `/api/pplns/mode/:address` endpoint.
+/// Outcome of a mining-mode resolution for one address. `group_id` is set only
+/// for Group-Solo and Blockparty: the group's canonical UUID from
+/// `pplns_group`, as the `/api/pplns/mode/:address` JSON contract expects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MiningModeResult {
     pub mode: MiningMode,

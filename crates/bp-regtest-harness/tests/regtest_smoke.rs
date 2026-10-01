@@ -29,16 +29,12 @@ async fn spawn_mine_shutdown() {
         "IPC socket should exist after startup"
     );
 
-    // Production-shape client should be usable end-to-end.
     let rpc = node.bitcoin_rpc().expect("BitcoinRpc construction");
     let info = rpc
         .get_network_info()
         .await
         .expect("getnetworkinfo should succeed");
-    // The spawned node must be the one `is_available` vouched for.
-    // That gate reads the `-version` banner; this reads `getnetworkinfo` off
-    // the running process, so agreement between them is what rules out
-    // "discovery found a v31 and then something else got spawned".
+    // The running node must match what the `-version` gate vouched for.
     let min_version = u64::from(MIN_BITCOIN_NODE_MAJOR) * 10_000;
     assert!(
         info.version >= min_version,
@@ -46,7 +42,6 @@ async fn spawn_mine_shutdown() {
         info.version
     );
 
-    // Mine 5 blocks to a fresh wallet address.
     let height = node
         .generate_to_self(5)
         .await

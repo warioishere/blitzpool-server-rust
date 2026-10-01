@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! PPLNS pure math — the weight-native distribution builder (SV2 ext
-//! 0x0003 §4 model) plus its telemetry and weight constants.
-//!
-//! No I/O. Window aggregation, Redis snapshots, DB writes, and dust-sweep
-//! cron belong to a higher-level service crate that consumes this one.
-//!
-//! **Sat tolerance:** a payout is `floor(weight · T / W)`, so an entry is at
-//! most one satoshi under its exact share, and the pool output takes the §4
-//! residual `pay_P = T − Σpay` — the outputs sum to `T` exactly. There is no
-//! drift allowance beyond that flooring.
+//! PPLNS pure math, no I/O: the ext 0x0003 §4 weight distribution builder,
+//! its telemetry and weight constants. A payout is `floor(weight · T / W)`
+//! and the pool output takes the residual `pay_P = T − Σpay`, so the
+//! outputs sum to `T` exactly.
 
 mod distribution;
 mod weight;

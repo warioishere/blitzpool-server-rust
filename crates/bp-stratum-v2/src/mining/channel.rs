@@ -1,22 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Per-channel state for SV2 Standard + Extended mining channels.
-//!
-//! One `ChannelState` struct; the [`ChannelKind`] discriminant tells callers
-//! which fields are meaningful:
-//!
-//! - **Standard**: `extranonce_size = 0` (the miner cannot roll).
-//!   [`StandardJobMaps`] drives share validation; `extended_jobs` stays empty.
-//! - **Extended**: `extranonce_size > 0` after the pool-assigned prefix.
-//!   [`ExtendedJob`] entries in `extended_jobs` carry everything needed to
-//!   rebuild the coinbase and walk the merkle path on submit, including the
-//!   job's difficulty.
-//!
-//! `declared_max_target` is the channel's SV2 ceiling: vardiff clamps against
-//! it before sending `SetTarget`.
-//!
-//! [`SubmissionCache`] is the per-channel dedup set, cleared on
-//! `SetNewPrevHash`.
+//! Per-channel state for SV2 Standard + Extended mining channels. The
+//! [`ChannelKind`] says which fields are meaningful: Standard channels use
+//! [`StandardJobMaps`] and cannot roll extranonce; Extended channels keep
+//! [`ExtendedJob`]s with everything needed to rebuild the coinbase on submit.
 
 use std::collections::{HashMap, HashSet};
 
@@ -57,11 +44,9 @@ pub struct ChannelState {
     /// the clamp check loses no precision.
     pub declared_max_target: [u8; 32],
 
-    /// The `nominal_hash_rate` this channel last declared, if any.
-    ///
-    /// The silence-easing path uses it to tell a NEW declaration (news about
-    /// the channel now, e.g. a proxy whose workers just attached) from the
-    /// same value re-sent on a timer, where observed silence still rules.
+    /// The `nominal_hash_rate` this channel last declared. Silence-easing uses
+    /// it to tell a NEW declaration (e.g. a proxy whose workers just attached)
+    /// from the same value re-sent on a timer, where observed silence rules.
     pub last_declared_hash_rate: Option<f32>,
 
     /// Standard-channel job bookkeeping
@@ -93,14 +78,10 @@ pub struct ChannelState {
     /// Per-channel submission dedup set. Cleared on block change.
     pub submission_cache: SubmissionCache,
 
-    /// Content signature of the last job sent on this channel — version,
-    /// prev_hash, n_bits and the merkle root (Standard) or coinbase
-    /// prefix/suffix + merkle path (Extended). A same-block *refresh*
-    /// whose signature matches is byte-identical work and is NOT re-issued
-    /// under a fresh `job_id`: strict firmware (BraiinsOS) resets its
-    /// hashing pipeline on every `NewMiningJob`, so re-announcing identical
-    /// work freezes its effective hashrate / best-difficulty. A real block
-    /// change (`SetNewPrevHash`) is always sent. `None` until the first job.
+    /// Content signature of the last job sent. A same-block refresh with the
+    /// same signature is not re-issued: BraiinsOS resets its hashing pipeline
+    /// on every `NewMiningJob`, so identical re-announced work stalls it. A
+    /// block change (`SetNewPrevHash`) is always sent.
     pub last_sent_job_signature: Option<u64>,
 
     /// One-shot diagnostic flag: the first share per channel logs its actual
@@ -114,7 +95,6 @@ pub struct ChannelState {
 }
 
 impl ChannelState {
-    /// Construct a fresh **Standard** channel.
     pub fn new_standard(
         channel_id: u32,
         extranonce_prefix: Vec<u8>,
@@ -145,7 +125,6 @@ impl ChannelState {
         }
     }
 
-    /// Construct a fresh **Extended** channel.
     pub fn new_extended(
         channel_id: u32,
         extranonce_prefix: Vec<u8>,
@@ -238,11 +217,9 @@ pub struct ExtendedDedupKey {
     pub extranonce: ExtranonceBytes,
 }
 
-/// Upper bound on the per-channel submission dedup set. The set is only
-/// cleared on a block change, and a channel may keep one `job_id` for the
-/// whole block, so without a cap a fast miner grows it without end (and a
-/// firmware nonce-range replay gets flagged as duplicates). When it fills,
-/// the whole generation is dropped.
+/// Cap on the dedup set: it is cleared only on a block change and a channel
+/// may keep one `job_id` all block, so a fast miner would grow it without end.
+/// When full, the whole generation is dropped.
 const MAX_SUBMISSION_CACHE: usize = 10_000;
 
 impl SubmissionCache {
@@ -263,9 +240,7 @@ impl SubmissionCache {
         }
     }
 
-    /// Try to record an Extended-channel submission. Returns `true` if
-    /// it was newly inserted, `false` if duplicate. See
-    /// [`Self::insert_standard`] for the kind-mismatch behaviour.
+    /// Extended counterpart of [`Self::insert_standard`].
     pub fn insert_extended(&mut self, key: ExtendedDedupKey) -> bool {
         match self {
             SubmissionCache::Extended(set) => {

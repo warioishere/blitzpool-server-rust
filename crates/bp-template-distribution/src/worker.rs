@@ -1,21 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Dedicated OS-thread that hosts `BitcoinCoreSv2TDP` inside a
-//! `tokio::task::LocalSet` (required because the upstream type is `!Send`).
-//!
-//! The thread owns three pieces:
-//!
-//! 1. The `BitcoinCoreSv2TDP` instance itself (running its event loop).
-//! 2. A **bridge_in** task that consumes a `tokio::mpsc::Receiver<TdpRequest>`
-//!    coming from pool code and forwards translated `TemplateDistribution`
-//!    payloads into the TDP via `async_channel::Sender`.
-//! 3. A **bridge_out** task that drains the TDP's outbound
-//!    `async_channel::Receiver<TemplateDistribution>` and re-broadcasts
-//!    each payload as `TemplateUpdate` over a `tokio::broadcast::Sender`.
-//!
-//! Cancellation: a single `CancellationToken` is observed by both the TDP
-//! and both bridge tasks. Dropping the public `TdpHandle` triggers cancel,
-//! which makes `BitcoinCoreSv2TDP::run` return; the thread is then joined.
+//! Dedicated OS thread hosting `BitcoinCoreSv2TDP` in a `LocalSet`, because the
+//! upstream type is `!Send`. Two bridge tasks translate between the pool's tokio
+//! channels and the TDP's `async_channel`s; one `CancellationToken` stops the TDP
+//! and both bridges when the `TdpHandle` is dropped.
 
 use std::path::PathBuf;
 
@@ -94,31 +82,23 @@ fn run_thread(
     let local_set = tokio::task::LocalSet::new();
 
     local_set.block_on(&runtime, async move {
-        // `submit_rx` (the pool→TDP request channel) must survive across
-        // reconnects, so each connection iteration borrows it via
-        // `bridge_in` and hands it back on exit. `templates_tx` (the
-        // TDP→pool broadcast) is cheaply cloned per iteration.
+        // `submit_rx` must survive reconnects, so `bridge_in` hands it back
+        // when its connection ends.
         let mut submit_rx = submit_rx;
-        // `ready_tx` is a one-shot rendezvous with `spawn_worker`: signal
-        // exactly once, on the FIRST connection outcome. A boot-time
-        // failure is fatal (caller aborts boot); any later disconnect is
-        // recoverable and must NOT re-signal (the receiver is long gone).
+        // Signalled once, on the first connection outcome: a boot failure is
+        // fatal, a later disconnect is recoverable and has nobody to tell.
         let mut ready_tx = Some(ready_tx);
 
         loop {
-            // Pool shutdown requested before (re)connecting — stop.
             if cancel.is_cancelled() {
                 break;
             }
 
-            // Per-connection child token: cancelled either by pool
-            // shutdown (cascades from `cancel`) or explicitly after the TDP
-            // run-loop returns, so the bridges for THIS connection exit
-            // without tearing down the shared channels.
+            // Per-connection token: ends this connection's bridges without
+            // tearing down the channels shared across reconnects.
             let conn_cancel = cancel.child_token();
 
-            // Channels that talk to BitcoinCoreSv2TDP directly. Re-created
-            // per connection — the library takes ownership of one half.
+            // Re-created per connection: the library takes ownership of one half.
             let (into_tdp_tx, into_tdp_rx) =
                 async_channel::unbounded::<TemplateDistributionOwned>();
             let (from_tdp_tx, from_tdp_rx) =
@@ -137,14 +117,11 @@ fn run_thread(
                 Ok(tdp) => tdp,
                 Err(e) => {
                     if let Some(tx) = ready_tx.take() {
-                        // First attempt failed — fatal boot error.
                         let _ = tx.send(Err(format!("BitcoinCoreSv2TDP::new failed: {e:?}")));
                         cancel.cancel();
                         return;
                     }
-                    // Reconnect attempt failed — bitcoin-core still down.
-                    // Back off and retry; the last template stays live for
-                    // miners in the meantime.
+                    // Miners keep the last template while bitcoin-core is down.
                     warn!(
                         socket = %socket_path.display(),
                         error = ?e,
@@ -165,9 +142,8 @@ fn run_thread(
                 "bp-tdp-worker connected to bitcoin-core IPC"
             );
 
-            // Send the startup CoinbaseOutputConstraints. The TDP will not
-            // distribute templates until it has seen one. On a reconnect
-            // this re-arms the fresh connection identically.
+            // The TDP distributes no templates before it has seen
+            // CoinbaseOutputConstraints, so every connection gets them.
             if let Err(e) = send_coinbase_constraints(&into_tdp_tx, coinbase_constraints).await {
                 if let Some(tx) = ready_tx.take() {
                     let _ = tx.send(Err(format!(
@@ -184,9 +160,6 @@ fn run_thread(
                 continue;
             }
 
-            // Bridges for THIS connection. `bridge_in` takes `submit_rx`
-            // by value and returns it when `conn_cancel` fires, so the
-            // next iteration can reuse it.
             let bridge_out_handle = {
                 let conn_cancel = conn_cancel.clone();
                 let templates_tx = templates_tx.clone();
@@ -198,24 +171,19 @@ fn run_thread(
                 tokio::task::spawn_local(bridge_in(submit_rx, into_tdp_tx, conn_cancel))
             };
 
-            // Signal boot readiness on the first successful connection only.
             if let Some(tx) = ready_tx.take() {
                 let _ = tx.send(Ok(()));
             }
 
-            // Run the TDP event loop. Returns on IPC disconnect OR when
-            // `conn_cancel` fires (pool shutdown cascading through the
-            // child token).
+            // Returns on IPC disconnect or pool shutdown.
             let mut tdp = tdp;
             tdp.run().await;
 
-            // Tear down this connection's bridges and reclaim `submit_rx`.
             conn_cancel.cancel();
             submit_rx = match bridge_in_handle.await {
                 Ok(rx) => rx,
                 Err(e) => {
-                    // bridge_in panicked — can't recover the channel; the
-                    // pool→TDP request path is dead. Treat as fatal.
+                    // A panicked bridge took `submit_rx` with it: the request path is dead.
                     error!(error = %e, "bp-tdp-worker: bridge_in task panicked; aborting worker");
                     cancel.cancel();
                     return;
@@ -228,7 +196,6 @@ fn run_thread(
                 break;
             }
 
-            // Unexpected disconnect (bitcoin-core restart / IPC drop).
             warn!(
                 backoff_secs = reconnect_backoff.as_secs(),
                 "bp-tdp-worker: bitcoin-core IPC disconnected; reconnecting"
@@ -240,9 +207,7 @@ fn run_thread(
     });
 }
 
-/// Sleep for `backoff`, but wake early if `cancel` fires. Returns `true`
-/// if the wait ended because of cancellation (caller should stop the
-/// reconnect loop), `false` if the full backoff elapsed.
+/// Returns `true` when `cancel` cut the backoff short, so the reconnect loop stops.
 async fn sleep_or_cancelled(backoff: std::time::Duration, cancel: &CancellationToken) -> bool {
     tokio::select! {
         _ = cancel.cancelled() => true,
@@ -275,8 +240,7 @@ async fn bridge_out(
             recv = from_tdp_rx.recv() => match recv {
                 Ok(msg) => {
                     if let Some(update) = TemplateUpdate::from_upstream(&msg) {
-                        // It is fine if no subscribers exist yet — bitcoin-core
-                        // keeps producing templates and they are just dropped.
+                        // Without subscribers the template is simply dropped.
                         let _ = templates_tx.send(update);
                     } else {
                         debug!("bridge_out: dropping non-outbound payload variant");
@@ -291,10 +255,8 @@ async fn bridge_out(
     }
 }
 
-/// Forwards pool→TDP requests for the lifetime of ONE connection.
-/// Returns `submit_rx` on exit so the reconnect loop can hand the same
-/// channel to the next connection's bridge — the pool-side `submit_tx`
-/// stays valid across reconnects.
+/// Forwards pool requests for one connection, then returns `submit_rx` so the
+/// pool-side sender stays valid across reconnects.
 async fn bridge_in(
     mut submit_rx: mpsc::Receiver<TdpRequest>,
     into_tdp_tx: AcSender<TemplateDistributionOwned>,
@@ -369,8 +331,6 @@ fn make_submit_solution(
     header_nonce: u32,
     coinbase_tx: Vec<u8>,
 ) -> Result<TemplateDistributionOwned, String> {
-    // `B064KOwned::try_from(Vec<u8>)` enforces the upper length bound
-    // (u16::MAX bytes — far above any realistic coinbase).
     let coinbase_tx = stratum_core::binary_sv2::B064KOwned::try_from(coinbase_tx)
         .map_err(|e| format!("coinbase_tx too large for B064K: {e:?}"))?;
 
@@ -404,7 +364,6 @@ mod tests {
     async fn sleep_or_cancelled_returns_true_when_already_cancelled() {
         let cancel = CancellationToken::new();
         cancel.cancel();
-        // Long backoff — must return immediately because cancel is set.
         let stop = sleep_or_cancelled(std::time::Duration::from_secs(3600), &cancel).await;
         assert!(stop, "pre-cancelled token must short-circuit the backoff");
     }
@@ -424,7 +383,6 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             child.cancel();
         });
-        // 60 s backoff but the spawned task cancels after 10 ms — must wake early.
         let start = std::time::Instant::now();
         let stop = sleep_or_cancelled(std::time::Duration::from_secs(60), &cancel).await;
         assert!(stop, "cancel during wait must report stop");
@@ -436,9 +394,7 @@ mod tests {
 
     #[test]
     fn child_token_cascades_from_parent() {
-        // The reconnect loop relies on this: pool shutdown cancels the
-        // outer token, which must cascade to the per-connection child so
-        // the in-flight TDP run loop returns.
+        // Pool shutdown must reach the per-connection token of the reconnect loop.
         let parent = CancellationToken::new();
         let child = parent.child_token();
         assert!(!child.is_cancelled());

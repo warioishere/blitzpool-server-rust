@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `/api/downstream-report` — in-memory store of SV2 JDC-downstream
-//! miner reports (5-min TTL, keyed by `jdcUserIdentity`).
-//!
-//! Storing a report also writes a vendor-derived userAgent into the
-//! matching client_entity rows via `bp_db::update_sv2_user_agent_by_address`.
+//! `/api/downstream-report` — in-memory store of SV2 JDC-downstream miner
+//! reports (5-min TTL, keyed by `jdcUserIdentity`). Storing one also writes
+//! the vendor-derived userAgent into the matching `client_entity` rows.
 
 use std::collections::HashMap;
 use std::sync::Mutex;

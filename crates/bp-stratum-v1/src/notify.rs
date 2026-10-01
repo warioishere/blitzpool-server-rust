@@ -1,23 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! The SV1 active template and the `mining.notify` frame builder.
-//!
-//! Two halves:
-//!
-//! - [`ActiveSV1Template`] is the shared [`ActiveTemplate`] plus the hex SV1
-//!   broadcasts on every `mining.notify`, encoded once per template. The
-//!   state machine that pairs TDP updates into it is
-//!   [`bp_template_distribution::TemplateAssembler`], shared with SV2; a
-//!   [`bp_template_distribution::TemplateChange`] tells callers whether to set `clean_jobs=true`.
-//!
-//! - [`build_notify_frame`] takes an active template, a per-miner
-//!   [`bp_mining_job::MiningJob`], a jobId, and the clean-jobs flag, and
-//!   emits the line-terminated `mining.notify` bytes. Numeric fields
-//!   (version/bits/ntime) are emitted as 8-hex-padded lowercase, the
-//!   ckpool convention.
-//!
-//! The Tokio plumbing that drives the assembler from a
-//! `TdpHandle::subscribe()` receiver lives in `server.rs`.
+//! [`ActiveSV1Template`] (the shared [`ActiveTemplate`] plus the hex every
+//! `mining.notify` carries, encoded once per template) and
+//! [`build_notify_frame`]. Templates are assembled by the SV2-shared
+//! [`bp_template_distribution::TemplateAssembler`].
 
 use std::ops::Deref;
 
@@ -34,17 +20,12 @@ use serde::Serialize;
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActiveSV1Template {
     pub template: ActiveTemplate,
-    /// Pre-encoded hex form of `merkle_path`, computed once per template
-    /// activation/refresh, so the per-client `mining.notify` broadcast does
-    /// not hex-encode the path once per connection.
+    /// Hex of `merkle_path`, encoded once per activation/refresh instead of
+    /// once per connection.
     pub merkle_branch_hex: Vec<String>,
-    /// Pre-encoded hex of the notify **header-constant** fields — prev_hash
-    /// (word-swapped), version, n_bits, header_timestamp — cached once per
-    /// template alongside `merkle_branch_hex`. These are identical for every
-    /// connection on a template, so `mining.notify` borrows them instead of
-    /// re-hex-encoding for each per-client broadcast. Kept in sync by
-    /// `ActiveSV1Template::recompute_notify_header_hex` (construction +
-    /// mempool refresh — the only paths that change the source fields).
+    /// Hex of the header fields every connection shares (prev_hash
+    /// word-swapped, version, n_bits, header_timestamp). Kept in sync by
+    /// `recompute_notify_header_hex` and `refresh`.
     pub prev_hash_hex: String,
     pub version_hex: String,
     pub n_bits_hex: String,
@@ -74,14 +55,9 @@ impl ActiveSV1Template {
         active
     }
 
-    /// (Re)compute the cached hex of the notify header-constant fields —
-    /// prev_hash (word-swapped) + version + n_bits + header_timestamp. Same
-    /// once-per-template caching `merkle_branch_hex` gets, so per-client
-    /// `mining.notify` borrows them instead of re-encoding for every miner.
-    ///
-    /// `pub(crate)` so intra-crate test fixtures that change a field of
-    /// `template` can re-sync the cache the way the production paths do; the
-    /// debug guard in [`build_notify_frame`] enforces this in test builds.
+    /// Re-derive the cached header hex. `pub(crate)` so test fixtures that
+    /// mutate `template` can re-sync it; the debug guard in
+    /// [`build_notify_frame`] catches a forgotten call.
     pub(crate) fn recompute_notify_header_hex(&mut self) {
         self.prev_hash_hex = hex::encode(swap_endian_words(&self.template.prev_hash));
         self.version_hex = format!("{:08x}", self.template.version);
@@ -98,31 +74,20 @@ impl ActiveFromTemplate for ActiveSV1Template {
     fn refresh(&mut self, t: &NewTemplate) {
         self.template.refresh(t);
         self.merkle_branch_hex = encode_merkle_branch(&self.template.merkle_path);
-        // A refresh changes only `version` among the four header-hex sources
-        // (prev_hash/n_bits/header_timestamp are left untouched), so refresh
-        // just that one cached string instead of re-encoding all four. The
-        // debug guard in `build_notify_frame` verifies the untouched three
-        // stayed in sync.
+        // Of the four header-hex sources a refresh changes only `version`;
+        // the debug guard in `build_notify_frame` checks the other three.
         self.version_hex = format!("{:08x}", self.template.version);
     }
 }
 
-/// Hex-encode each 32-byte merkle-branch entry. Called once per
-/// template activation; the result is cached on `ActiveSV1Template`
-/// and re-shared across every per-client `mining.notify` build.
 fn encode_merkle_branch(path: &[[u8; 32]]) -> Vec<String> {
     path.iter().map(hex::encode).collect()
 }
 
 // ── Pure helpers ─────────────────────────────────────────────────────
 
-/// Swap each 4-byte word inside a 32-byte buffer. Used to convert the
-/// Bitcoin internal LE prev-hash form (as delivered by SV2 TDP) to the
-/// SV1 `mining.notify`-on-wire form (per ckpool / Stratum-V1 convention).
-///
-/// Operates on 8 little-endian u32 words: `[w0,w1,…,w7]` →
-/// `[swap_u32(w0), swap_u32(w1), …]` where `swap_u32` reverses the
-/// 4 bytes of each word.
+/// Reverse the bytes of each 4-byte word: converts the internal LE
+/// prev-hash from TDP into the form SV1 `mining.notify` puts on the wire.
 pub fn swap_endian_words(bytes: &[u8; 32]) -> [u8; 32] {
     let mut out = [0u8; 32];
     for i in 0..8 {
@@ -144,10 +109,8 @@ struct MiningNotifyFrame<'a> {
     params: MiningNotifyParams<'a>,
 }
 
-/// 9-element tuple — serializes as a JSON array, field order pinned by
-/// declaration order. The merkle-branch slot is borrowed from the
-/// cached `ActiveSV1Template::merkle_branch_hex` so per-client builds
-/// don't re-hex-encode or re-allocate the branch vector.
+/// Serializes as the JSON params array, order pinned by the tuple; every
+/// slot borrows a cached hex string so per-client builds do not re-encode.
 type MiningNotifyParams<'a> = (
     &'a str,      // jobId
     &'a str,      // prevHash (word-swapped + hex) — cached on the template
@@ -160,26 +123,17 @@ type MiningNotifyParams<'a> = (
     bool,         // clean_jobs
 );
 
-/// Emit a line-terminated `mining.notify` frame for the given active
-/// template + per-miner mining job.
-///
-/// `job_id_hex` is the lowercase hex string the pool advertises to the
-/// miner; it's the same id miners echo back in `mining.submit[1]`.
-///
-/// Numeric fields version / n_bits / header_timestamp are emitted as
-/// **8-hex-padded lowercase** (ckpool convention): every real miner
-/// accepts it, and fixed-width fields are easier to read in pcaps/logs.
+/// Emit a line-terminated `mining.notify` frame. `job_id_hex` is what the
+/// miner echoes back in `mining.submit[1]`; version / n_bits / ntime go out
+/// as 8-digit lowercase hex, which every miner accepts.
 pub fn build_notify_frame(
     state: &ActiveSV1Template,
     job: &MiningJob,
     job_id_hex: &str,
     clean_jobs: bool,
 ) -> Vec<u8> {
-    // Debug-only stale-cache guard: every borrowed `*_hex` must equal a fresh
-    // encode of its source field. Compiles to nothing in release; in every
-    // test/regtest (debug) a forgotten `recompute_notify_header_hex` or a
-    // desynced coinbase hex fails loudly here instead of silently broadcasting
-    // a `mining.notify` with wrong header/coinbase values to miners.
+    // Debug-only stale-cache guard: a desynced `*_hex` fails every test here
+    // instead of broadcasting a notify with wrong header/coinbase values.
     debug_assert_eq!(
         state.prev_hash_hex,
         hex::encode(swap_endian_words(&state.prev_hash)),
@@ -227,12 +181,9 @@ pub fn build_notify_frame(
         method: "mining.notify",
         params,
     };
-    // Pre-size the output buffer to an upper bound so serde_json writes the
-    // whole frame without a single realloc — that Vec is then the only
-    // allocation this builder makes, and it's unavoidable (the bytes are
-    // returned to be written to the socket). Base 64 covers the fixed JSON
-    // scaffolding `{"id":null,"method":"mining.notify","params":[ … ]}`; each
-    // string field adds its length + 3 for the two quotes and a comma.
+    // Upper-bound size so the returned Vec is the builder's only allocation.
+    // 64 covers the fixed JSON scaffolding; each string field adds its length
+    // + 3 for two quotes and a comma.
     let est = 64
         + job_id_hex.len()
         + 3
@@ -349,8 +300,6 @@ mod tests {
             template_id: 1,
             version: 0x2000_0000,
             prev_hash: {
-                // Distinct bytes per word so swap_endian_words can be
-                // verified by inspection.
                 let mut h = [0u8; 32];
                 for (i, b) in h.iter_mut().enumerate() {
                     *b = i as u8;
@@ -466,15 +415,10 @@ mod tests {
 
     #[test]
     fn build_notify_frame_pads_short_numeric_fields() {
-        // Version 2, n_bits 0x0000_00ff, ntime 0x10 — all small enough
-        // that unpadded hex would be < 8 chars. Padded form must be
-        // exactly 8 chars.
         let mut active = assembled_active();
         active.template.version = 2;
         active.template.n_bits = 0x0000_00ff;
         active.template.header_timestamp = 0x10;
-        // Direct field mutation bypasses the constructor/refresh — refresh the
-        // cached header hex the way production does before building a notify.
         active.recompute_notify_header_hex();
         let job = job_from_active(&active);
         let bytes = build_notify_frame(&active, &job, "1", false);
@@ -489,10 +433,7 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "stale version_hex")]
     fn build_notify_frame_debug_guard_rejects_stale_header_hex() {
-        // Mutate a source field WITHOUT re-syncing the cache. The debug guard
-        // in build_notify_frame must catch the desync — this is the net that
-        // stops a forgotten recompute from ever broadcasting a wrong-header
-        // mining.notify to miners.
+        // Mutate a source field without re-syncing the cache.
         let mut active = assembled_active();
         active.template.version = 0x1234_5678; // version_hex now stale
         let job = job_from_active(&active);
@@ -501,11 +442,8 @@ mod tests {
 
     #[test]
     fn new_block_notify_carries_new_prev_hash_not_stale_cache() {
-        // End-to-end pin for the header-hex cache: a genuinely new block must
-        // produce a mining.notify carrying the NEW prev_hash, never the
-        // previous template's cached hex. Drive the real assembler path
-        // (NewTemplate + SetNewPrevHash) twice with different prev_hashes and
-        // assert the built notify's prevhash field tracks each block.
+        // Through the real assembler: each new block's notify carries its own
+        // prev_hash, never the previous template's cached hex.
         let notify_prevhash = |asm: &TemplateAssembler<ActiveSV1Template>| -> String {
             let active = asm.current().expect("active template");
             let job = job_from_active(active);
@@ -538,10 +476,8 @@ mod tests {
         assert_ne!(notify_a, notify_b, "new block served a stale prev_hash");
     }
 
-    /// A fee refresh changes the merkle path and version under the active
-    /// template; the notify built after it must carry both, not the hex
-    /// cached at activation. The debug guard in `build_notify_frame` checks
-    /// the header fields but not the merkle branch, so this pins the branch.
+    /// After a refresh the notify carries the new merkle branch and version;
+    /// the debug guard does not cover the branch, so this test does.
     #[test]
     fn refresh_notify_carries_the_refreshed_merkle_branch_and_version() {
         let mut asm = TemplateAssembler::<ActiveSV1Template>::new();
@@ -567,22 +503,16 @@ mod tests {
 
     #[test]
     fn build_notify_frame_field_order_is_id_method_params() {
-        // Pin the field order at the byte level. JSON serialization order
-        // `{id, method, params}` emits `id` first, then `method`, then
-        // `params`. The Serialize-derived struct must do the same.
         let active = assembled_active();
         let job = job_from_active(&active);
         let bytes = build_notify_frame(&active, &job, "1", false);
         let s = std::str::from_utf8(&bytes).unwrap();
-        // The first two keys after `{`.
         assert!(s.starts_with("{\"id\":null,\"method\":\"mining.notify\",\"params\":["));
     }
 
     #[test]
     fn build_notify_frame_empty_merkle_branch_is_an_empty_array() {
-        // A template with no other transactions (rare in mainnet, common
-        // on a fresh regtest tip) emits an empty merkle_branch — must
-        // serialize as `[]`, not omit the field.
+        // A template without transactions must serialize `[]`, not omit it.
         let mut active = assembled_active();
         active.template.merkle_path = vec![];
         active.merkle_branch_hex = vec![];
@@ -597,9 +527,7 @@ mod tests {
 
     #[test]
     fn build_notify_frame_coinb1_coinb2_match_extranonce_splice() {
-        // Round-trip: rebuild the full coinbase from coinb1 + 12-byte zero
-        // slot + coinb2, decode via rust-bitcoin to ensure the SV1 frame
-        // points to a real, valid coinbase tx.
+        // coinb1 + zeroed extranonce slot + coinb2 must decode as a real tx.
         let active = assembled_active();
         let job = job_from_active(&active);
         let bytes = build_notify_frame(&active, &job, "1", false);

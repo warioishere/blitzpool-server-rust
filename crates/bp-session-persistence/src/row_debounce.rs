@@ -1,26 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Debounced client-row birth.
-//!
-//! A `client_entity` row is born late: `register_session` only records
-//! the session in the in-memory [`RowDebounce`] map, and the birth flush
-//! writes it (batched, one statement per tick) once it has survived
-//! `row_debounce` (default 15 s). Most short-lived connections never
-//! submit a share; one that disconnects while still pending costs zero
-//! statements. Teardown soft-deletes only sessions that were born.
-//!
-//! The debounce must stay well below the device-status gate's
-//! `online_dwell` (90 s): the gate drops `(address, worker)` keys that
-//! have no `client_entity` row yet, so a longer delay would make it treat
-//! a connected device as absent.
-//!
-//! ## The teardown race is left to `kill_dead_clients`
-//!
-//! A session that disconnects while its row is in flight is already
-//! drained (nothing pending) and not yet born (no soft-delete), so the
-//! flush commits a row for a dead session. `kill_dead_clients` sweeps
-//! exactly such unstamped rows. The gate is unaffected: its session
-//! counts come from the fronts' Redis live-session sets.
+//! Debounced client-row birth: a `client_entity` row is written only once its
+//! session survived `row_debounce`, so short-lived probes cost no statement.
+//! The debounce must stay well below the device-status gate's `online_dwell`,
+//! which treats a device without a row as absent.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -34,16 +17,13 @@ use tracing::{debug, error, warn};
 
 use crate::touch_buffer::TouchKey;
 
-/// How often a row-specific failure (a Postgres error for exactly this
-/// row while the connection is healthy) is retried before the entry is
-/// dropped. Transient outages (pool/IO errors) do not count against
-/// this — they retry indefinitely, like the touch buffer's rebuffer.
+/// Retries for a row-specific Postgres error before the entry is dropped.
+/// Transient outages (pool/IO errors) do not count and retry indefinitely.
 pub(crate) const MAX_BIRTH_ATTEMPTS: u32 = 3;
 
-/// One not-yet-born session. Values are captured at `register_session`
-/// (authorize) so the row carries the authorize-time `userAgent` (incl.
-/// the SV2 `jd-client/sv2` placeholder the downstream-report refinement
-/// matches on) and authorize-time `startTime`/`firstSeen`.
+/// One not-yet-born session, captured at authorize so the row carries the
+/// authorize-time `userAgent` (incl. the SV2 `jd-client/sv2` placeholder the
+/// downstream-report refinement matches on) and `startTime`.
 pub(crate) struct PendingRow {
     pub user_agent: Option<String>,
     pub start_time_ms: i64,
@@ -53,28 +33,17 @@ pub(crate) struct PendingRow {
 
 #[derive(Default)]
 struct Inner {
-    /// Keyed on the row PK triple — NOT on `sessionId` alone: a rental
-    /// proxy that switches worker names re-registers the SAME session id
-    /// under a different `clientName`, and each pair needs its own row.
+    /// Keyed on the row PK triple, not `sessionId` alone: a rental proxy can
+    /// re-register the same session under another `clientName`.
     pending: HashMap<TouchKey, PendingRow>,
-    /// Session ids with at least one born row. Drives the teardown
-    /// decision: only a born session gets the soft-delete statement
-    /// (which is `sessionId`-wide, covering every worker of the
-    /// session).
-    ///
-    /// Entries leave at deregister. Two bounded cases leave an entry
-    /// behind for good: a session that disconnects between its drain and
-    /// its `mark_born` (a window one bulk INSERT wide), and a teardown that
-    /// never fires (task aborted mid-shutdown).
+    /// Session ids with at least one born row; only those get the
+    /// session-wide soft-delete at teardown.
     born: HashSet<String>,
 }
 
-/// Shared pending-session state. The hook writes into it on
-/// authorize/disconnect; the birth flush drains it on every tick.
-///
-/// Locking is a plain `std::sync::Mutex`: no critical section spans an
-/// `.await` (register/deregister mutate the maps; the flush drains
-/// before the DB round-trip), matching the touch buffer's posture.
+/// Pending-session state: the hook writes on authorize/disconnect, the
+/// birth flush drains it each tick. A `std::sync::Mutex` is enough because
+/// no critical section spans an `.await`.
 #[derive(Default)]
 pub(crate) struct RowDebounce {
     inner: Mutex<Inner>,
@@ -85,11 +54,9 @@ impl RowDebounce {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Record a freshly-authorized session. Overwrites a pending entry
-    /// for the same triple (defensive re-register): latest authorize
-    /// wins, retry budget resets. A re-register of an already-born
-    /// session pends again; the birth flush's `ON CONFLICT` arm then
-    /// refreshes the row and clears its soft-delete.
+    /// Record a freshly-authorized session; the latest authorize wins and
+    /// resets the retry budget. A born session pends again, and the flush's
+    /// `ON CONFLICT` arm refreshes the row and clears its soft-delete.
     pub(crate) fn register(
         &self,
         address: &str,
@@ -115,9 +82,9 @@ impl RowDebounce {
         );
     }
 
-    /// Session teardown. Drops every pending entry of the session (a
-    /// probe's entire trace) and returns whether any row was born — the
-    /// caller runs the session-wide soft-delete exactly then.
+    /// Session teardown: drops the session's pending entries and returns
+    /// whether a row was born (then the caller soft-deletes). A row still in
+    /// flight at teardown is left to `kill_dead_clients`, which sweeps it.
     pub(crate) fn deregister(&self, session_id: &str) -> bool {
         let mut guard = self.guard();
         guard.pending.retain(|k, _| k.session_id != session_id);
@@ -143,10 +110,8 @@ impl RowDebounce {
         self.guard().born.insert(session_id.to_string());
     }
 
-    /// Fold entries whose write failed back into the pending map, with
-    /// their (possibly incremented) retry state. A newer entry for the
-    /// same triple — the session re-registered while the write was in
-    /// flight — wins over the stale snapshot.
+    /// Fold failed entries back into the pending map. A newer entry for the
+    /// same triple (re-registered while the write was in flight) wins.
     pub(crate) fn restore(&self, rows: Vec<(TouchKey, PendingRow)>) {
         let mut guard = self.guard();
         for (k, v) in rows {
@@ -154,19 +119,15 @@ impl RowDebounce {
         }
     }
 
-    /// Number of sessions currently awaiting birth. Diagnostic — the
-    /// integration tests pin the retry/drop budget through it.
+    /// Number of sessions awaiting birth; tests pin the retry budget with it.
     pub(crate) fn pending_len(&self) -> usize {
         self.guard().pending.len()
     }
 }
 
-/// A Postgres statement-level error is row-specific and deterministic
-/// for the same input (e.g. `22001` for an over-long `clientName`, which
-/// the SV1 path does not length-check), so it counts against
-/// [`MAX_BIRTH_ATTEMPTS`]. Everything else — pool exhaustion, IO, a
-/// restarting Postgres — is an outage: the row is fine, the retry is
-/// free, and dropping it would orphan the session's whole trace.
+/// A Postgres statement error is deterministic for the row (e.g. `22001`
+/// over-long `clientName`), so it counts against [`MAX_BIRTH_ATTEMPTS`].
+/// Anything else is an outage: retrying is free, dropping would orphan the row.
 fn is_row_error(e: &DbError) -> bool {
     matches!(e, DbError::Sqlx(sqlx::Error::Database(_)))
 }
@@ -199,10 +160,8 @@ pub(crate) async fn flush_once(debounce: &RowDebounce, pool: &PgPool, min_age: D
             n
         }
         Err(bulk_err) => {
-            // Per-row isolation. The bulk statement is all-or-nothing, so
-            // a single bad row (22001 over-long name) would otherwise
-            // block every session in the batch, and with unbounded retry
-            // every later batch too.
+            // The bulk statement is all-or-nothing: retry per row so one
+            // bad row cannot block the whole batch.
             warn!(
                 error = %bulk_err,
                 rows = due.len(),
@@ -248,12 +207,8 @@ pub(crate) async fn flush_once(debounce: &RowDebounce, pool: &PgPool, min_age: D
     }
 }
 
-/// Spawned birth-flush loop. Returns when `shutdown_rx` resolves.
-///
-/// No final drain on shutdown, unlike the touch flush: a front that is
-/// shutting down is closing its sockets, so every still-pending session
-/// is about to end and its row would only create work for
-/// `kill_dead_clients`.
+/// Birth-flush loop until `shutdown_rx` resolves. No final drain: every
+/// still-pending session is about to end with the shutdown anyway.
 pub(crate) async fn run_birth_loop(
     debounce: std::sync::Arc<RowDebounce>,
     pool: PgPool,
@@ -292,9 +247,7 @@ mod tests {
         d.register(&key(session, worker).address, worker, session, None, 1, now);
     }
 
-    /// The probe path: a session that deregisters while pending leaves
-    /// nothing behind, and `deregister` reports it was never born — the
-    /// caller must not issue the soft-delete statement for it.
+    /// A probe that deregisters while pending leaves nothing and owes no soft-delete.
     #[test]
     fn a_probe_leaves_no_pending_entry_and_no_born_flag() {
         let d = RowDebounce::default();
@@ -307,8 +260,7 @@ mod tests {
         assert!(d.drain_due(Duration::ZERO, now).is_empty());
     }
 
-    /// A born session is torn down exactly once: the first deregister
-    /// reports born (soft-delete runs), a duplicate does not.
+    /// A born session reports born on the first deregister only.
     #[test]
     fn deregister_reports_born_exactly_once() {
         let d = RowDebounce::default();
@@ -320,9 +272,7 @@ mod tests {
         assert!(!d.deregister("sessB001"), "second teardown is a no-op");
     }
 
-    /// A rental proxy re-registers the SAME session id under a second
-    /// worker name. Both pairs must pend independently, and one
-    /// deregister drops the whole session's trace.
+    /// Two workers on one session pend independently; one deregister drops both.
     #[test]
     fn two_workers_on_one_session_pend_independently() {
         let d = RowDebounce::default();
@@ -356,8 +306,7 @@ mod tests {
         assert_eq!(d.pending_len(), 1, "the young session keeps pending");
     }
 
-    /// `restore` must not clobber a fresher re-register of the same
-    /// triple that landed while the failed write was in flight.
+    /// `restore` does not clobber a fresher re-register of the same triple.
     #[test]
     fn restore_keeps_the_newer_entry() {
         let d = RowDebounce::default();

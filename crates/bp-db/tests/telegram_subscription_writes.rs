@@ -3,11 +3,8 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! Integration tests for the Telegram-subscription default-management
-//! primitives that back the `/show_addresses` inline keyboard:
-//! `upsert_telegram_subscription` (new address becomes default),
-//! `set_telegram_default_subscription`, and
-//! `promote_telegram_default_if_none`.
+//! Integration tests for the Telegram default-subscription primitives behind
+//! the `/show_addresses` keyboard and for the hourly flag toggles.
 
 use bp_common::AddressId;
 use bp_db::{

@@ -21,12 +21,8 @@ const WITNESS_COMMIT_MAGIC: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
 /// `0xffffffff`). Matches the value Core 31's template provider emits.
 const COINBASE_NONFINAL_SEQUENCE: u32 = 0xffff_fffe;
 
-/// A miner-payout entry for the coinbase outputs.
-///
-/// Carries the EXACT satoshi amount for the output. The payout distributors
-/// (PPLNS / Group-Solo / Blockparty) already do the precise integer allocation,
-/// so the coinbase builder places those sats verbatim; re-deriving them from a
-/// float percentage would floor each output and drop up to a sat per output.
+/// A miner-payout entry carrying the exact satoshis, placed verbatim:
+/// re-deriving them from a float percentage would drop up to a sat per output.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PayoutEntry {
     pub address: String,
@@ -45,14 +41,10 @@ impl PayoutEntry {
     }
 }
 
-/// A resolved payout list plus the identity of the distribution it was
-/// derived from — what a `PayoutResolver` hands the job build.
-///
-/// The fingerprint identifies the DISTRIBUTION (settlement inputs), not the
-/// satoshi list: one distribution yields different sats at different template
-/// revenues and all of them settle through one snapshot, so it travels WITH
-/// the entries instead of being derived from them. A zeroed fingerprint means
-/// "books without a snapshot" (Solo / Blockparty recompute on their own).
+/// A resolved payout list plus the fingerprint of the distribution behind it.
+/// The fingerprint travels with the entries because one distribution yields
+/// different sats at different revenues yet settles through one snapshot; a
+/// zeroed fingerprint means "books without a snapshot".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedPayouts {
     pub entries: Vec<PayoutEntry>,
@@ -69,15 +61,9 @@ impl ResolvedPayouts {
         }
     }
 
-    /// **No payout list at all — serve no job.**
-    ///
-    /// The answer for a mode whose distribution could not be built. A solo
-    /// list instead would pay a PPLNS or Group-Solo block entirely to the
-    /// connecting miner; withholding the job costs that miner some hashing
-    /// time and nobody else anything.
-    ///
-    /// SV1 then sends no `mining.notify` and SV2 yields no job inputs; the
-    /// miner keeps hashing whatever job it holds.
+    /// Serve no job: the answer when a mode's distribution could not be built.
+    /// A solo list instead would pay a PPLNS or Group-Solo block entirely to
+    /// the connecting miner; withholding the job costs only hashing time.
     pub fn none() -> Self {
         Self::unsnapshotted(Vec::new())
     }
@@ -93,25 +79,19 @@ impl ResolvedPayouts {
 pub struct CoinbaseTemplate {
     pub block_height: u32,
     pub coinbase_value_sats: u64,
-    /// 32-byte witness commitment hash, already double-SHA256'd by the
-    /// template provider (TDP `NewTemplate.witness_commitment` or RPC
-    /// `getblocktemplate.default_witness_commitment`).
+    /// Witness commitment hash, already double-SHA256'd by the template
+    /// provider.
     pub witness_commitment: [u8; 32],
 }
 
-/// A coinbase transaction split into its non-witness bytes before and
-/// after the extranonce slot. Per-share submission splices the
-/// miner-supplied extranonce in to compute the coinbase txid without
-/// re-building or mutating shared state.
-///
-/// `MiningJob` is immutable after construction — `&MiningJob` is `Send + Sync`.
+/// A coinbase split into its non-witness bytes before and after the
+/// extranonce slot, so each share splices its extranonce in without rebuilding
+/// or mutating shared state.
 #[derive(Clone, Debug)]
 pub struct MiningJob {
     coinbase_prefix: Vec<u8>,
     coinbase_suffix: Vec<u8>,
-    /// Lowercase-hex of `coinbase_prefix`/`coinbase_suffix`, precomputed once
-    /// because the job is shared and SV1 `mining.notify` borrows them for
-    /// every client.
+    /// Precomputed hex, because SV1 `mining.notify` borrows it for every client.
     coinbase_prefix_hex: String,
     coinbase_suffix_hex: String,
     /// Identity of the distribution this coinbase pays, so a block found on
@@ -134,14 +114,12 @@ impl MiningJob {
         &self.payouts_fingerprint
     }
 
-    /// Precomputed lowercase-hex of the coinbase prefix — the `coinb1` slot of
-    /// a `mining.notify`.
+    /// Hex of the coinbase prefix: the `coinb1` slot of a `mining.notify`.
     pub fn coinbase_prefix_hex(&self) -> &str {
         &self.coinbase_prefix_hex
     }
 
-    /// Precomputed lowercase-hex of the coinbase suffix — the `coinb2` slot of
-    /// a `mining.notify`.
+    /// Hex of the coinbase suffix: the `coinb2` slot of a `mining.notify`.
     pub fn coinbase_suffix_hex(&self) -> &str {
         &self.coinbase_suffix_hex
     }
@@ -150,8 +128,7 @@ impl MiningJob {
     /// scriptsig and return the resulting coinbase txid (sha256d of the
     /// non-witness serialization).
     pub fn coinbase_txid_with_extranonce(&self, enonce1: &[u8; 4], enonce2: &[u8; 8]) -> [u8; 32] {
-        // Stream the parts into the hasher: same txid as hashing the
-        // concatenation, without a per-share `Vec`.
+        // Streamed, so no per-share `Vec`.
         sha256d_from_parts(&[
             self.coinbase_prefix.as_slice(),
             enonce1.as_slice(),
@@ -160,13 +137,8 @@ impl MiningJob {
         ])
     }
 
-    /// Splice the extranonce in and return the **witness-form** coinbase
-    /// bytes for block submission (BIP-141 layout: marker `0x00` + flag
-    /// `0x01` inserted after version, 32-zero witness reserved value
-    /// inserted before locktime).
-    ///
-    /// Block-found path only; share validation needs just the non-witness
-    /// form (`coinbase_txid_with_extranonce`).
+    /// Splice the extranonce in and return the witness-form coinbase for block
+    /// submission; share validation needs only the non-witness txid.
     pub fn witness_coinbase_with_extranonce(
         &self,
         enonce1: &[u8; 4],
@@ -183,13 +155,10 @@ impl MiningJob {
     }
 }
 
-/// Convert a non-witness (stratum) coinbase into the witness form Bitcoin
-/// Core's `submitblock` expects: BIP-141 marker `0x00` + flag `0x01` right
-/// after `version`, and a single 32-zero-byte witness item (the coinbase
-/// input's mandatory reserved value) right before `locktime`.
-///
-/// The one implementation of that layout, shared by SV1
-/// ([`MiningJob::witness_coinbase_with_extranonce`]), SV2 and the JDP block path.
+/// Convert a non-witness coinbase into the BIP-141 witness form `submitblock`
+/// expects (marker + flag after `version`, the 32-zero reserved value before
+/// `locktime`). The one implementation, shared by SV1
+/// ([`MiningJob::witness_coinbase_with_extranonce`]), SV2 and JDP.
 pub fn assemble_witness_coinbase(stratum_coinbase: &[u8]) -> Vec<u8> {
     debug_assert!(
         stratum_coinbase.len() >= 8,
@@ -223,28 +192,10 @@ pub enum MiningJobError {
     NoPayouts,
 }
 
-/// Build a `MiningJob` for the given template + payouts.
-///
-/// Scriptsig layout: BIP-34 height push, pool identifier (dropped if it
-/// would exceed the 100-byte consensus limit), `extranonce_slot_size`
-/// bytes for the extranonce slot (zeroed at build time, spliced per
-/// share).
-///
-/// `extranonce_slot_size` is the total channel-negotiated extranonce width:
-/// SV1 passes [`EXTRANONCE_SLOT_LEN`], SV2 Extended passes
-/// `channel.extranonce_prefix.len() + channel.extranonce_size`, so the
-/// scriptsig_len varint matches the wire bytes exactly.
-///
-/// Each `PayoutEntry`'s sats are placed verbatim; any shortfall vs
-/// `coinbase_value_sats` (normally zero) is swept onto `outs[0]`.
-///
-/// The coinbase is BIP-54-compliant: `nLockTime = block_height - 1` and a
-/// non-final `nSequence`. The TDP path ([`build_mining_job_from_tdp`]) takes
-/// Core's `NewTemplate` values instead.
-///
-/// `payouts_fingerprint` identifies the DISTRIBUTION behind this coinbase
-/// (see `ResolvedPayouts`); `[0u8; 32]` means "no settlement behind this
-/// job", e.g. a preview.
+/// Build a `MiningJob` (RPC path). The pool identifier is dropped if the
+/// scriptsig would exceed the consensus limit; `extranonce_slot_size` is the
+/// full negotiated width so the scriptsig varint matches the wire. BIP-54:
+/// `nLockTime = height - 1` and a non-final `nSequence`.
 pub fn build_mining_job(
     network: Network,
     payouts: &[PayoutEntry],
@@ -262,8 +213,6 @@ pub fn build_mining_job(
     let padding_len = extranonce_slot_size + 3usize.saturating_sub(height_len);
     let padding = vec![0u8; padding_len];
 
-    // Try with identifier first; drop it if the resulting scriptsig would
-    // exceed the consensus limit.
     let identifier_bytes = pool_identifier.as_bytes();
     let mut script_sig = build_scriptsig(&height_encoded, identifier_bytes, &padding);
     if script_sig.len() > MAX_SCRIPT_SIZE {
@@ -280,9 +229,7 @@ pub fn build_mining_job(
         &template.witness_commitment,
     )?;
 
-    // BIP-54: nLockTime = block_height - 1, non-final nSequence. Prefix and
-    // suffix are serialized directly; the extranonce slot between them is
-    // spliced per share and never materialized.
+    // The extranonce slot between prefix and suffix is never materialized.
     let locktime = template.block_height.saturating_sub(1);
     let coinbase_prefix = serialize_coinbase_prefix(
         2,
@@ -308,53 +255,27 @@ pub fn build_mining_job(
     })
 }
 
-/// TDP-side template fields needed for coinbase assembly.
-///
-/// The relevant `template_distribution_sv2::NewTemplate` fields, taken
-/// verbatim. The required outputs blob is typically just the
-/// witness-commitment OP_RETURN, already computed by bitcoin-core.
+/// The `NewTemplate` fields needed for coinbase assembly, taken verbatim.
 #[derive(Clone, Debug)]
 pub struct TdpCoinbaseTemplate<'a> {
-    /// `NewTemplate.coinbase_prefix` — BIP-34 height push + any data
-    /// bitcoin-core was configured to inject. The pool identifier and the
+    /// BIP-34 height push plus any Core-injected data; the pool identifier and
     /// extranonce slot are appended after it.
     pub coinbase_prefix: &'a [u8],
-    /// `NewTemplate.coinbase_tx_version` — typically 2.
     pub coinbase_tx_version: u32,
-    /// `NewTemplate.coinbase_tx_input_sequence` — typically 0xFFFFFFFF or
-    /// 0xFFFFFFFE.
     pub coinbase_tx_input_sequence: u32,
-    /// `NewTemplate.coinbase_tx_value_remaining` — subsidy + fees minus
-    /// the value already allocated to bitcoin-core's required outputs.
-    /// This is what gets split across the payout entries.
+    /// Value left after Core's required outputs: what the payouts split.
     pub coinbase_tx_value_remaining: u64,
-    /// `NewTemplate.coinbase_tx_outputs` — raw concatenated TxOut bytes
-    /// (each output = 8-byte LE value + scriptlen varint + script).
-    /// **NOT** prefixed with an output-count varint; the count lives in
-    /// `coinbase_tx_outputs_count` separately.
+    /// Raw concatenated TxOuts, without an output-count varint (the count is
+    /// `coinbase_tx_outputs_count`).
     pub coinbase_tx_outputs: &'a [u8],
-    /// `NewTemplate.coinbase_tx_outputs_count` — number of TxOuts encoded
-    /// in `coinbase_tx_outputs`. Added to the payout count to form the
-    /// final coinbase's output-count varint.
     pub coinbase_tx_outputs_count: u32,
-    /// `NewTemplate.coinbase_tx_locktime` — typically 0.
     pub coinbase_tx_locktime: u32,
 }
 
-/// Build a `MiningJob` from a TDP `NewTemplate`'s coinbase fields plus
-/// the pool's per-job payout split.
-///
-/// Differences from [`build_mining_job`]:
-///
-/// - The scriptsig starts with `template.coinbase_prefix` (BIP-34 height
-///   already encoded by bitcoin-core); only the pool identifier (if it
-///   fits) and the extranonce slot are appended.
-/// - Output order is `[payout_0, …, payout_N-1, tdp_outputs…]`, the
-///   template outputs copied verbatim.
-/// - `version`, `input_sequence`, and `locktime` come from the template.
-///
-/// The returned `MiningJob` has the same prefix/suffix split as
-/// `build_mining_job`, so the share and block-found paths work identically.
+/// Build a `MiningJob` from a TDP `NewTemplate`: the scriptsig extends the
+/// template's prefix, payouts come before the template outputs, and
+/// version / sequence / locktime come from the template. Same prefix/suffix
+/// split as [`build_mining_job`].
 pub fn build_mining_job_from_tdp(
     network: Network,
     payouts: &[PayoutEntry],
@@ -367,9 +288,8 @@ pub fn build_mining_job_from_tdp(
         return Err(MiningJobError::NoPayouts);
     }
 
-    // Scriptsig first, outputs second: the error precedence
-    // NoPayouts → ScriptSigTooLong → InvalidAddress matches
-    // `MiningJobCache`, so both report the same cause for the same inputs.
+    // Scriptsig before outputs: NoPayouts → ScriptSigTooLong → InvalidAddress,
+    // as in `MiningJobCache`, so both report the same cause for the same inputs.
     let script_sig = checked_tdp_scriptsig(
         template.coinbase_prefix,
         pool_identifier,
@@ -388,11 +308,9 @@ pub fn build_mining_job_from_tdp(
     ))
 }
 
-/// Build the TDP scriptsig (template prefix + pool identifier +
-/// extranonce slot), dropping the identifier if the result would exceed
-/// the 100-byte consensus limit, as `build_mining_job` does. Shared so
-/// [`crate::cache::MiningJobCache`] runs the same check in the same order
-/// as [`build_mining_job_from_tdp`].
+/// Build the TDP scriptsig, dropping the pool identifier if it would exceed
+/// the consensus limit. Shared so [`crate::cache::MiningJobCache`] runs the
+/// same check in the same order as [`build_mining_job_from_tdp`].
 pub(crate) fn checked_tdp_scriptsig(
     tdp_prefix: &[u8],
     pool_identifier: &str,
@@ -409,11 +327,9 @@ pub(crate) fn checked_tdp_scriptsig(
     Ok(script_sig)
 }
 
-/// Assemble a `MiningJob` from an ALREADY-CHECKED scriptsig and
-/// ALREADY-BUILT payout outputs ([`checked_tdp_scriptsig`],
-/// [`build_payout_outputs`]), so [`crate::cache::MiningJobCache`] can reuse
-/// parsed outputs across builds that differ only in slot size / template
-/// coinbase fields. Serialization itself cannot fail.
+/// Assemble a `MiningJob` from an already-checked scriptsig and already-built
+/// outputs, so [`crate::cache::MiningJobCache`] can reuse parsed outputs across
+/// builds that differ only in slot size or template fields.
 pub(crate) fn assemble_tdp_job(
     script_sig: Vec<u8>,
     payout_outputs: &[(u64, Vec<u8>)],
@@ -426,8 +342,6 @@ pub(crate) fn assemble_tdp_job(
     let total_output_count =
         payout_outputs.len() as u64 + u64::from(template.coinbase_tx_outputs_count);
 
-    // Prefix and suffix are serialized directly; the extranonce slot between
-    // them is spliced per share and never materialized.
     let coinbase_prefix = serialize_coinbase_prefix(
         template.coinbase_tx_version,
         &script_sig[..script_sig.len() - extranonce_slot_size],
@@ -460,15 +374,9 @@ fn build_tdp_scriptsig(tdp_prefix: &[u8], identifier: &[u8], slot_len: usize) ->
     s
 }
 
-/// Serialize the coinbase **prefix**: everything up to (but not including) the
-/// extranonce slot — version, input count, null prev-outpoint, the scriptsig
-/// length varint, and `scriptsig_head`, the scriptsig bytes *before* the slot.
-///
-/// `scriptsig_len` is the **full** scriptsig length, including the extranonce
-/// slot that the per-share path splices in after the head.
-///
-/// The one implementation of this layout: the pool's own jobs build it here,
-/// and so does SV2's `SetCustomMiningJob`, whose head comes from the JDC.
+/// Serialize the coinbase up to the extranonce slot. `scriptsig_len` is the
+/// full length including the slot spliced in per share. The one implementation,
+/// shared with SV2's `SetCustomMiningJob`, whose head comes from the JDC.
 pub fn serialize_coinbase_prefix(
     version: u32,
     scriptsig_head: &[u8],
@@ -489,10 +397,8 @@ pub fn serialize_coinbase_prefix(
     buf
 }
 
-/// Serialize the coinbase **suffix**: everything from nSequence on — input
-/// sequence, output-count varint, the payout outputs, any template-provided raw
-/// outputs (TDP path; empty on the RPC path), and locktime. Counterpart to
-/// [`serialize_coinbase_prefix`].
+/// Serialize the coinbase from nSequence on; counterpart to
+/// [`serialize_coinbase_prefix`]. `raw_extra_outputs` is empty on the RPC path.
 fn serialize_coinbase_suffix(
     input_sequence: u32,
     total_output_count: u64,
@@ -539,25 +445,20 @@ pub(crate) fn build_payout_outputs(
     let mut total_paid: u64 = 0;
 
     for p in payouts {
-        // Exact sats from the distributor, placed verbatim.
         let amount = p.sats;
         total_paid = total_paid.saturating_add(amount);
         let script = address::address_to_script(network, &p.address)?.into_bytes();
         outputs.push((amount, script));
     }
 
-    // Consume EXACTLY `reward_sats` so the coinbase is never bad-cb-amount.
-    // The distributors already sum to the reward; this is a defensive guard.
+    // Consume exactly `reward_sats`, so the coinbase is never bad-cb-amount.
     match total_paid.cmp(&reward_sats) {
-        // Undershoot: sweep the shortfall onto the first output so the full
-        // reward is claimed.
+        // Sweep a shortfall onto the first output so the full reward is claimed.
         std::cmp::Ordering::Less => {
             outputs[0].0 = outputs[0].0.saturating_add(reward_sats - total_paid);
         }
-        // Overshoot must never happen (all allocators bound the sum at the
-        // reward). An over-value coinbase would make a found block invalid, so
-        // the excess is trimmed off the trailing outputs; `debug_assert` keeps
-        // the invariant loud in tests.
+        // Never expected; an over-value coinbase would invalidate a found
+        // block, so trim the excess off the trailing outputs.
         std::cmp::Ordering::Greater => {
             debug_assert!(
                 false,
@@ -600,10 +501,8 @@ fn build_outputs(
     Ok(outputs)
 }
 
-/// BIP-34 minimal CScriptNum encoding of a positive block height.
-/// Strips trailing zero bytes (high-order in LE) and appends a 0x00 sign
-/// disambiguator if the most-significant byte's high bit would otherwise
-/// indicate a negative number.
+/// BIP-34 minimal CScriptNum encoding of a positive block height; a 0x00 is
+/// appended when the top bit would otherwise read as negative.
 fn encode_block_height_minimal(height: u32) -> Vec<u8> {
     if height == 0 {
         return vec![];
@@ -654,15 +553,9 @@ impl Default for SoloFeeConfig {
     }
 }
 
-/// Solo-mode coinbase split — the ONE implementation.
-///
-/// Shared by the payout resolver that builds the real coinbase and the
-/// `/api/client/:address/block-template` preview, so the preview shows
-/// exactly the outputs the miner's job carries.
-///
-/// 100%-to-miner, or `dev_fee_percent` to dev + remainder to miner. The dev
-/// fee floors and the miner takes the remainder, so both outputs sum to
-/// exactly `reward_sats`.
+/// Solo-mode coinbase split, shared by the payout resolver and the
+/// block-template preview so the preview shows exactly the job's outputs. The
+/// dev fee floors and the miner takes the remainder, so the sum is exact.
 pub fn solo_payouts(
     miner_address: &str,
     fee: &SoloFeeConfig,
@@ -684,7 +577,6 @@ pub fn solo_payouts(
         (true, _) => vec![],
         (false, None) => full_to_miner(),
         (false, Some(_dev)) if !(0.0..=100.0).contains(&percent) => {
-            // Defensive: out-of-range dev percent → ignore the fee, full to miner.
             warn!(
                 percent,
                 "solo dev_fee_percent out of [0,100]; ignoring fee + paying 100% to miner"
@@ -692,9 +584,7 @@ pub fn solo_payouts(
             full_to_miner()
         }
         (false, Some(_dev)) if percent <= 0.0 => {
-            // Dev address set but a zero (or negative) percent (the default is
-            // 0.0): a 0 % dev output would be a useless zero-value output, so
-            // the whole reward goes to the miner.
+            // No zero-value dev output.
             full_to_miner()
         }
         (false, Some(dev)) => {
@@ -715,10 +605,7 @@ pub fn solo_payouts(
 mod tests {
     use super::*;
 
-    /// Pin the BIP-141 witness layout: marker `0x00` + flag `0x01`
-    /// right after the 4-byte `version`, then a 1-byte witness-stack
-    /// length (`0x01`) + 1-byte item length (`0x20`) + 32 zero bytes
-    /// inserted right before the trailing 4-byte `locktime`.
+    /// Pins the BIP-141 witness layout byte by byte.
     #[test]
     fn assemble_witness_coinbase_pins_bip141_layout() {
         // Minimal coinbase: 4B version + 4B body + 4B locktime = 12B.
@@ -1106,8 +993,6 @@ mod tests {
         assert!(!scriptsig.windows(10).any(|w| w == xxx));
     }
 
-    // Small helper shim because rust-bitcoin's `Amount` doesn't expose
-    // `to_sat_value` — readability of the assertion above.
     trait ToSatVal {
         fn to_sat_value(&self) -> u64;
     }
@@ -1148,9 +1033,7 @@ mod tests {
         (prefix, outputs)
     }
 
-    /// The direct prefix/suffix serialization produces exactly the bytes of
-    /// serializing the whole coinbase and slicing around the extranonce slot;
-    /// the oracle below does the latter.
+    /// The direct prefix/suffix equal the full coinbase sliced around the slot.
     #[test]
     fn tdp_direct_split_matches_full_serialize_then_split() {
         let (prefix, outputs) = tdp_template_for([0x5A; 32]);
@@ -1622,8 +1505,7 @@ mod solo_split_tests {
         assert_eq!(out[0].sats, REWARD);
     }
 
-    /// A configured fee does split, and the two outputs sum to exactly the
-    /// reward — the coinbase must not lose or invent a satoshi.
+    /// A configured fee splits, and the two outputs sum to exactly the reward.
     #[test]
     fn a_configured_dev_fee_splits_and_conserves_every_satoshi() {
         let out = solo_payouts("bc1qminer", &fee(Some("bc1qdev"), 1.0), REWARD);

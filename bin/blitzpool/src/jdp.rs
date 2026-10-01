@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! JDP server wiring: one listener on `[sv2].jdp_port`, each socket handed to
-//! [`StratumV2JdpServer::accept_connection`] (no protocol detection).
-//!
+//! JDP server wiring: one listener on `[sv2].jdp_port`, no protocol detection.
 //! The [`TemplateTxCache`]-backed tx provider runs only with
-//! `[sv2].jdp_orphan_submitblock = true`, since only then does the pool need
-//! the declared tx bytes. JDP is off unless `[sv2].jdp_enabled = true`.
+//! `[sv2].jdp_orphan_submitblock = true`, the one case that needs the declared
+//! tx bytes.
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;

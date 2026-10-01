@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Projects SV2's native share types into the protocol-agnostic
-//! `bp_share_hook` views the server hands its sinks.
-//!
-//! Symmetric counterpart to `bp_stratum_v1`'s `shared_adapter`. See the
-//! `bp-share-hook` crate-level docs for the architecture.
+//! `bp_share_hook` views the server hands its sinks; the SV1 twin is
+//! `bp_stratum_v1`'s `shared_adapter`.
 
 use bp_share::Difficulty;
 use bp_share_hook::{RejectedReason, SharedAcceptedShare, SharedRejectedShare};
@@ -42,11 +40,8 @@ pub(crate) fn shared_accepted<'a>(
     }
 }
 
-/// Maps SV2's per-protocol reject reasons onto the canonical
-/// `bp_stats::RejectedReason`. `None` for the protocol-validity rejects
-/// that do not count toward the per-address rejected-stats.
-/// `BadExtranonceSize` is a pre-share-validation reject and never reaches
-/// this in practice.
+/// Maps SV2's reject reasons onto the canonical `RejectedReason`; `None` for
+/// protocol-validity rejects, which the per-address rejected-stats do not count.
 fn map_sv2_reject(reason: RejectReason) -> Option<RejectedReason> {
     match reason {
         // A share for a retired job is stale; one for a job the channel
@@ -55,9 +50,6 @@ fn map_sv2_reject(reason: RejectReason) -> Option<RejectedReason> {
         RejectReason::InvalidJobId => Some(RejectedReason::JobNotFound),
         RejectReason::DuplicateShare => Some(RejectedReason::DuplicateShare),
         RejectReason::DifficultyTooLow => Some(RejectedReason::LowDifficulty),
-        // Channel-id rejects + bad-extranonce-size are protocol-validity
-        // failures, not share-correctness ones — they don't count toward
-        // the per-address rejected-stats counters.
         RejectReason::InvalidChannelId | RejectReason::BadExtranonceSize => None,
     }
 }
@@ -136,9 +128,7 @@ mod tests {
         assert!(shared_accepted("a", "w", "s", None, &accept, 0.0, 1).is_block_candidate);
     }
 
-    /// The projection is the birth point of `ts_ms` — it must stamp the
-    /// Core accept time so downstream sinks (and the Core→Satellite stream)
-    /// carry the real share time instead of a sink-side `now()`.
+    /// `ts_ms` is stamped at accept time, not at a downstream sink.
     #[test]
     fn stamps_accept_time() {
         let before = bp_common::now_ms();

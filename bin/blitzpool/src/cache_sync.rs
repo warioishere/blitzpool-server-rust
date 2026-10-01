@@ -1,21 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Cross-process routing-cache sync.
-//!
-//! Group-Solo and Blockparty membership live in per-process routing caches
-//! the Stratum mode gate reads, but the API writers and the Front are
-//! separate processes.
-//!
-//! - **Publish** ([`StreamCacheNotifier`]): the writer `XADD`s a
-//!   [`CacheInvalidation`] to `cache:invalidate` after every membership
-//!   mutation (via [`bp_group_mgmt_engine::MembershipChangeNotifier`]).
-//! - **Consume + backstop** ([`spawn`]): the Front drains the stream from
-//!   the tail (it warmed from the DB at boot) and rebuilds the matching
-//!   cache, and rebuilds both on a timer so a missed event self-heals.
-//!
-//! The same stream carries [`cache_kind::SETTLEMENT`]: the ext 0x0003
-//! payout registry lives on the Front, and `payout` books blocks. See
-//! [`crate::settlement`], including why that kind has no backstop.
+//! Cross-process routing-cache sync: API writers publish membership
+//! invalidations to `cache:invalidate` ([`StreamCacheNotifier`]), the Front
+//! rebuilds the matching cache plus a timed backstop ([`spawn`]). The stream
+//! also carries [`cache_kind::SETTLEMENT`], see [`crate::settlement`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,19 +25,10 @@ use bp_mining_mode::MiningModeResult;
 use crate::engines::BlitzpoolModeGate;
 use crate::group_service::SharedGroupService;
 
-/// Consumer group for the Front's invalidation drain.
-///
-/// ⚠️ **One group shared by every front, so exactly ONE front may consume
-/// it** (operator decision: the pool runs one front). A consumer group
-/// hands each entry to one consumer, so a second front would miss entries:
-/// the 60 s [`BACKSTOP_INTERVAL`] covers membership, but
-/// [`cache_kind::SETTLEMENT`] has no backstop, and a missed one keeps a
-/// pre-settlement payout distribution current for up to one publish
-/// interval.
-///
-/// Reaching every front needs a group per front (distinct consumer names
-/// in one group still split entries) or a plain tail `XREAD`.
-/// `two_consumers_in_one_group_split_the_entries` pins the semantics.
+/// Consumer group for the Front's invalidation drain. ⚠️ Exactly ONE front
+/// may consume it: a group splits entries between consumers, and a missed
+/// [`cache_kind::SETTLEMENT`] (no backstop) keeps a pre-settlement payout
+/// distribution current. More fronts need a group each or a plain `XREAD`.
 const GROUP: &str = "cache-sync-front";
 const CONSUMER: &str = "c1";
 const BATCH: usize = 32;
@@ -185,11 +164,10 @@ pub(crate) fn spawn(
     CacheSyncHandle { task, cancel }
 }
 
-/// §10: a block settled on another process. Every distribution this Front
-/// published encodes pre-settlement balances, so their acceptance window
-/// closes now; declaring against them would pay those balances twice.
-/// Reads no database: the registry bumps its settlement epoch and the JDP
-/// publisher pushes a fresh distribution.
+/// ext 0x0003/Implementation Notes: a block settled on another process.
+/// Every distribution this Front published encodes pre-settlement balances,
+/// so their acceptance window closes now; declaring against them would pay
+/// those balances twice.
 fn invalidate_payout_distributions(
     registry: &Arc<std::sync::OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>>,
 ) {
@@ -214,16 +192,10 @@ async fn rebuild_group(group: &SharedGroupService, gate: &Arc<BlitzpoolModeGate>
     reconcile_gate_modes(group, gate).await;
 }
 
-/// After a membership change, flip the **live** mode gate for connected
-/// miners so their shares route correctly without a reconnect:
-///
-/// - `Solo` miner now in an active group → `GroupSolo` (its authorize-time
-///   mode stays Solo otherwise; this makes an approved join take effect
-///   from the next share),
-/// - `GroupSolo` miner no longer in an active group → `Solo` (left /
-///   kicked / dissolved).
-///
-/// Runs on every group invalidation and on the backstop.
+/// Flip the **live** mode gate of connected miners after a membership change
+/// so an approved join or a leave takes effect from the next share, without
+/// a reconnect: `Solo` in an active group becomes `GroupSolo`, `GroupSolo`
+/// in none becomes `Solo`.
 async fn reconcile_gate_modes(group: &SharedGroupService, gate: &Arc<BlitzpoolModeGate>) {
     let cache = group.service.address_cache();
     let (mut upgraded, mut downgraded) = (0u32, 0u32);
@@ -271,9 +243,7 @@ mod tests {
     use super::*;
     use bp_test_support::{connect_redis_in_range_or_skip, redis_db};
 
-    /// The notifier publishes `group` + `blockparty` invalidations onto the
-    /// stream, and a consumer reads them back intact — the exact path the Front
-    /// drains to rebuild its routing caches.
+    /// Published `group` + `blockparty` invalidations read back intact.
     #[tokio::test]
     async fn notifier_publishes_invalidations_a_consumer_reads() {
         let Some(redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 12).await else {
@@ -302,11 +272,7 @@ mod tests {
         assert_eq!(kinds, vec!["group".to_string(), "blockparty".to_string()]);
     }
 
-    /// The constraint behind [`GROUP`]: two consumers in ONE group SPLIT the
-    /// entries — they do not each get a copy.
-    ///
-    /// Asserted on the TOTAL number of deliveries: the property is "each
-    /// entry is delivered once, not once per front", not who wins a race.
+    /// The constraint behind [`GROUP`]: two consumers in ONE group split the entries.
     #[tokio::test]
     async fn two_consumers_in_one_group_split_the_entries() {
         let Some(redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 1).await else {
@@ -347,9 +313,7 @@ mod tests {
         );
     }
 
-    /// MONEY / ext 0x0003 §10: a settlement crosses the process boundary.
-    /// `payout` books the block with no local registry and publishes; the
-    /// `front`, which holds the registry, receives and invalidates.
+    /// MONEY: a settlement on `payout` invalidates the registry on `front`.
     #[tokio::test]
     async fn a_settlement_on_one_process_invalidates_the_registry_on_another() {
         use bp_stratum_v2::bridge::{JdpDeclaredJobRegistry, PayoutDistributionEntry};

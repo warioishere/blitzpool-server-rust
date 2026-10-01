@@ -1,29 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Per-route per-IP rate-limiting middleware.
-//!
-//! Applied per route on the rate-limited endpoints (email register
-//! 5/min, invitation accept/decline 20/min each, etc.). Each call to
-//! [`per_minute`] allocates its own `GovernorConfig`, so a 5/min
-//! limit on `/api/email/register` and a 5/min limit on
-//! `/api/groups/:id/invitations/open` count independently.
-//!
-//! ### Key extraction
-//!
-//! [`SmartIpKeyExtractor`] reads `x-forwarded-for` → `x-real-ip` →
-//! `Forwarded` → peer-addr in that order. **Operator note:** in
-//! production behind a reverse proxy, that proxy must set one of
-//! those headers — otherwise every request shares the proxy's IP and
-//! the bucket throttles the whole deployment. The peer-addr fallback
-//! relies on a `ConnectInfo<SocketAddr>` request extension; the
-//! production server wires it via `into_make_service_with_connect_info`
-//! so direct hits (no proxy header) key on the real peer IP instead of
-//! failing. Where neither a header nor `ConnectInfo` is present — e.g.
-//! a tower `oneshot` test that bypasses the connection layer — the
-//! extractor cannot resolve a key and the layer responds with HTTP 500
-//! (see [`tower_governor::GovernorError::UnableToExtractKey`]). The
-//! smoke tests therefore set `x-forwarded-for: 127.0.0.1` on any
-//! request that traverses a rate-limited route.
+//! Per-route per-IP rate limiting; each [`per_minute`] call has its own
+//! bucket. [`SmartIpKeyExtractor`] keys on the proxy headers, then the peer
+//! address: a reverse proxy must set one, or the whole deployment shares one
+//! bucket. With neither (e.g. a `oneshot` test) the layer answers 500.
 
 use std::sync::Arc;
 use std::time::Duration;

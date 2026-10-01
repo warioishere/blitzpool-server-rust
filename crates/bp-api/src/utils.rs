@@ -4,16 +4,8 @@
 //! share the same wire-shape transforms (email masking, etc.) without
 //! drifting per-file.
 
-/// Mask an email for over-the-wire exposure.
-///
-/// Format: `<first-char-local>***@<first-char-SLD>***<tld-and-below>`.
-///
-/// - `alice@gmail.com` → `a***@g***.com`
-/// - `bob@sub.example.co.uk` → `b***@s***.example.co.uk`
-/// - empty string → empty string
-/// - missing `@` → `***`
-/// - `@x.com` / `a@` (empty local or domain) → `***`
-/// - `a@nodomain` (no dot in domain) → `a***@***`
+/// Mask an email for over-the-wire exposure: `alice@gmail.com` →
+/// `a***@g***.com`. Malformed input collapses to `***`.
 pub fn mask_email(email: &str) -> String {
     if email.is_empty() {
         return String::new();
@@ -43,13 +35,8 @@ pub fn mask_email(email: &str) -> String {
 
 // ─── Member pseudonymisation ───────────────────────────────────────
 //
-// The Group-Solo and Blockparty detail endpoints are anonymous (a group id alone opens them), so
-// they must never hand out a member's full payout address — the id would then
-// be a scraper key for every member's on-chain address. Instead each member is
-// exposed as an opaque `memberId` (the stable join key the UI uses across the
-// detail endpoints) plus a masked `addressLabel` for display. The full address
-// never leaves the server; the viewer's own row is flagged via `?viewer=`, and
-// the UI already knows its own address (from the route) for the self-link.
+// The group detail endpoints open on a group id alone, so a full member
+// address there would make the id a scraper key for every member's payouts.
 
 /// Opaque, stable per-(group, member) id. Deterministic so every detail
 /// endpoint produces the same id for the same member (the UI joins on it), and
@@ -64,11 +51,8 @@ pub(crate) fn member_id(group_id: uuid::Uuid, address: &str) -> String {
     hex::encode(&h.finalize()[..8]) // 64-bit → collision-free within a group
 }
 
-/// Masked labels for a group's members, guaranteed unique within the group.
-/// Base = last-5 (like the UI); if two members would collapse to the same
-/// label, both are widened to last-9, which makes an intra-group visual
-/// collision astronomically unlikely. (The `memberId` join is collision-free
-/// regardless — this only keeps two rows from *looking* identical.)
+/// Masked labels for a group's members: last-5 like the UI, widened to last-9
+/// for members whose labels would collide, so two rows never look identical.
 pub(crate) fn build_member_labels(
     addresses: &[String],
 ) -> std::collections::HashMap<String, String> {

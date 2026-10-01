@@ -2,12 +2,9 @@
 
 #![allow(clippy::print_stderr)]
 
-//! Integration test for the custom-extranonce Solo-eligibility guard.
-//!
-//! The core applies overrides only on the Solo stream, so the API must reject
-//! addresses it can determine are non-Solo — group / Group-Solo / Blockparty
-//! members — instead of persisting an override the core would silently drop.
-//! Runs against a real PG (skips if none reachable), mirroring `smoke.rs`.
+//! Custom-extranonce endpoints against a real PG. The core applies overrides
+//! only on the Solo stream, so the API must reject non-Solo addresses instead
+//! of persisting an override the core would silently drop.
 
 use std::sync::Arc;
 
@@ -406,13 +403,8 @@ async fn set_requires_the_bearer_header() {
     assert_eq!(js["code"], "missing-token");
 }
 
-/// `/api/client/:address` carries the stored prefix per worker, so the customer
-/// sees on their own address page which workers run on a custom extranonce and
-/// which on the pool-allocated one.
-///
-/// Both directions are asserted in one test: the configured worker shows its
-/// prefix AND the unconfigured one shows `null`. Without the second assertion
-/// this would still pass if the field were filled unconditionally.
+/// `/api/client/:address` reports the stored prefix per worker, and `null` for
+/// a worker without one (so a field filled unconditionally fails).
 #[tokio::test]
 async fn client_address_reports_the_custom_extranonce_per_worker() {
     let Some(pool) = connect_or_skip().await else {

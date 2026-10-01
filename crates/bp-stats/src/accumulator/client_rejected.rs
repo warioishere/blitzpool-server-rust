@@ -66,11 +66,7 @@ impl ClientRejectedAccumulator {
         }
     }
 
-    /// Hot-path: record a rejected share. `count` defaults to 1.0 per
-    /// share; `diff` is the diff-1 weight that's also written to
-    /// `client_statistics` via [`ClientStatisticsAccumulator`].
-    ///
-    /// [`ClientStatisticsAccumulator`]: crate::accumulator::client_statistics::ClientStatisticsAccumulator
+    /// `diff` is the same diff-1 weight `ClientStatisticsAccumulator` records.
     pub fn add(&self, key: ClientRejectedKey, count: f64, diff: f64) {
         if !count.is_finite() || !diff.is_finite() {
             return;
@@ -100,8 +96,6 @@ impl ClientRejectedAccumulator {
     }
 
     pub fn confirm(&self, snapshot: &ClientRejectedSnapshot) {
-        // Convert back into the internal record shape for the buffer's
-        // sub-assign-clamped contract.
         let internal: HashMap<_, _> = snapshot
             .iter()
             .map(|(k, v)| {

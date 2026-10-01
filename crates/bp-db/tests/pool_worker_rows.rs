@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `find_pool_worker_rows_since` is the skinny projection behind
-//! `/api/info/workers` (slot time + address + worker only). This test pins its
-//! row set: it returns exactly the non-soft-deleted rows at or after `since`,
-//! with the identity columns the in-process distinct-counting needs.
+//! Pins the row set of `find_pool_worker_rows_since`: exactly the
+//! non-soft-deleted rows at or after `since`.
 
 use std::collections::HashSet;
 
@@ -12,9 +10,7 @@ use sqlx::{postgres::PgPoolOptions, PgPool};
 
 const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
 
-// Test-only skip diagnostics: the workspace denies `print_stderr` for
-// production code, but printing why an integration test skipped (no local PG)
-// is exactly what stderr is for here.
+// Printing why an integration test skipped is what stderr is for here.
 #[allow(clippy::print_stderr)]
 async fn connect_or_skip() -> Option<PgPool> {
     let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
@@ -78,9 +74,7 @@ async fn skinny_reader_returns_active_rows_in_window() {
         .await
         .expect("skinny reader")
         .into_iter()
-        // Scope to this test's fixture so unrelated rows in the shared DB
-        // (this runs in a rolled-back tx, but other data may pre-exist) don't
-        // leak in.
+        // Pre-existing rows in the shared DB must not leak in.
         .filter(|r| r.address.starts_with("bp_pwr_"))
         .map(|r| (r.address, r.client_name, r.time))
         .collect();

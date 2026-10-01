@@ -7,8 +7,7 @@ use std::path::PathBuf;
 /// Where the RPC client connects to and how it authenticates.
 #[derive(Clone, Debug)]
 pub struct BitcoinRpcConfig {
-    /// Full base URL — `http://127.0.0.1:8332` for mainnet, `:18332`
-    /// for testnet, `:18443` for regtest. No trailing slash.
+    /// Base URL without trailing slash.
     pub url: String,
     pub auth: RpcAuth,
     /// Per-request timeout. `None` = `reqwest` default (~30s).
@@ -18,9 +17,8 @@ pub struct BitcoinRpcConfig {
 /// JSON-RPC authentication mode.
 #[derive(Clone, Debug)]
 pub enum RpcAuth {
-    /// Cookie file path, typically `<datadir>/.cookie`. Read on every
-    /// connect so a restarting bitcoind (which rotates its cookie) doesn't
-    /// strand long-lived clients. Format: `__cookie__:<random-hex>`.
+    /// Cookie file path. Read on every connect because bitcoind rotates the
+    /// cookie on restart.
     Cookie(PathBuf),
     /// Static credentials from `bitcoin.conf` (`rpcuser` / `rpcpassword`).
     UserPassword { user: String, password: String },

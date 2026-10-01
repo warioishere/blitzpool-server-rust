@@ -1,23 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Outbound-email hook trait. The invitation + join-request services
-//! call into this for the three transactional email kinds (invitation
-//! / approved / rejected). Production wiring routes through
-//! `bp-notifications::adapter::smtp::SmtpAdapter` +
-//! `bp-notifications::template::*`.
-//!
-//! Best-effort: failed sends are logged and swallowed by the caller.
-//! A trait so tests can swap in [`CapturingEmailHooks`] to
-//! assert what would have been sent without standing up SMTP.
+//! Outbound-email hook for invitation and join-decision mails. A trait so
+//! tests can assert sends with [`CapturingEmailHooks`] without SMTP.
 
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 
-/// Data passed to [`EmailHooks::send_invitation`] for a freshly-created
-/// directed invitation. The hook owner is responsible for picking the
-/// right template (`bp-notifications::template::invitation::*`) and
-/// putting the URL together from `accept_url` (already includes the
-/// hash-prefix `/#/invite/<token>` segment used by the SPA).
+/// Data for [`EmailHooks::send_invitation`]. `accept_url` already
+/// includes the SPA's `/#/invite/<token>` segment.
 #[derive(Debug, Clone)]
 pub struct InvitationEmailContext {
     pub to_email: String,
@@ -28,8 +18,7 @@ pub struct InvitationEmailContext {
     pub expires_at_ms: i64,
 }
 
-/// Data passed to [`EmailHooks::send_join_decision`] for approve /
-/// reject paths. `outcome` is the discriminant the template uses.
+/// Data for [`EmailHooks::send_join_decision`].
 #[derive(Debug, Clone)]
 pub struct JoinDecisionEmailContext {
     pub to_email: String,
@@ -45,17 +34,15 @@ pub enum JoinDecisionOutcome {
     Rejected,
 }
 
-/// Outbound email hook. All methods are best-effort: implementations
-/// should log + swallow errors instead of propagating them up the
-/// admin-request path.
+/// Best-effort: implementations log and swallow errors, so a failed mail
+/// never fails the admin request.
 #[async_trait]
 pub trait EmailHooks: Send + Sync {
     async fn send_invitation(&self, ctx: InvitationEmailContext);
     async fn send_join_decision(&self, ctx: JoinDecisionEmailContext);
 }
 
-/// No-op email sink. Used when SMTP isn't configured and by
-/// integration tests where the SMTP fan-out is out of scope.
+/// Used when SMTP isn't configured.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopEmailHooks;
 
@@ -65,8 +52,7 @@ impl EmailHooks for NoopEmailHooks {
     async fn send_join_decision(&self, _ctx: JoinDecisionEmailContext) {}
 }
 
-/// In-memory capture sink for tests. Stores every send call in order
-/// so assertions can inspect counts + payloads.
+/// Test sink that records every send in order.
 #[derive(Debug, Default, Clone)]
 pub struct CapturingEmailHooks {
     pub invitations: Arc<Mutex<Vec<InvitationEmailContext>>>,

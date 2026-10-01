@@ -9,26 +9,17 @@ use crate::error::SinkError;
 /// Constructed once at `bin/blitzpool` startup, immutable thereafter.
 #[derive(Clone, Debug)]
 pub struct StatsSinkConfig {
-    /// Flush cadence. 60 s in production; tests use sub-second
-    /// intervals.
     pub flush_interval: Duration,
-    /// Max rows per single `client_statistics_entity` bulk-upsert.
-    /// Above this the coordinator batches across multiple PG calls.
-    /// Each batch sends 13 arrays of length N; stays well under PG's
-    /// 65 535 param limit.
+    /// Max rows per `client_statistics_entity` bulk upsert; larger drains
+    /// are split across several calls.
     pub client_stats_batch_size: usize,
-    /// Whether to fire an immediate "spot flush" the moment the
-    /// current 10-minute slot ends. When disabled, residuals wait
-    /// for the next cron tick (up to `flush_interval`).
+    /// Flush immediately when the 10-minute slot ends instead of waiting
+    /// for the next tick.
     pub slot_aligned_flush: bool,
-    /// Whether to run the `seedIfEmpty` bootstrap on
-    /// [`crate::engine::ShareStatsEngine::spawn`]. Disabled by tests
-    /// that don't want the migration overhead.
+    /// Run `seed_if_empty` on [`crate::engine::ShareStatsEngine::spawn`].
     pub seed_on_spawn: bool,
-    /// Phase offset applied to the first tick of the flush loop so
-    /// it doesn't fire on the same boot-relative instant as other
-    /// 60 s loops (e.g. kill_dead_clients).
-    /// Default zero — set in the bin to spread PG load.
+    /// Delays the first tick so the flush does not coincide with the other
+    /// 60 s loops and their PG load.
     pub startup_offset: Duration,
 }
 

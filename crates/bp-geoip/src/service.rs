@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! In-process cache + background TTL refresher in front of the HTTP
-//! lookup. Uses a whole-cache wipe every 10 minutes (not per-entry
-//! TTL) so failed lookups eventually retry.
+//! In-process cache in front of the HTTP lookup, wiped whole every TTL
+//! (not per entry) so cached failures eventually retry.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,9 +15,7 @@ use crate::client::GeoIpClient;
 use crate::config::GeoIpConfig;
 use crate::error::GeoIpError;
 
-/// Resolved location for a single IP. Both fields are non-empty when
-/// the lookup succeeded; partial results (e.g. country known but city
-/// missing) keep the known field and leave the other as `None`.
+/// Resolved location for one IP; a partial result keeps the known field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GeoLocation {
     pub city: Option<String>,
@@ -26,11 +23,8 @@ pub struct GeoLocation {
 }
 
 impl GeoLocation {
-    /// Predicate used by the service to decide whether to cache the
-    /// result as a positive hit (`Some(GeoLocation)`) or as a negative
-    /// hit (`None`). A "success"-status response with both city +
-    /// country empty is treated as a negative — caches `None` so the
-    /// same unmappable IP is not re-queried for 10 minutes.
+    /// A "success" response with both city and country empty is cached as
+    /// a negative hit, so an unmappable IP is not re-queried until the wipe.
     pub fn is_meaningful(&self) -> bool {
         let has_city = self.city.as_deref().is_some_and(|c| !c.is_empty());
         let has_country = self.country.as_deref().is_some_and(|c| !c.is_empty());
@@ -38,17 +32,14 @@ impl GeoLocation {
     }
 }
 
-/// Spawn-friendly service handle. Owns the cache + the periodic clear
-/// task. Cheap to clone (single `Arc`).
 pub struct GeoIpService<C: GeoIpClient> {
     client: Arc<C>,
     cache: Arc<Mutex<HashMap<String, Option<GeoLocation>>>>,
 }
 
 impl<C: GeoIpClient> GeoIpService<C> {
-    /// Build the service WITHOUT starting the background cache-clear
-    /// task. Useful for tests that drive the cache manually. Production
-    /// callers go through [`Self::spawn`].
+    /// Without the background cache-clear task; production uses
+    /// [`Self::spawn`].
     pub fn new(_config: &GeoIpConfig, client: Arc<C>) -> Self {
         Self {
             client,
@@ -56,7 +47,6 @@ impl<C: GeoIpClient> GeoIpService<C> {
         }
     }
 
-    /// Build + spawn the periodic cache-clear task.
     pub fn spawn(config: GeoIpConfig, client: Arc<C>) -> Result<GeoIpServiceHandle, GeoIpError> {
         config.validate()?;
         let service = Self::new(&config, client);
@@ -94,11 +84,7 @@ impl<C: GeoIpClient> GeoIpService<C> {
         })
     }
 
-    /// Direct lookup path — used by [`GeoIpServiceHandle::get_location`]
-    /// in production. Exposed on `Self` so the test fixture can drive
-    /// the same code path without spawning the background task.
     pub async fn get_location(&self, ip: &str) -> Option<GeoLocation> {
-        // Fast path: cache hit (either positive or negative).
         if let Some(cached) = self
             .cache
             .lock()
@@ -109,9 +95,7 @@ impl<C: GeoIpClient> GeoIpService<C> {
             return cached;
         }
 
-        // Cache miss — HTTP lookup. Any failure / unmeaningful payload
-        // gets cached as `None` so repeat calls for the same address
-        // do not hammer ip-api.
+        // Failures are cached as `None` so repeats do not hammer ip-api.
         let result = match self.client.lookup(ip).await {
             Ok(resp) if resp.status == "success" => {
                 let loc = GeoLocation {
@@ -141,14 +125,11 @@ impl<C: GeoIpClient> GeoIpService<C> {
         result
     }
 
-    /// Internal cache accessor for tests + the handle's read-side.
     pub fn cache_len(&self) -> usize {
         self.cache.lock().expect("geoip cache poisoned").len()
     }
 }
 
-/// Cheap-to-clone handle. `bin/blitzpool` and `bp-api` clone this into
-/// the per-request task pool.
 pub struct GeoIpServiceHandle {
     inner: Arc<GeoIpServiceInner>,
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
@@ -207,8 +188,6 @@ impl GeoIpServiceHandle {
         self.inner.cache.lock().expect("geoip cache poisoned").len()
     }
 
-    /// Force-clear the cache. Used by admin endpoints that want to
-    /// invalidate without waiting for the next TTL tick.
     pub fn clear_cache(&self) {
         self.inner
             .cache
@@ -217,8 +196,7 @@ impl GeoIpServiceHandle {
             .clear();
     }
 
-    /// Signal shutdown + await the background task. Idempotent — second
-    /// call is a no-op.
+    /// Signal shutdown and await the background task. Idempotent.
     pub async fn shutdown(&self) {
         if let Some(tx) = self
             .shutdown_tx
@@ -228,9 +206,7 @@ impl GeoIpServiceHandle {
         {
             let _ = tx.send(());
         }
-        // Take the JoinHandle out of the Mutex BEFORE the .await so the
-        // MutexGuard doesn't live across the await point (clippy lint:
-        // `await_holding_lock`).
+        // Take the JoinHandle out first so the guard is not held across the await.
         let join = self.join.lock().expect("geoip join poisoned").take();
         if let Some(join) = join {
             if let Err(e) = join.await {
@@ -390,8 +366,6 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_handle_clears_cache_on_ttl_tick() {
-        // Tight TTL so the test runs fast. Drive the same code path
-        // production uses.
         let client = Arc::new(ScriptedClient::new());
         client.enqueue_ok("success", Some("A"), Some("B"));
         client.enqueue_ok("success", Some("C"), Some("D"));

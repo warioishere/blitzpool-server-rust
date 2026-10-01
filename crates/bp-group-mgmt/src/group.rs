@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Group-shape validators + lifecycle predicates.
-//!
-//! Pure logic only — no DB lookups, no Redis. The service-wiring layer
-//! does the I/O and consults these functions for "is this OK?" answers.
+//! Group-shape validators and lifecycle predicates; pure, no I/O.
 
 use crate::constants::{
     MAX_FINDER_BONUS_PPM, MAX_GROUP_NAME_LEN, MAX_RESET_INTERVAL_DAYS, MIN_GROUP_NAME_LEN,
@@ -20,9 +17,8 @@ pub enum GroupNameError {
     ControlChar,
 }
 
-/// Validated group name. Construct via [`GroupName::new`] (trims +
-/// validates) or [`GroupName::from_trusted`] when the source is already
-/// validated (e.g. a row read from `pplns_group.name`).
+/// Validated group name: [`GroupName::new`] for input,
+/// [`GroupName::from_trusted`] for values read back from the DB.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GroupName(String);
 
@@ -99,17 +95,9 @@ pub enum KickEligibility {
     CannotKickCreator,
 }
 
-/// Decide whether `address` may be removed from the group.
-///
-/// Pure function of these values:
-///
-/// - `role`: creators can never be kicked (the creator role must be
-///   transferred or the group dissolved first).
-/// - `last_active_ms`: timestamp of the address's most recent accepted
-///   share (or `joined_at` if it never mined).
-/// - `now_ms`: current wall-clock time.
-/// - `inactivity_threshold_days`: pool config, typically
-///   [`crate::constants::DEFAULT_KICK_INACTIVITY_DAYS`].
+/// Whether a member may be removed. A creator never can (transfer or
+/// dissolve first); `last_active_ms` is the latest accepted share, or
+/// `joined_at` if the member never mined.
 pub fn kick_eligibility(
     role: MemberRole,
     last_active_ms: i64,
@@ -170,18 +158,10 @@ impl RoundResetPreset {
 
 // ─── Payout mode ────────────────────────────────────────────────────────────
 
-/// Per-group payout mode. Stored as a varchar in `pplns_group.payoutMode`.
-///
-/// **Immutable**: chosen once at group creation and never changed (no live
-/// state migration between modes). Modelled on [`RoundResetPreset`].
-///
-/// - `Prop` (default) — classic Group-Solo: shares accumulate in a single
-///   per-group round and pay out PROP per round; the round is wiped on
-///   block-found (when `resetRoundOnBlock`) or on a calendar/manual reset.
-/// - `Window` — a continuously-sliding time window (like PPLNS, but
-///   time-based): the payout distribution is "the last N days of shares",
-///   trimming itself over time. No round reset; the window length is the
-///   group's reset-cadence config reinterpreted as a window duration.
+/// Per-group payout mode, **immutable** after creation (no live state
+/// migration between modes). `Prop` pays PROP per round, wiped on block or
+/// calendar/manual reset; `Window` pays the last N days of shares, with N
+/// taken from the reset-cadence config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PayoutMode {
     #[default]
@@ -197,9 +177,6 @@ impl PayoutMode {
         }
     }
 
-    /// Parse the stored varchar. Returns `None` for an unrecognized value so
-    /// the caller can decide the fallback (callers default to `Prop`, the
-    /// safe default).
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "prop" => Self::Prop,
@@ -208,8 +185,6 @@ impl PayoutMode {
         })
     }
 
-    /// Lenient parse used on the read side: an unknown / absent value resolves
-    /// to `Prop` (the default) rather than erroring.
     pub fn parse_or_default(s: &str) -> Self {
         Self::parse(s).unwrap_or_default()
     }
@@ -219,14 +194,10 @@ impl PayoutMode {
 /// reset-cadence config to reinterpret.
 pub const DEFAULT_WINDOW_DAYS: u32 = 1;
 
-/// Interpret the round-reset cadence config as a sliding-window length in
-/// **days** (only meaningful for [`PayoutMode::Window`]).
-///
-/// The window reuses the existing reset config rather than adding a new
-/// field: `daily` → 1, `weekly` → 7, `monthly` → 30, `custom` → the
-/// configured `interval_days`. A missing / zero config falls back to
-/// [`DEFAULT_WINDOW_DAYS`]. Changing this later only trims more/less of the
-/// window — it never migrates state — so it stays editable in the PATCH path.
+/// Window length in days for [`PayoutMode::Window`], read from the reset
+/// cadence config; missing or zero falls back to [`DEFAULT_WINDOW_DAYS`].
+/// Changing it only trims more or less of the window, never migrates
+/// state, so it stays editable in the PATCH path.
 pub fn window_days(preset: Option<RoundResetPreset>, interval_days: Option<u32>) -> u32 {
     match preset {
         Some(RoundResetPreset::Daily) => 1,
@@ -241,7 +212,6 @@ pub fn window_days(preset: Option<RoundResetPreset>, interval_days: Option<u32>)
     }
 }
 
-/// Sliding-window length in **milliseconds** — [`window_days`] × one day.
 pub fn window_duration_ms(preset: Option<RoundResetPreset>, interval_days: Option<u32>) -> i64 {
     window_days(preset, interval_days) as i64 * MS_PER_DAY
 }
@@ -251,16 +221,11 @@ pub fn window_duration_ms(preset: Option<RoundResetPreset>, interval_days: Optio
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoundResetConfig {
     pub preset: Option<RoundResetPreset>,
-    /// Authoritative only when `preset == Some(Custom)`; cleared
-    /// otherwise so debug logs aren't misleading. Always in
-    /// `1..=MAX_RESET_INTERVAL_DAYS` when set.
+    /// Only with `preset == Some(Custom)`, in `1..=MAX_RESET_INTERVAL_DAYS`.
     pub interval_days: Option<u32>,
-    /// IANA timezone name (e.g. `Europe/Berlin`). Required when `preset`
-    /// is set. Validation of the actual IANA shape is the service layer's
-    /// job (depends on OS / chrono-tz); this crate only enforces non-empty.
+    /// IANA name, required with a preset; only non-empty is checked here.
     pub timezone: Option<String>,
-    /// Finder bonus as a fraction of the miner cut, in parts-per-million
-    /// (1 % = 10 000 ppm). 0 = disabled, capped at
+    /// Share of the miner cut in ppm; 0 disables, capped at
     /// [`MAX_FINDER_BONUS_PPM`].
     pub finder_bonus_ppm: i32,
 }
@@ -279,13 +244,7 @@ pub enum RoundResetError {
     FinderBonusOutOfRange(i32),
 }
 
-/// Validate a `RoundResetConfig`. Pure — does not consult the DB.
-///
-/// The finder bonus has no `min_payout` cross-check: it is a PROPORTION of
-/// the miner cut, not a satoshi amount, and is part of the finder's own
-/// output.
 pub fn validate_round_reset(config: &RoundResetConfig) -> Result<(), RoundResetError> {
-    // intervalDays only meaningful with Custom preset.
     if let Some(d) = config.interval_days {
         if config.preset != Some(RoundResetPreset::Custom) {
             return Err(RoundResetError::IntervalWithoutCustomPreset);
@@ -295,7 +254,6 @@ pub fn validate_round_reset(config: &RoundResetConfig) -> Result<(), RoundResetE
         }
     }
 
-    // A preset requires a timezone + (for Custom) intervalDays.
     if let Some(preset) = config.preset {
         match &config.timezone {
             Some(tz) if !tz.is_empty() => {}
@@ -306,12 +264,10 @@ pub fn validate_round_reset(config: &RoundResetConfig) -> Result<(), RoundResetE
         }
     }
 
-    // Finder bonus bounds — a range check and nothing else. What a ppm
-    // bonus comes to depends on block revenue and on how the round's
-    // shares fell, neither known at configuration time, so it cannot be
-    // checked against `min_payout` here. Small bonuses are not harmless:
-    // `build_weight_distribution`'s withholding pass can still prune a
-    // finder whose entire weight is a small bonus from the coinbase.
+    // Range check only: a ppm bonus's sat value depends on block revenue
+    // and share spread, unknown here, so no `min_payout` check. A finder
+    // whose whole weight is a small bonus can still be withheld by
+    // `build_weight_distribution`.
     let bonus = config.finder_bonus_ppm;
     if !(0..=MAX_FINDER_BONUS_PPM).contains(&bonus) {
         return Err(RoundResetError::FinderBonusOutOfRange(bonus));
@@ -540,9 +496,7 @@ mod tests {
         );
     }
 
-    /// A tiny bonus is valid: as a proportion it scales with the block and
-    /// is part of the finder's own output, so there is no payout floor to
-    /// check it against.
+    /// A tiny ppm bonus passes: there is no sat floor to check it against.
     #[test]
     fn round_reset_a_tiny_finder_bonus_is_accepted() {
         let mut cfg = ok_cfg();

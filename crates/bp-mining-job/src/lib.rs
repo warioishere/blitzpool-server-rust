@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Mining job construction — coinbase, merkle root, BIP-141 witness, block-header assembly.
-//!
-//! Pure functions plus a `MiningJob` value type that captures the per-template
-//! coinbase split (prefix / extranonce-slot / suffix) so per-share extranonce
-//! splicing is allocation-light and thread-safe.
+//! Mining job construction: coinbase, merkle root, BIP-141 witness, block header.
+//! `MiningJob` holds the coinbase split (prefix / extranonce slot / suffix) so
+//! per-share extranonce splicing is allocation-light and thread-safe.
 
 mod address;
 pub mod bip54;

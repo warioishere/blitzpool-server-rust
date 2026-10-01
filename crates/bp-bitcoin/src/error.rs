@@ -25,9 +25,8 @@ pub enum RpcError {
     Unauthorized,
 }
 
-/// The `error` object inside a JSON-RPC response.
-/// Code semantics mirror `src/rpc/protocol.h` in bitcoin-core
-/// (e.g. -32601 for "method not found", -8 for "invalid parameter").
+/// The `error` object inside a JSON-RPC response; codes as in Core's
+/// `src/rpc/protocol.h`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RpcErrorDetail {
     pub code: i32,

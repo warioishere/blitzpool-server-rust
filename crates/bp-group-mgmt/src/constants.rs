@@ -1,30 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Tunable constants governing activation, kick, and expiry thresholds
-//! across group management, invitations, and join requests.
+//! Activation, kick and expiry thresholds for groups, invitations and
+//! join requests.
 
-/// Number of members at or above which a group becomes active. The
-/// stratum layer refuses Group-Solo connections for addresses in
-/// inactive groups (under this floor). `1` means a group mines as soon as
-/// it has its creator: the coinbase is then built from that one member's
-/// proportional share + the fee output (+ finder bonus when configured).
+/// Members at or above which a group is active; the stratum layer refuses
+/// Group-Solo connections for inactive groups. `1` lets a group mine with
+/// just its creator.
 pub const MIN_MEMBERS_ACTIVE: u32 = 1;
 
-/// Kick-inactivity window: an admin can only remove a member who hasn't
-/// submitted a share in this many days. NOT configurable — `blitzpool`
-/// hardcodes it as `group_service::KICK_INACTIVITY_DAYS`, which must stay in
-/// step with this constant.
+/// An admin can only remove a member idle for this many days. Must stay in
+/// step with `blitzpool`'s hardcoded `group_service::KICK_INACTIVITY_DAYS`.
 pub const DEFAULT_KICK_INACTIVITY_DAYS: u32 = 14;
 
 /// Hard upper bound on the round-reset custom interval, in days.
 pub const MAX_RESET_INTERVAL_DAYS: u32 = 365;
 
-/// Hard cap for the optional per-block finder bonus, in parts-per-
-/// million of the miner cut (50 %). Mirrors
+/// Cap on the finder bonus, ppm of the miner cut (50 %); past half the pot
+/// the proportional split is meaningless, so more is a typo. Mirrors
 /// `bp_pplns::MAX_FINDER_BONUS_PPM`, which is what the build clamps to.
-///
-/// Half the pot to one member already makes the proportional split
-/// nearly meaningless, so anything past this is a typo.
 pub const MAX_FINDER_BONUS_PPM: i32 = 500_000;
 
 /// How long a directed invitation stays valid before auto-expiring.
@@ -44,6 +37,4 @@ pub const MAX_GROUP_NAME_LEN: usize = 64;
 /// at the API boundary (DB column is plain `text`).
 pub const MAX_JOIN_REQUEST_MESSAGE_LEN: usize = 500;
 
-/// Ms in a day — convenience used by the kick-eligibility and expiry
-/// predicates.
 pub const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;

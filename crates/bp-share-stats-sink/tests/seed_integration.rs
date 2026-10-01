@@ -3,9 +3,8 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! Integration tests for `seed_if_empty_with_executor` against docker-PG.
-//! Uses TX-rollback via the `_with_executor` variant — no suite-wide
-//! mutex needed since each test owns its own transaction.
+//! `seed_if_empty_with_executor` against PG; each test owns a transaction
+//! it rolls back, so no suite-wide mutex is needed.
 
 use bp_db::{bulk_upsert_client_statistics_entity, ClientStatsUpsert};
 use bp_share_stats_sink::seed::seed_if_empty_with_executor;
@@ -43,14 +42,13 @@ async fn seed_is_noop_when_worker_shares_already_populated() {
     };
     let mut tx = pool.begin().await.expect("begin tx");
 
-    // Don't truncate — the real DB has worker_shares rows (or fixtures
-    // do); seed must observe non-empty and skip. Pre-condition check.
+    // Precondition: the table is non-empty.
     let n_before: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM worker_shares_entity"#)
         .fetch_one(&mut *tx)
         .await
         .expect("count");
     if n_before == 0 {
-        // Insert a placeholder so the test premise holds even on a fresh DB.
+        // A fresh DB needs a placeholder row.
         sqlx::query(
             r#"INSERT INTO worker_shares_entity (address, "clientName", shares, "rejectedShares")
                VALUES ($1, $2, 0, 0)"#,
@@ -77,7 +75,7 @@ async fn seed_fires_when_worker_shares_empty_and_client_stats_present() {
     };
     let mut tx = pool.begin().await.expect("begin tx");
 
-    // Wipe both tables inside the tx — rollback will undo.
+    // The rollback undoes this.
     sqlx::query("TRUNCATE worker_shares_entity")
         .execute(&mut *tx)
         .await
@@ -87,7 +85,7 @@ async fn seed_fires_when_worker_shares_empty_and_client_stats_present() {
         .await
         .expect("truncate cs");
 
-    // Seed client_statistics rows the migration should aggregate.
+    // Rows the seed should aggregate.
     let stats = vec![
         ClientStatsUpsert {
             address: "test_seed_fire_alice".to_string(),
@@ -103,9 +101,8 @@ async fn seed_fires_when_worker_shares_empty_and_client_stats_present() {
             rejected_duplicate_share_diff1: 0.0,
             rejected_low_difficulty_share_count: 1,
             rejected_low_difficulty_share_diff1: 0.5,
-            // Three reject reasons at three distinct diff-1 weights, so the
-            // `rejectedShares` assertion below fails if the seed's SUM drops
-            // any one term — the silent under-report the seed doc warns about.
+            // Distinct diff-1 weights per reason, so the `rejectedShares`
+            // assertion fails if the seed's SUM drops any term.
             rejected_version_rolling_count: 1,
             rejected_version_rolling_diff1: 0.25,
             rejected_stale_count: 1,
@@ -151,9 +148,7 @@ async fn seed_fires_when_worker_shares_empty_and_client_stats_present() {
             .expect("alice");
     assert!((alice_shares - 100.0).abs() < 0.01);
 
-    // 0.5 low-difficulty + 0.25 version-rolling + 0.125 stale. Dropping any
-    // single term from the seed's SUM lands on a different number, so this
-    // pins every reject reason having a place in it.
+    // 0.5 low-difficulty + 0.25 version-rolling + 0.125 stale.
     let alice_rejected: f64 = sqlx::query_scalar(
         r#"SELECT "rejectedShares" FROM worker_shares_entity WHERE address = $1"#,
     )

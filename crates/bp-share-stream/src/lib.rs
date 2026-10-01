@@ -1,26 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Redis-stream transport for accepted shares (Core → Satellite).
-//!
-//! The Core's share producer `XADD`s each accepted share (as a
-//! [`bp_share_hook::SharedAcceptedShareOwned`] record) onto one Redis
-//! stream; the Satellite consumes it through a **consumer group** and
-//! reconstructs the owned record, then borrows a view back to drive the
-//! per-engine accounting sinks (the same sink impls regardless of transport).
-//!
-//! # Delivery + exactly-once
-//!
-//! This layer is **at-least-once**: a consumer group delivers each entry,
-//! and the consumer `XACK`s once it has handed the share to the sinks.
-//! Exactly-once for the non-idempotent money sinks comes from a layer
-//! above — the per-`share_id` dedup marker inside the PPLNS / Group-Solo
-//! `record_share` Lua. A crash between sink-apply and `XACK` redelivers the
-//! entry; the dedup marker makes the re-apply a no-op, so a *separate*
-//! `XACK` is safe and the transport stays simple (it never needs to fold
-//! the ack into the engine's mutation).
-//!
-//! Each entry stores the share as a single JSON field (`d`) — compact
-//! enough at pool share-rates, and human-inspectable via `XRANGE`.
+//! Redis-stream transport (Core → Satellite) feeding the same share sinks
+//! the engines expose in-process. Delivery is at-least-once; exactly-once
+//! for the money sinks comes from the per-`share_id` dedup marker in the
+//! PPLNS / Group-Solo `record_share` Lua, so a separate `XACK` is safe.
 
 mod runner;
 pub use runner::{ConsumerLoopConfig, EnsureMode, StreamConsumerHandle, StreamEntryHandler};
@@ -45,46 +28,33 @@ use tokio::sync::mpsc;
 /// Field name carrying the JSON-encoded share in each stream entry.
 const FIELD: &str = "d";
 
-/// Default cap on a stream's length (approximate `MAXLEN ~`): hours of buffer
-/// for a Satellite outage at pool share-rates; beyond it the producer trims the
-/// oldest instead of letting Redis grow unbounded. A breach costs fairness (the
-/// coinbase already paid the window), not funds; the consumer-lag monitor
-/// alerts before then.
+/// Approximate `MAXLEN ~` cap: hours of buffer for a Satellite outage before
+/// the oldest entries are trimmed. A breach costs fairness, not funds (the
+/// coinbase already paid the window).
 pub const DEFAULT_STREAM_MAXLEN: usize = 1_000_000;
 
-/// Redis key of the accepted-share stream. Shared by the Core's producer
-/// and the Satellite's consumer so the two stay in sync from one source.
+/// Accepted-share stream (Core → Satellite).
 pub const ACCEPTED_STREAM_KEY: &str = "shares:accepted";
 
-/// Redis key of the block-found event stream (Core → Satellite). Rare,
-/// low-volume traffic; the Satellite runs the block-found accounting +
-/// notifications off it. At-least-once is fine — the apply is PG-idempotent.
+/// Block-found events (Core → Satellite); at-least-once is fine because the
+/// apply is PG-idempotent.
 pub const BLOCK_FOUND_STREAM_KEY: &str = "blocks:found";
 
-/// Redis key of the rejected-share stream (Core → Satellite). The Satellite
-/// runs the Group-Solo + stats reject counters off it. The share is
-/// group_id-stamped by the Core, so the consumer needs no mode gate.
+/// Rejected-share stream (Core → Satellite). The Core stamps `group_id`, so
+/// the consumer needs no mode gate.
 pub const REJECTED_STREAM_KEY: &str = "shares:rejected";
 
-/// Redis key of the device-status event stream (Core → Satellite). Carries
-/// miner online/offline events from the Stratum front so the Satellite (which
-/// owns the notification dispatcher) can fan them out. Front-originated like
-/// block-found, but notify-only — no ledger, so at-least-once is harmless
-/// (a duplicated online/offline push is cosmetic).
+/// Miner online/offline events (Front → Satellite). Notify-only, so a
+/// duplicate from at-least-once delivery is cosmetic.
 pub const DEVICE_STATUS_STREAM_KEY: &str = "device:status";
 
-/// Redis key of the cache-invalidation stream (Api/back → Front). Group-Solo +
-/// Blockparty membership lives in per-process in-memory routing caches that the
-/// Stratum mode-gate reads. When a membership change lands on a process other
-/// than the Front (e.g. the `api` process in a split), it publishes here so the
-/// Front rebuilds its routing cache — otherwise the change wouldn't route until
-/// the Front restarts. Consumed tail-start (the Front warms from the DB at
-/// boot, then only needs *new* invalidations).
+/// Tells the Front to rebuild its in-memory routing caches when membership
+/// changes in another process, which would otherwise only route after a
+/// Front restart. Consumed from the tail: the Front warms from the DB at boot.
 pub const CACHE_INVALIDATION_STREAM_KEY: &str = "cache:invalidate";
 
-/// Which routing cache a [`CACHE_INVALIDATION_STREAM_KEY`] event asks the Front
-/// to rebuild. Plain string on the wire so the set can grow without a breaking
-/// change (an unknown kind is ignored by the consumer).
+/// Which routing cache a [`CACHE_INVALIDATION_STREAM_KEY`] event targets.
+/// A plain string so the set can grow; the consumer ignores unknown kinds.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CacheInvalidation {
     /// `"group"` (Group-Solo address cache) or `"blockparty"` (party routing
@@ -92,22 +62,14 @@ pub struct CacheInvalidation {
     pub kind: String,
 }
 
-/// Canonical [`CacheInvalidation::kind`] values, kept as constants so the
-/// publisher and consumer agree without a shared enum across crates.
+/// Canonical [`CacheInvalidation::kind`] values.
 pub mod cache_kind {
     pub const GROUP: &str = "group";
     pub const BLOCKPARTY: &str = "blockparty";
-    /// A block was booked, so every published SV2 ext-0x0003 payout
-    /// distribution is stale (ext 0x0003/Implementation Notes). Unlike the
-    /// two above this asks the Front to INVALIDATE, not to rebuild from the
-    /// DB — the published weights encode pre-settlement ledger balances,
-    /// and a job-declaring client still mining them would pay those
-    /// balances a second time.
-    ///
-    /// It rides this stream because the settling process and the process
-    /// holding the JDP registry are different ones under the role split
-    /// (`payout` books, `front` publishes distributions), and this is the
-    /// channel that already crosses that boundary.
+    /// A block was booked: every published ext 0x0003 distribution is stale
+    /// (ext 0x0003/Implementation Notes) and must be invalidated, since its
+    /// weights encode pre-settlement balances that a job-declaring client
+    /// would pay a second time.
     pub const SETTLEMENT: &str = "settlement";
 }
 
@@ -121,21 +83,17 @@ pub enum StreamError {
     MissingField { id: String },
 }
 
-/// Off-loop publish buffer. It only fills if Redis publishing stalls or
-/// falls behind the share rate. On overflow the share is dropped (best-effort,
-/// the miner already got its accept) rather than blocking the stratum read loop.
+/// Fills only when Redis publishing stalls; overflow drops the share rather
+/// than blocking the stratum read loop (the miner already got its accept).
 const PUBLISH_BUFFER: usize = 8192;
 
-/// Most values one drain round trip carries. The drain takes whatever is
-/// queued, up to this, and writes it as one pipeline, so throughput is not
-/// capped at one Redis round trip per share.
+/// Values per pipelined drain round trip, so throughput is not one Redis
+/// round trip per share.
 const PUBLISH_BATCH: usize = 256;
 
-/// Off-loop publish core shared by the producing sinks: a bounded channel + a
-/// drain task that owns the `XADD` round-trip, so the latency-sensitive stratum
-/// read loop never blocks on Redis.
-/// On buffer overflow it drops best-effort and logs on power-of-two crossings
-/// to surface a sustained stall without flooding.
+/// Bounded channel plus a drain task owning the `XADD`s, so the stratum read
+/// loop never blocks on Redis. Overflow drops are logged on power-of-two
+/// counts to surface a sustained stall without flooding.
 struct BufferedPublisher<T> {
     tx: mpsc::Sender<T>,
     dropped: Arc<AtomicU64>,
@@ -166,9 +124,8 @@ impl<T: Serialize + Send + Sync + 'static> BufferedPublisher<T> {
         }
     }
 
-    /// Non-blocking hand-off to the drain task (a few atomics + a move, no
-    /// network `.await`). Drops best-effort if the buffer is full (publish
-    /// lagging) or the drain task is gone.
+    /// Non-blocking hand-off; drops if the buffer is full or the drain task
+    /// is gone.
     fn offer(&self, item: T) {
         if self.tx.try_send(item).is_err() {
             let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
@@ -183,14 +140,9 @@ impl<T: Serialize + Send + Sync + 'static> BufferedPublisher<T> {
     }
 }
 
-/// A [`SharedAcceptedShareSink`] that publishes each accepted share onto the
-/// Redis stream — the Core's fan-out target in `core` mode.
-///
-/// Because it *is* a sink, the Core reuses the in-process composite
-/// (which stamps `share_id` + `mode` + `group_id`) and simply fans out to
-/// this one sink instead of the engine sinks. The share it receives is
-/// already stamped, so the published owned record carries everything the
-/// Satellite's sinks need.
+/// Publishes accepted shares onto the stream. Being a sink, it sits behind
+/// the Core's in-process composite, so shares arrive already stamped with
+/// `share_id`, `mode` and `group_id`.
 pub struct ProducingSink {
     inner: BufferedPublisher<SharedAcceptedShareOwned>,
 }
@@ -210,11 +162,8 @@ impl SharedAcceptedShareSink for ProducingSink {
     }
 }
 
-/// A [`SharedRejectedShareSink`] that publishes each rejected share onto the
-/// Redis stream — the Core's rejected fan-out target in `core` mode. Mirrors
-/// [`ProducingSink`]: the Core's rejected composite stamps the `group_id`
-/// first, so the published owned record carries everything the Satellite's
-/// reject sinks need.
+/// [`ProducingSink`] for rejected shares; the Core's rejected composite
+/// stamps `group_id` first.
 pub struct ProducingRejectedSink {
     inner: BufferedPublisher<SharedRejectedShareOwned>,
 }
@@ -234,10 +183,9 @@ impl SharedRejectedShareSink for ProducingRejectedSink {
     }
 }
 
-/// The Satellite's per-entry action on the accepted-share stream: hand each
-/// consumed share to every sink, in order. The sinks are the *same*
-/// [`SharedAcceptedShareSink`] impls the engines expose in-process, so the
-/// transport adds nothing to what a share does (the equivalence seam).
+/// Hands each consumed share to every sink in order; the sinks are the same
+/// [`SharedAcceptedShareSink`] impls used in-process, so the transport
+/// changes nothing about what a share does.
 pub struct AcceptedShareFanOut {
     sinks: Vec<Arc<dyn SharedAcceptedShareSink>>,
 }
@@ -259,14 +207,9 @@ impl StreamEntryHandler<SharedAcceptedShareOwned> for AcceptedShareFanOut {
 }
 
 // ── Typed transport ─────────────────────────────────────────────────
-//
-// One Redis-stream producer/consumer over any serde type. Every
-// Core→Satellite stream rides it, the accepted-share (money) stream included;
-// only what an undecodable entry costs differs, see
-// [`StreamConsumer::accepted`].
 
-/// Counter bumped for every accepted share the consumer could not decode and
-/// had to drop. Operators alert on it: each increment is a miner underpaid.
+/// Each increment is an accepted share that could not be decoded, i.e. a
+/// miner underpaid; operators alert on it.
 const ACCEPTED_UNDECODABLE_COUNTER: &str = "accepted_share_undecodable_dropped_total";
 
 /// Publishes JSON-encoded `T` values onto a Redis stream. Cheap to clone.
@@ -353,14 +296,9 @@ pub struct StreamConsumer<T> {
 }
 
 impl StreamConsumer<SharedAcceptedShareOwned> {
-    /// Consumer for the accepted-share (money) stream. Same transport as every
-    /// other stream; the one difference is that an undecodable entry is a
+    /// Consumer for the accepted-share stream. An undecodable entry here is a
     /// share that can never be credited, so its drop is logged at `error` and
-    /// counted (`accepted_share_undecodable_dropped_total`). The loss must be
-    /// alertable so the operator fixes the root cause: a non-additive
-    /// share-schema skew across a rolling Core/Satellite deploy, or a corrupt
-    /// Redis write. Additive changes are absorbed by `#[serde(default)]` and
-    /// never land here.
+    /// counted, making a non-additive schema skew or corrupt write alertable.
     pub fn accepted(
         conn: ConnectionManager,
         stream_key: impl Into<String>,
@@ -391,22 +329,16 @@ impl<T: DeserializeOwned> StreamConsumer<T> {
         }
     }
 
-    /// Create the consumer group if absent (`MKSTREAM`, from id `0` — replays
-    /// the whole stream history on first creation). Idempotent: a `BUSYGROUP`
-    /// error is treated as success. Use for **idempotent** consumers (e.g. the
-    /// ledger apply, guarded by PG `UNIQUE`), where replaying history is a safe
-    /// no-op. For non-idempotent consumers (notifications) use
-    /// [`Self::ensure_group_at_tail`] so a first start doesn't re-fire history.
+    /// Creates the group from id `0` if absent, replaying the whole history:
+    /// only for idempotent consumers. Non-idempotent ones (notifications) use
+    /// [`Self::ensure_group_at_tail`].
     pub async fn ensure_group(&self) -> Result<(), StreamError> {
         self.ensure_group_from("0").await
     }
 
-    /// Create the consumer group if absent starting at the tail (`$` — only
-    /// entries added *after* creation). Idempotent (`BUSYGROUP` = success), so
-    /// an existing group keeps its offset and isn't reset. Use for
-    /// non-idempotent consumers (the notify fan-out): a freshly-added group on
-    /// a stream that already has history must NOT replay it — that would re-fire
-    /// a push for every historical block / device event.
+    /// Creates the group at the tail (`$`) if absent, so a new notify group
+    /// does not re-fire a push for every historical event. An existing group
+    /// keeps its offset.
     pub async fn ensure_group_at_tail(&self) -> Result<(), StreamError> {
         self.ensure_group_from("$").await
     }
@@ -447,9 +379,8 @@ impl<T: DeserializeOwned> StreamConsumer<T> {
         Ok(self.read_pending_counted(count).await?.0)
     }
 
-    /// Like [`Self::read_pending`] but also returns the total RAW entry count
-    /// (good + dead-lettered) so the resume loop in `run` can distinguish an
-    /// empty PEL (stop) from an all-poison batch (keep draining).
+    /// Also returns the raw entry count (good + dead-lettered), so the resume
+    /// loop can tell an empty PEL from an all-poison batch.
     pub(crate) async fn read_pending_counted(
         &self,
         count: usize,
@@ -485,19 +416,10 @@ impl<T: DeserializeOwned> StreamConsumer<T> {
         Ok(serde_json::from_str(&json)?)
     }
 
-    /// Split a reply into decodable entries; entries that can't be
-    /// reconstructed (missing `d` field / malformed JSON) are **dead-lettered**
-    /// (logged and `XACK`ed here) so one bad entry neither fails its whole
-    /// batch nor lingers un-acked in the PEL, masking the consumer-lag monitor.
-    /// A decode failure is deterministic, so retrying is futile. Additive
-    /// schema changes are absorbed by `#[serde(default)]` on new fields.
-    ///
-    /// A drop is a `warn`, except on the accepted-share (money) stream, where
-    /// it is an `error` + counter (see [`StreamConsumer::accepted`]).
-    ///
-    /// Returns `(decodable entries, total raw entries seen)` — the raw count is
-    /// what the resume loop keys on so an all-poison batch doesn't halt it with
-    /// good entries still queued behind (see [`Self::read_pending_counted`]).
+    /// Returns `(decodable entries, raw count)`. Undecodable entries are
+    /// logged and `XACK`ed here: a decode failure is deterministic, and an
+    /// un-acked one would sit in the PEL masking the consumer-lag monitor.
+    /// See [`StreamConsumer::accepted`] for the money stream's handling.
     async fn partition(&self, reply: StreamReadReply) -> (Vec<Consumed<T>>, usize) {
         let mut good = Vec::new();
         let mut poison = Vec::new();
@@ -553,10 +475,8 @@ impl<T: DeserializeOwned> StreamConsumer<T> {
 
 #[cfg(test)]
 mod tests {
-    //! Integration tests against a local docker-Redis at
-    //! `redis://127.0.0.1:16379` (override with `BP_REDIS_URL`). Each test
-    //! uses a distinct logical DB + stream key and skips cleanly if Redis
-    //! isn't reachable.
+    //! Integration tests against Redis (`BP_REDIS_URL`); each test uses its
+    //! own logical DB and skips if Redis is unreachable.
     #![allow(clippy::print_stderr)]
 
     use super::*;
@@ -566,9 +486,7 @@ mod tests {
     const DEFAULT_URL: &str = "redis://127.0.0.1:16379";
 
     async fn connect_or_skip(db: u8) -> Option<ConnectionManager> {
-        // Fold this binary's local number into its own DB range —
-        // see `bp_test_support::redis_db`. Two binaries both using
-        // 0..15 flush each other mid-run.
+        // This binary's own DB range, so other test binaries do not flush it.
         let db =
             bp_test_support::redis_db_in_range(bp_test_support::redis_db::SHARE_STREAM, db).await;
         let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
@@ -596,17 +514,11 @@ mod tests {
         Some(conn)
     }
 
-    /// Open a SECOND connection to a DB already prepared by
-    /// [`connect_or_skip`] — does NOT flush (the first connection owns
-    /// setup). Production runs the producer (Core) and the blocking
-    /// consumer (Satellite) as separate processes on separate
-    /// connections; a blocking `XREADGROUP … BLOCK` would otherwise
-    /// head-of-line-block a deferred `XADD` sharing the same multiplexed
-    /// connection.
+    /// Second, non-flushing connection to the same DB: a blocking
+    /// `XREADGROUP … BLOCK` would otherwise head-of-line-block an `XADD` on
+    /// the shared multiplexed connection.
     async fn connect_peer(db: u8) -> Option<ConnectionManager> {
-        // MUST fold identically to `connect_or_skip` — this opens a SECOND
-        // connection to the same logical DB, and a producer and consumer on
-        // different databases simply never see each other.
+        // Must fold like `connect_or_skip`, or producer and consumer never meet.
         let db =
             bp_test_support::redis_db_in_range(bp_test_support::redis_db::SHARE_STREAM, db).await;
         let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
@@ -734,10 +646,8 @@ mod tests {
         );
     }
 
-    /// A poison (undecodable) entry between two good shares must not fail the
-    /// batch: the good shares still reach the sinks in order, and the poison
-    /// entry is dead-lettered (acked) rather than dropping the whole batch or
-    /// lingering in the PEL.
+    /// A poison entry between two good shares is dead-lettered while the good
+    /// ones still reach the sinks in order.
     #[tokio::test]
     async fn drain_new_dead_letters_poison_share_and_keeps_good() {
         let Some(conn) = connect_or_skip(5).await else {
@@ -781,8 +691,7 @@ mod tests {
         );
     }
 
-    /// Counts every counter increment by name. Just enough of a recorder to
-    /// see whether `partition` bumped the lost-share counter.
+    /// Minimal recorder counting counter increments by name.
     #[derive(Default)]
     struct CountingRecorder {
         counts: Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
@@ -849,11 +758,8 @@ mod tests {
         }
     }
 
-    /// A dropped accepted share is lost money, so it must stay alertable: the
-    /// accepted consumer bumps `accepted_share_undecodable_dropped_total`.
-    /// Negative control on the same poison entry: a plain consumer drops it
-    /// without counting, so the assertion cannot pass on a counter that
-    /// something else bumped.
+    /// The accepted consumer counts an undecodable drop; a plain consumer on
+    /// the same entry does not (negative control).
     #[test]
     fn an_undecodable_accepted_share_is_counted_as_lost() {
         let recorder = CountingRecorder::default();
@@ -906,9 +812,8 @@ mod tests {
         );
     }
 
-    /// The resume loop drains good pending shares even when an all-poison
-    /// batch sits at the FRONT of the PEL: it keys on the RAW count, so a
-    /// batch that yields zero good shares does not end the drain.
+    /// An all-poison batch at the front of the PEL does not end the resume
+    /// drain before the good shares behind it.
     #[tokio::test]
     async fn resume_loop_drains_good_share_stranded_behind_front_poison() {
         let Some(conn) = connect_or_skip(2).await else {
@@ -928,9 +833,8 @@ mod tests {
             .await
             .expect("publish good");
 
-        // Post-crash state (delivered, not acked): a raw XREADGROUP `>` puts
-        // both in the PEL without running `partition`, so the poison is not
-        // yet dead-lettered.
+        // Post-crash state: a raw `>` read puts both in the PEL without
+        // `partition` dead-lettering the poison.
         let _: redis::Value = redis::cmd("XREADGROUP")
             .arg("GROUP")
             .arg(group)
@@ -944,9 +848,8 @@ mod tests {
             .await
             .expect("raw deliver to PEL");
 
-        // The production loop, batch 1 to force an all-poison first batch;
-        // `>` never hands a pending entry out again, so only the resume drain
-        // can reach the good share.
+        // Batch 1 forces an all-poison first batch; only the resume drain can
+        // reach the good share.
         let (fan_out, recorded) = recording_fan_out();
         let cancel = tokio_util::sync::CancellationToken::new();
         let task = tokio::spawn(consumer.clone().run(
@@ -984,9 +887,7 @@ mod tests {
         let Some(consumer_conn) = connect_or_skip(11).await else {
             return;
         };
-        // Producer holds its own connection — the sink's XADD is deferred
-        // to a drain task, so it must not share the multiplexed socket the
-        // consumer blocks on (mirrors the Core/Satellite process split).
+        // The deferred XADD must not share the socket the consumer blocks on.
         let Some(producer_conn) = connect_peer(11).await else {
             return;
         };
@@ -1014,8 +915,7 @@ mod tests {
         assert_eq!(got[1].value, s2, "mode + group_id round-trip intact");
     }
 
-    /// A burst larger than one drain batch arrives complete and in order:
-    /// the money consumer's window order is the stream order.
+    /// A burst larger than one drain batch arrives complete and in order.
     #[tokio::test]
     async fn producing_sink_keeps_order_across_batches() {
         let Some(consumer_conn) = connect_or_skip(13).await else {
@@ -1030,8 +930,7 @@ mod tests {
 
         let sink = ProducingSink::new(StreamProducer::new(producer_conn, key));
         let n = PUBLISH_BATCH * 3 + 7;
-        // Offered without yielding, so the drain finds more than one batch
-        // queued.
+        // No yield, so the drain finds more than one batch queued.
         for i in 0..n {
             sink.record_accepted(sample(&format!("ep1:{i}"), MiningMode::Pplns, None).as_view())
                 .await;
@@ -1049,9 +948,7 @@ mod tests {
         assert_eq!(ids, want);
     }
 
-    /// The rejected producing sink publishes a (group_id-stamped) rejected
-    /// share onto the rejected stream; the Satellite reads the owned record
-    /// back intact via the generic consumer.
+    /// A group-stamped rejected share round-trips the rejected stream intact.
     #[tokio::test]
     async fn producing_rejected_sink_publishes_each_rejected_share() {
         let Some(consumer_conn) = connect_or_skip(9).await else {
@@ -1093,10 +990,8 @@ mod tests {
         label: String,
     }
 
-    /// The generic `StreamProducer<T>`/`StreamConsumer<T>` move typed values
-    /// through a consumer group: round-trip new entries, then prove a
-    /// delivered-but-unacked entry is replayed via `read_pending` (the
-    /// at-least-once redelivery the block-found apply relies on).
+    /// Typed values round-trip, and an unacked entry is replayed by
+    /// `read_pending` (the redelivery the block-found apply relies on).
     #[tokio::test]
     async fn generic_stream_round_trips_and_redelivers_pending() {
         let Some(conn) = connect_or_skip(10).await else {
@@ -1144,14 +1039,11 @@ mod tests {
             .is_empty());
     }
 
-    /// `ensure_group_at_tail` (`$`) on a stream that already has history must
-    /// NOT replay it — the notify consumers (block-found notify + device-status)
-    /// rely on this so a first start doesn't re-fire a push for every historical
-    /// block / event. Contrasted against the `0`-started group, which does.
+    /// A tail-started group skips existing history; a `0`-started group on
+    /// the same stream replays it.
     #[tokio::test]
     async fn ensure_group_at_tail_skips_history() {
-        // Own DB (1): `connect_or_skip` FLUSHDBs, so a shared DB would let
-        // parallel tests wipe each other.
+        // Own DB: `connect_or_skip` flushes it.
         let Some(conn) = connect_or_skip(1).await else {
             return;
         };
@@ -1201,10 +1093,8 @@ mod tests {
         assert_eq!(all.len(), 2, "a 0-started group replays the full history");
     }
 
-    /// The producer caps stream length (`MAXLEN ~`) so a stuck consumer can't
-    /// grow Redis without bound. Approximate trimming keeps at least the cap
-    /// but may keep up to a macro-node more, so the assertion is "well below
-    /// the produced count", not an exact length.
+    /// The producer caps stream length; approximate trimming may keep a
+    /// macro-node extra, so the assertion is "well below produced".
     #[tokio::test]
     async fn producer_caps_stream_length() {
         let Some(conn) = connect_or_skip(8).await else {

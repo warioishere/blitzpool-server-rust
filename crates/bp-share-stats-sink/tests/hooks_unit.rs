@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Unit-level fan-out tests for the share-hook impls. No PG, no flush.
-//!
-//! The hooks impl `bp_share_hook`'s protocol-agnostic traits; the SV1 and
-//! SV2 servers project their native `ShareAccept` / `ShareReject` into the
-//! shared view in their `shared_adapter` modules. These tests drive the
-//! shared view directly.
+//! Fan-out of the share hooks into the accumulators, driven through the
+//! protocol-agnostic `bp_share_hook` view. No PG, no flush.
 
 use std::sync::Arc;
 
@@ -45,9 +41,8 @@ async fn rejected_share_with_address_fans_into_four_accumulators() {
     let snap = accs.pool_shares.drain();
     assert_eq!(snap.values().next().unwrap().rejected, 25.0);
     let pr = accs.pool_rejected.drain();
-    // pool_rejected stores difficulty SUM per (slot, reason), not a
-    // raw share count — the frontend chart graphs "rejected diff-1
-    // per reason per slot".
+    // Difficulty sum per (slot, reason), not a share count: the chart
+    // plots rejected diff-1 per reason.
     assert_eq!(
         pr.values().next().unwrap()[&RejectedReason::LowDifficulty],
         25.0

@@ -1,19 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Wire-primitive conversions shared by both SV2 codecs.
-//!
-//! [`crate::server_codec`] (mining) and [`crate::jdp_server_codec`] (job
-//! declaration) translate between the lifetime-bound `stratum_core` wire types
-//! and the owned shapes the pure handlers take. The per-message mapping is
-//! specific to each sub-protocol; the primitives underneath it are not — a
-//! fixed-width byte field, a UTF-8 string, a token, a `Str0255` behave the same
-//! whichever frame carries them, so they have one implementation here.
-//!
-//! The same holds for the messages both sub-protocols carry
-//! (`SetupConnection` and ext 0x0001 `RequestExtensions`, with their
-//! `.Success` / `.Error` replies), for [`CodecError`], which both codecs
-//! return, and for the write side: [`WriteError`], `write_message` and
-//! `write_raw_frame` serve both server tasks.
+//! What [`crate::server_codec`] and [`crate::jdp_server_codec`] share: wire
+//! primitives, the messages both sub-protocols carry (`SetupConnection`,
+//! ext 0x0001 `RequestExtensions`), [`CodecError`] and the frame writers, so
+//! each exists once.
 
 use stratum_core::codec_sv2::MessageFrame;
 use stratum_core::common_messages_sv2::{
@@ -39,10 +29,8 @@ use crate::tokens::Token;
 /// in the spec sense.
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
-    /// Inbound message arrived on the wrong sub-protocol port —
-    /// e.g. a JDP frame on the mining listener. Caller logs +
-    /// ignores (the per-connection task already routed by port).
-    /// Name and message are protocol-neutral because both codecs raise it.
+    /// Inbound message arrived on the wrong sub-protocol port, e.g. a JDP
+    /// frame on the mining listener. Protocol-neutral: both codecs raise it.
     #[error("message type not served on this sub-protocol port: {0:?}")]
     NotForThisSubProtocol(&'static str),
     /// Sv2 wire type → owned-data conversion failure. Typically a
@@ -57,7 +45,6 @@ pub enum CodecError {
 
 impl CodecError {
     /// Wrap any `Debug` conversion failure as [`CodecError::Conversion`].
-    /// `pub(crate)` because both codecs and both write paths use it.
     pub(crate) fn from_conv<E: core::fmt::Debug>(e: E) -> Self {
         CodecError::Conversion(format!("{e:?}"))
     }
@@ -157,11 +144,9 @@ pub(crate) fn str0255(s: String) -> Result<stratum_core::binary_sv2::Str0255Owne
 
 // ── Messages both sub-protocols carry ───────────────────────────────
 
-/// `protocol-version-mismatch` — the peer's `SetupConnection` version range
+/// `protocol-version-mismatch`: the peer's `SetupConnection` version range
 /// does not include [`crate::protocol_version::MIN_PROTOCOL_VERSION`].
-///
-/// One constant for both sub-protocols: it answers the same message for the
-/// same reason on either port.
+/// One constant for both sub-protocols, as it answers the same message.
 pub const ERR_PROTOCOL_VERSION_MISMATCH: &str = "protocol-version-mismatch";
 
 /// `unsupported-protocol` — `SetupConnection.protocol` is not the

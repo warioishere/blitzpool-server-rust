@@ -1,79 +1,33 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Per-connection group-channel registry for SV2 mining channels.
-//!
-//! ## What is a group channel? (SV2 Mining/Group Channel / SV2 Mining/NewExtendedMiningJob)
-//!
-//! A **group channel** lets the pool broadcast ONE `NewExtendedMiningJob`
-//! (and one `SetNewPrevHash`) addressed to a `group_channel_id` instead of
-//! one job per member channel. The downstream (a proxy without the
-//! `REQUIRES_STANDARD_JOBS` flag) splices each of its own channels'
-//! `extranonce_prefix` into the shared coinbase to derive per-channel work.
-//! It saves frames on connections that aggregate many channels.
-//!
-//! ## Grouping invariant
-//!
-//! Every channel in a group MUST share the EXACT SAME full extranonce size
-//! (SV2 Mining/Group Channel / SV2 Mining/Extended Extranonce): the group's
-//! single `coinbase_tx_prefix` carries a fixed scriptSig-length varint, so the
-//! coinbase slot size must be identical for every member. So there is one
-//! group per `(connection, full_extranonce_size)`, and a channel only joins
-//! the group of its own size ([`GroupChannelRegistry::join_group_for_size`]).
-//!
-//! ## Shared job id
-//!
-//! A group broadcast carries ONE `job_id`, so the group owns a monotonic
-//! counter ([`GroupChannel::alloc_job_id`]). The caller stores the job on
-//! every member channel under that id, so per-channel `SubmitShares*`
-//! validation (keyed by job id) works unchanged.
-//!
-//! ## Scope: per-connection, group id from the channel-id namespace
-//!
-//! [`GroupChannelRegistry`] is embedded in `MiningSessionState`
-//! (per-connection). The `group_channel_id` MUST live in the SAME namespace as
-//! `channel_id` and never collide (SV2 Mining/Group Channel), so the
-//! **caller** allocates the id from the session's `next_channel_id` counter
-//! and hands it to [`GroupChannelRegistry::join_group_for_size`] — the
-//! registry never invents ids.
+//! Per-connection SV2 group channels: one `NewExtendedMiningJob` per group.
+//! Members MUST share one full extranonce size, since the shared coinbase prefix
+//! fixes the scriptSig-length varint (SV2 Mining/Group Channel). Group ids come
+//! from the caller's channel-id namespace so they never collide with a channel id.
 
 use std::collections::{HashMap, HashSet};
 
 use super::jobs::ExtendedJob;
 
-/// A single group: its id, the member channel ids, the shared full
-/// extranonce size that defines it, and the monotonic job-id counter used
-/// for group broadcasts.
-///
-/// `Eq` is intentionally not derived: [`current_job`](Self::current_job)
-/// carries an [`ExtendedJob`] whose `Difficulty` fields are `f64`-backed
-/// and therefore not `Eq`.
+/// One group, defined by its shared full extranonce size. A broadcast carries
+/// one `job_id`, stored on every member so per-channel validation works.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GroupChannel {
     pub id: u32,
     pub channel_ids: HashSet<u32>,
-    /// The full extranonce size (bytes) every member shares — the grouping
-    /// invariant. For an Extended member it's `extranonce_prefix.len() +
-    /// extranonce_size`. (Only Extended channels are grouped.)
+    /// The grouping invariant; only Extended channels are grouped.
     pub full_extranonce_size: usize,
-    /// Monotonic source of the shared `job_id` carried on group broadcasts.
-    /// Starts at 1.
     next_job_id: u32,
-    /// The `job_id` of the most recently broadcast group job, or `None`
-    /// before the first broadcast. Lets a newly-opened member be onboarded
-    /// onto the CURRENT job (same id) instead of sending the existing members
-    /// a fresh job and a spurious new block.
+    /// Lets a newly-opened member join the CURRENT job instead of sending
+    /// the existing members a fresh job and a spurious new block.
     current_job_id: Option<u32>,
-    /// The coinbase TEMPLATE of the group's current broadcast job, or `None`
-    /// before the first broadcast. Stored on the group because an
-    /// emptied-then-refilled group has no member to copy it from. Its
-    /// `difficulty` is a placeholder; onboarding uses the new member's own.
+    /// Kept on the group because an emptied-then-refilled group has no member
+    /// to copy it from. Its `difficulty` is a placeholder.
     current_job: Option<ExtendedJob>,
 }
 
 impl GroupChannel {
-    /// Allocate the next shared `job_id` for a group broadcast and record it
-    /// as the group's current job. The caller stores the resulting job on
-    /// every member channel under this id.
+    /// Next shared `job_id`, recorded as the group's current job.
     pub fn alloc_job_id(&mut self) -> u32 {
         let id = self.next_job_id;
         self.next_job_id = self.next_job_id.wrapping_add(1);
@@ -81,30 +35,22 @@ impl GroupChannel {
         id
     }
 
-    /// The `job_id` of the group's current broadcast job, or `None` before
-    /// the first broadcast.
     pub fn current_job_id(&self) -> Option<u32> {
         self.current_job_id
     }
 
-    /// Record the coinbase template of the group's current broadcast job.
-    /// Called once per full group broadcast (after [`alloc_job_id`]); read
-    /// by the onboard path to seed a freshly-opened member.
-    ///
-    /// [`alloc_job_id`]: Self::alloc_job_id
+    /// Record the current broadcast's coinbase template; seeds a member that
+    /// opens later.
     pub fn set_current_job(&mut self, job: ExtendedJob) {
         self.current_job = Some(job);
     }
 
-    /// The coinbase template of the group's current broadcast job, or `None`
-    /// before the first broadcast.
     pub fn current_job(&self) -> Option<&ExtendedJob> {
         self.current_job.as_ref()
     }
 }
 
-/// Per-connection group-channel registry. Pure data structure — no I/O,
-/// no locking, owned `&mut` by the connection task.
+/// Per-connection group-channel registry, owned by the connection task.
 #[derive(Clone, Debug, Default)]
 pub struct GroupChannelRegistry {
     groups: HashMap<u32, GroupChannel>,
@@ -133,20 +79,17 @@ impl GroupChannelRegistry {
         self.groups.get_mut(&group_id)
     }
 
-    /// The group a channel belongs to, or `None` if un-grouped. Linear scan
-    /// — fine for the single-digit-groups-per-connection scale.
+    /// The group a channel belongs to. A linear scan suits the few groups
+    /// per connection.
     pub fn group_for_channel(&self, channel_id: u32) -> Option<u32> {
         self.groups
             .iter()
             .find_map(|(&id, g)| g.channel_ids.contains(&channel_id).then_some(id))
     }
 
-    /// Add `channel_id` to the group of its `full_extranonce_size`, creating
-    /// that group under `new_group_id()` when there is none yet, and return
-    /// the group's id. The id is drawn only when a group is created; the
-    /// caller takes it from the session's channel-id namespace so it can
-    /// never collide with a channel id. Idempotent: re-adding a member is a
-    /// no-op.
+    /// Add `channel_id` to the group of its size and return the group's id.
+    /// `new_group_id` is called only when a group is created; it must come
+    /// from the session's channel-id namespace. Idempotent.
     pub fn join_group_for_size(
         &mut self,
         channel_id: u32,
@@ -180,8 +123,7 @@ impl GroupChannelRegistry {
         group_id
     }
 
-    /// Drop a channel from whichever group it's in (no-op if un-grouped).
-    /// Called on channel close.
+    /// Drop a channel from its group on channel close.
     pub fn remove_channel(&mut self, channel_id: u32) {
         if let Some(group_id) = self.group_for_channel(channel_id) {
             if let Some(group) = self.groups.get_mut(&group_id) {
@@ -197,21 +139,16 @@ impl GroupChannelRegistry {
         }
     }
 
-    /// Drop an entire group + its membership. Returns the removed group.
     pub fn remove_group(&mut self, group_id: u32) -> Option<GroupChannel> {
         self.groups.remove(&group_id)
     }
 
-    /// Allocate the next shared `job_id` for a group's broadcast. `None` if
-    /// the group is unknown.
     pub fn alloc_job_id(&mut self, group_id: u32) -> Option<u32> {
         self.groups
             .get_mut(&group_id)
             .map(GroupChannel::alloc_job_id)
     }
 
-    /// Iterate `(group_id, &GroupChannel)` — for the broadcast's
-    /// "one job per group" fan-out.
     pub fn iter(&self) -> impl Iterator<Item = (u32, &GroupChannel)> {
         self.groups.iter().map(|(&id, g)| (id, g))
     }
@@ -233,9 +170,8 @@ mod tests {
         assert_eq!(g.channel_ids, [2].into_iter().collect());
     }
 
-    /// A channel of an existing size joins that group without drawing an id;
-    /// a channel of another size gets a group of its own, so no group ever
-    /// mixes sizes (SV2 Mining/Group Channel).
+    /// Same size joins the existing group without drawing an id; another size
+    /// gets its own group (SV2 Mining/Group Channel).
     #[test]
     fn join_groups_by_full_extranonce_size() {
         let mut reg = GroupChannelRegistry::new();
@@ -343,9 +279,8 @@ mod tests {
         }
     }
 
-    /// Emptying a group drops its current job (id + template) so a later
-    /// re-joining member gets a fresh full broadcast, not the onboard-reuse of
-    /// a job pinned to a now-old block.
+    /// Emptying a group drops its current job, so a re-joining member gets a
+    /// fresh broadcast instead of a job pinned to an old block.
     #[test]
     fn remove_last_channel_clears_current_job_state() {
         let mut reg = GroupChannelRegistry::new();
@@ -369,8 +304,7 @@ mod tests {
         );
     }
 
-    /// Removing one of several members does NOT clear the group's current job
-    /// (the group is still active for the remaining members).
+    /// Removing one of several members keeps the group's current job.
     #[test]
     fn remove_non_last_channel_keeps_current_job_state() {
         let mut reg = GroupChannelRegistry::new();

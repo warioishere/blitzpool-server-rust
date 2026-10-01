@@ -1,26 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `InflightResultCache<K, V, E>` — per-key dedup of concurrent
-//! `compute()` callers + TTL-based result caching.
-//!
-//! One NewTemplate fans out to N channels that all ask for the same payout
-//! distribution; coalescing turns those N Redis + Postgres reads and
-//! builds into one, since the result is identical for every caller.
-//!
-//! Behavior:
-//!
-//! - First caller for `key`: stamps an in-flight slot, runs the
-//!   `compute` future, and broadcasts the result to any waiters.
-//! - Concurrent caller for the same `key`: subscribes to the
-//!   in-flight slot and awaits the broadcast.
-//! - Caller within `ttl` of a previous successful compute: gets the
-//!   cached `Arc<V>` directly, no compute call.
-//! - Caller after a failed compute: the failed slot is removed
-//!   immediately (no negative caching); the next caller retries.
-//!
-//! `Result<Arc<V>, Arc<E>>` is the shared shape — `Arc<E>` works
-//! around the common case where `E` doesn't impl `Clone`
-//! (e.g. `sqlx::Error`).
+//! `InflightResultCache<K, V, E>`: per-key dedup of concurrent `compute()`
+//! callers plus TTL caching of successes (failures are not cached). One
+//! NewTemplate fans out to N channels asking for the same distribution, so N
+//! builds become one. `Arc<E>` lets errors without `Clone` be shared.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -38,27 +21,21 @@ enum Slot<V, E> {
     Cached { value: Arc<V>, expires_at: Instant },
 }
 
-/// Slot map plus a monotonic generation counter.
-///
-/// Every invalidation bumps `generation`. A leader records the
-/// generation it started under, so when it finishes it can tell whether
-/// an invalidation landed mid-compute — in which case its result is
-/// already superseded and must not be cached for the full TTL.
+/// Slot map plus a generation counter that every invalidation bumps, so a
+/// leader can tell an invalidation landed mid-compute and must not cache its
+/// already superseded result.
 struct Inner<K, V, E> {
     slots: HashMap<K, Slot<V, E>>,
     generation: u64,
 }
 
-/// Generic per-key in-flight dedup + TTL cache. Cheap to clone (the
-/// inner state is `Arc<Mutex<…>>`).
+/// Per-key in-flight dedup + TTL cache. Clones share state.
 pub struct InflightResultCache<K, V, E> {
     state: Arc<Mutex<Inner<K, V, E>>>,
     ttl: Duration,
 }
 
-// Manual `Clone` impl so `Clone` doesn't require `K: Clone, V: Clone,
-// E: Clone` — only the `Arc` + `Duration` are cloned, neither of
-// which constrains the type parameters.
+// Manual impl: a derive would require `K, V, E: Clone`.
 impl<K, V, E> Clone for InflightResultCache<K, V, E> {
     fn clone(&self) -> Self {
         Self {
@@ -84,22 +61,14 @@ where
         }
     }
 
-    /// Look up `key`; if a fresh cached result exists return it; else
-    /// either run `compute` as the leader or subscribe to the leader's
-    /// in-flight broadcast as a follower.
-    ///
-    /// On compute success the result is cached for `ttl`. On failure
-    /// the slot is dropped immediately — no negative caching, the next
-    /// caller retries.
+    /// Return a fresh cached result, or run `compute` as leader, or wait for
+    /// the leader's broadcast. Success is cached for `ttl`; a failure drops
+    /// the slot so the next caller retries.
     pub async fn get_or_compute<F, Fut>(&self, key: K, compute: F) -> SharedResult<V, E>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<V, E>>,
     {
-        // Critical section: probe the cache, install the in-flight slot
-        // as leader, or take a follower receiver.
-        // `generation_at_start` is the invalidation epoch the leader
-        // computes under (see `Inner`).
         let (receiver, generation_at_start) = {
             let mut state = self.state.lock().expect("inflight mutex poisoned");
             let generation_at_start = state.generation;
@@ -119,7 +88,6 @@ where
         };
 
         if let Some(mut rx) = receiver {
-            // Wait for the leader to publish.
             return match rx.recv().await {
                 Ok(result) => result,
                 Err(_) => {
@@ -131,15 +99,13 @@ where
             };
         }
 
-        // Leader path.
         let outcome = compute().await;
         let shared: SharedResult<V, E> = match outcome {
             Ok(v) => Ok(Arc::new(v)),
             Err(e) => Err(Arc::new(e)),
         };
 
-        // Update state + broadcast. Both happen under one lock so an
-        // invalidation can't slip between the remove and the re-insert.
+        // One lock, so an invalidation cannot slip between remove and insert.
         let prev = {
             let mut state = self.state.lock().expect("inflight mutex poisoned");
             let prev = state.slots.remove(&key);
@@ -159,29 +125,23 @@ where
             prev
         };
         if let Some(Slot::InFlight(tx)) = prev {
-            // Best-effort: with no followers `send` errs, which is fine.
-            // Followers get this result even when it was not cached: it is
-            // the value they queued for, and the next caller recomputes.
+            // Errs with no followers. Followers get the result even when it
+            // was not cached: it is the value they queued for.
             let _ = tx.send(shared.clone());
         }
         shared
     }
 
-    /// Invalidate any cached or in-flight entry for `key`. The next
-    /// caller will run `compute` fresh. Used by the engine after
-    /// state-mutating events that would change the distribution (e.g.
-    /// a new share landed, network difficulty changed).
-    /// Also bumps the generation, so a compute already in flight for
-    /// this key does not install its now-superseded result.
+    /// Drop any cached or in-flight entry for `key` and bump the generation,
+    /// so a compute already in flight does not install its superseded result.
     pub fn invalidate(&self, key: &K) {
         let mut state = self.state.lock().expect("inflight mutex poisoned");
         state.slots.remove(key);
         state.generation = state.generation.wrapping_add(1);
     }
 
-    /// Drop all cached + in-flight entries. Useful at engine shutdown.
-    /// Like [`Self::invalidate`], in-flight computes started before this
-    /// call will not cache their results.
+    /// Drop all entries; like [`Self::invalidate`], in-flight computes will
+    /// not cache their results.
     pub fn clear(&self) {
         let mut state = self.state.lock().expect("inflight mutex poisoned");
         state.slots.clear();
@@ -320,9 +280,7 @@ mod tests {
         );
     }
 
-    /// An invalidation that lands *while* a compute is in flight is not
-    /// lost: the leader's result, computed from pre-invalidation state, is
-    /// returned to its caller but not cached.
+    /// A mid-compute invalidation: the leader's result is returned but not cached.
     #[tokio::test]
     async fn invalidate_during_inflight_is_not_resurrected() {
         let cache: Arc<InflightResultCache<u64, u64, FakeError>> =
@@ -336,8 +294,6 @@ mod tests {
                 cache
                     .get_or_compute(1, || async move {
                         calls.fetch_add(1, Ordering::SeqCst);
-                        // Long enough for the invalidation below to land
-                        // mid-compute.
                         tokio::time::sleep(Duration::from_millis(80)).await;
                         Ok(11u64)
                     })

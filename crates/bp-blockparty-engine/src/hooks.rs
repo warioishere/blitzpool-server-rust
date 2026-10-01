@@ -1,33 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Cross-cutting hooks the service relies on. The mode-collision check
-//! against PplnsGroup is wired directly through a
-//! [`bp_group_mgmt_engine::AddressCache`] handed to the service at
-//! construction — no trait needed there.
-//!
-//! The remaining cross-cut is **verified-email lookup**: the invitee's
-//! email is pulled from the verified-email-binding service so the admin
-//! can never inject a bogus email. The hook abstracts that lookup so
-//! tests can supply a stub instead of standing up the real email
-//! verification pipeline.
+//! Verified-email lookup. A member's email always comes from its verified
+//! binding, so an admin can never inject one; the trait lets tests stub it.
 
 use async_trait::async_trait;
 use bp_common::AddressId;
 
-/// Cross-crate dependency surface: one lookup.
 #[async_trait]
 pub trait BlockpartyHooks: Send + Sync {
-    /// Return the verified email-binding for `address`, or `None` if no
-    /// binding exists / is unverified. `add_member` without a verified email
-    /// (and without a signature proof) surfaces as
-    /// [`crate::BlockpartyServiceError::EmailNotVerified`].
+    /// `None` when no verified binding exists.
     async fn verified_email_for(&self, address: &AddressId) -> Option<String>;
 }
 
-/// Sentinel for tests + bring-up wiring: every address resolves to the
-/// same canned email. Tests that don't care about the binding flow can
-/// use this; tests that DO need to assert "missing email" branches
-/// should supply a small `FnMut`-style stub instead.
+/// Resolves every address to the same canned email.
 #[derive(Debug, Clone)]
 pub struct NoopHooks {
     pub canned_email: String,

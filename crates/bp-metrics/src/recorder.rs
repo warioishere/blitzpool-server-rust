@@ -1,21 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Typed recorder helpers wrapping the `metrics` macros, so emit-sites
-//! share one set of metric + label names ([`crate::constants`]).
-//!
-//! All functions are zero-cost when the global recorder isn't
-//! installed (the `metrics` facade no-ops). That makes tests safe even
-//! without a [`crate::service::MetricsService::spawn`].
+//! Typed helpers over the `metrics` macros, so emit-sites share the names in
+//! [`crate::constants`]. They no-op without an installed recorder, so tests
+//! need no [`crate::service::MetricsService::spawn`].
 
 use metrics::{counter, gauge};
 
 use crate::constants::*;
 
-/// Update the Core→Satellite stream-consumer lag gauges for one consumer
-/// group. `lag` is `None` when Redis can't compute it (the stream was trimmed
-/// below the group's read offset, probable entry loss); the `_computable`
-/// gauge then drops to `0` so alerting sees what a lag of "0" would hide.
-/// `pending` (PEL size) is always known and always emitted.
+/// Update the stream-consumer gauges for one group. `lag` is `None` when
+/// Redis cannot compute it; the `_computable` gauge then drops to `0`, so
+/// alerting sees what a lag of "0" would hide.
 pub fn set_stream_consumer_lag(stream: &str, group: &str, lag: Option<u64>, pending: u64) {
     let stream = stream.to_string();
     let group = group.to_string();
@@ -37,12 +32,8 @@ pub fn record_stratum_difficulty_adjustment() {
     counter!(STRATUM_DIFFICULTY_ADJUSTMENTS_TOTAL).increment(1);
 }
 
-/// Publish the two block-parking depths from the confirmation watcher's
-/// pass.
-///
-/// `unbookable` is the one to alert on: those blocks paid miners on-chain
-/// and never reached a ledger. Nothing else in the pool reads that store,
-/// so this gauge is the only standing signal that it is not empty.
+/// Publish the two block-parking depths. Alert on `unbookable`: those blocks
+/// paid miners on-chain and never reached a ledger.
 pub fn set_parked_block_counts(pending_apply: u64, unbookable: u64) {
     gauge!(POOL_BLOCKS_PENDING_APPLY).set(pending_apply as f64);
     gauge!(POOL_BLOCKS_UNBOOKABLE).set(unbookable as f64);
@@ -52,8 +43,7 @@ pub fn set_parked_block_counts(pending_apply: u64, unbookable: u64) {
 mod tests {
     use super::*;
 
-    /// The facade no-ops without a global recorder, so every helper must be
-    /// safe to call before `MetricsService::spawn` (and in tests).
+    /// Every helper is safe to call without a global recorder.
     #[test]
     fn recorder_helpers_no_panic_without_global_recorder() {
         set_stream_consumer_lag("shares:accepted", "money", Some(0), 0);

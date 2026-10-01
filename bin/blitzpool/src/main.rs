@@ -5,13 +5,8 @@
 // stderr too, so the operator sees them under any `RUST_LOG` filter.
 #![allow(clippy::print_stderr)]
 
-//! `blitzpool` binary entry-point.
-//!
-//! Loads `AppConfig`, spawns the foundation handles via [`boot::boot`], the
-//! engines via [`engines::spawn`] and the production hooks via
-//! [`hooks::spawn`], then wires each subsystem according to the process's
-//! roles. The one user-facing knob is `--config <PATH>` (default
-//! `./blitzpool.toml`).
+//! `blitzpool` binary entry-point: loads `AppConfig`, boots the foundation
+//! handles, engines and hooks, then wires each subsystem by the process's roles.
 
 // Process-wide allocator: glibc malloc fragments under the pool's
 // small-alloc / free pattern (per-connection buffers, query results), and
@@ -90,9 +85,7 @@ struct Cli {
     config: PathBuf,
 
     /// Parse the config file, log the startup summary, and exit
-    /// without binding any sockets or contacting any external
-    /// service. Useful for CI smoke-checks against a deployment's
-    /// `.local/blitzpool.toml`.
+    /// without binding any sockets or contacting any external service.
     #[arg(long)]
     check_config: bool,
 
@@ -183,15 +176,12 @@ async fn main() -> ExitCode {
         Ok(cfg) => cfg,
         Err(err) => {
             tracing::error!(%err, "config load failed");
-            // Plain stderr too, so the operator sees the error under any
-            // tracing filter or terminal.
             eprintln!("blitzpool: {err}");
             print_config_error_help(&err);
             return ExitCode::from(2);
         }
     };
-    // `--roles` / `BLITZPOOL_ROLES` overrides the config's topology so every
-    // container can share one config file and differ only by this env var.
+    // Lets every container share one config file and differ only by roles.
     if !cli.roles.is_empty() {
         tracing::info!(roles = ?cli.roles, "roles overridden from CLI/env");
         cfg.roles = cli.roles.clone();
@@ -203,8 +193,7 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Operator one-shot tools for the Redis-state backup: list / restore, then
-    // exit. They need only PG (+ Redis for the restore), no roles and no full
+    // Redis-state backup tools need only PG (+ Redis to restore) and no full
     // boot, so they work during recovery while the rest of the stack is down.
     if cli.list_redis_backups || cli.restore_redis_state {
         let db = match boot::spawn_pg(&cfg.database).await {
@@ -258,9 +247,8 @@ async fn main() -> ExitCode {
         };
     }
 
-    // Role validation runs after `--check-config`, since roles usually arrive
-    // via BLITZPOOL_ROLES at deploy time. A process with no role does nothing
-    // useful, so fail fast instead of booting an inert process.
+    // After `--check-config`, since roles usually arrive via BLITZPOOL_ROLES
+    // at deploy time.
     if cfg.effective_roles().is_empty() {
         tracing::error!(
             "no roles configured: set BLITZPOOL_ROLES (e.g. =front) or a `roles` \
@@ -273,10 +261,8 @@ async fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    // The front always produces shares onto the Redis stream and a separate
-    // payout Satellite consumes them. A process holding both `front` and
-    // `payout` would produce shares no one consumes, so fail fast rather than
-    // silently drop the money path.
+    // The front produces shares to a stream a separate payout process
+    // consumes; both in one process would silently drop the money path.
     if cfg.has_role(Role::Front) && cfg.has_role(Role::Payout) {
         tracing::error!(
             "invalid roles: a single process cannot run both `front` and `payout` \
@@ -342,30 +328,19 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Deployment topology by role (see `Role`). Each subsystem is gated on
-    // the role(s) this process runs, so the back-office can be one process
-    // (`satellite` = api+payout+stats) or split (e.g. an `api`-only process
-    // that serves reads while the `payout` process restarts).
-    // - front: Stratum + share producer + block submit + JDP.
-    // - api: HTTP API (read-only engines, no consumers/crons).
-    // - accounting (payout|stats): engines + stream consumers + ledger apply +
-    //   maintenance crons + confirmation watcher.
-    // - notify: dispatcher + listeners + notification crons + notify-only
-    //   fan-out of the block-found + device-status streams.
+    // Each subsystem is gated on this process's roles: front = Stratum, JDP,
+    // share producer; api = HTTP; accounting (payout|stats) = consumers,
+    // ledger, crons; notify = dispatcher, listeners, notification fan-out.
     let is_front = cfg.has_role(Role::Front);
     let is_api = cfg.has_role(Role::Api);
     let is_accounting = cfg.has_role(Role::Payout) || cfg.has_role(Role::Stats);
     let is_notify = cfg.has_role(Role::Notify);
-    // A back-accounting process consumes the engine streams; the front
-    // produces to them.
     let consumes_streams = is_accounting && !is_front;
     let produces_streams = is_front && !cfg.has_role(Role::Payout);
-    // A notify process that isn't also the front consumes the notify streams
-    // (block-found notify + device-status). A front never carries the notify
-    // role, so it produces those events for the notify process to consume.
+    // A front produces the notify events (block-found, device-status) for a
+    // separate notify process to consume.
     let consumes_notify_streams = is_notify && !is_front;
-    // An accounting process without the notify role means notifications live
-    // in a separate `notify` process; warn so a missing one is noticed.
+    // Warn so a missing separate `notify` process is noticed.
     if is_accounting && !is_notify {
         tracing::warn!(
             "roles: this process runs accounting WITHOUT notify — notifications \
@@ -375,10 +350,8 @@ async fn main() -> ExitCode {
         );
     }
 
-    // Telegram + ntfy listener loops + the notification dispatcher belong to the
-    // `notify` role. The listeners answer read-commands (/pplns_status …) from
-    // the read-only engines; the dispatcher fans out pushes. Off the notify role
-    // both collapse to the inert `disabled()` / `None` forms.
+    // Telegram/ntfy listeners and the dispatcher belong to the `notify` role;
+    // elsewhere they are inert.
     let listeners = if is_notify {
         match listeners::spawn(&cfg, &handles, &engines) {
             Ok(h) => h,
@@ -394,23 +367,15 @@ async fn main() -> ExitCode {
     };
     listeners.log_summary(is_notify);
 
-    // NotificationDispatcher from the four adapters (FCM + Web-Push from
-    // hooks; Telegram + ntfy from listeners). `None` when no transport is
-    // wired, so the `notify_*` calls become no-ops.
-    //
-    // Notify-only: all of the dispatcher's drivers run where `notify` runs.
-    // Off that role a front produces the block-found + device-status events
-    // to streams instead, for the notify process to fan out.
+    // `None` when no transport is wired, so the `notify_*` calls are no-ops.
     let dispatcher = if is_notify {
         dispatcher::build(&handles, &production_hooks, &listeners)
     } else {
         None
     };
 
-    // Device-status debounce. Lives wherever the dispatcher lives, so both
-    // the in-process sink (combined front+notify) and the stream consumer
-    // (split deployment) feed the same instance and a device is judged
-    // once, not once per producer.
+    // Device-status debounce lives with the dispatcher, so every producer
+    // feeds one instance and a device is judged once.
     let device_status_gate = dispatcher.as_ref().map(|_| {
         let ds = &cfg.notifications.device_status;
         crate::device_status_gate::build(
@@ -445,32 +410,25 @@ async fn main() -> ExitCode {
         }
     };
     if let Some(ref bp) = blockparty {
-        // Hook the trait object into EngineHandles so the
-        // ProductionPayoutResolver constructed by stratum::spawn picks
-        // up the Blockparty arm + the Solo pending-fee guard.
+        // Before stratum::spawn, so its payout resolver gets the Blockparty
+        // arm and the pending-fee guard.
         engines.blockparty = Some(bp.service.clone());
-        // Append the share-accept fan-out sink so the first share for a
-        // routable admin auto-promotes the party from READY to ACTIVE. Only
-        // the front holds an in-process composite; on the satellite the same
-        // sink is added to the stream consumer's set below.
+        // The first share of a routable admin promotes the party READY →
+        // ACTIVE. In-process on the front; the satellite adds it below.
         if let Some(accepted_sink) = engines.accepted_sink.as_ref() {
             accepted_sink.push(Arc::new(
                 crate::blockparty_service::BlockpartyAcceptedShareSink::new(bp.service.clone()),
             ));
         }
-        // Bidirectional mode-collision: PPLNS-group adds refuse addresses
-        // already in a Blockparty.
+        // Group joins refuse addresses already in a Blockparty.
         group_service
             .service
             .set_blockparty_reader(bp.membership_reader.clone());
     }
 
-    // Cross-process routing-cache sync. The API process is the membership
-    // writer — attach the notifier so every group/blockparty mutation publishes
-    // an invalidation onto the `cache:invalidate` stream. The Front consumes it
-    // (spawned below) and rebuilds, so an API-created group/party routes without
-    // a Front restart. (A process holding both `api` and `front` publishes
-    // and self-consumes; the rebuild is idempotent.)
+    // The API writes memberships, so it publishes every group/party change to
+    // `cache:invalidate`; the front rebuilds its routing from it without a
+    // restart.
     if is_api {
         let notifier = Arc::new(crate::cache_sync::StreamCacheNotifier::new(
             handles.redis.clone(),
@@ -481,7 +439,6 @@ async fn main() -> ExitCode {
         }
     }
 
-    // The HTTP API is the back-office surface — back-only.
     let api = if is_api {
         match api_server::spawn(
             &cfg,
@@ -511,23 +468,16 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // ext 0x0003/Implementation Notes settlement fan-out: every path that
-    // books a block tells the local JDP registry (if any) and the
-    // `cache:invalidate` stream, since `payout` books while `front` holds the
-    // registry. Created ahead of the Stratum listeners, whose block sinks
-    // settle on the immediate apply and need the same signal. See
-    // `crate::settlement`.
+    // ext 0x0003/Implementation Notes settlement fan-out: `payout` books while
+    // `front` holds the JDP registry, so every booking path signals both.
+    // Created before the Stratum block sinks, which settle on immediate apply.
     let settle_signal = crate::settlement::SettlementSignal::new(handles.redis.clone());
 
-    // ONE JDP bridge for the whole process, built here because BOTH servers
-    // that use it are spawned below and neither may build its own. It is the
-    // only channel between them: the JDP server registers declared jobs and
-    // base-protocol allocations, the SV2 mining server resolves a
-    // `SetCustomMiningJob` against them. A second bridge would leave the
-    // mining side reading a registry nobody writes to.
+    // One JDP bridge shared by both servers: JDP registers declared jobs, the
+    // SV2 mining server resolves `SetCustomMiningJob` against them. A second
+    // bridge would leave the mining side reading a registry nobody writes.
     let jdp_bridge = stratum_v2::build_bridge();
 
-    // Stratum listeners + share producer are the always-on front — front-only.
     let stratum = if is_front {
         match stratum::spawn(
             &cfg,
@@ -562,11 +512,7 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Background crons split by role: maintenance (kill-dead, cleanups,
-    // invitation/join expiry) on the accounting role; the notification crons
-    // (network-difficulty, best-difficulty, hourly stats) on the notify role.
-    // The best_difficulty + hourly crons seed from address_settings to avoid
-    // cold-start notification spam.
+    // Maintenance crons run on accounting, notification crons on notify.
     let crons = if is_accounting || is_notify {
         let crons = crons::spawn(
             &handles,
@@ -584,12 +530,9 @@ async fn main() -> ExitCode {
         None
     };
 
-    // Confirmation watcher: PPLNS + Group-Solo block-founds park their frozen
-    // distribution in Redis; this task applies it once the block reaches
-    // `confirmation_depth` and discards it on orphan, so a reorg never drifts
-    // the internal ledger. Accounting role only; without a TDP feed it runs on
-    // the fallback timer alone. Blockparty is exempt: its fixed-percentage
-    // payouts are recomputed from the DB, so there is nothing to drift.
+    // Applies parked PPLNS/Group-Solo blocks at `confirmation_depth` and
+    // discards them on orphan, so a reorg never drifts the ledger. Blockparty
+    // recomputes from the DB, so it needs no confirmation.
 
     let block_confirmation = if is_accounting {
         let depth = cfg
@@ -610,10 +553,8 @@ async fn main() -> ExitCode {
         None
     };
 
-    // Keep the PPLNS window's trim size on the CURRENT network difficulty.
-    // Payout role only: the window is trimmed inside `record_share`, which
-    // only that process runs. The source is the RPC because this process has
-    // no TDP feed; see `crate::network_difficulty`.
+    // Keep the PPLNS window's trim size on the current network difficulty.
+    // Payout only, where `record_share` trims; from RPC, as payout has no TDP.
     let _net_diff_refresh = match (cfg.has_role(Role::Payout), engines.pplns.as_ref()) {
         (true, Some(pplns)) => Some(crate::network_difficulty::spawn_refresh_task(
             handles.bitcoin_rpc.clone(),
@@ -624,10 +565,9 @@ async fn main() -> ExitCode {
         _ => None,
     };
 
-    // Periodic best-effort backup of the live PPLNS + Group-Solo Redis state
-    // to Postgres, for a MANUAL restore after a Redis wipe
-    // (`--restore-redis-state`). Payout process only, on its own Redis
-    // connection so the SCAN/DUMP burst never touches the share hot-path.
+    // Best-effort backup of PPLNS + Group-Solo Redis state to Postgres for a
+    // manual `--restore-redis-state`. Own connection, so the SCAN/DUMP burst
+    // never touches the share hot path.
     let _redis_state_backup = if cfg.has_role(Role::Payout) {
         let backup_redis = handles
             .dedicated_redis(&cfg.redis, "redis-state-backup")
@@ -642,10 +582,8 @@ async fn main() -> ExitCode {
         None
     };
 
-    // Chain → ledger check: reads the coinbase of every block that landed and
-    // reports the ones the ledger has no record of. Payout role, where that
-    // ledger is written. Reports only: the chain does not carry the
-    // distribution behind a coinbase, so it cannot book.
+    // Reports pool blocks on chain the ledger has no record of. Report only:
+    // the chain does not carry the distribution behind a coinbase.
     let _block_reconcile = if cfg.has_role(Role::Payout) {
         let markers = crate::block_reconcile::PoolMarkers::new([
             cfg.pplns
@@ -676,9 +614,8 @@ async fn main() -> ExitCode {
         None
     };
 
-    // Satellite: drain the accepted-share stream the Core produces into the
-    // real engine sinks (two consumer groups by durability class). Only the
-    // back (accounting, no front role) consumes the stream.
+    // Drain the accepted-share stream into the engine sinks, two consumer
+    // groups by durability class.
     let satellite_consumer = if consumes_streams {
         let mut sinks = engines::build_accepted_sinks(
             engines.pplns.as_ref(),
@@ -687,15 +624,14 @@ async fn main() -> ExitCode {
             &engines.session_persistence,
             handles.redis.clone(),
         );
-        // Blockparty auto-promote runs off the share-accept too — on the
-        // satellite it joins the order-insensitive (aux) consumer group.
+        // Blockparty auto-promote is order-insensitive, so it joins aux.
         if let Some(bp) = blockparty.as_ref() {
             sinks.aux.push(Arc::new(
                 crate::blockparty_service::BlockpartyAcceptedShareSink::new(bp.service.clone()),
             ));
         }
-        // Dedicated connection per consumer group — a blocking XREAD must not
-        // share a multiplexed connection (it head-of-line-blocks the rest).
+        // Dedicated connections: a blocking XREAD would head-of-line-block a
+        // shared multiplexed one.
         let money_redis = handles.dedicated_redis(&cfg.redis, "satellite-money").await;
         let stats_redis = handles.dedicated_redis(&cfg.redis, "satellite-stats").await;
         Some(satellite_consumer::spawn(money_redis, stats_redis, sinks))
@@ -703,10 +639,8 @@ async fn main() -> ExitCode {
         None
     };
 
-    // Payout: drain the block-found stream for the engine ledger-write only (the
-    // Core submits + records the durable blocks_entity row). No dispatcher:
-    // the notify fan-out is a separate consumer on the `notify` role, so a
-    // notification change never restarts payout.
+    // Block-found stream → ledger only. Notification is a separate consumer
+    // on `notify`, so a notification change never restarts payout.
     let block_found_consumer = if consumes_streams {
         let applier = crate::block_sink::BlockFoundApplier::new(
             engines.pplns.clone(),
@@ -728,9 +662,8 @@ async fn main() -> ExitCode {
         None
     };
 
-    // Notify: drain the block-found stream on its own consumer group and fan out
-    // the notification only (no engines, no ledger). Runs alongside the payout
-    // ledger consumer — both read every event independently.
+    // Block-found stream → notification only, on its own consumer group so it
+    // and the ledger consumer each see every event.
     let block_found_notify_consumer = if consumes_notify_streams {
         match dispatcher.clone() {
             Some(d) => {
@@ -757,8 +690,6 @@ async fn main() -> ExitCode {
         None
     };
 
-    // Satellite: drain the rejected-share stream into the Group-Solo + stats
-    // reject counters (the Core stamps the group_id, then publishes).
     let rejected_consumer = if consumes_streams {
         let sinks = engines::build_rejected_sinks(&engines.group_solo, &engines.stats);
         let rej_redis = handles.dedicated_redis(&cfg.redis, "rejected").await;
@@ -767,10 +698,7 @@ async fn main() -> ExitCode {
         None
     };
 
-    // Notify: drain the device-status stream (miner online/offline events the
-    // front publishes) and fan them out via the dispatcher. Only when a
-    // dispatcher exists — with no transport configured there's nothing to send
-    // and the stream just trims at MAXLEN.
+    // Without a dispatcher there is nothing to send; the stream trims at MAXLEN.
     let device_status_consumer = if consumes_notify_streams {
         match device_status_gate.clone() {
             Some((g, subs)) => {
@@ -795,10 +723,8 @@ async fn main() -> ExitCode {
         _ => None,
     };
 
-    // Core: watch the Core→Satellite streams' consumer lag (the always-on
-    // side notices the restartable Satellite falling behind / going down).
-    // Budget = 10% of the default stream cap, so it fires well before MAXLEN
-    // trims. Only the producing front runs it.
+    // The always-on front watches consumer lag so a lagging or down satellite
+    // is noticed; budget is 10% of the stream cap, well before MAXLEN trims.
     let stream_monitor = if produces_streams {
         Some(crate::stream_monitor::spawn(
             handles.redis.clone(),
@@ -814,24 +740,18 @@ async fn main() -> ExitCode {
         None
     };
 
-    // Latency diagnostics (front producer, gated by debug.submit_latency):
-    // a runtime-stall watchdog + a Redis PING probe on the shared
-    // ConnectionManager, to split a slow per-share XADD into "executor
-    // starved" vs "ConnectionManager slow".
+    // Runtime-stall watchdog + Redis PING probe, to tell a slow per-share XADD
+    // apart as "executor starved" vs "ConnectionManager slow".
     let _runtime_diag = if produces_streams && cfg.debug.submit_latency {
         Some(crate::runtime_diag::spawn(handles.redis.clone()))
     } else {
         None
     };
 
-    // Front: keep the Stratum routing caches (Group-Solo + Blockparty) in sync
-    // with membership changes made on another process (the api). Drains the
-    // `cache:invalidate` stream + rebuilds on a periodic backstop. Only the
-    // Front routes shares, so only it needs this.
+    // Keep the front's routing caches in sync with membership changes made
+    // by the api, from `cache:invalidate` plus a periodic rebuild.
     let cache_sync = if is_front {
-        // Dedicated Redis connection: the blocking `XREAD BLOCK 1000` would
-        // head-of-line-stall every other command on a shared multiplexed
-        // `ConnectionManager`, including the per-share `XADD`.
+        // Dedicated: the blocking XREAD would stall the per-share `XADD`.
         let cache_conn = handles.dedicated_redis(&cfg.redis, "cache-sync").await;
         Some(crate::cache_sync::spawn(
             cache_conn,
@@ -844,9 +764,6 @@ async fn main() -> ExitCode {
         None
     };
 
-    // One role-aware line stating this process's relationship to the Redis
-    // streams. A process can consume the engine streams (accounting) and/or
-    // the notify streams (notify).
     let any_consume = consumes_streams || consumes_notify_streams;
     match (produces_streams, any_consume) {
         (false, true) => tracing::info!(
@@ -857,21 +774,14 @@ async fn main() -> ExitCode {
         (true, false) => tracing::info!(
             "stream summary: producing (this core XADDs accepted/rejected/block-found/device-status)"
         ),
-        // Neither produces nor consumes: a read-only api process (serves from
-        // Postgres, never touches the streams).
         (false, false) => tracing::info!(
             "stream summary: no stream role (read-only process — serves from Postgres)"
         ),
         (true, true) => tracing::info!("stream summary: producing + consuming"),
     }
 
-    // JDP + the coinbase-budget autoscaler are front-only and need the TDP
-    // feed; without it (e.g. `--skip-tdp`) JDP binds nothing. `jdp` stays a
-    // (disabled) handle either way so the shutdown sequence is uniform.
-    //
-    // The autoscaler tunes `coinbase_weight_budget` within [floor, ceiling]
-    // against bitcoin-core's reservation; `None` unless
-    // `[pplns.coinbase_autoscale]` is enabled.
+    // JDP and the coinbase-budget autoscaler need the TDP feed. `jdp` stays a
+    // disabled handle without it, so shutdown is uniform.
     let (jdp, autoscaler) = if is_front {
         match handles.tdp.clone() {
             Some(tdp_handle) => {
@@ -882,9 +792,8 @@ async fn main() -> ExitCode {
                     &handles.redis,
                 )
                 .await;
-                // Fresh ProductionPayoutResolver for the JDP path; shares
-                // `engines` + `cfg` with the one stratum.rs builds, so the two
-                // always resolve the same answer for the same address.
+                // Built from the same `engines` + `cfg` as the Stratum one, so
+                // both resolve the same answer for the same address.
                 let jdp_payout_resolver =
                     std::sync::Arc::new(crate::payout_resolver::ProductionPayoutResolver::new(
                         engines.mode_gate.clone(),
@@ -896,10 +805,8 @@ async fn main() -> ExitCode {
                         },
                         engines.blockparty.clone(),
                     ));
-                // The JDP template-tx cache, when the pool needs the txs
-                // (`jdp_orphan_submitblock` → reconstruct the full block +
-                // `submitblock`). Spawned BEFORE jdp::spawn so its broadcast
-                // subscription registers before the first NewTemplate.
+                // Needed to rebuild a full block for `submitblock`. Spawned
+                // before jdp::spawn so it subscribes before the first NewTemplate.
                 let template_tx_cache: Option<
                     std::sync::Arc<bp_template_distribution::TemplateTxCache>,
                 > = if cfg.sv2.jdp_orphan_submitblock {
@@ -914,9 +821,8 @@ async fn main() -> ExitCode {
                     );
                     None
                 };
-                // Ledger fan-out for JDC-found blocks, built by the same
-                // constructor as the Stratum sinks so a declared block books
-                // through the same path a pool-built one does.
+                // Same constructor as the Stratum sinks, so a declared block
+                // books through the same path as a pool-built one.
                 let jdp_ledger_booker =
                     std::sync::Arc::new(crate::block_sink::TdpBlockSubmissionSink::wired(
                         tdp_handle.clone(),
@@ -1030,9 +936,7 @@ async fn wait_for_shutdown(
 ) {
     use tokio::signal::unix::{signal, SignalKind};
 
-    // Shutdown anchor: a signal, or the API task ending on its own. With no
-    // API (a front-only process) the api arm is `pending()`, so only a signal
-    // triggers shutdown.
+    // Without an API the api arm is `pending()`, so only a signal shuts down.
     let api_join = async move {
         match api {
             Some(a) => {
@@ -1061,9 +965,8 @@ async fn wait_for_shutdown(
         }
     }
 
-    // Single shutdown sequence (both signal paths converge here). Cancel
-    // engine-owned background tasks BEFORE the final drains so the next tick
-    // doesn't fire mid-shutdown.
+    // Cancel background tasks before the final drains so no tick fires
+    // mid-shutdown.
     if let Some(a) = autoscaler {
         a.shutdown().await;
     }
@@ -1105,7 +1008,6 @@ async fn wait_for_shutdown(
         p.shutdown();
     }
     engine_shutdown.group_solo.shutdown();
-    // Final stats drain (consumes the handle by-value).
     engine_shutdown.stats.shutdown().await;
     listeners.shutdown().await;
     engine_shutdown.session_persistence.shutdown().await;
@@ -1334,9 +1236,8 @@ fn print_api_error_help(err: &ApiServerError) {
 
 /// One-line-per-hook summary after [`hooks::spawn`] returns.
 fn log_hooks_summary(_h: &ProductionHooks) {
-    // The aggregate is `Arc<dyn _>`-typed, so the concrete impls are not
-    // visible here; `hooks::spawn` logs their readiness. This line anchors
-    // the phase boundary.
+    // The concrete impls are behind `Arc<dyn _>`; `hooks::spawn` logs their
+    // readiness, this line only marks the phase boundary.
     tracing::info!(
         email_verification_ready = true,
         invitation_email_ready = true,
@@ -1508,9 +1409,7 @@ fn print_boot_error_help(err: &BootError) {
     }
 }
 
-/// Operator-friendly hint when the config can't be loaded. Most of
-/// the failure modes are "file not found" or "deny_unknown_fields"
-/// tripping on a typo — both have actionable next steps.
+/// Operator-friendly hint when the config can't be loaded.
 fn print_config_error_help(err: &ConfigError) {
     match err {
         ConfigError::Io { path, .. } => {

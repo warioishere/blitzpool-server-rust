@@ -1,48 +1,29 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Redis writer for the per-session live hashes (`client:live:*`).
-//!
-//! Two hot-write paths share one Redis hash per session (key schema in
-//! [`bp_common::live_client_key`]):
-//!
-//! - the touch flush ([`crate::touch_buffer`]) writes best/current
-//!   difficulty, channel count and the last-seen timestamp, and
-//!   **refreshes the TTL**: it is the session's liveness signal;
-//! - the hashrate sampler ([`crate::hashrate_sampler`]) writes only
-//!   `hash_rate` and sets the TTL **only when its HSET created the
-//!   key**: the sampler keeps writing fades for up to 3 windows after
-//!   the shares stop, and letting those writes refresh the TTL would
-//!   extend a dead session's liveness past the touch-derived rule.
-//!
-//! Both writes are Lua scripts so HSET and EXPIRE land as one
-//! indivisible step: prod Redis runs `volatile-lru`, where a key that
-//! ever exists without a TTL is both immortal and un-evictable (same
-//! guard as `device:live:*` and the coinbase snapshots).
-//!
-//! `best_difficulty` is max-merged against the stored value inside the
-//! script. The touch buffer only maxes within one 30 s flush window, so
-//! a plain HSET would let a later window regress the session's best.
+//! Redis writer for the per-session `client:live:*` hashes. Only the touch
+//! flush refreshes the TTL (it is the liveness signal); the sampler's fade
+//! writes must not. HSET and EXPIRE run in one Lua script because under
+//! `volatile-lru` a key without a TTL is immortal and un-evictable.
 
 use bp_common::live_client_key::client_live_key;
 use hashbrown::HashMap;
 use redis::aio::ConnectionManager;
 use tokio::time::Duration;
 
-/// Upper bound for one script invocation. A manager mid-reconnect makes
-/// callers await its full retry ladder (minutes on redis-rs 0.27's
-/// defaults); the flush loops — and the shutdown drain — must fail fast
-/// and rebuffer instead of stalling on it.
+/// Upper bound for one script invocation: a manager mid-reconnect would
+/// make the flush loops wait out its whole retry ladder instead of
+/// failing fast and rebuffering.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 use crate::touch_buffer::{TouchEntry, TouchKey};
 
-/// Keys per script invocation. The cap keeps one EVAL's argument list
-/// (and its blocking time on the server) bounded as the pool grows.
+/// Keys per script invocation, bounding one EVAL's server blocking time.
 const CHUNK: usize = 400;
 
 /// Touch write. `ARGV[1]` = TTL seconds, then a stride of 4 per key:
-/// best difficulty, current difficulty (empty string = "no sample", keeps
-/// the stored value), channel count, last-seen epoch-ms.
+/// best difficulty (max-merged with the stored one, so a later flush cannot
+/// regress it), current difficulty ("" keeps the stored value), channel
+/// count, last-seen epoch-ms.
 const TOUCH_LIVE_LUA: &str = r#"
 local ttl = tonumber(ARGV[1])
 for i = 1, #KEYS do
@@ -86,9 +67,8 @@ end
 return #KEYS
 "#;
 
-/// One prepared script invocation: parallel key / argument lists (the
-/// TTL is prepended at invoke time). Split out as data so the batch
-/// layout is unit-testable without a Redis server.
+/// One prepared script invocation (TTL prepended at invoke time), kept as
+/// data so the layout is testable without Redis.
 struct Batch {
     keys: Vec<String>,
     args: Vec<String>,
@@ -130,9 +110,6 @@ fn build_hashrate_batches(writes: &[(TouchKey, f64)]) -> Vec<Batch> {
         .collect()
 }
 
-/// Shared store handle. `ConnectionManager` is `Clone` + internally
-/// multiplexed, so the flush loops clone it per call like every other
-/// Redis user in the workspace.
 pub(crate) struct LiveSessionStore {
     conn: ConnectionManager,
     ttl_secs: i64,
@@ -169,14 +146,9 @@ impl LiveSessionStore {
         }
     }
 
-    /// Mirror one touch-flush snapshot into the live hashes.
-    ///
-    /// Every chunk is attempted even after one fails: a chunk carries an
-    /// arbitrary slice of the pool, and returning early would leave the
-    /// sessions behind the failure point without a TTL refresh until
-    /// their keys lapsed — and the dead-session sweep would then retire
-    /// miners that never stopped hashing. The first error is reported
-    /// once the pass is done, so the caller still rebuffers and retries.
+    /// Mirror one touch-flush snapshot. Every chunk is attempted even after a
+    /// failure, or the sessions behind it would miss their TTL refresh and be
+    /// swept while still hashing; the first error is returned at the end.
     pub(crate) async fn write_touch_batch(
         &self,
         snapshot: &HashMap<TouchKey, TouchEntry>,
@@ -195,7 +167,6 @@ impl LiveSessionStore {
             .await
     }
 
-    /// Run every batch, keep the first error, report it at the end.
     async fn invoke_all(
         &self,
         script: &redis::Script,
@@ -239,8 +210,7 @@ mod tests {
         }
     }
 
-    // The Lua bodies spell the field names as literals; this pins them to
-    // the shared schema constants so neither side can drift alone.
+    // The Lua field-name literals match the shared schema constants.
     #[test]
     fn lua_field_names_match_the_shared_schema() {
         for field in [
@@ -285,12 +255,7 @@ mod tests {
         assert_eq!(batches[0].args[1], "", "None sentinel is the empty string");
     }
 
-    /// One failing chunk must not starve the sessions in the others: a
-    /// chunk carries an arbitrary slice of the pool, so an early return
-    /// would leave those keys without a TTL refresh — and the sweep
-    /// would retire miners that never stopped hashing. The test poisons
-    /// a key the FIRST chunk owns (asking the layout, so it is not
-    /// order-dependent) and asserts the second chunk still landed.
+    /// A failing first chunk does not stop the second from being written.
     #[tokio::test]
     async fn a_failing_chunk_does_not_stop_the_later_ones() {
         let Some(mut conn) = connect_redis_in_range_or_skip(redis_db::SESSION_PERSISTENCE, 8).await
@@ -303,8 +268,7 @@ mod tests {
         }
         let batches = build_touch_batches(&snap);
         assert_eq!(batches.len(), 2, "fixture must span two chunks");
-        // A string where the script wants a hash → WRONGTYPE, i.e. the
-        // whole EVAL for that chunk fails.
+        // A string where the script wants a hash fails that chunk's EVAL.
         let poisoned = batches[0].keys[0].clone();
         let _: () = redis::cmd("SET")
             .arg(&poisoned)

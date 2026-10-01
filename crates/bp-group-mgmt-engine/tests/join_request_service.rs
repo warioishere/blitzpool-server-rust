@@ -19,8 +19,7 @@ use uuid::Uuid;
 
 const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
 
-/// Coinbase member ceiling — high enough to stay out of the way here.
-/// The cap itself is exercised in `group_service.rs`.
+/// Coinbase ceiling high enough to stay out of the way here.
 const TEST_COINBASE_CAP: u64 = 10_000;
 
 async fn connect_or_skip() -> Option<PgPool> {
@@ -117,14 +116,12 @@ async fn create_public_group(
     suffix: &str,
 ) -> (Uuid, String) {
     let creator = format!("bc1qcr{suffix}");
-    // Name must stay ≤64 chars (`MAX_GROUP_NAME_LEN`); the suffix is
-    // 32-hex (Uuid::simple) which is enough on its own.
+    // Name must stay ≤64 chars (`MAX_GROUP_NAME_LEN`).
     let g = group_svc
         .create_group(&format!("g-{suffix}"), &creator)
         .await
         .expect("g");
-    // Flip is_public=true via the round-reset PATCH (cheapest path to
-    // a public group without writing raw SQL).
+    // Make the group public through the round-reset PATCH, not raw SQL.
     group_svc
         .update_round_reset_config(
             g.group.id,

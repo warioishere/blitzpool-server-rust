@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Service-layer error model. Wire-codes (`code()`) are the stable
-//! strings the bp-api HTTP-status layer maps to and the UI surfaces
-//! verbatim. Same shape as [`bp_group_mgmt_engine::GroupServiceError`].
+//! Service-layer errors. `code()` strings are stable: the HTTP layer maps
+//! them and the UI shows them verbatim.
 
 use bp_db::DbError;
 
@@ -72,8 +71,6 @@ pub enum BlockpartyServiceError {
 }
 
 impl BlockpartyServiceError {
-    /// Stable wire-code. The HTTP layer maps these to status codes;
-    /// the UI surfaces them verbatim.
     pub fn code(&self) -> &'static str {
         match self {
             Self::MissingToken => "missing-token",

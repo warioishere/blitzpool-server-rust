@@ -2,14 +2,10 @@
 
 #![allow(clippy::print_stderr)]
 
-//! Integration tests for the `client:live:*` live store: every touch
-//! flush and sampler pass must land in the per-session Redis hash with
-//! the TTL semantics the store promises (touch refreshes liveness, the
-//! sampler never does), and a Redis outage must never hang the flush or
-//! touch the PG birth path.
-//!
-//! Needs `bp-test-pg` (15433) and `bp-test-redis` (16379) — every test
-//! skips when a service is unreachable, so watch the passed-count.
+//! Integration tests for the `client:live:*` live store: touch refreshes
+//! liveness, the sampler never does, and a Redis outage never hangs a flush.
+//! Needs `bp-test-pg` (15433) and `bp-test-redis` (16379); every test skips
+//! when a service is unreachable, so watch the passed-count.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -114,8 +110,7 @@ async fn ttl(conn: &mut ConnectionManager, key: &str) -> i64 {
         .expect("TTL")
 }
 
-/// One touch flush lands in the session's Redis hash, and the hash carries
-/// a TTL: a key without one (TTL = -1) is immortal under `volatile-lru`.
+/// A touch flush lands in the session hash with a TTL (none = immortal under `volatile-lru`).
 #[tokio::test]
 async fn touch_flush_dual_writes_hash_and_ttl() {
     let Some(pool) = pg_or_skip().await else {
@@ -171,11 +166,7 @@ async fn touch_flush_dual_writes_hash_and_ttl() {
     cleanup(&pool, prefix).await;
 }
 
-/// `updated_at_ms` is when the front accepted the share, not when this
-/// process consumed it. The satellite can reach a session's last shares
-/// after the front has already soft-deleted its row on disconnect; stamped
-/// with the consume time, those shares look like mining after the
-/// soft-delete, and `kill_dead_clients` revives a session that is gone.
+/// `updated_at_ms` is the front's accept time, not this process's consume time.
 #[tokio::test]
 async fn a_late_consumed_share_keeps_its_acceptance_time() {
     let Some(pool) = pg_or_skip().await else {
@@ -214,13 +205,7 @@ async fn a_late_consumed_share_keeps_its_acceptance_time() {
     cleanup(&pool, prefix).await;
 }
 
-/// The session half of a best-difficulty reset: `/bestdiff_reset` clears
-/// the per-session best too, so worker rows do not keep the old high.
-///
-/// Pins the three properties that make the clear safe: it removes the
-/// one field and leaves the live telemetry beside it, it is scoped to a
-/// single address, and it really drops the high-water mark rather than
-/// masking it, so a LOWER later share becomes the new best.
+/// A best-difficulty reset clears only that field of one address; a lower share then wins.
 #[tokio::test]
 async fn clearing_the_live_best_takes_one_field_from_one_address() {
     let Some(pool) = pg_or_skip().await else {
@@ -253,8 +238,7 @@ async fn clearing_the_live_best_takes_one_field_from_one_address() {
     let my_key = client_live_key(&mine, "rig1", "sessC001");
     let other_key = client_live_key(&other, "rig1", "sessC002");
 
-    // Precondition: both sessions carry a best. Without this the
-    // "it is gone" assertion below would also pass on an empty hash.
+    // Precondition, or "it is gone" below would pass on an empty hash.
     assert_eq!(
         hgetall(&mut redis, &my_key)
             .await
@@ -303,8 +287,7 @@ async fn clearing_the_live_best_takes_one_field_from_one_address() {
         "the clear is scoped to one address"
     );
 
-    // A LOWER share now sets the best: the old high is really gone, not
-    // hiding behind a nil that the monotonicity guard would treat as 0.
+    // A lower share now sets the best: the old high is gone, not masked.
     sink.record_accepted(share(&mine, "rig1", "sessC001", 7.25, 64.0, 2))
         .await;
     handle.flush_touches_now().await;
@@ -321,10 +304,7 @@ async fn clearing_the_live_best_takes_one_field_from_one_address() {
     cleanup(&pool, prefix).await;
 }
 
-/// `best_difficulty` must be monotone ACROSS flushes. The touch buffer
-/// only maxes within one flush window, so a plain HSET would let a
-/// later window regress the stored best — the channel-count change in
-/// the same flush is the positive control that the second write landed.
+/// `best_difficulty` stays monotone across flushes while other fields overwrite.
 #[tokio::test]
 async fn best_difficulty_is_monotone_across_flushes() {
     let Some(pool) = pg_or_skip().await else {
@@ -374,9 +354,7 @@ async fn best_difficulty_is_monotone_across_flushes() {
     cleanup(&pool, prefix).await;
 }
 
-/// The sampler's write must NOT extend a session's liveness — that is
-/// the touch path's job (the sampler keeps writing fades for minutes
-/// after the shares stop), so a shortened TTL stays short.
+/// The sampler's write does not extend a session's TTL.
 #[tokio::test]
 async fn hashrate_write_does_not_refresh_liveness() {
     let Some(pool) = pg_or_skip().await else {
@@ -429,10 +407,7 @@ async fn hashrate_write_does_not_refresh_liveness() {
     cleanup(&pool, prefix).await;
 }
 
-/// When the sampler's HSET CREATES the key (share landed after the hash
-/// expired), the conditional EXPIRE still fires, so the fresh key is not
-/// immortal under `volatile-lru`. The resulting hash is partial (only
-/// `hash_rate`); readers must tolerate that, so the test pins it.
+/// A sampler HSET that creates the key still sets a TTL; the hash holds only `hash_rate`.
 #[tokio::test]
 async fn hashrate_write_on_fresh_key_sets_ttl() {
     let Some(pool) = pg_or_skip().await else {
@@ -473,12 +448,8 @@ async fn hashrate_write_on_fresh_key_sets_ttl() {
     cleanup(&pool, prefix).await;
 }
 
-/// A dead Redis must cost nothing but a warning: the flush call has to
-/// RETURN (rebuffering its snapshot for the next tick) and the PG birth
-/// path must stay untouched by the outage. The connection is
-/// established through a local TCP proxy that is killed after connect —
-/// a `ConnectionManager` cannot be built against an address that never
-/// accepted.
+/// A dead Redis costs only a warning: the flush returns and PG births still land.
+/// A killed TCP proxy fakes the outage, since a `ConnectionManager` needs one connect.
 #[tokio::test]
 async fn redis_down_does_not_hang_the_flush() {
     let Some(pool) = pg_or_skip().await else {
@@ -577,10 +548,7 @@ async fn redis_down_does_not_hang_the_flush() {
     cleanup(&pool, prefix).await;
 }
 
-/// Writer and reader must agree on ONE keyspace: what the engine's
-/// flushes wrote, `bp_client_live`'s scans must find and sum — per
-/// address, across addresses, and pool-wide (with an uninvolved
-/// address reading 0, not missing).
+/// `bp_client_live`'s scans find and sum what the engine wrote (per address and pool-wide).
 #[tokio::test]
 async fn live_reader_agrees_with_the_writer() {
     let Some(pool) = pg_or_skip().await else {
@@ -666,10 +634,7 @@ async fn live_reader_agrees_with_the_writer() {
     cleanup(&pool, prefix).await;
 }
 
-/// The composed-read path: what the engine's flushes wrote, the
-/// positional `live_fields_for_sessions` reader must return field by
-/// field — and a session that never flushed must come back `None` in
-/// its position, not shift the alignment.
+/// `live_fields_for_sessions` returns what was written, `None` in place when unflushed.
 #[tokio::test]
 async fn composed_reader_returns_the_writers_fields_in_position() {
     let Some(pool) = pg_or_skip().await else {

@@ -53,9 +53,7 @@ async fn cleanup(pool: &PgPool, prefix: &str) {
     }
 }
 
-/// The full debounced life of a mining session: register writes NOTHING,
-/// the birth flush writes the row with the values register captured,
-/// deregister soft-deletes it.
+/// Register writes nothing, the birth flush writes the captured values, deregister soft-deletes.
 #[tokio::test]
 async fn engine_session_persistence_hook_debounces_then_soft_deletes() {
     let _guard = ENGINE_LOCK.lock().await;
@@ -75,9 +73,7 @@ async fn engine_session_persistence_hook_debounces_then_soft_deletes() {
     hook.register_session("sessZ001", &address, "worker1", Some("bitaxe/2.7"))
         .await;
 
-    // No row yet — authorize must not write. (The 5s birth ticker can't
-    // race this: its first tick is a full interval away and the 15s
-    // default debounce means it would find nothing due anyway.)
+    // No row yet: authorize must not write.
     let n: i64 = sqlx::query_scalar(r#"SELECT count(*) FROM client_entity WHERE "sessionId" = $1"#)
         .bind("sessZ001")
         .fetch_one(&pool)
@@ -88,8 +84,7 @@ async fn engine_session_persistence_hook_debounces_then_soft_deletes() {
         "authorize must not write a row — that is the whole saving"
     );
 
-    // A tick honouring the 15s debounce also writes nothing for a
-    // seconds-old session.
+    // A tick honouring the debounce writes nothing for a young session.
     handle.flush_due_births().await;
     assert_eq!(
         handle.pending_births(),
@@ -97,8 +92,7 @@ async fn engine_session_persistence_hook_debounces_then_soft_deletes() {
         "young session must stay pending"
     );
 
-    // Force the birth (age check dropped) — the row must carry what
-    // register captured, not defaults.
+    // Forced birth: the row carries what register captured, not defaults.
     handle.flush_births_now().await;
     let row = sqlx::query(
         r#"SELECT "deletedAt", "userAgent", "startTime", "firstSeen" FROM client_entity
@@ -136,10 +130,7 @@ async fn engine_session_persistence_hook_debounces_then_soft_deletes() {
     cleanup(&pool, prefix).await;
 }
 
-/// The probe path and its negative control in one test: a session that
-/// deregisters before its birth leaves NO row, while the surviving
-/// control session from the same batch does get one, so a filter that
-/// drops everything cannot pass.
+/// A probe deregistered before birth leaves no row; the surviving control session gets one.
 #[tokio::test]
 async fn a_probe_session_leaves_no_row_while_a_survivor_gets_one() {
     let _guard = ENGINE_LOCK.lock().await;
@@ -185,9 +176,7 @@ async fn a_probe_session_leaves_no_row_while_a_survivor_gets_one() {
     cleanup(&pool, prefix).await;
 }
 
-/// A rental proxy re-registers the SAME session id under a second worker
-/// name (documented live_sessions behaviour). Both workers must get
-/// their row, and the one session teardown must retire both.
+/// Two workers on one session id each get a row, and one teardown retires both.
 #[tokio::test]
 async fn two_workers_on_one_session_both_get_rows_and_one_teardown_retires_both() {
     let _guard = ENGINE_LOCK.lock().await;
@@ -238,10 +227,7 @@ async fn two_workers_on_one_session_both_get_rows_and_one_teardown_retires_both(
     cleanup(&pool, prefix).await;
 }
 
-/// One poisoned entry (a `clientName` past the column's varchar(64),
-/// which the SV1 path does not length-check) must not starve the healthy
-/// rows in its batch, and is dropped after its bounded retries so it
-/// cannot stall every later flush.
+/// An over-long `clientName` does not starve its batch and is dropped after bounded retries.
 #[tokio::test]
 async fn a_poisoned_birth_row_is_isolated_and_dropped_after_bounded_retries() {
     let _guard = ENGINE_LOCK.lock().await;
@@ -360,9 +346,7 @@ async fn engine_invalid_config_rejected() {
 
 #[tokio::test]
 async fn engine_shutdown_is_a_drop_no_op() {
-    // Dropping the handle without `shutdown()` must not panic — the
-    // background loops (birth/touch/sampler/diff-stat) just keep running
-    // on their intervals until the runtime tears them down.
+    // Dropping the handle without `shutdown()` must not panic.
     let Some(pool) = connect_or_skip().await else {
         return;
     };
@@ -376,14 +360,7 @@ async fn engine_shutdown_is_a_drop_no_op() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 }
 
-/// `ClientDifficultyStatisticsSink` records the per-(address, worker,
-/// hour-slot) MAX submission difficulty; a lower follow-up share leaves
-/// the stored max untouched, and a higher one raises it.
-///
-/// Goes through the ENGINE: the sink only merges into the buffer, and the
-/// row appears when the flush loop or the shutdown drain writes it. Covers
-/// the whole chain (record → coalesce → bulk upsert → row), including that
-/// `shutdown()` does not discard the current window.
+/// The hourly max difficulty reaches PG only via the flush, and `shutdown()` keeps the window.
 #[tokio::test]
 async fn diff_stats_sink_keeps_per_slot_maximum() {
     let _guard = ENGINE_LOCK.lock().await;
@@ -400,9 +377,7 @@ async fn diff_stats_sink_keeps_per_slot_maximum() {
     };
     del(pool.clone()).await;
 
-    // A long interval on purpose: the assertion must be satisfied by the
-    // SHUTDOWN drain, not by a tick that happened to fire in between. A test
-    // that passes only because a timer raced it would not pin the drain.
+    // Long interval so only the shutdown drain, never a tick, can write.
     let handle = SessionPersistenceEngine::spawn(
         SessionPersistenceConfig {
             diff_stat_flush_interval: Duration::from_secs(3_600),
@@ -414,8 +389,7 @@ async fn diff_stats_sink_keeps_per_slot_maximum() {
     .await
     .expect("spawn engine");
     let sink = handle.client_difficulty_statistics_sink();
-    // Two hours back: the row must land in the hour the share was
-    // accepted in, not the hour the sink ran in.
+    // The row lands in the hour the share was accepted in, not the sink's.
     let accepted_at = bp_common::now_ms() - 2 * 3_600_000;
     let share = |submission_difficulty: f64| SharedAcceptedShare {
         address,

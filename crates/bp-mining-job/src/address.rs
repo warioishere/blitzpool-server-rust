@@ -7,10 +7,8 @@ use std::str::FromStr;
 
 use bitcoin::{Address, Network, ScriptBuf};
 
-/// Convert a BTC address to its `scriptPubKey` bytes for the given network.
-/// All address types supported by `rust-bitcoin` are handled (P2PKH, P2SH,
-/// P2WPKH, P2WSH, P2TR). A network mismatch (e.g. testnet address with
-/// `Network::Bitcoin`) is rejected.
+/// Convert a BTC address to its `scriptPubKey`; an address for another network
+/// is rejected.
 pub fn address_to_script(network: Network, address: &str) -> Result<ScriptBuf, AddressError> {
     let unchecked = Address::from_str(address).map_err(|e| AddressError::Parse(e.to_string()))?;
     let checked = unchecked

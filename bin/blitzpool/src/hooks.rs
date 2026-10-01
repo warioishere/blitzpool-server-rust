@@ -1,18 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Production hook impls for the Noop-by-default trait surfaces of bp-api
-//! and the group-mgmt engine:
-//!
-//! 1. **`bp_api::EmailVerificationHooks`** — the verification link on
-//!    register and a binding-change warning on FCFS-lock rejection.
-//! 2. **`bp_group_mgmt_engine::EmailHooks`** — invitation and
-//!    join-decision emails.
-//! 3. **`bp_group_mgmt_engine::GroupServiceHooks`** — last-active lookup
-//!    and kick / dissolve cleanup of the Group-Solo Redis state.
-//!
-//! The block sink lives with the Stratum wiring
-//! ([`crate::block_sink::TdpBlockSubmissionSink`]): it needs the share's
-//! extranonce fields to rebuild the coinbase.
+//! Production impls of the Noop-by-default hook traits of bp-api and the
+//! group-mgmt engine: verification, invitation and join-decision emails, and
+//! the Group-Solo last-active lookup plus kick / dissolve Redis cleanup.
 
 use std::sync::Arc;
 
@@ -50,21 +40,15 @@ use crate::boot::FoundationHandles;
 use crate::engines::EngineHandles;
 
 /// Every production hook impl, handed to the bp-api `AppState` and the
-/// engine wiring.
-///
-/// `AppState` is generic over `H: GroupServiceHooks` + `M: EmailHooks`, so
-/// `group_service` and `invitation_email` are concrete types (the SMTP
-/// wrapper holds an `Option` so its type does not depend on `[smtp]`);
-/// `email_verification` is a trait object as `AppState` stores it.
+/// engine wiring. `group_service` and `invitation_email` are concrete types
+/// because `AppState` is generic over them; the SMTP wrapper holds an
+/// `Option` so its type does not depend on `[smtp]`.
 pub(crate) struct ProductionHooks {
     pub(crate) email_verification: Arc<dyn EmailVerificationHooks>,
     pub(crate) invitation_email: Arc<SmtpInvitationEmailHooks>,
     pub(crate) group_service: Arc<ProductionGroupServiceHooks>,
-    /// FCM adapter for the crons ([`spawn_network_difficulty_cron`]).
-    /// `None` when `[notifications.fcm]` is not configured; the cron then
-    /// keeps the tracker row fresh without push fan-out.
-    ///
-    /// [`spawn_network_difficulty_cron`]: bp_notifications::cron::network_difficulty::spawn_network_difficulty_cron
+    /// FCM adapter for the crons. `None` without `[notifications.fcm]`; the
+    /// network-difficulty cron then keeps its tracker row fresh without push.
     pub(crate) fcm: Option<Arc<FcmAdapter>>,
     /// Web-Push adapter for the `NotificationDispatcher`. `None` when
     /// `[notifications.web_push]` is not configured.
@@ -307,12 +291,9 @@ pub(crate) struct ProductionGroupServiceHooks {
 #[async_trait]
 impl GroupServiceHooks for ProductionGroupServiceHooks {
     async fn last_active_for_member(&self, group_id: Uuid, address: &AddressId) -> Option<i64> {
-        // Redis is the only source: the timestamp is stamped on every
-        // accepted share, and Group-Solo keeps no ledger row.
-        //
-        // `None` makes the caller fall back to `joined_at`, so a Redis loss
-        // without `--restore-redis-state` makes a long-standing member look
-        // freshly joined and therefore kickable.
+        // Redis is the only source (Group-Solo keeps no ledger row). `None`
+        // makes the caller fall back to `joined_at`, so after a Redis loss a
+        // long-standing member looks freshly joined.
         let group_key = group_id.to_string();
         match self
             .group_solo
@@ -458,7 +439,6 @@ mod tests {
 
     #[test]
     fn epoch_ms_to_utc_round_trips_a_known_timestamp() {
-        // 2026-05-16T12:00:00Z = 1_779_278_400_000 ms (epoch ms).
         let dt = epoch_ms_to_utc(1_779_278_400_000);
         assert_eq!(dt.timestamp_millis(), 1_779_278_400_000);
     }

@@ -1,22 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Noise-XK handshake wiring + per-connection certificate validity.
-//!
-//! Thin wrapper over [`stratum_apps::network_helpers::accept_noise_connection`]:
-//! `stratum-apps` owns the Noise-XK state machine, framing and the
-//! `NoiseTcpStream` split; this module owns the pool's authority keys, the
-//! re-exports, and the [`DEFAULT_CERT_VALIDITY`] convention.
-//!
-//! ## Cert validity
-//!
-//! Every [`accept_pool_noise`] call builds a fresh Responder whose cert is
-//! valid for [`DEFAULT_CERT_VALIDITY`] (12 h). The authority key-pair does
-//! not rotate, only the per-connection cert, so "rotation" needs no shared
-//! state. Not configurable.
-//!
-//! The TCP accept loop and fail-ban guards live in [`crate::server`] /
-//! [`crate::jdp_server`]; once [`accept_pool_noise`] returns a
-//! [`NoiseTcpStream`], the per-connection task drives the frame loop.
+//! Noise-XK wiring over [`stratum_apps::network_helpers::accept_noise_connection`],
+//! which owns the handshake and framing. This module holds the pool's authority
+//! keys and issues each connection a fresh cert valid for [`DEFAULT_CERT_VALIDITY`],
+//! so only the cert rotates and that needs no shared state.
 
 use std::time::Duration;
 
@@ -71,16 +58,9 @@ impl NoiseConfig {
 
 // ── accept_pool_noise ───────────────────────────────────────────────
 
-/// Accept a freshly-connected `TcpStream` as a Noise responder.
-///
-/// Passes the authority key-pair from [`NoiseConfig`] and
-/// [`DEFAULT_CERT_VALIDITY`] to
-/// [`stratum_apps::network_helpers::accept_noise_connection`]. The handshake
-/// timeout is internal to `stratum_apps`; see
-/// [`stratum_apps::network_helpers::noise_stream::NoiseTcpStream::accept`].
-///
-/// Returns a [`NoiseTcpStream`] for the per-connection task; per-IP fail-ban
-/// on failure is the listener loop's concern.
+/// Accept a freshly-connected `TcpStream` as a Noise responder with the
+/// [`NoiseConfig`] keys. The handshake timeout is internal to `stratum_apps`;
+/// per-IP fail-ban on failure is the listener loop's concern.
 pub async fn accept_pool_noise(
     stream: TcpStream,
     config: &NoiseConfig,

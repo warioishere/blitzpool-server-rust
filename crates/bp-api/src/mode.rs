@@ -1,17 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Which payout mode an address is on, as the API reports it — the one
-//! resolution `/api/pplns/mode/:address` and the per-address block-template
-//! preview share, so the two cannot report different modes for one address.
-//!
-//! 1. The live port marker `miner:{address}:mode`, written on every accepted
-//!    share with the mode the pool actually used (5-min TTL). A group marker
-//!    is only trusted while the group still resolves; a dissolved one falls
-//!    through.
-//! 2. Otherwise state: group membership, then Blockparty admin routing, then
-//!    PPLNS window presence, else Solo. This lags by hours after a port
-//!    switch — a miner who leaves the PPLNS port keeps window shares — which
-//!    is why the marker goes first.
+//! An address's payout mode, shared by `/api/pplns/mode/:address` and the
+//! block-template preview so the two cannot disagree. The live port marker
+//! goes first (a group one only while the group resolves); the state fallback
+//! lags by hours after a port switch, since window shares outlive it.
 
 use bp_common::{AddressId, MiningMode};
 use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
@@ -146,10 +138,8 @@ mod tests {
     // nothing for it and answers Solo.
     const ADDR: &str = "bcrt1qmodeunittestaddressxxxxxxxxxxxxxxxxxx";
 
-    /// The marker wins over the state fallback: with no group, no
-    /// Blockparty and no PPLNS window, a `pplns` marker still reads PPLNS.
-    /// The negative control is the same address without a marker, which the
-    /// fallback reads as Solo — so the first answer came from the marker.
+    /// The marker wins over the state fallback (negative control: no marker
+    /// reads Solo).
     #[tokio::test]
     async fn the_live_marker_wins_over_the_state_fallback() {
         let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
@@ -171,9 +161,7 @@ mod tests {
         );
     }
 
-    /// A group marker whose group no longer resolves (dissolved between the
-    /// share and the read) falls through to state instead of reporting a
-    /// group that does not exist.
+    /// A group marker whose group no longer resolves falls through to state.
     #[tokio::test]
     async fn a_group_marker_without_its_group_falls_through() {
         let Some(pool) = bp_test_support::connect_pg_or_skip().await else {

@@ -1,23 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Stratum V1 JSON-RPC wire layer.
-//!
-//! Two halves:
-//!
-//! - [`parse_request`] consumes one line of JSON and returns a typed
-//!   [`SV1Request`] or a typed [`FrameParseError`] (the latter carries the
-//!   exact wire reason the caller should emit). `mining.subscribe` accepts
-//!   empty `params` for Braiins probers, `mining.submit` requires the first
-//!   five params to be strings, etc.
-//!
-//! - [`write_subscribe_response`] / [`write_configure_response`] /
-//!   [`write_authorize_response`] / [`write_submit_success`] /
-//!   [`write_set_difficulty`] / [`write_error`] emit the corresponding
-//!   wire frame, terminated with `\n`. Field order is pinned via
-//!   `Serialize`-derived structs so the JSON is byte-stable per shape.
-//!
-//! `mining.notify` emission lives in `notify.rs` because it depends on
-//! per-template state the frame layer doesn't see.
+//! Stratum V1 JSON-RPC wire layer: [`parse_request`] turns a line into a
+//! typed [`SV1Request`] or [`FrameParseError`], the `write_*` functions emit
+//! `\n`-terminated frames whose field order is pinned by `Serialize` structs
+//! so the JSON is byte-stable. `mining.notify` lives in `notify.rs`.
 
 use std::borrow::Cow;
 
@@ -119,12 +105,10 @@ impl<'de> Deserialize<'de> for RpcId {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SubscribeRequest {
     pub id: RpcId,
-    /// The raw user-agent string as the miner sent it (or `None` if the
-    /// client sent `params: []` — Braiins-style minimal probe).
+    /// `None` when the client sent `params: []` (Braiins-style probe).
     pub raw_user_agent: Option<String>,
-    /// The refined user-agent label used downstream for behaviour
-    /// dispatch (cpuminer fallback) and stats categorization. Falls back
-    /// to `"unknown"` if `raw_user_agent` was absent.
+    /// Normalised label for behaviour dispatch and stats; `"unknown"` when
+    /// `raw_user_agent` is absent.
     pub user_agent: String,
 }
 
@@ -142,25 +126,16 @@ pub enum RequestedMask {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConfigureRequest {
     pub id: RpcId,
-    /// The full `params` array, preserved verbatim.
-    /// [`Self::requested_version_rolling_mask`] reads the one BIP-310 field
-    /// `handle_configure` needs; the raw value is kept so downstream tooling
-    /// can inspect anything else the miner asked for.
+    /// The `params` array verbatim, so tooling can inspect more than the one
+    /// field [`Self::requested_version_rolling_mask`] reads.
     pub params: serde_json::Value,
 }
 
 impl ConfigureRequest {
-    /// The `version-rolling.mask` the miner asked for, per BIP-310.
-    ///
-    /// `Absent` carries BIP-310's default: the field is OPTIONAL with
-    /// default `"ffffffff"` — "A miner doesn't have to send the mask, in
-    /// this case a default full mask is used" — so an absent field means
-    /// *everything*, never *nothing*.
-    ///
-    /// `Malformed` is kept apart on purpose: the BIP's default covers a
-    /// missing field, while an unreadable one (`"1fffe0000"`, `"zzzz"`, a
-    /// non-string) must not be upgraded to "grant everything", which would
-    /// hand the miner bits it never asked for.
+    /// The `version-rolling.mask` the miner asked for. BIP-310 defaults an
+    /// absent field to `ffffffff` (everything), but a present-and-unreadable
+    /// one is `Malformed` and must never be upgraded to that default, or the
+    /// miner gets bits it never asked for.
     pub fn requested_version_rolling_mask(&self) -> RequestedMask {
         let Some(field) = self
             .params
@@ -208,27 +183,18 @@ pub struct SuggestDifficultyRequest {
     pub suggested_difficulty: f64,
 }
 
-/// `mining.submit` — the steady-state hot path (one frame per share).
-///
-/// All fields borrow directly from the inbound line: the five hex params
-/// and the optional version mask are `&str` slices into the connection
-/// buffer, and `worker` is a [`Cow`] that only allocates if the JSON
-/// string carried an escape (worker names are plain in practice, so this
-/// is borrow-only). No DOM, no per-field `String` — see [`parse_request`].
-///
-/// The borrow only holds because `worker` is deserialized through
-/// `CowStr`, **not** the blanket `Deserialize for Cow` (which always
-/// allocates). Pinned by `parse_submit_plain_worker_is_borrowed_not_allocated`.
+/// `mining.submit`, the per-share hot path: every field borrows from the
+/// inbound line, and `worker` only allocates when the JSON carried an escape.
+/// That borrow holds only because `worker` goes through `CowStr`, not the
+/// blanket `Deserialize for Cow`, which always allocates.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SubmitRequest<'a> {
     pub id: RpcId,
     /// `params[0]` — `address.worker` echoed by the miner.
     pub worker: Cow<'a, str>,
-    /// `params[1]` — hex jobId (the int hex string the pool advertised
-    /// in `mining.notify`).
+    /// `params[1]` — hex job id as advertised in `mining.notify`.
     pub job_id: &'a str,
-    /// `params[2]` — hex extranonce2 (the miner's 8-byte share of the
-    /// extranonce slot).
+    /// `params[2]` — hex extranonce2.
     pub extranonce2_hex: &'a str,
     /// `params[3]` — hex ntime.
     pub ntime_hex: &'a str,
@@ -238,11 +204,8 @@ pub struct SubmitRequest<'a> {
     pub version_mask_hex: &'a str,
 }
 
-/// Typed inbound SV1 request.
-///
-/// The lifetime is borrowed by the hot-path [`SubmitRequest`] variant
-/// only; the session-setup variants own their (cold, once-per-connection)
-/// data.
+/// Typed inbound SV1 request. Only the hot-path [`SubmitRequest`] borrows;
+/// the once-per-connection setup variants own their data.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SV1Request<'a> {
     Subscribe(SubscribeRequest),
@@ -250,12 +213,9 @@ pub enum SV1Request<'a> {
     Authorize(AuthorizeRequest),
     SuggestDifficulty(SuggestDifficultyRequest),
     Submit(SubmitRequest<'a>),
-    /// `mining.extranonce.subscribe` — explicitly recognized so the
-    /// caller can drop it the ckpool way (no reply, no error). The id is
-    /// preserved for completeness but normally goes unused.
+    /// `mining.extranonce.subscribe`.
     ExtranonceSubscribe(RpcId),
-    /// Any other `method` value. The id + method are captured for
-    /// diagnostic logging.
+    /// Any other `method`, kept for diagnostic logging.
     Other {
         id: RpcId,
         method: String,
@@ -281,18 +241,10 @@ pub enum FrameParseError {
 
 // ── Parser ───────────────────────────────────────────────────────────
 
-/// A `Cow<str>` that actually borrows from the input.
-///
-/// serde's blanket `Deserialize for Cow<'a, T>` **always** yields
-/// `Cow::Owned` — it deserializes a `String` and wraps it — so a field
-/// merely *typed* `Cow<'a, str>` allocates on every parse even when the
-/// input needed no unescaping, and `#[serde(borrow)]` does not reach
-/// through an `Option<…>` either.
-///
-/// This wrapper implements the borrowing visitor directly:
-/// `visit_borrowed_str` (a span of the input) yields `Cow::Borrowed`, and
-/// only `visit_str` / `visit_string` (serde had to unescape into a scratch
-/// buffer) allocates.
+/// A `Cow<str>` that actually borrows from the input. serde's blanket
+/// `Deserialize for Cow` always yields `Cow::Owned`, and `#[serde(borrow)]`
+/// does not reach through `Option`, so this visitor borrows directly and
+/// only allocates when serde had to unescape.
 struct CowStr<'a>(Cow<'a, str>);
 
 impl<'de> Deserialize<'de> for CowStr<'de> {
@@ -341,11 +293,9 @@ struct Envelope<'a> {
     params: Option<&'a RawValue>,
 }
 
-/// Borrowed view of a `mining.submit` `params` array, deserialised
-/// directly from the params span with no intermediate DOM and no
-/// per-field allocation. The five required params must be JSON strings;
-/// the optional sixth (version mask) is tolerated as absent / null /
-/// non-string, all of which fall back to `"0"` at the call site.
+/// Borrowed view of a `mining.submit` `params` array, read without a DOM.
+/// The five required params must be strings; a missing / null / non-string
+/// sixth (version mask) falls back to `"0"` at the call site.
 struct SubmitParams<'a> {
     worker: Cow<'a, str>,
     job_id: &'a str,
@@ -408,27 +358,18 @@ impl<'de> Deserialize<'de> for SubmitParams<'de> {
     }
 }
 
-/// Parse one JSON-RPC line into a typed `SV1Request`.
-///
-/// The line should NOT include the trailing newline (the framing layer
-/// is the line splitter). Leading/trailing whitespace inside the line
-/// is tolerated: the first-byte router in `bin/blitzpool` sends a
-/// connection that leads with a space/CR/LF to SV1 but only peeks, so
-/// that whitespace arrives here and is trimmed.
+/// Parse one JSON-RPC line (without its newline) into a typed `SV1Request`.
+/// Surrounding whitespace is trimmed because the protocol router only peeks,
+/// so a connection that leads with a space/CR/LF arrives here intact.
 pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
     let trimmed = line.trim();
-    // Parse only the JSON-RPC envelope — `serde_json::from_str` borrows the
-    // method and captures `id` / `params` as un-parsed `RawValue` spans, so
-    // no DOM is built here. The hot `mining.submit` path then reads its
-    // params straight out of the borrowed span; the cold session-setup
-    // methods build a small DOM lazily below.
+    // Envelope only, no DOM: submit reads its params from the borrowed span,
+    // the cold setup methods build a small DOM below.
     let envelope: Envelope = match serde_json::from_str(trimmed) {
         Ok(env) => env,
         Err(_) => {
-            // Distinguish "not JSON at all" (connection-fatal) from "valid
-            // JSON but not a request object / non-string method"; the
-            // latter is a broken frame tolerated as `Other`. A bare
-            // `RawValue` parse validates the JSON without building a DOM.
+            // Not JSON at all is connection-fatal; valid JSON that is not a
+            // request object is tolerated as `Other`.
             return match serde_json::from_str::<&RawValue>(trimmed) {
                 Ok(_) => Ok(SV1Request::Other {
                     id: RpcId::Null,
@@ -463,10 +404,8 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
                 message: VALIDATION_INVALID_SUBMIT,
             });
         }
-        // `SubmitParams` deserialises straight from the params span: the
-        // five required hex strings + the optional version mask, all
-        // borrowed. A non-array, a short array, or a non-string in the
-        // first five positions fails deserialisation → invalid submit.
+        // A non-array, short array or non-string in the first five
+        // positions fails deserialisation and becomes an invalid submit.
         let parsed = envelope
             .params
             .and_then(|raw| serde_json::from_str::<SubmitParams<'_>>(raw.get()).ok());
@@ -478,7 +417,6 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
                 extranonce2_hex: p.extranonce2,
                 ntime_hex: p.ntime,
                 nonce_hex: p.nonce,
-                // Default version mask to '0' if absent / null / non-string.
                 version_mask_hex: p.version_mask.unwrap_or("0"),
             })),
             None => Err(FrameParseError::Validation {
@@ -490,8 +428,7 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
     }
 
     // ── Cold paths: session-setup methods ────────────────────────────
-    // These fire at most once per connection, so building a small DOM for
-    // their `params` is irrelevant to steady-state throughput.
+    // Once per connection, so a small DOM here costs nothing in steady state.
     let params_dom: Option<serde_json::Value> = envelope
         .params
         .and_then(|raw| serde_json::from_str(raw.get()).ok());
@@ -506,9 +443,7 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
                     message: VALIDATION_INVALID_SUBSCRIBE,
                 });
             }
-            // params[0] is optional — bare-minimum probers (Braiins
-            // Hashpower marketplace upstream check) send `params: []`.
-            // Treat absent as "unknown" rather than rejecting.
+            // params[0] is optional: marketplace probers send `params: []`.
             let arr = params.unwrap().as_array().unwrap();
             let raw_ua = arr.first().and_then(|v| v.as_str()).map(String::from);
             let user_agent = raw_ua
@@ -552,10 +487,9 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
                 });
             }
             let raw_username = arr[0].as_str().unwrap().to_string();
-            // A trailing dot ("addr.") gets the same default as no dot at
-            // all. The share path writes under a non-empty name, so a ""
-            // client row would never be touched and `kill_dead_clients`
-            // would sweep an actively-hashing session.
+            // "addr." gets the no-dot default: the share path writes under a
+            // non-empty name, so a "" client row would go stale and
+            // `kill_dead_clients` would sweep a live session.
             let (address, worker) = match bp_common::split_user_identity(&raw_username) {
                 (a, Some(w)) if !w.is_empty() => (a.to_string(), w.to_string()),
                 (a, _) => (a.to_string(), "worker".to_string()),
@@ -643,9 +577,6 @@ pub(crate) fn write_subscribe_response(
     extranonce1_hex: &str,
     extranonce2_size: u8,
 ) -> Vec<u8> {
-    // Outer result: 3-tuple → JSON array of 3 elements.
-    // The first element is itself an array of `["method", sessionId]`
-    // subscription tuples; exactly one entry is sent.
     let result = (
         vec![("mining.notify", session_id)],
         extranonce1_hex,
@@ -659,11 +590,8 @@ pub(crate) fn write_subscribe_response(
     finalize(&frame)
 }
 
-/// Emit a `mining.configure` response advertising version-rolling.
-///
-/// The pool returns a fixed `{version-rolling: true, mask: <hex>}` map
-/// regardless of which extensions the client asked for. The mask is
-/// emitted as 8-hex-padded lowercase.
+/// Emit a `mining.configure` response: always `version-rolling: true` with
+/// the mask as 8-digit lowercase hex, whatever extensions were requested.
 pub(crate) fn write_configure_response(id: &RpcId, version_rolling_mask: u32) -> Vec<u8> {
     let mask = format!("{:08x}", version_rolling_mask);
     let frame = SuccessFrame {
@@ -710,11 +638,8 @@ pub(crate) fn write_set_difficulty(difficulty: f64) -> Vec<u8> {
     finalize(&frame)
 }
 
-/// Emit a `mining.extranonce.subscribe` response: `{"id":<id>,"error":null,"result":true}`.
-///
-/// Sent when a client opts in to the dynamic-extranonce extension. It only
-/// confirms the request: the pool never follows up with
-/// `mining.set_extranonce`.
+/// Emit a `mining.extranonce.subscribe` response. It only confirms: the pool
+/// never follows up with `mining.set_extranonce`.
 pub(crate) fn write_extranonce_subscribe_response(id: &RpcId) -> Vec<u8> {
     let frame = SuccessFrame {
         id,
@@ -724,11 +649,8 @@ pub(crate) fn write_extranonce_subscribe_response(id: &RpcId) -> Vec<u8> {
     finalize(&frame)
 }
 
-/// Emit a Stratum error frame.
-///
-/// Wire shape: `{"id":<id>,"result":null,"error":[<code>,"<msg>",""]}`.
-/// The third element is always the empty string: no validation details
-/// are collected.
+/// Emit `{"id":<id>,"result":null,"error":[<code>,"<msg>",""]}`; the third
+/// element stays empty because no validation details are collected.
 pub(crate) fn write_error(id: &RpcId, code: i64, message: &str) -> Vec<u8> {
     let frame = ErrorFrame {
         id,
@@ -772,7 +694,6 @@ mod tests {
             SV1Request::Subscribe(s) => {
                 assert_eq!(s.id, RpcId::from(1));
                 assert_eq!(s.raw_user_agent.as_deref(), Some("cgminer/4.11.1"));
-                // Normalised to the part before the first '/'.
                 assert_eq!(s.user_agent, "cgminer");
             }
             other => panic!("expected Subscribe, got {:?}", other),
@@ -781,7 +702,6 @@ mod tests {
 
     #[test]
     fn parse_subscribe_with_empty_params() {
-        // Braiins Hashpower marketplace minimal probe: params: [].
         let req = parse_request(r#"{"id":1,"method":"mining.subscribe","params":[]}"#).expect("ok");
         match req {
             SV1Request::Subscribe(s) => {
@@ -893,9 +813,7 @@ mod tests {
         }
     }
 
-    /// A trailing dot must never yield an empty worker name: the share path
-    /// writes under a non-empty name, so a "" client row would never be
-    /// touched and `kill_dead_clients` would sweep the live session.
+    /// A trailing dot must never yield an empty worker name.
     #[test]
     fn parse_authorize_with_trailing_dot_gets_the_default_worker_name() {
         let req = parse_request(
@@ -1010,7 +928,6 @@ mod tests {
 
     #[test]
     fn parse_submit_defaults_version_mask_to_zero_when_absent() {
-        // params length 5 — no versionMask. Defaults to '0'.
         let req = parse_request(
             r#"{"id":5,"method":"mining.submit","params":["addr.w","000a","1122","ntime","nonce"]}"#,
         )
@@ -1074,9 +991,8 @@ mod tests {
         }
     }
 
-    /// The other half of the `Cow` contract: a PLAIN worker name (the
-    /// common case) must be **borrowed** from the input line, not copied,
-    /// so the hot submit path does not allocate per share.
+    /// A plain worker name is borrowed from the input, so submit does not
+    /// allocate per share.
     #[test]
     fn parse_submit_plain_worker_is_borrowed_not_allocated() {
         let line = r#"{"id":5,"method":"mining.submit","params":["bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4.worker1","000a","1122","ntime","nonce"]}"#;
@@ -1195,8 +1111,7 @@ mod tests {
 
     #[test]
     fn parse_tolerates_leading_whitespace_inside_line() {
-        // Some implementations lead with whitespace; the first-byte router
-        // only peeks, so it reaches the parser. Don't reject.
+        // The protocol router only peeks, so leading whitespace reaches here.
         let req = parse_request("   {\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}")
             .expect("ok");
         assert!(matches!(req, SV1Request::Subscribe(_)));
@@ -1330,7 +1245,7 @@ mod tests {
 
     #[test]
     fn rpc_id_serde_coerces_object_to_null() {
-        // Spec-illegal but observed in the wild from sloppy probers.
+        // Spec-illegal, but sloppy probers send it.
         let id: RpcId = serde_json::from_value(json!({"foo": 1})).unwrap();
         assert_eq!(id, RpcId::Null);
     }

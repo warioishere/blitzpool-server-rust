@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! End-to-end test: spawn a regtest `bitcoin-node`, plug `TdpHandle`
-//! against its IPC socket, mine blocks and verify at least one
-//! `NewTemplate` + `SetNewPrevHash` update arrives on the outbound broadcast.
-//!
-//! Skipped (with a printed warning) when `bitcoin-node` is not installed
-//! at the host's default location or via `BITCOIN_NODE_PATH`.
+//! `TdpHandle` against a real regtest `bitcoin-node`; skipped with a printed
+//! warning when no `bitcoin-node` is found.
 
 use std::time::Duration;
 
@@ -22,16 +18,13 @@ async fn tdp_emits_new_template_after_block() {
         return;
     }
 
-    // Start regtest and mine 101 blocks BEFORE attaching the TDP. Bitcoin
-    // Core v31 makes IPC `createNewBlock` block while IBD is active; mining
-    // a chain of recent-timestamp blocks first kicks IBD off.
+    // IPC `createNewBlock` blocks during IBD; mining recent blocks first ends it.
     let node = RegtestNode::start_with(cfg).await.expect("regtest start");
     node.generate_to_self(101)
         .await
         .expect("mine 101 blocks for IBD-exit + coinbase maturity");
 
-    // Now attach TDP. Use a very low fee threshold and short interval so
-    // mempool-empty regtest still produces frequent templates.
+    // Low threshold and interval so an empty-mempool regtest still emits templates.
     let tdp = TdpHandle::spawn(
         TdpConfig::new(node.ipc_socket_path())
             .with_fee_threshold(1)
@@ -41,16 +34,12 @@ async fn tdp_emits_new_template_after_block() {
 
     let mut rx = tdp.subscribe();
 
-    // Trigger a NewPrevHash by mining another block. This forces the
-    // upstream to emit a fresh NewTemplate followed by SetNewPrevHash.
     let new_tip = node
         .generate_to_self(1)
         .await
         .expect("mine 1 more to force new template");
     assert_eq!(new_tip, 102, "tip should advance to 102");
 
-    // Drain updates until both NewTemplate and SetNewPrevHash arrived, or
-    // a 20 s budget runs out.
     let mut saw_new_template = false;
     let mut saw_set_new_prev_hash = false;
     let _ = tokio::time::timeout(Duration::from_secs(20), async {
@@ -87,11 +76,8 @@ async fn tdp_emits_new_template_after_block() {
         "expected at least one SetNewPrevHash update after mining"
     );
 
-    // The snapshot tap (a separate broadcast subscriber) must have stamped
-    // `last_update_at` once it absorbed the same template/prev-hash pair.
-    // This is what `/api/health` reads for TDP staleness, so it must get
-    // populated against real bitcoin-core. Poll briefly: the tap is a
-    // distinct subscriber and may lag the drain loop by a scheduler tick.
+    // `/api/health` reads `last_update_at` for TDP staleness. Polled because the
+    // snapshot tap is a separate subscriber and may lag this loop.
     let stamped = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if tdp.current_snapshot().last_update_at.is_some() {
@@ -111,10 +97,7 @@ async fn tdp_emits_new_template_after_block() {
     node.shutdown().await.expect("regtest clean shutdown");
 }
 
-/// Reconnect path: kill the bitcoin-node mid-run (simulating a `bitcoind`
-/// restart for a version upgrade), restart it at the SAME datadir (= same
-/// IPC socket), and assert the `TdpHandle` worker reconnects on its own
-/// and resumes emitting templates — without a pool restart.
+/// The worker reconnects on its own after bitcoind restarts on the same socket.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::print_stderr)]
 async fn tdp_reconnects_after_bitcoind_restart() {
@@ -124,13 +107,10 @@ async fn tdp_reconnects_after_bitcoind_restart() {
         return;
     }
 
-    // The TEST owns the datadir so it survives node1's shutdown and node2
-    // reuses it (same chain, same IPC socket path). Manual cleanup at the
-    // end — no tempfile dev-dep needed.
+    // The test owns the datadir so node2 reuses node1's chain and IPC socket path.
     let datadir = std::env::temp_dir().join(format!("bp-tdp-reconnect-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&datadir); // clean any stale leftover
+    let _ = std::fs::remove_dir_all(&datadir);
 
-    // ── Phase 1: node1 up, TDP attached, template flowing ─────────────
     let node1 =
         RegtestNode::start_with(RegtestConfig::default().with_external_datadir(datadir.clone()))
             .await
@@ -145,7 +125,6 @@ async fn tdp_reconnects_after_bitcoind_restart() {
         TdpConfig::new(&socket)
             .with_fee_threshold(1)
             .with_min_interval_secs(1)
-            // Short backoff so the test doesn't wait long for the retry.
             .with_reconnect_backoff(Duration::from_millis(500)),
     )
     .expect("TdpHandle::spawn against node1 IPC");
@@ -160,25 +139,19 @@ async fn tdp_reconnects_after_bitcoind_restart() {
         "expected a NewTemplate before the restart"
     );
 
-    // ── Phase 2: kill node1; datadir (caller-owned) survives ──────────
     node1.shutdown().await.expect("node1 shutdown");
 
-    // Let the worker notice the dropped IPC and enter its reconnect loop
-    // (it will fail to connect while the node is down and back off).
+    // Let the worker notice the dropped IPC and enter its reconnect loop.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Drain every PRE-restart template still buffered in the broadcast
-    // channel AND assert the channel is still open. After this, any
-    // NewTemplate seen below can only have come from the reconnected
-    // worker — otherwise the test would false-positive on a stale buffered
-    // template. A `Closed` here means the worker thread died (no reconnect).
+    // Discard buffered pre-restart templates, so a NewTemplate below can only
+    // come from the reconnected worker.
     assert!(
         drain_all_open(&mut rx),
         "TDP broadcast must stay OPEN across a bitcoind restart — \
          a closed channel means the worker died instead of reconnecting"
     );
 
-    // ── Phase 3: node2 at the SAME datadir/socket; TDP must reconnect ──
     let node2 =
         RegtestNode::start_with(RegtestConfig::default().with_external_datadir(datadir.clone()))
             .await
@@ -188,7 +161,7 @@ async fn tdp_reconnects_after_bitcoind_restart() {
         .await
         .expect("mine 1 on node2 to force a post-reconnect template");
 
-    // Generous budget: reconnect backoff + node2 IBD-exit + template emit.
+    // Covers reconnect backoff, node2's IBD exit and the template emit.
     let reconnected = drain_until_new_template(&mut rx, Duration::from_secs(40)).await;
 
     // Clean up before asserting so a failed assert still tears down.
@@ -203,8 +176,7 @@ async fn tdp_reconnects_after_bitcoind_restart() {
     );
 }
 
-/// Drain the broadcast until a `NewTemplate` arrives or `budget` elapses.
-/// Returns `true` if a `NewTemplate` was seen.
+/// `true` once a `NewTemplate` arrives within `budget`.
 async fn drain_until_new_template(
     rx: &mut tokio::sync::broadcast::Receiver<TemplateUpdate>,
     budget: Duration,
@@ -222,11 +194,8 @@ async fn drain_until_new_template(
     .unwrap_or(false)
 }
 
-/// Drain every currently-buffered message without blocking. Returns
-/// `true` if the channel is still open (Empty/Lagged after draining),
-/// `false` if it's Closed (worker thread gone). Used to discard
-/// pre-restart templates so a later `recv` can only observe
-/// post-reconnect ones.
+/// Drains the buffer without blocking; `false` means the channel closed,
+/// i.e. the worker thread is gone.
 fn drain_all_open(rx: &mut tokio::sync::broadcast::Receiver<TemplateUpdate>) -> bool {
     use tokio::sync::broadcast::error::TryRecvError;
     loop {

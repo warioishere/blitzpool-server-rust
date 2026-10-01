@@ -58,8 +58,7 @@ where
 
 #[derive(Serialize)]
 struct VersionResponse {
-    /// Wire shape `{ version: "v<semver>" }` — the `v`-prefix is
-    /// part of the string so the UI can render it verbatim.
+    /// `v`-prefixed so the UI renders it verbatim.
     version: String,
 }
 
@@ -102,8 +101,7 @@ where
 
 // ─── /api/info/peers ──────────────────────────────────────────────
 
-/// `/api/info/peers` entry. `version` is the bitcoin-RPC `subver`
-/// string projected forward so the UI can render it verbatim.
+/// `version` is the RPC `subver`, rendered verbatim by the UI.
 #[derive(Serialize)]
 struct PeerEntry {
     version: String,
@@ -132,9 +130,7 @@ where
                     .bitcoin_rpc
                     .as_ref()
                     .ok_or(ApiError::Unavailable("bitcoin-rpc not wired"))?;
-                // Raw JSON rather than a typed struct: bitcoin-core keeps adding
-                // `getpeerinfo` fields, and this projection reads only the keys
-                // the UI renders, so a new field cannot fail the endpoint.
+                // Raw JSON, so a new `getpeerinfo` field cannot fail the endpoint.
                 let raw: serde_json::Value = rpc.call("getpeerinfo", serde_json::json!([])).await?;
                 let peers = raw.as_array().cloned().unwrap_or_default();
                 let mut out = Vec::with_capacity(peers.len());
@@ -193,11 +189,8 @@ where
 
 fn extract_ip(addr: &str) -> Option<String> {
     if let Some(stripped) = addr.strip_prefix('[') {
-        // IPv6 form `[::1]:8333` → `::1`
         stripped.split_once(']').map(|(ip, _)| ip.to_string())
     } else {
-        // IPv4 form `1.2.3.4:8333` → `1.2.3.4`. If no port present,
-        // the whole string is the IP.
         Some(
             addr.rsplit_once(':')
                 .map(|(ip, _)| ip.to_string())
@@ -249,9 +242,6 @@ fn format_location(loc: &bp_geoip::GeoLocation) -> String {
 }
 
 // ─── /api/info/difficulty ────────────────────────────────────────
-//
-// The singleton network-difficulty tracker row: current value plus the
-// previous one for the UI's delta arrow.
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -304,10 +294,8 @@ where
     Ok(Json(template))
 }
 
-/// Next-block reward, computed server-side from the current `getblocktemplate`.
-/// `coinbasevalue` is the authoritative subsidy + real mempool fees the pool
-/// would mine (the same value the live coinbase payout is built from), split
-/// into subsidy + fees via the shared halving helper.
+/// From the template's `coinbasevalue`, the same value the live coinbase is
+/// built from, split into subsidy and fees.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NextBlockReward {
@@ -352,8 +340,6 @@ where
     }))
 }
 
-/// Per-recipient payout row — `{address, percent, sats}` triple
-/// the UI uses to render the distribution preview.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PayoutInfoEntry {
@@ -367,26 +353,18 @@ struct PayoutInfoEntry {
 #[serde(rename_all = "camelCase")]
 struct ClientBlockTemplateResponse {
     block_template: serde_json::Value,
-    /// `solo` / `pplns` / `group-solo` / `blockparty` — drives the UI's
-    /// distribution-preview labelling.
     mode: &'static str,
     payout_information: Vec<PayoutInfoEntry>,
     /// Set for the two group modes, `group-solo` and `blockparty`.
     #[serde(skip_serializing_if = "Option::is_none")]
     group_id: Option<String>,
-    /// Full block hex (header + per-address coinbase + template txs)
-    /// with a zero nonce, suitable for the UI's preview panel. Empty
-    /// when payouts are unknown (PPLNS window not yet warm, etc.) or
-    /// the assembly step fails — the panel then renders just the
-    /// template + mode tile.
+    /// Zero-nonce preview block; empty when payouts are unknown or assembly
+    /// fails, and the panel then renders only the template and mode.
     block_hex: String,
-    /// Per-address coinbase tx hex (witness form, zero extranonces).
-    /// Same fallback behaviour as `blockHex`.
+    /// Witness form, zero extranonces; same fallback as `block_hex`.
     coinbase_tx_hex: String,
-    /// Group-Solo only: the member the preview names as finder, the one its
-    /// finder bonus is paid to. The asking address when it has shares in
-    /// the window, otherwise the member with the largest window share
-    /// (see `preview_finder`). Absent for the modes without a finder bonus.
+    /// Group-Solo only: the member the preview names as finder (see
+    /// `preview_finder`).
     #[serde(skip_serializing_if = "Option::is_none")]
     preview_finder: Option<String>,
 }
@@ -446,8 +424,7 @@ where
                                 let finder = preview_finder(&addr, &window);
                                 previewed_finder = Some(finder.as_str().to_string());
                                 match engine.build_distribution(gid, reward_sats, &finder).await {
-                                    // The §4 evaluation at this template's
-                                    // revenue — what the real coinbase pays.
+                                    // What the real coinbase pays at this revenue.
                                     Ok(dist) => dist
                                         .distribution
                                         .payout_entries_at(reward_sats)
@@ -497,8 +474,7 @@ where
                     }
                     MiningMode::Pplns => match s.pplns.as_ref() {
                         Some(engine) => match engine.build_distribution(reward_sats).await {
-                            // The §4 evaluation at this template's revenue —
-                            // exactly what the real coinbase build runs.
+                            // What the real coinbase pays at this revenue.
                             Ok(dist) => dist
                                 .distribution
                                 .payout_entries_at(reward_sats)
@@ -539,9 +515,6 @@ where
                     }
                 };
 
-                // An empty distribution (e.g. an empty PPLNS window at startup)
-                // skips block assembly; the panel still renders the template
-                // and mode tile.
                 let (coinbase_tx_hex, block_hex) = if payouts.is_empty() {
                     (String::new(), String::new())
                 } else {
@@ -563,13 +536,9 @@ where
     Ok(JsonBytes(bytes))
 }
 
-/// Who the Group-Solo preview names as the block's finder.
-///
-/// A member's job names that member as finder, so an address with shares in
-/// the current window previews its own job. An address without shares cannot
-/// find the block, so the preview names the member with the largest window
-/// share instead. With an empty window the asking address stays the finder,
-/// as the first block of an empty window is built that way.
+/// Group-Solo preview finder: the asker if it has window shares (its own job
+/// names it), else the largest window share, since a shareless address cannot
+/// find the block. An empty window keeps the asker, as the real job does.
 fn preview_finder(
     requester: &bp_common::AddressId,
     window: &std::collections::HashMap<String, f64>,
@@ -649,15 +618,11 @@ fn assemble_block_preview(
     )
     .map_err(|e| format!("build_mining_job: {e}"))?;
 
-    // Zero extranonces — preview is byte-stable; the miner splices in
-    // its own values at submit time.
     let zero_e1 = [0u8; 4];
     let zero_e2 = [0u8; 8];
     let coinbase_bytes = job.witness_coinbase_with_extranonce(&zero_e1, &zero_e2);
     let coinbase_tx_hex = hex::encode(&coinbase_bytes);
 
-    // Deserialise all the template's transactions so consensus::serialize
-    // re-emits them in the standard block layout.
     let mut txdata: Vec<Transaction> = Vec::new();
     let coinbase_tx: Transaction = consensus::deserialize(&coinbase_bytes)
         .map_err(|e| format!("coinbase deserialize: {e}"))?;
@@ -721,9 +686,7 @@ fn assemble_block_preview(
 
 // ─── /api/pool ────────────────────────────────────────────────────
 
-/// Pool-wide summary card. `blocksFound` is the full found-block log (the
-/// same projection `/api/info` returns as `blockData`). `fee` is always `0`;
-/// the dashboard tile still reads the key.
+/// `fee` is always `0`; the dashboard tile still reads the key.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PoolResponse {
@@ -818,16 +781,11 @@ struct HealthResponse {
 struct HealthChecks {
     database: &'static str,
     bitcoin: Option<&'static str>,
-    /// Redis/cache reachability. Informational only — a cache outage
-    /// does NOT flip `status` to "degraded" (the share path is
-    /// availability-first and survives a Redis blip). `None` when no
-    /// Redis handle is wired into the API state.
+    /// Informational only: the share path survives a Redis blip, so a cache
+    /// outage does not degrade `status`.
     cache: Option<&'static str>,
-    /// TDP template-feed freshness: `"connected"` when the last
-    /// NewTemplate/SetNewPrevHash is within the staleness window, `"stale"`
-    /// otherwise, `None` when no TDP handle is wired. Unlike `cache`, a
-    /// stale feed flips `status` to "degraded": without fresh templates the
-    /// pool cannot hand out valid work.
+    /// A stale feed degrades `status`: without fresh templates the pool
+    /// cannot hand out valid work.
     tdp: Option<&'static str>,
 }
 
@@ -863,8 +821,6 @@ where
             state.tdp_staleness_threshold_ms,
         )
     });
-    // `status` gates on database + bitcoin RPC + TDP freshness; Redis is
-    // reported in `checks.cache` but never degrades it.
     let status = if database && bitcoin_ok.unwrap_or(true) && tdp_fresh.unwrap_or(true) {
         "healthy"
     } else {
@@ -889,11 +845,8 @@ where
     }))
 }
 
-/// Decide whether the TDP feed counts as fresh. `last_update_at` is the
-/// wall-clock of the last template/prev-hash (None until the first one
-/// arrives); when absent, age counts from `start_ms` so a core that never
-/// attaches still trips the threshold. `true` when the age is within
-/// `threshold_ms`.
+/// Without any template yet, age counts from `start_ms`, so a core that never
+/// attaches still trips the threshold.
 fn tdp_is_fresh(
     last_update_at: Option<i64>,
     start_ms: i64,
@@ -905,9 +858,7 @@ fn tdp_is_fresh(
     age_ms <= threshold_ms
 }
 
-/// SET a short-TTL probe key and read it back — confirms Redis is
-/// reachable AND round-tripping, not just TCP-accepting. Any error or
-/// value mismatch reports `false` (disconnected).
+/// Write and read back, so Redis must round-trip, not just accept TCP.
 async fn redis_health_roundtrip(mut conn: redis::aio::ConnectionManager) -> bool {
     use redis::AsyncCommands;
     const KEY: &str = "__health_check__";
@@ -935,9 +886,7 @@ fn format_uptime(ms: u64) -> String {
 
 // ─── /api/info/chart ──────────────────────────────────────────────
 //
-// Pool-wide hashrate timeseries: per-slot accepted weight to H/s via
-// `accepted * 2^32 / 600`. The in-progress slot (past the visibility
-// cutoff) is excluded so the chart never ends in a half-filled bucket.
+// The in-progress slot is excluded so the chart never ends half-filled.
 
 use crate::time_range::{
     accepted_slot_data, chart_slot_boundaries, fold_into_slots, max_difficulty_slot_data,
@@ -974,8 +923,7 @@ where
             let since = now - range.window_ms();
             let cutoff = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
             let rows = bp_db::find_pool_share_statistics_since(&s.pool, since).await?;
-            // One ChartPoint per DB row: slot-end label + rounded
-            // hashrate; UI fills any gaps itself.
+            // The UI fills gaps itself.
             Ok(rows
                 .into_iter()
                 .filter(|r| r.time < cutoff)
@@ -1017,8 +965,6 @@ where
 }
 
 // ─── /api/info/max-difficulty ─────────────────────────────────────
-//
-// The highest single share difficulty the pool saw in each 10-minute slot.
 
 async fn max_difficulty<H, M>(
     State(state): State<SharedState<H, M>>,
@@ -1046,12 +992,6 @@ where
 }
 
 // ─── /api/info/workers ────────────────────────────────────────────
-//
-// Two counts per slot:
-//   - `addresses` = DISTINCT payout-address count
-//   - `workers`   = DISTINCT (address, client_name) pair count
-//
-// The slot bucket key is the row's stored slot-end timestamp.
 
 async fn workers<H, M>(
     State(state): State<SharedState<H, M>>,
@@ -1068,8 +1008,6 @@ where
         .cache
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::Workers, async move {
             let since = bp_common::now_ms() - range.window_ms();
-            // Only slot time + address + worker are fetched; distinct
-            // counting happens in-process.
             let rows = bp_db::find_pool_worker_rows_since(&s.pool, since).await?;
             Ok(worker_slots(
                 &chart_slot_boundaries(since),
@@ -1104,14 +1042,8 @@ fn worker_slots<'a>(
 }
 
 // ─── /api/info/rejected ───────────────────────────────────────────
-//
-// Per-reason aggregation. Every slot bucket is pre-filled with all
-// known reason keys so the UI's per-reason chart series always have
-// a value (zero if no shares for that reason in that slot).
 
-/// Reason keys the UI knows about. Pre-filled into every slot so chart
-/// series stay continuous even when a slot has zero rejects of a given
-/// reason.
+/// Pre-filled into every slot so the UI's per-reason series stay continuous.
 pub(crate) const REJECT_REASON_KEYS: &[&str] = &[
     "OtherUnknown",
     "JobNotFound",
@@ -1123,9 +1055,7 @@ pub(crate) const REJECT_REASON_KEYS: &[&str] = &[
     "VersionRollingNotAllowed",
 ];
 
-/// Normalise the reason string stored on `pool_rejected_statistics_entity`
-/// to the camel-case key the UI expects. Stored rows carry either the
-/// camel-case or the kebab-case form; both map here.
+/// Stored rows carry camel-case or kebab-case reasons; the UI expects camel-case.
 pub(crate) fn normalise_reject_reason(raw: &str) -> &'static str {
     match raw {
         "OtherUnknown" => "OtherUnknown",
@@ -1136,7 +1066,6 @@ pub(crate) fn normalise_reject_reason(raw: &str) -> &'static str {
         "UnauthorizedWorker" => "UnauthorizedWorker",
         "NotSubscribed" => "NotSubscribed",
         "Stale" => "Stale",
-        // Kebab-case rows.
         "job-not-found" => "JobNotFound",
         "duplicate-share" => "DuplicateShare",
         "low-difficulty" | "low-difficulty-share" => "LowDifficultyShare",
@@ -1170,7 +1099,6 @@ where
     Ok(JsonBytes(bytes))
 }
 
-/// `(time, (reason, count))` samples → per-reason counts per slot.
 fn rejected_slots<'a>(
     boundaries: &[i64],
     samples: impl IntoIterator<Item = (i64, (&'a str, f64))>,
@@ -1187,8 +1115,7 @@ fn rejected_slots<'a>(
     SlotDataResponse::from_slots(slots, with_all_reasons)
 }
 
-/// Every key of [`REJECT_REASON_KEYS`], holding what `seen` recorded for
-/// it or the default, plus anything else `seen` recorded.
+/// Every key of [`REJECT_REASON_KEYS`], defaulted, plus whatever `seen` holds.
 fn with_all_reasons<X: Default>(seen: BTreeMap<String, X>) -> BTreeMap<String, X> {
     let mut counts: BTreeMap<String, X> = REJECT_REASON_KEYS
         .iter()
@@ -1198,9 +1125,7 @@ fn with_all_reasons<X: Default>(seen: BTreeMap<String, X>) -> BTreeMap<String, X
     counts
 }
 
-/// Per-reason rejected-share bucket of the per-address and per-group
-/// `/rejected` endpoints — `count` is the raw rejection count,
-/// `diffMinusOne` is the share-difficulty sum at the moment of rejection.
+/// `diff_minus_one` is the share-difficulty sum at the moment of rejection.
 #[derive(Serialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RejectCounts {
@@ -1223,8 +1148,6 @@ pub(crate) struct RejectSlotsResponse {
     slot_data: Vec<RejectedSlot>,
 }
 
-/// `(time, (reason, count, diff1))` samples → per-reason counts and
-/// diff-1 sums per slot, every known reason present.
 pub(crate) fn rejected_by_reason_slots<'a>(
     boundaries: &[i64],
     samples: impl IntoIterator<Item = (i64, (&'a str, f64, f64))>,
@@ -1252,10 +1175,6 @@ pub(crate) fn rejected_by_reason_slots<'a>(
 }
 
 // ─── /api/info/shares ─────────────────────────────────────────────
-//
-// Singleton totals: accepted/rejected over 1d, 14d, plus
-// `acceptedSinceBlock` — sliced from the last block's `createdAt`
-// in `blocks_entity`.
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1310,8 +1229,7 @@ where
                 let accepted_30d = month_rows.iter().map(|r| r.accepted as f64).sum::<f64>();
                 let rejected_30d = month_rows.iter().map(|r| r.rejected as f64).sum::<f64>();
 
-                // Slice since the most-recent confirmed block; with no block
-                // ever found, 0 (epoch) yields the cumulative share total.
+                // With no block ever found, epoch yields the cumulative total.
                 let last_block_at: Option<i64> = sqlx::query_scalar(
                     r#"SELECT MAX("createdAt") FROM blocks_entity WHERE "deletedAt" IS NULL"#,
                 )
@@ -1343,15 +1261,11 @@ where
     Ok(JsonBytes(bytes))
 }
 
-// Silence "unused" warning on the Arc import — used transitively
-// through SharedState in every handler.
+// Exists only to keep the `Arc` import used.
 #[allow(dead_code)]
 fn _force_arc_use(_: Arc<()>) {}
 
 // ─── /api/info ────────────────────────────────────────────────────
-//
-// Top-level dashboard payload: found-block log, user-agent histogram,
-// best-difficulty leaderboard, plus pool uptime.
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1389,7 +1303,7 @@ struct InfoResponse {
     block_data: Vec<FoundBlockEntry>,
     user_agents: Vec<UserAgentEntry>,
     high_scores: Vec<HighScoreEntry>,
-    /// Pool start time as ISO-8601 string.
+    /// Pool start time as an ISO-8601 string, not a duration.
     uptime: String,
 }
 
@@ -1460,15 +1374,7 @@ where
 
 // ─── /api/info/chart/mode/:mode ────────────────────────────────────
 //
-// Per-payout-mode hashrate chart. Default range is `1d`; valid range
-// presets are `1d`, `3d`, `7d` (NOTE: differs from `/api/info/chart`
-// which also accepts `1m`). Unknown `:mode` → empty array.
-//
-// Aggregation:
-//   - 10-min slots
-//   - hide both the in-progress and just-ended slot (via the same
-//     visibility-cutoff helper the writer uses)
-//   - hashrate = ROUND(diff * HASHES_PER_DIFFICULTY_1 / 600)
+// Unknown `:mode` answers an empty array.
 
 async fn chart_mode<H, M>(
     State(state): State<SharedState<H, M>>,
@@ -1483,8 +1389,7 @@ where
         Ok(m) => m,
         Err(_) => return Ok(Json(Vec::new())),
     };
-    // Local range parsing — this endpoint's set is {1d, 3d, 7d} with
-    // default `7d`, narrower than the shared `Range::parse`.
+    // Narrower than the shared `Range::parse`: {1d, 3d, 7d}, default `7d`.
     let (window_ms, _slot) = match q.range.as_deref().unwrap_or("7d") {
         "1d" => (24 * 60 * 60 * 1000_i64, 600_000_i64),
         "3d" => (3 * 24 * 60 * 60 * 1000_i64, 600_000_i64),
@@ -1534,9 +1439,7 @@ mod slot_json_tests {
         );
     }
 
-    /// `/api/info/max-difficulty` and `/api/client/:address/max-difficulty` —
-    /// the highest share per slot: not the sum (800) and not the last row
-    /// (300); an empty slot is 0 and a row off the grid is dropped.
+    /// Max-difficulty keeps the highest share per slot, not the sum or last row.
     #[test]
     fn max_difficulty_json_keeps_the_highest_share_per_slot() {
         let samples = vec![
@@ -1589,8 +1492,7 @@ mod slot_json_tests {
 
 #[cfg(test)]
 mod tests {
-    /// `previewFinder` is present for Group-Solo only; every other mode's
-    /// JSON omits the key entirely (no null).
+    /// `previewFinder` is omitted, not null, when unset.
     #[test]
     fn preview_finder_field_is_absent_unless_set() {
         let response = |finder: Option<&str>| ClientBlockTemplateResponse {
@@ -1629,7 +1531,7 @@ mod tests {
         let zero = HashMap::from([(asker.as_str().to_string(), 0.0), (top.clone(), 10.0)]);
         assert_eq!(preview_finder(&asker, &zero).as_str(), top);
 
-        // Empty window: nobody else to name, the asker bootstraps it.
+        // Empty window: the asker bootstraps it.
         assert_eq!(preview_finder(&asker, &HashMap::new()), asker);
     }
 
@@ -1642,14 +1544,12 @@ mod tests {
 
     #[test]
     fn tdp_fresh_when_recent_template() {
-        // last update 10s ago, 120s threshold → fresh.
         let now = 1_000_000_000;
         assert!(tdp_is_fresh(Some(now - 10_000), now - 60_000, now, 120_000));
     }
 
     #[test]
     fn tdp_stale_when_template_older_than_threshold() {
-        // last update 5min ago, 120s threshold → stale.
         let now = 1_000_000_000;
         assert!(!tdp_is_fresh(
             Some(now - 300_000),
@@ -1670,7 +1570,6 @@ mod tests {
 
     #[test]
     fn tdp_clock_skew_backwards_is_not_stale() {
-        // last_update_at in the (apparent) future → age clamps to 0, fresh.
         let now = 1_000_000_000;
         assert!(tdp_is_fresh(Some(now + 5_000), now, now, 120_000));
     }

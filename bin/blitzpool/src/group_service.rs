@@ -1,16 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Shared `GroupService` owner.
-//!
-//! The bp-api HTTP layer performs group lifecycle operations and the
-//! Stratum layer reads the
-//! [`AddressCache`](bp_group_mgmt_engine::AddressCache) on each
-//! authorize to resolve `address → group_id`; both use one
-//! [`GroupService<ProductionGroupServiceHooks>`] so they see a single
-//! membership cache.
-//!
-//! The cache is warmed at boot via `GroupService::rebuild_cache()`
-//! so the first share doesn't pay a PG round-trip.
+//! Shared `GroupService` owner: the API and the Stratum authorize path use one
+//! instance so they see a single
+//! [`AddressCache`](bp_group_mgmt_engine::AddressCache).
 
 use std::sync::Arc;
 
@@ -23,7 +15,6 @@ use tracing::info;
 use crate::boot::FoundationHandles;
 use crate::hooks::{ProductionGroupServiceHooks, ProductionHooks};
 
-/// Kick-inactivity cutoff (days) handed to `GroupService::new`.
 pub(crate) const KICK_INACTIVITY_DAYS: u32 = 14;
 
 #[derive(Debug, Error)]
@@ -32,21 +23,14 @@ pub(crate) enum GroupServiceSpawnError {
     Rebuild(#[from] GroupServiceError),
 }
 
-/// Shared handle aggregate — clone the inner `Arc` to hand the same
-/// service to multiple consumers.
 #[derive(Clone)]
 pub(crate) struct SharedGroupService {
     pub(crate) service: Arc<GroupService<ProductionGroupServiceHooks>>,
 }
 
-/// Construct the production `GroupService`, warm the address cache,
-/// and return the shared aggregate. Failure to rebuild the cache is
-/// fatal — Stratum + API both depend on a hot cache at first share.
-///
-/// The member ceiling comes from the Group-Solo engine's coinbase weight
-/// budget, computed with the same [`max_coinbase_outputs`] that
-/// `GET /api/pplns/groups/coinbase-capacity` reports, so what the UI shows and
-/// what a join is refused against are one number.
+/// A failed cache rebuild is fatal: Stratum and API need it at first share.
+/// The member ceiling uses the same [`max_coinbase_outputs`] the
+/// coinbase-capacity endpoint reports, so the UI and the join refusal agree.
 pub(crate) async fn spawn(
     foundation: &FoundationHandles,
     production_hooks: &ProductionHooks,

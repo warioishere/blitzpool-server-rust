@@ -1,24 +1,9 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
-//! Periodic best-effort backup of the live PPLNS + Group-Solo Redis state to
-//! Postgres, plus a MANUAL operator-triggered restore.
-//!
-//! The PPLNS window and the Group-Solo rounds (the share weights behind each
-//! block's payout split) live only in Redis. AOF survives a crash, not a
-//! logical wipe, and Postgres cannot reconstruct them. Every 10 min this task
-//! `DUMP`s every `pplns:*` + `groupsolo:*` key into `redis_state_backup`.
-//!
-//! Restore is **never automatic**: an operator runs
-//! `blitzpool --restore-redis-state [--restore-force]` after deciding the
-//! live state is bad. `DUMP`/`RESTORE` is verbatim per key.
-//!
-//! **A restore is an APPROXIMATION**, not a point-in-time snapshot: keys are
-//! dumped one after another, so the window aggregate and the bucket hashes
-//! can differ by the shares of one SCAN+DUMP pass, and the trim may then
-//! decrement value the aggregate never received. The PPLNS trim counts and
-//! warns about fields driven below zero (`bp_pplns_engine::window`'s
-//! `TRIM_BATCH_LUA`) rather than leaving them for the payout read to treat
-//! as absent.
+//! Periodic backup of the PPLNS window and Group-Solo rounds, which live only
+//! in Redis (AOF survives a crash, not a logical wipe), to Postgres. Restore
+//! is manual only and an APPROXIMATION: keys are dumped one after another, so
+//! aggregate and buckets can differ by the shares of one SCAN+DUMP pass.
 
 use std::time::Duration;
 
@@ -40,13 +25,9 @@ const SCOPES: &[(&str, &str)] = &[("pplns", "pplns:*"), ("groupsolo", "groupsolo
 /// `RENAME`; never worth backing up (and confusing on restore).
 const SKIP_SUFFIX: &str = ":by-address:rebuild";
 
-/// Per-job coinbase-distribution snapshots: `pplns:snapshot:{hex}` and
-/// `groupsolo:{group}:jobsnapshot:{hex}`.
-///
-/// Skipped as neither restorable nor few: each belongs to one issued job,
-/// and jobs live in process memory, so after a Redis loss nothing looks a
-/// restored one up. There is one per distinct payout list for its TTL, far
-/// more than window or round state.
+/// Per-job coinbase-distribution snapshots, skipped as neither restorable
+/// nor few: each belongs to one in-memory job, so after a Redis loss nothing
+/// looks a restored one up.
 fn is_per_job_snapshot(key: &str) -> bool {
     key.starts_with("pplns:snapshot:") || key.contains(":jobsnapshot:")
 }
@@ -288,8 +269,7 @@ mod tests {
     const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
     const RETENTION_MS: i64 = 48 * 3600 * 1000;
 
-    /// The backup filter's classification: per-job snapshots are skipped,
-    /// window and round state are not.
+    /// Per-job snapshots are skipped, window and round state are not.
     #[test]
     fn per_job_snapshots_are_classified_apart_from_restorable_state() {
         let fp = "ab".repeat(32);
@@ -326,9 +306,7 @@ mod tests {
         Some(db.pool().clone())
     }
 
-    /// Seed representative PPLNS + Group-Solo state, back it up, wipe Redis,
-    /// restore, and assert every key + value came back byte-for-byte. Also
-    /// proves the transient rebuild temp is skipped and `--scope` filters.
+    /// Backup, wipe, restore returns every key byte-for-byte; skips and `--scope` hold.
     #[tokio::test]
     async fn backup_then_restore_roundtrip_restores_exact_state() {
         let Some(mut redis) = redis_or_skip(9).await else {
@@ -366,8 +344,7 @@ mod tests {
             .hset("pplns:window:by-address:rebuild", "x", "1")
             .await
             .unwrap();
-        // Per-job coinbase snapshots. A busy pool holds thousands of these and
-        // none of them survives its job, so the backup must leave them alone.
+        // Per-job coinbase snapshots, which the backup must leave alone.
         let _: () = redis
             .hset(format!("pplns:snapshot:{}", "ab".repeat(32)), "reward", "1")
             .await

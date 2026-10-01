@@ -1,62 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Pool-side extranonce-prefix allocation, shared by the SV1 and SV2
-//! stratum servers.
-//!
-//! ## What prefix uniqueness actually buys
-//!
-//! Two connections search the same space only if they hash the **same
-//! coinbase** — the header commits to it through the merkle root, so a
-//! shared `(extranonce_prefix + extranonce)` pair produces identical
-//! hashes only when everything *else* in the coinbase is identical too.
-//! "Same coinbase" is exactly `bp_mining_job`'s job-cache key
-//! (`network, pool_identifier, extranonce_slot_size, payouts, template…`
-//! — see `cache::job_key_tuple`):
-//!
-//! - **Same cache key** ⟺ same coinbase ⟺ the prefix is the sole
-//!   work-partitioner. A shared prefix here means overlapping search plus
-//!   duplicate-share rejects on the colliding session.
-//! - **Different cache key** ⟺ a shared prefix is harmless: the coinbases,
-//!   and therefore the headers, differ no matter what the prefix is.
-//!
-//! Solo / Group-Solo / Blockparty sessions each hash their own payout
-//! outputs, so they never collide whatever prefix they hold. PPLNS is where
-//! the prefix carries the entire burden: every PPLNS miner on a stream
-//! hashes one identical coinbase.
-//!
-//! The allocator still guarantees prefixes unique **pool-wide**: it
-//! subsumes the per-class guarantee, costs nothing (2^24 prefixes per
-//! partition), and spares callers from reasoning about a session's mode.
-//! It is a simplifying invariant, not a claim that a shared prefix is
-//! always harmful.
-//!
-//! ## Allocation strategy
-//!
-//! The prefix is 4 bytes; the top 8 bits select the worker (0..=255) and
-//! the remaining 24 bits are the per-worker counter. The allocator hands
-//! out the next free big-endian integer starting from 1 (some firmwares
-//! treat an all-zero `extranonce_prefix` as "no prefix"). Released
-//! prefixes are reused.
-//!
-//! Each protocol builds ONE [`SharedExtranonceAllocator`] on its own worker
-//! id and shares it across all of its ports, so SV1 (`0x01…`) and SV2
-//! (`0x00…`) prefixes never collide without the two instances having to
-//! coordinate. Within a protocol the instance must be shared: an allocator
-//! per port would start every port at the same prefix, and two PPLNS ports
-//! hash the same coinbase.
-//!
-//! Only workers 0 and 1 are assigned; **workers 2..=255 are unowned**, so no
-//! counter ever emits `0x02…`..`0xFF…`. That makes the range the home for a
-//! hand-administered prefix, and room for any further independent
-//! allocator to claim a worker id.
-//!
-//! The 4-byte prefix is the pool's part of `bp_mining_job`'s 12-byte
-//! coinbase extranonce slot (`EXTRANONCE_SLOT_LEN`), leaving 8 for the
-//! miner (SV1's `extranonce2`), because the Braiins Hashpower marketplace
-//! requires `extranonce2_size >= 7`.
-//!
-//! `ExtranonceAllocator` is crate-private so the only way in is
-//! [`SharedExtranonceAllocator`]; no server can build a per-port allocator.
+//! Pool-wide unique 4-byte extranonce prefixes: top byte = worker, counter from 1 (some firmware
+//! reads all-zero as "no prefix"). One shared instance per protocol, since PPLNS miners hash one
+//! coinbase and the prefix is their only work partitioner. Workers 2..=255 stay unowned for
+//! hand-administered prefixes; 8 slot bytes remain because Braiins needs `extranonce2_size >= 7`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,14 +17,8 @@ pub enum ExtranonceError {
     Exhausted,
 }
 
-/// Worker-partition ids reserved per stratum protocol. The top byte of a
-/// 4-byte prefix carries the worker id, so allocators built on distinct
-/// workers hand out disjoint prefixes. Both reservations live here so the
-/// cross-protocol uniqueness invariant is in one place.
-///
-/// Each protocol builds one [`SharedExtranonceAllocator`] on its id: SV2 on
-/// this one (worker 0 → `0x00…` prefixes), SV1 on [`SV1_WORKER_ID`]
-/// (worker 1 → `0x01…`).
+/// Worker partition per stratum protocol (SV2 `0x00…`, SV1 `0x01…`), kept
+/// together so the cross-protocol uniqueness invariant lives in one place.
 pub const SV2_WORKER_ID: u32 = 0;
 /// See [`SV2_WORKER_ID`]. SV1's partition (`0x01…`), disjoint from SV2's.
 pub const SV1_WORKER_ID: u32 = 1;
@@ -103,9 +44,6 @@ pub(crate) struct ExtranonceAllocator {
 }
 
 impl ExtranonceAllocator {
-    /// A 4-byte prefix on the given worker partition: the top byte of the
-    /// prefix carries the worker id, so two partitions never collide.
-    ///
     /// # Panics
     /// When `worker_id` does not fit the top byte (> 255).
     pub(crate) fn new_default_on_worker(worker_id: u32) -> Self {
@@ -122,16 +60,12 @@ impl ExtranonceAllocator {
         }
     }
 
-    /// Count of currently-allocated channels.
     pub(crate) fn allocated_count(&self) -> usize {
         self.allocated.len()
     }
 
-    /// Allocate (or re-return) the prefix for `channel_key` — a key unique
-    /// among every live allocation on this instance (see
-    /// [`SharedExtranonceAllocator::next_key`]); a repeated key gets the SAME
-    /// prefix back. Big-endian. Returns `Err(Exhausted)` only when every
-    /// prefix in the worker partition is in use.
+    /// Big-endian prefix for `channel_key`; a repeated key gets the same one
+    /// back. `Err(Exhausted)` only when the whole partition is in use.
     pub(crate) fn allocate(&mut self, channel_key: u64) -> Result<[u8; 4], ExtranonceError> {
         if let Some(&existing) = self.allocated.get(&channel_key) {
             return Ok(existing.to_be_bytes());
@@ -172,13 +106,9 @@ impl ExtranonceAllocator {
     }
 }
 
-/// One protocol's allocator, shared by all of its port servers, plus the
-/// counter its callers draw allocation keys from.
-///
-/// The allocator needs keys that are unique among live allocations; a
-/// counter gives that by construction, where anything derived from a random
-/// session id only does so with high probability. Cheap to clone (both
-/// fields are `Arc`).
+/// One protocol's allocator, shared by all of its ports, plus the counter
+/// its keys come from: a counter is unique by construction, a random session
+/// id only with high probability.
 #[derive(Clone, Debug)]
 pub struct SharedExtranonceAllocator {
     allocator: Arc<Mutex<ExtranonceAllocator>>,
@@ -202,26 +132,23 @@ impl SharedExtranonceAllocator {
         self.next_key.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// The prefix for `key`, big-endian; the same one again for a repeated
-    /// key. `Err(Exhausted)` only when every prefix in the partition is in
-    /// use.
+    /// Big-endian prefix for `key`; a repeated key gets the same one back.
+    /// `Err(Exhausted)` only when the whole partition is in use.
     pub fn allocate(&self, key: u64) -> Result<[u8; 4], ExtranonceError> {
         self.lock().allocate(key)
     }
 
-    /// Return `key`'s prefix. A no-op for a key holding none.
+    /// A no-op for a key holding no prefix.
     pub fn release(&self, key: u64) {
         self.lock().release(key);
     }
 
-    /// How many prefixes are currently held.
     pub fn allocated_count(&self) -> usize {
         self.lock().allocated_count()
     }
 
-    /// Recovers a poisoned lock instead of panicking: the allocator's
-    /// operations never leave it half-updated, and giving up on it would
-    /// either strand every prefix it holds or refuse every new channel.
+    /// Recovers a poisoned lock: no operation leaves the allocator half-updated,
+    /// and giving up would strand every prefix or refuse every new channel.
     fn lock(&self) -> MutexGuard<'_, ExtranonceAllocator> {
         self.allocator
             .lock()
@@ -317,8 +244,7 @@ mod tests {
 
     // ── Encoding and exhaustion ─────────────────────────────────────
 
-    /// Big-endian encoding: prefix=1 must be 0x00,0x00,0x00,0x01.
-    /// Skips 0 so the first allocation lands at 1.
+    /// The first prefix is 1, big-endian.
     #[test]
     fn first_allocation_is_one_big_endian() {
         let mut mgr = ExtranonceAllocator::new_default_on_worker(SV2_WORKER_ID);
@@ -326,9 +252,7 @@ mod tests {
         assert_eq!(p, [0x00, 0x00, 0x00, 0x01]);
     }
 
-    /// An exhausted partition terminates with `Exhausted` instead of looping
-    /// forever, and a release makes room again. The partition is shrunk to
-    /// two prefixes; the full 2^24 is the same loop with a larger bound.
+    /// An exhausted partition returns `Exhausted` instead of looping; a release makes room.
     #[test]
     fn exhausted_partition_reports_exhausted() {
         let mut mgr = ExtranonceAllocator::new_default_on_worker(SV1_WORKER_ID);
@@ -342,9 +266,7 @@ mod tests {
 
     // ── Worker-partition invariants (SV1 / SV2 disjointness) ─────────
 
-    /// Worker 0 (SV2) and worker 1 (SV1) draw from disjoint prefix
-    /// spaces: worker 0's top byte is 0x00, worker 1's is 0x01, so no
-    /// prefix can ever appear in both — even across many allocations.
+    /// SV2 (worker 0) and SV1 (worker 1) prefix spaces never overlap.
     #[test]
     fn worker_partitions_never_overlap() {
         let mut sv2 = ExtranonceAllocator::new_default_on_worker(SV2_WORKER_ID); // worker 0
@@ -365,8 +287,7 @@ mod tests {
         );
     }
 
-    /// First allocation on worker 1 is `0x01000001` big-endian
-    /// (worker_offset 0x01000000 + first local prefix 1).
+    /// First allocation on worker 1 is `0x01000001` big-endian.
     #[test]
     fn worker_one_first_allocation_big_endian() {
         let mut mgr = ExtranonceAllocator::new_default_on_worker(1);
@@ -374,9 +295,7 @@ mod tests {
         assert_eq!(p, [0x01, 0x00, 0x00, 0x01]);
     }
 
-    /// Worker 255 is the last partition a 4-byte prefix has room for
-    /// (0xFF000000 + 0x00FFFFFF == 0xFFFFFFFF); 256 does not fit and is
-    /// refused rather than truncated into another worker's partition.
+    /// Worker 255 is the last partition; 256 is refused, not truncated into another.
     #[test]
     fn worker_255_is_the_last_partition() {
         let mut mgr = ExtranonceAllocator::new_default_on_worker(255);
@@ -386,8 +305,7 @@ mod tests {
         );
     }
 
-    /// Both reserved worker ids construct, and worker 1's prefixes never
-    /// collide with worker 0's (different top byte).
+    /// The two reserved worker ids get different top bytes.
     #[test]
     fn reserved_worker_ids_are_disjoint() {
         let mut sv2 = ExtranonceAllocator::new_default_on_worker(SV2_WORKER_ID);

@@ -1,24 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Hourly stats / workers cron (fires once an hour).
-//!
-//! Per tick:
-//!
-//! 1. Fetch all Telegram + ntfy subscriptions with either
-//!    `hourlyStatsEnabled` or `hourlyWorkersEnabled` set.
-//! 2. For each: reuse the existing read-command builders
-//!    (`build_stats` / `build_show_workers`) to render per-language
-//!    text, then push via the matching adapter.
-//!
-//! Language resolution:
-//!
-//! - ntfy uses the subscription row's `language` column.
-//! - Telegram reads the per-chat in-memory language map shared from
-//!   `CommandHandler` (the one `/deutsch` / `/english` write), so a
-//!   chat's hourly digest matches the language it chose. Defaults to
-//!   English for chats that never set one (the map is per-process, so a
-//!   chat that hasn't issued a language command since the last restart
-//!   falls back to the default).
+//! Hourly stats / workers digest for Telegram and ntfy subscribers, rendered
+//! by the same builders as the read commands. Telegram language comes from
+//! the in-memory map `/deutsch` / `/english` write, so a chat that has not
+//! picked one since the last restart gets the default.
 
 use std::collections::HashMap;
 use std::sync::Arc;

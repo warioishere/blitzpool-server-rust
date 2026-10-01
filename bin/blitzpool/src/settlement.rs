@@ -1,27 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Fan-out of an ext 0x0003/Implementation Notes settlement.
-//!
-//! When a block is booked, every payout distribution the pool has published
-//! becomes stale at once: its weights encode the ledger balances as they stood
-//! BEFORE the booking, so a job-declaring client still declaring against them
-//! would pay those balances a second time. ext 0x0003/Implementation Notes
-//! therefore requires the acceptance window to close on a settlement rather
-//! than expire on its own.
-//!
-//! The registry that has to hear it
-//! ([`bp_stratum_v2::jdp_server::StratumV2JdpServer`]'s) lives on the
-//! `front`; **the booking does not**: the `payout` process applies the
-//! ledger. So a settlement goes two ways, like the membership caches
-//! ([`crate::cache_sync`]): to the local registry if this process has one,
-//! and onto the `cache:invalidate` stream for a registry elsewhere. A
-//! process that is both settles twice, which is harmless: the second epoch
-//! bump invalidates an already-invalid set and the republish coalesces.
-//!
-//! Deliberately NO periodic backstop: "settle again just in case" would
-//! force a republish on a timer forever. A missed event self-heals within
-//! one `[sv2].jdp_payout_distribution_interval_secs` (60 s by default),
-//! since the next publish rebuilds from the post-settlement ledger.
+//! Fan-out of an ext 0x0003/Implementation Notes settlement: after a booking,
+//! every published distribution encodes balances that would pay twice. The
+//! registry is on `front`, the booking on `payout`, so it goes local and onto
+//! `cache:invalidate`. No backstop: the next distribution publish heals a miss.
 
 use std::sync::{Arc, OnceLock};
 
@@ -33,21 +15,14 @@ use redis::aio::ConnectionManager;
 use tracing::{debug, warn};
 
 /// Tells every published payout distribution that a block settled.
-///
-/// Cheap to clone: an `Arc` plus an optionally-present producer that is
-/// itself `Arc`-backed.
 #[derive(Clone)]
 pub(crate) struct SettlementSignal {
     /// Filled by `jdp::spawn`, so only on a `front`. `OnceLock` because the
     /// Stratum sinks and the confirmation watcher are built BEFORE the JDP
     /// server exists.
     local: Arc<OnceLock<DistributionInvalidationHandle>>,
-    /// `None` only without Redis (tests).
-    ///
-    /// ⚠️ It does NOT reach a second front: all fronts share one consumer
-    /// group ([`crate::cache_sync`]), which hands each entry to one
-    /// consumer. The other front keeps its distribution until its next
-    /// publish tick. See `cache_sync::GROUP`.
+    /// `None` only without Redis (tests). ⚠️ Does NOT reach a second front:
+    /// all fronts share one consumer group, see `cache_sync::GROUP`.
     remote: Option<StreamProducer<CacheInvalidation>>,
 }
 

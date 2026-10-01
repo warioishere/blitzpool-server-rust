@@ -44,11 +44,8 @@ pub struct AppState<H: GroupServiceHooks + 'static, M: EmailHooks + 'static> {
     /// doesn't need a third generic param for `BlockpartyHooks`.
     pub blockparty: Option<Arc<dyn BlockpartyApi>>,
     pub tdp: Option<TdpHandle>,
-    /// Age (ms) past which the TDP snapshot's last template/prev-hash is
-    /// reported stale by `/api/health`. Fed from `[tdp]
-    /// staleness_threshold_secs`. Generous by default so a brief
-    /// bitcoin-core restart (auto-reconnect re-attaches) doesn't flip
-    /// health.
+    /// Age (ms) past which `/api/health` reports the TDP snapshot stale.
+    /// Generous by default so a brief bitcoin-core restart does not flip health.
     pub tdp_staleness_threshold_ms: i64,
     pub bitcoin_rpc: Option<Arc<BitcoinRpc>>,
     pub geoip: Option<Arc<GeoIpServiceHandle>>,
@@ -71,10 +68,8 @@ pub struct AppState<H: GroupServiceHooks + 'static, M: EmailHooks + 'static> {
     /// Bitcoin network the pool is mining against. Drives address
     /// parsing inside the per-address block-template handler.
     pub network: bitcoin::Network,
-    /// Pool identifier written into the coinbase scriptsig
-    /// (`pool_identifier` toml). Carried through to the block-template
-    /// preview so the UI's coinbase tile shows the same pool tag the
-    /// real coinbase would carry.
+    /// Pool identifier written into the coinbase scriptsig, so the
+    /// block-template preview shows the same pool tag the real coinbase carries.
     pub pool_identifier: String,
     /// Solo-mode dev fee, exactly as the payout resolver receives it, so
     /// the block-template preview shows a solo miner the fee output its

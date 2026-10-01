@@ -3,11 +3,8 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! Integration tests for `bp-group-solo-engine::round` (state + snapshot)
-//! against docker-Redis.
-//!
-//! Each test uses a distinct Redis logical DB and skips via `eprintln!` if
-//! the URL is unreachable. Group ids are unique per test as well.
+//! Integration tests for `bp-group-solo-engine::round` against Redis; each
+//! test uses its own logical DB and skips when Redis is unreachable.
 
 use bp_group_mgmt::group::PayoutMode;
 use bp_group_solo_engine::round::{
@@ -82,7 +79,6 @@ async fn record_share_writes_all_keys() {
         .expect("ok");
 
     let mut conn = conn;
-    // Round state is the per-address aggregate.
     let total_str: String = conn.get(key_total(group)).await.unwrap();
     assert!((total_str.parse::<f64>().unwrap() - 100.0).abs() < 1e-9);
     let by_addr: f64 = conn
@@ -99,9 +95,7 @@ async fn record_share_writes_all_keys() {
         .parse()
         .unwrap();
     assert_eq!(last_at, 1_700_000_000_000);
-    // `None` share_id, so no dedup marker is written; the marker's scoring
-    // is pinned in `record_share_is_idempotent_per_share_id`. The counter
-    // key is unused and must stay unwritten.
+    // The counter key is unused and must stay unwritten.
     let counter_exists: bool = conn.exists(key_counter(group)).await.unwrap();
     assert!(
         !counter_exists,
@@ -140,8 +134,6 @@ async fn read_by_address_returns_aggregate() {
     let store = GroupRoundStore::new(conn.clone());
     let group = "g_fallback1";
 
-    // record_share maintains the by-address aggregate directly. Two shares
-    // for foo, one for bar.
     store
         .record_share(None, group, "bc1qfoo", 30.0, 1700)
         .await
@@ -171,8 +163,7 @@ async fn reset_for_block_found_preserves_last_accepted_share_at() {
     let store = GroupRoundStore::new(conn.clone());
     let group = "g_reset_blockfound";
 
-    // Use a share_id so the dedup zset (`key_applied`) gets populated; the
-    // reset must keep it (asserted below).
+    // A share_id populates the dedup zset, which the reset must keep.
     store
         .record_share(Some("ep1:0"), group, "bc1qfoo", 50.0, 1_700_000_000_001)
         .await
@@ -203,10 +194,8 @@ async fn reset_for_block_found_preserves_last_accepted_share_at() {
         last_at_exists,
         "last-accepted-share-at preserved across block-found reset"
     );
-    // MONEY: the dedup set must OUTLIVE the reset. The satellite ACKs a
-    // batch only after dispatching it; if a reset lands in that gap, a
-    // redelivery without markers would credit work from the wiped round a
-    // second time, into a fresh round it can dominate.
+    // MONEY: without the markers, a batch redelivered after the reset would
+    // credit the wiped round's work a second time into the fresh round.
     assert!(
         applied_exists,
         "the dedup zset must survive a round reset, or an un-ACKed satellite \
@@ -241,9 +230,7 @@ async fn reset_full_wipes_everything_including_last_accepted() {
     let applied_exists: bool = conn.exists(key_applied(group)).await.unwrap();
     assert!(!last_at_exists, "last-accepted-share-at wiped");
     assert!(!rejected_exists, "rejected-shares wiped");
-    // Even a full (calendar) reset keeps the dedup set: it discards the
-    // round's work deliberately, and reapplying an un-ACKed batch into the
-    // fresh round would hand those miners an unearned start.
+    // Reapplying an un-ACKed batch would hand those miners an unearned start.
     assert!(
         applied_exists,
         "the dedup zset must survive a full reset too"
@@ -489,9 +476,6 @@ async fn multiple_groups_redis_state_is_isolated() {
 }
 
 // ── Test 12 — record_share is idempotent per share_id ───────────────
-//
-// A redelivered share (same share_id) is a no-op against the round, while
-// distinct ids accumulate normally (RECORD_SHARE_LUA's dedup path).
 #[tokio::test]
 async fn record_share_is_idempotent_per_share_id() {
     let conn = match connect_or_skip(11).await {
@@ -520,7 +504,6 @@ async fn record_share_is_idempotent_per_share_id() {
         .expect("ok");
     assert!(applied2, "a fresh share_id must append");
 
-    // The round counted exactly two shares (200), not three.
     let mut conn = conn;
     let applied_card: u64 = conn.zcard(key_applied(group)).await.unwrap();
     assert_eq!(
@@ -547,8 +530,7 @@ async fn record_share_is_idempotent_per_share_id() {
         "by-address must also exclude the dup"
     );
 
-    // The marker is scored by the SHARE'S OWN accept time, which stays
-    // monotonic across resets and so lets the set outlive a round reset.
+    // Scored by the share's own accept time, so the set can outlive a reset.
     let score: f64 = conn
         .zscore(key_applied(group), "ep1:0")
         .await
@@ -557,12 +539,8 @@ async fn record_share_is_idempotent_per_share_id() {
 }
 
 // ── The dedup marker must outlive a round reset ────────────────────
-//
-// MONEY. The satellite ACKs a batch only after dispatching it to the sinks.
-// A share redelivered after a reset in that gap (unclean restart, failed
-// ack) must still be deduped, or work from the wiped round is credited a
-// second time into a fresh round it can dominate. Same contract as PPLNS's
-// never-reset `pplns:applied`.
+// MONEY: a share redelivered after a reset must still be deduped, or the
+// wiped round's work is credited again into the fresh round.
 
 #[tokio::test]
 async fn a_redelivered_share_is_still_deduped_across_a_round_reset() {
@@ -592,8 +570,6 @@ async fn a_redelivered_share_is_still_deduped_across_a_round_reset() {
     );
 
     let mut conn = conn;
-    // The fresh round must be untouched by the replay — not carrying the
-    // previous round's work.
     let total_exists: bool = conn.exists(key_total(group)).await.unwrap();
     assert!(
         !total_exists,
@@ -605,8 +581,6 @@ async fn a_redelivered_share_is_still_deduped_across_a_round_reset() {
         "nor its by-address aggregate — that is the double credit"
     );
 
-    // And the same holds for the calendar reset, which discards a round's
-    // work deliberately.
     store.reset_full(group).await.unwrap();
     assert!(
         !store
@@ -634,11 +608,6 @@ async fn a_redelivered_share_is_still_deduped_across_a_round_reset() {
 }
 
 // ── Test 13 — windowed record aggregates into time buckets ──────────
-//
-// `record_share_windowed` aggregates per (time-bucket, address) and keeps the
-// `window:by-address` aggregate + the `wbuckets` index lock-step. Two shares
-// for the same address in the same hour bucket sum; a share in a later bucket
-// registers a second bucket id.
 #[tokio::test]
 async fn windowed_record_aggregates_into_buckets() {
     let conn = match connect_or_skip(12).await {
@@ -666,9 +635,7 @@ async fn windowed_record_aggregates_into_buckets() {
     assert!((agg["bc1qfoo"] - 50.0).abs() < 1e-9, "foo summed in-bucket");
     assert!((agg["bc1qbar"] - 70.0).abs() < 1e-9);
 
-    // The windowed record also stamps `last-accepted-share-at` on every
-    // accepted share (the member-list view reads it, so active miners do not
-    // show as "never mined"). It holds each address's MOST RECENT timestamp.
+    // The member list reads `last-accepted-share-at`, so window mode stamps it too.
     let foo_last = store
         .read_last_accepted_share_at(group, "bc1qfoo")
         .await
@@ -684,13 +651,10 @@ async fn windowed_record_aggregates_into_buckets() {
         .unwrap();
     assert_eq!(bar_last, Some(102 * bkt));
 
-    // Two distinct time buckets registered in the index zset.
     let mut conn = conn;
     let buckets: Vec<i64> = conn.zrange(key_window_buckets(group), 0, -1).await.unwrap();
     assert_eq!(buckets, vec![100, 102], "FIFO-ordered bucket ids");
 
-    // Window-timeline read: per-bucket per-address diffs, oldest→newest (feeds
-    // the sliding-window chart). A 30-bucket window keeps both buckets here.
     let timeline = store
         .read_window_timeline(group, 102 * bkt, 30 * bkt)
         .await
@@ -702,15 +666,8 @@ async fn windowed_record_aggregates_into_buckets() {
     assert!((timeline[1].1["bc1qbar"] - 70.0).abs() < 1e-9);
 }
 
-// ── Test 14 — trim_window drops aged-out buckets ────────────────────
-//
-// Buckets older than `window_ms` relative to `now_ms` are dropped, and the
-// `window:by-address` aggregate is decremented by exactly the dropped bucket's
-// per-address contribution (hDel-ing addresses that hit zero).
-/// MONEY. A trim that decrements an address below zero (a bucket ahead of
-/// the aggregate, which the per-key Redis backup can restore) must remove
-/// the field, as the PPLNS trim does. A negative value would swallow the
-/// address's next shares: work in the window the payout never sees.
+/// MONEY: a trim that drives an address below zero must remove the field;
+/// a negative value would swallow the address's next shares.
 #[tokio::test]
 async fn windowed_trim_does_not_strand_a_negative_entry() {
     let conn = match connect_or_skip(21).await {
@@ -728,8 +685,7 @@ async fn windowed_trim_does_not_strand_a_negative_entry() {
         .record_share_windowed(None, group, "bc1qfresh", 60.0, 5 * bkt)
         .await
         .unwrap();
-    // Forge the restore skew: the aggregate holds LESS for bc1qold than
-    // its bucket does.
+    // Forge a restore skew: the aggregate holds less than the bucket.
     let mut conn = conn;
     let _: () = conn
         .hset(key_window_by_address(group), "bc1qold", "10")
@@ -750,8 +706,6 @@ async fn windowed_trim_does_not_strand_a_negative_entry() {
         raw.is_none(),
         "the underflowed entry must be removed, found {raw:?}"
     );
-    // The address mines on, and that work must count in full, not first
-    // pay off a phantom -30.
     store
         .record_share_windowed(None, group, "bc1qold", 20.0, 5 * bkt)
         .await
@@ -787,14 +741,13 @@ async fn windowed_trim_drops_aged_buckets() {
         .unwrap();
     assert_eq!(store.read_window_by_address(group).await.unwrap().len(), 2);
 
-    // now = bucket 5, window = 2 buckets → cutoff bucket 3 → drop bucket 0.
+    // now = bucket 5, window = 2 buckets → drop bucket 0.
     store.trim_window(group, 5 * bkt, 2 * bkt).await.unwrap();
 
     let after = store.read_window_by_address(group).await.unwrap();
     assert!(!after.contains_key("bc1qold"), "aged-out addr dropped");
     assert!((after["bc1qfresh"] - 60.0).abs() < 1e-9, "fresh addr kept");
 
-    // The old bucket's hash + index entry are gone; only bucket 5 remains.
     let mut conn = conn;
     let buckets: Vec<i64> = conn.zrange(key_window_buckets(group), 0, -1).await.unwrap();
     assert_eq!(buckets, vec![5]);
@@ -803,10 +756,6 @@ async fn windowed_trim_drops_aged_buckets() {
 }
 
 // ── Test 15 — read_payout_shares(Window) trims on read (idle group) ─
-//
-// The dispatcher trims before reading, so even a group that went idle after
-// recording sees a current window at payout-build time. PROP mode reads the
-// independent per-round aggregate; the branch picks the right keyspace.
 #[tokio::test]
 async fn read_payout_shares_window_trims_on_read() {
     let conn = match connect_or_skip(14).await {
@@ -831,7 +780,6 @@ async fn read_payout_shares_window_trims_on_read() {
         .await
         .unwrap();
 
-    // Window read at now=bucket 10, window=2 buckets → stale bucket 0 trimmed.
     let win = store
         .read_payout_shares(group, PayoutMode::Window, 10 * bkt, 2 * bkt)
         .await
@@ -846,7 +794,6 @@ async fn read_payout_shares_window_trims_on_read() {
         "window read ignores PROP keyspace"
     );
 
-    // PROP read of the same group returns only the PROP aggregate.
     let prop = store
         .read_payout_shares(group, PayoutMode::Prop, 10 * bkt, 2 * bkt)
         .await
@@ -859,9 +806,6 @@ async fn read_payout_shares_window_trims_on_read() {
 }
 
 // ── Test 16 — windowed record is idempotent per share_id ────────────
-//
-// Same exactly-once contract as the PROP path: a redelivered windowed share
-// (same share_id) is a no-op against the window aggregate.
 #[tokio::test]
 async fn windowed_record_is_idempotent_per_share_id() {
     let conn = match connect_or_skip(15).await {
@@ -893,8 +837,6 @@ async fn windowed_record_is_idempotent_per_share_id() {
         "window aggregate counts the share once, not twice"
     );
 
-    // reset_full (the dissolve / scheduled-wipe path) clears the dynamic
-    // window keyspace too via delete_window_keys.
     store.reset_full(group).await.unwrap();
     assert!(
         store
@@ -910,11 +852,8 @@ async fn windowed_record_is_idempotent_per_share_id() {
 }
 
 // ── Test 18 — a windowed reject lands in its bucket, not in the tally ─
-//
-// The reject lane has the same bucket / index / aggregate shape as the
-// accepted lane. The PROP running tally (`rejected-shares`) must stay
-// untouched: that tally never shrinks, so against a windowed denominator it
-// would not be a rate of anything.
+// The PROP tally never shrinks, so against a windowed denominator it would
+// not be a rate of anything.
 #[tokio::test]
 async fn windowed_reject_lands_in_its_bucket_and_window_aggregate() {
     let conn = match connect_or_skip(17).await {
@@ -1033,11 +972,7 @@ async fn windowed_trim_and_reset_cover_the_reject_lane() {
 }
 
 // ── Test 20 — round stats: Window reads the windowed rejects, PROP the tally ─
-//
-// Both directions in one test, so it cannot pass on a precondition that
-// silently did not hold: the PROP tally carries 999, the reject lane carries
-// 5 fresh + 4 aged-out. A Window read must answer 5 (trimmed on read, tally
-// ignored); a PROP read of the same group must answer 999 (lane ignored).
+// Tally 999, lane 5 fresh + 4 aged: Window must answer 5 and PROP 999.
 #[tokio::test]
 async fn round_stats_window_reads_the_reject_lane_not_the_running_tally() {
     let conn = match connect_or_skip(19).await {
@@ -1085,11 +1020,8 @@ async fn round_stats_window_reads_the_reject_lane_not_the_running_tally() {
 }
 
 // ── Test 21 — forget_member is mode-aware: a kick leaves the window too ─
-//
-// Both directions: a PROP forget touches only the round keys (the window
-// lanes keep the address), a Window forget removes the address from every
-// live bucket of both lanes plus the aggregates and returns the window
-// contribution, since `window:by-address` is the coinbase source.
+// PROP forget leaves the window lanes alone; Window forget clears every
+// bucket of both lanes, since `window:by-address` is the coinbase source.
 #[tokio::test]
 async fn forget_member_window_removes_the_address_from_both_lanes() {
     let conn = match connect_or_skip(20).await {
@@ -1181,8 +1113,7 @@ async fn forget_member_window_removes_the_address_from_both_lanes() {
         .await
         .unwrap();
     assert!(!last_at_has_a, "inactivity clock slot deleted");
-    // The other member's bucket entries survive; a later trim of bucket 5
-    // still finds bc1qb there and nothing for bc1qa.
+    // The other member's bucket entries survive.
     let b_in_5: bool = conn
         .hexists(WindowLane::Accepted.bucket_key(group, 5), "bc1qb")
         .await

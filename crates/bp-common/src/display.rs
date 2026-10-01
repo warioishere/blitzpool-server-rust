@@ -1,17 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! How an identity is shortened for display.
-//!
-//! One rule: the first four characters, `...`, the last five. The pool API
-//! (group member labels), the notification bot and the UI all show an identity
-//! this way; on the Rust side this is the only implementation.
-//!
-//! The UI's twin is `formatBtcAddress` in blitzpool-ui
-//! (`src/app/shared/address-format.ts`). TypeScript cannot call this, so the
-//! two are pinned to the same test vectors instead: change both or neither.
-//!
-//! The rule does not look at what it shortens, on purpose. Every identity is
-//! cut the same way, so none shows more of itself than another.
+//! The one Rust implementation of shortening an identity for display. Its UI twin
+//! `formatBtcAddress` (blitzpool-ui) shares the test vectors: change both or neither.
+//! It deliberately ignores what it shortens, so no identity shows more of itself.
 
 /// First 4 + `...` + last 5, trimmed; unchanged when too short to shorten.
 pub fn short_address(address: &str) -> String {
@@ -35,8 +26,7 @@ pub fn short_address_with_tail(address: &str, tail: usize) -> String {
 mod tests {
     use super::*;
 
-    /// The shared vectors. blitzpool-ui's `address-format.spec.ts` asserts the
-    /// same inputs and outputs for `formatBtcAddress`.
+    /// The vectors shared with blitzpool-ui's `address-format.spec.ts`.
     #[test]
     fn short_address_matches_the_shared_vectors() {
         for (input, want) in [

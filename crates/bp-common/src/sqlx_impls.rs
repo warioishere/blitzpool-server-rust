@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `sqlx::Type` / `Decode` / `Encode` for Postgres on `Sats` / `AddressId` /
-//! `MiningMode`. Gated behind the `sqlx` Cargo feature.
-//!
-//! Lives in `bp-common` (not `bp-db`) to satisfy the Rust orphan rule —
-//! you can only `impl ForeignTrait for ForeignType` from the crate that
-//! owns the type.
+//! Postgres `sqlx` impls for the primitive types, here rather than in `bp-db`
+//! because of the orphan rule.
 
 use std::str::FromStr;
 

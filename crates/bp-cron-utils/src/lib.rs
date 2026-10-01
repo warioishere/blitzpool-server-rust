@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Cron-flavoured time-source + scheduling utilities shared across
-//! the pool-service engines.
-//!
-//! - [`Clock`] + [`SystemClock`] + [`TestClock`] — `chrono::DateTime<Utc>`-based
-//!   time source. `TestClock` is `Arc<Mutex<DateTime>>`-backed so
-//!   tests can step time deterministically.
-//! - [`next_3am_utc`] — chrono-based next-occurrence math with
-//!   strictly-greater-than semantics (at exactly 03:00:00 returns
-//!   *tomorrow's* tick — prevents loop-re-fire on clock jitter).
-//! - [`BlockHeightGen`] — strict-monotonic generator producing
-//!   synthetic negative-unix-seconds blockHeight values for sweep /
-//!   audit rows whose `(blockHeight, …)` UNIQUE index must not
-//!   collide on sub-second re-triggers.
+//! Time source ([`Clock`], steppable [`TestClock`]) and scheduling helpers
+//! shared by the cron-driven engines.
 
 use std::sync::{Arc, Mutex};
 
@@ -20,10 +9,8 @@ use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, 
 
 // ── Clock abstraction ──────────────────────────────────────────────
 
-/// Time source returning `chrono::DateTime<Utc>`. Distinct from
-/// `bp-vardiff::Clock` which works in epoch-ms `u64` — the cron path
-/// needs date-time math for calendar-aligned scheduling so it gets a
-/// richer return type.
+/// Time source returning `chrono::DateTime<Utc>`, unlike the epoch-ms
+/// `bp-vardiff::Clock`, because cron scheduling is calendar-aligned.
 pub trait Clock: Send + Sync + 'static {
     fn now(&self) -> DateTime<Utc>;
 }
@@ -37,8 +24,7 @@ impl Clock for SystemClock {
     }
 }
 
-/// Test clock — set + advance manually. Cloneable so multiple
-/// handles share one inner mutex.
+/// Manually stepped clock; clones share one time.
 #[derive(Clone)]
 pub struct TestClock {
     now: Arc<Mutex<DateTime<Utc>>>,
@@ -69,9 +55,8 @@ impl Clock for TestClock {
 
 // ── next_3am_utc ───────────────────────────────────────────────────
 
-/// The next 03:00 UTC strictly after `now`. If `now` is already past
-/// today's 03:00 UTC (or exactly at it), returns tomorrow's. Always
-/// emits exactly 03:00:00 UTC.
+/// The next 03:00 UTC strictly after `now`; at exactly 03:00 it returns
+/// tomorrow's, so a loop cannot re-fire on clock jitter.
 pub fn next_3am_utc(now: DateTime<Utc>) -> DateTime<Utc> {
     let today = NaiveDate::from_ymd_opt(now.year(), now.month(), now.day())
         .expect("naive-date from valid year/month/day");
@@ -86,15 +71,10 @@ pub fn next_3am_utc(now: DateTime<Utc>) -> DateTime<Utc> {
 
 // ── BlockHeightGen ─────────────────────────────────────────────────
 
-/// Strict-monotonic generator for synthetic negative `blockHeight`
-/// values used by audit rows (e.g. dust-sweep records).
-///
-/// Sweep audit rows live in the same history tables as real block
-/// payouts and share the same `(blockHeight, …)` UNIQUE index. To
-/// avoid collisions with real heights AND with prior sweep rows for
-/// the same address, the generator emits `-(unix_seconds)` adjusted
-/// downward by 1 on sub-second re-triggers so each call produces a
-/// strictly-earlier negative value.
+/// Strictly decreasing synthetic negative `blockHeight` (`-(unix_seconds)`)
+/// for audit rows such as dust sweeps. They share the history tables'
+/// `(blockHeight, …)` UNIQUE index, so they must collide neither with real
+/// heights nor with each other on sub-second re-triggers.
 #[derive(Debug, Default)]
 pub struct BlockHeightGen {
     last: Mutex<Option<i32>>,
@@ -105,9 +85,8 @@ impl BlockHeightGen {
         Self::default()
     }
 
-    /// Produce the next synthetic `blockHeight`. `now` carries the
-    /// current wall-clock; sub-second re-calls step back from the
-    /// previous value to stay unique.
+    /// Next synthetic `blockHeight`; a re-call within the same second steps
+    /// back from the previous value to stay unique.
     pub fn next(&self, now: DateTime<Utc>) -> i32 {
         let candidate = -(now.timestamp() as i32);
         let mut last = self.last.lock().expect("block-height-gen poisoned");

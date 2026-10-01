@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! The one consume loop every [`StreamConsumer`] runs.
-//!
-//! Every Core→back consumer (accepted shares, block-found, device-status,
-//! rejected, cache invalidation) runs the same skeleton: ensure the consumer
-//! group, replay the delivered-but-unacked backlog, then drain new entries
-//! until cancelled — acking each batch after dispatch. Each consumer only
-//! supplies its per-entry action ([`StreamEntryHandler`]) plus a little config.
+//! The one consume loop every [`StreamConsumer`] runs: ensure the group,
+//! replay the unacked backlog, then drain new entries until cancelled. Each
+//! consumer supplies only a [`StreamEntryHandler`] and a little config.
 
 use std::time::Duration;
 
@@ -22,25 +18,19 @@ use crate::{Consumed, StreamConsumer, StreamError};
 /// their offset either way (`ensure_*` is idempotent on `BUSYGROUP`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnsureMode {
-    /// From id `0` — replay the whole stream history on first creation. For
-    /// **idempotent** consumers (ledger apply guarded by PG `UNIQUE`; reject
-    /// counters that tolerate a rare double-count).
+    /// From id `0`, replaying history: only for idempotent consumers.
     FromZero,
-    /// From the tail (`$`) — only entries added after group creation. For
-    /// **non-idempotent** consumers (notifications) so a first start doesn't
+    /// From the tail (`$`): for notifications, so a first start does not
     /// re-fire a push for every historical event.
     FromTail,
 }
 
-/// Tuning + labelling for the consume loop. `block_ms` (read-block) and
-/// `error_backoff` are the same across every event consumer; only `batch` +
-/// `label` differ, so [`Self::new`] fills the shared cadence.
+/// Tuning and labelling for the consume loop.
 #[derive(Debug, Clone, Copy)]
 pub struct ConsumerLoopConfig {
     /// Max entries pulled per read.
     pub batch: usize,
-    /// How long `read_new` blocks for at least one entry before looping back to
-    /// re-check the cancel signal.
+    /// Read block before re-checking the cancel signal.
     pub block_ms: usize,
     /// Back-off after a transient stream error before retrying.
     pub error_backoff: Duration,
@@ -49,8 +39,7 @@ pub struct ConsumerLoopConfig {
 }
 
 impl ConsumerLoopConfig {
-    /// Shared cadence: 1s read-block, 500ms error back-off. Only `batch` +
-    /// `label` are per-consumer.
+    /// Shared cadence; only `batch` and `label` are per consumer.
     pub fn new(batch: usize, label: &'static str) -> Self {
         Self {
             batch,
@@ -61,20 +50,14 @@ impl ConsumerLoopConfig {
     }
 }
 
-/// Per-entry action a consumer runs against each reconstructed value. The driver
-/// owns the batch read, id collection, `XACK`, and logging; a handler only
-/// decides what one entry *does* (fan out to sinks, apply the ledger, fire a
-/// notification). `&self` so it can hold shared deps (sinks / applier /
-/// dispatcher) without cloning them per entry.
+/// What one entry does; the driver owns reading, acking and logging.
 #[async_trait]
 pub trait StreamEntryHandler<T>: Send + Sync {
     async fn handle(&self, value: T);
 }
 
 impl<T: DeserializeOwned + Send + 'static> StreamConsumer<T> {
-    /// Spawn the standard consume loop and return its handle. Ensures the group
-    /// at `ensure`, replays the pending backlog, then drains new entries until
-    /// the handle is shut down.
+    /// Spawns [`StreamConsumer::run`].
     pub fn spawn<H>(
         self,
         ensure: EnsureMode,
@@ -89,8 +72,7 @@ impl<T: DeserializeOwned + Send + 'static> StreamConsumer<T> {
         StreamConsumerHandle::new(vec![task], cancel, config.label)
     }
 
-    /// The consume loop itself (spawned by [`Self::spawn`]; `pub` so tests can
-    /// drive it directly). Returns when `cancel` fires.
+    /// The consume loop; returns when `cancel` fires.
     pub async fn run<H>(
         self,
         ensure: EnsureMode,
@@ -109,11 +91,9 @@ impl<T: DeserializeOwned + Send + 'static> StreamConsumer<T> {
             return;
         }
 
-        // Resume: replay the delivered-but-unacked backlog before new entries.
-        // Any error ends the replay rather than retrying it: `drain_pending`
-        // re-reads from `0`, so retrying after a failed ack would hand the same
-        // entries to the handler again, as fast as Redis answers. What is left
-        // stays in the PEL and replays on the next start.
+        // An error ends the replay instead of retrying: `drain_pending` re-reads
+        // from `0`, so a retry after a failed ack would re-handle the same
+        // entries as fast as Redis answers. The rest replays on the next start.
         loop {
             match self.drain_pending(&handler, config.batch).await {
                 Ok(0) => break,
@@ -147,9 +127,8 @@ impl<T: DeserializeOwned + Send + 'static> StreamConsumer<T> {
         info!(label = config.label, "stream-consumer: stopped");
     }
 
-    /// Drain one batch of **new** entries: read up to `count` (blocking up to
-    /// `block_ms`), hand each to the handler in stream order, then `XACK`.
-    /// Returns the number of entries handled (`0` on timeout).
+    /// Handles and acks one batch of new entries; returns how many (`0` on
+    /// timeout).
     pub async fn drain_new<H>(
         &self,
         handler: &H,
@@ -165,14 +144,9 @@ impl<T: DeserializeOwned + Send + 'static> StreamConsumer<T> {
         Ok(n)
     }
 
-    /// Drain one batch of this consumer's **pending** (delivered-but-unacked)
-    /// entries — the restart-resume path. Same dispatch + ack as
-    /// [`Self::drain_new`].
-    ///
-    /// Returns the RAW entry count seen (handled + dead-lettered), NOT the
-    /// number handled. The resume loop drains until this is `0` (PEL empty);
-    /// the handled count would let an all-poison batch report `0` and end the
-    /// replay with good entries still queued behind the poison.
+    /// [`Self::drain_new`] for the pending backlog. Returns the raw count
+    /// (handled + dead-lettered), so an all-poison batch does not end the
+    /// replay with good entries still queued behind it.
     pub async fn drain_pending<H>(&self, handler: &H, count: usize) -> Result<usize, StreamError>
     where
         H: StreamEntryHandler<T>,
@@ -182,11 +156,9 @@ impl<T: DeserializeOwned + Send + 'static> StreamConsumer<T> {
         Ok(raw)
     }
 
-    /// Hand each entry to the handler in stream order, then `XACK` the whole
-    /// batch. Acking *after* dispatch is safe across a crash: every consumer is
-    /// idempotent (money sinks dedup on `share_id`, ledger via PG `UNIQUE`,
-    /// counters tolerate a dup, a re-sent notification is cosmetic), so a
-    /// redelivery is harmless.
+    /// Acks only after dispatch: a crash redelivers, which every consumer
+    /// tolerates (money sinks dedup on `share_id`, the ledger on PG `UNIQUE`,
+    /// counters accept a dup, a repeated notification is cosmetic).
     async fn dispatch_and_ack<H>(
         &self,
         handler: &H,
@@ -208,11 +180,8 @@ impl<T: DeserializeOwned + Send + 'static> StreamConsumer<T> {
     }
 }
 
-/// Live consumer task(s) + their shared cancel token. One shape for both the
-/// single-task consumers ([`StreamConsumer::spawn`]) and the accepted-share
-/// consumer's two durability-class groups (built via [`Self::new`] with two
-/// tasks, each driving [`StreamConsumer::run`]). [`Self::shutdown`] cancels
-/// and joins them as part of graceful shutdown.
+/// Consumer task(s) sharing one cancel token: one for
+/// [`StreamConsumer::spawn`], two for the accepted-share consumer groups.
 pub struct StreamConsumerHandle {
     tasks: Vec<JoinHandle<()>>,
     cancel: CancellationToken,
@@ -220,9 +189,7 @@ pub struct StreamConsumerHandle {
 }
 
 impl StreamConsumerHandle {
-    /// Bundle already-spawned task(s) sharing `cancel`. Used by
-    /// [`StreamConsumer::spawn`] (one task) and the accepted-share consumer
-    /// (two tasks, one per consumer group).
+    /// Bundles already-spawned task(s) sharing `cancel`.
     pub fn new(tasks: Vec<JoinHandle<()>>, cancel: CancellationToken, label: &'static str) -> Self {
         Self {
             tasks,
@@ -244,11 +211,8 @@ impl StreamConsumerHandle {
 
 #[cfg(test)]
 mod tests {
-    //! Integration tests against a local docker-Redis at
-    //! `redis://127.0.0.1:16379` (override with `BP_REDIS_URL`). Each test uses
-    //! a distinct logical DB + stream key and skips cleanly if Redis isn't
-    //! reachable. They pin the consume loop itself (ordering, pending-backlog
-    //! replay, tail-start, clean cancel).
+    //! Consume-loop tests against Redis (`BP_REDIS_URL`); each test uses its
+    //! own logical DB and skips if Redis is unreachable.
     #![allow(clippy::print_stderr)]
 
     use std::sync::Arc;
@@ -280,9 +244,7 @@ mod tests {
     }
 
     async fn connect_or_skip(db: u8) -> Option<ConnectionManager> {
-        // Fold this binary's local number into its own DB range —
-        // see `bp_test_support::redis_db`. Two binaries both using
-        // 0..15 flush each other mid-run.
+        // This binary's own DB range, so other test binaries do not flush it.
         let db =
             bp_test_support::redis_db_in_range(bp_test_support::redis_db::SHARE_STREAM, db).await;
         let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
@@ -323,8 +285,7 @@ mod tests {
         StreamProducer::new(conn, key)
     }
 
-    /// The driver ensures its group, drains entries in stream order through the
-    /// handler, acks them (nothing left pending), and stops cleanly on cancel.
+    /// Entries are handled in stream order and acked; the loop stops on cancel.
     #[tokio::test]
     async fn run_consumes_in_order_acks_and_stops_on_cancel() {
         let Some(conn) = connect_or_skip(6).await else {
@@ -364,9 +325,7 @@ mod tests {
         task.await.expect("loop task joins after cancel");
     }
 
-    /// A delivered-but-unacked backlog (a prior consumer that read but never
-    /// acked — e.g. crashed mid-apply) is replayed through the handler on
-    /// restart, before new entries.
+    /// An unacked backlog is replayed on restart.
     #[tokio::test]
     async fn run_replays_pending_backlog_on_restart() {
         let Some(conn) = connect_or_skip(7).await else {
@@ -400,9 +359,7 @@ mod tests {
         task.await.expect("join");
     }
 
-    /// `FromTail` on a stream with pre-existing history must NOT replay it — a
-    /// first start of a non-idempotent (notify) consumer only sees entries added
-    /// after the group was created.
+    /// `FromTail` skips history that predates the group.
     #[tokio::test]
     async fn run_from_tail_skips_history() {
         let Some(conn) = connect_or_skip(3).await else {
@@ -423,8 +380,7 @@ mod tests {
             RecordingHandler { seen: seen.clone() },
         ));
 
-        // Give the loop a moment to create the group at the tail, then publish a
-        // fresh entry that SHOULD be seen.
+        // Let the loop create the group before publishing.
         tokio::time::sleep(Duration::from_millis(300)).await;
         prod.publish(&Evt { n: 200 }).await.expect("publish new");
 
@@ -441,9 +397,7 @@ mod tests {
         task.await.expect("join");
     }
 
-    /// A single undecodable (poison) entry between two good ones must NOT drop
-    /// the whole batch: the good entries still process, and the poison entry is
-    /// dead-lettered (acked, gone from the PEL) rather than lingering.
+    /// A poison entry is dead-lettered while the good ones around it are handled.
     #[tokio::test]
     async fn run_dead_letters_poison_entry_and_keeps_good() {
         let Some(conn) = connect_or_skip(4).await else {

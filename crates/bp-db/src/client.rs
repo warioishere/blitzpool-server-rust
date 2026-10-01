@@ -1,23 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Client sessions + per-share statistics tables (hot-path).
-//!
-//! - `client_entity` — active mining sessions (composite PK address+clientName+sessionId, soft-deleted)
-//! - `client_statistics_entity` — per-share counters, time-slotted (UNIQUE address+clientName+sessionId+time)
-//! - `client_difficulty_statistics_entity` — per-10-min max-difficulty (UNIQUE address+clientName+slotTime)
-//! - `client_rejected_statistics_entity` — per-reject reason counters (UNIQUE address+time+reason)
-//! - `worker_shares_entity` — cumulative per-worker counts (composite PK address+clientName)
+//! Client sessions (`client_entity`, soft-deleted) and the per-share
+//! statistics tables on the hot path.
 
 use bp_common::AddressId;
 use sqlx::{postgres::PgPool, FromRow};
 
 use crate::DbError;
 
-/// The birth half of a session. The live half (`hashRate`,
-/// `currentDifficulty`, `channelCount`, per-session `bestDifficulty`,
-/// last-seen) lives in the `client:live:*` Redis hashes — consumers
-/// compose it via `bp_client_live::live_fields_for_sessions`, keyed by
-/// the same `(address, client_name, session_id)` triple.
+/// The birth half of a session. The live half (hashrate, difficulty,
+/// last-seen) is in the `client:live:*` Redis hashes, joined on the same
+/// triple via `bp_client_live::live_fields_for_sessions`.
 #[derive(Clone, Debug, FromRow)]
 pub struct ClientRow {
     pub address: AddressId,
@@ -68,8 +61,7 @@ pub async fn find_client(
     .map_err(DbError::from)
 }
 
-/// All active (non-soft-deleted) client sessions for an address. Used
-/// by `/stats` to enumerate workers + sum hashrate per address.
+/// All active (non-soft-deleted) client sessions for an address.
 pub async fn find_clients_by_address(
     pool: &PgPool,
     address: &AddressId,
@@ -92,12 +84,9 @@ pub async fn find_clients_by_address(
     .map_err(DbError::from)
 }
 
-/// Every **active** session's `(userAgent, key triple)` — the PG half
-/// of the `/api/info` `userAgents` aggregation; the numbers come from
-/// the `client:live:*` hashes via
-/// `bp_client_live::aggregate_by_user_agent`. The `deletedAt IS NULL`
-/// filter keeps an idle pool from emitting a ghost
-/// `{userAgent: null, count: 0}` entry.
+/// Every active session's key and user agent: the PG half of the
+/// `/api/info` `userAgents` aggregation. Filtering on `deletedAt IS NULL`
+/// keeps an idle pool from emitting a ghost `{userAgent: null}` entry.
 pub async fn find_active_session_keys(pool: &PgPool) -> Result<Vec<ClientRow>, DbError> {
     sqlx::query_as!(
         ClientRow,
@@ -115,13 +104,9 @@ pub async fn find_active_session_keys(pool: &PgPool) -> Result<Vec<ClientRow>, D
     .map_err(DbError::from)
 }
 
-/// Active session rows for an address list — the PG half of
-/// `/api/pplns`'s `userAgents` aggregation and of the group roster's
-/// per-member session stats.
-///
-/// Filtered on `deletedAt IS NULL`: the numbers come from the live hashes,
-/// which a retired session no longer has, so counting its row would put a
-/// session count next to hashrate from a different population.
+/// Active session rows for an address list. Only active rows: the numbers
+/// come from the live hashes, which a retired session no longer has, so
+/// counting it would mix two populations.
 pub async fn find_active_sessions_for_addresses(
     pool: &PgPool,
     addresses: &[String],
@@ -147,15 +132,9 @@ pub async fn find_active_sessions_for_addresses(
 }
 
 // ── Time-range readers ───────────────────────────────────────────────
-//
-// Consumed by `bp-api`'s chart / accepted / workers / rejected
-// endpoints. Each returns the raw rows filtered to `time >= since_ms`;
-// the API layer does slot-bucket aggregation in-memory because the
-// right bucket size + format is endpoint-specific.
+// Raw rows only: bucketing is endpoint-specific, so the API layer does it.
 
-/// Pool-wide `client_statistics_entity` rows from `since_ms` onward,
-/// ordered by `time ASC`. Drives `/api/info/chart` (pool hashrate),
-/// `/api/info/workers` (worker + session counts).
+/// Pool-wide `client_statistics_entity` rows from `since_ms` on, by time.
 pub async fn find_client_statistics_since(
     pool: &PgPool,
     since_ms: i64,
@@ -195,10 +174,8 @@ pub async fn find_client_statistics_since(
     .map_err(DbError::from)
 }
 
-/// Minimal projection for `/api/info/workers`: only the slot time + identity
-/// columns needed to count DISTINCT addresses / (address, worker) per slot.
-/// Three columns instead of the full stats row keep the payload small, and
-/// there's no `ORDER BY` (the caller buckets into a map) so PG skips a sort.
+/// Minimal projection for counting distinct workers per slot; unordered
+/// because the caller buckets into a map, so PG skips a sort.
 #[derive(Clone, Debug, FromRow)]
 pub struct PoolWorkerRow {
     pub time: i64,
@@ -226,9 +203,7 @@ where
     .map_err(DbError::from)
 }
 
-/// Same as [`find_client_statistics_since`] but restricted to one
-/// address. Drives `/api/client/:address/chart`, `/api/client/:address/
-/// workers`, `/api/client/:address/accepted`.
+/// [`find_client_statistics_since`] for one address.
 pub async fn find_client_statistics_since_for_address(
     pool: &PgPool,
     address: &AddressId,
@@ -270,10 +245,8 @@ pub async fn find_client_statistics_since_for_address(
     .map_err(DbError::from)
 }
 
-/// The highest share difficulty per slot over `addresses`, from `since_ms`
-/// on: one `(time, max)` pair per slot any of them has a row in. Drives
-/// `/api/pplns/groups/:id/max-difficulty` — one query for every member
-/// instead of one per member.
+/// Highest share difficulty per slot across `addresses` from `since_ms` on,
+/// in one query rather than one per member.
 pub async fn find_max_difficulty_since_for_addresses<'e, E>(
     executor: E,
     addresses: &[AddressId],
@@ -300,9 +273,7 @@ where
         .collect())
 }
 
-/// `client_rejected_statistics_entity` rows for one address from
-/// `since_ms` onward. Drives `/api/client/:address/rejected` (per-
-/// reason aggregation done in bp-api).
+/// `client_rejected_statistics_entity` rows for one address from `since_ms`.
 pub async fn find_client_rejected_statistics_since_for_address(
     pool: &PgPool,
     address: &AddressId,
@@ -376,22 +347,10 @@ pub struct ClientStatisticsRow {
     pub max_difficulty: f32,
 }
 
-/// N per-slot maxima in one `INSERT … SELECT unnest(...) … ON CONFLICT DO
-/// UPDATE`. Sole writer of the table's upsert path.
-///
-/// `maxDifficulty` takes `GREATEST` against what is already stored (a lower
-/// share in the same batch must not lower the slot's max), `updatedAt`
-/// overwrites, and `createdAt` is only set on the insert so an existing row
-/// keeps its original.
-///
-/// ⚠️ **The caller MUST collapse duplicates per `(address, clientName,
-/// slotTime)`.** Postgres rejects a multi-row `ON CONFLICT DO UPDATE` that
-/// would touch the same row twice with a hard error, not a merge. The buffer
-/// that feeds this is keyed by exactly that triple.
-///
-/// No advisory lock here, unlike `client_entity`: a single flush loop is the
-/// only writer. ⚠️ Splitting `payout` and `stats` into two processes would
-/// create a second writer, which then needs its own lock on its own key.
+/// Upserts per-slot maxima; `GREATEST` so a lower share never lowers a slot.
+/// The caller MUST collapse duplicates per `(address, clientName, slotTime)`:
+/// Postgres errors when one `ON CONFLICT DO UPDATE` hits a row twice. No
+/// advisory lock because one flush loop is the only writer; a second needs one.
 pub async fn bulk_upsert_client_difficulty_statistics(
     pool: &PgPool,
     addresses: &[String],
@@ -502,13 +461,9 @@ pub async fn find_worker_shares(
 
 // ── Session-persistence writes (consumer: bp-session-persistence) ───
 
-/// One client-row to insert / upsert. Production rows are written by the
-/// row-birth debounce in `bp-session-persistence`: a session earns its
-/// row by surviving the debounce window, so a probe that authorizes and
-/// hangs up right away never reaches this type. `firstSeen` is set to
-/// `start_time_ms` (the authorize timestamp) on INSERT and left
-/// unchanged on re-register conflicts. The live per-share values live
-/// in the session's `client:live:*` Redis hash, not in this table.
+/// One client row to upsert, written once a session survives the row-birth
+/// debounce, so a connect-and-hang-up probe never gets a row. `firstSeen`
+/// is set from `start_time_ms` on insert only.
 #[derive(Clone, Debug)]
 pub struct ClientUpsert {
     pub address: String,
@@ -518,17 +473,10 @@ pub struct ClientUpsert {
     pub start_time_ms: i64,
 }
 
-/// The one INSERT … ON CONFLICT statement behind [`upsert_client`] and
-/// [`bulk_upsert_clients`] — keyed on the composite PK
-/// `(address, clientName, sessionId)`. The conflict arm covers a
-/// re-register with the same sessionId: refreshes `userAgent`,
-/// `startTime`, and clears `deletedAt` so a previously soft-deleted
-/// session is reactivated without leaking the soft-delete flag.
-///
-/// `rows` must be unique per `(address, clientName, sessionId)` —
-/// `ON CONFLICT DO UPDATE` rejects a statement that hits the same row
-/// twice. Both callers hold that by construction (a map keyed on the
-/// triple / a single row).
+/// The statement behind [`upsert_client`] and [`bulk_upsert_clients`]. A
+/// re-register clears `deletedAt`, reviving a soft-deleted session; `firstSeen`
+/// is left alone. `rows` must be unique per key triple, since
+/// `ON CONFLICT DO UPDATE` rejects hitting one row twice.
 async fn upsert_clients_stmt<'e, E>(executor: E, rows: &[ClientUpsert]) -> Result<u64, DbError>
 where
     E: sqlx::PgExecutor<'e>,
@@ -578,10 +526,8 @@ where
     Ok(result.rows_affected())
 }
 
-/// Single-row convenience over `upsert_clients_stmt`. Executor-generic
-/// so a test can run it inside its rollback transaction; production
-/// writes go through [`bulk_upsert_clients`], which takes the bulk-write
-/// lock.
+/// Single-row upsert without the bulk-write lock, so a test can run it in
+/// its rollback transaction; production writes use [`bulk_upsert_clients`].
 pub async fn upsert_client<'e, E>(executor: E, row: &ClientUpsert) -> Result<u64, DbError>
 where
     E: sqlx::PgExecutor<'e>,
@@ -589,26 +535,14 @@ where
     upsert_clients_stmt(executor, std::slice::from_ref(row)).await
 }
 
-/// Advisory-lock key serialising the multi-row writers of
-/// `client_entity`: the row-birth upsert, the dead-session sweep, and
-/// its repair half.
-///
-/// Postgres takes row locks in processing order, and each of these
-/// builds its arrays from an unordered source (a `HashMap` for the
-/// births, a query result for the sweep), so two of them running
-/// concurrently over shared rows can deadlock.
-///
-/// Sorting the inputs does NOT fix it — the planner may reorder the
-/// join, so input order does not determine lock order. Serialising the
-/// writers does, and it has to be this PG advisory lock: births run on the
-/// Front, the sweep on the accounting role, i.e. two processes.
-///
-/// ⚠️ Any multi-row writer of `client_entity` MUST take this lock.
+/// Advisory lock serialising the multi-row `client_entity` writers, which run
+/// in two processes and would otherwise deadlock on shared rows. Sorting the
+/// inputs does not help: the planner decides lock order.
+/// Any multi-row writer of `client_entity` MUST take this lock.
 const CLIENT_ENTITY_BULK_WRITE_LOCK: i64 = 0x636c_6e74_6277; // "clntbw"
 
-/// Take [`CLIENT_ENTITY_BULK_WRITE_LOCK`] for the rest of `tx`. The
-/// `_xact_` variant releases on commit OR rollback, so an error path
-/// cannot leak the lock and wedge the other writer.
+/// Take [`CLIENT_ENTITY_BULK_WRITE_LOCK`] for the rest of `tx`; the `_xact_`
+/// variant releases on rollback too, so an error cannot leak the lock.
 async fn take_client_entity_bulk_write_lock(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<(), DbError> {
@@ -632,11 +566,8 @@ pub async fn bulk_upsert_clients(pool: &PgPool, rows: &[ClientUpsert]) -> Result
     Ok(n)
 }
 
-/// Soft-delete every `client_entity` row matching `sessionId`. Sets
-/// `deletedAt = now()`. Returns the number of rows touched — typically
-/// 1 (sessionId is 8 chars + per-authorize unique in practice), but the
-/// composite PK does NOT constrain sessionId-only-uniqueness so this
-/// filters by sessionId alone.
+/// Soft-delete every active row with this `sessionId`. The PK does not make
+/// `sessionId` unique on its own, so more than one row may be touched.
 pub async fn delete_client_for_session<'e, E>(executor: E, session_id: &str) -> Result<u64, DbError>
 where
     E: sqlx::PgExecutor<'e>,
@@ -654,14 +585,10 @@ where
     Ok(result.rows_affected())
 }
 
-/// Active sessions whose `updatedAt` is older than `cutoff_ms` — the
-/// CANDIDATES of the dead-session sweep, not its verdict. `updatedAt`
-/// is only stamped at birth, re-register, and soft-delete, so age alone
-/// does not mean "silent": the cron in `bin/blitzpool` checks each
-/// candidate's `client:live:*` key and soft-deletes (via
-/// [`soft_delete_sessions`]) only those whose live hash is gone. The
-/// age predicate is the birth grace period — a session younger than the
-/// cutoff may not have flushed its first touch yet.
+/// Candidates (not verdicts) of the dead-session sweep: `updatedAt` is not
+/// touched per share, so age alone does not mean silent. The cron soft-deletes
+/// via [`soft_delete_sessions`] only those whose live hash is gone; the cutoff
+/// is the birth grace period.
 pub async fn find_stale_active_sessions<'e, E>(
     executor: E,
     cutoff_ms: i64,
@@ -746,13 +673,10 @@ impl bp_common::live_client_key::SessionKey for DeletedSessionRow {
     }
 }
 
-/// Sessions soft-deleted at or after `since_ms` — the input to the
-/// sweep's REPAIR half ([`revive_sessions`]).
-///
-/// Nothing on the share path clears `deletedAt`, so a session
-/// soft-deleted by mistake (Redis restarted empty, its key was evicted)
-/// would stay invisible for the rest of its TCP connection. The sweep
-/// therefore reconciles in both directions.
+/// Sessions soft-deleted since `since_ms`, input to [`revive_sessions`].
+/// Nothing on the share path clears `deletedAt`, so a session wrongly
+/// soft-deleted (e.g. its live key was lost) would otherwise stay hidden for
+/// the rest of its connection.
 pub async fn find_recently_deleted_sessions(
     pool: &PgPool,
     since_ms: i64,
@@ -810,11 +734,8 @@ pub async fn revive_sessions(
     Ok(result.rows_affected())
 }
 
-/// Refine the `userAgent` for every active session belonging to
-/// `address` whose current `userAgent` is a JDP-placeholder
-/// (`jd-client/sv2` or `/sv2`). Called from the downstream-report
-/// POST handler once the JDP miner reports its downstream device
-/// vendors. Returns the number of rows updated.
+/// Replace the JDP placeholder `userAgent` (`jd-client/sv2`, `/sv2`) of an
+/// address's sessions once the miner reports its downstream devices.
 pub async fn update_sv2_user_agent_by_address<'e, E>(
     executor: E,
     address: &str,
@@ -823,9 +744,7 @@ pub async fn update_sv2_user_agent_by_address<'e, E>(
 where
     E: sqlx::PgExecutor<'e>,
 {
-    // updatedAt is bumped explicitly here: there's no implicit
-    // "updated-at" trigger, so every UPDATE that should refresh the
-    // row's freshness must set it.
+    // No updated-at trigger exists, so every UPDATE must set it.
     let result = sqlx::query(
         r#"UPDATE client_entity
            SET "userAgent" = $2,
@@ -841,9 +760,8 @@ where
     Ok(result.rows_affected())
 }
 
-/// Hard-delete every `client_entity` row whose `deletedAt` is older
-/// than `cutoff_ms`. Runs hourly alongside `delete_old_statistics`
-/// so the soft-deleted backlog doesn't grow unbounded.
+/// Hard-delete rows soft-deleted before `cutoff_ms`, so the backlog stays
+/// bounded.
 pub async fn delete_old_clients<'e, E>(executor: E, cutoff_ms: i64) -> Result<u64, DbError>
 where
     E: sqlx::PgExecutor<'e>,
@@ -859,12 +777,8 @@ where
     Ok(result.rows_affected())
 }
 
-/// Hard-delete rows from `client_statistics_entity` /
-/// `client_rejected_statistics_entity` /
-/// `client_difficulty_statistics_entity` / `pool_mode_hashrate`
-/// whose time column is older than the supplied cutoff. The UI only
-/// renders 1d / 3d / 7d charts from these so anything past 14 d is
-/// dead weight.
+/// Hard-delete `client_statistics_entity` rows older than `cutoff_ms`; the
+/// charts read only recent days.
 pub async fn delete_old_client_statistics<'e, E>(
     executor: E,
     cutoff_ms: i64,
@@ -931,33 +845,15 @@ where
 pub struct DeviceFirstSeenRow {
     pub address: String,
     pub client_name: String,
-    /// Earliest `COALESCE("firstSeen", "startTime")` across **all** rows
-    /// for the pair, soft-deleted ones included — when the pool first saw
-    /// this worker.
-    ///
-    /// `startTime` alone is NOT this value: [`upsert_client`]'s
-    /// `ON CONFLICT` refreshes it on every re-register, so a device that
-    /// has been connected for days can carry a `startTime` of minutes ago.
-    /// `firstSeen` is deliberately absent from that SET list and is the
-    /// stable column.
+    /// Earliest `COALESCE("firstSeen", "startTime")` over all rows of the pair,
+    /// soft-deleted included. Not `startTime` alone: [`upsert_client`]
+    /// refreshes that on every re-register, while `firstSeen` stays put.
     pub first_seen_ms: i64,
 }
 
-/// Liveness + first-seen for each requested `(address, clientName)`.
-/// Pairs with no row at all are absent from the result.
-///
-/// This is the authoritative connectivity answer for the device-status
-/// debounce: `deletedAt` is cleared by [`upsert_client`] on register,
-/// stamped by [`delete_client_for_session`] on disconnect, and swept by
-/// the dead-session cron (via [`soft_delete_sessions`]) when a session
-/// dies without a clean FIN. Asking
-/// the table at notification time — rather than counting connect and
-/// disconnect events in memory — is what makes the debounce survive a
-/// process restart and stay correct across several Stratum fronts.
-///
-/// Batched over both key columns so one sweep costs one round-trip
-/// regardless of how many devices are due. The `(address, clientName)`
-/// prefix of the primary key carries the scan.
+/// First-seen time for each requested `(address, clientName)`; pairs with no
+/// row are absent. Batched so one device-status pass is one round-trip,
+/// served by the primary key's `(address, clientName)` prefix.
 pub async fn device_first_seen(
     pool: &PgPool,
     addresses: &[String],
@@ -987,20 +883,10 @@ pub async fn device_first_seen(
         .collect())
 }
 
-/// Every `(address, clientName, userAgent)` under `addresses` whose state
-/// could still be in flight: either a session is connected right now, or
-/// its most recent session was soft-deleted no longer ago than
-/// `deleted_since_ms`.
-///
-/// This is what the device-status gate seeds its watch list from after a
-/// restart. Without it the gate would only ever learn about a device from
-/// a Stratum event, so a miner that died just before the restart — and
-/// will therefore never emit another event — could never be reported.
-///
-/// ⚠️ `updatedAt` is not touched per share, so the `ORDER BY "updatedAt"`
-/// inside the aggregate picks the user agent of the most recently born
-/// or soft-deleted session, not the most recently active one. It only
-/// affects the seed's user-agent string, never liveness.
+/// Devices under `addresses` that are connected or were soft-deleted since
+/// `deleted_since_ms`: the device-status watch list after a restart, so a
+/// miner that died just before it is still reported. The user agent is from
+/// the most recently born or deleted session, not the most active one.
 pub async fn device_watch_seed(
     pool: &PgPool,
     addresses: &[String],

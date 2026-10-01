@@ -72,13 +72,9 @@ fn addr(s: &str) -> AddressId {
     AddressId::new(s.to_string()).expect("valid test AddressId")
 }
 
-/// An address subscribed on Telegram or ntfy alone is scanned. The push-only
-/// query is asserted in the same test to miss it, so the difference between
-/// the two is pinned rather than assumed.
-///
-/// Also: a Telegram row with best-diff switched OFF is still scanned (the
-/// flag is checked at send time; the scan keeps the tracker baseline
-/// current), and a removed ntfy subscription is not.
+/// Telegram- or ntfy-only addresses are scanned (and missed by the push-only
+/// query), best-diff switched off is still scanned, a removed subscription
+/// is not.
 #[tokio::test]
 async fn best_diff_scan_covers_every_transport() {
     let Some(pool) = connect_or_skip().await else {

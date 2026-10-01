@@ -1,31 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Pool-wide share statistics sink — coordinator-flush pattern.
-//!
-//! Wraps `bp-stats`'s in-memory accumulators with a 60 s flush cron
-//! that bulk-upserts to 7 PG tables (5 slot-bucketed stats tables +
-//! `address_settings_entity` lifetime totals and best difficulty +
-//! `worker_shares_entity` per-worker cumulative counts).
-//!
-//! Mode-blind: every accepted / rejected share lands here regardless of
-//! solo / PPLNS / group-solo. The Stratum-server composes this sink with
-//! `bp-pplns-engine`'s and `bp-group-solo-engine`'s hooks via a
-//! [`tokio::join!`]-style fan-out in `bin/blitzpool`.
-//!
-//! ## Modules
-//!
-//! - [`config`] — engine tunables (flush interval, batch size,
-//!   slot-aligned flushes on/off).
-//! - [`error`] — `SinkError` enum.
-//! - [`flush`] — drain accumulators → build 7 bulk-upserts → confirm on
-//!   success → update `FlushHealthMonitor`.
-//! - [`seed`] — boot-time one-shot `seedIfEmpty` for `worker_shares_entity`.
-//! - [`hooks`] — `SharedAcceptedShareSink` + `SharedRejectedShareSink` impls fan
-//!   shares into the accumulators.
-//! - [`reader`] — read-only handle for `/api/admin/stats-health`
-//!   surface.
-//! - [`engine`] — `ShareStatsEngine::spawn(...)` → handle + 60 s tick
-//!   with slot-transition spot-flush.
+//! Pool-wide share statistics: in-memory accumulators flushed every 60 s as
+//! bulk upserts into seven PG tables.
+//! Mode-blind: every accepted and rejected share lands here, whatever the
+//! payout mode.
 
 pub mod config;
 pub mod engine;

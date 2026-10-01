@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Blockparty mining mode — group / member / block-history rows.
-//!
-//! - `blockparty_group` — UUID PK, status FSM (draft/confirming/ready/active/dissolved)
-//! - `blockparty_member` — bigint PK, UNIQUE on address (pool-wide single membership).
-//!   A dissolve deletes the group's rows, so the address is free again.
-//! - `blockparty_block_history` — bigint PK, UNIQUE (groupId, blockHash) for replay-safety
+//! Blockparty mining mode: group, member and block-history rows. A member
+//! address is UNIQUE pool-wide; a dissolve deletes the group's member rows so
+//! the address is free again. Block history is UNIQUE (groupId, blockHash).
 
 use bp_common::{AddressId, Sats};
 use sqlx::{postgres::PgPool, types::Json, FromRow};
@@ -611,10 +608,8 @@ pub async fn insert_blockparty_block_history(
     splits: &[BlockpartySplitSnapshot],
     created_at: i64,
 ) -> Result<Option<BlockpartyBlockHistoryRow>, DbError> {
-    // ON CONFLICT DO NOTHING preserves replay-safety: a duplicate
-    // (groupId, blockHash) returns 0 rows and the caller treats it as
-    // a no-op rather than an error. The UNIQUE index on the pair is
-    // the real authority.
+    // Replay-safe: a duplicate (groupId, blockHash) returns no row, which the
+    // caller treats as a no-op.
     sqlx::query_as!(
         BlockpartyBlockHistoryRow,
         r#"INSERT INTO blockparty_block_history

@@ -1,47 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Template Distribution Protocol (TDP) client.
-//!
-//! This crate is an in-process bridge between bitcoin-core's SV2 IPC
-//! endpoint and the rest of the Blitzpool runtime. It owns a single
-//! [`bitcoin_core_sv2::unix_capnp::v31x::template_distribution_protocol::BitcoinCoreSv2TDP`]
-//! instance on a dedicated OS thread (the underlying type is `!Send`
-//! because `capnp-rpc` is not `Send`) and exposes a `Send + Clone`
-//! [`TdpHandle`] to the multi-threaded pool runtime.
-//!
-//! # Architecture
-//!
-//! ```text
-//!  Pool runtime (multi-thread tokio)
-//!  ────────────────────────────────────────────────────────
-//!     bp-stratum-v1, bp-stratum-v2, bp-api, ...
-//!       │ subscribe()           │ submit_solution(), …
-//!       ▼                       ▼
-//!     broadcast::Receiver   mpsc::Sender
-//!       │                       │
-//!  ─────┼───────────────────────┼───────────────────────────
-//!       │   bp-tdp-worker (dedicated OS thread)            │
-//!       │   tokio::runtime + tokio::task::LocalSet          │
-//!       │                                                   │
-//!       │   bridge_out ◀── async_channel ── BitcoinCoreSv2TDP
-//!       │   bridge_in  ──▶ async_channel ──▶               │
-//!  ──────────────────────────────────────────────────────────
-//!                                │ Cap'n-Proto over UNIX socket
-//!                                ▼
-//!                          bitcoin-core v31.0
-//! ```
-//!
-//! Cancellation flows through a single [`tokio_util::sync::CancellationToken`]
-//! that the public handle holds and that every internal task observes.
-//! Dropping the last [`TdpHandle`] clone cancels the worker and joins the
-//! thread.
-//!
-//! # Scope
-//!
-//! - **In:** TDP message exchange (templates out, solutions and tx-data
-//!   requests in), startup `CoinbaseOutputConstraints`, graceful shutdown.
-//! - **Out:** SV1 `mining.notify` translation (lives in `bp-stratum-v1`),
-//!   SV2 frame serialisation and JDP (both `bp-stratum-v2`).
+//! Template Distribution Protocol client over bitcoin-core's SV2 IPC socket.
+//! The upstream `BitcoinCoreSv2TDP` is `!Send` (capnp-rpc), so it lives on its
+//! own OS thread behind a `Send + Clone` [`TdpHandle`]. Mining-protocol
+//! translation and JDP live in the stratum crates, not here.
 
 mod assembler;
 mod config;

@@ -1,26 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Pool-side extranonce-prefix allocation for SV2 channels.
-//!
-//! The allocator itself lives in [`bp_common::extranonce`], shared with SV1.
-//! What is SV2's own is the key: SV1 holds one prefix per connection, SV2
-//! one per channel, and a wire `channel_id` is only unique within its
-//! connection (every connection's first channel is id 1).
+//! SV2 extranonce-prefix allocation on the allocator shared with SV1
+//! ([`bp_common::extranonce`]). SV2 keys one prefix per channel, and a wire
+//! `channel_id` is only unique within its connection.
 
 pub use bp_common::extranonce::{SharedExtranonceAllocator, SV2_WORKER_ID};
 
-/// One connection's view of the SV2 allocator: the pool-wide instance plus
-/// a number that sets this connection's channel keys apart from every other
-/// live connection's.
-///
-/// That number comes from the allocator's own counter, not from the random
-/// `session_id`, because two connections can draw the same session id and
-/// must still get distinct prefixes. It is truncated to
-/// 32 bits to leave the low half of the key for the channel id, so it
-/// repeats after 2^32 connections — a collision then needs a connection
-/// that stayed open across all of them.
-///
-/// Deliberately not `Clone`: a copy would carry the same connection number.
+/// One connection's view of the SV2 allocator. The connection number comes
+/// from the allocator's counter, not the random `session_id`, which can
+/// collide; it is 32 bits so the channel id fits beside it in the key. Not
+/// `Clone`: a copy would share the connection number.
 #[derive(Debug)]
 pub struct ConnectionExtranonce {
     shared: SharedExtranonceAllocator,
@@ -64,8 +53,8 @@ impl ConnectionExtranonce {
 mod tests {
     use super::*;
 
-    /// Channel 1 on two connections gets two prefixes; the same channel id
-    /// again gets its own prefix back; a release frees it.
+    /// The same channel id on two connections gets distinct prefixes, a repeat
+    /// keeps its own, and release frees it exactly once.
     #[test]
     fn channel_keys_are_per_connection() {
         let shared = SharedExtranonceAllocator::new_default_on_worker(SV2_WORKER_ID);

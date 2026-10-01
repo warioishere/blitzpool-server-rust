@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Outbound email hooks the `/api/email/*` controller calls into.
-//! Covers the verification and binding-change-attempt mails —
-//! production wiring routes through
-//! `bp-notifications::adapter::smtp::SmtpAdapter` +
-//! the verification / binding-change templates.
-//!
-//! Best-effort: implementations should log + swallow errors instead
-//! of propagating them up the register/verify path so a transient
-//! SMTP outage doesn't block the user from a retry on a different
-//! tab.
+//! Outbound email hooks of the `/api/email/*` controller. Best-effort:
+//! implementations log and swallow errors, so a transient SMTP outage does
+//! not fail the register/verify path.
 
 use async_trait::async_trait;
 

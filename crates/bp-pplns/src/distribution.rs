@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Distribution telemetry.
-//!
-//! The satoshi allocation itself lives in [`crate::weights`]: the pool's
-//! payout model is the SV2 ext 0x0003 §4 weight formula
-//! (`floor(weight·T/W)` with dust pruning and the pool output absorbing
-//! the remainder), evaluated by the pool's own coinbase build, by every
-//! job-declaration client at its own template revenue, and by the
-//! declared-coinbase validator alike.
+//! Distribution telemetry. The satoshi allocation itself is the ext 0x0003
+//! §4 weight formula in [`crate::weights`].
 
 /// Per-distribution weight-budget pressure, consumed by the coinbase-budget
 /// autoscaler. Utilization = `desired_weight / effective_budget`: at ≥ 1.0 the

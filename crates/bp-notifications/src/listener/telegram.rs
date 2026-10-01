@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Telegram long-poll loop.
-//!
-//! Calls `getUpdates` with a running `offset` so each update is
-//! processed exactly once. Per-update text → [`parse_command`] →
-//! [`CommandHandler::dispatch`]; inline-button taps arrive as
-//! `callback_query` updates and go to
-//! [`CommandHandler::handle_telegram_callback`].
+//! Telegram long-poll loop. A running `getUpdates` offset processes each
+//! update exactly once; text goes to [`CommandHandler::dispatch`], button taps
+//! to [`CommandHandler::handle_telegram_callback`].
 
 use std::sync::Arc;
 use std::time::Duration;

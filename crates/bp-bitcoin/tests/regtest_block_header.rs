@@ -1,25 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Regtest: `BitcoinRpc::get_block_header` against a real `bitcoin-node`.
-//!
-//! This is the bitcoin-core-touching half of the confirmation-gated
-//! block-found feature (the watcher in `bin/blitzpool` keys its
-//! apply/discard decision entirely on `BlockHeaderInfo.confirmations`):
-//!
-//! - a buried block reports `confirmations >= depth`,
-//! - an `invalidateblock`'d block reports `confirmations == -1` (the
-//!   orphan signal the watcher discards on),
-//! - an unknown hash surfaces Core's `-5` "Block not found".
-//!
-//! Skipped (with a printed warning) when `bitcoin-node` is not installed.
+//! Regtest: `BitcoinRpc::get_block_header` against a real `bitcoin-node`,
+//! pinning the `confirmations` values the block-found watcher decides on.
+//! Skipped when `bitcoin-node` is not installed.
 
 use std::time::Duration;
 
 use bp_bitcoin::{BitcoinRpc, BitcoinRpcConfig, RpcAuth, RpcError};
 use bp_regtest_harness::{RegtestConfig, RegtestNode};
 
-/// Build a `BitcoinRpc` pointed at the regtest node, authenticating with
-/// the node's `.cookie` (`__cookie__:<secret>`).
+/// `BitcoinRpc` for the regtest node, authenticated with its `.cookie`.
 fn rpc_for(node: &RegtestNode) -> BitcoinRpc {
     let cookie = std::fs::read_to_string(node.cookie_path()).expect("read regtest cookie");
     let (user, password) = cookie.split_once(':').expect("cookie is user:password");
@@ -86,10 +76,8 @@ async fn get_block_header_reports_confirmations_orphan_and_not_found() {
             .expect("getblockhash tip"),
     )
     .expect("tip hash is a string");
-    // `invalidateblock` returns `null`; the harness RPC caller rejects a
-    // null result, but the side effect (marking the block invalid) still
-    // takes effect on the node. Ignore the client-side parse quirk — the
-    // `confirmations == -1` assertion below is the real check.
+    // The harness rejects `invalidateblock`'s `null` result although the
+    // node applied it; the `confirmations == -1` assertion is the check.
     let _ = node
         .rpc_call("invalidateblock", serde_json::json!([tip_hash]))
         .await;

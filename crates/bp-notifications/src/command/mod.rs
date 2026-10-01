@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Bot-command parsing + dispatch.
-//!
-//! Telegram polling and ntfy SSE share one command surface: a single
-//! [`Command`] enum models the wire form, [`CommandHandler`] holds the
-//! bp-db pool + dispatcher and replies through the [`Transport`] the
-//! command arrived on.
+//! Bot-command parsing + dispatch. Telegram and ntfy share one [`Command`]
+//! surface; [`CommandHandler`] replies through the [`Transport`] the command
+//! arrived on.
 
 mod handler;
 mod parser;

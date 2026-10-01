@@ -1,16 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! HTTP API for the Blitzpool admin/UI surface.
-//!
-//! Built on `axum` + a typed [`AppState`] threaded through every
-//! handler. Each `controllers/<name>.rs` module exposes a `routes()`
-//! helper returning an axum `Router<SharedState<H, M>>`.
-//!
-//! ## Route prefixes
-//!
-//! Group routes are mounted under `/api/pplns/groups/*` and invitation
-//! routes under `/api/pplns/invitations/*`. UI fetch URLs use these exact
-//! prefixes.
+//! HTTP API for the Blitzpool UI, built on `axum` with a typed [`AppState`].
+//! Group and invitation routes live under `/api/pplns/groups/*` and
+//! `/api/pplns/invitations/*`; the UI fetches those exact prefixes.
 
 mod controllers;
 pub mod email_hooks;

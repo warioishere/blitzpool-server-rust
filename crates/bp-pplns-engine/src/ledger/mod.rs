@@ -1,23 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Postgres-backed signed credit/debit ledger.
-//!
-//! Two tables, written atomically inside one PG transaction per block:
-//!
-//! - `pplns_balance` — keyed by `address`, signed `balanceSats`
-//!   (> 0 = credit owed to miner, < 0 = debit owed by miner,
-//!   = 0 = settled), lifetime `totalPaidSats`, last-accepted-share
-//!   timestamp. Writes are *absolute* (upsert-style), idempotent on
-//!   replay.
-//! - `pplns_payout_history` — one row per `(block_height, address)`.
-//!   `UNIQUE(blockHeight, address)` gates double-write replays.
-//!
-//! Primitives live in `bp-db` (`bulk_upsert_pplns_balances` +
-//! `bulk_insert_pplns_payout_history`). This module composes them into
-//! the [`apply_distribution`] TX-orchestrator that block-found uses.
-//!
-//! Submodule [`touch_buffer`] coalesces hot-path `markTouch` writes
-//! into one bulk UPDATE every 60s.
+//! Postgres signed ledger: `pplns_balance` (> 0 owed to the miner, < 0 owed
+//! by the miner, absolute writes) and `pplns_payout_history`, both written in
+//! one transaction per block by [`apply_distribution`]. [`touch_buffer`]
+//! batches the hot-path `lastAcceptedShareAt` writes.
 
 pub mod touch_buffer;
 
@@ -28,16 +14,12 @@ use bp_db::{
 };
 
 pub use bp_db::TouchUpdate;
-// Shared with Group-Solo — one source of truth for the rowType wire
-// strings + apply-distribution result / error shapes.
+// Shared with Group-Solo.
 pub use bp_coinbase_snapshot::{ApplyDistributionResult, LedgerError, PayoutRowType};
 
-/// One row in the apply-distribution audit log.
-///
-/// The engine builds these from the block's own coinbase settled against
-/// the weight snapshot: one row per address the coinbase paid, one row per
-/// ledger debit/credit that didn't land on-chain, and one zero row per
-/// "late arrival" observed between snapshot and block-found.
+/// One audit row, built from the block's own coinbase settled against the
+/// snapshot: per address paid, per ledger delta that stayed off-chain, and a
+/// zero row per late arriver.
 #[derive(Clone, Debug)]
 pub struct AuditRow {
     pub address: AddressId,
@@ -46,9 +28,7 @@ pub struct AuditRow {
     pub row_type: PayoutRowType,
 }
 
-/// Convenience constructor: a pending ledger row (signed delta, no
-/// on-chain output). Percent is 0.0 by convention since pending rows
-/// don't represent a coinbase fraction.
+/// A signed ledger delta with no on-chain output, hence 0 percent.
 pub fn pending_row(address: AddressId, delta_sats: Sats) -> AuditRow {
     AuditRow {
         address,
@@ -60,50 +40,10 @@ pub fn pending_row(address: AddressId, delta_sats: Sats) -> AuditRow {
 
 // ── apply_distribution — the block-found TX ─────────────────────────
 
-/// Atomically:
-/// 1. Refuse outright if this block already has payout history — see
-///    below.
-/// 2. Insert audit rows into `pplns_payout_history`.
-/// 3. Upsert absolute new `balanceSats` + `totalPaidSats` + `updatedAt`
-///    into `pplns_balance`.
-///
-/// On any error the transaction rolls back — neither write lands.
-///
-/// **Why step 1 asks the block rather than counting inserted rows.** The
-/// `(blockHeight, address)` UNIQUE only swallows a replay while the row set
-/// is identical, and it is not: the caller appends one row per "late
-/// arriver" (live in the window at apply time, absent from the snapshot),
-/// and the window moves between attempts. A replay would then report
-/// progress and re-apply the ABSOLUTE balance write (`current + delta`)
-/// against a `current` that already includes the first booking, paying a
-/// credit twice at the other miners' expense.
-///
-/// Sequential replay happens when the confirmation watcher's post-apply
-/// `remove_pending_block` fails (its error is ignored) or the process dies
-/// in that window. Concurrent duplicates are handled by the row locks the
-/// caller takes before this runs, see below.
-///
-/// **Takes the caller's transaction rather than opening one.** The
-/// balance write is absolute (`current + delta`), so the `current` it was
-/// computed from has to be read UNDER `FOR UPDATE` in this same
-/// transaction — see
-/// [`bp_db::find_pplns_balances_for_addresses_locked`]. A caller that
-/// reads outside it hands the daily dust sweep a window in which its
-/// write is silently undone.
-///
-/// That ordering also hardens the gate below: locking the block's rows
-/// first means a second, concurrent apply of the same block blocks on
-/// them, and by the time it proceeds the first has committed its history
-/// rows — so the `SELECT` sees them. A plain read-committed `SELECT`
-/// alone would not.
-///
-/// Caller (typically [`crate::engine::PplnsEngine::on_block_found`]) is
-/// responsible for:
-/// - reading the snapshot persisted at template-build time
-/// - opening the transaction, locking the balance rows, and mapping the
-///   snapshot to the audit-row list and absolute-balance list
-/// - committing, and calling all of it inside the block-found
-///   re-entrancy lock
+/// Book one block: audit rows plus absolute balances. An already-booked height
+/// writes nothing, since a replay would re-apply `current + delta` and pay twice.
+/// Runs in the caller's transaction, which must hold the rows under
+/// [`bp_db::find_pplns_balances_for_addresses_locked`] (also serializing concurrent applies).
 pub async fn apply_distribution(
     tx: &mut sqlx::PgConnection,
     block_height: i32,
@@ -111,14 +51,9 @@ pub async fn apply_distribution(
     balances: &[BalanceWrite],
     now_ms: i64,
 ) -> Result<ApplyDistributionResult, LedgerError> {
-    // Height is the only identity a booked block has here (no `blockHash`
-    // column, UNIQUE on `(blockHeight, address)`). Existing history is
-    // either a redelivery of the same block, which must pass silently, or a
-    // different block at the same height after a reorg, whose settlement
-    // must not be skipped silently. They are told apart by the booking
-    // itself: if the recorded value-bearing rows match what this apply
-    // would write, replaying moves nothing, even for a different block that
-    // paid the same coinbase.
+    // Height is the only identity of a booked block. Existing history is a
+    // redelivery (passes silently) or a reorged block (must not be skipped
+    // silently); identical value-bearing rows mean replaying moves nothing.
     let booked = bp_db::pplns_booked_value_rows_at_height(&mut *tx, block_height).await?;
     if !booked.is_empty() {
         let mut want: Vec<(String, i64)> = rows
@@ -128,9 +63,6 @@ pub async fn apply_distribution(
             .collect();
         want.sort();
         if booked == want {
-            // The ordinary replay: the confirmation watcher's post-apply
-            // `remove_pending_block` failed, or the process died in that
-            // window. Nothing to do.
             return Ok(ApplyDistributionResult {
                 history_inserted: 0,
                 balances_affected: 0,
@@ -165,9 +97,8 @@ pub async fn apply_distribution(
         })
         .collect();
 
-    // Past the gate above this block has no history, so both writes are
-    // this apply's first and only ones. The `ON CONFLICT DO NOTHING` on
-    // the insert is a constraint-level backstop.
+    // Past the gate the height has no history; `ON CONFLICT DO NOTHING` is
+    // only a backstop.
     let history_inserted = bulk_insert_pplns_payout_history(&mut *tx, &history_rows).await?;
     let balances_affected = bulk_upsert_pplns_balances(&mut *tx, &balance_rows).await?;
 
@@ -177,10 +108,8 @@ pub async fn apply_distribution(
     })
 }
 
-/// Absolute new balance state for one address after applying the
-/// distribution. Distinct from [`AuditRow`] because one block can
-/// touch a balance without writing a history row (a "fully settled"
-/// miner) and vice versa.
+/// Absolute new balance for one address. Separate from [`AuditRow`]: a block
+/// can touch a balance without a history row and vice versa.
 #[derive(Clone, Debug)]
 pub struct BalanceWrite {
     pub address: AddressId,

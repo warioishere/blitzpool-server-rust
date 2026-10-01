@@ -1,16 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Shared primitive types — `Sats`, `AddressId`, `MiningMode`, and the narrow
-//! error variants that come with them.
-//!
-//! Intentionally there is no `BlitzError` umbrella enum. Each crate defines its
-//! own `thiserror` type for its concerns; these primitives carry only the
-//! narrow errors that arise from constructing/parsing them.
-//!
-//! With the `sqlx` Cargo feature enabled, `Sats` / `AddressId` / `MiningMode`
-//! gain `sqlx::Type` + `Decode` + `Encode` impls for Postgres so they
-//! round-trip the wire format automatically (lives here rather than in
-//! `bp-db` to satisfy the orphan rule).
+//! Shared primitive types and their narrow construction errors; deliberately
+//! no umbrella error enum, each crate owns its own. The `sqlx` impls live here
+//! rather than in `bp-db` because of the orphan rule.
 
 use std::fmt;
 use std::ops::{Add, AddAssign, Neg, Sub, SubAssign};
@@ -23,10 +15,8 @@ use serde::{Deserialize, Serialize};
 /// live hashrate sampler and the API charts all use.
 pub const HASHES_PER_DIFFICULTY_1: f64 = 4_294_967_296.0;
 
-/// Bitcoin Core's default dust policy value for P2PKH at
-/// `dustRelayFee = 3000 sat/kvB`. Outputs below this can't be relayed as
-/// standard transactions. Every payout mode floors its coinbase outputs
-/// here.
+/// Bitcoin Core's default P2PKH dust limit; smaller outputs are non-standard.
+/// Every payout mode floors its coinbase outputs here.
 pub const DUST_LIMIT_SATS: u64 = 546;
 
 pub mod display;
@@ -45,11 +35,8 @@ mod sqlx_impls;
 // Sats
 // ---------------------------------------------------------------------------
 
-/// Satoshis. Signed because the PPLNS ledger represents debits as negative
-/// balances (see `pplns_balance.balanceSats` in the PG schema). For
-/// amount-only contexts where only non-negative values are valid (payout
-/// amounts, share rewards), check non-negativity at the boundary; this type
-/// itself does not enforce a sign.
+/// Satoshis. Signed because the PPLNS ledger stores debits as negative
+/// balances; amount-only contexts check non-negativity at the boundary.
 #[derive(
     Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -59,12 +46,10 @@ pub struct Sats(pub i64);
 impl Sats {
     pub const ZERO: Sats = Sats(0);
 
-    /// Returns the raw signed integer value.
     pub fn to_i64(self) -> i64 {
         self.0
     }
 
-    /// Saturating addition — clamps at `i64::MAX` / `i64::MIN` instead of overflowing.
     pub fn saturating_add(self, rhs: Sats) -> Sats {
         Sats(self.0.saturating_add(rhs.0))
     }
@@ -145,30 +130,22 @@ impl fmt::Display for Sats {
 // AddressId
 // ---------------------------------------------------------------------------
 
-/// A miner's Bitcoin address as the pool uses it — round-trips between PG
-/// (`varchar(62)`), API JSON, and Stratum `authorize` frames as a string.
-///
-/// This type only enforces *shape*: non-empty, ASCII-graphic, ≤62 chars.
-/// Cryptographic validation (network check, witness version, bech32/base58
-/// checksum) belongs at the I/O boundary in `bp-share` (or wherever
-/// `bitcoin::Address::from_str` is called), not here.
+/// A miner's Bitcoin address as the pool stores it (`varchar(62)`). Enforces
+/// shape only (non-empty, ASCII-graphic, ≤62 chars); network and checksum
+/// validation belong where `bitcoin::Address` parses it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AddressId(String);
 
 impl AddressId {
-    /// Construct from any string-like. Validates shape; does not check
-    /// crypto.
     pub fn new(s: impl Into<String>) -> Result<Self, InvalidAddressError> {
         let s = s.into();
         validate_address_shape(&s)?;
         Ok(AddressId(s))
     }
 
-    /// [`normalize_btc_address`] a user-supplied address, then validate its
-    /// shape. The one way raw input becomes an `AddressId` wherever it is
-    /// compared against stored rows: normalizing first is what lets a
-    /// mixed-case bech32 or a verbatim Base58 address find its row.
+    /// [`normalize_btc_address`], then validate. Use it wherever raw input is
+    /// compared against stored rows, so mixed-case bech32 finds its row.
     pub fn normalized(raw: &str) -> Result<Self, InvalidAddressError> {
         Self::new(normalize_btc_address(raw))
     }
@@ -182,16 +159,9 @@ impl AddressId {
     }
 }
 
-/// Normalize a BTC address for storage / equality comparison.
-///
-/// Bech32 / bech32m (BIP-173 / BIP-350) are case-insensitive by spec —
-/// wallets may present them uppercase (QR-code optimization) but the
-/// canonical wire form is lowercase. Legacy P2PKH / P2SH (base58) IS
-/// case-sensitive — different cases are different addresses with
-/// different checksums — and is left untouched, or a legacy address would
-/// never match its own row.
-///
-/// Whitespace is trimmed. Empty input maps to empty output.
+/// Normalize a BTC address for storage and comparison: trim, lowercase
+/// bech32/bech32m (case-insensitive by BIP-173/350). Base58 is case-sensitive
+/// and left untouched, or a legacy address would never match its own row.
 pub fn normalize_btc_address(address: &str) -> String {
     let trimmed = address.trim();
     if trimmed.is_empty() {
@@ -269,11 +239,8 @@ pub enum InvalidAddressError {
 // MiningMode
 // ---------------------------------------------------------------------------
 
-/// Payout mode used for routing a miner's shares.
-///
-/// Wire format is kebab-case (`solo`, `pplns`, `group-solo`,
-/// `blockparty`) — used directly in `GET /api/pplns/mode/:address`
-/// responses and the per-mode hashrate aggregation key.
+/// Payout mode used for routing a miner's shares. The kebab-case wire form
+/// is API output and an aggregation key, so it must not change.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MiningMode {
@@ -311,21 +278,10 @@ impl FromStr for MiningMode {
 // StreamKind
 // ---------------------------------------------------------------------------
 
-/// Which TDP template stream — i.e. which bitcoin-core coinbase reservation —
-/// a connection mines on, and through which a found block is submitted. The
-/// pool runs one stream per reservation class against a single bitcoind
-/// (separate IPC connections).
-///
-/// Every non-PPLNS payout mode has its own fixed-reservation stream:
-/// `Solo` (1–2 outputs), `GroupSolo` and `Blockparty` (member-count sized). Only `Pplns` is PPLNS-autoscaled, and
-/// it serves PPLNS exclusively (it is also the default/boot stream).
-///
-/// [`StreamKind::for_mode`] is the **single source of truth** for the
-/// mode→stream mapping. The stratum stream-selection (which template a
-/// connection builds jobs from) and the block-submission routing (which TDP
-/// handle a solution goes to) both consult it, so they can never disagree —
-/// submitting a job to a handle that doesn't know its template_id would be an
-/// invalid block.
+/// Which TDP template stream (bitcoin-core coinbase reservation) a connection
+/// mines on and submits through. [`StreamKind::for_mode`] is the one mapping
+/// both job building and block submission consult: a solution sent to a
+/// handle that does not know its template would be an invalid block.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub enum StreamKind {
     /// PPLNS-autoscaled stream — the primary stream every connection boots on
@@ -344,18 +300,14 @@ pub enum StreamKind {
 }
 
 impl StreamKind {
-    /// Every non-`Pplns` stream — the fixed-reservation classes a connection
-    /// can be swapped onto once its payout mode resolves at
-    /// authorize/OpenChannel. Order is irrelevant (callers key a map by it).
+    /// The fixed-reservation streams a connection can be swapped onto once
+    /// its payout mode resolves.
     pub const NON_PPLNS: [StreamKind; 3] = [
         StreamKind::Solo,
         StreamKind::GroupSolo,
         StreamKind::Blockparty,
     ];
 
-    /// Map a resolved payout mode to its template stream. Every non-PPLNS mode
-    /// has its own fixed-reservation stream; PPLNS rides the autoscaled
-    /// `Pplns` stream.
     pub fn for_mode(mode: MiningMode) -> Self {
         match mode {
             MiningMode::Solo => StreamKind::Solo,
@@ -395,17 +347,10 @@ pub struct UnknownMiningModeError(pub String);
 // now_ms — the pool's epoch-millisecond wall clock
 // ---------------------------------------------------------------------------
 
-/// Milliseconds since the UNIX epoch, as `i64`.
-///
-/// `i64` and not `u64` because this is the width the values are stored and
-/// compared at: Postgres `bigint` columns, and [`LogThrottle::allow`] below.
-///
-/// **Not a clock abstraction**: it reads the system clock and cannot be
-/// substituted in a test. For controllable time use `bp_vardiff::Clock`
-/// (epoch-ms `u64`) or `bp_cron_utils::Clock` (`chrono::DateTime<Utc>`).
-/// Where data carries its own timestamp (a share's `ts_ms`), prefer that.
-///
-/// Saturates to 0 if the system clock is before the epoch.
+/// Milliseconds since the UNIX epoch, `i64` to match Postgres `bigint`.
+/// Reads the system clock and cannot be faked in a test; use
+/// `bp_vardiff::Clock` / `bp_cron_utils::Clock` for that, or the data's own
+/// timestamp where it has one.
 pub fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -420,14 +365,8 @@ pub fn now_ms() -> i64 {
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
-/// Time-based throttle for a hot-path log line that would otherwise flood —
-/// e.g. a per-accepted-share warning while Redis is unreachable, which at a
-/// few thousand shares/s would bury every other log and fill disk.
-///
-/// [`Self::allow`] returns `Some(suppressed)` at most once per `interval_ms`,
-/// where `suppressed` is the number of calls swallowed since the previous
-/// allowed one (so the caller can append "… (N suppressed)"). Lock-free;
-/// share it behind the same handle the hot path already holds.
+/// Lock-free time throttle for a hot-path log line that would otherwise flood,
+/// e.g. a per-share warning while Redis is down.
 #[derive(Debug)]
 pub struct LogThrottle {
     interval_ms: i64,
@@ -444,10 +383,9 @@ impl LogThrottle {
         }
     }
 
-    /// `Some(suppressed_since_last)` when `now_ms` is at least `interval_ms`
-    /// past the last allowed call (claims the slot atomically so only one
-    /// caller wins under contention); `None` otherwise, after counting this
-    /// call as suppressed.
+    /// `Some(suppressed_since_last)` at most once per `interval_ms` (only one
+    /// caller wins the slot under contention); otherwise counts this call and
+    /// returns `None`.
     pub fn allow(&self, now_ms: i64) -> Option<u64> {
         let last = self.last_ms.load(Ordering::Relaxed);
         if now_ms.saturating_sub(last) >= self.interval_ms
@@ -464,11 +402,8 @@ impl LogThrottle {
     }
 }
 
-/// Emit a `tracing::warn!` at most once per the [`LogThrottle`]'s window,
-/// auto-appending a `suppressed` field with the count dropped since the last
-/// emit. Centralises the "a Redis outage fails every share — don't flood the
-/// log" idiom: pass the throttle, the timestamp, then the usual `warn!`
-/// fields + message. Expands to a no-op when the window hasn't elapsed.
+/// `tracing::warn!` at most once per [`LogThrottle`] window, with a
+/// `suppressed` count field appended.
 ///
 /// ```
 /// use bp_common::{warn_throttled, LogThrottle};
@@ -483,16 +418,14 @@ impl LogThrottle {
 macro_rules! warn_throttled {
     ($throttle:expr, $now_ms:expr, $($fields:tt)+) => {
         if let Some(suppressed) = $throttle.allow($now_ms) {
-            // `$crate::tracing`, not `::tracing`: through this crate's
-            // re-export a caller needs no direct `tracing` dependency. The
-            // doctest above, compiled as its own crate, pins that.
+            // `$crate::tracing` so callers need no direct `tracing`
+            // dependency; the doctest above pins that.
             $crate::tracing::warn!(suppressed, $($fields)+);
         }
     };
 }
 
-/// Re-export for [`warn_throttled!`] to expand against. Not part of the
-/// public API.
+/// Re-export for [`warn_throttled!`] to expand against; not public API.
 #[doc(hidden)]
 pub use tracing;
 
@@ -553,8 +486,7 @@ mod tests {
 
     // ── split_user_identity ──────────────────────────────────────────
 
-    /// The cases the SV1 authorize, the SV2 channel open, the JDP allocate
-    /// and the ext 0x0002 Worker-ID resolution rely on.
+    /// Pins the split every authorize/channel-open/Worker-ID path relies on.
     #[test]
     fn split_user_identity_splits_at_the_first_dot() {
         assert_eq!(split_user_identity("addr.rig1"), ("addr", Some("rig1")));
@@ -806,7 +738,6 @@ mod tests {
     proptest! {
         #[test]
         fn sats_saturating_add_never_panics(a: i64, b: i64) {
-            // Just exercising — no assertion needed; success = no panic.
             let _ = Sats(a).saturating_add(Sats(b));
         }
 
@@ -829,8 +760,6 @@ mod tests {
 
         #[test]
         fn address_shape_round_trip(s in "[!-~]{1,62}") {
-            // Any 1..=62 ASCII-graphic string round-trips through the
-            // shape-only validator.
             let a = AddressId::new(s.clone()).unwrap();
             prop_assert_eq!(a.as_str(), s.as_str());
         }

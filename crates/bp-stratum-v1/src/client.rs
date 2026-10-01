@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Per-connection session state + pure SV1 handler functions.
-//!
-//! SV1 message handlers split by inbound method. State mutations are
-//! confined to the [`SessionState`] struct; outbound frames are returned
-//! as `Vec<u8>` so the I/O layer (the server task) decides how to flush them.
-//!
-//! Side-effects (DB writes, stats fan-out, per-mode share recording,
-//! notifications) live behind the trait boundaries in `hooks.rs`. Handlers
-//! return a typed [`SessionEvent`] alongside the wire frames so the server
-//! task can drive those hooks without re-deriving the state.
+//! Per-connection SV1 session state and pure handlers. Handlers mutate only
+//! [`SessionState`] and return wire frames plus [`SessionEvent`]s, so the
+//! server task owns all I/O and drives the side-effect hooks from the events.
 
 use std::sync::Arc;
 
@@ -40,29 +33,13 @@ use bp_vardiff::{Clock, VarDiffEngine};
 
 // ── SessionState ─────────────────────────────────────────────────────
 
-/// All per-session mutable state. Owned by the server task that drives
-/// the connection; passed `&mut` into every handler so the state-machine
-/// invariants stay local.
-///
-/// **No I/O fields** — this struct never owns a socket / channel.
-/// Outbound frames produced by handlers are returned as `Vec<u8>` for
-/// the caller to flush; inbound bytes are parsed and dispatched
-/// upstream.
+/// All per-session mutable state, owned by the connection's server task.
+/// Holds no socket or channel: handlers return frames for the caller to flush.
 pub(crate) struct SessionState<C: Clock> {
-    /// BIP-310 `last_mask`: which version bits this session may change.
-    ///
-    /// Starts at the pool's advertised mask, and every `mining.configure`
-    /// **replaces** it with `server_mask & miner_mask` for that request.
-    /// A repeated configure is a fresh negotiation, so the value can move
-    /// in either direction — it is always exactly the mask the miner was
-    /// last told, which is the only thing it can act on.
-    ///
-    /// ⚠️ Starting at the advertised mask rather than at zero is a deliberate
-    /// compatibility decision. The strict BIP-310 reading gives a miner that
-    /// never ran `mining.configure` a zero mask, but ckpool, which SV1
-    /// firmware is tested against, validates every submit against the pool's
-    /// own mask. Starting at zero would reject non-configuring rollers that
-    /// ckpool accepts; strictness applies only to a mask the pool answered.
+    /// BIP-310 `last_mask`; each `mining.configure` replaces it with the mask
+    /// just sent. ⚠️ Starts at the advertised mask, not zero: SV1 firmware is
+    /// tested against ckpool, which accepts rolling without configure, so
+    /// strictness applies only to a mask the pool actually answered.
     pub version_rolling_mask: u32,
 
     // Identity
@@ -93,30 +70,21 @@ pub(crate) struct SessionState<C: Clock> {
     // Live caches mirrored back from vardiff
     pub hash_rate: f64,
 
-    /// Which TDP template stream this connection mines on. Resolved once from
-    /// the authorized address (`StreamKind::for_mode`) and then fixed for the
-    /// connection's lifetime, so the block-submit handle can never disagree
-    /// with the template the job was built on. Defaults to `Default` until
-    /// `mining.authorize` resolves it.
+    /// TDP template stream, resolved once at authorize and then fixed, so the
+    /// block-submit handle can never disagree with the template a job was
+    /// built on.
     pub stream: bp_common::StreamKind,
 
-    /// Per-share diagnostic logging toggle (server-level
-    /// `stratum_share_logs`). Copied from [`ServerConfig`] at
-    /// construction; gates the `🎯 Share difficulty` + `✅ Share
-    /// accepted` traces in [`validate_submit`].
+    /// Per-share diagnostic traces in [`validate_submit`], copied from
+    /// [`ServerConfig`].
     pub share_logs: bool,
 }
 
 impl<C: Clock> SessionState<C> {
-    /// Construct a fresh session. `clock` drives the vardiff engine.
-    /// `session_id_hex` is the 8-hex session identity (UI / DB / device
-    /// notifications): pass a freshly-generated one via
-    /// [`random_session_id_hex`] or a fixed value for deterministic tests.
-    ///
-    /// `extranonce1` is seeded from `session_id_hex` here as a fallback;
-    /// the server overwrites it right after construction with a pool-wide
-    /// collision-free prefix from `server::SharedExtranonce`, so two
-    /// sessions can never mine identical coinbases.
+    /// `extranonce1` is seeded from `session_id_hex` only as a fallback; the
+    /// server overwrites it with a pool-wide collision-free prefix
+    /// (`server::SharedExtranonce`) so two sessions never mine identical
+    /// coinbases.
     pub(crate) fn new(
         clock: C,
         server_config: &ServerConfig,
@@ -172,13 +140,8 @@ fn parse_session_id(hex_id: &str) -> [u8; 4] {
     out
 }
 
-/// Generate an 8-hex-char session id from the OS CSPRNG.
-/// 4 random bytes → BE u32 → zero-padded hex string.
-///
-/// Returns `"00000000"` if `getrandom` fails — the OS RNG only fails in
-/// pathological cases (e.g. closed FDs in a hardened seccomp sandbox),
-/// and even then a fixed session id is preferable to crashing the
-/// connection.
+/// 8-hex-char session id from the OS CSPRNG. Falls back to `"00000000"` if
+/// the RNG fails: a fixed id is better than dropping the connection.
 pub(crate) fn random_session_id_hex() -> String {
     let mut bytes = [0u8; 4];
     getrandom::getrandom(&mut bytes).unwrap_or_default();
@@ -188,43 +151,30 @@ pub(crate) fn random_session_id_hex() -> String {
 
 // ── Session-level outcomes ───────────────────────────────────────────
 
-/// What a handler decided about the session beyond the wire frames it
-/// returned. The server task uses this to drive the hooks layer
-/// (DB writes, share-stats fan-out, disconnect) without re-deriving
-/// state.
+/// What a handler decided beyond its wire frames; the server task drives the
+/// hooks from these without re-deriving state.
 #[derive(Debug)]
 pub(crate) enum SessionEvent {
-    /// Subscribe completed (sessionId pinned, extranonce assigned). The
-    /// server can log the user-agent etc. Carried for diagnostic logging
-    /// only — no hooks fire on this.
+    /// Diagnostic only; no hooks fire on it.
     Subscribed,
-    /// Authorize completed for `address` (already normalized). The
-    /// server registers the client under this address for fan-out.
-    Authorized { address: String, worker: String },
-    /// The session difficulty moved. The server counts it as a retarget
-    /// metric.
+    /// `address` is already normalized.
+    Authorized {
+        address: String,
+        worker: String,
+    },
     DifficultyChanged,
-    /// Accepted share — caller updates share-totals, runs PPLNS /
-    /// group-solo `recordShare` (if applicable), invokes the block-found
-    /// path when `is_block_candidate`.
     ShareAccepted(Box<ShareAccept>),
-    /// Rejected share — caller fans out to per-mode reject counters.
     ShareRejected {
         reason: RejectReason,
         difficulty: f64,
     },
-    /// Connection should be torn down (currently triggered only by
-    /// invalid-bitcoin-address rejection during authorize).
     Disconnect,
 }
 
-/// Result of an inbound-request handler.
 #[derive(Debug, Default)]
 pub(crate) struct HandlerOutcome {
-    /// Bytes to write to the socket, in order. Each entry is a fully
-    /// line-terminated JSON-RPC frame.
+    /// Line-terminated JSON-RPC frames, in write order.
     pub outbound_frames: Vec<Vec<u8>>,
-    /// Side-effects the server task should drive.
     pub events: Vec<SessionEvent>,
 }
 
@@ -245,15 +195,8 @@ impl HandlerOutcome {
 
 // ── Dispatch ─────────────────────────────────────────────────────────
 
-/// Parse a JSON-RPC line and dispatch to the appropriate handler.
-/// Convenience wrapper that callers (the server task) use end-to-end:
-///
-/// - JSON parse failure → empty outcome (caller closes the socket).
-/// - Validation failure → an error frame with the parsed id + error reason string.
-/// - Recognized method → matching handler.
-///
-/// The pure handlers are also exposed individually so tests can drive
-/// the state machine without re-encoding to JSON each time.
+/// Parse a JSON-RPC line and dispatch it. Unparseable JSON disconnects; a
+/// request that fails validation gets an error frame with its id.
 pub(crate) fn dispatch<C: Clock>(
     state: &mut SessionState<C>,
     server_config: &ServerConfig,
@@ -266,7 +209,6 @@ pub(crate) fn dispatch<C: Clock>(
     let request = match parse_request(line) {
         Ok(req) => req,
         Err(FrameParseError::InvalidJson) => {
-            // Surfaced as a Disconnect event with no frames.
             let mut out = HandlerOutcome::default();
             out.push_event(SessionEvent::Disconnect);
             return out;
@@ -298,10 +240,8 @@ pub(crate) fn dispatch<C: Clock>(
     }
 }
 
-/// `mining.extranonce.subscribe` — opt-in to the dynamic-extranonce extension.
-/// Acks with `{"result":true}` and nothing else: the pool never pushes
-/// `mining.set_extranonce`, so extranonce-1 stays the pool-assigned prefix
-/// from subscribe time for the whole connection.
+/// Acked and otherwise ignored: the pool never sends `mining.set_extranonce`,
+/// so extranonce-1 stays fixed for the whole connection.
 pub(crate) fn handle_extranonce_subscribe(id: RpcId) -> HandlerOutcome {
     HandlerOutcome::with_frame(write_extranonce_subscribe_response(&id))
 }
@@ -318,10 +258,8 @@ pub(crate) fn handle_subscribe<C: Clock>(
 ) -> HandlerOutcome {
     let mut out = HandlerOutcome::default();
 
-    // 1. Subscribe response. A repeated subscribe re-uses the same session
-    // id. The extranonce1 field is `state.extranonce1`, the pool-wide
-    // collision-free prefix (see `server::SharedExtranonce`), not the
-    // session id; submit rebuilds the coinbase from the same value.
+    // extranonce1 is the pool-wide prefix, not the session id: submit
+    // rebuilds the coinbase from this same value.
     let already_subscribed = state.subscription.is_some();
     state.subscription = Some(request);
     let subscription_id = state.subscription.as_ref().expect("just set").id.clone();
@@ -334,8 +272,8 @@ pub(crate) fn handle_subscribe<C: Clock>(
     ));
     out.push_event(SessionEvent::Subscribed);
 
-    // 2. ckpool-style immediate init right after the subscribe response,
-    // not gated on mining.extranonce.subscribe. A re-subscribe skips it.
+    // Init right after subscribe, as ckpool does, not gated on
+    // mining.extranonce.subscribe. A re-subscribe skips it.
     if !state.stratum_initialized && !already_subscribed {
         flush_init(
             state,
@@ -349,8 +287,6 @@ pub(crate) fn handle_subscribe<C: Clock>(
     out
 }
 
-/// Initialize the Stratum handshake. Factored out so test helpers can
-/// drive it directly without the full subscribe round-trip.
 fn flush_init<C: Clock>(
     state: &mut SessionState<C>,
     _port_config: &PortConfig,
@@ -361,13 +297,10 @@ fn flush_init<C: Clock>(
 ) {
     state.stratum_initialized = true;
 
-    // cpuminer fallback: any session whose userAgent identifies as
-    // cpuminer AND whose initial difficulty is below the high-diff
-    // threshold gets pinned to 0.1.
     if let Some(sub) = &state.subscription {
         if sub.user_agent == "cpuminer" && state.initial_difficulty < CPUMINER_HIGH_DIFF_THRESHOLD {
             let new_diff = CPUMINER_FALLBACK_DIFFICULTY;
-            // Snapshot the boundary for the ckpool race-clamp.
+            // Boundary for the ckpool race-clamp.
             state.old_session_difficulty = state.session_difficulty;
             state.diff_change_job_id = Some(registry.peek_next_job_id());
             state.session_difficulty = new_diff;
@@ -376,15 +309,12 @@ fn flush_init<C: Clock>(
         }
     }
 
-    // First set_difficulty — only if the client hadn't already supplied
-    // a `suggest_difficulty`.
     if state.suggested_difficulty.is_none() {
         out.push_frame(write_set_difficulty(state.session_difficulty));
     }
 
-    // The first mining.notify is built by the IO layer after authorize,
-    // once payouts are resolved via [`crate::hooks::PayoutResolver`];
-    // before authorize there is no address to resolve against.
+    // No notify here: the IO layer sends the first one after authorize,
+    // since payouts cannot be resolved before there is an address.
     let _ = current_template;
 }
 
@@ -394,14 +324,9 @@ pub(crate) fn handle_configure<C: Clock>(
     state: &mut SessionState<C>,
     request: ConfigureRequest,
 ) -> HandlerOutcome {
-    // BIP-310: "The server responds to the configuration message by sending
-    // a mask with common bits intersection of the miner's mask and its a
-    // mask (`response = server_mask & miner_mask`)."
-    //
-    // An absent mask field is `ffffffff` per BIP-310, so it intersects to
-    // the pool's full mask. An unreadable field gets the same treatment:
-    // it grants exactly what a miner sending no mask gets, rather than
-    // costing it version rolling entirely. It is logged.
+    // BIP-310: response = server_mask & miner_mask. An absent mask counts as
+    // `ffffffff` per BIP-310; an unreadable one is treated the same (and
+    // logged) rather than costing the miner version rolling entirely.
     let requested = match request.requested_version_rolling_mask() {
         RequestedMask::Requested(mask) => mask,
         RequestedMask::Absent => u32::MAX,
@@ -416,10 +341,8 @@ pub(crate) fn handle_configure<C: Clock>(
     };
     let negotiated = VERSION_ROLLING_MASK & requested;
 
-    // BIP-310's `last_mask` for the rest of the session. Assigned, not
-    // narrowed against the previous value: a repeated `mining.configure` is
-    // a fresh negotiation and its answer is what the miner will act on, so
-    // the stored mask has to be the one just sent.
+    // Assigned, not narrowed: a repeated configure is a fresh negotiation,
+    // and the miner acts on the mask just sent.
     state.version_rolling_mask = negotiated;
     HandlerOutcome::with_frame(write_configure_response(&request.id, negotiated))
 }
@@ -454,8 +377,7 @@ pub(crate) fn handle_authorize<C: Clock>(
         return out;
     }
 
-    // Normalise (trim + bech32-lowercase). Critical for downstream cache
-    // / PPLNS-window keys.
+    // Every cache and PPLNS-window key depends on the normalized form.
     request.address = normalize_btc_address(&request.address);
 
     // `address_to_script` covers parse failure AND network mismatch.
@@ -478,10 +400,8 @@ pub(crate) fn handle_authorize<C: Clock>(
         worker: request.worker.clone(),
     });
 
-    // The post-authorize mining.notify is the IO layer's job: on
-    // [`SessionEvent::Authorized`] it resolves payouts via
-    // [`crate::hooks::PayoutResolver`] and calls [`apply_new_template`],
-    // so this handler stays synchronous.
+    // The IO layer sends the first notify on `Authorized` after resolving
+    // payouts, so this handler stays synchronous.
     out
 }
 
@@ -502,7 +422,6 @@ pub(crate) fn handle_suggest_difficulty<C: Clock>(
         return out;
     }
     if state.used_suggested_difficulty {
-        // Silent return — second suggest is ignored.
         return out;
     }
     state.suggested_difficulty = Some(request.clone());
@@ -558,16 +477,12 @@ pub(crate) fn handle_submit<C: Clock>(
         return out;
     }
 
-    // Liveness heartbeat, once, before anything below can return early:
-    // the single choke point for "rejected shares count as alive", as in
-    // the SV2 handlers, so no early return can skip it. It goes after the
-    // two guards above because an unauthorized or unsubscribed peer is not
-    // a miner.
+    // Liveness heartbeat before any early return, so rejected shares count
+    // as alive too; after the guards, because an unauthorized or
+    // unsubscribed peer is not a miner.
     state.vardiff.note_submission();
 
-    // Project the read-only inputs inline so `state.share_cache` can be
-    // borrowed `&mut` alongside them (disjoint field borrows do not see
-    // through helper methods).
+    // Built inline so `state.share_cache` can be borrowed `&mut` alongside.
     let extranonce1 = state.extranonce1;
     let session_ctx = SessionContext {
         extranonce1: &extranonce1,
@@ -588,25 +503,18 @@ pub(crate) fn handle_submit<C: Clock>(
     match validation {
         ShareValidation::Accepted(accept) => {
             out.push_frame(write_submit_success(&id));
-            // Feed vardiff; a share counts as current-diff when its
-            // effective difficulty equals the session difficulty.
             let is_current = accept.effective_difficulty == state.session_difficulty;
             state
                 .vardiff
                 .update_hash_rate(accept.effective_difficulty, is_current);
             state.hash_rate = state.vardiff.hash_rate();
-            // The caller drives per-mode share-stats + block-found fan-
-            // out via the event; pass the full ShareAccept through.
             out.push_event(SessionEvent::ShareAccepted(accept));
         }
         ShareValidation::Rejected(reject) => {
-            // Liveness was stamped at the top. Whether this reject also
-            // resets the no-share evidence depends on the reason: a
-            // duplicate, stale or unknown job cleared the target and merely
-            // arrived wrong. `LowDifficulty` is the state the silence-easing
-            // descent has to act on, and `VersionRollingNotAllowed` is
-            // returned before the header is hashed, so it demonstrates
-            // nothing about the target.
+            // A duplicate, stale or unknown-job share cleared the target and
+            // merely arrived wrong. `LowDifficulty` is what silence-easing must
+            // act on, and `VersionRollingNotAllowed` is decided before the
+            // header is hashed, so neither proves the target was reached.
             let demonstrates_target = match reject.reason {
                 RejectReason::DuplicateShare | RejectReason::JobNotFound | RejectReason::Stale => {
                     true
@@ -628,14 +536,10 @@ pub(crate) fn handle_submit<C: Clock>(
 
 // ── Periodic vardiff check (60s timer poll) ──────────────────────────
 
-/// Difficulty validation check. Polled on the difficulty-check
-/// timer AND inline after every accepted current-diff share.
-///
-/// Returns:
-///   - empty outcome if no retarget needed
-///   - else: a `mining.set_difficulty` frame + a fresh `mining.notify`
-///     with `clean_jobs=false`: in-flight shares at the old difficulty are
-///     covered by the ckpool-style clamp, not by a job flush.
+/// Vardiff retarget, polled on the timer and after each accepted current-diff
+/// share. A retarget sends `mining.set_difficulty` plus a notify with
+/// `clean_jobs=false`: in-flight shares at the old difficulty are covered by
+/// the ckpool-style clamp, not by a job flush.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_vardiff_check<C: Clock>(
     state: &mut SessionState<C>,
@@ -650,15 +554,10 @@ pub(crate) fn apply_vardiff_check<C: Clock>(
     let mut out = HandlerOutcome::default();
     state.last_difficulty_check_ms = now_ms;
 
-    // A session can only be judged on shares it had a chance to produce,
-    // and silence counts as evidence, so two preconditions apply:
-    //
-    // - the handshake completed, or `mining.set_difficulty` would go to a
-    //   peer that has not even subscribed and count as a retarget;
-    // - a template exists, or the session was never sent a
-    //   `mining.notify` and its silence says nothing about its hashrate.
-    //   A template outage would otherwise walk every connected session
-    //   down to the descent floor and make them all flood on recovery.
+    // Silence counts as evidence, so only judge a session that could have
+    // mined: without a handshake there is no miner, and without a template
+    // an outage would walk every session down to the floor and make them
+    // all flood on recovery.
     if !state.stratum_initialized || current_template.is_none() {
         return out;
     }
@@ -670,8 +569,8 @@ pub(crate) fn apply_vardiff_check<C: Clock>(
         return out;
     }
 
-    // Snapshot the boundary BEFORE the ratchet. Any job
-    // whose id is < the upcoming next-id was issued under the old diff.
+    // Snapshot the boundary BEFORE the ratchet: any job id below the next
+    // id was issued under the old diff.
     state.old_session_difficulty = state.session_difficulty;
     state.diff_change_job_id = Some(registry.peek_next_job_id());
     state.session_difficulty = target;
@@ -680,9 +579,6 @@ pub(crate) fn apply_vardiff_check<C: Clock>(
 
     out.push_frame(write_set_difficulty(target));
 
-    // Fresh mining.notify with clean_jobs=false. The new notify carries
-    // the new target implicitly; old jobs continue at old diff until
-    // they age out (covered by the ckpool clamp).
     if let Some(template) = current_template {
         if let Some(frame) = build_and_register_notify(
             state,
@@ -703,13 +599,8 @@ pub(crate) fn apply_vardiff_check<C: Clock>(
 
 // ── New-template event (server-driven; see translator in notify.rs) ──
 
-/// Push a fresh mining.notify when the assembler produces an
-/// [`bp_template_distribution::TemplateChange`]. `clean_jobs` boolean is true on
-/// `SetNewPrevHash`, false on `NewTemplate(future=false)` refreshes.
-///
-/// Side-effects:
-///   - allocates a new jobId in the registry,
-///   - clears the dedup cache on `clean_jobs=true`.
+/// Push a notify for a [`bp_template_distribution::TemplateChange`].
+/// `clean_jobs` is true on a new prevhash, which also clears the dedup cache.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_new_template<C: Clock>(
     state: &mut SessionState<C>,
@@ -745,17 +636,10 @@ pub(crate) fn apply_new_template<C: Clock>(
     out
 }
 
-/// Build the per-miner [`bp_mining_job::MiningJob`] for `template` +
-/// `payouts`, register it in the [`JobRegistry`], and produce the
-/// wire bytes for the resulting `mining.notify`. Returns `None` when
-/// `payouts` is empty (early return when no payout target is
-/// resolvable).
-///
-/// `payouts` is supplied by the caller because resolution may be
-/// async (PPLNS / Group-Solo distributions are read from the engine
-/// crates). The IO-layer connection loop async-resolves payouts at
-/// template-broadcast / authorize time via the
-/// [`crate::hooks::PayoutResolver`] hook and threads them down here.
+/// Build and register the [`bp_mining_job::MiningJob`] and return its notify.
+/// MONEY: `None` for an empty payout list, which means "serve no job"; a
+/// coinbase for it would pay this one miner the whole block. `payouts` comes
+/// from the caller because resolving it is async.
 #[allow(clippy::too_many_arguments)]
 fn build_and_register_notify<C: Clock>(
     state: &SessionState<C>,
@@ -781,9 +665,8 @@ fn build_and_register_notify<C: Clock>(
         coinbase_tx_outputs_count: template.coinbase_tx_outputs_count,
         coinbase_tx_locktime: template.coinbase_tx_locktime,
     };
-    // Pool-wide memoized build: SV1 always uses the fixed
-    // EXTRANONCE_SLOT_LEN, so every connection with the same payout set
-    // (all of PPLNS) shares literally ONE `MiningJob` per template.
+    // Memoized pool-wide: SV1 always uses EXTRANONCE_SLOT_LEN, so every
+    // connection with the same payout set shares ONE `MiningJob` per template.
     let mining_job = job_cache
         .get_or_build(
             state.network,
@@ -802,8 +685,6 @@ fn build_and_register_notify<C: Clock>(
         })
         .ok()?;
 
-    // `template.clone()` is an Arc refcount bump — the registry shares
-    // the one template allocation across every connection's registration.
     let template_id_hex = registry.add_template_shared(template.clone(), now_ms);
     let job_id_hex = registry.add_job_shared(mining_job.clone(), template_id_hex, now_ms);
     Some(build_notify_frame(
@@ -840,9 +721,7 @@ mod tests {
         Arc::new(JobRegistry::from_server_config(&server_config()))
     }
 
-    /// The vardiff tick refuses to judge a session that could not have
-    /// mined (no handshake, or no template ever issued); tests that want a
-    /// retarget have to satisfy both.
+    /// Vardiff only judges a session with a handshake and a template.
     fn mineable_template() -> Arc<ActiveSV1Template> {
         let t = ActiveSV1Template::from_template(bp_template_distribution::ActiveTemplate {
             template_id: 1,
@@ -867,16 +746,8 @@ mod tests {
         SessionState::new(clock, &server_config(), port, "abcd1234".to_string())
     }
 
-    /// MONEY: an empty payout list is the resolver saying "serve no job"
-    /// because its distribution could not be built. Answering it with a
-    /// coinbase would mean paying this one miner the whole block, so a
-    /// transient Postgres or Redis fault would cost every other miner in
-    /// the window their share. No `mining.notify` goes out and the miner
-    /// keeps hashing the job it holds.
-    ///
-    /// This pins the OUTCOME, not one guard: `MiningJobCache` and
-    /// `build_payout_outputs` refuse an empty list too, and the no-job
-    /// policy depends on the outcome, not on which layer enforces it.
+    /// MONEY: an empty payout list ("serve no job") yields no notify, whichever
+    /// layer enforces it, so a resolver fault never pays one miner the block.
     #[test]
     fn no_notify_is_built_when_the_resolver_serves_no_job() {
         let port = solo_port(1.0);
@@ -900,8 +771,7 @@ mod tests {
             "an empty payout list must produce NO mining.notify"
         );
 
-        // Control: the same call with a real list DOES produce one, so the
-        // assertion above cannot pass for an unrelated reason.
+        // Control: a real list DOES produce one.
         let out = build_and_register_notify(
             &state,
             &server_config(),
@@ -949,26 +819,21 @@ mod tests {
     // Real regtest bech32 — accepted by `address_to_script(Network::Regtest, ...)`.
     const REGTEST_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
-    /// Parse a `mining.notify` frame and assert its header-constant params
-    /// carry `template_for_regtest`'s real values. Pins that the production
-    /// path emits proper header hex — a desynced fixture (empty cache) would
-    /// emit `""` for these and this catches it.
+    /// Asserts the notify carries `template_for_regtest`'s real header values,
+    /// not the `""` a desynced fixture would emit.
     fn assert_regtest_notify_header(frame: &[u8]) {
         let v: serde_json::Value =
             serde_json::from_slice(&frame[..frame.len() - 1]).expect("notify is JSON");
         let p = v["params"].as_array().expect("params array");
-        // prev_hash [0xAB; 32] word-swapped is identity (all four-byte words
-        // are 0xABABABAB), so the advertised prevhash is 64× 'ab'.
+        // Word-swapping [0xAB; 32] is the identity.
         assert_eq!(p[1].as_str().unwrap(), "ab".repeat(32), "prevhash");
         assert_eq!(p[5].as_str().unwrap(), "20000000", "version");
         assert_eq!(p[6].as_str().unwrap(), "207fffff", "nbits");
         assert!(!p[7].as_str().unwrap().is_empty(), "ntime present");
     }
 
-    /// Test fixture: builds a `SubscribeRequest` with the **refined** UA
-    /// (`bp_common::normalize_user_agent` strips `/version` and collapses known firmware
-    /// tags). Pass the raw UA; the fixture mirrors the parser's behavior
-    /// so the in-engine `== "cpuminer"` check fires as it would in prod.
+    /// Normalizes the raw UA as the parser does, so the `== "cpuminer"`
+    /// check fires as it would in production.
     fn subscribe_req(raw_ua: Option<&str>) -> SubscribeRequest {
         let refined = raw_ua
             .map(bp_common::normalize_user_agent)
@@ -990,10 +855,6 @@ mod tests {
         }
     }
 
-    /// Solo-mode single-output payout fixture for the
-    /// `apply_new_template` / `apply_vardiff_check` tests; in production
-    /// the IO-layer connection loop resolves it via
-    /// [`crate::hooks::PayoutResolver`].
     fn solo_payouts_fixture(addr: &str) -> ResolvedPayouts {
         ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
             address: addr.to_string(),
@@ -1013,9 +874,7 @@ mod tests {
         let mut out = HandlerOutcome::default();
         flush_init(&mut state, &port, &reg, None, 0, &mut out);
 
-        // First out-frame is set_difficulty (no suggested-diff seen).
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
-        // 0.1 → integer-valued? No: 0.1.fract() != 0 → float.
         assert!(s.contains("\"params\":[0.1]"));
         assert_eq!(state.session_difficulty, 0.1);
     }
@@ -1052,7 +911,6 @@ mod tests {
         assert_eq!(out.outbound_frames.len(), 1);
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert!(s.contains("Suggest difficulty is disabled for this connection"));
-        // Session difficulty unchanged from its initial.
         assert_eq!(state.session_difficulty, 1_000_000.0);
         assert!(!state.used_suggested_difficulty);
     }
@@ -1072,8 +930,7 @@ mod tests {
             subscribe_req(Some("cgminer/4.11.1")),
             0,
         );
-        // First frame: subscribe response. Second frame: set_difficulty
-        // (no clientSuggestedDifficulty + no template).
+        // Subscribe response, then set_difficulty.
         assert!(out.outbound_frames.len() >= 2);
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         // Wire format: [[["mining.notify", sid]], ext1, 8].
@@ -1084,13 +941,10 @@ mod tests {
 
     #[test]
     fn subscribe_response_carries_allocated_extranonce1_not_session_id() {
-        // The server assigns a pool-wide collision-free extranonce1 that is
-        // decoupled from the (random) session id. The subscribe response
-        // must carry that allocated prefix as the extranonce1 field while
-        // keeping the session id in the mining.notify subscription tuple.
+        // Pins: extranonce1 field is the allocated prefix, the session id
+        // stays in the mining.notify subscription tuple.
         let port = solo_port(16384.0);
         let mut state = fresh_state(TestClock::new(0), &port); // session id "abcd1234"
-                                                               // Simulate a worker-1 allocated prefix distinct from the session id.
         state.extranonce1 = [0x01, 0x00, 0x00, 0x2a];
         let reg = empty_registry();
         let out = handle_subscribe(
@@ -1102,12 +956,10 @@ mod tests {
             0,
         );
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
-        // Session id stays as the subscription id (notify tuple)...
         assert!(
             s.contains("\"abcd1234\""),
             "session id must remain the subscription id: {s}"
         );
-        // ...but the extranonce1 field is the allocated prefix, not the session id.
         assert!(
             s.contains("\"0100002a\""),
             "extranonce1 must be the allocated prefix 0100002a: {s}"
@@ -1116,10 +968,8 @@ mod tests {
 
     #[test]
     fn subscribe_does_not_send_notify_inline_anymore() {
-        // Even on an already-authorized connection (unusual but legal),
-        // the handler emits only subscribe-response + set_difficulty; the
-        // notify is built by the IO-layer connection loop once payouts
-        // are resolved via the `PayoutResolver` hook.
+        // Pins: even when already authorized, subscribe sends no notify and
+        // touches no registry; the IO layer builds it after resolving payouts.
         let port = solo_port(16384.0);
         let mut state = fresh_state(TestClock::new(0), &port);
         state.authorization = Some(authorize_req(REGTEST_ADDR));
@@ -1133,12 +983,9 @@ mod tests {
             subscribe_req(Some("cgminer/4.11.1")),
             0,
         );
-        // Frames: subscribe response + set_difficulty. NO notify.
         assert_eq!(out.outbound_frames.len(), 2);
         let last = std::str::from_utf8(out.outbound_frames.last().unwrap()).unwrap();
         assert!(last.contains("\"mining.set_difficulty\""));
-        // Registry untouched: notify-build (and its registry insert)
-        // happens at the IO layer.
         assert_eq!(reg.job_count(), 0);
         assert_eq!(reg.template_count(), 0);
     }
@@ -1176,11 +1023,8 @@ mod tests {
         s[start..start + 8].to_string()
     }
 
-    /// An unreadable `version-rolling.mask` must cost the miner nothing.
-    ///
-    /// Reading it as `ffffffff` would let a typo widen what the miner is
-    /// granted, and reading it as `0` would take its version rolling away.
-    /// The advertised mask is what a miner sending no mask already gets.
+    /// An unreadable `version-rolling.mask` gets the advertised mask: neither
+    /// widened by a typo nor costing the miner its version rolling.
     #[test]
     fn an_unreadable_mask_falls_back_to_the_advertised_mask() {
         for bad in [
@@ -1205,9 +1049,7 @@ mod tests {
             );
         }
 
-        // Negative control: a readable mask is still honoured, so the
-        // cases above are about unreadability and not about the parser
-        // having stopped working.
+        // Negative control: a readable mask is still honoured.
         assert_eq!(
             negotiated_mask_hex(serde_json::json!([
                 ["version-rolling"],
@@ -1217,9 +1059,7 @@ mod tests {
         );
     }
 
-    /// A session that has not run `mining.configure` starts at the pool's
-    /// advertised mask, not at zero (the ckpool-compatibility decision on
-    /// `SessionState::version_rolling_mask`).
+    /// A session without `mining.configure` starts at the advertised mask, not zero.
     #[test]
     fn a_fresh_session_starts_at_the_advertised_mask() {
         let port = solo_port(16384.0);
@@ -1233,16 +1073,12 @@ mod tests {
         let (s, stored) = configure(serde_json::json!([]));
         assert!(s.contains("\"version-rolling\":true"));
         assert!(s.contains("\"version-rolling.mask\":\"1fffe000\""));
-        // The negotiated mask becomes BIP-310's `last_mask` for the session.
         assert_eq!(stored, 0x1fffe000);
     }
 
-    /// BIP-310: "The server responds to the configuration message by sending
-    /// a mask with common bits intersection of the miner's mask and its a
-    /// mask (`response = server_mask & miner_mask`)."
+    /// BIP-310: `response = server_mask & miner_mask`.
     #[test]
     fn the_response_is_the_intersection_of_server_and_miner_mask() {
-        // What shipping firmware asks for: the full advertised mask.
         assert_eq!(
             negotiated_mask_hex(serde_json::json!([
                 ["version-rolling"],
@@ -1250,8 +1086,7 @@ mod tests {
             ])),
             "1fffe000"
         );
-        // Asks for a subset -> gets exactly that subset. Answering with more
-        // than was asked for is what BIP-310 forbids.
+        // A subset gets exactly that subset; BIP-310 forbids answering more.
         assert_eq!(
             negotiated_mask_hex(serde_json::json!([
                 ["version-rolling"],
@@ -1259,8 +1094,7 @@ mod tests {
             ])),
             "00c00000"
         );
-        // Asks for bits the pool does not grant -> those drop out, the rest
-        // survives.
+        // Bits the pool does not grant drop out.
         assert_eq!(
             negotiated_mask_hex(serde_json::json!([
                 ["version-rolling"],
@@ -1270,12 +1104,8 @@ mod tests {
         );
     }
 
-    /// BIP-310 makes the mask field OPTIONAL with default `"ffffffff"`:
-    /// "A miner doesn't have to send the mask, in this case a default full
-    /// mask is used."
-    ///
-    /// Reading an absent field as zero instead would answer such a miner
-    /// with `00000000` and switch its version rolling off.
+    /// BIP-310: an absent mask defaults to `ffffffff`; reading it as zero
+    /// would switch the miner's version rolling off.
     #[test]
     fn an_absent_mask_field_means_everything_not_nothing() {
         for params in [
@@ -1288,8 +1118,7 @@ mod tests {
                 "absent mask must intersect to the full server mask for {params}"
             );
         }
-        // Negative control: an *explicit* zero is honoured as zero, so the
-        // cases above really are about absence.
+        // Negative control: an *explicit* zero is honoured as zero.
         assert_eq!(
             negotiated_mask_hex(serde_json::json!([
                 ["version-rolling"],
@@ -1304,7 +1133,6 @@ mod tests {
     #[test]
     fn extranonce_subscribe_acks() {
         let out = handle_extranonce_subscribe(RpcId::from(7));
-        // Acked with {"result":true} carrying the request id.
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert_eq!(s, "{\"id\":7,\"error\":null,\"result\":true}\n");
     }
@@ -1327,7 +1155,6 @@ mod tests {
         );
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert!(s.contains("\"result\":true"));
-        // Event signal for the hooks layer.
         assert!(out
             .events
             .iter()
@@ -1396,7 +1223,6 @@ mod tests {
             suggested_difficulty: 64.0,
         };
         let out = handle_suggest_difficulty(&mut state, &port, &reg, req, 0);
-        // Clamped UP to 1000.
         assert_eq!(state.session_difficulty, 1000.0);
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert!(s.contains("\"params\":[1000]"));
@@ -1457,20 +1283,13 @@ mod tests {
             1_000,
         );
         assert!(out.outbound_frames.is_empty());
-        // last_difficulty_check_ms is still updated.
         assert_eq!(state.last_difficulty_check_ms, 1_000);
     }
 
     // ── silence easing wiring ────────────────────────────────────────
-    //
-    // The engine math is unit-tested in bp-vardiff; these prove the
-    // operator switch survives ServerConfig → SessionState → engine and
-    // produces (or withholds) a real `mining.set_difficulty` frame.
-    //
-    // Setup: 30 accepted shares at the session's own 16384, 10 s apart —
-    // equilibrium for the default 6/min target (closed-window target
-    // ≈ 16949, inside the 2× deadband), so the share-driven math alone
-    // never retargets and anything observed is the silence path.
+    // These prove the operator switch reaches the wire. `eased_session` sits
+    // at equilibrium (30 shares at 16384, 10 s apart), so any retarget
+    // observed comes from the silence path.
 
     fn eased_session(
         easing: bool,
@@ -1488,10 +1307,8 @@ mod tests {
         (state, sc, port)
     }
 
-    /// SV1 has no hashrate advertisement, so an over-assigned session is
-    /// simply one that connected to a port whose start difficulty it cannot
-    /// reach. The silence-easing switch walks it down, and the reduction
-    /// reaches the wire.
+    /// A session that never reaches its port's start difficulty is eased
+    /// down on the wire.
     #[test]
     fn a_session_with_no_share_ever_is_eased_down_on_the_wire() {
         let clock = Arc::new(TestClock::new(0));
@@ -1500,7 +1317,6 @@ mod tests {
         let port = solo_port(1_000_000.0); // a high-diff port
         let mut state = SessionState::new(clock.clone(), &sc, &port, "abcd1234".to_string());
         state.stratum_initialized = true;
-        // No update_hash_rate call anywhere: not one share was ever accepted.
         clock.advance_ms(61_000);
         let out = apply_vardiff_check(
             &mut state,
@@ -1574,9 +1390,8 @@ mod tests {
     fn silence_easing_config_reaches_the_wire() {
         let clock = Arc::new(TestClock::new(0));
         let (mut state, sc, port) = eased_session(true, &clock);
-        // 400 s of silence: total window 690 s → target ≈ 7124 < 8192
-        // (= client/2) → retarget. The ladder is powers of two rounded UP, so
-        // 7124 lands on 8192, one eased step down from 16384.
+        // 400 s of silence: target ≈ 7124, below half of 16384, rounds UP
+        // on the power-of-two ladder to 8192.
         clock.advance_ms(400_000);
         let out = apply_vardiff_check(
             &mut state,
@@ -1602,24 +1417,19 @@ mod tests {
 
     #[test]
     fn a_rejected_share_holds_the_easing_back() {
-        // A VALIDATION reject (unknown job id from a fully set-up session)
-        // stamps the liveness heartbeat, so the silence clock restarts and
-        // the check that would have eased holds. Pre-handshake errors (not
-        // subscribed / unauthorized) do NOT stamp: they are not evidence
-        // of a hashing miner.
+        // Pins: a validation reject restarts the silence clock, so the check
+        // that would have eased holds.
         let clock = Arc::new(TestClock::new(0));
         let (mut state, sc, port) = eased_session(true, &clock);
         state.stratum_initialized = true;
         state.authorization = Some(authorize_req(REGTEST_ADDR));
         clock.advance_ms(390_000);
-        // Rejected share at t+390 s — unknown job → validation reject.
         let reg = empty_registry();
         let out = handle_submit(&mut state, &reg, submit_req("1"), clock.now_ms());
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert!(s.contains("error"), "expected a reject frame, got {s}");
         clock.advance_ms(10_000);
-        // t+400 s: without the reject this eased (see the wire test);
-        // with it, the tail is 10 s and the difficulty holds.
+        // t+400 s eases without the reject (see the wire test).
         let out = apply_vardiff_check(
             &mut state,
             &sc,
@@ -1645,7 +1455,6 @@ mod tests {
         let mut state = fresh_state(TestClock::new(0), &port);
         state.stratum_initialized = true;
         state.authorization = Some(authorize_req(REGTEST_ADDR));
-        // One share already in the dedup cache.
         state.share_cache.record(&submit_req("99"));
         assert!(!state.share_cache.is_empty());
 

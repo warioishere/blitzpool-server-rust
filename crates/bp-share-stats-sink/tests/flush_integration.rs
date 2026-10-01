@@ -3,12 +3,9 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! Integration tests for `flush_once` against docker-PG. Drives the
-//! whole drain → bulk-upsert → confirm pipeline for one tick at a time.
-//!
-//! Each test wraps the multi-table assertions in a suite-wide mutex
-//! plus prefix-based cleanup — `flush_once` takes a `PgPool` (not a
-//! transaction), so TX-rollback isolation doesn't fit.
+//! `flush_once` against PG, one drain → upsert → confirm tick at a time.
+//! `flush_once` takes a `PgPool`, not a transaction, so tests isolate via a
+//! suite-wide mutex and prefix-based cleanup instead of rollback.
 
 use std::sync::Arc;
 
@@ -110,9 +107,8 @@ async fn flush_once_drains_all_seven_tables_to_pg() {
     .await
     .expect("seed addr row");
 
-    // Drive accumulators: pretend one accepted + one rejected share. The
-    // accepted one is credited at 10 but solved 4096, which only the slot
-    // maximum records.
+    // One accepted share credited at 10 but solved at 4096 (only the slot
+    // maximum records that), plus one rejected.
     let accs = Arc::new(Accumulators::default());
     accs.pool_shares.add_accepted(slot, 10.0, 4096.0);
     accs.pool_shares.add_rejected(slot, 1.0);
@@ -260,10 +256,8 @@ async fn flush_once_drains_all_seven_tables_to_pg() {
     cleanup(&pool, slot.as_millis(), prefix).await;
 }
 
-/// The best-difficulty accumulator folds the window max into
-/// `address_settings_entity."bestDifficulty"` via GREATEST at flush time —
-/// end-to-end (accumulator → `flush_once` → PG), no per-share write, no
-/// pre-existing row required.
+/// Pins that the flush folds the window's best difficulty into
+/// `address_settings_entity` via GREATEST, inserting the row if missing.
 #[tokio::test]
 async fn flush_once_folds_best_difficulty_via_greatest() {
     let _guard = FLUSH_TEST_LOCK.lock().await;
@@ -356,11 +350,8 @@ async fn replay_idempotency_double_flush_doubles_counts() {
     let prefix = "test_flush_replay_";
     cleanup(&pool, slot.as_millis(), prefix).await;
 
-    // Two consecutive flushes of the same accepted-share batch ⇒
-    // counts should be 2× (INCREMENT semantics). Models the situation
-    // where the coordinator restarted after PG succeeded but the
-    // accumulator never confirmed, and a new tick re-includes the
-    // same snapshot.
+    // Flushes INCREMENT, so re-flushing an unconfirmed snapshot (PG
+    // committed, confirm lost) double-counts it.
     let accs1 = Arc::new(Accumulators::default());
     accs1.pool_shares.add_accepted(slot, 5.0, 5.0);
     let health1 = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
@@ -388,8 +379,7 @@ async fn replay_idempotency_double_flush_doubles_counts() {
 
 #[tokio::test]
 async fn health_monitor_tracks_success_after_single_clean_flush() {
-    // Sanity that the FlushHealth surface is wired — single-flush, no
-    // failures, no degraded state.
+    // One clean flush leaves the health monitor un-degraded.
     let _guard = FLUSH_TEST_LOCK.lock().await;
     let Some(pool) = connect_or_skip().await else {
         return;

@@ -1,22 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Token primitives — generation, hashing, constant-time verification.
-//!
-//! Two token shapes:
-//!
-//! - **Admin tokens** prefixed with `GRP-` — handed to the group creator
-//!   exactly once and used for every admin action (member add/remove,
-//!   round-reset config update, dissolve, transfer). 24 bytes of CSPRNG
-//!   entropy ≈ 192 bits.
-//! - **Invitation tokens** without prefix — embedded in invitation /
-//!   open-invite URLs. 32 bytes of CSPRNG entropy = 256 bits. The
-//!   extra entropy reflects that invitation links are pasted into chat
-//!   apps / forwarded by humans, so a slightly larger search space is
-//!   worth the longer URL.
-//!
-//! Both are stored as **hashes** (`sha256` hex) in the DB; the plaintext
-//! is only ever returned to the human-in-the-loop once. Verification is
-//! constant-time via [`subtle::ConstantTimeEq`].
+//! Admin tokens (`GRP-` + 24 random bytes) and invitation tokens (32 random
+//! bytes; links get forwarded around, so the larger space is worth the
+//! longer URL). Only the SHA-256 hex is stored, the plaintext is shown
+//! once, and verification is constant-time via [`subtle::ConstantTimeEq`].
 
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -41,18 +28,15 @@ pub enum TokenError {
 }
 
 impl AdminToken {
-    /// Generate a fresh admin token. Returns the plaintext — caller
-    /// must hash it before persisting and surface the plaintext to
-    /// the human exactly once.
+    /// The caller persists only the hash and shows the plaintext once.
     pub fn generate() -> Result<Self, TokenError> {
         let mut bytes = [0u8; 24];
         getrandom::getrandom(&mut bytes).map_err(|e| TokenError::Csprng(e.to_string()))?;
         Ok(Self(format!("GRP-{}", hex::encode(bytes))))
     }
 
-    /// View the cleartext. Use sparingly — anything that persists or
-    /// transmits this string outside the create / transfer response is
-    /// a bug.
+    /// Persisting or transmitting this outside the create / transfer
+    /// response is a bug.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -62,7 +46,6 @@ impl AdminToken {
         self.0
     }
 
-    /// Hash this token for persistence.
     pub fn hash(&self) -> TokenHash {
         TokenHash::of_str(&self.0)
     }
@@ -96,9 +79,8 @@ impl TokenHash {
         Self(hex::encode(h.finalize()))
     }
 
-    /// Constant-time check that `provided` hashes to the same value as
-    /// `self`. Returns `false` on any length mismatch as a fast path,
-    /// then compares byte-by-byte without short-circuiting.
+    /// Constant-time comparison, so response timing does not leak how
+    /// much of a guessed hash matched.
     pub fn verifies(&self, provided: &str) -> bool {
         let candidate = Self::of_str(provided);
         if candidate.0.len() != self.0.len() {
@@ -107,7 +89,6 @@ impl TokenHash {
         candidate.0.as_bytes().ct_eq(self.0.as_bytes()).into()
     }
 
-    /// Inner hex string. Used by `bp-db` to set the column value.
     pub fn as_str(&self) -> &str {
         &self.0
     }

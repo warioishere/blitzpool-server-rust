@@ -29,8 +29,6 @@ impl PoolRejectedAccumulator {
         }
     }
 
-    /// Record `count` shares rejected against `(slot, reason)`. Typical
-    /// hot-path call has `count = 1.0`.
     pub fn add(&self, slot: TimeSlot, reason: RejectedReason, count: f64) {
         if !count.is_finite() || count <= 0.0 {
             return;

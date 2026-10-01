@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `BlockpartyService` — group lifecycle FSM, token-gated mutations,
-//! routing cache, and the share/block hooks.
-//!
-//! ## Load-bearing invariant
-//!
-//! Every method that changes a party's `status` column **must** also
-//! call [`BlockpartyCache::set_admin_status`] for the new value. If the
-//! cache drifts from the DB the routing guards either pin shares to the
-//! pool-fee fallback for a confirmed party, or skip the Blockparty
-//! coinbase for one whose members have all confirmed. Every
-//! status-mutation site has a matching `set_admin_status` call.
+//! `BlockpartyService`: group lifecycle, token-gated mutations, routing cache.
+//! Invariant: every change to a party's `status` must also call
+//! [`BlockpartyCache::set_admin_status`], or routing drifts from the DB and
+//! pays a confirmed party's block to the pool fee (or skips its coinbase).
 
 use std::sync::Arc;
 
@@ -36,15 +29,13 @@ use bp_common::now_ms;
 
 // ─── Config + result types ─────────────────────────────────────────
 
-/// Construction-time config knobs. The pool fee address + percent are
-/// resolved by the bin/blitzpool boot layer (`[group_fees].address`/`.percent`,
-/// address falling back to `[pplns].fee_address`) and handed in as values.
+/// Fee address and percent are resolved by the boot layer and passed in.
 #[derive(Clone, Debug)]
 pub struct BlockpartyServiceConfig {
     pub fee_address: Option<AddressId>,
     pub fee_percent: f64,
-    /// Operational dust floor for per-member coinbase outputs. Clamped
-    /// to ≥ `bp_blockparty::DUST_LIMIT_SATS` at distribution time.
+    /// Dust floor per member output; clamped to at least
+    /// `bp_blockparty::DUST_LIMIT_SATS`.
     pub min_payout_sats: bp_common::Sats,
 }
 
@@ -58,25 +49,13 @@ impl Default for BlockpartyServiceConfig {
     }
 }
 
-/// Hook that re-sizes the Blockparty coinbase reservation to fit a party's
-/// confirmed roster. Called at the `Confirming → Ready` transition — the point
-/// the roster is final-for-now and the party becomes routable (Ready miners
-/// build the party coinbase, and the first share flips it to Active). Any later
-/// roster edit bounces the party back through `Confirming`, so each `→ Ready`
-/// carries the current member count.
-///
-/// Decoupled from the TDP layer on purpose: the bin implements it over the
-/// Blockparty `TdpHandle`; the engine just signals "this many members are about
-/// to mine". Implementations are high-water-mark (only raise) above a floor.
-///
-/// **Validity note:** a raise reaches bitcoin-core templates within ~one TDP
-/// cycle, so this is *headroom above a floor that already covers the typical
-/// party*, not the sole guarantee — keep `[blockparty].coinbase_weight_budget`
-/// ≥ your realistic max party so the common case never needs a (lagging) raise.
+/// Re-sizes the Blockparty coinbase reservation at `Confirming → Ready`,
+/// when the roster becomes routable. High-water only. A raise reaches
+/// templates one TDP cycle late, so `[blockparty].coinbase_weight_budget`
+/// must already cover a realistic party; this is only headroom.
 #[async_trait::async_trait]
 pub trait CoinbaseReservation: Send + Sync {
-    /// Ensure the Blockparty coinbase reservation can hold `member_count`
-    /// member outputs plus the pool-fee output. Idempotent / high-water.
+    /// Room for `member_count` member outputs plus the pool-fee output.
     async fn ensure_capacity_for_members(&self, member_count: usize);
 }
 
@@ -86,22 +65,18 @@ pub struct BlockpartyCreateResult {
     pub admin_member: BlockpartyMemberRow,
     /// Plaintext admin token — surfaces to the human exactly once.
     pub admin_token: String,
-    /// Echoed back for the create-response so the UI doesn't need to
-    /// re-fetch config to display "you'll be charged X% on each block".
     pub pool_fee_percent: f64,
 }
 
 #[derive(Debug)]
 pub struct MarkMemberConfirmedResult {
-    /// `Some` when this confirmation minted a fresh persistent token
-    /// (first accept or post-reset). `None` when the member already had
-    /// a token (idempotent re-confirm via the persistent token).
+    /// `Some` only when this confirmation minted a fresh token; a re-confirm
+    /// with the existing token returns `None`.
     pub member_token: Option<String>,
 }
 
-/// Result of [`BlockpartyService::pending_party_fee_route`]. Names the
-/// pool-fee address the Solo-fallback path must pay the WHOLE block reward
-/// to when the admin's address belongs to an unconfirmed party.
+/// The address that receives the WHOLE block reward when the admin of an
+/// unconfirmed party mines on the Solo fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingPartyFeeRoute {
     pub fee_address: AddressId,
@@ -113,18 +88,13 @@ pub struct BlockpartyService<H: BlockpartyHooks> {
     pool: PgPool,
     hooks: Arc<H>,
     cache: BlockpartyCache,
-    /// PplnsGroup cache — read-only here, used for the bidirectional
-    /// mode-collision check on `create_group` / `add_member`.
+    /// Read-only; for the mode-collision check against PPLNS groups.
     pplns_cache: PplnsAddressCache,
     config: BlockpartyServiceConfig,
-    /// Optional coinbase-reservation hook — sizes the Blockparty TDP stream's
-    /// reservation to a party's roster at `→ Ready`. `None` in tests and when
-    /// the Blockparty TDP stream isn't wired (`--skip-tdp`).
+    /// `None` in tests and when the Blockparty TDP stream is not wired.
     reservation: Option<Arc<dyn CoinbaseReservation>>,
-    /// Optional cross-process cache-invalidation notifier (set-once). When set,
-    /// every public mutation publishes a `"blockparty"` invalidation so a
-    /// separate Stratum Front rebuilds its routing cache. Unset where no
-    /// cross-process notification is needed (e.g. tests).
+    /// Publishes a `"blockparty"` invalidation on every mutation so a
+    /// separate Stratum Front rebuilds its routing cache.
     change_notifier:
         Arc<std::sync::OnceLock<Arc<dyn bp_group_mgmt_engine::MembershipChangeNotifier>>>,
 }
@@ -147,9 +117,7 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         }
     }
 
-    /// Attach the cross-process cache-invalidation notifier (idempotent, set-
-    /// once). Wire on the process hosting the API writers so a party status
-    /// change reaches a separate Front's routing cache.
+    /// Set-once. Wire on the process hosting the API writers.
     pub fn set_change_notifier(
         &self,
         notifier: Arc<dyn bp_group_mgmt_engine::MembershipChangeNotifier>,
@@ -157,17 +125,15 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         let _ = self.change_notifier.set(notifier);
     }
 
-    /// Fire the cross-process invalidation (best-effort). `"blockparty"` matches
-    /// `bp_share_stream::cache_kind::BLOCKPARTY`. No-op until a notifier is set.
+    /// Best-effort. `"blockparty"` must match
+    /// `bp_share_stream::cache_kind::BLOCKPARTY`.
     async fn notify_changed(&self) {
         if let Some(n) = self.change_notifier.get() {
             n.membership_changed("blockparty").await;
         }
     }
 
-    /// Attach the coinbase-reservation hook (the bin's Blockparty TDP-stream
-    /// sizer). `None` leaves the reservation fixed at its configured floor.
-    /// Builder-style so it can be chained before the service is `Arc`-wrapped.
+    /// `None` leaves the reservation at its configured floor.
     pub fn with_coinbase_reservation(
         mut self,
         reservation: Option<Arc<dyn CoinbaseReservation>>,
@@ -176,27 +142,20 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         self
     }
 
-    /// Expose the cache for downstream consumers (stratum layer, bp-api
-    /// hot-path readers). Clones are cheap — `Arc` under the hood.
     pub fn cache(&self) -> BlockpartyCache {
         self.cache.clone()
     }
 
-    /// Borrow the hooks bundle — used by the invitation service to
-    /// pull verified email bindings without duplicating the hook trait.
     pub fn hooks(&self) -> &H {
         &self.hooks
     }
 
-    /// Read access to the wrapped PgPool — used by the invitation
-    /// service for the few raw queries it does outside `bp_db::*`.
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
 
-    /// Full rebuild from PG. Call once at boot before the stratum layer
-    /// starts handing shares; subsequent state-transition methods keep
-    /// the cache in sync via [`BlockpartyCache::set_admin_status`] etc.
+    /// Full rebuild from PG. Call once at boot before shares are routed;
+    /// the state-transition methods keep the cache in sync afterwards.
     pub async fn rebuild_cache(&self) -> Result<(), BlockpartyServiceError> {
         self.cache.rebuild(&self.pool).await
     }
@@ -216,10 +175,8 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         self.cache.routable_group_id_for_admin(address).await
     }
 
-    /// Returns a concrete fee output when the admin's address belongs
-    /// to a DRAFT/CONFIRMING party AND the pool has a configured fee
-    /// address. `None` otherwise — the caller then falls through to
-    /// the standard Solo coinbase.
+    /// `Some` when the admin's party is draft/confirming and a fee address
+    /// is configured; `None` means the plain Solo coinbase.
     pub async fn pending_party_fee_route(
         &self,
         address: &AddressId,
@@ -229,8 +186,7 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         Some(PendingPartyFeeRoute { fee_address })
     }
 
-    /// Member-side lookup. Returns the party's group id if `address`
-    /// is a member of any non-dissolved party.
+    /// Group id of the non-dissolved party `address` is a member of.
     pub async fn member_group_id(&self, address: &AddressId) -> Option<Uuid> {
         self.cache.member_group_id(address).await
     }
@@ -256,10 +212,8 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         Ok(bp_db::list_blockparty_block_history(&self.pool, group_id).await?)
     }
 
-    /// Build the coinbase payout distribution for a found block: pure-
-    /// function math over the current member roster + config. Returns
-    /// `Ok(None)` when the group does not exist (no panic for the
-    /// stratum-hot path).
+    /// Coinbase distribution over the current roster; `Ok(None)` when the
+    /// group does not exist.
     pub async fn build_payouts(
         &self,
         group_id: Uuid,
@@ -291,9 +245,8 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
 
     // ─── Token gating ──────────────────────────────────────────────
 
-    /// Resolve `(group, validated)` for an admin-token request. Returns
-    /// `InvalidToken` on any mismatch, `MissingToken` if the caller
-    /// supplied `None`, `NotFound` if dissolved/missing.
+    /// The group, if `token` is its admin token. A dissolved group is
+    /// `NotFound`.
     pub async fn require_admin_token(
         &self,
         group_id: Uuid,
@@ -303,8 +256,6 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         let group = bp_db::find_blockparty_group(&self.pool, group_id)
             .await?
             .ok_or(BlockpartyServiceError::NotFound)?;
-        // Dissolved groups behave as not-found for admin actions — UI
-        // doesn't need to disambiguate "wrong group" vs "dissolved".
         if group.status == BlockpartyStatus::Dissolved.as_str() {
             return Err(BlockpartyServiceError::NotFound);
         }
@@ -315,8 +266,6 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         Ok(group)
     }
 
-    /// Validate a member-token for `(group, address)`. Returns the
-    /// member row on success.
     pub async fn require_member_token(
         &self,
         group_id: Uuid,
@@ -340,9 +289,7 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
 
     // ─── Lifecycle ─────────────────────────────────────────────────
 
-    /// Create a fresh party. Validates name/address, checks mode-
-    /// collision against PplnsGroup, inserts group + admin member row,
-    /// populates cache. Admin token returned plaintext exactly once.
+    /// The admin token is returned in plaintext exactly once.
     pub async fn create_group(
         &self,
         name: &str,
@@ -353,11 +300,9 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         validate_percent_bp(admin_percent_bp)?;
         let admin_addr = normalize_address(admin_address)?;
 
-        // Unified onboarding gate: the admin address must be verified by a
-        // confirmed email OR a signature ownership proof. The verified email
-        // (if any) is snapshotted onto the admin member row; a signature-only
-        // admin stores "". The binding is the single source of truth — the
-        // client never supplies the email.
+        // The admin address needs a confirmed email or a signature ownership
+        // proof. The email comes from the binding, never from the client; a
+        // signature-only admin stores "".
         let admin_email = self.hooks.verified_email_for(&admin_addr).await;
         if admin_email.is_none()
             && !bp_db::is_address_ownership_verified(&self.pool, &admin_addr).await?
@@ -368,11 +313,9 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
             .map(|e| e.to_ascii_lowercase())
             .unwrap_or_default();
 
-        // Bidirectional mode-collision — reuse the PplnsGroup cache.
         if self.pplns_cache.get(&admin_addr).await.is_some() {
             return Err(BlockpartyServiceError::AddressInPplnsGroup);
         }
-        // Uniqueness — name + admin address are both globally unique.
         if bp_db::find_blockparty_group_by_name(&self.pool, name)
             .await?
             .is_some()
@@ -385,7 +328,6 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         {
             return Err(BlockpartyServiceError::AdminAddressTaken);
         }
-        // Pool-wide member-address uniqueness (admin row will use this slot).
         if bp_db::find_blockparty_member_by_address(&self.pool, &admin_addr)
             .await?
             .is_some()
@@ -409,9 +351,7 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         )
         .await?;
 
-        // Admin is auto-confirmed at creation (they hold the token, the
-        // authoring is the confirmation). No member-token minted yet —
-        // mark_member_confirmed handles that on first non-admin confirm.
+        // Creating the party is the admin's confirmation.
         let admin_member = bp_db::insert_blockparty_member(
             &self.pool,
             id,
@@ -436,9 +376,8 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         })
     }
 
-    /// Add a member. Admin-token gated. Pulls verified email via the
-    /// hook (admin input ignored — single source of truth is the
-    /// binding). Auto-flips DRAFT → CONFIRMING on first add.
+    /// Admin-gated. The member's email comes from its verified binding;
+    /// the first add moves the party from draft to confirming.
     pub async fn add_member(
         &self,
         group_id: Uuid,
@@ -464,9 +403,7 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
             return Err(BlockpartyServiceError::AddressInPplnsGroup);
         }
 
-        // Unified onboarding gate: verified by a confirmed email OR a signature
-        // ownership proof. The email (if any) is snapshotted onto the member row;
-        // a signature-only member has none.
+        // Confirmed email or signature ownership proof required.
         let email = self.hooks.verified_email_for(&address).await;
         if email.is_none() && !bp_db::is_address_ownership_verified(&self.pool, &address).await? {
             return Err(BlockpartyServiceError::EmailNotVerified);
@@ -485,16 +422,13 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
             Err(bp_db::DbError::Sqlx(sqlx::Error::Database(db_err)))
                 if db_err.code().as_deref() == Some("23505") =>
             {
-                // Concurrent admin-click race past the find-by-address
-                // check above. UNIQUE(address) catches it; surface as
-                // typed error so the UI shows the address-collision
-                // toast instead of a generic 500.
+                // A concurrent add slipped past the lookup above;
+                // UNIQUE(address) caught it.
                 return Err(BlockpartyServiceError::AddressInBlockparty);
             }
             Err(e) => return Err(e.into()),
         };
 
-        // DRAFT → CONFIRMING on first member (incl. cache sync).
         if group.status == BlockpartyStatus::Draft.as_str() {
             bp_db::update_blockparty_group_status(
                 &self.pool,
@@ -507,17 +441,13 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
                 .set_admin_status(&group.admin_address, group_id, BlockpartyStatus::Confirming)
                 .await;
         }
-        // Member entry into cache for mode-collision + UI.
         self.cache.insert_member(&address, group_id).await;
-        // Recompute keeps the cache in sync after every membership
-        // change. Idempotent and cheap.
         self.recompute_status(group_id).await?;
 
         Ok(inserted)
     }
 
-    /// Create (or replace) the group's single self-service join link. Admin-gated.
-    /// Returns the plaintext link token to share.
+    /// Create or replace the group's single join link; returns its token.
     pub async fn create_join_link(
         &self,
         group_id: Uuid,
@@ -534,10 +464,8 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         Ok(link.as_str().to_owned())
     }
 
-    /// Admin signals that members may now confirm their split (the button next
-    /// to Save Splits). Stamps `confirmationRequestedAt`; the member dashboard
-    /// only surfaces the confirm prompt once this is set, so a freshly-joined
-    /// member isn't nagged before the admin has assigned the real splits.
+    /// Stamps `confirmationRequestedAt`. Members see the confirm prompt only
+    /// after this, so nobody confirms before the real splits are assigned.
     pub async fn request_member_confirmation(
         &self,
         group_id: Uuid,
@@ -549,7 +477,6 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         Ok(())
     }
 
-    /// Revoke the group's join link. Admin-gated.
     pub async fn revoke_join_link(
         &self,
         group_id: Uuid,
@@ -560,9 +487,8 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         Ok(())
     }
 
-    /// Admin readback of the group's active (non-expired) join link, or `None`.
-    /// Admin-gated. Returns `(token, expires_at)` so the admin UI can re-display
-    /// the shareable link + its expiry without minting a fresh one.
+    /// The non-expired join link as `(token, expires_at)`, so the admin can
+    /// re-display it without minting a new one.
     pub async fn active_join_link(
         &self,
         group_id: Uuid,
@@ -575,11 +501,9 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
             .map(|l| (l.token, l.expires_at)))
     }
 
-    /// Self-service join via a shared link. No admin token — the joining address
-    /// proves itself (verified email OR signature ownership). Adds the member
-    /// unconfirmed with a 0 % placeholder split (the admin assigns it) and mints
-    /// the member token used to later confirm that split. Returns
-    /// `(member_token, group_id)`.
+    /// Self-service join; the address proves itself by email or signature.
+    /// Joins unconfirmed at a 0 % placeholder split and returns
+    /// `(member_token, group_id)` for confirming the split later.
     pub async fn join_via_link(
         &self,
         link_token: &str,
@@ -589,7 +513,7 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
             .await?
             .ok_or(BlockpartyServiceError::NotFound)?;
         let now = now_ms();
-        // An expired/invalid link surfaces as not-found (no info leak).
+        // Expired looks like unknown, so link validity does not leak.
         if link.expires_at < now {
             return Err(BlockpartyServiceError::NotFound);
         }
@@ -612,14 +536,12 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
             return Err(BlockpartyServiceError::AddressInPplnsGroup);
         }
 
-        // Unified onboarding gate: verified email OR signature ownership proof.
         let email = self.hooks.verified_email_for(&address).await;
         if email.is_none() && !bp_db::is_address_ownership_verified(&self.pool, &address).await? {
             return Err(BlockpartyServiceError::EmailNotVerified);
         }
         let email = email.map(|e| e.to_ascii_lowercase()).unwrap_or_default();
 
-        // Insert unconfirmed with a 0 % placeholder (the admin sets the real split).
         match bp_db::insert_blockparty_member(
             &self.pool, group.id, &address, &email, 0, "member", None, now,
         )
@@ -634,8 +556,6 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
             Err(e) => return Err(e.into()),
         }
 
-        // Mint the member token now (no confirm) so the member can confirm the
-        // split the admin will assign.
         let t = InvitationToken::generate()?;
         let hash = t.hash();
         bp_db::update_blockparty_member_confirmed(
@@ -648,7 +568,6 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         )
         .await?;
 
-        // DRAFT → CONFIRMING + cache + status recompute (mirrors add_member).
         if group.status == BlockpartyStatus::Draft.as_str() {
             bp_db::update_blockparty_group_status(
                 &self.pool,
@@ -667,9 +586,8 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         Ok((t.as_str().to_owned(), group.id))
     }
 
-    /// Public read: the group behind a valid, non-expired join link (for the
-    /// join landing page). `None` if the link is unknown, expired, or dissolved.
-    /// Returns `(group, link_expires_at)`.
+    /// `(group, link_expires_at)` for a valid link; `None` if the link is
+    /// unknown or expired or the group dissolved.
     pub async fn join_link_group(
         &self,
         link_token: &str,
@@ -687,7 +605,6 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
             .map(|g| (g, link.expires_at)))
     }
 
-    /// Remove a member. Admin-token gated. Refuses admin removal.
     pub async fn remove_member(
         &self,
         group_id: Uuid,
@@ -709,10 +626,8 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         Ok(())
     }
 
-    /// Update per-member splits. Validates each supplied member's percent
-    /// is in range. Non-admin members lose their `confirmedAt` (they must
-    /// re-confirm the new deal). The admin is presumed to confirm by
-    /// virtue of authoring the edit.
+    /// Non-admin members lose their confirmation and must re-confirm the new
+    /// splits; authoring the edit confirms the admin.
     pub async fn update_splits(
         &self,
         group_id: Uuid,
@@ -722,8 +637,7 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         let group = self.require_admin_token(group_id, token).await?;
         assert_editable(&group)?;
 
-        // Validate each percentBp. No total-sum check: splits arrive as
-        // the changed subset only, so the full roster isn't summable here.
+        // No total-sum check: only the changed subset arrives here.
         for (_, p) in updates {
             validate_percent_bp(*p)?;
         }
@@ -748,8 +662,7 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
                 return Err(BlockpartyServiceError::NotMember);
             }
         }
-        // Reset non-admin confirmations inside the same TX so a partial
-        // failure doesn't leave splits updated but confirmations stale.
+        // Same TX, so splits never change without resetting confirmations.
         sqlx::query!(
             r#"UPDATE blockparty_member
                SET "confirmedAt" = NULL, "updatedAt" = $2
@@ -760,9 +673,8 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         .execute(&mut *tx)
         .await
         .map_err(|e| BlockpartyServiceError::Db(bp_db::DbError::Sqlx(e)))?;
-        // Admin's edit authorship counts as their re-confirmation of the
-        // new splits; stamping it unconditionally also covers an admin row
-        // whose confirmedAt is null.
+        // Stamped unconditionally so an admin row with a null confirmedAt
+        // is covered too.
         sqlx::query!(
             r#"UPDATE blockparty_member
                SET "confirmedAt" = $2, "updatedAt" = $2
@@ -775,14 +687,13 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         .map_err(|e| BlockpartyServiceError::Db(bp_db::DbError::Sqlx(e)))?;
         tx.commit().await.map_err(bp_db::DbError::from)?;
 
-        // Reset means status drops back to CONFIRMING — handled by
-        // recompute_status (which also updates the cache).
+        // Drops the status back to confirming.
         self.recompute_status(group_id).await?;
         Ok(())
     }
 
-    /// Mark a member's row confirmed. Mints a persistent member token
-    /// on first call; idempotent on re-call. Plaintext returned once.
+    /// Idempotent. Mints the member token on the first call and returns its
+    /// plaintext only then.
     pub async fn mark_member_confirmed(
         &self,
         group_id: Uuid,
@@ -801,16 +712,14 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
             (None, None)
         };
 
-        // Set confirmedAt if null; otherwise leave existing timestamp.
         let confirmed_at = Some(member.confirmed_at.unwrap_or(now));
         let hash_str = hash_for_db
             .as_ref()
             .map(|h| h.as_str())
             .or(member.member_token_hash.as_deref());
 
-        // Confirm and status recompute share one TX: a crash between them
-        // would leave a fully-confirmed party stuck in CONFIRMING, never
-        // routable.
+        // One TX with the status recompute: a crash between them would leave
+        // a fully-confirmed party stuck in confirming, never routable.
         let mut tx = self.pool.begin().await.map_err(bp_db::DbError::from)?;
         bp_db::update_blockparty_member_confirmed(
             &mut *tx,
@@ -829,10 +738,8 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         Ok(MarkMemberConfirmedResult { member_token })
     }
 
-    /// Member-token-gated re-confirmation. Used by members to flip
-    /// `confirmedAt` back to non-null after an admin splits-edit reset
-    /// their confirmation. Does NOT mint a new token — the persistent
-    /// token from the original accept is the auth here.
+    /// Re-confirmation after a splits edit reset it, authenticated by the
+    /// existing member token; mints no new token.
     pub async fn confirm_as_member(
         &self,
         group_id: Uuid,
@@ -865,8 +772,7 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         Ok(())
     }
 
-    /// Explicit DRAFT → CONFIRMING transition. Validates the splits
-    /// sum first. CONFIRMING/READY are no-ops; ACTIVE/DISSOLVED reject.
+    /// Draft to confirming, only once the splits sum to 100 %.
     pub async fn transition_to_confirming(
         &self,
         group_id: Uuid,
@@ -907,17 +813,8 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         Ok(BlockpartyStatus::Confirming)
     }
 
-    /// Promotes CONFIRMING → READY when all members are confirmed;
-    /// demotes READY → CONFIRMING otherwise. **Always** updates the
-    /// admin-address cache so the routing guards don't see a stale
-    /// status — see the load-bearing invariant note at file top.
-    ///
-    /// The DB read+write is wrapped in its own transaction
-    /// ([`recompute_status_in_tx`]) so the status the row ends up with is
-    /// always consistent with the member roster read in the same TX.
-    /// Callers that need the member-write AND this recompute to be atomic
-    /// (the two confirm paths) call `recompute_status_in_tx` directly
-    /// inside their own TX instead.
+    /// [`recompute_status_in_tx`] in a standalone TX, then the cache update
+    /// the module invariant requires.
     async fn recompute_status(&self, group_id: Uuid) -> Result<(), BlockpartyServiceError> {
         let mut tx = self.pool.begin().await.map_err(bp_db::DbError::from)?;
         let outcome = recompute_status_in_tx(&mut tx, group_id, now_ms()).await?;
@@ -928,15 +825,9 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         Ok(())
     }
 
-    /// Non-DB side-effects of a status recompute, run AFTER the TX commits:
-    /// size the coinbase reservation (when the party is now READY) and
-    /// refresh the routing-guard cache. Both are idempotent.
-    ///
-    /// The reservation is sized after the status flip. The short window
-    /// where status is READY but the reservation hasn't grown yet is
-    /// harmless: the distribution trimmer rolls members beyond the budget
-    /// into the pool-fee output, so a block built then is still valid
-    /// (see `bp_blockparty::build_blockparty_distribution`).
+    /// Post-commit side effects of a recompute. Blockparty does not
+    /// weight-trim, so a party beyond the configured floor relies on this
+    /// reservation raise, which reaches templates a TDP cycle late.
     async fn apply_status_side_effects(&self, group_id: Uuid, outcome: &RecomputeOutcome) {
         if outcome.target == BlockpartyStatus::Ready {
             if let Some(reservation) = self.reservation.as_ref() {
@@ -948,14 +839,11 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         self.cache
             .set_admin_status(&outcome.admin_address, group_id, outcome.target)
             .await;
-        // Admin routing changed (status flip) — invalidate a separate Front's
-        // cache. Covers confirm_as_member + transition_to_confirming.
         self.notify_changed().await;
     }
 
-    /// Dissolve a party. Gated by `DISSOLVE_COOLDOWN_MS` of zero-share
-    /// silence when the party is ACTIVE. DRAFT/CONFIRMING/READY may
-    /// dissolve immediately (no rented hashpower in flight).
+    /// An active party must first be share-silent for
+    /// `DISSOLVE_COOLDOWN_MS`, so no rented hashpower is in flight.
     pub async fn dissolve_group(
         &self,
         group_id: Uuid,
@@ -969,7 +857,6 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         if matches!(status, BlockpartyStatus::Dissolved) {
             return Ok(()); // idempotent
         }
-        // Cooldown only applies once shares have landed.
         if matches!(status, BlockpartyStatus::Active) {
             if let Some(last) = group.last_share_at {
                 let now = now_ms();
@@ -979,10 +866,9 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
             }
         }
 
-        // Members and join link go with the status flip, in one TX: a dissolved
-        // party must not keep its addresses (UNIQUE (address) would lock them
-        // out of every later party, and the custom-extranonce Solo check
-        // reads the same rows). The history keeps its own split snapshot.
+        // Members go with the status flip in one TX: UNIQUE(address) would
+        // otherwise lock them out of every later party, and the
+        // custom-extranonce Solo check reads the same rows.
         let now = now_ms();
         let mut tx = self.pool.begin().await.map_err(bp_db::DbError::from)?;
         bp_db::delete_blockparty_members_for_group(&mut *tx, group_id).await?;
@@ -992,15 +878,12 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         self.cache
             .set_admin_status(&group.admin_address, group_id, BlockpartyStatus::Dissolved)
             .await;
-        // Admin stops routing — invalidate a separate Front's cache (dissolve
-        // bypasses apply_status_side_effects).
+        // Dissolve bypasses apply_status_side_effects.
         self.notify_changed().await;
         Ok(())
     }
 
-    /// Update `rentalProviderHint`. Admin-token gated. Trims the hint,
-    /// truncates to 64 chars, stores `None` when the result is empty.
-    /// Returns the stored value so the controller can echo it back.
+    /// Returns the stored (trimmed, truncated) hint.
     pub async fn update_rental_hint(
         &self,
         group_id: Uuid,
@@ -1029,10 +912,8 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
 
     // ─── Share / block hooks ───────────────────────────────────────
 
-    /// Refreshes `lastShareAt` on every share for the admin's address
-    /// and promotes READY → ACTIVE on the first share. Promotion is
-    /// restricted to READY — defensive against races where the status
-    /// changed between route-decision and share-accept.
+    /// Refreshes `lastShareAt` and promotes ready to active. Only from
+    /// ready, because the status may have changed since routing.
     pub async fn on_share_accepted(
         &self,
         admin_address: &AddressId,
@@ -1073,10 +954,7 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         Ok(())
     }
 
-    /// Record a found block. Idempotent via the DB UNIQUE(groupId,
-    /// blockHash) constraint and `ON CONFLICT DO NOTHING` in
-    /// `insert_blockparty_block_history`. Returns the inserted row on
-    /// first call, `None` on replay.
+    /// Idempotent via UNIQUE(groupId, blockHash): `None` on replay.
     #[allow(clippy::too_many_arguments)]
     pub async fn on_block_found(
         &self,
@@ -1107,30 +985,17 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
 
 // ─── Status recompute (TX-internal) ────────────────────────────────
 
-/// Result of a status recompute — the target status plus the data the
-/// caller needs for the post-commit side-effects (reservation sizing +
-/// cache refresh). `None` from [`recompute_status_in_tx`] means the
-/// group is gone or in a terminal status (no recompute applies).
+/// What the post-commit side effects need from a recompute.
 struct RecomputeOutcome {
     target: BlockpartyStatus,
     members_len: usize,
     admin_address: AddressId,
 }
 
-/// The DB half of a status recompute, runnable inside a caller-supplied
-/// transaction. Reads the group + member roster and writes the new
-/// status — all on the same connection, so the persisted status is
-/// always consistent with the roster it was derived from.
-///
-/// The two confirm paths (`mark_member_confirmed` / `confirm_as_member`)
-/// call this INSIDE the same TX as their member-confirm write, so a crash
-/// between the two cannot leave a fully-confirmed party stuck in
-/// CONFIRMING. `recompute_status` wraps it in a standalone TX for callers
-/// that don't need that coupling.
-///
-/// Promotes CONFIRMING → READY when all members are confirmed; demotes
-/// READY → CONFIRMING otherwise. Terminal statuses (DRAFT / ACTIVE /
-/// DISSOLVED) are left untouched.
+/// Confirming becomes ready when all members are confirmed, ready falls back
+/// otherwise; other statuses are untouched (`None`). Runs in the caller's TX
+/// so the status always matches the roster it was read from, and the confirm
+/// paths stay atomic with their member write.
 async fn recompute_status_in_tx(
     conn: &mut sqlx::PgConnection,
     group_id: Uuid,
@@ -1143,7 +1008,6 @@ async fn recompute_status_in_tx(
         .status
         .parse::<BlockpartyStatus>()
         .map_err(|_| BlockpartyServiceError::InvalidState)?;
-    // Only the two transient statuses participate.
     if !matches!(
         current,
         BlockpartyStatus::Confirming | BlockpartyStatus::Ready

@@ -6,14 +6,12 @@ use std::net::SocketAddr;
 
 use crate::error::MetricsError;
 
-/// Default listen address — `0.0.0.0:9000`. Production wiring picks
-/// this up from `[metrics] bind` in the TOML.
+/// Default listen address; overridden by `[metrics] bind`.
 pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:9000";
 
 #[derive(Clone, Debug)]
 pub struct PrometheusConfig {
-    /// HTTP listener address. The exporter serves Prometheus
-    /// text-format on `GET /metrics`.
+    /// HTTP listener address for `GET /metrics`.
     pub bind_addr: SocketAddr,
 }
 
@@ -28,8 +26,6 @@ impl Default for PrometheusConfig {
 }
 
 impl PrometheusConfig {
-    /// Construct with a caller-supplied bind addr. Returns a config
-    /// error if the string doesn't parse as a `SocketAddr`.
     pub fn with_bind(bind: &str) -> Result<Self, MetricsError> {
         let bind_addr = bind
             .parse()

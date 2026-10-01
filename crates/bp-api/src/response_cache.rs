@@ -1,14 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Per-endpoint response cache.
-//!
-//! A single in-process key/value store with per-endpoint TTLs and
-//! explicit invalidation on mutating routes
-//! (`POST /reset`, `/delete-stats`, `/delete-all`).
-//!
-//! Values are stored as `Bytes` (pre-serialized JSON) so a cache
-//! hit skips both the DB query and the DTO re-walk — the handler
-//! ships the bytes straight out with `Content-Type: application/json`.
+//! In-process response cache with per-endpoint TTLs and explicit
+//! invalidation on mutating routes. Values are pre-serialized JSON, so a hit
+//! skips both the DB query and the serialization.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -155,10 +149,8 @@ impl ResponseCache {
             .await
     }
 
-    /// Like [`Self::get_or_fetch`] but takes an explicit TTL in seconds
-    /// instead of a `TtlKind`. Use this when the TTL varies by runtime
-    /// parameter (e.g.
-    /// per-range diff-scores queries where longer ranges warrant longer caches).
+    /// Like [`Self::get_or_fetch`] with an explicit TTL in seconds, for TTLs
+    /// that vary at runtime.
     pub async fn get_or_fetch_secs<T, F, E>(
         &self,
         key: String,

@@ -1,18 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Read-style bot commands.
-//!
-//! Two layers:
-//!
-//! - Stateless commands (no engine reader needed):
-//!   [`build_pool_hashrate`], [`build_current_difficulty`],
-//!   [`build_next_difficulty`], [`build_stats`], [`build_group_history`].
-//! - Engine-reader commands: [`build_pplns_status`],
-//!   [`build_pplns_top`], [`build_group_status`], [`build_group_members`],
-//!   [`build_show_workers`]. These take the optional engine handles
-//!   from [`crate::command::CommandHandler`] and fall back to a
-//!   "not configured" reply when the corresponding engine wasn't
-//!   wired in at startup.
+//! Read-style bot commands. The engine-backed ones ([`build_pplns_status`],
+//! [`build_group_status`], ...) take optional engine handles and answer
+//! "not configured" when that engine was not wired in at startup.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -185,9 +175,8 @@ fn format_next_adjustment(lang: Language, adj: &NextDifficultyAdjustment) -> Str
 }
 
 /// Live fields for a worker list, positionally aligned. Redis trouble
-/// degrades to "no live data" (zeros in the rendered text) rather than
-/// an error reply — the durable half of the message is still worth
-/// sending, same policy as the hashrate-sum fallbacks above.
+/// degrades to zeros rather than an error reply, since the durable half of
+/// the message is still worth sending.
 async fn live_fields_for_workers(
     redis: Option<&ConnectionManager>,
     workers: &[bp_db::ClientRow],

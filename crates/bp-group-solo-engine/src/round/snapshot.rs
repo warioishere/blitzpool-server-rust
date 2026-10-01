@@ -1,18 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Per-(group, finder) coinbase snapshot persistence.
-//!
-//! Each miner in a group writes their own snapshot keyed by their
-//! address as the prospective finder (`groupsolo:{groupId}:snapshot:{finderAddress}`),
-//! and the same snapshot is written a second time under the payout
-//! list's own fingerprint. `on_block_found` resolves the fingerprint
-//! key — that is the one the winning job's coinbase was built from.
-//!
-//! The hash format + read/write/delete logic lives in
-//! [`bp_coinbase_snapshot::snapshot`] (shared with PPLNS so the wire
-//! format stays one source of truth). This module keeps only the
-//! Group-Solo key scheme: per-(group, finder) keys plus the SCAN-based
-//! group-wide cleanup.
+//! Group-Solo snapshot key scheme on top of [`bp_coinbase_snapshot::snapshot`].
+//! Each snapshot is written per (group, finder) and again under its payout
+//! fingerprint; `on_block_found` resolves the fingerprint key, because that is
+//! what the winning job's coinbase was built from.
 
 use redis::{aio::ConnectionManager, AsyncCommands, AsyncIter, RedisError};
 
@@ -22,17 +13,9 @@ pub fn key(group_id: &str, finder_address: &str) -> String {
 }
 
 /// Build the payout-list key `groupsolo:{group_id}:jobsnapshot:{hex}`.
-///
-/// Keyed by the identity of the distribution itself rather than by who might
-/// find the block: the block-found path then asks for the distribution the
-/// winning job's coinbase actually pays, instead of rebuilding one against a
-/// round that has moved since.
-///
-/// Deliberately NOT under the `…:snapshot:` prefix. These keys belong to
-/// individual live jobs, and a group-wide wipe ([`delete_all_for_group`],
-/// the round-reset cron, a kick) must not strip the distribution from jobs
-/// still being mined, or a block found on one could not be booked. They are
-/// consumed one at a time by the apply and otherwise bounded by their TTL.
+/// Deliberately outside the `…:snapshot:` prefix: a group-wide wipe
+/// ([`delete_all_for_group`]) must not strip the distribution from jobs still
+/// being mined, or a block found on one could not be booked.
 pub fn key_for_fingerprint(group_id: &str, payouts_fingerprint: &[u8; 32]) -> String {
     format!(
         "groupsolo:{group_id}:jobsnapshot:{}",
@@ -40,16 +23,14 @@ pub fn key_for_fingerprint(group_id: &str, payouts_fingerprint: &[u8; 32]) -> St
     )
 }
 
-/// Build the SCAN-match pattern for ALL per-finder snapshots of one group —
-/// used by [`delete_all_for_group`]. Does not cover the per-job payout-list
-/// keys; see [`key_for_fingerprint`].
+/// SCAN pattern for all per-finder snapshots of one group; does not cover the
+/// per-job keys (see [`key_for_fingerprint`]).
 pub fn key_match_all(group_id: &str) -> String {
     format!("groupsolo:{group_id}:snapshot:*")
 }
 
-/// Build the SCAN-match pattern for every key of one group, per-finder and
-/// per-job alike. Only for tearing a group down for good (dissolve), where no
-/// job of that group can still be worth booking.
+/// SCAN pattern for every snapshot key of one group. Only for dissolve, where
+/// no job of the group can still be worth booking.
 pub fn key_match_everything(group_id: &str) -> String {
     format!("groupsolo:{group_id}:*snapshot*")
 }
@@ -102,9 +83,8 @@ pub async fn delete_snapshot(
     bp_coinbase_snapshot::snapshot::delete_snapshot(conn, &key(group_id, finder_address)).await
 }
 
-/// Delete the payout-list snapshot the applied block consumed — and only that
-/// one. Every other live job's key stays, so a second block found before the
-/// next template rebuild still resolves; those are bounded by their TTL.
+/// Delete only the payout-list snapshot the applied block consumed, so a second
+/// block found before the next template rebuild still resolves.
 pub async fn delete_snapshot_for(
     conn: &mut ConnectionManager,
     group_id: &str,
@@ -117,9 +97,8 @@ pub async fn delete_snapshot_for(
     .await
 }
 
-/// SCAN + DEL every per-finder snapshot for the group — used by the block-found
-/// post-commit cleanup (other miners' snapshots are stale once a round
-/// resets) and the kick / dissolve admin flows.
+/// SCAN + DEL every per-finder snapshot for the group; they are stale once a
+/// round resets.
 pub async fn delete_all_for_group(
     conn: &mut ConnectionManager,
     group_id: &str,
@@ -127,9 +106,8 @@ pub async fn delete_all_for_group(
     delete_matching(conn, &key_match_all(group_id)).await
 }
 
-/// SCAN + DEL every snapshot of the group, per-finder AND per-job. Only for
-/// dissolve: it strips live jobs of their distribution, which is correct
-/// exactly when the group is gone and no block of it can be booked anymore.
+/// SCAN + DEL every snapshot of the group, per-job included. Only for
+/// dissolve, the one case where stripping live jobs is correct.
 pub async fn delete_everything_for_group(
     conn: &mut ConnectionManager,
     group_id: &str,
@@ -168,9 +146,7 @@ mod tests {
         assert_eq!(key_match_all("g1"), "groupsolo:g1:snapshot:*");
     }
 
-    /// The per-job keys must survive the group-wide per-finder wipe: they back
-    /// jobs that are still being mined, and a block found on one of those after
-    /// the wipe could not be booked at all.
+    /// Per-job keys survive the group-wide per-finder wipe.
     #[test]
     fn per_job_key_is_not_swept_by_the_per_finder_cleanup() {
         let fp = [0xabu8; 32];
@@ -189,8 +165,7 @@ mod tests {
         assert!(key("g1", "bc1qfoo").starts_with(&per_finder_prefix));
     }
 
-    /// Dissolve is the one wipe that must reach everything — the group is gone,
-    /// so no job of it can still be worth booking.
+    /// The dissolve pattern reaches both key kinds.
     #[test]
     fn dissolve_pattern_reaches_both_key_kinds() {
         let pattern = key_match_everything("g1");

@@ -2,21 +2,10 @@
 
 #![allow(clippy::print_stderr)]
 
-//! T1 — accounting equivalence between the in-process sink path and the
-//! Core→stream→Satellite path.
-//!
-//! The SAME share sequence (deterministic `share_id`s) driven
-//!   (a) directly through `PplnsAcceptedShareSink`, and
-//!   (b) through produce → Redis stream → drain into a *fresh*
-//!       `PplnsAcceptedShareSink`
-//! must leave **identical** PPLNS window state (per-address aggregate +
-//! total), i.e. the stream transport is accounting-neutral.
-//!
-//! Two Redis DBs: engine A on one, engine B + the stream on another (the
-//! stream's `t1:*` keys don't collide with the engine's `pplns:*` keys).
-//! A huge network-difficulty keeps the window from trimming, so the
-//! comparison is exact. Needs docker-Redis (16379) + PG (15433); skips
-//! cleanly otherwise.
+//! The Core→stream→Satellite path must be accounting-neutral: the same share
+//! sequence fed in-process and through the Redis stream must leave identical
+//! PPLNS window state. A huge network difficulty keeps the window from
+//! trimming so the comparison is exact.
 
 use std::sync::Arc;
 
@@ -32,8 +21,7 @@ use sqlx::PgPool;
 
 const N: usize = 60;
 
-/// Deterministic share sequence — 5 miners, varying difficulty, stable
-/// `share_id`s so both paths feed identical inputs.
+/// Stable `share_id`s so both paths feed identical inputs.
 fn share_seq() -> Vec<SharedAcceptedShareOwned> {
     (0..N)
         .map(|i| SharedAcceptedShareOwned {
@@ -55,9 +43,8 @@ fn share_seq() -> Vec<SharedAcceptedShareOwned> {
 }
 
 async fn spawn_engine(conn: ConnectionManager, pool: PgPool) -> PplnsEngine {
-    // Huge net-diff so the window never trims and the comparison is exact.
-    // Long touch-flush so neither engine writes PG during the test; only
-    // Redis window state is compared.
+    // Huge net-diff so the window never trims; long touch-flush so neither
+    // engine writes PG during the test.
     let net_diff = NetworkDifficulty::new(1_000_000.0);
     let config = PplnsEngineConfig {
         touch_flush_interval_secs: 3600,
@@ -73,7 +60,6 @@ async fn spawn_engine(conn: ConnectionManager, pool: PgPool) -> PplnsEngine {
         .expect("spawn pplns engine")
 }
 
-/// Read the comparable window state: per-address aggregate + total.
 async fn window_state(engine: &PplnsEngine) -> (std::collections::HashMap<String, f64>, f64) {
     let by_addr = engine
         .window()
@@ -112,8 +98,7 @@ fn assert_windows_equal(
     }
 }
 
-/// Drive `shares` through the stream into `sink`, draining until every
-/// produced entry has been consumed (and acked).
+/// Drains until every produced entry has been consumed and acked.
 async fn run_stream_path(
     conn: ConnectionManager,
     shares: &[SharedAcceptedShareOwned],
@@ -186,9 +171,7 @@ async fn in_process_and_stream_paths_leave_identical_pplns_window() {
 
 #[tokio::test]
 async fn duplicate_entries_in_the_stream_do_not_break_equivalence() {
-    // The redelivery story end-to-end: re-published entries (same share_id)
-    // must dedup inside the engine, so the stream window still matches the
-    // in-process one exactly.
+    // Re-published entries (same share_id) must dedup inside the engine.
     let Some(pool) = connect_pg_or_skip().await else {
         return;
     };
@@ -222,7 +205,6 @@ async fn duplicate_entries_in_the_stream_do_not_break_equivalence() {
     engine_b.shutdown();
 }
 
-/// One share with explicit id / mode / address / difficulty / ts_ms.
 fn mk_share(
     share_id: &str,
     mode: MiningMode,
@@ -247,11 +229,8 @@ fn mk_share(
     }
 }
 
-/// T8 — Core restart with epoch change mid-stream. `share_id` is
-/// `{core_epoch}:{seq}` and `seq` resets to 0 each boot, so two boots emit
-/// `1:0` and `2:0`. Both are distinct ids and must each apply once; a
-/// redelivery of either dedups. Proves the epoch discriminator keeps a
-/// post-restart `seq` from colliding with the previous boot's.
+/// `{core_epoch}:{seq}` ids from two Core boots apply once each and dedup on
+/// redelivery, so a restarted `seq` never collides with the previous boot's.
 #[tokio::test]
 async fn mixed_epoch_share_ids_apply_once_without_seq_collision() {
     let Some(pool) = connect_pg_or_skip().await else {
@@ -289,11 +268,8 @@ async fn mixed_epoch_share_ids_apply_once_without_seq_collision() {
     engine.shutdown();
 }
 
-/// T9 — Disconnect-before-consume. A miner can disconnect (clearing any
-/// Core gate) before the Satellite consumes its share; the share must still
-/// be credited to the mode it was stamped with. Driving a mix of modes
-/// through the PPLNS sink, only the `Pplns`-stamped shares land — the sink
-/// reads `share.mode`, never a gate.
+/// The sink credits by the share's stamped `mode`, never a Core gate that a
+/// disconnect may already have cleared.
 #[tokio::test]
 async fn only_pplns_mode_shares_land_in_the_pplns_window() {
     let Some(pool) = connect_pg_or_skip().await else {
@@ -331,10 +307,8 @@ async fn only_pplns_mode_shares_land_in_the_pplns_window() {
     engine.shutdown();
 }
 
-/// T11 — ts_ms replay. The Satellite may consume a share minutes/hours after
-/// it was accepted (outage + replay). The PPLNS `lastAcceptedShareAt` touch
-/// must reflect the SHARE's accept time, not the consume time — otherwise a
-/// replayed backlog would reset every miner's abandoned-balance clock.
+/// The touch uses the share's accept time, not consume time, so a replayed
+/// backlog cannot reset every miner's abandoned-balance clock.
 #[tokio::test]
 async fn pplns_touch_uses_share_time_not_consume_time() {
     let Some(pool) = connect_pg_or_skip().await else {

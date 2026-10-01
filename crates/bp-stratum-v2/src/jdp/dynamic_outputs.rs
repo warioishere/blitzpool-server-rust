@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Coinbase-output byte helpers shared by the JDP allocate and declare paths.
-//!
-//! The ext 0x0003 payout logic lives in [`crate::jdp::payout_distribution`].
-//! Here: the SV2 JDP/AllocateMiningJobToken.Success designated payout output,
-//! the fail-closed rebuild of a declared coinbase ([`declared_coinbase_tx`]),
-//! and the booking identity a proven declaration carries ([`PayoutBooking`]).
+//! Coinbase-output helpers shared by the JDP allocate and declare paths: the
+//! designated payout output, the fail-closed rebuild of a declared coinbase
+//! ([`declared_coinbase_tx`]) and the booking identity a proven declaration
+//! carries ([`PayoutBooking`]). ext 0x0003 logic is in [`crate::jdp::payout_distribution`].
 
 use bitcoin::{Amount, Script, TxOut};
 
@@ -29,12 +27,9 @@ pub fn designated_payout_script(coinbase_outputs: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Does this coinbase pay the designated script a non-zero amount, at any
-/// position (SV2 JDP/AllocateMiningJobToken.Success lets the JDC reorder and add
-/// outputs)? The amount is not checked: the spec names no threshold.
-///
-/// ⚠️ Sufficient only because the allocate designates a script solely when it
-/// is the asking miner's own, so a short payment shorts only that miner. Relax
-/// neither rule on the strength of the other.
+/// position (SV2 JDP/AllocateMiningJobToken.Success allows reordering)? The
+/// amount is unchecked, which is safe only because the designated script is
+/// always the asking miner's own; relax neither rule on the other's strength.
 pub fn pays_designated_output(outputs: &[TxOut], designated_script: &[u8]) -> bool {
     outputs
         .iter()
@@ -53,12 +48,9 @@ pub struct DeclaredCoinbase {
     pub script_sig_prefix: Vec<u8>,
 }
 
-/// Rebuild the declared coinbase from the SV2 prefix/suffix pair, slot
-/// zero-filled, and decode it by consensus rules so the transaction's own
-/// framing locates the outputs.
-///
-/// Fail-closed for scriptSig bytes AFTER the extranonce (T>0): the rebuilt
-/// scriptSig runs long and the decode fails, never a wrong accept.
+/// Rebuild the declared coinbase from the SV2 prefix/suffix pair and decode it
+/// by consensus rules, so the transaction's own framing locates the outputs.
+/// Fail-closed for scriptSig bytes after the extranonce (T>0): the decode fails.
 pub fn declared_coinbase_tx(
     coinbase_tx_prefix: &[u8],
     coinbase_tx_suffix: &[u8],
@@ -89,11 +81,9 @@ pub fn declared_coinbase_tx(
 /// rebuild buffer the declared length sizes.
 const MAX_COINBASE_SCRIPT_SIG_LEN: usize = 100;
 
-/// Bytes of scriptSig the prefix leaves for the extranonce, found by walking
-/// the header (segwit marker+flag optional, so 41 or 43 bytes).
-///
-/// ⚠️ The one place "the declaration is a coinbase" is decided: every later
-/// reader of `tx.output` and `input[0]` relies on the single-input test here.
+/// Bytes of scriptSig the prefix leaves for the extranonce (header is 41 or 43
+/// bytes). ⚠️ The one place "the declaration is a coinbase" is decided: every
+/// later reader of `tx.output` and `input[0]` relies on the single-input test.
 fn extranonce_slot_width(coinbase_tx_prefix: &[u8]) -> Option<usize> {
     use bitcoin::consensus::Decodable;
 
@@ -165,11 +155,9 @@ impl CandidateBacking {
         }
     }
 
-    /// Must the ext 0x0003/Implementation Notes settle fire at block-found?
-    ///
-    /// Only for [`Self::UnbookableDistribution`], since no ledger write follows.
-    /// A [`Self::Bookable`] block is settled after its booking: settling earlier
-    /// would republish the balances the block just paid.
+    /// Must the ext 0x0003/Implementation Notes settle fire at block-found? Only
+    /// for [`Self::UnbookableDistribution`]; a [`Self::Bookable`] block settles
+    /// after its booking, or the balances it just paid would be republished.
     pub fn settles_here(&self) -> bool {
         match self {
             Self::BaseProtocol | Self::Bookable(_) => false,

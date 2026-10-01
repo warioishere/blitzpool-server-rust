@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `bp_share_hook` trait impls gated on mining-mode = Group-Solo. The hook
-//! surface is protocol-neutral, so the same impl serves SV1 and SV2.
-//!
-//! The sinks read the producer-stamped `mode` / `group_id` off the share
-//! (the Core resolves them once from the mode gate at fan-out), so they
-//! hold no gate and run unchanged on the Satellite off the stream.
+//! Group-Solo share sinks for SV1 and SV2. They read the producer-stamped
+//! `mode` / `group_id` off the share instead of holding a mode gate, so they
+//! run unchanged on the Satellite off the stream.
 
 use async_trait::async_trait;
 use bp_common::{warn_throttled, LogThrottle, MiningMode};
@@ -17,9 +14,8 @@ use uuid::Uuid;
 
 use crate::engine::GroupSoloEngine;
 
-/// Throttle window for the per-share `record_share failed` warning — a Redis
-/// outage fails every accepted share, so warn at most once per 5s with a
-/// suppressed count instead of one line per share.
+/// Throttle window for `record_share failed`: a Redis outage fails every
+/// accepted share, so warn once per window with a suppressed count.
 const RECORD_SHARE_WARN_THROTTLE_MS: i64 = 5_000;
 
 /// `SharedAcceptedShareSink` impl that records the share against the
@@ -41,16 +37,14 @@ impl GroupSoloAcceptedShareSink {
 #[async_trait]
 impl SharedAcceptedShareSink for GroupSoloAcceptedShareSink {
     async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
-        // Producer-stamped mode + group_id — no gate query. Only fire for
-        // GroupSolo (NOT Blockparty, which also carries a group_id).
+        // Blockparty shares also carry a group_id, so test the mode.
         if share.mode != MiningMode::GroupSolo {
             return;
         }
         let Some(group_id) = share.group_id.and_then(|g| Uuid::parse_str(g).ok()) else {
             return;
         };
-        // Share's Core-accept time, not now(): replayed/backlogged shares
-        // must keep their original accept time, not the consume time.
+        // Accept time, not now(): backlogged shares keep their original time.
         let ts_ms = share.ts_ms;
         if let Err(e) = self
             .engine
@@ -63,8 +57,6 @@ impl SharedAcceptedShareSink for GroupSoloAcceptedShareSink {
             )
             .await
         {
-            // Throttled: a Redis outage fails every share — warn at most once
-            // per window with a count of those suppressed since.
             warn_throttled!(
                 self.warn_throttle,
                 ts_ms,
@@ -78,10 +70,8 @@ impl SharedAcceptedShareSink for GroupSoloAcceptedShareSink {
     }
 }
 
-/// `SharedRejectedShareSink` impl that increments the rejected-shares
-/// hash for the Group-Solo round when the share carries a `group_id`.
-/// Pre-auth rejects (`address = None`) and non-group shares (`group_id =
-/// None`) are silently dropped.
+/// Counts a reject against the Group-Solo round when the share carries a
+/// `group_id`; pre-auth and non-group rejects are dropped.
 pub struct GroupSoloRejectedShareSink {
     engine: GroupSoloEngine,
 }
@@ -98,7 +88,6 @@ impl SharedRejectedShareSink for GroupSoloRejectedShareSink {
         let Some(addr) = share.address else {
             return;
         };
-        // Producer-stamped group id, resolved by the Core at fan-out.
         let Some(group_id_str) = share.group_id else {
             return;
         };

@@ -1,21 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Regtest: the custom-extranonce override, at channel-open AND live.
-//!
-//! Two Extended miners stay connected to the same Solo-routed server:
-//!   - one whose `(address, worker)` has an override;
-//!   - one whose worker has none.
-//!
-//! Stage 1 (channel-open): the override miner's
-//! `OpenExtendedMiningChannelSuccess` carries the override prefix; the other
-//! keeps its allocated prefix. Neither receives `SetExtranoncePrefix`.
-//!
-//! Stage 2 (live change, no reconnect): the override value is changed and a new
-//! template is triggered (mining a block). The override miner receives a
-//! `SetExtranoncePrefix` with the NEW value plus a fresh job — without
-//! reconnecting. The other miner, across every broadcast in that window,
-//! receives its normal jobs and NEVER a `SetExtranoncePrefix`. That second
-//! miner is the isolation proof: the live path leaves non-customers untouched.
+//! Regtest: a custom-extranonce override arrives in the channel-open success,
+//! and a live change reaches its miner as `SetExtranoncePrefix` without a
+//! reconnect. A second miner without an override is the negative control: it
+//! keeps its allocated prefix and never sees `SetExtranoncePrefix`.
 
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;

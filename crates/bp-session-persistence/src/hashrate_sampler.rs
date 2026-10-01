@@ -1,31 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Live per-session hashrate sampler.
-//!
-//! Owns the `hash_rate` field of the `client:live:*` hashes. Every
-//! accepted share adds its **credited** difficulty (`effective_difficulty`)
-//! to a persistent per-session bucket. Every `sample_interval`
-//! (default 60 s) each bucket is turned into a hashrate estimate
-//!
-//! ```text
-//! rate = Σ credited_diff × 2^32 / window_seconds
-//! ```
-//!
-//! — the identical formula the hashrate chart applies per 10-min slot, so
-//! the live figure and the chart agree. The written value is a **2-sample moving
-//! average** of the current + previous window's estimate:
-//! `displayed = (prev + rate) / 2` (or `rate` alone for a session's very
-//! first window). Over a 60 s window vardiff keeps ~10–15 shares, enough
-//! that one window isn't dominated by share-arrival jitter; averaging two
-//! windows smooths it to a ~2-min figure.
-//!
-//! Unlike the share-touch buffer (which drains its map every flush), this
-//! map is **persistent**: a session that stops submitting stays tracked
-//! and samples to 0, so the moving average fades a stopped miner to 0 over
-//! two empty windows (R → R/2 → 0); the entry is kept one window longer to
-//! re-write the 0 (a retry if the terminal write failed), then dropped.
-//! That is what makes the reported hashrate self-zeroing and
-//! reconnect-immune without waiting for the key's TTL to expire.
+//! Live per-session hashrate (`hash_rate` in `client:live:*`): credited
+//! difficulty × 2^32 / window, the same formula as the hashrate chart, shown
+//! as a 2-window moving average. The map is persistent so a stopped session
+//! fades to 0 (R → R/2 → 0) instead of freezing until the key's TTL.
 
 use std::sync::{Arc, Mutex};
 
@@ -39,32 +17,21 @@ use bp_common::HASHES_PER_DIFFICULTY_1;
 use crate::live_store::LiveSessionStore;
 use crate::touch_buffer::{TouchKey, TouchKeyRef};
 
-/// Consecutive zero-share windows after which a faded session is dropped
-/// from the map. The fade itself reaches 0 after two empty windows
-/// (R → R/2 → 0); a third window re-writes the 0, so a transient failure
-/// on the terminal 0-write gets one retry instead of freezing a dead rig
-/// at R/2 until the key's TTL expires.
+/// Empty windows before a faded session is dropped. The fade reaches 0 after
+/// two; the third re-writes the 0 so a failed terminal write gets a retry.
 const MAX_EMPTY_WINDOWS: u32 = 3;
 
-/// Per-session sampling state. Persists across windows so a stopped
-/// session can fade rather than freezing at its last value.
+/// Per-session sampling state, kept across windows so a stopped session fades.
 struct SessionSample {
-    /// Credited difficulty accumulated in the current (open) window.
     diff_accum: f64,
-    /// Previous window's hashrate estimate (H/s), or `None` before this
-    /// session has completed its first window.
+    /// Previous window's estimate (H/s); `None` before the first window.
     prev_rate: Option<f64>,
-    /// Number of consecutive completed windows with zero shares.
     empty_windows: u32,
 }
 
-/// Shared sampler. The share sink records into it on every accepted
-/// share; the sample loop closes-and-writes it on every tick.
-///
-/// Locking is a plain `std::sync::Mutex`: neither `record` nor `sample`
-/// holds the lock across an `.await` (the DB write happens after `sample`
-/// has returned and released it), so an async mutex would be pure overhead
-/// on the per-share path.
+/// Shared sampler: the share sink records, the sample loop closes windows.
+/// A `std::sync::Mutex` suffices because the lock is never held across an
+/// `.await`.
 pub(crate) struct HashrateSampler {
     inner: Mutex<HashMap<TouchKey, SessionSample>>,
 }
@@ -78,21 +45,15 @@ impl Default for HashrateSampler {
 }
 
 impl HashrateSampler {
-    /// Lock the map, recovering the guard on poison rather than panicking
-    /// (see `TouchBuffer::guard` — a stray poison must not turn every
-    /// subsequent share into a panic).
+    /// Recovers from poison so one panic does not turn every later share
+    /// into a panic.
     fn guard(&self) -> std::sync::MutexGuard<'_, HashMap<TouchKey, SessionSample>> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Add a share's credited difficulty to its session's open window.
-    /// Non-finite / non-positive values are ignored (defensive — the
-    /// accounting sinks already clamp, but this is the hashrate path's
-    /// own guard against a corrupt sample poisoning the estimate).
-    ///
-    /// Takes a borrowed [`TouchKeyRef`] and allocates an owned key only
-    /// when a session first appears; every later share in the window is a
-    /// zero-allocation `get_mut` lookup.
+    /// Add a share's credited difficulty to its session's open window;
+    /// non-finite or non-positive values are ignored. Allocates an owned key
+    /// only when a session first appears.
     pub(crate) fn record(&self, key: TouchKeyRef<'_>, credited_diff: f64) {
         if !credited_diff.is_finite() || credited_diff <= 0.0 {
             return;
@@ -112,11 +73,8 @@ impl HashrateSampler {
         }
     }
 
-    /// Close the current window for every tracked session: compute its
-    /// hashrate estimate over `window_secs`, apply the 2-sample moving
-    /// average, advance the window state, and drop sessions that have
-    /// fully faded to 0. Returns the `(key, hashrate)` writes to persist.
-    /// One lock-pass; no `.await` while the lock is held.
+    /// Close every session's window, apply the moving average, drop fully
+    /// faded sessions, and return the `(key, hashrate)` writes.
     fn sample(&self, window_secs: f64) -> Vec<(TouchKey, f64)> {
         let window = window_secs.max(1.0);
         let mut guard = self.guard();
@@ -137,9 +95,6 @@ impl HashrateSampler {
             s.prev_rate = Some(rate);
             s.diff_accum = 0.0;
 
-            // Fade reaches 0 at the second empty window; keep the session
-            // for a third that re-writes the 0 (a free retry if the terminal
-            // write failed), then drop.
             s.empty_windows < MAX_EMPTY_WINDOWS
         });
         writes
@@ -151,14 +106,10 @@ impl HashrateSampler {
     }
 }
 
-/// One sample pass: close windows, write the rates into the Redis live
-/// hashes. On failure the values are simply stale until the next window
-/// overwrites them — a hashrate estimate is ephemeral, so (unlike a
-/// best-difficulty sample) there's nothing to rebuffer. The fade writes
-/// travel this path too, so a stopped session's `hash_rate` fades
-/// R → R/2 → 0; after the drop the key simply ages out on its
-/// touch-derived TTL (no DEL — the sampler must not shorten liveness
-/// any more than it may extend it).
+/// One sample pass into the Redis live hashes. A failed write is not
+/// rebuffered: the estimate is ephemeral and the next window overwrites it.
+/// No DEL after the drop: the sampler must not shorten liveness, only the
+/// touch-derived TTL ends it.
 pub(crate) async fn sample_and_write(
     sampler: &HashrateSampler,
     window_secs: f64,
@@ -184,18 +135,9 @@ pub(crate) async fn sample_and_write(
     }
 }
 
-/// Spawned sample loop. Ticks every `sample_interval` and divides each
-/// window's accumulated work by the **actual wall-clock** elapsed since the
-/// previous tick — measured with `Instant::now()`, not the tick deadline:
-/// `tokio::Interval::tick()` returns the scheduled grid time, so after a
-/// runtime stall that would understate elapsed and overstate the rate.
-/// Missed ticks are skipped rather than burst-fired.
-///
-/// No boot reconcile: a previous process's leftover rates live in TTL'd
-/// Redis keys that age out on their own.
-///
-/// Returns when `shutdown_rx` resolves — no final flush, the values are
-/// ephemeral and recomputed from live shares on the next boot.
+/// Sample loop. Divides by the wall-clock time since the last tick, not the
+/// tick deadline, which after a runtime stall would overstate the rate.
+/// No boot reconcile and no final flush: the values are ephemeral.
 pub(crate) async fn run_sample_loop(
     sampler: Arc<HashrateSampler>,
     live: Option<Arc<LiveSessionStore>>,
@@ -316,8 +258,6 @@ mod tests {
         let _ = s.sample(60.0); // prev = r, empty = 0
         let _ = s.sample(60.0); // idle window 1 → r/2, empty = 1
 
-        // A share lands before the second idle window → counter resets,
-        // session survives instead of being dropped.
         s.record(kref(), 600.0);
         let w = s.sample(60.0);
         assert!(

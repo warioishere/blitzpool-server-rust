@@ -1,24 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! SV1 server composition: one [`StratumV1Server`] per port (solo,
-//! solo-high-diff, and with PPLNS pplns + pplns-high-diff). The accept loop
-//! is in [`crate::stratum`], which shares each port between SV1 and SV2.
-//! Each server's [`ServerHooks`] carry:
-//!
-//! - **block_sink**: [`TdpBlockSubmissionSink`], shared across ports.
-//! - **accepted_sink / rejected_sink**: the shared, mode-gated composite
-//!   sinks from `EngineHandles`.
-//! - **session_persistence**: [`ModeGatePopulatingPersistence`], which
-//!   publishes the resolved [`MiningModeResult`] into the mode gate on
-//!   register, refcounts it down on deregister, then forwards to the
-//!   [`SessionPersistenceHook`](bp_session_persistence::SessionPersistenceHook).
-//!
-//! One server per port because a server clones one `ServerHooks` into every
-//! connection, and the fallback mode for a non-group address is per-port
-//! state. The extra translator tasks fire only on TDP updates.
-//!
-//! Mode at authorize: active Group-Solo membership ([`GroupLookup`]) wins,
-//! then Blockparty admin, otherwise the port's `payout_mode`.
+//! SV1 server composition: one [`StratumV1Server`] per port, because a
+//! server clones one [`ServerHooks`] into every connection and the fallback
+//! mode for a non-group address is per-port state. Mode at authorize: active
+//! Group-Solo membership wins, then Blockparty admin, else the port's mode.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -41,7 +26,7 @@ use crate::group_service::SharedGroupService;
 
 /// Per-port SV1 server, one per enabled `[stratum]`/`[pplns]` port.
 /// [`crate::stratum::spawn`] binds one listener per port and dispatches on
-/// the first byte to this server or the SV2 one.
+/// the opening bytes to this server or the SV2 one.
 pub(crate) struct Sv1PortServer {
     pub(crate) port_config: PortConfig,
     pub(crate) server: StratumV1Server,
@@ -297,17 +282,10 @@ impl BlockpartyAdminLookup for BlockpartyApiAdminLookup {
 
 // ─── ModeGatePopulatingPersistence ────────────────────────────────
 
-/// Wraps a `SharedSessionPersistence` and, on every register/deregister,
-/// publishes / refcounts the resolved `MiningModeResult` in the shared
-/// [`BlitzpoolModeGate`].
-///
-/// **Per port and protocol** ([`Self::for_port`]): `port_payout_mode` is
-/// the fallback for addresses in no active group, and SV1 and SV2 must not
-/// share an instance because `sessions` is keyed by ids each protocol mints
-/// on its own.
-///
-/// `deregister_session` carries only the session id, so `sessions` maps it
-/// back to the address for `mode_gate.clear_mode`.
+/// Publishes / refcounts the resolved `MiningModeResult` in the shared
+/// [`BlitzpoolModeGate`] on every register/deregister. One instance per port
+/// AND protocol: `sessions` is keyed by ids each protocol mints on its own,
+/// and maps them back to the address because deregister carries only the id.
 pub(crate) struct ModeGatePopulatingPersistence {
     port_payout_mode: MiningMode,
     mode_gate: Arc<BlitzpoolModeGate>,

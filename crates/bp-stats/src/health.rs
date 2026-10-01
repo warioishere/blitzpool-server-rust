@@ -1,25 +1,27 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Per-flusher consecutive-failure counter. Pure state machine — the
-//! caller decides what to do once the threshold trips (typically a
-//! single `tracing::warn!`).
+//! Per-flusher consecutive-failure counter; the caller decides what to do
+//! once the threshold trips.
 
 use std::collections::HashMap;
 use std::hash::Hash;
 
 use crate::constants::FLUSH_FAILURE_WARN_THRESHOLD;
 
-/// Outcome of [`FlushHealthMonitor::record_failure`]. Used by the caller
-/// to decide whether to log a warning.
+/// Outcome of [`FlushHealthMonitor::record_failure`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlushHealth {
-    /// Failure recorded but still under the threshold.
-    Healthy { consecutive_failures: u32 },
-    /// Failure recorded and the consecutive-failure count just **crossed**
-    /// the threshold. Emit a warning.
-    JustCrossedThreshold { consecutive_failures: u32 },
-    /// Already past the threshold — keep counting but don't re-emit.
-    Degraded { consecutive_failures: u32 },
+    Healthy {
+        consecutive_failures: u32,
+    },
+    /// The count just **crossed** the threshold: warn now, exactly once.
+    JustCrossedThreshold {
+        consecutive_failures: u32,
+    },
+    /// Already past the threshold; do not warn again.
+    Degraded {
+        consecutive_failures: u32,
+    },
 }
 
 pub struct FlushHealthMonitor<F: Eq + Hash> {
@@ -41,13 +43,10 @@ impl<F: Eq + Hash> FlushHealthMonitor<F> {
         }
     }
 
-    /// Mark a successful flush; resets the counter for `flusher` to 0.
     pub fn record_success(&mut self, flusher: F) {
         self.counts.remove(&flusher);
     }
 
-    /// Mark a failed flush. Returns the post-increment health snapshot
-    /// so the caller can decide whether to emit a warning.
     pub fn record_failure(&mut self, flusher: F) -> FlushHealth {
         let count = self.counts.entry(flusher).or_insert(0);
         let prev = *count;
@@ -68,7 +67,6 @@ impl<F: Eq + Hash> FlushHealthMonitor<F> {
         }
     }
 
-    /// Read the current consecutive-failure count for `flusher`.
     pub fn consecutive_failures(&self, flusher: &F) -> u32 {
         self.counts.get(flusher).copied().unwrap_or(0)
     }

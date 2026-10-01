@@ -121,10 +121,7 @@ where
     }))
 }
 
-/// Map an `InvitationServiceError` to the `ApiError` wire-form. Public
-/// reader endpoints rarely hit a service error other than internal
-/// faults (most validation is for writer paths), but the mapping is
-/// here so [`ApiError`] stays the single error surface.
+/// Map an `InvitationServiceError` to the [`ApiError`] wire form.
 pub(crate) fn invitation_to_api_error(e: bp_group_mgmt_engine::InvitationServiceError) -> ApiError {
     use axum::http::StatusCode;
     use bp_group_mgmt_engine::InvitationServiceError as I;

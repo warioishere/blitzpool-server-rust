@@ -1,19 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Group-management service layer — bridges the pure-domain
-//! [`bp_group_mgmt`] validators with the DB writes from [`bp_db`] and
-//! the engine-side Redis / cron hooks.
-//!
-//! Covers group lifecycle, membership, invitation, and join-request
-//! orchestration.
-//!
-//! ## Why a separate crate?
-//!
-//! The companion [`bp_group_mgmt`] crate is pure validators + token
-//! primitives + status enums — no `async`, no DB. The code that owns
-//! the DB orchestration, the [`AddressCache`], and the Redis-cleanup
-//! callbacks needs `tokio`, `sqlx`, and the cross-crate hook trait.
-//! Mirrors the `bp_pplns` + `bp_pplns_engine` split.
+//! Group-management service layer: group lifecycle, membership,
+//! invitations and join requests. It joins the pure [`bp_group_mgmt`]
+//! validators (no async, no DB) with [`bp_db`] writes, the
+//! [`AddressCache`] and the Redis / cron hooks.
 
 pub mod cache;
 pub mod cron;

@@ -103,11 +103,9 @@ pub struct DevicePartialArgs<'a> {
     pub address_suffix: Option<&'a str>,
 }
 
-/// Some of a worker's rigs are gone; the worker is still up.
-///
-/// Deliberately worded so it can never read as an outage: the owner of
-/// three rigs under one name has lost one, not all three, and a rental
-/// source whose count dipped has not ended its rental.
+/// Some of a worker's rigs are gone; the worker is still up. Worded so it
+/// never reads as an outage: the owner of three rigs under one name has lost
+/// one, not all three.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DevicePartialText {
     pub de: String,
@@ -156,9 +154,8 @@ pub struct DeviceAggregateArgs<'a> {
     pub went_offline: &'a [String],
     /// Workers that returned after having been reported offline.
     pub came_back: &'a [String],
-    /// Workers seen for the first time. Kept apart from `came_back`
-    /// because calling a brand-new miner "back online" tells the reader
-    /// it recovered from an outage they were never notified about.
+    /// Workers seen for the first time, kept apart from `came_back` so a
+    /// brand-new miner is never reported as "back online".
     pub first_seen: &'a [String],
     /// `(worker, remaining, before)` for workers that lost some rigs but
     /// are still hashing.
@@ -287,11 +284,8 @@ fn join_names(names: &[String], language: Language) -> String {
     }
 }
 
-/// Format a UTC instant in the per-deployment timezone (e.g.
-/// `Europe/Zurich`) as a short date + short time.
-///
-/// - `de` locale: `"01.05.26, 14:30"` (dd.MM.yy + HH:mm)
-/// - `en` locale: `"5/1/26, 2:30 PM"` (M/d/yy + h:mm AM/PM)
+/// Format a UTC instant in the deployment timezone as a short date + time:
+/// `"01.05.26, 14:30"` for `de`, `"5/1/26, 2:30 PM"` for `en`.
 pub fn format_device_time(
     tz: chrono_tz::Tz,
     event_utc: DateTime<Utc>,
@@ -425,8 +419,7 @@ mod tests {
         }
     }
 
-    /// First sightings get their own clause — telling someone a brand-new
-    /// miner is "back online" claims an outage they were never told about.
+    /// First sightings get their own clause, never "back online".
     #[test]
     fn aggregate_names_first_sightings_separately() {
         let back = names(&["old"]);
@@ -460,8 +453,7 @@ mod tests {
         );
     }
 
-    /// A batch that moves in both directions must say so in one message —
-    /// that is the whole point of collapsing.
+    /// A batch that moves both ways reports both in one message.
     #[test]
     fn aggregate_reports_both_directions_in_one_line() {
         let off = names(&["a", "b"]);
@@ -476,8 +468,7 @@ mod tests {
         assert!(t.en.contains("1 worker back online (c)"), "{}", t.en);
     }
 
-    /// A farm-sized batch must stay readable: names are capped and the
-    /// remainder is counted, never silently dropped.
+    /// Names are capped and the remainder is counted, never dropped.
     #[test]
     fn aggregate_caps_the_name_list_and_counts_the_rest() {
         let off = names(&["w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8", "w9"]);
@@ -501,8 +492,7 @@ mod tests {
         assert!(t.de.ends_with(" – Adresse bc1q...xyz."), "{}", t.de);
     }
 
-    /// A worker name is optional on the wire; an empty one must render as
-    /// a placeholder rather than an empty pair of commas.
+    /// An empty worker name renders as a placeholder.
     #[test]
     fn aggregate_renders_a_blank_worker_name_as_a_placeholder() {
         let off = names(&["", "b"]);

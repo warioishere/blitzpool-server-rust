@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `PplnsEngineConfig` — typed knobs for the PPLNS service-engine.
-//!
-//! Mirrors the `[pplns]` TOML section plus a few engine-internal tunables
-//! (trim batch size, snapshot TTL). Construction is fallible via
-//! [`PplnsEngineConfig::try_new`] so field-level errors surface before the
-//! engine spins up. Listener port and vardiff settings belong to
-//! bp-stratum-v1/v2 and are not duplicated here.
+//! Typed knobs for the PPLNS engine: the `[pplns]` TOML section plus a few
+//! internal tunables, validated by [`PplnsEngineConfig::try_new`] before boot.
 
 use bp_common::{AddressId, Sats};
 use bp_pplns::{
@@ -14,105 +9,54 @@ use bp_pplns::{
     DEFAULT_MIN_PAYOUT_SATS,
 };
 
-/// PPLNS-engine construction knobs.
-///
-/// All fields validated by [`PplnsEngineConfig::try_new`]. [`Default`] is a
-/// field-filler for the `..Default::default()` spread, NOT a usable config:
-/// it leaves `fee_address` unset, which `try_new` refuses. The fee address
-/// has no sensible default, and "none" would pay every block to one miner.
+/// PPLNS-engine construction knobs. [`Default`] only fills a `..` spread: it
+/// leaves `fee_address` unset, which `try_new` refuses.
 #[derive(Debug, Clone)]
 pub struct PplnsEngineConfig {
-    /// Coinbase output that receives the pool fee — and, under the weight
-    /// model, the §4 residual `pay_P`. **Required**, and
-    /// [`Self::try_new`] refuses without it.
-    ///
-    /// `build_weight_distribution` cannot produce a distribution without a
-    /// pool output; without one every PPLNS job would be a solo coinbase
-    /// paying the whole block to one miner. The `Option` exists only for the
-    /// reader's public `/api/pplns/fees` shape; construction guarantees
-    /// `Some`.
+    /// Receives the pool fee and the ext 0x0003 residual `pay_P`. Required:
+    /// without a pool output every job would pay the whole block to one miner.
+    /// `Option` only for the `/api/pplns/fees` shape; `try_new` guarantees `Some`.
     pub fee_address: Option<AddressId>,
 
-    /// Pool fee % as f64 (e.g. `1.5` for 1.5%). Must be `[0.0, 100.0]`.
-    /// `[pplns] fee_percent` in the TOML.
+    /// Percent, `[0.0, 100.0]`.
     pub fee_percent: f64,
 
-    /// Pool operational minimum payout. Outputs below this stay as
-    /// pending credit in the signed ledger. Always clamped upward to
-    /// `DUST_LIMIT_SATS` (546) — values below violate Bitcoin Core relay
-    /// policy. `[pplns] min_payout_sats` (default 5000).
+    /// Smaller amounts stay as ledger credit. At least `DUST_LIMIT_SATS`,
+    /// below that Bitcoin Core will not relay the output.
     pub min_payout_sats: Sats,
 
-    /// Coinbase weight budget (WU). Handed straight to bitcoin-core
-    /// over the TDP IPC stream (`tdp_constraint_for_budget`) — there is
-    /// no `bitcoin.conf` knob to keep in sync. Default 50_000 (≈400
-    /// P2WPKH outputs); floored at `bp_pplns::MIN_COINBASE_WEIGHT_BUDGET`.
-    /// `[pplns] coinbase_weight_budget`.
+    /// Weight units, handed to bitcoin-core over TDP; no `bitcoin.conf` knob
+    /// to keep in sync. Floored at `bp_pplns::MIN_COINBASE_WEIGHT_BUDGET`.
     pub coinbase_weight_budget: u32,
 
-    /// Sliding-window size factor: `window_size = factor *
-    /// network_difficulty`. Defaults to `4` (no env override).
+    /// `window_size = factor * network_difficulty`.
     pub window_factor: f64,
 
-    /// Snapshot TTL in seconds.
-    ///
-    /// One snapshot is written per distinct distribution and only the
-    /// applied block's own key is deleted, so the TTL is what bounds the
-    /// keyspace. The Redis->Postgres backup skips per-job snapshot keys
-    /// (`redis_backup::is_per_job_snapshot`), so an expired snapshot is gone
-    /// from every store.
-    ///
-    /// A snapshot is only useful while a job built from it can be mined; a
-    /// job is GC-eligible 10 min (`bp_jobs_lifecycle`'s `retention_ms`)
-    /// after it retired. The default of 1200 s is twice that.
-    ///
-    /// ⚠️ Deliberately NOT sized against the confirmation window: the gated
-    /// apply can land after the TTL expires. A found block's snapshot is
-    /// resolved at the block-found instant and carried in the parked blob
-    /// (`PplnsEngine::weight_snapshot_for_block_found`), so settlement never
-    /// depends on this value.
+    /// The TTL is what bounds the snapshot keyspace; twice the job GC
+    /// retention. Not sized against the confirmation window: a found block
+    /// carries its snapshot in the parked blob, so settlement never needs it.
     pub snapshot_ttl_secs: u32,
 
-    /// Shares per count-bucket for the window (default 10000). Higher = less
-    /// Redis memory + coarser trim; lower = more memory + finer.
-    ///
-    /// Effectively a boot-time-only value on a populated window: the bucket
-    /// id is `floor(pplns:counter / bucket_shares)` over a counter nothing
-    /// ever resets, so raising it puts new shares in a bucket id *below* the
-    /// live set, where the trim drops them again. See `WindowStore`'s
-    /// `bucket_shares` field for the arithmetic and the safe direction.
+    /// Shares per window bucket. Boot-time only on a populated window: raising
+    /// it puts new shares below the live bucket ids, where the trim drops them
+    /// (see `WindowStore`'s `bucket_shares`).
     pub bucket_shares: u64,
 
-    /// Touch-buffer flush interval. The hot path accumulates
-    /// `lastAcceptedShareAt` updates in a SwapBuffer; every `N` seconds
-    /// the buffer drains to a bulk `UPDATE pplns_balance …`. Defaults to
-    /// 60s, aligned with the `bp-stats` flush cadence so DB-write
-    /// spikes coalesce.
+    /// How often buffered `lastAcceptedShareAt` updates flush to Postgres.
     pub touch_flush_interval_secs: u32,
 
-    /// Whether the daily 03:00 UTC dust-sweep cron runs.
-    /// `[pplns] dust_sweep_enabled`. Manual sweeps via admin trigger remain
-    /// available independent of this flag.
+    /// Only the daily cron; manual sweeps work regardless.
     pub dust_sweep_enabled: bool,
 
-    /// A balance row is sweep-eligible once `lastAcceptedShareAt` is
-    /// older than this many days. `[pplns] abandoned_balance_days`
-    /// (default 90).
+    /// Days without a share before a balance owner counts as gone.
     pub abandoned_balance_days: u32,
 
-    /// PPLNS-port vardiff floor — sub-`min_difficulty` retargets are
-    /// clamped back up. Mirrored from the per-port toml so the
-    /// `/api/pplns/fees` endpoint can render the operator's gate
-    /// without taking a dep on bp-stratum-v1.
+    /// PPLNS-port vardiff floor, mirrored here so `/api/pplns/fees` can show
+    /// it without depending on bp-stratum-v1.
     pub min_difficulty: u64,
 
-    /// Blocks between subsidy halvings on the network this pool runs
-    /// on — the input to the settlement gate's floor
-    /// (`bp_share::block_subsidy_sats`). NOT an operator knob: it is
-    /// derived from the configured network at boot, because regtest
-    /// halves every 150 blocks and the mainnet 210 000 would make every
-    /// regtest block past height 150 look like it burned part of its
-    /// subsidy.
+    /// Derived from the network at boot, not an operator knob: regtest halves
+    /// every 150 blocks, and the settlement gate's subsidy floor needs that.
     pub subsidy_halving_interval: u32,
 }
 
@@ -136,13 +80,9 @@ impl Default for PplnsEngineConfig {
 }
 
 impl PplnsEngineConfig {
-    /// Validate field-level invariants and return a config or the first
-    /// violation. Field-order matches the struct so error messages are
-    /// predictable in tests.
+    /// Return the config or its first violation, in struct field order.
     pub fn try_new(self) -> Result<Self, ConfigError> {
-        // The fee / min-payout / coinbase-budget invariants are shared with
-        // the Group-Solo engine; the checks + thresholds live in bp-pplns and
-        // pass through this engine's ConfigError unchanged (field order preserved).
+        // Fee, min-payout and budget checks are shared with Group-Solo.
         validate_fee_payout_budget(
             self.fee_address.as_ref().map(|a| a.as_str()),
             self.fee_percent,
@@ -191,11 +131,9 @@ pub enum ConfigError {
     ZeroUnsignedField { field: &'static str },
 }
 
-/// Epoch-ms before which an owner counts as gone after `abandoned_days`
-/// without a share. The one place that turns `[pplns]
-/// abandoned_balance_days` into a boundary: the dust sweep's abandoned
-/// credits, the window trim's age rule and the ledger summary's abandoned
-/// buckets all read it through here.
+/// Epoch-ms before which an owner counts as gone. The one place that turns
+/// `abandoned_balance_days` into a boundary, for the sweep, the window trim
+/// and the ledger summary alike.
 pub(crate) fn abandoned_cutoff_ms(now_ms: i64, abandoned_days: u32) -> i64 {
     now_ms - (abandoned_days as i64) * 86_400_000
 }
@@ -207,9 +145,7 @@ mod tests {
     use super::*;
     const TEST_FEE_ADDRESS: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
 
-    /// A config that differs from [`PplnsEngineConfig::default`] only in having a
-    /// usable pool-output recipient. The default deliberately does NOT —
-    /// see `the_default_config_is_refused_because_it_has_no_fee_address`.
+    /// [`PplnsEngineConfig::default`] plus a usable pool-output recipient.
     fn valid() -> PplnsEngineConfig {
         PplnsEngineConfig {
             fee_address: Some(AddressId::new(TEST_FEE_ADDRESS).expect("valid")),
@@ -217,8 +153,7 @@ mod tests {
         }
     }
 
-    /// The pool output is structural under §4; without a fee address every
-    /// block would pay 100 % to one miner.
+    /// Without a fee address every block would pay 100 % to one miner.
     #[test]
     fn the_default_config_is_refused_because_it_has_no_fee_address() {
         assert_eq!(
@@ -227,8 +162,7 @@ mod tests {
         );
     }
 
-    /// Shape-valid but unparseable is the same failure with a likelier
-    /// cause (a typo), and `AddressId` does not catch it.
+    /// A typo passes `AddressId` but must still be refused.
     #[test]
     fn a_typo_in_the_fee_address_is_refused() {
         let typo = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLX";
@@ -279,8 +213,6 @@ mod tests {
             fee_percent: f64::NAN,
             ..valid()
         };
-        // NaN can't compare equal to NaN in the error variant; just
-        // check the variant tag.
         match cfg.try_new().unwrap_err() {
             ConfigError::FeePayoutBudget(FeePayoutBudgetError::InvalidFeePercent { value }) => {
                 assert!(value.is_nan())
@@ -390,7 +322,6 @@ mod tests {
         ));
     }
 
-    /// A non-zero fee validates.
     #[test]
     fn a_non_zero_fee_validates() {
         PplnsEngineConfig {

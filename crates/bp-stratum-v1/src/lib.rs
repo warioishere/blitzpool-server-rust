@@ -1,21 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Stratum V1 server — JSON-RPC parser/emitter, ckpool-style job lifecycle,
-//! TDP→mining.notify translator, vardiff, share validator, per-connection
-//! statemachine.
-//!
-//! Architecture notes:
-//!
-//! - **Multi-thread by default.** Per-connection task on the tokio
-//!   multi-thread runtime; share validation runs inline (~µs hashes don't
-//!   warrant `spawn_blocking`).
-//! - **TDP is the upstream.** This crate consumes
-//!   `bp_template_distribution::TdpHandle` for `NewTemplate` +
-//!   `SetNewPrevHash` updates and translates them to SV1 `mining.notify`
-//!   frames. There is no `getblocktemplate` polling.
-//! - **Behavioural spec.** Frame shape, edge cases, vardiff cadence, and
-//!   reject-strings follow the documented SV1 protocol behaviour, with
-//!   `mining.notify[5..8]` in the 8-hex-padded ckpool form.
+//! Stratum V1 server: TDP templates become `mining.notify` frames (no
+//! `getblocktemplate` polling), with vardiff, share validation and one task
+//! per connection. Shares are validated inline because a hash costs microseconds.
+//! `mining.notify[5..8]` use the 8-hex-padded ckpool form.
 
 mod client;
 mod config;

@@ -3,16 +3,9 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! Integration tests for `bp-pplns-engine::ledger` against docker-PG.
-//!
-//! Gated on a local Postgres at
-//! `postgres://postgres:postgres@localhost:15433/public_pool`
-//! (override with `BP_PG_URL`). Tests skip cleanly via `eprintln!` +
-//! early return if the instance isn't reachable.
-//!
-//! Each test seeds with a unique address-prefix (per-test-name) so
-//! parallel runs don't collide on the shared `pplns_*` tables. Tests
-//! clean up after themselves with a DELETE in a final block.
+//! Ledger tests against Postgres (`BP_PG_URL`); they skip when it is
+//! unreachable. Each test uses its own address prefix so parallel tests do
+//! not collide on the shared `pplns_*` tables.
 
 use bp_common::{AddressId, Sats};
 use bp_pplns_engine::ledger::{
@@ -21,9 +14,8 @@ use bp_pplns_engine::ledger::{
 };
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
-/// `apply_distribution` takes the caller's transaction, because the balance
-/// read it settles against has to be locked in the same one. These tests
-/// hand it their own, as the engine does.
+/// `apply_distribution` takes the caller's transaction because the balance
+/// read it settles against must be locked in the same one.
 async fn apply_in_tx(
     pool: &PgPool,
     block_height: i32,
@@ -174,9 +166,7 @@ async fn apply_distribution_replay_idempotent() {
     let first = apply_in_tx(&pool, block_height, &rows, &balances, 1_700_000_000_000).await;
     assert_eq!(first.history_inserted, 1);
 
-    // Replay: the height already holds the same value-bearing rows, so
-    // `apply_distribution` writes nothing and totalPaidSats cannot be
-    // double-counted.
+    // The height already holds the same rows, so nothing is written again.
     let second = apply_in_tx(&pool, block_height, &rows, &balances, 1_700_000_060_000).await;
     assert_eq!(
         second.history_inserted, 0,
@@ -187,7 +177,6 @@ async fn apply_distribution_replay_idempotent() {
         "replay must skip the balance upsert (idempotency gate)"
     );
 
-    // Verify exactly 1 history row, and totalPaidSats still 500k (not doubled).
     let hist_count: (i64,) =
         sqlx::query_as(r#"SELECT count(*) FROM pplns_payout_history WHERE "blockHeight" = $1"#)
             .bind(block_height)
@@ -406,11 +395,8 @@ async fn touch_buffer_flush_once_empty_returns_zero() {
 }
 
 // ── The settlement must LOCK the balances it reads ──────────────────
-//
-// The block-found balance write is absolute (`current + delta`), and the
-// daily dust sweep writes the same rows, so `current` is read under
-// `FOR UPDATE` inside the apply transaction. A second connection asking
-// for the same row with a short `lock_timeout` must be refused.
+// The balance write is absolute (`current + delta`) and the dust sweep
+// writes the same rows, so `current` is read `FOR UPDATE` in the apply TX.
 
 #[tokio::test]
 async fn the_settlement_read_locks_the_rows_it_will_write() {
@@ -431,8 +417,8 @@ async fn the_settlement_read_locks_the_rows_it_will_write() {
     .await
     .expect("seed");
 
-    // Control FIRST: with nothing holding the row, the competing update
-    // succeeds — so a failure below is the lock and not a broken query.
+    // Control: unlocked, the competing update succeeds, so a failure below
+    // is the lock and not a broken query.
     assert!(
         competing_update(&pool, address).await,
         "precondition: an unlocked row IS updatable within the timeout"
@@ -464,8 +450,8 @@ async fn the_settlement_read_locks_the_rows_it_will_write() {
         .await;
 }
 
-/// Try to take the row from a second connection with a short
-/// `lock_timeout`. `true` = got it, `false` = refused (55P03).
+/// `true` if a second connection can update the row within a short
+/// `lock_timeout`.
 async fn competing_update(pool: &PgPool, address: &str) -> bool {
     let mut other = pool.begin().await.expect("begin competitor");
     sqlx::query("SET LOCAL lock_timeout = '250ms'")

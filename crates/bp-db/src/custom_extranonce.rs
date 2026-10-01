@@ -1,24 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Customer-set extranonce prefix per worker, with a stored bearer token.
-//!
-//! - `pplns_extranonce_challenge` — the short-lived message an address signs to
-//!   be issued a token (PK address, nonced + expiring, consumed on issue — so
-//!   the signature itself is one-time and never a reusable credential).
-//! - `pplns_extranonce_token`     — the issued token's hash (PK address).
-//!   Re-issuing overwrites it, which revokes the previous token.
-//! - `pplns_custom_extranonce`    — the applied override, read at channel-open.
-//!
-//! The token (not the signature) is the reusable credential: the customer signs
-//! once to be issued a token, then presents that token on every headless
-//! "set the EN for worker X" call. Only its SHA-256 hash is stored, mirroring
-//! `pplns_group.adminTokenHash`.
-//!
-//! `prefix` is the 4-byte extranonce prefix, a `u32` everywhere in the pool (see
-//! `bp_common::extranonce`). Postgres has no unsigned integer type, so the column
-//! is `bigint` with a `CHECK (prefix >= 0 AND prefix <= 4294967295)`. That check
-//! is what makes the `bigint -> u32` narrowing below total; these helpers own the
-//! conversion so no caller has to know the column is wider than the value.
+//! Customer-set extranonce prefix per worker. An address signs a one-time,
+//! expiring challenge to be issued a bearer token; the token (stored only as a
+//! SHA-256 hash, re-issue revokes) is the reusable credential. `prefix` is a
+//! `u32` stored as `bigint` with a range CHECK, which makes the narrowing total.
 
 use bp_common::AddressId;
 use sqlx::postgres::PgPool;
@@ -185,27 +170,10 @@ pub async fn find_extranonce_token(
 
 // ── Applied override ─────────────────────────────────────────────────
 
-/// Apply a whole batch of `(worker, prefix)` overrides for ONE address
-/// atomically — all rows land or none do.
-///
-/// Can fail on the `UNIQUE (address, prefix)` constraint: one address must not
-/// point two workers at the same prefix, because in Solo both hash the SAME
-/// coinbase (the payout set is the address) and the prefix is then the only
-/// thing partitioning their search space. Two *different* addresses may share a
-/// prefix — different payouts mean a different coinbase, so their headers differ
-/// regardless. The caller surfaces the constraint error as a domain error.
-///
-/// Runs in a single transaction with that check **deferred to COMMIT**. That
-/// is what makes a *swap* possible: setting `rig1` to `rig2`'s current prefix
-/// would otherwise collide with rig2's still-unchanged row and abort the
-/// batch, even though the end state is perfectly valid. Deferring moves the
-/// check to the end, where only the final state matters — a genuine duplicate
-/// (two workers left on the same prefix) still fails, and the error surfaces
-/// from `commit()`.
-///
-/// Returns the rows as written. The caller is responsible for rejecting
-/// in-batch duplicates up front so it can name the offending worker; this
-/// function's own guarantee is atomicity, not diagnosis.
+/// Apply a batch of `(worker, prefix)` overrides for one address atomically.
+/// `UNIQUE (address, prefix)` holds because two Solo workers of one address
+/// hash the same coinbase and only the prefix splits their search space; the
+/// check is deferred to COMMIT so swapping two workers' prefixes is allowed.
 pub async fn upsert_custom_extranonces_batch(
     pool: &PgPool,
     address: &AddressId,
@@ -256,14 +224,9 @@ pub async fn upsert_custom_extranonces_batch(
     Ok(out)
 }
 
-/// Every override this address has stored, ordered by worker.
-///
-/// The customer-facing read-back: what `set` persisted, nothing more. It is
-/// **not** evidence that the prefix is in effect — whether a live connection
-/// actually carries it depends on the core's Solo/Extended/primary-channel
-/// gates, which live in another process and are not reflected in this table.
-///
-/// Ordered by worker so two consecutive reads are diffable.
+/// Every override this address has stored, ordered by worker. This is what
+/// was persisted, not proof the prefix is in effect: that depends on the
+/// core's channel gates, which this table does not reflect.
 pub async fn find_custom_extranonces_for_address(
     pool: &PgPool,
     address: &AddressId,
@@ -295,12 +258,8 @@ pub async fn find_custom_extranonces_for_address(
         .collect())
 }
 
-/// Every override, for the stratum core's in-memory cache.
-///
-/// The core refreshes this periodically instead of hitting PG per connection;
-/// the table holds a handful of rows, so a full read is one cheap query. The
-/// API process writes and the core reads, so a change lands on the core within
-/// one refresh interval rather than instantly.
+/// Every override, for the stratum core's periodically refreshed cache; a
+/// change written by the API reaches the core within one refresh interval.
 pub async fn all_custom_extranonces(pool: &PgPool) -> Result<Vec<CustomExtranonceRow>, DbError> {
     let rows = sqlx::query!(
         r#"SELECT

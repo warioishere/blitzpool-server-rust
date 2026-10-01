@@ -1,18 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! The one build-and-persist path both payout engines run.
-//!
-//! PPLNS and Group-Solo differ in where their share state comes from and
-//! in what the weights mean — but between "here are the shares" and
-//! "here is a distribution whose snapshot is on disk" they do the same
-//! three things: drop unusable addresses, project onto weights, persist
-//! the settlement inputs under the fingerprint. Keeping that stretch in
-//! one place keeps the modes from drifting apart.
-//!
-//! What deliberately stays with each engine: reading its own share
-//! state, its in-flight cache (the cache key is genuinely per-mode), and
-//! anything it does afterwards — the PPLNS autoscaler sample, the
-//! Group-Solo per-finder snapshot key.
+//! The one build-and-persist path both payout engines run: drop unusable
+//! addresses, project onto weights, persist the settlement inputs under the
+//! fingerprint. One copy keeps the modes from drifting; share sourcing,
+//! caching and post-build steps stay per engine.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -27,12 +18,8 @@ use tracing::warn;
 
 use crate::snapshot::{write_weight_snapshot, StoredWeightSnapshot};
 
-/// How often a failed snapshot write is retried before the job goes out
-/// without one.
-///
-/// A block found on this job can only be booked from this key. The write
-/// is `DEL` + `HSET` + `EXPIRE`, so a failure in the middle leaves the key
-/// deleted; a re-run repairs exactly that.
+/// Retries for a failed snapshot write before the job goes out without one;
+/// a block found on this job can only be booked from this key.
 const SNAPSHOT_WRITE_RETRIES: u32 = 2;
 /// Backoff between those attempts, multiplied by the attempt number.
 const SNAPSHOT_WRITE_BACKOFF: Duration = Duration::from_millis(40);
@@ -54,23 +41,10 @@ pub struct BuildRequest<'a> {
     pub finder_address: Option<&'a AddressId>,
     pub reference_revenue_sats: u64,
     pub withheld_value: WithheldValue,
-    /// Who claims the block when the share source turns out to be EMPTY.
-    ///
-    /// An empty source would pay the whole block to the pool output, so
-    /// [`build_weight_distribution`] refuses it
-    /// ([`WeightBuildError::NoScoredMiners`]). Shares only come from jobs,
-    /// though, so a new group could then never mine its first share. The
-    /// asking miner named here becomes the sole scored claimant; with an
-    /// empty source nobody else holds a claim, and the pool still takes
-    /// exactly its fee via `weight_P`.
-    ///
-    /// This applies only to a provably EMPTY source, never to a build that
-    /// failed on a Redis/Postgres fault: there the window likely holds
-    /// miners whose claims could not be read.
-    ///
-    /// `None` wherever no single miner is asking (the pool-wide JDP
-    /// publisher builds for every job-declaring client at once), which
-    /// publishes nothing instead.
+    /// Sole scored claimant when the share source is provably EMPTY (never on a
+    /// read fault), since [`WeightBuildError::NoScoredMiners`] would otherwise
+    /// leave a new group unable to mine its first share. The pool still takes
+    /// only its fee. `None` where no single miner asks: publishes nothing.
     pub bootstrap_claimant: Option<&'a AddressId>,
     /// Prefix for the log lines, e.g. `"pplns"` / `"group-solo"`.
     pub scope: &'static str,
@@ -85,20 +59,10 @@ pub struct BuiltDistribution {
     pub snapshot_written: bool,
 }
 
-/// Sanitize, build, persist.
-///
-/// A failed snapshot write does NOT fail the build: the distribution is
-/// correct, and an `Err` would leave the miner without a job. A lost
-/// snapshot costs a manual reprocess if a block lands on this job; a lost
-/// distribution costs every miner their hashing time.
-///
-/// `snapshot_key` is a closure because the fingerprint only exists once
-/// the distribution is built, and the engines use different key schemes
-/// (`pplns:snapshot:fp:…` vs `groupsolo:{groupId}:snapshot:fp:…`).
-///
-/// Whatever this writes is read back by
-/// [`crate::snapshot::resolve_snapshot_for_block_found`], so a key scheme
-/// change here changes there too.
+/// Sanitize, build, persist. A failed snapshot write does not fail the build:
+/// it costs a manual reprocess if a block lands, a missing job costs every
+/// miner. `snapshot_key` is a closure since the fingerprint exists only after
+/// the build; [`crate::snapshot::resolve_snapshot_for_block_found`] reads it back.
 pub async fn build_and_snapshot(
     req: BuildRequest<'_>,
     conn: &mut ConnectionManager,
@@ -108,11 +72,8 @@ pub async fn build_and_snapshot(
     let scope = req.scope;
     let distribution = sanitize_and_build(req)?;
 
-    // Persist the settlement INPUTS under the weights fingerprint.
-    // Nothing else writes that key, and because settlement books
-    // `claim(T_actual) − paid` from the real coinbase, one snapshot
-    // serves every job built from this distribution — the pool's own
-    // templates and every JDC's alike.
+    // Settlement books `claim(T_actual) − paid` from the real coinbase, so one
+    // snapshot serves every job built from this distribution, JDC jobs included.
     let snapshot = StoredWeightSnapshot::from_distribution(&distribution);
     let key = snapshot_key(&distribution.fingerprint);
     let snapshot_written = write_with_retry(conn, &key, &snapshot, ttl_secs, scope).await;
@@ -123,17 +84,14 @@ pub async fn build_and_snapshot(
     })
 }
 
-/// Sanitize the inputs and build the distribution, applying the
-/// empty-source bootstrap. **Pure — no I/O**, which is the point: every
-/// decision in here moves satoshis, and none of it should need a Redis to
-/// be exercised. [`build_and_snapshot`] is this plus the persistence.
+/// Sanitize and build, applying the empty-source bootstrap. Pure, no I/O, so
+/// every decision that moves satoshis is testable without Redis.
 pub fn sanitize_and_build(
     mut req: BuildRequest<'_>,
 ) -> Result<WeightDistribution, WeightBuildError> {
-    // Drop anything that isn't a parseable Bitcoin address: one
-    // unparseable row would fail `address_to_script` in `bp-mining-job`
-    // and with it every miner's job. The dropped row is simply not paid
-    // this block, and for PPLNS it stays in the ledger.
+    // One unparseable address would fail `address_to_script` and with it
+    // every miner's job; the dropped row is not paid this block (PPLNS keeps
+    // it in the ledger).
     let shares_before = req.address_shares.len();
     let balances_before = req.balances.len();
     req.address_shares
@@ -151,9 +109,8 @@ pub fn sanitize_and_build(
         );
     }
 
-    // Owned separately from `req` so the retry below can add the
-    // bootstrap claimant while `build` still borrows the rest of the
-    // request.
+    // Owned apart from `req` so the retry can add the claimant while `build`
+    // borrows the rest.
     let mut shares = std::mem::take(&mut req.address_shares);
     let build = |shares: &HashMap<AddressId, f64>| {
         build_weight_distribution(WeightDistributionInput {
@@ -170,20 +127,13 @@ pub fn sanitize_and_build(
         })
     };
 
-    // Empty source → the builder refuses (see `bootstrap_claimant`), and
-    // the claimant is scored instead. Keyed off the BUILDER's verdict, not
-    // `address_shares.is_empty()`: it also drops non-finite / non-positive
-    // weights and the fee address, and that predicate lives in one place.
-    //
-    // A nominal weight of 1.0 is scale-invariant, so the claimant holds
-    // the whole score space and is paid `(1 − fee) · T`; the result is an
-    // ordinary distribution settling at `delta ≈ 0`. With `score_total`
-    // non-zero, a standing PPLNS credit projects and is paid this block.
+    // Keyed off the builder's verdict, not `is_empty()`: the builder also
+    // drops bad weights and the fee address. Weight 1.0 gives the claimant the
+    // whole score space, settling at `delta ≈ 0`, and a non-zero `score_total`
+    // lets a standing PPLNS credit be paid.
     let distribution = match build(&shares) {
         Err(WeightBuildError::NoScoredMiners) => {
             let Some(claimant) = req.bootstrap_claimant else {
-                // No miner to name (pool-wide JDP publisher): publish
-                // nothing.
                 return Err(WeightBuildError::NoScoredMiners);
             };
             warn!(
@@ -194,10 +144,8 @@ pub fn sanitize_and_build(
                  the share stream is not reaching the round."
             );
             shares.insert(claimant.clone(), 1.0);
-            // One retry, not a loop: the claimant is now scored, so a
-            // second `NoScoredMiners` can only mean the builder dropped
-            // it (unpayable address, or it IS the fee address) — and then
-            // there is genuinely nobody to pay.
+            // One retry: a second `NoScoredMiners` means the builder dropped
+            // the claimant itself, and then there is nobody to pay.
             build(&shares)?
         }
         other => other?,
@@ -283,9 +231,7 @@ mod bootstrap_tests {
             .sum()
     }
 
-    /// MONEY: with a claimant named, an empty share source pays the
-    /// ASKING MINER and leaves the pool exactly its fee, never the whole
-    /// block.
+    /// An empty source with a claimant pays that miner; the pool keeps only its fee.
     #[test]
     fn an_empty_source_with_a_claimant_pays_that_miner_not_the_pool() {
         let fee = addr(FEE);
@@ -339,9 +285,7 @@ mod bootstrap_tests {
         );
     }
 
-    /// With NO claimant the refusal stands (the pool-wide JDP publisher's
-    /// case): nothing is published rather than a coinbase paying the pool
-    /// 100 %.
+    /// Without a claimant an empty source stays refused, never paying the pool 100 %.
     #[test]
     fn an_empty_source_without_a_claimant_stays_refused() {
         let fee = addr(FEE);
@@ -351,8 +295,7 @@ mod bootstrap_tests {
         );
     }
 
-    /// The claimant must never displace a real share source, or every
-    /// miner would be handed the whole block on every job.
+    /// The claimant never displaces a real share source.
     #[test]
     fn a_populated_source_ignores_the_claimant() {
         let fee = addr(FEE);
@@ -373,8 +316,7 @@ mod bootstrap_tests {
         );
     }
 
-    /// A source that is empty only AFTER sanitizing counts as empty: the
-    /// bootstrap keys off the builder's verdict, not the raw map length.
+    /// A source empty only after sanitizing bootstraps too.
     #[test]
     fn a_source_of_only_unpayable_addresses_bootstraps_too() {
         let fee = addr(FEE);
@@ -389,9 +331,7 @@ mod bootstrap_tests {
         assert!(paid_to(&d, MINER).abs_diff(T - FEE_ONLY) <= 2);
     }
 
-    /// A standing PPLNS credit on an empty window is PAID: its boost is
-    /// `extra · score_total / divisor`, which needs the claimant scored to
-    /// be non-zero.
+    /// A standing PPLNS credit on an empty window is paid and settles to 0.
     #[test]
     fn the_bootstrap_lets_a_standing_credit_be_paid() {
         const CREDIT: i64 = 10_000_000;

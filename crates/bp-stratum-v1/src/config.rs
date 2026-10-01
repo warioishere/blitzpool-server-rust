@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Configuration for the Stratum V1 server and its listener ports.
-//!
-//! Two layers:
-//!
-//! - [`ServerConfig`]: process-wide defaults (network, pool identifier,
-//!   job lifecycle). Built once at startup.
-//! - [`PortConfig`]: per-listener overrides (initial difficulty, payout
-//!   mode, vardiff floor). One per TCP port the operator
-//!   exposes.
-//!
-//! Default values are the production values.
+//! Stratum V1 configuration: process-wide [`ServerConfig`] and one
+//! [`PortConfig`] per listener. Defaults are the production values.
 
 use bitcoin::Network;
 use bp_common::MiningMode;
@@ -18,77 +9,57 @@ use bp_jobs_lifecycle::LifecycleConfig;
 
 use crate::error::StratumV1Error;
 
-/// SV1 `mining.subscribe` response advertises an extranonce-2 size of 8
-/// bytes. Combined with the 4-byte extranonce-1 from the session id, total
-/// extranonce slot is 12 bytes. Matches ckpool's `nonce2length` default
-/// and is required by the Braiins Hashpower marketplace (≥ 7).
+/// Extranonce2 size advertised in `mining.subscribe`; with the 4-byte
+/// extranonce1 the slot is 12 bytes. Hashpower marketplaces require ≥ 7.
 pub(crate) const EXTRANONCE2_SIZE: u8 = 8;
 
-/// SV1 `mining.configure` response advertises BIP-310 version-rolling with
-/// this mask. Standard value compatible with most ASIC firmwares.
+/// BIP-310 version-rolling mask advertised in `mining.configure`.
 pub(crate) const VERSION_ROLLING_MASK: u32 = 0x1fffe000;
 
-/// Default vardiff sample-window evaluation interval (60 s). The
-/// per-connection difficulty-check timer fires this often.
+/// How often each connection re-evaluates vardiff.
 pub(crate) const DEFAULT_DIFFICULTY_CHECK_INTERVAL_MS: u64 = 60_000;
 
-/// cpuminer fallback difficulty. When `userAgent == "cpuminer"` and the
-/// initial difficulty is below [`CPUMINER_HIGH_DIFF_THRESHOLD`], the
-/// session difficulty is pinned to this value.
+/// Session difficulty for a `cpuminer` user agent whose initial difficulty
+/// is below [`CPUMINER_HIGH_DIFF_THRESHOLD`].
 pub(crate) const CPUMINER_FALLBACK_DIFFICULTY: f64 = 0.1;
 
-/// Above this initial difficulty, the cpuminer fallback is skipped (the
-/// session was deliberately started at high diff — typically a stress
-/// test, not a real CPU miner).
+/// Above this initial difficulty the cpuminer fallback is skipped: such a
+/// session was started high on purpose and is not a real CPU miner.
 pub(crate) const CPUMINER_HIGH_DIFF_THRESHOLD: f64 = 1_000_000.0;
 
-/// Default vardiff target submission rate per minute. Used when the
-/// port doesn't override it.
+/// Vardiff target shares per minute when the port does not override it.
 pub(crate) const DEFAULT_TARGET_SHARES_PER_MINUTE: f64 = 6.0;
 
-/// Default initial session difficulty fallback when a port doesn't supply
-/// one and the miner doesn't successfully negotiate via
-/// `mining.suggest_difficulty`.
+/// Initial difficulty when the port sets none and no suggest_difficulty
+/// was negotiated.
 pub(crate) const DEFAULT_INITIAL_DIFFICULTY: f64 = 16_384.0;
 
-/// Default pool identifier embedded in the coinbase scriptsig (after the
-/// BIP-34 height push, before the extranonce slot). Dropped at coinbase-
-/// build time if the resulting scriptsig would exceed 100 bytes.
+/// Pool identifier in the coinbase scriptsig; dropped at build time if the
+/// scriptsig would exceed 100 bytes.
 pub const DEFAULT_POOL_IDENTIFIER: &str = "Public-Pool";
 
-/// Process-wide configuration: bitcoin network, pool identity, lifecycle
-/// constants. Held in an `Arc` and shared across all connections.
+/// Process-wide configuration, shared across all connections.
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub network: Network,
-    /// Embedded in the coinbase scriptsig. Dropped if the resulting
-    /// scriptsig would exceed the 100-byte consensus limit.
+    /// Embedded in the coinbase scriptsig; dropped if the scriptsig would
+    /// exceed the 100-byte consensus limit.
     pub pool_identifier: String,
     /// Job/template retire-and-age-out parameters for the registry.
-    /// Starts at [`LifecycleConfig::DEFAULT`]; production overrides only
-    /// `retention_ms` (`[stratum] job_retention_ms`).
     pub lifecycle: LifecycleConfig,
     /// How often each connection re-evaluates its vardiff target.
     pub difficulty_check_interval_ms: u64,
-    /// Whether vardiff may use elapsed silence as evidence and walk a
-    /// quiet session's difficulty down (see [`bp_vardiff`]'s module doc,
-    /// "Silence easing"). Off by default — it changes retarget behaviour
-    /// for every session, so operators switch it on per deployment.
+    /// Let vardiff treat silence as evidence and walk a quiet session down
+    /// (see [`bp_vardiff`]). Off by default because it changes retargeting
+    /// for every session.
     pub vardiff_silence_easing: bool,
-    /// When `true`, every inbound JSON-RPC line and every outbound
-    /// frame the per-connection task writes is logged at DEBUG with
-    /// `📨 RX:` / `📤 TX:` prefixes. Heavy — only enable in staging.
+    /// Log every inbound and outbound frame at DEBUG. Heavy, staging only.
     pub protocol_debug: bool,
-    /// When `true`, emit per-share diagnostic traces at DEBUG
-    /// (`🎯 Share difficulty` + `✅ Share accepted`). Separate from
-    /// [`Self::protocol_debug`] (raw frame dumps) so operators can tail
-    /// per-share difficulty without the full JSON-RPC firehose.
+    /// Per-share difficulty traces at DEBUG, without the frame firehose of
+    /// [`Self::protocol_debug`].
     pub share_logs: bool,
-    /// When `true`, log the pool-internal submit→ack latency (µs from the
-    /// inbound `mining.submit` line being read to its response being
-    /// written) at INFO, one line per accepted/rejected share. Mirrors
-    /// the SV2 path; both are driven by the unified `debug.submit_latency`
-    /// config so operators get one switch for SV1 + SV2.
+    /// Log submit-to-ack latency per share at INFO; set by the same
+    /// `debug.submit_latency` switch as SV2.
     pub log_submit_latency: bool,
 }
 
@@ -107,8 +78,7 @@ impl ServerConfig {
         }
     }
 
-    /// Validate cross-field invariants. Called by the server before any
-    /// connection is accepted.
+    /// Validate cross-field invariants before any connection is accepted.
     pub fn validate(&self) -> Result<(), StratumV1Error> {
         if self.lifecycle.retention_ms < self.lifecycle.grace_ms {
             return Err(StratumV1Error::InvalidConfig(format!(
@@ -129,33 +99,24 @@ impl ServerConfig {
 #[derive(Clone, Debug)]
 pub struct PortConfig {
     pub port: u16,
-    /// Starting difficulty for new sessions on this port. The cpuminer
-    /// fallback and the suggest-difficulty handshake may lower it; the
-    /// `minimum_difficulty` floor (when > 0) is enforced on both.
+    /// Starting difficulty. The cpuminer fallback and suggest_difficulty may
+    /// lower it, but never below `minimum_difficulty` when that is set.
     pub initial_difficulty: f64,
-    /// When `false`, `mining.suggest_difficulty` is rejected with the
-    /// "Suggest difficulty is disabled for this connection" error.
+    /// When `false`, `mining.suggest_difficulty` is rejected.
     pub allow_suggested_difficulty: bool,
-    /// Target submission rate per minute. The vardiff engine retargets
-    /// to keep observed shares/min close to this.
+    /// Vardiff target shares per minute.
     pub target_shares_per_minute: f64,
-    /// Payout-mode routing for shares accepted on this port. Solo gets
-    /// per-miner coinbase; PPLNS shares a window-aggregated payout;
-    /// GroupSolo uses per-group PROP rounds. The PPLNS port overrides
-    /// any group membership the address has — the port choice is the
-    /// session-level opt-out signal.
+    /// Payout mode for shares on this port. The PPLNS port overrides any
+    /// group membership: choosing the port is the session's opt-out.
     pub payout_mode: MiningMode,
-    /// VarDiff floor. When `> 0`, the per-session retarget will never
-    /// drop below this value, and `mining.suggest_difficulty` is clamped
-    /// to at least this. Used on payout-mode ports to keep sub-dust
-    /// devices off the ledger.
+    /// Vardiff floor when `> 0`, also clamping suggest_difficulty. Keeps
+    /// sub-dust devices off the ledger on payout-mode ports.
     pub minimum_difficulty: f64,
 }
 
 impl PortConfig {
-    /// Construct a `PortConfig` with production defaults for `port`, leaving the
-    /// initial difficulty for the caller to set (no sensible default —
-    /// solo ports run very different starts than PPLNS ones).
+    /// Production defaults; the caller sets the initial difficulty because
+    /// solo and PPLNS ports start very differently.
     pub fn new(port: u16, initial_difficulty: f64) -> Self {
         Self {
             port,
@@ -167,12 +128,9 @@ impl PortConfig {
         }
     }
 
-    /// Clamp the configured start: if `initial_difficulty` is non-finite or
-    /// non-positive, fall back to `DEFAULT_INITIAL_DIFFICULTY`; if the
-    /// minimum-difficulty floor is set, raise the initial to meet it.
-    ///
-    /// Returns the effective starting difficulty that the connection's
-    /// first `mining.set_difficulty` should advertise.
+    /// The difficulty the first `mining.set_difficulty` advertises: a
+    /// non-finite or non-positive start falls back to the default, then the
+    /// floor is applied.
     pub fn effective_initial_difficulty(&self) -> f64 {
         let raw = if self.initial_difficulty.is_finite() && self.initial_difficulty > 0.0 {
             self.initial_difficulty
@@ -191,9 +149,7 @@ impl PortConfig {
         if self.port == 0 {
             return Err(StratumV1Error::InvalidConfig("port must be > 0".into()));
         }
-        // initial_difficulty may be NaN/0 in the raw struct — the
-        // effective value clamps that, but negatives are still rejected
-        // as a configuration error.
+        // NaN/0 opt into the fallback; a negative value is a config error.
         if self.initial_difficulty.is_finite() && self.initial_difficulty < 0.0 {
             return Err(StratumV1Error::InvalidConfig(format!(
                 "initial_difficulty {} must be ≥ 0 (use 0 / NaN to opt into the fallback)",
@@ -253,8 +209,7 @@ mod tests {
 
     #[test]
     fn rejects_retention_below_grace() {
-        // job_retention_ms must be ≥ stale_grace_ms — a job has to survive
-        // at least the grace window to be classifiable.
+        // A job must outlive the grace window to be classifiable as stale.
         let mut c = cfg();
         c.lifecycle.retention_ms = 1_000;
         c.lifecycle.grace_ms = 5_000;
@@ -326,7 +281,6 @@ mod tests {
 
     #[test]
     fn effective_initial_difficulty_fallback_on_nonfinite_input() {
-        // Check that non-finite values default to 16384.
         let p = port(3333, f64::NAN);
         assert_eq!(p.effective_initial_difficulty(), DEFAULT_INITIAL_DIFFICULTY);
         let p = port(3333, f64::INFINITY);
@@ -339,7 +293,6 @@ mod tests {
 
     #[test]
     fn effective_initial_difficulty_clamps_to_minimum_when_set() {
-        // Check that values are clamped to minimum difficulty when set.
         let mut p = port(3333, 64.0);
         p.minimum_difficulty = 1024.0;
         assert_eq!(p.effective_initial_difficulty(), 1024.0);
@@ -358,8 +311,6 @@ mod tests {
 
     #[test]
     fn effective_initial_difficulty_applies_floor_on_nonfinite_input() {
-        // When raw is non-finite AND a floor is set, fall back to 16384
-        // then clamp to floor.
         let mut p = port(3333, f64::NAN);
         p.minimum_difficulty = 100_000.0;
         assert_eq!(p.effective_initial_difficulty(), 100_000.0);

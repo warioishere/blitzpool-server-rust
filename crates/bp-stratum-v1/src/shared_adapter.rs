@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Projects SV1's native share types into the protocol-agnostic
-//! `bp_share_hook` views the server hands its sinks.
-//!
-//! Engines (PPLNS, group-solo, share-stats-sink, session-persistence)
-//! implement the shared sink traits once; the SV1 server calls them
-//! directly with what these functions build. SV2 has the symmetric pair
-//! in `bp-stratum-v2`. See the `bp-share-hook` crate-level docs for the
-//! full picture.
+//! Projects SV1 share types into the protocol-agnostic `bp_share_hook`
+//! views, so the sinks are implemented once for SV1 and SV2.
 
 use bp_share_hook::{RejectedReason, SharedAcceptedShare, SharedRejectedShare};
 
@@ -34,18 +28,16 @@ pub(crate) fn shared_accepted<'a>(
         // SV1 is one device per connection — never bundled.
         channel_count: 1,
         ts_ms: bp_common::now_ms(),
-        // Producer-assigned downstream at the single fan-out point; the
-        // protocol side has no global share sequence and no mode-gate, so it
-        // leaves share_id/mode/group_id blank.
+        // Stamped downstream at the fan-out point; the protocol side has no
+        // share sequence and no mode gate.
         share_id: "",
         mode: bp_common::MiningMode::Solo,
         group_id: None,
     }
 }
 
-/// Maps SV1's `RejectReason` onto the canonical `bp_stats::RejectedReason`,
-/// one to one: a stale share (for a job the pool has retired) is kept apart
-/// from one for a job the pool never had or already dropped.
+/// One-to-one mapping; a stale share (retired job) stays apart from one for
+/// a job the pool never had or already dropped.
 fn map_sv1_reject(reason: RejectReason) -> RejectedReason {
     match reason {
         RejectReason::JobNotFound => RejectedReason::JobNotFound,
@@ -163,9 +155,7 @@ mod tests {
         assert!(shared_accepted("a", "w", "s", None, &accept, 0.0).is_block_candidate);
     }
 
-    /// The projection is the birth point of `ts_ms` — it must stamp the
-    /// Core accept time so downstream sinks (and the Core→Satellite stream)
-    /// carry the real share time instead of a sink-side `now()`.
+    /// `ts_ms` is stamped at accept time, not by a downstream sink.
     #[test]
     fn stamps_accept_time() {
         let before = bp_common::now_ms();

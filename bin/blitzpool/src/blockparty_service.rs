@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Shared Blockparty service owner.
-//!
-//! Mirrors [`crate::group_service`] but for the Blockparty mode. Both
-//! the bp-api HTTP layer (`api_server.rs`) and the SV1 / SV2 stratum
-//! layer (via `PayoutResolver` in `payout_resolver.rs`) need the same
-//! handle so membership state + the routing cache stay coherent.
-//!
-//! The feature is **opt-in**: when `cfg.blockparty` is `None` this
-//! module returns `Ok(None)` and every Blockparty surface falls back
-//! to its safe Solo-equivalent default.
+//! Shared Blockparty service owner, like [`crate::group_service`]: the API and
+//! the Stratum layer need the same handle so membership state and routing
+//! cache stay coherent. Opt-in: without `[blockparty]` every surface falls back
+//! to its Solo-equivalent default.
 
 use std::sync::Arc;
 
@@ -95,11 +89,9 @@ pub(crate) async fn spawn(
     // source of truth — share the same handle the GroupService owns.
     let pplns_cache = group_service.service.address_cache();
 
-    // Size the Blockparty coinbase reservation to a party's roster when it
-    // reaches Ready (the engine calls the hook from `recompute_status`). Wired
-    // only when the Blockparty TDP stream exists; the configured budget is the
-    // floor the stream was already booted with. `None` (e.g. `--skip-tdp`)
-    // leaves the reservation fixed at that floor.
+    // Size the reservation to a party's roster when it reaches Ready. The
+    // configured budget is the floor the stream booted with; without the
+    // Blockparty TDP stream (`--skip-tdp`) it stays fixed there.
     let reservation: Option<Arc<dyn CoinbaseReservation>> =
         foundation.alt_tdp.get(&StreamKind::Blockparty).map(|tdp| {
             Arc::new(crate::blockparty_reservation::TdpCoinbaseReservation::new(
@@ -126,12 +118,9 @@ pub(crate) async fn spawn(
     }))
 }
 
-/// Resolve the shared group-fee config (Group-Solo + Blockparty).
-/// `cfg.group_fees.address` / `.percent` win when set; otherwise
-/// `cfg.pplns.fee_address` / `.fee_percent` apply, so a config with only
-/// a `[pplns]` fee needs no separate group-fee section. Returns
-/// `(parsed_address, percent)` — `Err((raw, parse_error))` when the
-/// resolved address string fails `AddressId::new`.
+/// Resolve the shared Group-Solo + Blockparty fee: `[group_fees]` wins when
+/// set, otherwise the `[pplns]` fee applies, so a config with only a PPLNS
+/// fee needs no separate section. `Err((raw, parse_error))` on a bad address.
 pub(crate) fn resolve_group_fees(
     cfg: &AppConfig,
 ) -> Result<(Option<AddressId>, f64), (String, bp_common::InvalidAddressError)> {
@@ -163,14 +152,10 @@ pub(crate) fn resolve_group_fees(
     Ok((address, percent))
 }
 
-/// `SharedAcceptedShareSink` that calls `on_share_accepted` for every
-/// share whose connecting address resolves to Blockparty mode. Drives
-/// the READY → ACTIVE auto-promotion on the first share landing on
-/// the admin's address; subsequent shares refresh `lastShareAt` (the
-/// dissolve-cooldown gate).
-///
-/// Reads the producer-stamped `share.mode`, so it holds no mode gate and
-/// runs unchanged on the Satellite off the accepted stream.
+/// Calls `on_share_accepted` for every Blockparty share: the first promotes
+/// READY → ACTIVE, later ones refresh `lastShareAt` (the dissolve-cooldown
+/// gate). Reads the producer-stamped `share.mode`, so it needs no mode gate
+/// and runs unchanged on the Satellite.
 pub(crate) struct BlockpartyAcceptedShareSink {
     service: Arc<dyn BlockpartyApi>,
 }

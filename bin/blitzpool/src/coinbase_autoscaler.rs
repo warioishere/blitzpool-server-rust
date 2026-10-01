@@ -1,27 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Runtime driver for the coinbase-budget autoscaler.
-//!
-//! Connects the pure control core ([`bp_pplns_engine::autoscale`]) to:
-//!
-//! - the **live budget handle** the PPLNS distribution builder reads per
-//!   template (pressure samples flow out, new budgets flow in);
-//! - **bitcoin-core's reservation** via the TDP handle, coupled to the
-//!   trimmer budget in the race-safe order so a found block is never rejected;
-//! - **Redis persistence** so the live value survives a restart instead of
-//!   resetting to the floor and climbing again.
-//!
-//! ## Race-safe coupling
-//!
-//! Invariant: *trimmer budget ≤ bitcoin-core reservation at every instant.*
-//! - **increase** (the growth case): raise core's reservation FIRST, then the
-//!   trimmer budget — a fresh job built after the change always fits.
-//! - **decrease**: lower the trimmer budget FIRST, then core — the trimmer
-//!   never emits more than the shrinking reservation.
-//!
-//! This is safe across in-flight templates because a coinbase is baked at
-//! job-build time and snapshot-replayed at block-found: an already-issued job
-//! keeps its old (smaller) coinbase regardless of a later budget bump.
+//! Runtime driver for the coinbase-budget autoscaler ([`bp_pplns_engine::autoscale`]).
+//! Invariant: *trimmer budget ≤ bitcoin-core reservation at every instant*,
+//! so a raise moves core first and a cut moves the trimmer first; an issued
+//! job keeps the coinbase it was built with. The value persists in Redis.
 
 use std::time::Duration;
 

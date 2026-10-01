@@ -25,18 +25,11 @@ const DEFAULT_WALLET_NAME: &str = "bp_regtest";
 /// Not `Clone` — there is exactly one underlying process per instance. Pass
 /// `&RegtestNode` around if multiple tasks need access.
 pub struct RegtestNode {
-    /// The bitcoin-node child. Wrapped in `Option` so it can be taken out in
-    /// [`RegtestNode::shutdown`] without leaving an invalid `Child` behind
-    /// for `Drop`.
+    /// `Option` so [`RegtestNode::shutdown`] can take it out before `Drop`.
     child: Option<Child>,
-    /// Owned tempdir backing `<datadir>` — `Some` only when the node
-    /// created its own datadir (deleted on shutdown/drop). `None` when an
-    /// external datadir was supplied via
-    /// [`RegtestConfig::external_datadir`] (caller owns cleanup, so the
-    /// directory survives a node restart).
+    /// `Some` only for an owned tempdir; `None` with
+    /// [`RegtestConfig::external_datadir`], which survives a node restart.
     datadir_guard: Option<TempDir>,
-    /// Resolved datadir path — valid regardless of whether the directory
-    /// is internally owned or external.
     datadir_path: PathBuf,
     rpc_port: u16,
     p2p_port: u16,
@@ -59,8 +52,6 @@ impl RegtestNode {
             ));
         }
 
-        // Either use the caller-supplied external datadir (survives node
-        // restarts) or create an owned tempdir (auto-cleaned on drop).
         let (datadir_guard, datadir_path) = match &config.external_datadir {
             Some(path) => {
                 std::fs::create_dir_all(path).map_err(RegtestError::Io)?;
@@ -125,8 +116,7 @@ impl RegtestNode {
         match node.wait_for_ready(config.startup_timeout).await {
             Ok(()) => Ok(node),
             Err(e) => {
-                // best-effort kill before surfacing the error so the
-                // bitcoin-node process doesn't leak.
+                // Kill before surfacing the error so the process doesn't leak.
                 node.kill_quietly();
                 Err(e)
             }
@@ -182,18 +172,14 @@ impl RegtestNode {
         Ok(())
     }
 
-    /// Peek for process death without blocking. `child` is always `Some`
-    /// between construction and shutdown.
-    ///
-    /// Uses `try_wait` (hence `&mut self`) rather than probing `/proc`,
-    /// which does not exist on macOS; it also yields the real exit status.
+    /// Peek for process death without blocking. `try_wait` rather than
+    /// `/proc`, which macOS lacks, and it yields the real exit status.
     fn check_alive(&mut self) -> Result<(), RegtestError> {
         let Some(child) = self.child.as_mut() else {
             return Ok(());
         };
         let pid = child.id();
         match child.try_wait() {
-            // Still running.
             Ok(None) => Ok(()),
             Ok(Some(status)) => Err(RegtestError::ExitedDuringStartup(format!(
                 "bitcoin-node pid {pid} exited with {status}"
@@ -255,15 +241,10 @@ impl RegtestNode {
             .call("createwallet", json!([DEFAULT_WALLET_NAME]))
             .await
         {
-            // Freshly created (and therefore loaded).
             Ok(_) => Ok(()),
-            // Already loaded in this process → nothing to do.
             Err(RegtestError::Rpc { detail, .. }) if detail.contains("already loaded") => Ok(()),
-            // Wallet exists on disk but is NOT loaded — the common case
-            // after a node restart at the same datadir (createwallet
-            // reports "Database already exists"). createwallet does NOT
-            // load it, so `loadwallet` runs explicitly; otherwise the
-            // first wallet RPC fails with -18 "wallet not loaded".
+            // On disk but not loaded, e.g. after a restart at the same
+            // datadir; `createwallet` does not load it, so `loadwallet` must.
             Err(RegtestError::Rpc { detail, .. }) if detail.contains("already exists") => {
                 match self
                     .rpc
@@ -278,9 +259,7 @@ impl RegtestNode {
                 }
             }
             Err(e) => {
-                // Some bitcoin-core configurations may pre-load the default
-                // wallet; loadwallet may also be necessary if the wallet was
-                // present from a previous run but not auto-loaded.
+                // The wallet may be pre-loaded or present but not auto-loaded.
                 if let Err(load_err) = self
                     .rpc
                     .call("loadwallet", json!([DEFAULT_WALLET_NAME]))
@@ -295,9 +274,7 @@ impl RegtestNode {
         }
     }
 
-    /// Generic **wallet** RPC passthrough (URL carries the wallet path).
-    /// For tests that need to fund a wallet + fill the mempool —
-    /// `sendmany`, `createrawtransaction`, `fundrawtransaction`, etc.
+    /// Generic wallet RPC passthrough (URL carries the wallet path).
     pub async fn wallet_call(
         &self,
         method: &'static str,
@@ -307,8 +284,7 @@ impl RegtestNode {
         self.wallet_rpc(method, params).await
     }
 
-    /// Generic **node** (non-wallet) RPC passthrough — `getmempoolinfo`,
-    /// `getblocktemplate`, `getrawmempool`, etc.
+    /// Generic node (non-wallet) RPC passthrough.
     pub async fn rpc_call(
         &self,
         method: &'static str,
@@ -318,9 +294,7 @@ impl RegtestNode {
     }
 
     async fn wallet_rpc(&self, method: &'static str, params: Value) -> Result<Value, RegtestError> {
-        // Bitcoin-core wallet RPCs require the URL to include the wallet
-        // name as a path component. A per-wallet RpcCaller is built on the
-        // fly rather than kept in a field; the call rate is low.
+        // Wallet RPCs need the wallet name in the URL path.
         let wallet_url = format!(
             "http://127.0.0.1:{}/wallet/{}",
             self.rpc_port, DEFAULT_WALLET_NAME
@@ -329,11 +303,8 @@ impl RegtestNode {
         wallet_caller.call(method, params).await
     }
 
-    /// Fresh wallet-derived address of the given type. `address_type` is
-    /// passed directly to bitcoin-core's `getnewaddress` second argument
-    /// (`"legacy"` → P2PKH, `"p2sh-segwit"` → P2SH-P2WPKH, `"bech32"` →
-    /// P2WPKH, `"bech32m"` → P2TR). Used by the address-type-coverage
-    /// regtest to source one address of each type the pool supports.
+    /// Fresh wallet address; `address_type` is `getnewaddress`'s second
+    /// argument (`"legacy"`, `"p2sh-segwit"`, `"bech32"`, `"bech32m"`).
     pub async fn new_address(&self, address_type: &str) -> Result<String, RegtestError> {
         self.ensure_wallet().await?;
         let value = self
@@ -345,10 +316,7 @@ impl RegtestNode {
         })
     }
 
-    /// Hex-encoded compressed pubkey for a wallet-derived bech32 address.
-    /// Wraps `getaddressinfo` and pulls the `pubkey` field. Used by the
-    /// 5-address-type regtest to derive a P2WSH (wrap an inner P2WPKH
-    /// script around a real on-chain pubkey via P2WSH).
+    /// Hex compressed pubkey of a wallet address, via `getaddressinfo`.
     pub async fn address_pubkey_hex(&self, address: &str) -> Result<String, RegtestError> {
         self.ensure_wallet().await?;
         let value = self.wallet_rpc("getaddressinfo", json!([address])).await?;
@@ -362,10 +330,7 @@ impl RegtestNode {
             })
     }
 
-    /// Submit a fully-assembled raw block (hex). Returns `None` on
-    /// accepted; `Some(reason)` on rejected. Used by regtests that
-    /// build blocks via the SV1 `MiningJob` path (no TDP
-    /// `SubmitSolution` round-trip).
+    /// Submit a raw block (hex): `None` if accepted, `Some(reason)` if rejected.
     pub async fn submit_block(&self, block_hex: &str) -> Result<Option<String>, RegtestError> {
         let value = self.rpc.call("submitblock", json!([block_hex])).await?;
         match value {
@@ -396,10 +361,6 @@ impl RegtestNode {
     }
 
     /// Mine `n` blocks whose coinbase pays `address`. Returns the tip height.
-    ///
-    /// Distinct from [`Self::generate_to_self`]: a test that cares *who* the
-    /// coinbase paid needs to choose the recipient, not take a fresh wallet
-    /// address it never sees.
     pub async fn generate_to_address(&self, n: u32, address: &str) -> Result<u32, RegtestError> {
         self.ensure_wallet().await?;
         let _hashes = self
@@ -445,10 +406,8 @@ impl RegtestNode {
     /// Stop the node cleanly. Idempotent.
     pub async fn shutdown(mut self) -> Result<(), RegtestError> {
         if let Some(mut child) = self.child.take() {
-            // bitcoin-core flushes chainstate on the `stop` RPC; do that
-            // first so the process exits cleanly.
+            // `stop` flushes chainstate so the process exits cleanly.
             let _ = self.rpc.call("stop", json!([])).await;
-            // Give it up to 5 seconds to exit gracefully.
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 match child.try_wait() {
@@ -471,9 +430,7 @@ impl RegtestNode {
                 }
             }
         }
-        // Drop the owned tempdir explicitly so cleanup errors are surfaced
-        // via the tracing log rather than swallowed by `Drop`. An external
-        // datadir (`datadir_guard == None`) is left intact for the caller.
+        // Close explicitly so cleanup errors are logged, not swallowed by `Drop`.
         if let Some(dir) = self.datadir_guard.take() {
             if let Err(e) = dir.close() {
                 warn!(error = %e, "regtest: failed to remove datadir");
@@ -493,10 +450,7 @@ impl RegtestNode {
 impl Drop for RegtestNode {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            // Fast path on Drop: SIGKILL the process. There is no async
-            // context here, so a graceful `stop` RPC isn't viable. Tempdir
-            // cleanup happens automatically when `self.datadir_guard` drops
-            // (owned tempdir only; external datadirs are left for the caller).
+            // No async context here for a graceful `stop`, so SIGKILL.
             if let Err(e) = child.kill() {
                 debug!(error = %e, "regtest: kill on Drop failed (process may already be gone)");
             }

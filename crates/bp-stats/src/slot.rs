@@ -1,73 +1,57 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Time-slot bookkeeping.
-//!
-//! All stats are bucketed by **slot end** timestamp (Unix millis). A 10-min
-//! slot ending at `t` covers `[t - SLOT_DURATION_MS, t)`. Slots are
-//! produced by floor-rounding `now` and adding one slot width.
+//! Time slots. Stats are bucketed by **slot end** (Unix millis): the slot
+//! ending at `t` covers `[t - SLOT_DURATION_MS, t)`.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::constants::{CHART_VISIBILITY_BUFFER_MS, SLOT_DURATION_MS};
 
-/// Time slot — end-of-slot timestamp in Unix milliseconds.
-///
-/// Constructed via [`TimeSlot::current`], [`TimeSlot::for_time`] or
-/// [`TimeSlot::from_millis`]. The inner i64 is `pub` so callers that
-/// receive a slot from `bp-db` rows can wrap directly without going
-/// through the helper.
+/// End-of-slot timestamp in Unix milliseconds. The inner i64 is `pub` so
+/// slots loaded from `bp-db` rows can be wrapped without re-rounding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TimeSlot(pub i64);
 
 impl TimeSlot {
-    /// Wrap an existing Unix-millis end timestamp without re-rounding it.
-    /// Used by code that loads slots from PG.
+    /// Wrap an existing end timestamp without re-rounding it.
     pub const fn from_millis(end_ms: i64) -> Self {
         Self(end_ms)
     }
 
-    /// Current slot for `now()`. Calls the system clock.
     pub fn current() -> Self {
         Self::for_time(now_millis())
     }
 
-    /// Slot that contains `timestamp_ms`. Floor-rounds and adds one slot
-    /// width so the result is the slot's **end**.
+    /// Slot containing `timestamp_ms`, identified by its **end**.
     pub fn for_time(timestamp_ms: i64) -> Self {
         let aligned = timestamp_ms.div_euclid(SLOT_DURATION_MS) * SLOT_DURATION_MS;
         Self(aligned + SLOT_DURATION_MS)
     }
 
-    /// Previous slot relative to `self`.
     pub fn previous(self) -> Self {
         Self(self.0 - SLOT_DURATION_MS)
     }
 
-    /// Next slot relative to `self`.
     pub fn next(self) -> Self {
         Self(self.0 + SLOT_DURATION_MS)
     }
 
-    /// `true` if `self` is older than the current slot (i.e. fully past).
+    /// `true` if `self` is fully in the past.
     pub fn is_complete(self) -> bool {
         self < Self::current()
     }
 
-    /// `true` if `self` is the current (in-progress) slot.
     pub fn is_current(self) -> bool {
         self == Self::current()
     }
 
-    /// Inner millis.
     pub fn as_millis(self) -> i64 {
         self.0
     }
 }
 
-/// The chart-visibility cutoff: chart consumers filter `time < cutoff`.
-/// A just-ended slot only crosses the threshold once
-/// `now >= slot_end + CHART_VISIBILITY_BUFFER_MS`, giving the flush a
-/// fixed window to commit. Computed against system time.
+/// Charts show only `time < cutoff`. A just-ended slot becomes visible
+/// `CHART_VISIBILITY_BUFFER_MS` after it ends, giving the flush time to commit.
 pub fn chart_visibility_cutoff_slot() -> TimeSlot {
     let cutoff = now_millis() - CHART_VISIBILITY_BUFFER_MS;
     TimeSlot::for_time(cutoff)
@@ -77,7 +61,6 @@ fn now_millis() -> i64 {
     let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before UNIX epoch");
-    // i128 → i64 conversion can't overflow until year 292 277 026 596 AD.
     dur.as_millis() as i64
 }
 
@@ -87,16 +70,13 @@ mod tests {
 
     #[test]
     fn for_time_aligns_to_slot_end() {
-        // 10-min slot width = 600_000 ms. A timestamp at 1234 ms falls in
-        // the slot ending at 600_000.
         let t = TimeSlot::for_time(1_234);
         assert_eq!(t.as_millis(), SLOT_DURATION_MS);
     }
 
     #[test]
     fn for_time_at_exact_slot_boundary_rolls_to_next_slot() {
-        // Timestamp exactly at a slot boundary lands in the NEXT slot
-        // (closed-open interval [start, end)).
+        // Slots are closed-open `[start, end)`.
         let t = TimeSlot::for_time(SLOT_DURATION_MS);
         assert_eq!(t.as_millis(), SLOT_DURATION_MS * 2);
     }

@@ -1,25 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Regtest: the SV1 translator bootstraps from
-//! [`bp_template_distribution::TdpHandle::current_snapshot`] when its
-//! broadcast subscription is installed AFTER bitcoin-core's startup
-//! `NewTemplate + SetNewPrevHash` pair was already emitted.
-//!
-//! `tokio::sync::broadcast` does not replay messages to late
-//! subscribers, and the production boot subscribes after `spawn_tdp()`.
-//! The TdpHandle's internal tap subscribes BEFORE the worker thread
-//! starts and captures the pair into [`TemplateSnapshot`]; the SV1
-//! translator's `spawn` replays that snapshot through the assembler so
-//! `current_template` is populated without waiting for another block.
-//!
-//! The test reproduces that ordering (spawn TDP, wait for the bootstrap
-//! pair, THEN subscribe + snapshot + spawn the server) and asserts
-//! `current_template()` becomes `Some` with no on-chain block. Without
-//! the replay it stays `None`: on regtest the mempool monitor only emits
-//! `NewTemplate(future=false)`, which alone never pairs in the assembler.
-//!
-//! Skipped (with a printed warning) when `bitcoin-node` is not
-//! installed at the host's default location or via `BITCOIN_NODE_PATH`.
+//! Regtest: a server that subscribes after bitcoin-core's startup template
+//! pair was broadcast still gets a current template, by replaying
+//! `TdpHandle::current_snapshot`. The broadcast does not replay to late
+//! subscribers, and production subscribes late.
 
 use std::time::Duration;
 
@@ -46,10 +30,7 @@ async fn sv1_translator_bootstraps_current_template_from_late_snapshot() {
         .await
         .expect("mine 101 for IBD-exit + coinbase maturity");
 
-    // ── Spawn TDP. The handle's internal snapshot tap subscribes
-    //    BEFORE the worker thread starts; bitcoin-core's bootstrap
-    //    NewTemplate + SetNewPrevHash pair will land in the snapshot
-    //    once `tdp.run()` is awake. ───────────────────────────────────
+    // ── Spawn TDP; its snapshot tap subscribes before the worker starts ──
     let tdp = TdpHandle::spawn(
         TdpConfig::new(node.ipc_socket_path())
             .with_fee_threshold(1)
@@ -57,11 +38,7 @@ async fn sv1_translator_bootstraps_current_template_from_late_snapshot() {
     )
     .expect("TdpHandle::spawn against regtest IPC");
 
-    // ── Simulate production timing: don't subscribe immediately.
-    //    Sleep long enough for bitcoin-core's bootstrap pair to be
-    //    emitted into the broadcast (where, with no live subscriber,
-    //    it would be lost) AND into the snapshot tap (where it
-    //    survives). 500 ms is generous on regtest. ──────────────────
+    // ── Production timing: let the bootstrap pair go out unheard ─────
     tokio::time::sleep(Duration::from_millis(500)).await;
     let snapshot = tdp.current_snapshot();
     assert!(
@@ -89,28 +66,20 @@ async fn sv1_translator_bootstraps_current_template_from_late_snapshot() {
         "snapshot pair must be from the same template (sanity)"
     );
 
-    // ── NOW subscribe — by this point the broadcast has long since
-    //    sent its bootstrap pair into the void. Without the snapshot
-    //    replay in `StratumV1Server::spawn`, the assembler stays
-    //    empty until a fresh on-chain block. ───────────────────────
+    // ── Subscribe late ───────────────────────────────────────────────
     let updates_rx = tdp.subscribe();
     let server_config = ServerConfig::defaults_for(Network::Regtest);
     let server = StratumV1Server::spawn(
         server_config,
         updates_rx,
         snapshot,
-        // No alt streams — this test asserts the default-stream snapshot replay.
         Vec::new(),
         ServerHooks::no_op(),
         SharedExtranonce::new(),
         std::sync::Arc::new(bp_mining_job::MiningJobCache::new()),
     );
 
-    // ── Assert: current_template populated WITHOUT mining another
-    //    block. With the bootstrap replay the translator pre-applies
-    //    the snapshot pair to its assembler on entry → current_template
-    //    is `Some` within a few hundred ms. Without it, this assertion
-    //    fails (would only become `Some` after another block). ─────
+    // ── A template must appear without mining another block ──────────
     let mut current = None;
     for _ in 0..40 {
         if let Some(t) = server.current_template() {

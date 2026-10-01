@@ -1,14 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! BTC address-ownership proof via message signature.
-//!
-//! - `pplns_ownership_challenge` — the short-lived exact message an address must
-//!   sign (PK address; only the most recent challenge is valid).
-//! - `pplns_address_ownership`   — the verified ownership binding (PK address).
-//!
-//! A generic "this address proved control of its key" primitive: consumed by the
-//! group-invite eligibility gate (a 2nd option next to the verified email) and
-//! the custom-extranonce override auth gate.
+//! BTC address-ownership proof via a signed, short-lived challenge (only the
+//! most recent one is valid). Gates group-invite eligibility (as an
+//! alternative to a verified email) and custom-extranonce overrides.
 
 use bp_common::AddressId;
 use sqlx::{postgres::PgPool, FromRow};
@@ -182,10 +176,8 @@ pub async fn is_address_ownership_verified(
     .map_err(DbError::from)
 }
 
-/// Batch form of [`is_address_ownership_verified`]: given a set of addresses,
-/// return the subset that has a signature-ownership proof — one query instead of
-/// one per address (avoids an N+1 fan-out on the roster read paths). Empty input
-/// short-circuits without a round-trip.
+/// Batch form of [`is_address_ownership_verified`]: the subset of `addresses`
+/// with a proof, in one query so roster reads avoid an N+1 fan-out.
 pub async fn addresses_with_ownership_proof(
     pool: &PgPool,
     addresses: &[String],

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! HTTP-level surface. Production impl talks to ip-api.com via
-//! `reqwest`; tests inject a recording mock.
+//! HTTP lookup against ip-api.com, behind a trait so tests inject a mock.
 
 use std::time::Duration;
 
@@ -10,9 +9,8 @@ use serde::Deserialize;
 
 use crate::error::GeoIpError;
 
-/// Raw response shape from `http://ip-api.com/json/{ip}?fields=status,city,country`.
-/// `status` is `"success"` on success and `"fail"` / `"private range"` /
-/// `"reserved range"` etc. on failure.
+/// Response of `http://ip-api.com/json/{ip}?fields=status,city,country`;
+/// any `status` other than `"success"` is a failure.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct IpApiResponse {
     pub status: String,
@@ -22,23 +20,18 @@ pub struct IpApiResponse {
     pub country: Option<String>,
 }
 
-/// HTTP-level abstraction. Production impl wraps `reqwest`; tests use
-/// a recording mock. Keeps the service free of `reqwest` so unit-tests
-/// can run without a live HTTP listener.
+/// Keeps the service free of `reqwest`, so tests run without HTTP.
 #[async_trait]
 pub trait GeoIpClient: Send + Sync + 'static {
     async fn lookup(&self, ip: &str) -> Result<IpApiResponse, GeoIpError>;
 }
 
-/// Production HTTP impl. Constructed once per `GeoIpService::spawn`.
 pub struct ReqwestGeoIpClient {
     http: reqwest::Client,
     base_url: String,
 }
 
 impl ReqwestGeoIpClient {
-    /// `base_url` is `http://ip-api.com` in production; tests can point
-    /// it at a mock HTTP server.
     pub fn new(base_url: impl Into<String>, request_timeout: Duration) -> Result<Self, GeoIpError> {
         let http = reqwest::Client::builder()
             .timeout(request_timeout)
@@ -72,16 +65,14 @@ impl GeoIpClient for ReqwestGeoIpClient {
 
 #[cfg(test)]
 pub mod test_support {
-    //! Recording mock client for unit tests — public under `cfg(test)`
-    //! so the integration tests in `tests/` can reuse it.
+    //! Recording mock client for unit tests.
 
     use super::*;
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    /// Returns queued responses in order. After the queue is drained,
-    /// any further call panics — keeps tests honest about expected
-    /// HTTP-call counts.
+    /// Returns queued responses in order and panics once drained, so a
+    /// test cannot make more HTTP calls than it expects.
     pub struct ScriptedClient {
         queue: Mutex<VecDeque<Result<IpApiResponse, GeoIpError>>>,
         calls: Mutex<Vec<String>>,

@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//
-//! In-memory routing cache. The stratum layer hits this on every share
-//! to decide whether the connected miner's address should route to a
-//! Blockparty coinbase (admin), be considered a member of one (for
-//! mode-collision / UI badging), or fall through to whatever mode the
-//! address resolves to elsewhere.
-//!
-//! **Load-bearing invariant**: `set_admin_status` MUST be called from
-//! every state-transition site (`recompute_status`, `on_share_accepted`,
-//! `dissolve_group`). If the cache holds a stale status the routing
-//! guards either keep an unconfirmed admin's reward in the pool-fee
-//! fallback or skip a confirmed party's coinbase entirely.
+//! In-memory routing cache, read on every share. Every status transition
+//! must call `set_admin_status`; a stale status routes a confirmed party's
+//! block to the pool fee, or skips its coinbase.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,25 +14,18 @@ use uuid::Uuid;
 
 use crate::error::BlockpartyServiceError;
 
-/// Cached admin-side entry. `status` drives the two routing predicates
-/// (READY/ACTIVE → coinbase, DRAFT/CONFIRMING → pending-fee fallback).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdminCacheEntry {
     pub group_id: Uuid,
     pub status: BlockpartyStatus,
 }
 
-/// Two-map routing index. Both maps live behind one `RwLock` so a
-/// `rebuild()` atomically swaps both — the stratum layer never sees
-/// a half-rebuilt state where admin lookup hits but member lookup misses.
+/// One lock over both maps so a rebuild swaps them together.
 #[derive(Debug, Default)]
 struct Inner {
-    /// Admin address → routable entry. Populated for every non-dissolved
-    /// party.
+    /// Non-dissolved parties only.
     admin: HashMap<AddressId, AdminCacheEntry>,
-    /// Member address → group id. Populated for every member row of every
-    /// non-dissolved party (incl. the admin's own member row — admin is
-    /// also a member with role='admin').
+    /// Includes the admin's own member row.
     member: HashMap<AddressId, Uuid>,
 }
 
@@ -57,25 +41,19 @@ impl BlockpartyCache {
 
     // ─── Read paths (stratum hot path) ─────────────────────────────
 
-    /// `O(1)` admin lookup. Returns `None` for non-admin addresses or
-    /// addresses of dissolved parties.
     pub async fn get_admin(&self, address: &AddressId) -> Option<AdminCacheEntry> {
         self.inner.read().await.admin.get(address).copied()
     }
 
-    /// Returns a groupId only if status is `ready` or `active`.
-    /// CONFIRMING/DRAFT/DISSOLVED → `None`, so shares fall through to
-    /// whatever the next routing layer decides.
+    /// `Some` only for a ready or active party.
     pub async fn routable_group_id_for_admin(&self, address: &AddressId) -> Option<Uuid> {
         let entry = self.inner.read().await.admin.get(address).copied()?;
         entry.status.is_routable().then_some(entry.group_id)
     }
 
-    /// When the admin address belongs to a DRAFT/CONFIRMING party,
-    /// signals to the Solo-fallback path that the entire block reward
-    /// should route to the pool-fee address instead of to the admin.
-    /// Without this guard the admin would otherwise pocket the full
-    /// reward via Solo before members confirm the splits.
+    /// `Some` for a draft or confirming party: the Solo fallback then pays
+    /// the whole reward to the pool fee, so the admin cannot pocket it
+    /// before the members confirm the splits.
     pub async fn pending_fee_route_admin(&self, address: &AddressId) -> Option<Uuid> {
         let entry = self.inner.read().await.admin.get(address).copied()?;
         entry
@@ -84,22 +62,15 @@ impl BlockpartyCache {
             .then_some(entry.group_id)
     }
 
-    /// `O(1)` member lookup. Returns the party's group id if `address`
-    /// is a member (any role). Used for mode-collision checks against
-    /// PplnsGroup and for UI mode-badging.
+    /// Any role, admin included.
     pub async fn member_group_id(&self, address: &AddressId) -> Option<Uuid> {
         self.inner.read().await.member.get(address).copied()
     }
 
     // ─── Write paths (service-layer only) ──────────────────────────
 
-    /// Replace the admin entry for a single address. **MUST** be called
-    /// from every state transition (`recompute_status`,
-    /// `on_share_accepted`, `dissolve_group`) so the routing guards
-    /// don't read stale status.
-    ///
-    /// `status == Dissolved` removes the admin entry and every member
-    /// entry of the group — the dissolve deletes those member rows.
+    /// Must be called from every status transition. `Dissolved` also drops
+    /// the group's member entries, matching the dissolve's row deletion.
     pub async fn set_admin_status(
         &self,
         admin_address: &AddressId,
@@ -114,13 +85,10 @@ impl BlockpartyCache {
             guard
                 .admin
                 .insert(admin_address.clone(), AdminCacheEntry { group_id, status });
-            // The admin is also a member (admin role), so its member
-            // entry is populated here too.
             guard.member.insert(admin_address.clone(), group_id);
         }
     }
 
-    /// Insert a member entry (non-admin role).
     pub async fn insert_member(&self, address: &AddressId, group_id: Uuid) {
         self.inner
             .write()
@@ -129,20 +97,16 @@ impl BlockpartyCache {
             .insert(address.clone(), group_id);
     }
 
-    /// Remove a member entry (a single `remove_member`).
     pub async fn remove_member(&self, address: &AddressId) {
         self.inner.write().await.member.remove(address);
     }
 
-    /// Full rebuild from PG. Single read-lock-then-swap so the hot path
-    /// never sees a partial map. Used at boot and after operations that
-    /// touch many rows (bulk imports, dissolve cleanup).
+    /// Full rebuild from PG, swapped in under one write lock so readers
+    /// never see a partial map.
     pub async fn rebuild(&self, pool: &PgPool) -> Result<(), BlockpartyServiceError> {
         let groups = bp_db::list_blockparty_groups_non_dissolved(pool).await?;
         let members = bp_db::list_all_blockparty_members(pool).await?;
 
-        // status_by_id + admin_by_id: avoid a second SELECT for each
-        // member by indexing groups once.
         let mut status_by_id: HashMap<Uuid, BlockpartyStatus> =
             HashMap::with_capacity(groups.len());
         let mut admin_by_id: HashMap<Uuid, AddressId> = HashMap::with_capacity(groups.len());
@@ -172,7 +136,6 @@ impl BlockpartyCache {
             if status_by_id.contains_key(&m.group_id) {
                 next_member.insert(m.address, m.group_id);
             }
-            // Members of dissolved groups are silently dropped.
         }
 
         let mut guard = self.inner.write().await;
@@ -181,7 +144,6 @@ impl BlockpartyCache {
         Ok(())
     }
 
-    /// Snapshot count — diagnostics / `/metrics` gauge.
     pub async fn admin_len(&self) -> usize {
         self.inner.read().await.admin.len()
     }
@@ -191,9 +153,8 @@ impl BlockpartyCache {
     }
 }
 
-/// Cross-mode collision: when `bp_group_mgmt_engine::GroupService`
-/// adds an address to a PPLNS group it consults this trait to refuse
-/// addresses already in a Blockparty (admin OR member row counts).
+/// Lets `GroupService` refuse a PPLNS join for an address already in a
+/// Blockparty, admin or member.
 #[async_trait::async_trait]
 impl bp_group_mgmt_engine::BlockpartyMembershipReader for BlockpartyCache {
     async fn is_member(&self, address: &AddressId) -> bool {

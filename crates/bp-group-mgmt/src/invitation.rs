@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Invitation lifecycle types + status-transition validator.
-//!
-//! Mirrors `pplns_group_invitation` (DB). The two flavours of
-//! invitation — `directed` (admin → specific address, single-use, emailed)
-//! and `open` (admin → shareable link, multi-use) — share the status enum
-//! but use different subsets of it (see [`InvitationStatus::Accepted`]).
+//! Invitation lifecycle types and status-transition validators for
+//! `pplns_group_invitation`. Directed and open invitations share the status
+//! enum but use different subsets of it (see [`InvitationStatus::Accepted`]).
 
 use crate::constants::{INVITATION_TTL_DAYS, MS_PER_DAY};
 
@@ -37,11 +34,9 @@ impl InvitationKind {
     }
 }
 
-/// Status of an invitation row. Lifecycle:
-///
-/// - **directed**: `Pending` → `Accepted` | `Declined` | `Expired`
-/// - **open**:     `Pending` → `Revoked` | `Expired`
-///   (no `Accepted` — open invites stay claimable until TTL/revoke).
+/// Directed: `Pending` → `Accepted` | `Declined` | `Expired`.
+/// Open: `Pending` → `Revoked` | `Expired`; never `Accepted`, since an
+/// open invite stays claimable until TTL or revoke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InvitationStatus {
     Pending,
@@ -100,23 +95,15 @@ pub fn invitation_ttl_ms() -> i64 {
     INVITATION_TTL_DAYS as i64 * MS_PER_DAY
 }
 
-/// `true` if the invitation row is past its `expires_at` at `now_ms`.
-/// Used by both the cron sweeper and inline-on-read checks before
-/// honouring an accept/decline.
 pub fn is_expired(expires_at_ms: i64, now_ms: i64) -> bool {
     now_ms >= expires_at_ms
 }
 
-/// Compute `expires_at` for a freshly-created invitation, using the
-/// default TTL.
 pub fn expires_at(created_at_ms: i64) -> i64 {
     created_at_ms + invitation_ttl_ms()
 }
 
-/// Validate that an invitation in state `current` can be moved to
-/// `Accepted`. Returns `Ok(())` for a clean `Pending → Accepted`; an
-/// `Err(_)` for any other current status or when `kind == Open` (open
-/// invites have no `Accepted` state).
+/// Only a pending, unexpired directed invite can be accepted.
 pub fn can_accept(
     current: InvitationStatus,
     kind: InvitationKind,
@@ -141,9 +128,7 @@ pub fn can_accept(
     }
 }
 
-/// Validate that an invitation in state `current` can be moved to
-/// `Declined`. Same semantics as [`can_accept`], specialised for the
-/// decline path.
+/// Same rules as [`can_accept`], for the decline path.
 pub fn can_decline(
     current: InvitationStatus,
     kind: InvitationKind,
@@ -168,9 +153,7 @@ pub fn can_decline(
     }
 }
 
-/// Validate that an open invite can be revoked. Open-only —
-/// directed invites can't be "revoked" (they're either still pending,
-/// accepted, declined, or expired).
+/// Only a pending open invite can be revoked.
 pub fn can_revoke(
     current: InvitationStatus,
     kind: InvitationKind,

@@ -4,12 +4,8 @@
 
 use bp_share::sha256d;
 
-/// Fold the coinbase txid up through the merkle branch to produce the root.
-/// At each level, the hash is `sha256d(current || sibling)`.
-///
-/// - `coinbase_hash` is the non-witness coinbase txid (LE bytes).
-/// - `merkle_branch` is the leaf-to-root sequence of sibling hashes, as
-///   provided by an SV1 `mining.notify` or the TDP template equivalent.
+/// Fold the non-witness coinbase txid (LE) up through the leaf-to-root
+/// sibling branch, `sha256d(current || sibling)` per level.
 pub fn merkle_root_from_coinbase(coinbase_hash: &[u8; 32], merkle_branch: &[[u8; 32]]) -> [u8; 32] {
     let mut current = *coinbase_hash;
     let mut buf = [0u8; 64];
@@ -21,16 +17,9 @@ pub fn merkle_root_from_coinbase(coinbase_hash: &[u8; 32], merkle_branch: &[[u8;
     current
 }
 
-/// The inverse: build the branch [`merkle_root_from_coinbase`] folds.
-///
-/// `leaves` is the block's txid list in block order, coinbase first, each in
-/// internal byte order. Returns the sibling hashes from the coinbase leaf up
-/// to the root — what an SV1 `mining.notify` merkle branch and an SV2
-/// `merkle_path` carry. Odd levels duplicate their last entry, as consensus
-/// does.
-///
-/// It lives beside the fold deliberately: the two must agree on the
-/// duplicate-last rule, and this module's cross-check test pins that they do.
+/// Build the branch [`merkle_root_from_coinbase`] folds from the block's txids
+/// (coinbase first, internal byte order). Odd levels duplicate their last
+/// entry as consensus does; it lives beside the fold so both agree on that.
 pub fn coinbase_merkle_branch(leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
     let mut level = leaves.to_vec();
     let mut branch = Vec::new();
@@ -96,15 +85,6 @@ mod tests {
         assert_eq!(merkle_root_from_coinbase(&cb, &[s1, s2, s3]), h3);
     }
 
-    // ── Reference cross-check against a full Bitcoin merkle tree ────────
-    //
-    // The synthetic tests above fix the siblings by hand. This builds a
-    // complete merkle tree the way Bitcoin Core does (pair + duplicate the
-    // last node on an odd count), extracts the coinbase's branch, and
-    // confirms `merkle_root_from_coinbase` reconstructs the same root — for
-    // several leaf counts including odd ones (which exercise the
-    // duplicate-last rule that an SV1 `mining.notify` branch encodes).
-
     /// Hash-like leaf from a seed byte (looks like a real txid).
     fn leaf(seed: u8) -> [u8; 32] {
         sha256d(&[seed; 32])
@@ -130,13 +110,10 @@ mod tests {
         level[0]
     }
 
-    /// The cross-check runs against the production branch builder.
-    /// `reference_root` is hand-rolled on purpose: an independent route to the
-    /// root (pair the whole level, repeat) rather than siblings on the way up.
+    /// Branch + fold reproduce an independently built full-tree root,
+    /// including odd counts that hit the duplicate-last rule.
     #[test]
     fn fold_matches_full_tree_root_for_various_tx_counts() {
-        // 1 (coinbase-only), 2, 3, 4, 5, 7, 9 transactions. Odd counts force
-        // the duplicate-last rule at one or more levels.
         for n in [1usize, 2, 3, 4, 5, 7, 9] {
             let leaves: Vec<[u8; 32]> = (0..n as u8).map(leaf).collect();
             let expected = reference_root(&leaves);

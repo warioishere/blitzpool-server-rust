@@ -1,30 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Pool-wide statistics accumulation — in-process buffers for the
-//! hot-path-writes-periodic-bulk-flush pattern.
-//!
-//! ## Scope
-//!
-//! Pure logic. The crate owns no I/O — no Redis, no PG, no cron. The
-//! stratum crates call `add_*` methods to fold a single share into the
-//! right accumulator(s); the service-wiring coordinator calls
-//! `drain_*` and `confirm_*` to flush to PG.
-//!
-//! ## Modules
-//!
-//! - [`slot`] — `TimeSlot` newtype + helpers (current slot, chart
-//!   visibility cutoff, slot-end alignment).
-//! - [`buffer`] — the generic primitives:
-//!   [`buffer::SwapBuffer`], [`buffer::NumberDeltaBuffer`],
-//!   [`buffer::NestedDeltaBuffer`], [`buffer::RecordDeltaBuffer`].
-//! - [`accumulator`] — the domain types built on top of the buffers,
-//!   each wrapping a `Mutex<…>` so `add_*` from the stratum path is
-//!   thread-safe.
-//! - [`health`] — `FlushHealthMonitor` counts consecutive flush failures
-//!   per flusher and surfaces a one-shot threshold-crossing signal.
-//!
-//! The bulk-flush queries (PG `unnest(...)` upserts) and the cron schedule
-//! live in the service-wiring layer.
+//! In-process statistics buffers: the share path folds each share in with
+//! `add_*`, and the service layer flushes them to PG with `drain_*` and
+//! `confirm_*`. Pure logic with no I/O, so the hot path never waits on a
+//! database.
 
 pub mod accumulator;
 pub mod buffer;

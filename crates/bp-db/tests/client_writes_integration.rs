@@ -197,12 +197,8 @@ async fn upsert_client_on_conflict_resurrects_soft_deleted_row() {
 
 // ── bulk_upsert_clients ─────────────────────────────────────────────
 
-/// The birth flush's bulk form: N rows, mixed insert + conflict, mixed
-/// Some/None `userAgent`, in one statement. Same statement as
-/// `upsert_client`, so the column semantics above carry over; what this
-/// pins is the array plumbing. Pool-level (the fn owns its transaction
-/// for the bulk-write lock), so cleanup by sessionId instead of
-/// TX-rollback.
+/// Pins the array plumbing of the bulk upsert: mixed insert + conflict and
+/// mixed Some/None `userAgent` in one statement.
 #[tokio::test]
 async fn bulk_upsert_clients_inserts_and_updates_in_one_statement() {
     let Some(pool) = connect_or_skip().await else {
@@ -499,10 +495,8 @@ async fn delete_client_for_session_skips_already_deleted_rows() {
 }
 
 // ── dead-session sweep primitives (candidates + verdict halves) ─────
-//
-// The sweep itself lives in bin/blitzpool and consults Redis between
-// these two calls; the PG halves are pinned here: age selects
-// CANDIDATES only, and the soft-delete hits exactly the given triples.
+// Age selects CANDIDATES only (the sweep consults Redis before the verdict);
+// the soft-delete hits exactly the given triples.
 
 /// Seed a row straight on the pool (the sweep writers own their own
 /// transaction for the bulk-write lock, so a rollback-tx test cannot
@@ -671,9 +665,7 @@ async fn recently_deleted_sessions_are_listed_and_revivable() {
 
 #[tokio::test]
 async fn update_sv2_user_agent_by_address_bumps_updated_at() {
-    // The UPDATE must refresh updatedAt, otherwise a
-    // downstream report refining a worker's userAgent would leave a stale
-    // "last seen" timestamp.
+    // Without the bump, refining a userAgent would leave a stale "last seen".
     let Some(pool) = connect_or_skip().await else {
         return;
     };
@@ -730,11 +722,9 @@ async fn update_sv2_user_agent_by_address_bumps_updated_at() {
 
 // ── bulk_upsert_client_difficulty_statistics ──────────────────────
 
-/// The batched form must keep the per-slot MAX, not last-write-wins: the
-/// flush window is drained in `HashMap` order, so if the upsert overwrote
-/// instead of taking `GREATEST`, whichever row happened to be iterated last
-/// would decide the stored value — and a miner's best share of the hour would
-/// silently disappear whenever a lower one followed it into the same batch.
+/// The batched form keeps the per-slot MAX, not last-write-wins: the flush
+/// drains in `HashMap` order, so overwriting would lose a best share whenever
+/// a lower one followed it into the batch.
 #[tokio::test]
 async fn bulk_diff_stats_keep_the_running_max_per_slot() {
     let Some(pool) = connect_or_skip().await else {

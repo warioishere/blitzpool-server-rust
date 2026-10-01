@@ -2,15 +2,9 @@
 
 #![allow(clippy::print_stderr)]
 
-//! The public leaderboard behind `/api/info` → `highScores`.
-//!
-//! The list must read `allTimeBestDifficulty`, not the column
-//! `/bestdiff_reset` zeroes: otherwise a miner clearing their own best
-//! would drop off the leaderboard, and the flush's `GREATEST` could never
-//! restore the entry (it only offers the CURRENT window's max).
-//!
-//! Needs `bp-test-pg` (15433) — skips when it is unreachable, so watch
-//! the passed-count.
+//! The public leaderboard must read `allTimeBestDifficulty`, not the column
+//! `/bestdiff_reset` zeroes, or a reset would drop the miner off it for good.
+//! Needs `bp-test-pg` (15433) and skips without it, so watch the passed-count.
 
 use bp_common::AddressId;
 use bp_db::{
@@ -55,12 +49,8 @@ async fn cleanup(pool: &PgPool, address: &str) {
         .await;
 }
 
-/// A miner's own `/bestdiff_reset` must not remove them from the public
+/// A miner's own `/bestdiff_reset` does not remove them from the public
 /// leaderboard.
-///
-/// Runs against real rows rather than a rollback transaction, because
-/// `find_high_scores` takes a pool — the seeded value is far above any
-/// real entry so the assertions do not depend on what else is in the DB.
 #[tokio::test]
 async fn a_reset_does_not_remove_the_miner_from_the_public_leaderboard() {
     let Some(pool) = connect_or_skip().await else {
@@ -81,9 +71,7 @@ async fn a_reset_does_not_remove_the_miner_from_the_public_leaderboard() {
     .await
     .expect("seed record");
 
-    // Precondition: the entry is in the list before the reset. Without
-    // this the post-reset assertion could pass on a list that never had
-    // it — the failure mode this whole test exists to catch.
+    // Precondition: the entry is on the list before the reset.
     let before = find_high_scores(&pool).await.expect("list before");
     let seeded = before
         .iter()

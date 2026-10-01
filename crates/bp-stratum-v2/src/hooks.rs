@@ -1,22 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Async-trait boundaries for production wiring.
-//!
-//! Same design as `bp_stratum_v1::hooks` (`Arc<dyn Trait>` aggregator, a
-//! [`NoOpHooks`] default, a [`test_support::RecordingHooks`] recorder), plus
-//! the SV2-specific hooks:
-//!
-//! - **`PayoutResolver`** — resolves the connection's miner address into a
-//!   payout list on every template broadcast; the result feeds
-//!   [`bp_mining_job::build_mining_job_from_tdp`] and then
-//!   [`crate::mining::client::apply_template_broadcast`].
-//! - **`BlockSubmissionSink`** — receives block-candidate shares; production
-//!   forwards to `bp_template_distribution::TdpHandle::submit_solution`.
-//! - **`CustomExtranonceSource`** — customer extranonce overrides.
-//!
-//! Accepted / rejected shares, session lifecycle and device status go to the
-//! protocol-agnostic `bp_share_hook` traits shared with SV1
-//! (`crate::shared_adapter` projects into them).
+//! Hook boundaries of the SV2 mining server, shaped like `bp_stratum_v1::hooks`
+//! with a [`NoOpHooks`] default and a [`test_support::RecordingHooks`] recorder.
+//! Shares, sessions and device status go to the `bp_share_hook` traits shared
+//! with SV1; only the SV2-specific hooks live here.
 
 use std::sync::Arc;
 
@@ -31,41 +18,25 @@ use crate::mining::submit::ShareAccept;
 
 // ── PayoutResolver ──────────────────────────────────────────────────
 
-/// Resolve a miner address to a coinbase payout list, per template
-/// broadcast. The list feeds [`bp_mining_job::build_mining_job_from_tdp`]
-/// and the resulting `MiningJob` goes to
-/// [`crate::mining::client::apply_template_broadcast`].
-///
-/// The production impl looks the address up in the mode gate and evaluates
-/// the per-mode distribution (PPLNS/Group-Solo: the ext 0x0003/Payout
-/// Computation weight formula; Blockparty / solo: their own allocators).
-/// [`NoOpHooks`] pays 100% to the miner.
+/// Resolve a miner address to a coinbase payout list per template broadcast,
+/// feeding [`bp_mining_job::build_mining_job_from_tdp`]. Production evaluates
+/// the address's mode; [`NoOpHooks`] pays 100% to the miner.
 #[async_trait::async_trait]
 pub trait PayoutResolver: Send + Sync {
-    /// Resolve the payout list for a given connection's locked
-    /// address + reward (in sats), together with the fingerprint of
-    /// the distribution it came from (zeroed = books without a
-    /// snapshot). Each entry carries its exact output sats;
-    /// `bp_mining_job::build_mining_job_from_tdp` places them verbatim.
+    /// Exact output sats per entry, placed verbatim, plus the fingerprint of
+    /// the distribution they came from (zeroed = books without a snapshot).
     async fn resolve_payouts(&self, miner_address: &AddressId, reward_sats: u64)
         -> ResolvedPayouts;
 
-    /// Which TDP template stream a connection with this address mines on,
-    /// resolved once at OpenChannel. Default `StreamKind::Pplns`; the
-    /// production resolver routes Solo addresses to the Solo stream. Sync
-    /// (in-memory mode cache).
+    /// Which TDP template stream this address mines on, resolved once at
+    /// OpenChannel from the in-memory mode cache.
     fn resolve_stream(&self, _miner_address: &AddressId) -> StreamKind {
         StreamKind::Pplns
     }
 
-    /// [`Self::resolve_stream`], with `None` for "not known yet".
-    ///
-    /// The mode cache learns an address from the port its mining session
-    /// opens on, so before any session exists there is nothing to read, and a
-    /// `StreamKind` cannot express that. On the JDP allocate path, which runs
-    /// before the mining channel opens, this is the normal case.
-    ///
-    /// Default: `resolve_stream`'s answer, for resolvers without a mode cache.
+    /// [`Self::resolve_stream`], with `None` for "not known yet": the mode cache
+    /// learns an address from its mining session, which the JDP allocate path
+    /// normally precedes.
     fn resolve_stream_known(&self, miner_address: &AddressId) -> Option<StreamKind> {
         Some(self.resolve_stream(miner_address))
     }
@@ -73,14 +44,11 @@ pub trait PayoutResolver: Send + Sync {
 
 // ── BlockSubmissionSink ─────────────────────────────────────────────
 
-/// Receives a block-candidate share. Production forwards to
-/// `bp_template_distribution::TdpHandle::submit_solution`; a JDC's
-/// PushSolution may reach bitcoin-core in parallel via the JDP server, which
-/// is safe because `submitblock` is idempotent.
+/// Receives a block-candidate share. A JDC's PushSolution may reach
+/// bitcoin-core in parallel via the JDP server; `submitblock` is idempotent.
 #[async_trait::async_trait]
 pub trait BlockSubmissionSink: Send + Sync {
-    // `stream`: the template stream this job was built on — routes the
-    // solution to the matching TDP handle. See [`bp_common::StreamKind`].
+    // `stream` routes the solution to the TDP handle the job was built on.
     async fn submit_block(
         &self,
         accept: &ShareAccept,
@@ -93,24 +61,17 @@ pub trait BlockSubmissionSink: Send + Sync {
 
 // ── CustomExtranonceSource ──────────────────────────────────────────
 
-/// Look up a customer-set extranonce prefix for a `(address, worker)`.
-///
-/// An address that proved control of its key may pin its own 4-byte prefix
-/// per worker through the API; the stratum server consults this at channel
-/// open to replace the pool-allocated prefix.
-///
-/// Sync on purpose: the production impl reads an in-memory cache refreshed
-/// from PG periodically, never a per-lookup DB round-trip.
+/// Customer-pinned 4-byte extranonce prefix for `(address, worker)`, replacing
+/// the pool-allocated one at channel open. Sync on purpose: it reads an
+/// in-memory cache, never a per-lookup DB round-trip.
 pub trait CustomExtranonceSource: Send + Sync {
     fn lookup(&self, address: &str, worker: &str) -> Option<[u8; 4]>;
 }
 
 // ── ServerHooks aggregator ──────────────────────────────────────────
 
-/// Composite hook handle for the SV2 mining server. Cheap to clone
-/// (each field is an `Arc<dyn Trait>`). Production wiring constructs
-/// once at startup with concrete impls; the server clones it into
-/// every per-connection task.
+/// Composite hook handle for the SV2 mining server, cloned into every
+/// per-connection task.
 #[derive(Clone)]
 pub struct MiningServerHooks {
     pub payout_resolver: Arc<dyn PayoutResolver>,
@@ -119,14 +80,11 @@ pub struct MiningServerHooks {
     pub rejected_sink: Arc<dyn SharedRejectedShareSink>,
     pub session_persistence: Arc<dyn SharedSessionPersistence>,
     pub device_status_sink: Arc<dyn DeviceStatusSink>,
-    /// Customer extranonce overrides. [`NoOpHooks`] returns `None` for every
-    /// worker.
     pub custom_extranonce: Arc<dyn CustomExtranonceSource>,
 }
 
 impl MiningServerHooks {
-    /// Build with every hook set to [`NoOpHooks`], for regtest / smoke-test
-    /// wiring.
+    /// Every hook set to [`NoOpHooks`].
     pub fn no_op() -> Self {
         let no_op: Arc<NoOpHooks> = Arc::new(NoOpHooks);
         let shared: Arc<NoOpSink> = Arc::new(NoOpSink);
@@ -144,8 +102,7 @@ impl MiningServerHooks {
 
 // ── NoOpHooks ───────────────────────────────────────────────────────
 
-/// [`MiningServerHooks`]-compatible impl that ignores every event, for tests
-/// and regtests that do not inspect hook fan-out.
+/// Ignores every event; pays 100% to the miner.
 pub struct NoOpHooks;
 
 #[async_trait::async_trait]
@@ -175,8 +132,7 @@ impl CustomExtranonceSource for NoOpHooks {
 
 // ── test_support ────────────────────────────────────────────────────
 
-/// Recording hooks for tests: every call lands in a `Mutex<Vec<...>>` buffer
-/// for assertions. Public so integration tests outside this crate can use it.
+/// Recording hooks for tests; public so integration tests can use them.
 pub mod test_support {
     use super::*;
     use bp_share_hook::{RejectedReason, SharedAcceptedShare, SharedRejectedShare};
@@ -208,8 +164,7 @@ pub mod test_support {
         pub worker: String,
     }
 
-    /// Records every hook call. Cheap to clone (`Arc<...>` internal
-    /// buffers — multiple clones share the same recordings).
+    /// Records every hook call; clones share the same recordings.
     #[derive(Clone, Default)]
     pub struct RecordingHooks {
         pub accepted: Arc<Mutex<Vec<AcceptedRecord>>>,
@@ -219,9 +174,8 @@ pub mod test_support {
         pub deregistered: Arc<Mutex<Vec<String>>>,
         /// (address, worker, online) per `on_device_event`.
         pub device_events: Arc<Mutex<Vec<(String, String, bool)>>>,
-        /// Payout list returned by [`PayoutResolver::resolve_payouts`]
-        /// — default is a 100%-to-the-given-address entry; tests can
-        /// override via [`Self::with_payouts`].
+        /// Replaces the default 100%-to-the-miner payout list; see
+        /// [`Self::with_payouts`].
         pub payouts_override: Arc<Mutex<Option<Vec<PayoutEntry>>>>,
     }
 
@@ -237,8 +191,7 @@ pub mod test_support {
             self
         }
 
-        /// Wrap into a [`MiningServerHooks`] for plugging into
-        /// `StratumV2MiningServer::spawn`.
+        /// Wrap into a [`MiningServerHooks`].
         pub fn into_server_hooks(self) -> MiningServerHooks {
             let arc = Arc::new(self);
             MiningServerHooks {
@@ -248,7 +201,6 @@ pub mod test_support {
                 rejected_sink: arc.clone(),
                 session_persistence: arc.clone(),
                 device_status_sink: arc,
-                // RecordingHooks doesn't record EN lookups — no override in tests.
                 custom_extranonce: Arc::new(NoOpHooks),
             }
         }

@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Shared persistence + ledger primitives for the coinbase-payout
-//! engines (`bp-pplns-engine`, `bp-group-solo-engine`).
-//!
-//! - [`snapshot`] — the Redis-hash format + write/read/delete that bridges template-build-time coinbase distribution to block-found ledger application.
-//! - [`share_map_from_redis_hash`] — the Redis share aggregate → validated distribution input.
-//! - [`ledger`] — the row-type discriminator + apply-distribution result / error types.
-//!
-//! One copy keeps the wire format (stable across deploys) and the DB
-//! row-type strings identical for both engines. Each engine keeps only
-//! its mode-specific wrappers (PPLNS: a fixed key; Group-Solo:
-//! per-(group, finder) keys + SCAN cleanup).
+//! Persistence and ledger primitives shared by the PPLNS and Group-Solo
+//! payout engines. One copy keeps the snapshot wire format (stable across
+//! deploys) and the DB row-type strings identical for both; each engine keeps
+//! only its key scheme.
 
 pub mod actual;
 pub mod budget;
@@ -33,18 +26,10 @@ pub use snapshot::{
     WeightSnapshotEntry,
 };
 
-/// Convert a Redis per-address share aggregate (`address → diff-1 sum`,
-/// raw strings straight off `HGETALL`) into the validated
-/// `HashMap<AddressId, f64>` the distribution math expects.
-///
-/// Both payout engines build their distribution input this way: PPLNS
-/// from the sliding-window hash, Group-Solo from the per-round hash.
-/// Entries whose address fails `AddressId` validation are skipped with
-/// a warn: dropping that one share beats failing the whole
-/// distribution. Non-positive diffs are skipped too.
-///
-/// `invalid_address_warning` is the engine-specific log line emitted on
-/// a rejected address.
+/// Redis per-address share aggregate (`address → diff-1 sum`) into the
+/// validated distribution input. An invalid address is skipped with a warn
+/// (dropping one share beats failing the whole distribution), as are
+/// non-positive diffs.
 pub fn share_map_from_redis_hash(
     raw: &HashMap<String, f64>,
     invalid_address_warning: &str,

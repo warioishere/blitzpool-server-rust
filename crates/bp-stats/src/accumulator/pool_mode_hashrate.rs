@@ -30,8 +30,7 @@ impl PoolModeHashrateAccumulator {
         }
     }
 
-    /// Record `diff` worth of share against `(slot, mode)`. Non-finite or
-    /// out-of-range values are silently discarded.
+    /// Non-finite or out-of-range values are dropped.
     pub fn add(&self, slot: TimeSlot, mode: MiningMode, diff: f64) {
         if !diff.is_finite() || diff <= 0.0 || diff > MAX_REASONABLE_DIFFICULTY {
             return;

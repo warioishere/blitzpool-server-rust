@@ -1,21 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `bp_share_hook` trait impls: fan a single share into the accumulators
-//! that back the stats tables.
-//!
-//! Both per-share hooks come from `bp-share-hook`, decoupled from the wire
-//! protocol, so this single impl serves both the SV1 and SV2 servers.
-//!
-//! **Mode-blind**: every accepted / rejected share lands here regardless
-//! of solo / PPLNS / group-solo. `bin/blitzpool` composes this sink
-//! with `bp-pplns-engine`'s and `bp-group-solo-engine`'s hooks via a
-//! fan-out composite so each engine sees only the shares it cares
-//! about while the stats-sink sees them all.
-//!
-//! The `pool_mode_hashrate` table is per-mode (solo / pplns /
-//! group-solo). The share carries its producer-resolved
-//! [`bp_common::MiningMode`], so the sink reads `share.mode` directly —
-//! no per-share mode-gate query.
+//! `bp_share_hook` impls that fan every share into the stats accumulators.
+//! Mode-blind: every accepted / rejected share of every mode lands here; the
+//! per-mode hashrate reads the producer-stamped `share.mode`.
 
 use std::sync::Arc;
 
@@ -32,8 +19,6 @@ use bp_stats::{
 
 use crate::flush::Accumulators;
 
-/// `SharedAcceptedShareSink` impl that mutates the accumulators on
-/// every accepted share. Cheap to clone (single `Arc`).
 pub struct ShareStatsAcceptedSink {
     accumulators: Arc<Accumulators>,
 }
@@ -52,9 +37,7 @@ impl SharedAcceptedShareSink for ShareStatsAcceptedSink {
             return;
         }
         let slot = TimeSlot::current();
-        // Producer-stamped mode — no per-share gate query.
         let mode = share.mode;
-        // Per-share accumulator fan-out.
         self.accumulators
             .pool_shares
             .add_accepted(slot, diff, share.submission_difficulty);
@@ -78,10 +61,8 @@ impl SharedAcceptedShareSink for ShareStatsAcceptedSink {
                 ..Default::default()
             },
         );
-        // All-time best difficulty tracks the SOLVED difficulty (can exceed
-        // the credited/clamped one), stamped with the miner's firmware. Folded
-        // into `address_settings_entity."bestDifficulty"` at flush time via
-        // GREATEST, so there is no per-share PG write.
+        // Best difficulty tracks the solved difficulty, which can exceed the
+        // credited one.
         self.accumulators.best_difficulty.add(
             &address_id,
             share.submission_difficulty,
@@ -93,9 +74,8 @@ impl SharedAcceptedShareSink for ShareStatsAcceptedSink {
     }
 }
 
-/// `SharedRejectedShareSink` impl. Address is `Option` because some
-/// reject reasons fire before authorize completes; such a reject still
-/// bumps the pool-wide counters but skips the per-address ones.
+/// A reject before authorize has no address: it bumps only the pool-wide
+/// counters.
 pub struct ShareStatsRejectedSink {
     accumulators: Arc<Accumulators>,
 }
@@ -115,10 +95,8 @@ impl SharedRejectedShareSink for ShareStatsRejectedSink {
         }
         let slot = TimeSlot::current();
         let reason = share.reason;
-        // Pool-wide counters always fire. The per-reason
-        // accumulator stores share-difficulty SUM rather than a
-        // literal share count — that's the value the frontend
-        // chart renders ("rejected difficulty per reason per slot").
+        // The per-reason accumulator sums difficulty, not a share count:
+        // that is what the chart renders.
         self.accumulators.pool_shares.add_rejected(slot, difficulty);
         self.accumulators
             .pool_rejected
@@ -132,7 +110,6 @@ impl SharedRejectedShareSink for ShareStatsRejectedSink {
             Err(_) => return,
         };
 
-        // Per-address rejected stats.
         self.accumulators.client_rejected.add(
             ClientRejectedKey {
                 address: address_id.clone(),
@@ -153,10 +130,8 @@ impl SharedRejectedShareSink for ShareStatsRejectedSink {
             rejected_count: 1.0,
             ..Default::default()
         };
-        // One column pair per reason, no folds — every arm below writes a
-        // different pair, so the five counters sum to `rejected_count`. Adding
-        // a `RejectedReason` variant without a pair to put it in would break
-        // that sum silently; a new variant gets its own column pair.
+        // One column pair per reason, no folds, so the counters sum to
+        // `rejected_count`; a new `RejectedReason` variant needs its own pair.
         match reason {
             RejectedReason::JobNotFound => {
                 delta.rejected_job_not_found_count = 1.0;
@@ -170,17 +145,14 @@ impl SharedRejectedShareSink for ShareStatsRejectedSink {
                 delta.rejected_low_difficulty_share_count = 1.0;
                 delta.rejected_low_difficulty_share_diff1 = difficulty;
             }
-            // Not folded into low-difficulty: such a share's proof-of-work may
-            // be perfectly good, so an operator seeing it there would read
-            // normal churn where a miner is ignoring the mask it negotiated.
+            // Not low-difficulty: the work may be fine, the miner is ignoring
+            // the mask it negotiated.
             RejectedReason::VersionRollingNotAllowed => {
                 delta.rejected_version_rolling_count = 1.0;
                 delta.rejected_version_rolling_diff1 = difficulty;
             }
-            // Not folded into job-not-found: this is the ordinary tail of a
-            // block transition and needs no action, that one is work the pool
-            // never had. Folded together, every block change would read as a
-            // fleet of broken miners.
+            // Not job-not-found: a stale share is the ordinary tail of a block
+            // change; folded together, every block would look like broken miners.
             RejectedReason::Stale => {
                 delta.rejected_stale_count = 1.0;
                 delta.rejected_stale_diff1 = difficulty;
@@ -195,9 +167,7 @@ mod tests {
     use super::*;
     use bp_common::MiningMode;
 
-    /// The slot maximum is the difficulty the share solved, the sums are what
-    /// it was credited at. Handing the credited value to the maximum would
-    /// leave it at 10 here.
+    /// Slot maxima take the solved difficulty, sums the credited one.
     #[tokio::test]
     async fn an_accepted_share_feeds_the_solved_difficulty_into_both_slot_maxima() {
         let accs = Arc::new(Accumulators::default());

@@ -26,8 +26,8 @@ struct Inner {
 }
 
 impl BitcoinRpc {
-    /// Build a client. Does NOT perform any network I/O — the first
-    /// actual RPC call is when the connection (and auth) are exercised.
+    /// Performs no network I/O; connection and auth are first exercised by
+    /// the first RPC call.
     pub fn new(config: BitcoinRpcConfig) -> Result<Self, RpcError> {
         let mut builder = reqwest::Client::builder();
         if let Some(timeout) = config.timeout {
@@ -62,50 +62,35 @@ impl BitcoinRpc {
         self.call("getmininginfo", serde_json::json!([])).await
     }
 
-    /// Current chain-tip height. Used on the block-found hot path to
-    /// derive the won-block's height (`prev_height + 1`) for
-    /// `engine.on_block_found` and the dispatcher's block-found
-    /// notification — the SV1/SV2 share-accept path doesn't carry
-    /// height through its `ShareAccept` shape.
+    /// Current chain-tip height. The block-found path derives the won
+    /// block's height from it, since `ShareAccept` carries no height.
     pub async fn get_block_count(&self) -> Result<u64, RpcError> {
         self.call("getblockcount", serde_json::json!([])).await
     }
 
-    /// Fetch a block header (`getblockheader <hash> true`). The
-    /// block-found confirmation watcher uses the `confirmations` field to
-    /// decide a found block's fate: `>= confirmation_depth` ⇒ confirmed
-    /// (apply the frozen distribution), `< 0` ⇒ orphaned (discard).
-    ///
-    /// If the node doesn't know the hash at all it returns a
-    /// `Block not found` error (code `-5`); the watcher treats that the
-    /// same as orphaned — a hash the node can't place is, by definition,
-    /// not on the active chain.
+    /// `getblockheader <hash> true`. The confirmation watcher reads
+    /// `confirmations`: `>= confirmation_depth` confirms, `< 0` orphans.
+    /// An unknown hash returns `-5 Block not found`, which the watcher also
+    /// treats as orphaned: it is not on the active chain.
     pub async fn get_block_header(&self, block_hash: &str) -> Result<BlockHeaderInfo, RpcError> {
         self.call("getblockheader", serde_json::json!([block_hash, true]))
             .await
     }
 
-    /// Block hash at `height` on the node's active chain
-    /// (`getblockhash <height>`).
+    /// Block hash at `height` on the node's active chain.
     pub async fn get_block_hash(&self, height: u64) -> Result<String, RpcError> {
         self.call("getblockhash", serde_json::json!([height])).await
     }
 
-    /// Txids of a block in order (`getblock <hash> 1`); `txids[0]` is the
-    /// coinbase. Verbosity 1 deliberately — verbosity 2 would pull every
-    /// transaction's full JSON, megabytes per block, when the caller only
-    /// wants the first one.
+    /// Txids of a block in order; `txids[0]` is the coinbase. Verbosity 1,
+    /// because verbosity 2 would pull every transaction's full JSON.
     pub async fn get_block_txids(&self, block_hash: &str) -> Result<BlockTxids, RpcError> {
         self.call("getblock", serde_json::json!([block_hash, 1]))
             .await
     }
 
-    /// Decode one transaction of a known block
-    /// (`getrawtransaction <txid> true <blockhash>`).
-    ///
-    /// Passing the block hash is what makes this work on a node without
-    /// `txindex`: Core reads the transaction out of that block rather than
-    /// searching an index the pool cannot assume exists.
+    /// Decode one transaction of a known block. Passing the block hash makes
+    /// this work on a node without `txindex`.
     pub async fn get_raw_transaction_in_block(
         &self,
         txid: &str,
@@ -118,20 +103,10 @@ impl BitcoinRpc {
         .await
     }
 
-    /// Submit a raw block hex to bitcoin-core via the `submitblock` RPC.
-    ///
-    /// Bitcoin Core's `submitblock` returns:
-    /// - `null` on accepted (the block was added to / propagated by the
-    ///   node);
-    /// - a string error code on rejected (`"high-hash"`, `"bad-prevblk"`,
-    ///   `"duplicate"`, etc. — see Bitcoin Core's
-    ///   `validation::BlockValidationState` for the catalogue).
-    ///
-    /// This RPC is the **only** non-TDP block-submission path, a deliberate
-    /// exception for JDP PushSolution: the pool reconstructs the JDC's
-    /// found block and submits it in parallel to the JDC's own submission.
-    /// JDP-declared templates have no pool-side `template_id`, so
-    /// `TdpHandle::submit_solution` (which requires one) cannot be used.
+    /// `submitblock`: `None` when accepted, `Some(reason)` when rejected.
+    /// The only non-TDP submission path, for JDP PushSolution: JDP-declared
+    /// templates have no pool-side `template_id`, so
+    /// `TdpHandle::submit_solution` cannot be used.
     pub async fn submit_block(&self, block_hex: String) -> Result<Option<String>, RpcError> {
         let raw: serde_json::Value = self
             .call_raw("submitblock", serde_json::json!([block_hex]))
@@ -146,11 +121,9 @@ impl BitcoinRpc {
         }
     }
 
-    /// Variant of [`Self::call`] that surfaces a `null` result as
-    /// `serde_json::Value::Null` instead of treating it as a missing
-    /// field. `submitblock` is the lone caller — its "accepted" response
-    /// is `{"result": null, ...}` which the standard envelope would
-    /// otherwise reject as "neither result nor error".
+    /// Like [`Self::call`], but a `null` result is a success: `submitblock`
+    /// answers "accepted" with `{"result": null}`, which `call` rejects as
+    /// "neither result nor error".
     async fn call_raw(
         &self,
         method: &str,
@@ -175,10 +148,7 @@ impl BitcoinRpc {
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Err(RpcError::Unauthorized);
         }
-        // See `call`: parse the JSON-RPC envelope regardless of HTTP status so
-        // an application error code (returned with HTTP 500) surfaces as
-        // `BitcoinCore`; fall back to the transport error only for a
-        // non-envelope body.
+        // See `call`: parse the envelope regardless of HTTP status.
         let status_err = resp.error_for_status_ref().err();
         let body = resp.bytes().await?;
         match serde_json::from_slice::<RawRpcResponse>(&body) {
@@ -186,7 +156,6 @@ impl BitcoinRpc {
                 if let Some(err) = envelope.error {
                     return Err(RpcError::BitcoinCore(err));
                 }
-                // `null` result is a valid success signal here (submitblock).
                 Ok(envelope.result.unwrap_or(serde_json::Value::Null))
             }
             Err(parse_err) => match status_err {
@@ -196,8 +165,7 @@ impl BitcoinRpc {
         }
     }
 
-    /// Generic RPC entry point — escape hatch for callers that need a
-    /// method not covered by the typed helpers above.
+    /// Generic RPC entry point for methods without a typed helper.
     pub async fn call<T: DeserializeOwned>(
         &self,
         method: &str,
@@ -223,13 +191,10 @@ impl BitcoinRpc {
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Err(RpcError::Unauthorized);
         }
-        // bitcoin-core returns application errors (e.g. `-5 Block not found`)
-        // with an HTTP 500 status AND the JSON-RPC error envelope in the
-        // body. Parse the body regardless of status so the error `code`
-        // surfaces as `BitcoinCore` instead of being buried as an opaque
-        // HTTP error; only fall back to the transport error when the body
-        // isn't a JSON-RPC envelope. (`error_for_status_ref` borrows, so it
-        // doesn't consume the response before the body is read.)
+        // Core returns application errors (e.g. `-5 Block not found`) with
+        // HTTP 500 and the error envelope in the body. Parse the body
+        // regardless of status so the code surfaces as `BitcoinCore`; the
+        // transport error is only the fallback for a non-envelope body.
         let status_err = resp.error_for_status_ref().err();
         let body = resp.bytes().await?;
         match serde_json::from_slice::<RpcResponse<T>>(&body) {
@@ -292,11 +257,8 @@ struct RpcResponse<T> {
     id: serde_json::Value,
 }
 
-/// Envelope variant that preserves a JSON `null` result as
-/// [`serde_json::Value::Null`]. Used by [`BitcoinRpc::call_raw`] for
-/// `submitblock`, whose "accepted" response is `result = null` — the
-/// typed [`RpcResponse`] would map `null` to `Option::None` and lose
-/// the distinction from an absent field.
+/// Envelope for [`BitcoinRpc::call_raw`], which reads a `null` result as
+/// success where the typed [`RpcResponse`] would reject it.
 #[derive(Deserialize)]
 struct RawRpcResponse {
     result: Option<serde_json::Value>,
@@ -319,8 +281,6 @@ mod tests {
             params: serde_json::json!([]),
         };
         let s = serde_json::to_string(&req).unwrap();
-        // Order matters for bitcoind compatibility but `serde_json` keeps
-        // struct field order from the type declaration.
         assert!(s.contains("\"jsonrpc\":\"1.0\""));
         assert!(s.contains("\"id\":42"));
         assert!(s.contains("\"method\":\"getnetworkinfo\""));
@@ -385,21 +345,15 @@ mod tests {
         assert!(matches!(err, RpcError::CookieRead { .. }));
     }
 
-    // Tiny helpers — keep tests independent of `tempfile` crate.
-    //
-    // The path is returned alongside the handle rather than recovered from
-    // the fd: `/proc/self/fd` does not exist on macOS.
+    // Returns the path with the handle: `/proc/self/fd` does not exist on
+    // macOS.
     fn tempfile_in_default() -> (std::fs::File, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!("bp-bitcoin-test-cookie-{}", rand_suffix()));
         let file = std::fs::File::create(&path).unwrap();
         (file, path)
     }
-    /// Unique per call, even between two `#[test]` threads in the same
-    /// microsecond.
-    ///
-    /// A bare nanosecond timestamp is NOT unique on macOS, whose clock
-    /// advances in 1µs steps; the atomic counter breaks the tie regardless
-    /// of clock resolution.
+    /// Unique per call across threads. The counter is needed because the
+    /// macOS clock advances in 1µs steps.
     fn rand_suffix() -> String {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -414,9 +368,7 @@ mod tests {
         )
     }
 
-    /// The suffix must be unique across threads, or the two cookie tests
-    /// above silently overwrite each other's file. A collision is
-    /// timing-dependent, so nothing else here would catch it.
+    /// Pins that `rand_suffix` stays unique under thread contention.
     #[test]
     fn rand_suffix_is_unique_under_thread_contention() {
         let handles: Vec<_> = (0..8)

@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Periodic best-effort backup of the live PPLNS + Group-Solo Redis state
-//! (`redis_state_backup`), for MANUAL operator-triggered reconstruction after a
-//! Redis wipe / corruption / bad deploy. One row per Redis key (verbatim `DUMP`
-//! payload) per backup run, all sharing a `captured_at` (epoch ms). There is no
-//! automatic restore — see `bin/blitzpool/src/redis_backup.rs`.
+//! Periodic best-effort backup of the live PPLNS + Group-Solo Redis state:
+//! one row per key (verbatim `DUMP` payload) per run, sharing a `captured_at`.
+//! Restore is manual and operator-triggered only.
 
 use sqlx::postgres::PgPool;
 

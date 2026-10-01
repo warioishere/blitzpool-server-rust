@@ -1,26 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #![allow(unsafe_code)] // dev-only bench: a counting global allocator needs `unsafe impl GlobalAlloc`.
 #![allow(clippy::print_stdout)] // dev-only bench: reporting alloc counts to stdout is the point.
-//
-//! Hot-path micro-benchmark for the SV2 **extended-channel** share path
-//! ([`bp_stratum_v2::mining::submit::validate_submit_extended`]), the
-//! steady-state work done once per submitted share.
-//!
-//! Two figures per case:
-//!   - **allocations per call**: a validated share costs 1 alloc, the
-//!     `Box<ShareAccept>`. The coinbase txid is streamed straight into the
-//!     hasher (`sha256d_from_parts`), and the merkle walk, worker-name
-//!     resolver and `bp_share::calculate_difficulty` (`f64`) are zero-alloc.
-//!     The `ext_job clone` cases measure a per-share `ExtendedJob` copy as a
-//!     baseline; the handler avoids it with disjoint-field borrows.
-//!   - **ns/op** (criterion): wall-clock, dominated by the per-merkle-level
-//!     SHA-256d (so it scales with merkle depth) plus the coinbase + header
-//!     double-hashes.
-//!
-//! The SV2 share path is hash-bound, not parse-bound; the hashing is
-//! irreducible verifier work.
-//!
-//! Run: `cargo bench -p bp-stratum-v2 --bench submit`
+//! Micro-benchmark of the SV2 extended-channel share path
+//! ([`bp_stratum_v2::mining::submit::validate_submit_extended`]): allocations
+//! per call (one, the `Box<ShareAccept>`) and ns/op, which is hash-bound and
+//! scales with merkle depth. Run: `cargo bench -p bp-stratum-v2 --bench submit`
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
@@ -35,9 +19,8 @@ use bp_stratum_v2::mining::submit::{
 };
 use criterion::{BatchSize, Criterion, Throughput};
 
-// ── Counting allocator: tallies every `alloc`/`realloc`. Only the counter
-//    delta around one isolated call is read, so criterion's own
-//    allocations do not count. ──
+// Counting allocator; only the delta around one isolated call is read, so
+// criterion's own allocations do not count.
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
 struct Counting;
@@ -59,14 +42,9 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
-// ── Realistic inputs ─────────────────────────────────────────────────
-//
-// Mainnet-shaped: an 8-byte negotiated extranonce, a coinbase split into
-// a ~64-byte prefix and ~100-byte suffix, and a merkle path whose depth
-// matches a real block (~3–4k txs → ~12 levels). The job difficulty is
-// set trivially easy so the share is Accepted (the hot path), and the
-// job's n_bits is difficulty 1, out of reach for the synthetic share, so
-// it is NOT a block-candidate (no witness-coinbase assembly).
+// Mainnet-shaped inputs (~12 merkle levels). The job difficulty is trivial so
+// the share is Accepted, while n_bits stays out of reach so it is never a
+// block candidate (no witness-coinbase assembly).
 
 const MERKLE_DEPTH_MAINNET: usize = 12;
 const MERKLE_DEPTH_SHALLOW: usize = 1;
@@ -98,7 +76,6 @@ fn ext_job(merkle_depth: usize) -> ExtendedJob {
         min_ntime: 0,
         // Trivially easy → target ≈ MAX → any hash meets it → Accepted.
         difficulty: Difficulty(1.0 / 4_294_967_296.0),
-        // Unreachably hard → never a block candidate (no witness assembly).
         coinbase_tx_value_remaining: 5_000_000_000,
         template_id: Some(1),
         jdp_claims_the_block: false,
@@ -107,10 +84,8 @@ fn ext_job(merkle_depth: usize) -> ExtendedJob {
     }
 }
 
-/// `nonce` is varied per call: `validate_submit_extended` inserts every
-/// accepted share into the channel dedup cache, so re-submitting the same
-/// nonce would short-circuit on `duplicate-share` and never exercise the
-/// hash path. Each measured share must therefore be unique.
+/// `nonce` must vary per call: a repeated one short-circuits on
+/// `duplicate-share` and never reaches the hash path.
 fn ext_submission(nonce: u32) -> SubmitSharesExtendedInput {
     SubmitSharesExtendedInput {
         channel_id: 2,
@@ -124,10 +99,8 @@ fn ext_submission(nonce: u32) -> SubmitSharesExtendedInput {
     }
 }
 
-/// One `validate_submit_extended` call (Accept path). Projects the
-/// channel into the `ExtendedChannelView` + `&mut submission_cache` the
-/// validator takes, the same projection the handler does inline so it
-/// needs no per-share `ExtendedJob` clone.
+/// One accepted `validate_submit_extended` call, with the same channel
+/// projection the handler does inline to avoid a per-share job clone.
 fn run_validate(channel: &mut ChannelState, sub: &SubmitSharesExtendedInput, job: &ExtendedJob) {
     let job_target = channel.target_for(job.difficulty);
     let view = ExtendedChannelView {
@@ -149,9 +122,7 @@ fn run_validate(channel: &mut ChannelState, sub: &SubmitSharesExtendedInput, job
     black_box(&v);
 }
 
-/// Baseline: clone the whole `ExtendedJob`, then validate against the
-/// clone. Identical to `run_validate` except for the clone, so the
-/// difference is its cost.
+/// Baseline: `run_validate` plus a job clone, so the difference is its cost.
 fn run_validate_with_clone(
     channel: &mut ChannelState,
     sub: &SubmitSharesExtendedInput,
@@ -161,10 +132,8 @@ fn run_validate_with_clone(
     run_validate(channel, sub, &cloned);
 }
 
-/// A channel warmed by `n` accepted shares (nonces `0..n`). Warms the
-/// target memo and — for `n` large enough — grows the dedup HashSet past
-/// its realloc points so a subsequent insert measures steady state
-/// rather than a one-off table resize.
+/// A channel warmed by `n` accepted shares (nonces `0..n`), so the next insert
+/// measures steady state rather than a one-off table resize.
 fn warmed_channel_n(job: &ExtendedJob, n: u32) -> ChannelState {
     let mut channel = ext_channel();
     for nonce in 0..n {
@@ -173,9 +142,7 @@ fn warmed_channel_n(job: &ExtendedJob, n: u32) -> ChannelState {
     channel
 }
 
-/// Steady-state allocations of one accepted share: the dedup set is
-/// pre-grown (warm with 512 shares) so the measured share #512 does not
-/// pay a HashSet resize — isolating the irreducible per-share allocs.
+/// Steady-state allocations of one accepted share on a pre-grown dedup set.
 fn allocs_for_validate(depth: usize) -> usize {
     let job = ext_job(depth);
     let mut channel = warmed_channel_n(&job, 512);
@@ -195,8 +162,7 @@ fn allocs_for_validate_with_clone(depth: usize) -> usize {
     ALLOCS.load(Ordering::Relaxed) - before
 }
 
-/// Allocations of one `bp_share::calculate_difficulty` call, the
-/// hash→difficulty conversion done once per share inside the validator.
+/// Allocations of one `bp_share::calculate_difficulty` call.
 fn allocs_for_difficulty_calc() -> usize {
     let header = [0xABu8; 80];
     let _ = black_box(calculate_difficulty(&header)); // warm lazy statics
@@ -236,11 +202,8 @@ fn report_allocs() {
 fn bench(c: &mut Criterion) {
     let mut g = c.benchmark_group("sv2_submit_extended");
 
-    // Clone baseline vs validate-only at mainnet merkle depth: the only
-    // difference is the ext_job clone. `iter_batched_ref` rebuilds a
-    // freshly-warmed channel per iteration (untimed setup) so every timed
-    // submit is unique — avoiding the duplicate-share short-circuit while
-    // keeping the cache size ≤1.
+    // Clone baseline vs validate-only. A fresh channel per iteration (untimed)
+    // keeps every timed submit unique, avoiding the duplicate-share short-circuit.
     {
         let job = ext_job(MERKLE_DEPTH_MAINNET);
         let sub = ext_submission(1);
@@ -261,8 +224,6 @@ fn bench(c: &mut Criterion) {
         });
     }
 
-    // The necessary work across merkle depths: build coinbase +
-    // walk merkle + double-hash header. Scales with merkle depth.
     for depth in [MERKLE_DEPTH_SHALLOW, MERKLE_DEPTH_MAINNET] {
         let job = ext_job(depth);
         let sub = ext_submission(1); // unique vs the nonce-0 warm share
@@ -276,7 +237,6 @@ fn bench(c: &mut Criterion) {
         });
     }
 
-    // The difficulty conversion inside the validator, isolated.
     {
         let header = [0xABu8; 80];
         g.bench_function("calculate_difficulty (f64, post-C1)", |b| {

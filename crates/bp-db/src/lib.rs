@@ -1,38 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `sqlx`-based data layer against the Blitzpool Postgres schema, which
-//! `crates/bp-db/migrations/` builds from an empty database (the base tables
-//! are `0000_baseline.sql`).
-//!
-//! # Scope
-//!
-//! - Strongly-typed `Row` structs for every domain table — what comes back
-//!   from a `SELECT *` materialises into Rust types that round-trip
-//!   `Sats` ↔ BIGINT, `AddressId` ↔ VARCHAR, `MiningMode` ↔ kebab-case
-//!   VARCHAR automatically.
-//! - `Db` connection-pool wrapper + `DbError`.
-//! - Module split by domain (see below) — no orchestration, no business
-//!   logic, no caching.
-//!
-//! # API surface choice
-//!
-//! Each table module exposes a `find_<table>_by_pk(...)` async function —
-//! this is universal (every consumer needs to look a row up by its key),
-//! so it lands in the data layer up-front.
-//!
-//! **Anything beyond find_by_pk** (filtered, batched, time-windowed,
-//! with-soft-delete, RETURNING-id INSERT, conditional UPSERT, …) has
-//! multiple plausible signatures whose right shape only becomes clear at
-//! the consumer site. Those are added when a call site needs them, never
-//! speculatively.
-//!
-//! # SQL verification status
-//!
-//! Write queries and point-read queries use the compile-time `sqlx::query!`
-//! / `sqlx::query_as!` macros backed by the `.sqlx` offline cache. A small
-//! number of aggregate read queries (e.g. `find_user_agents`,
-//! `find_found_blocks`) use the runtime `query_as` form where the
-//! projection is derived — those are type-checked at the `FromRow` boundary.
+//! `sqlx` data layer over the Blitzpool Postgres schema, which
+//! `crates/bp-db/migrations/` builds from an empty database. Typed rows and
+//! queries only, split by domain: no orchestration, business logic or caching.
+//! Queries are added when a call site needs them, never speculatively.
 
 mod address;
 mod address_ownership;

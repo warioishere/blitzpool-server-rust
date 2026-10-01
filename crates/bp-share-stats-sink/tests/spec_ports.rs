@@ -3,19 +3,9 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! Statistics-coordinator scenarios not already covered
-//! by the generic `stats_writes_integration` / `flush_integration` /
-//! `engine_integration` suites:
-//!
-//! - Scenario: 1500 client-statistics rows split correctly across batches
-//!   (`batch_size = 1000`).
-//! - Scenario: special-character escaping in `clientName` (commas, quotes,
-//!   braces, backslashes) roundtrips cleanly through the UNNEST array codec.
-//! - Scenario: per-worker rejected-diff fan-out from `client_statistics`
-//!   lands in `worker_shares_entity.rejectedShares` correctly summed across
-//!   sessions.
-//! - Scenario: all-zero rejected diffs don't trigger a `worker_shares` write
-//!   (no-op pass-through).
+//! Statistics-coordinator edge cases: batch splitting, special characters in
+//! `clientName`, and the per-worker rejected-diff fan-out into
+//! `worker_shares_entity`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,9 +72,7 @@ async fn client_statistics_1500_rows_split_across_batches() {
     let prefix = "test_spec_batch_";
     cleanup(&pool, prefix).await;
 
-    // Build 1500 client-statistics keys. Use 1500 distinct addresses to
-    // skirt the UNIQUE constraint. The batch logic must produce a
-    // 1000-row + 500-row pair under `batch_size=1000`.
+    // 1500 distinct addresses must split into a 1000-row and a 500-row batch.
     let slot = TimeSlot::from_millis(32_503_680_100_000);
     let accs = Arc::new(Accumulators::default());
     for i in 0..1500u32 {
@@ -132,9 +120,7 @@ async fn client_name_with_special_chars_roundtrips_through_unnest() {
     let prefix = "test_spec_special_";
     cleanup(&pool, prefix).await;
 
-    // Each of these clientName values stresses a different PG-text-array
-    // escape rule. Empty/whitespace/large-quoted ones can throw off
-    // hand-rolled arrays — sqlx's UNNEST binding handles all four cases.
+    // Each name stresses a different PG text-array escape rule.
     let stress_names = [
         r#"worker,with,commas"#,
         r#"worker"with"quotes"#,
@@ -263,11 +249,7 @@ async fn rejected_diff_fanout_per_worker_aggregates_across_sessions() {
 
 #[tokio::test]
 async fn rejected_fanout_skips_zero_rejected_diffs() {
-    // When every confirmed client-statistics row has zero rejected
-    // diffs (i.e. all accepted shares), the worker_shares write fires
-    // for the accepted-side totals but the `rejectedShares` field stays
-    // at zero. No phantom row created if there are no accepted totals
-    // either.
+    // Zero rejected diffs and no accepted totals create no worker_shares row.
     let _guard = SPEC_PORT_LOCK.lock().await;
     let Some(pool) = connect_or_skip().await else {
         return;
@@ -304,10 +286,7 @@ async fn rejected_fanout_skips_zero_rejected_diffs() {
     .await
     .expect("read");
 
-    // No worker_totals row exists at all (accepted-side share_totals
-    // accumulator was never `.add`ed, so flush_worker_totals had only
-    // an empty fan-out + empty snapshot → no-op). This is the
-    // "all-zeros → no call" assertion.
+    // share_totals was never fed and the fan-out is empty: no write at all.
     assert!(
         row.is_none(),
         "no worker_shares row expected with empty share_totals + zero rejected fan-out"
@@ -320,9 +299,7 @@ async fn rejected_fanout_skips_zero_rejected_diffs() {
 
 #[tokio::test]
 async fn engine_handles_repeated_empty_ticks_without_error() {
-    // Coordinator-level robustness: with nothing in the accumulators,
-    // multiple ticks back-to-back stay healthy. Models the very small
-    // pool with long idle stretches.
+    // Back-to-back ticks with empty accumulators stay healthy.
     let _guard = SPEC_PORT_LOCK.lock().await;
     let Some(pool) = connect_or_skip().await else {
         return;

@@ -1,24 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! BIP-54 (Consensus Cleanup) coinbase rules.
-//!
-//! Three of BIP-54's consensus changes are properties of the coinbase
-//! transaction — the only transaction a mining pool builds itself; every
-//! other transaction in the block comes from bitcoin-core's template.
-//! bitcoin-core owns and enforces the rest (timewarp timestamp limits, the
-//! 2500-sigop per-transaction cap, transaction selection).
-//!
-//! The pool sources its coinbase fields from Core's SV2 `NewTemplate` over
-//! IPC, so against a BIP-54-aware node (Core 31 emits `nLockTime =
-//! height - 1` and a non-final `nSequence` of `0xfffffffe`) the coinbase is
-//! already compliant. This module codifies the rules so tests can assert
-//! them on coinbase bytes the pool assembles itself.
-//!
-//! The three coinbase rules:
-//!  1. the witness-stripped serialized size must NOT be exactly 64 bytes,
-//!  2. the sole input's `nSequence` must NOT be `0xffffffff` (non-final), and
-//!  3. `nLockTime` must equal `block_height - 1`.
-//!
+//! BIP-54 (Consensus Cleanup) rules on the coinbase, the one transaction the
+//! pool builds itself: witness-stripped size not 64 bytes, input `nSequence`
+//! not final, `nLockTime == height - 1`. Core enforces the rest of BIP-54.
 //! See <https://github.com/bitcoin/bips/blob/master/bip-0054.md>.
 
 use bitcoin::consensus::Decodable;
@@ -41,14 +25,10 @@ pub enum Bip54Violation {
     Undecodable,
 }
 
-/// Decode the BIP-34 block height from the leading minimal-`CScriptNum`
-/// push of a coinbase scriptsig (or the `NewTemplate.coinbase_prefix`,
-/// which begins with that push). Returns `None` if the first byte isn't a
-/// direct 1..=4-byte push or the buffer is too short.
+/// Decode the BIP-34 height from the leading push of a coinbase scriptsig or
+/// `NewTemplate.coinbase_prefix`; `None` unless it is a direct 1..=4-byte push.
 pub fn decode_bip34_height(scriptsig: &[u8]) -> Option<u32> {
     let len = *scriptsig.first()? as usize;
-    // BIP-34 heights use a direct push opcode whose value is the byte length
-    // (1..=4 covers every height bitcoin will ever reach).
     if len == 0 || len > 4 || scriptsig.len() < 1 + len {
         return None;
     }
@@ -59,16 +39,13 @@ pub fn decode_bip34_height(scriptsig: &[u8]) -> Option<u32> {
     Some(height)
 }
 
-/// Validate the pool-relevant BIP-54 coinbase rules against the
-/// **non-witness** serialization of a coinbase transaction mined at
-/// `block_height`.
+/// Check the BIP-54 coinbase rules on the non-witness serialization.
 pub fn check_coinbase(
     non_witness_coinbase: &[u8],
     block_height: u32,
 ) -> Result<(), Bip54Violation> {
-    // Rule 1 — 64-byte transaction prohibition. The witness-stripped size is
-    // exactly the non-witness serialization length, so check it before any
-    // decode (and so a 64-byte buffer is caught even if it wouldn't parse).
+    // Checked before decoding, so a 64-byte buffer is caught even if it
+    // would not parse.
     if non_witness_coinbase.len() == 64 {
         return Err(Bip54Violation::SixtyFourByteTransaction);
     }
@@ -76,7 +53,6 @@ pub fn check_coinbase(
     let tx = bitcoin::Transaction::consensus_decode(&mut &non_witness_coinbase[..])
         .map_err(|_| Bip54Violation::Undecodable)?;
 
-    // Rule 2 — non-final sequence on the (single) coinbase input.
     let sequence = tx
         .input
         .first()
@@ -87,7 +63,6 @@ pub fn check_coinbase(
         return Err(Bip54Violation::FinalSequence);
     }
 
-    // Rule 3 — nLockTime == block_height - 1.
     let expected = block_height.saturating_sub(1);
     let found = tx.lock_time.to_consensus_u32();
     if found != expected {
@@ -105,9 +80,7 @@ mod tests {
         Transaction, TxIn, TxOut, Witness,
     };
 
-    /// Build the non-witness serialization of a coinbase-shaped tx with the
-    /// given locktime / sequence. The empty witness means rust-bitcoin emits
-    /// the legacy (witness-stripped) encoding.
+    /// Non-witness serialization of a coinbase-shaped tx (empty witness).
     fn coinbase_bytes(locktime: u32, sequence: u32, scriptsig: Vec<u8>) -> Vec<u8> {
         let tx = Transaction {
             version: Version(2),
@@ -118,9 +91,7 @@ mod tests {
                 sequence: Sequence(sequence),
                 witness: Witness::new(),
             }],
-            // 22-byte P2WPKH-shaped script (OP_0 OP_PUSHBYTES_20 <20 bytes>).
-            // Keeps the serialized size clear of the 64-byte boundary that a
-            // minimal single-OP_RETURN coinbase would otherwise hit exactly.
+            // P2WPKH-shaped output keeps the size clear of the 64-byte boundary.
             output: vec![TxOut {
                 value: Amount::from_sat(50 * 100_000_000),
                 script_pubkey: ScriptBuf::from_bytes(
@@ -130,8 +101,6 @@ mod tests {
         };
         consensus::serialize(&tx)
     }
-
-    // ---- decode_bip34_height ----
 
     #[test]
     fn decode_height_single_and_multi_byte() {
@@ -152,8 +121,6 @@ mod tests {
         assert_eq!(decode_bip34_height(&[0x02, 0x01]), None); // truncated
     }
 
-    // ---- check_coinbase ----
-
     #[test]
     fn compliant_coinbase_passes() {
         let bytes = coinbase_bytes(102, 0xffff_fffe, vec![0x01, 0x67]);
@@ -171,7 +138,7 @@ mod tests {
 
     #[test]
     fn wrong_locktime_is_rejected() {
-        // locktime 0 (the pre-BIP-54 default) at height 103 → must equal 102.
+        // locktime 0 at height 103 → must equal 102.
         let bytes = coinbase_bytes(0, 0xffff_fffe, vec![0x01, 0x67]);
         assert_eq!(
             check_coinbase(&bytes, 103),
@@ -184,7 +151,6 @@ mod tests {
 
     #[test]
     fn sixty_four_byte_transaction_is_rejected() {
-        // Caught purely on length, before any decode attempt.
         let buf = vec![0u8; 64];
         assert_eq!(
             check_coinbase(&buf, 100),

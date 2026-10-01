@@ -1,16 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Parse the leading bot-command from a raw user message.
-//!
-//! Subscription-management commands: /start, /subscribe, /remove,
-//! /show_addresses, /subscribe_bestdiff, /device_notifications,
-//! /send_hourly, /bestdiff_reset, /deutsch, /english.
-//!
-//! Read commands (/stats, /show_workers, /poolhashrate, /difficulty,
-//! /next_difficulty, /pplns_status, /group_status, ...) are emitted as
-//! [`Command::ReadDeferred`] carrying the command name; the handler
-//! answers them from the read builders or with a not-configured reply
-//! when the engine they need is not wired in.
+//! Parse the leading bot-command from a raw user message. Read commands
+//! (`/stats`, `/pplns_status`, ...) come out as [`Command::ReadDeferred`]
+//! carrying their name, so the handler alone decides how to answer them.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {

@@ -1,20 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! 60-second `lastAcceptedShareAt` flush buffer.
-//!
-//! Per-share PG-write is too expensive on the hot path (a busy pool
-//! sees thousands of shares per minute, but the abandoned-balance
-//! sweep tolerates 60-second drift trivially). Instead the hot path
-//! calls [`TouchBuffer::mark`] (lock + insert, ~100ns), and a
-//! background tokio task drains the buffer every 60 seconds and
-//! issues one bulk `UPDATE pplns_balance` per drain.
-//!
-//! On flush failure the snapshot is `rebuffer`-ed back into the
-//! buffer (newer-wins policy: if the hot path recorded a fresher
-//! timestamp for an address during the failed flush, that fresher
-//! value survives the merge). Next tick retries.
-//!
-//! Atomicity is achieved via `std::sync::Mutex` + `mem::take`.
+//! Buffers `lastAcceptedShareAt` per address and flushes it in one bulk
+//! `UPDATE` per interval: a PG write per share is too expensive on the hot
+//! path, and the abandoned-balance sweep tolerates a minute of drift.
+//! A failed flush is merged back newest-wins and retried on the next tick.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -26,19 +15,9 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-/// Default flush cadence — 60 seconds.
 pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Lock-around-HashMap buffer for `(address → latest timestamp ms)`.
-///
-/// `mark` is sync + non-throwing for the hot path. `drain` snapshots
-/// the buffer and resets it for the next window. `rebuffer` re-merges
-/// a drained snapshot back on flush failure.
-///
-/// `mark` and `drain`/`rebuffer` are serialized by a `Mutex`; for a
-/// typical pool (≲10k shares/s) the contention is negligible (each
-/// `mark` is a HashMap-insert in nanoseconds). Reach for `parking_lot`
-/// or a sharded shape only if profiling later shows contention.
+/// `address → latest share timestamp (ms)`, newest wins.
 #[derive(Debug, Default)]
 pub struct TouchBuffer {
     inner: Mutex<HashMap<String, i64>>,
@@ -49,18 +28,13 @@ impl TouchBuffer {
         Self::default()
     }
 
-    /// Hot-path entry. Coalesces multiple marks for the same address
-    /// within one flush window via "newest-wins" — the buffer holds
-    /// the most-recent `ts_ms` per address.
     pub fn mark(&self, address: &str, ts_ms: i64) {
         if address.is_empty() {
             return;
         }
         let mut buf = self.inner.lock();
-        // Avoid allocating a `String` key on the hot path when the address
-        // is already buffered (the common case: a miner submits many shares
-        // per flush window). Only the first mark per (address, window) owns
-        // the key.
+        // Look up before inserting so the common case (address already
+        // buffered) allocates no `String` key on the hot path.
         if let Some(entry) = buf.get_mut(address) {
             if ts_ms > *entry {
                 *entry = ts_ms;
@@ -70,9 +44,6 @@ impl TouchBuffer {
         }
     }
 
-    /// Drain the current buffer into a `Vec<TouchUpdate>` and reset
-    /// the in-memory map. Idempotent: called multiple times in
-    /// succession the second call returns an empty Vec.
     pub fn drain(&self) -> Vec<TouchUpdate> {
         let snapshot = {
             let mut buf = self.inner.lock();
@@ -87,9 +58,8 @@ impl TouchBuffer {
             .collect()
     }
 
-    /// Re-merge a previously-drained snapshot back into the buffer
-    /// (flush retry path). Existing entries that are newer than the
-    /// snapshot value are preserved — newest-wins.
+    /// Merges a drained snapshot back after a failed flush; a newer
+    /// hot-path mark that landed meanwhile is kept.
     pub fn rebuffer(&self, drained: Vec<TouchUpdate>) {
         let mut buf = self.inner.lock();
         for tu in drained {
@@ -103,7 +73,6 @@ impl TouchBuffer {
         }
     }
 
-    /// Snapshot the current buffer size (lock-bounded).
     pub fn len(&self) -> usize {
         self.inner.lock().len()
     }
@@ -115,12 +84,8 @@ impl TouchBuffer {
 
 // ── Background flush task ───────────────────────────────────────────
 
-/// One-shot flush attempt. Returns `Ok(n)` with the number of rows
-/// actually updated, or `Err((rebuffered, err))` after rebuffering
-/// the snapshot on failure.
-///
-/// Exposed so [`crate::engine::PplnsEngine::shutdown`] can do a final
-/// drain before exit.
+/// Returns the rows updated; on error the snapshot is already rebuffered.
+/// Public so [`crate::engine::PplnsEngine::shutdown`] can do a final drain.
 pub async fn flush_once(pool: &PgPool, buffer: &TouchBuffer) -> Result<u64, DbError> {
     let snapshot = buffer.drain();
     if snapshot.is_empty() {
@@ -129,20 +94,13 @@ pub async fn flush_once(pool: &PgPool, buffer: &TouchBuffer) -> Result<u64, DbEr
     match bulk_update_pplns_last_accepted_share_at(pool, &snapshot).await {
         Ok(n) => Ok(n),
         Err(e) => {
-            // On failure: re-merge the drained snapshot so next tick
-            // retries. Newer-wins policy preserves any hot-path touch
-            // that landed during the failed flush.
             buffer.rebuffer(snapshot);
             Err(e)
         }
     }
 }
 
-/// Spawn the periodic-flush background task. Returns the
-/// `JoinHandle` so the engine can `await` it during shutdown.
-///
-/// `cancel_rx` lets the engine signal a graceful exit: on cancel the
-/// task drains one final time before returning.
+/// On cancel the task drains one final time before returning.
 pub fn spawn_flush_task(
     pool: PgPool,
     buffer: std::sync::Arc<TouchBuffer>,
@@ -151,10 +109,10 @@ pub fn spawn_flush_task(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
-        // Skip the first immediate tick — `tokio::time::interval`
-        // fires at t=0 by default which would race the first share.
+        // `interval` fires at t=0; that first tick is consumed below so the
+        // first flush does not race the first share.
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        tick.tick().await; // consume the initial t=0 tick
+        tick.tick().await;
 
         loop {
             tokio::select! {

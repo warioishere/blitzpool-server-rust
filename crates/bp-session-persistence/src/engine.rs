@@ -1,24 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Composite handle exposing the hook impls + the buffered share-touch
-//! flusher.
-//!
-//! Nothing here writes a statement per event. The connection path
-//! (authorize/disconnect) is debounced (see `RowDebounce`): a session's
-//! row is born only once it has survived `row_debounce`, so probe
-//! connections never reach Postgres. Everything on the share path is
-//! buffered, because a statement per share would dominate the DB write
-//! budget:
-//!
-//! - `RowDebounce` → one bulk `INSERT … ON CONFLICT` for the due row
-//!   births every `row_flush_interval` (default 5 s).
-//! - `TouchBuffer` → one batched write into the `client:live:*` Redis
-//!   hashes every `touch_flush_interval` (default 30 s).
-//! - `HashrateSampler` → one batched `hash_rate` write into the same
-//!   hashes per `hashrate_sample_interval` (default 60 s).
-//! - `DiffStatBuffer` → one bulk upsert into
-//!   `client_difficulty_statistics_entity` every
-//!   `diff_stat_flush_interval` (default 30 s).
+//! Engine handle exposing the hook impls and their background flush loops.
+//! Nothing writes a statement per event: row births are debounced and every
+//! share-path write is batched, because a statement per share would dominate
+//! the DB write budget.
 
 use std::sync::Arc;
 
@@ -50,15 +35,9 @@ pub struct SessionPersistenceEngine {
 }
 
 impl SessionPersistenceEngine {
-    /// Build the engine without spawning any background task. Use
-    /// [`Self::spawn`] for the production path; this is for unit tests
-    /// that wire the hooks but don't need the flusher.
-    ///
-    /// `redis` carries the `client:live:*` live store the share hot path
-    /// writes into (see the crate-private `live_store` module). `None`
-    /// degrades the engine to births / soft-deletes / diff-stats only —
-    /// the live session stats are then dropped with a warning, never
-    /// buffered unboundedly.
+    /// Build the engine without spawning a background task ([`Self::spawn`]
+    /// is the production path). Without `redis` the live session stats are
+    /// dropped with a warning rather than buffered unboundedly.
     pub fn new(
         config: SessionPersistenceConfig,
         pool: PgPool,
@@ -82,9 +61,7 @@ impl SessionPersistenceEngine {
         })
     }
 
-    /// Build the engine + spawn the touch-buffer flush loop. Returns
-    /// a handle whose [`SessionPersistenceEngineHandle::shutdown`]
-    /// drains the residual buffer before returning.
+    /// Build the engine and spawn its background loops.
     pub async fn spawn(
         config: SessionPersistenceConfig,
         pool: PgPool,
@@ -109,10 +86,6 @@ impl SessionPersistenceEngine {
     }
 
     fn spawn_internal(self) -> SessionPersistenceEngineHandle {
-        // Four background loops: the 5s row-birth flush, the 30s
-        // touch-buffer flush, the 60s live-hashrate sampler, and the 30s
-        // diff-stat flush. Each gets its own shutdown channel; the handle
-        // joins all of them on `shutdown()`.
         let (birth_tx, birth_rx) = oneshot::channel();
         let birth_join = tokio::spawn(run_birth_loop(
             self.row_debounce.clone(),
@@ -162,23 +135,16 @@ impl SessionPersistenceEngine {
     }
 }
 
-/// Shutdown plumbing held behind a `Mutex` so the handle can stay
-/// `Clone` (the SV1 and SV2 servers each clone the handle into their
-/// hook wiring at startup). Only the first `shutdown()` actually
-/// signals + joins; subsequent calls are no-ops. Holds one entry per
-/// background loop (row birth + touch flush + hashrate sampler +
-/// diff-stat flush).
+/// Behind a `Mutex` so the handle stays `Clone`; only the first
+/// `shutdown()` signals and joins.
 #[derive(Default)]
 struct ShutdownState {
     txs: Vec<oneshot::Sender<()>>,
     joins: Vec<JoinHandle<()>>,
 }
 
-/// Shared handle. `bin/blitzpool` clones it into the SV1 / SV2 server
-/// hooks at startup. Implements `shutdown()` — calling it on any clone
-/// drains the touch buffer once and joins the flush tasks. (The row
-/// debounce is deliberately NOT drained on shutdown — its pending
-/// sessions are about to die with the process's sockets.)
+/// Shared handle cloned into the SV1/SV2 server hooks. The row debounce is
+/// not drained on shutdown: its pending sessions die with the sockets.
 #[derive(Clone)]
 pub struct SessionPersistenceEngineHandle {
     pool: PgPool,
@@ -192,45 +158,34 @@ pub struct SessionPersistenceEngineHandle {
 }
 
 impl SessionPersistenceEngineHandle {
-    /// Hook impl for `bp_share_hook::SharedSessionPersistence`. Wire into
-    /// `ServerHooks::session_persistence`. All clones share the one
+    /// Hook for `ServerHooks::session_persistence`; all clones share one
     /// debounce, so SV1 and SV2 sessions pend into the same map.
     pub fn session_persistence_hook(&self) -> SessionPersistenceHook {
         SessionPersistenceHook::new(self.pool.clone(), self.row_debounce.clone())
     }
 
-    /// Run one birth pass over EVERY pending session, debounce age
-    /// ignored. The deterministic drain the integration tests use (the
-    /// birth loop has no shutdown drain to lean on); harmless in
-    /// production — it writes the same rows a tick would, just earlier.
+    /// One birth pass over every pending session, debounce age ignored
+    /// (deterministic drain for tests).
     pub async fn flush_births_now(&self) -> u64 {
         crate::row_debounce::flush_once(&self.row_debounce, &self.pool, Duration::ZERO).await
     }
 
-    /// Number of sessions currently pending birth. Diagnostic; the
-    /// integration tests pin the retry/drop budget through it.
+    /// Number of sessions currently pending birth.
     pub fn pending_births(&self) -> usize {
         self.row_debounce.pending_len()
     }
 
-    /// Run one birth pass honouring the configured debounce age —
-    /// exactly what a timer tick does. Tests use this to show that a
-    /// session younger than the debounce is NOT written.
+    /// One birth pass honouring the debounce age, exactly like a tick.
     pub async fn flush_due_births(&self) -> u64 {
         crate::row_debounce::flush_once(&self.row_debounce, &self.pool, self.row_debounce_age).await
     }
 
-    /// Run one touch-flush pass — exactly what a timer tick does
-    /// (batched write into the `client:live:*` hashes). The
-    /// deterministic drain the integration tests use; harmless in
-    /// production, it writes the same data a tick would, just earlier.
+    /// One touch-flush pass into the `client:live:*` hashes, exactly like a tick.
     pub async fn flush_touches_now(&self) -> u64 {
         crate::touch_buffer::flush_once(&self.touch_buffer, self.live_store.as_deref()).await
     }
 
-    /// Close one hashrate sample window over `window_secs` — exactly
-    /// what a sampler tick does. Deterministic-test twin of
-    /// [`Self::flush_touches_now`].
+    /// Close one hashrate window over `window_secs`, exactly like a tick.
     pub async fn sample_hashrate_now(&self, window_secs: f64) {
         crate::hashrate_sampler::sample_and_write(
             &self.hashrate_sampler,
@@ -240,24 +195,19 @@ impl SessionPersistenceEngineHandle {
         .await
     }
 
-    /// Hook impl that touches the per-session `client:live:*` hash on
-    /// every accepted share. Writes are buffered and flushed every
-    /// `touch_flush_interval` (default 30s) by the engine's background
-    /// task.
+    /// Hook that touches the session's `client:live:*` hash on every
+    /// accepted share, buffered until the next touch flush.
     pub fn client_row_touch_sink(&self) -> ClientRowTouchSink {
         ClientRowTouchSink::new(self.touch_buffer.clone(), self.hashrate_sampler.clone())
     }
 
-    /// Hook impl that records the per-`(address, worker, hour-slot)` max
-    /// share difficulty for the diff-scores chart. Buffered and flushed by
-    /// the engine's background task every `diff_stat_flush_interval`.
+    /// Hook that records the per-`(address, worker, hour-slot)` max share
+    /// difficulty for the diff-scores chart.
     pub fn client_difficulty_statistics_sink(&self) -> ClientDifficultyStatisticsSink {
         ClientDifficultyStatisticsSink::new(self.diff_stat_buffer.clone())
     }
 
-    /// Signal the flush loop, wait for the final drain, and join the
-    /// task. Idempotent across handle clones — only the first call
-    /// actually signals; subsequent calls are no-ops.
+    /// Signal every loop and join them; idempotent across handle clones.
     pub async fn shutdown(&self) {
         let (txs, joins) = {
             let mut guard = match self.shutdown.lock() {
@@ -269,8 +219,7 @@ impl SessionPersistenceEngineHandle {
                 std::mem::take(&mut guard.joins),
             )
         };
-        // Signal all loops first, then await each — so they drain
-        // concurrently rather than serially.
+        // Signal all first so the loops drain concurrently.
         for tx in txs {
             let _ = tx.send(());
         }

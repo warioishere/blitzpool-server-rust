@@ -2,13 +2,8 @@
 
 #![allow(clippy::print_stderr)]
 
-//! End-to-end test: spawn the Prometheus exporter, emit through the
-//! recorder helpers, scrape `/metrics`, verify the
-//! Prometheus-text-format output contains the expected lines.
-//!
-//! **Single test only**: the global recorder is install-once per
-//! process, so two tests in this binary calling `MetricsService::spawn`
-//! would conflict. Every end-to-end assertion lives in this one test.
+//! Spawn the exporter, emit through the helpers, scrape `/metrics`. A single
+//! test only: the global recorder installs once per process.
 
 use std::sync::atomic::{AtomicU16, Ordering};
 

@@ -42,10 +42,8 @@ pub struct FoundBlockRow {
     pub session_id: String,
 }
 
-/// Append a found-block record. Called once per accepted block after
-/// the solution is submitted to bitcoin-core. `block_data` stores the
-/// 80-byte header hex (little-endian); the column is append-only and
-/// not surfaced via any public API endpoint.
+/// Append a found-block record once the solution is submitted. `block_data`
+/// is the 80-byte header hex and is never exposed by the API.
 pub async fn insert_found_block<'e, E>(
     executor: E,
     height: i64,
@@ -74,14 +72,9 @@ where
 }
 
 /// The miner address the pool recorded for the block at `height`, or `None`
-/// when it has no record of one.
-///
-/// The chain→ledger reconciliation asks this about a block whose coinbase
-/// pays the pool: `None` means the pool mined it and never registered it, and
-/// the address it returns resolves the payout mode, which decides whether a
-/// missing payout row is a fault or normal (Solo keeps no ledger).
-/// Dev-seed rows are excluded for the same reason `find_found_blocks`
-/// excludes them — a bootstrap fixture is not evidence of a real block.
+/// when it has no record of one. The chain-to-ledger reconciliation uses the
+/// address to resolve the payout mode (Solo keeps no ledger). Dev-seed rows
+/// are excluded: a bootstrap fixture is not evidence of a real block.
 pub async fn found_block_miner_at_height(
     pool: &PgPool,
     height: i64,
@@ -98,24 +91,10 @@ pub async fn found_block_miner_at_height(
     .map_err(DbError::from)
 }
 
-/// `true` when some payout ledger recorded a distribution for `height`.
-///
-/// Distinct from [`found_block_miner_at_height`], and the distinction is the
-/// point: `blocks_entity` is written by the front the moment a block is
-/// found, *before* any ledger applies. A block whose distribution then fails
-/// to book has the `blocks_entity` row and no payout rows — the exact shape of
-/// a miss. Only the payout tables are evidence that miners were credited.
-///
-/// Solo blocks legitimately have no row here: they pay directly in the
-/// coinbase and keep no ledger. Callers must not treat their absence as a
-/// miss without first checking that the coinbase paid nobody else.
-///
-/// **A row is not an accounting.** Every clause requires a row that moved
-/// VALUE, because a block can produce rows that account for nothing: the
-/// PPLNS apply writes a 0-sat `pending` row for every address that is live
-/// in the window but absent from the block's distribution ("late
-/// arrivers"), so a distribution that paid nobody still leaves rows behind.
-/// A plain `EXISTS` would read such a block as booked.
+/// `true` when a payout ledger booked value for `height`; unlike
+/// [`found_block_miner_at_height`] this proves miners were credited. Only rows
+/// that moved value count, since PPLNS writes 0-sat rows for late arrivers.
+/// Solo blocks keep no ledger, so their absence here is not a miss.
 pub async fn payout_recorded_at_height(pool: &PgPool, height: i32) -> Result<bool, DbError> {
     let found = sqlx::query_scalar!(
         r#"SELECT (
@@ -143,10 +122,8 @@ pub async fn payout_recorded_at_height(pool: &PgPool, height: i32) -> Result<boo
 /// All rows from `blocks_entity` projected down to
 /// `{height, minerAddress, worker, sessionId}`, unordered.
 pub async fn find_found_blocks(pool: &PgPool) -> Result<Vec<FoundBlockRow>, DbError> {
-    // Filter out dev-seed rows (`synthseed*` miner addresses from
-    // bootstrap fixtures); they have no payout value and would
-    // leak into /api/info blockData / /api/pool blocksFound tiles
-    // on a fresh test database.
+    // Dev-seed rows (`synthseed*`) are bootstrap fixtures and must not show
+    // up as found blocks in the API.
     sqlx::query_as!(
         FoundBlockRow,
         r#"SELECT height AS "height!",

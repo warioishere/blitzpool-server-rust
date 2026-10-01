@@ -1,25 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! End-to-end regtest test for the SV2 mining server — Extended channel.
-//!
-//! Sibling of `regtest_standard.rs`: same Noise + TDP + server topology,
-//! but exercises the Extended-channel path. Extended channels differ
-//! from Standard in three ways the test pins:
-//!
-//! 1. **OpenExtendedMiningChannel** carries `min_extranonce_size: u16`;
-//!    the success response carries the actual `extranonce_size` (pool-
-//!    side allocated) + the `extranonce_prefix` bytes.
-//! 2. **NewExtendedMiningJob** carries `version_rolling_allowed: bool`,
-//!    a `merkle_path: Seq0255<U256>`, and the coinbase split as
-//!    `coinbase_tx_prefix` + `coinbase_tx_suffix` (so the miner can
-//!    roll their portion of the extranonce locally without a pool
-//!    round-trip).
-//! 3. **Shares** can be rolled by the miner. Block acceptance for that
-//!    path is proven directly in `regtest_extended_block_submit.rs`, which
-//!    drives `validate_submit_extended` and submits the bytes it produces.
-//!    This test owns the Open / NewExtendedMiningJob wire contract.
-//!
-//! Skipped (with a printed warning) when `bitcoin-node` isn't installed.
+//! End-to-end regtest of the SV2 Extended-channel wire contract:
+//! `OpenExtendedMiningChannel` grants and refusals, and the fields of
+//! `NewExtendedMiningJob`. Block acceptance of rolled shares is covered by
+//! `regtest_extended_block_submit.rs`.
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -62,10 +46,7 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
         .expect("mine 101 blocks for IBD-exit + coinbase maturity");
 
     // ── Spawn TDP, subscribe FIRST, then force a template emission ────
-    //
-    // `tokio::sync::broadcast` does not replay messages sent before any
-    // receiver existed, so a template forced before `subscribe()` can be
-    // lost. Order: spawn → subscribe → generate → wait.
+    // `broadcast` does not replay messages sent before a receiver existed.
     let tdp = TdpHandle::spawn(
         TdpConfig::new(node.ipc_socket_path())
             .with_fee_threshold(1)
@@ -136,11 +117,9 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
             protocol: Protocol::MiningProtocol,
             min_version: 2,
             max_version: 2,
-            // Deliberately NO flags — not REQUIRES_VERSION_ROLLING either.
-            // SV2 Mining/SetupConnection Flags for Mining Protocol's flag
-            // means "I need version rolling", so a client that omits it has
-            // said nothing, and the job it gets must still allow rolling
-            // (asserted below).
+            // No flags: omitting REQUIRES_VERSION_ROLLING says nothing, so the
+            // job must still allow rolling (SV2 Mining/SetupConnection Flags
+            // for Mining Protocol).
             flags: 0,
             endpoint_host: "127.0.0.1".to_string().try_into().unwrap(),
             endpoint_port: addr.port(),
@@ -155,10 +134,8 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
     match resp {
         AnyMessageOwned::Common(CommonMessagesOwned::SetupConnectionSuccess(s)) => {
             assert_eq!(s.used_version, 2);
-            // Server capability bits
-            // (SV2 Mining/SetupConnection Flags for Mining Protocol) are built
-            // fresh, NOT echoed: a version-rolling client must NOT get
-            // REQUIRES_FIXED_VERSION back.
+            // Server flags are built fresh, not echoed, or a version-rolling
+            // client would get REQUIRES_FIXED_VERSION back.
             assert_eq!(
                 s.flags, 0,
                 "Success.flags must be 0, not an echo of the request flags"
@@ -170,9 +147,8 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
         ),
     }
 
-    // OpenExtendedMiningChannel: request 10 rollable bytes. The pool must
-    // grant a >8 request exactly (an aggregating proxy needs this) instead
-    // of under-granting.
+    // Request 10 rollable bytes: an aggregating proxy needs a >8 request
+    // granted exactly.
     let open = AnyMessageOwned::Mining(MiningOwned::OpenExtendedMiningChannel(
         OpenExtendedMiningChannelOwned {
             request_id: 7,
@@ -232,9 +208,7 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
         "OpenExtendedMiningChannelSuccess must arrive within 5 s"
     );
 
-    // Force a NewBlock fan-out if the broadcast didn't already
-    // produce a NewExtendedMiningJob (some templates emit it only on
-    // the next NewBlock).
+    // Some templates emit the job only on the next NewBlock.
     if !got_new_ext_job {
         node.generate_to_self(1)
             .await
@@ -261,10 +235,6 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
     );
 
     // ── Assertions on Extended-channel fields ─────────────────────────
-    //
-    // The pool's ExtranonceAllocator emits 4-byte prefixes by default. The
-    // granted extranonce_size must EXACTLY honor the requested
-    // min_extranonce_size (10).
     let extranonce_size = seen_extranonce_size.expect("Success captured");
     let extranonce_prefix_len = seen_extranonce_prefix_len.expect("Success captured");
     assert_eq!(
@@ -276,10 +246,8 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
         "pool must honor the requested min_extranonce_size (10) exactly, not cap it"
     );
 
-    // Every extended job allows BIP-323 rolling, and this connection asked
-    // for nothing (`flags: 0`). That flag only says "I require rolling"; not
-    // setting it is not a refusal, and `version_rolling_allowed: false` would
-    // cost a capable miner its version-rolling search space.
+    // `flags: 0` is not a refusal of rolling; `false` here would cost a
+    // capable miner its version-rolling search space.
     assert_eq!(
         seen_version_rolling_allowed,
         Some(true),
@@ -289,7 +257,6 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
     // Regtest may emit empty merkle paths for empty-mempool blocks, so only
     // check that the field was observed, not its length.
     let _ = merkle_path_len;
-    // Coinbase split must be non-empty on both sides.
     let coinbase_prefix_len = seen_coinbase_prefix_len.expect("captured");
     let coinbase_suffix_len = seen_coinbase_suffix_len.expect("captured");
     assert!(
@@ -301,11 +268,9 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
         "coinbase_tx_suffix must carry the sequence + outputs + locktime"
     );
 
-    // ── Oversize extranonce request → OpenMiningChannelError (not a
-    //    silently-smaller grant). A pool rule, not the spec's:
-    //    SV2 Mining/OpenExtendedMiningChannel binds the granted size to the
-    //    requested minimum nowhere.
-    //    17 > the pool's 16-byte rollable cap.
+    // ── Oversize request (17 > the 16-byte cap) → OpenMiningChannelError,
+    //    never a silently smaller grant. A pool rule: SV2
+    //    Mining/OpenExtendedMiningChannel does not bind the grant to the minimum.
     let oversize = AnyMessageOwned::Mining(MiningOwned::OpenExtendedMiningChannel(
         OpenExtendedMiningChannelOwned {
             request_id: 8,
@@ -328,8 +293,7 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
                     );
                     got_reject = true;
                 }
-                // Broadcast job / prev-hash / target frames for the already-open
-                // channel may interleave — ignore them while awaiting the reject.
+                // Frames for the already-open channel may interleave.
                 AnyMessageOwned::Mining(_) => {}
                 other => panic!(
                     "unexpected frame while awaiting oversize reject: {:?}",

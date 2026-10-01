@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! SV2 JDP wire codec: maps `AnyMessage::JobDeclaration(...)` to and from the
-//! owned shapes in [`crate::jdp::client`].
-//!
-//! Ext 0x0003 has no inbound message. Its outbound `SetPayoutDistribution` is
-//! not in `stratum-core::AnyMessage`, so [`encode_jdp_outbound`] returns it as
-//! [`JdpWireFrame::Ext0x0003`] bytes for the IO layer to frame by hand.
-//! `DeclareMiningJob.excess_data` is dropped on decode.
+//! SV2 JDP wire codec to and from the owned shapes in [`crate::jdp::client`].
+//! ext 0x0003 `SetPayoutDistribution` is not in `stratum-core::AnyMessage`, so
+//! [`encode_jdp_outbound`] returns it as [`JdpWireFrame::Ext0x0003`] bytes for
+//! the IO layer to frame by hand.
 
 use stratum_core::job_declaration_sv2::{
     AllocateMiningJobToken as Sv2AllocateMiningJobToken,

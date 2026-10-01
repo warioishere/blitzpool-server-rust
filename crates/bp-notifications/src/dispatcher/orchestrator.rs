@@ -181,10 +181,8 @@ impl NotificationDispatcher {
         join_all(tasks).await;
     }
 
-    /// Send a device-status message that [`DeviceStatusGate`] has already
-    /// confirmed. This is the entry point production uses; the raw
-    /// per-event [`notify_device_status`](Self::notify_device_status)
-    /// stays public for the single-transition path and the tests.
+    /// Send a device-status message the [`DeviceStatusGate`] has already
+    /// confirmed; the production entry point.
     ///
     /// [`DeviceStatusGate`]: super::DeviceStatusGate
     pub async fn notify_device_notice(&self, notice: &DeviceNotice) {
@@ -195,10 +193,8 @@ impl NotificationDispatcher {
         }
     }
 
-    /// Some of a worker's rigs are gone and the rest keep hashing.
-    ///
-    /// Same transports and filtering as the other two; only the wording
-    /// differs, and deliberately so — the owner of three rigs must not
+    /// Some of a worker's rigs are gone and the rest keep hashing. Only the
+    /// wording differs from the other two: the owner of three rigs must not
     /// read "offline" when two are still working.
     pub async fn notify_device_partial(&self, partial: &DevicePartial) {
         let (telegram_subs, _ntfy_sub, push_subs) = self.load_subs(&partial.address).await;
@@ -282,11 +278,9 @@ impl NotificationDispatcher {
             }
         }
 
-        // The two push transports do NOT share a payload: FCM turns
-        // `tag` into `data.status` and merges `extras`, while UnifiedPush
-        // flattens to `title|body|tag`. One payload for both would change
-        // the UnifiedPush wire shape, so each is built separately, as in
-        // the single-event path.
+        // The two push transports do NOT share a payload: FCM turns `tag`
+        // into `data.status` and merges `extras`, while UnifiedPush flattens
+        // to `title|body|tag`. One payload for both would change that shape.
         let fcm_dev: Vec<_> = push_subs
             .iter()
             .filter(|s| {
@@ -437,10 +431,8 @@ struct PushHandles {
 type TaskFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 // ── Send functions per (transport, event-kind) ──────────────────────
-//
-// Each one resolves to `Future<Output = ()>` so the dispatcher can
-// `join_all` them. Errors are logged and absorbed — failed subscribers
-// don't take down the entire fan-out.
+// Errors are logged and absorbed so one failed subscriber does not take
+// down the whole `join_all` fan-out.
 
 async fn send_telegram_block_found(
     adapter: Arc<TelegramAdapter>,
@@ -605,12 +597,9 @@ async fn send_telegram_device_partial(
     join_all(tasks).await;
 }
 
-/// Push payload for a partial loss.
-///
-/// `status` is deliberately NOT `online`/`offline`: a client that branches
-/// on those two must not file this under either, because the worker is
-/// neither gone nor unchanged. The device keys shipped clients read are
-/// all present, with the counts added alongside.
+/// Push payload for a partial loss. `status` is deliberately neither
+/// `online` nor `offline`, because the worker is neither gone nor unchanged;
+/// the keys shipped clients read are all present, the counts added alongside.
 fn device_partial_fcm_payload(partial: &DevicePartial) -> PushPayload {
     let time_str = partial.timestamp.format("%m/%d/%y, %-I:%M %p").to_string();
     let text = DevicePartialText::build(&DevicePartialArgs {
@@ -714,18 +703,10 @@ async fn send_telegram_device_aggregate(
     join_all(tasks).await;
 }
 
-/// Push payload for an aggregate.
-///
-/// Deliberately carries the **same** key set as the single device-status
-/// payload, because the FCM adapter turns `tag` into `data.status` and
-/// merges `extras` verbatim: a client that branches on `data["status"]`
-/// or reads `data["workerName"]` must not get an empty string or a
-/// missing key just because several workers moved at once.
-///
-/// `status` is `online` / `offline` when the batch moved one way and
-/// `mixed` when it moved both, so a client that only knows the two
-/// original values still lands in a defined branch. `workerName` lists
-/// the workers involved; the aggregate-only counts are additive.
+/// Push payload for an aggregate. Carries the same key set as the single
+/// device-status payload, because FCM turns `tag` into `data.status` and
+/// merges `extras` verbatim: clients must not see a missing key just because
+/// several workers moved at once. `mixed` only when the batch moved both ways.
 fn device_aggregate_fcm_payload(agg: &DeviceAggregate) -> PushPayload {
     let time_str = agg.timestamp.format("%m/%d/%y, %-I:%M %p").to_string();
     let text = DeviceAggregateText::build(&DeviceAggregateArgs {
@@ -772,10 +753,8 @@ fn device_aggregate_fcm_payload(agg: &DeviceAggregate) -> PushPayload {
     }
 }
 
-/// UnifiedPush counterpart. That transport flattens the payload to
-/// `title|body|tag`, and the single-event path deliberately leaves the
-/// trailing field empty — matching it keeps the shape existing clients
-/// already parse.
+/// UnifiedPush counterpart; leaves the trailing `tag` field empty like the
+/// single-event path, the `title|body|` shape existing clients parse.
 fn device_aggregate_unified_payload(agg: &DeviceAggregate) -> PushPayload {
     let time_str = agg.timestamp.format("%m/%d/%y, %-I:%M %p").to_string();
     let text = DeviceAggregateText::build(&DeviceAggregateArgs {
@@ -1118,9 +1097,7 @@ mod tests {
         assert_eq!(extract_difficulty_tag("(not a difficulty)"), "Unknown");
     }
 
-    /// The stored `subscriptionType` is lowercase (`unified_push` / `fcm`),
-    /// so the routing constants MUST be lowercase and the comparison
-    /// case-insensitive. A regression here silently drops every push.
+    /// Push routing matches the stored lowercase `subscriptionType` in any casing.
     #[test]
     fn push_type_constants_lowercase_and_match_case_insensitively() {
         assert_eq!(PUSH_TYPE_UNIFIED, "unified_push");
@@ -1168,10 +1145,7 @@ mod tests {
         }
     }
 
-    /// The FCM adapter turns `tag` into `data.status` and merges
-    /// `extras`, so an aggregate that omits a key the single form sends
-    /// hands existing clients a missing field. Assert key parity rather
-    /// than the exact values.
+    /// The FCM aggregate payload carries every data key the single form sends.
     #[test]
     fn aggregate_fcm_payload_keeps_the_single_events_data_keys() {
         let single = {
@@ -1206,8 +1180,7 @@ mod tests {
         );
     }
 
-    /// A brand-new miner must not be described to its owner as having
-    /// recovered from an outage they were never told about.
+    /// A brand-new miner is not reported as back online.
     #[test]
     fn aggregate_separates_first_sightings_from_returns() {
         let p = device_aggregate_fcm_payload(&aggregate_full(&[], &["back"], &["fresh"]));
@@ -1229,9 +1202,7 @@ mod tests {
         );
     }
 
-    /// UnifiedPush flattens to `title|body|tag` and the single-event path
-    /// leaves the trailing field empty. The aggregate must not change
-    /// that shape.
+    /// The UnifiedPush aggregate keeps the empty trailing `tag` field.
     #[test]
     fn aggregate_unified_payload_keeps_the_empty_trailing_field() {
         let p = device_aggregate_unified_payload(&aggregate(&["a", "b"], &[]));

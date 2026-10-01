@@ -1,22 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Shared `?range=` parsing + slot-bucket math for chart/timeseries
-//! endpoints. The slot size is a fixed 10 minutes for every range — the
-//! stats are stored at that resolution and surfaced natively, so a
-//! longer range just returns more points (never coarser buckets).
-//!
-//! ## Range presets
-//!
-//! | range | window  | slot size | point count |
-//! |-------|---------|-----------|-------------|
-//! | `1d`  | 24h     | 10 min    | 144         |
-//! | `3d`  | 72h     | 10 min    | 432         |
-//! | `7d`  | 168h    | 10 min    | 1008        |
-//! | `14d` | 336h    | 10 min    | 2016        |
-//! | `1m`  | 30 days | 10 min    | 4320        |
-//!
-//! Endpoints that don't take `range` (e.g. `/api/info/shares`) just
-//! compute their own millis directly.
+//! Shared `?range=` parsing + slot-bucket math for chart endpoints. Every
+//! range uses the stored 10-minute slots, so a longer range returns more
+//! points, never coarser buckets.
 
 use std::collections::BTreeMap;
 
@@ -34,9 +20,7 @@ pub enum Range {
 }
 
 impl Range {
-    /// Parse the `?range=` query param. Returns `BadRequest`-mapped
-    /// `ApiError::InvalidQuery` on unknown values; default-callers
-    /// should swallow that with `.unwrap_or(Range::Day)`.
+    /// Parse the `?range=` query param; an unknown value is a 400.
     pub fn parse(s: Option<&str>) -> Result<Self, ApiError> {
         match s.unwrap_or("1d") {
             "1d" => Ok(Self::Day),
@@ -73,11 +57,9 @@ impl Range {
     }
 }
 
-/// Slot size of every chart: the stats are persisted in 10-min slots and
-/// surfaced at that native resolution (longer ranges simply return more
-/// points). Coarser bucketing would both drop resolution and, on the
-/// hashrate charts, inflate the value (the `* 2^32 / 600s` conversion
-/// assumes a 10-min slot).
+/// Slot size of every chart, the stored resolution. Coarser bucketing would
+/// also inflate the hashrate charts, whose `* 2^32 / 600s` conversion
+/// assumes a 10-min slot.
 const SLOT_MS: i64 = bp_stats::SLOT_DURATION_MS;
 
 /// Snap `t_ms` down to the nearest slot boundary. Stable — `t_ms`
@@ -102,11 +84,8 @@ pub fn chart_visibility_cutoff_ms() -> i64 {
     bp_stats::slot::chart_visibility_cutoff_slot().as_millis()
 }
 
-/// Generate slot-end boundaries for the window `[since_ms, until_ms)`.
-/// Slots are end-labeled — the boundary at `14:00:00.000Z` represents
-/// the slot covering `[13:50, 14:00)`. First boundary is the first
-/// slot-end at or after `since_ms`; emission stops once a boundary
-/// would reach or exceed `until_ms`.
+/// Slot-end boundaries for the window `[since_ms, until_ms)`. Slots are
+/// end-labeled: the boundary `14:00:00.000Z` is the slot `[13:50, 14:00)`.
 pub fn slot_boundaries(since_ms: i64, until_ms: i64) -> Vec<i64> {
     let mut out = Vec::new();
     if since_ms >= until_ms {

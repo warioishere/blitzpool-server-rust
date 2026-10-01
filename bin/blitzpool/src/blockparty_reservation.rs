@@ -1,25 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Blockparty coinbase-reservation sizer.
-//!
-//! Implements [`bp_blockparty_engine::CoinbaseReservation`] over the Blockparty
-//! TDP stream. When a party reaches `Ready` (roster final, about to mine), the
-//! engine calls [`TdpCoinbaseReservation::ensure_capacity_for_members`], which
-//! computes the coinbase weight the roster needs and, if it exceeds what is
-//! reserved, raises bitcoin-core's reservation via
-//! [`TdpHandle::set_coinbase_constraints`].
-//!
-//! **High-water-mark.** The reservation only grows (across all parties sharing
-//! the one Blockparty stream) and never drops below the floor
-//! (`[blockparty].coinbase_weight_budget`). A party that fits the floor is a
-//! no-op, so the common case has no template lag. A raise reaches templates
-//! within about one TDP cycle; keeping the floor at or above the realistic max
-//! party makes that lagging path headroom, not the validity guarantee.
-//!
-//! Blockparty does NOT weight-trim (unlike Group-Solo / PPLNS), so this sizing
-//! is how a larger-than-floor party stays valid. The reservation caps at
-//! [`BLOCKPARTY_MAX_RESERVATION_WU`]; a party beyond it is logged and risks
-//! rejection, far past any realistic size.
+//! Blockparty coinbase-reservation sizer: Blockparty does NOT weight-trim, so
+//! a party reaching `Ready` raises bitcoin-core's reservation to fit its
+//! roster. High-water mark, never below `[blockparty].coinbase_weight_budget`;
+//! a raise lags about one TDP cycle, so the floor should cover realistic parties.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 

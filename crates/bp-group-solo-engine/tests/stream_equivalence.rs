@@ -2,16 +2,9 @@
 
 #![allow(clippy::print_stderr)]
 
-//! Accounting equivalence for Group-Solo between the in-process sink path
-//! and the Core→stream→Satellite path. Mirror of the PPLNS equivalent.
-//!
-//! The same Group-Solo share sequence (deterministic `share_id`s, one
-//! group) driven (a) directly through `GroupSoloAcceptedShareSink` vs
-//! (b) produce → Redis stream → drain into a fresh sink must leave
-//! identical round state (per-address aggregate + total). Group-Solo is a
-//! PROP round (no trim), so the comparison is exact by construction.
-//!
-//! Needs docker-Redis (16379) + PG (15433); skips cleanly otherwise.
+//! The same Group-Solo share sequence through the in-process sink and through
+//! the Redis stream must leave identical round state. PROP has no trim, so the
+//! comparison is exact. Needs docker Redis + PG; skips otherwise.
 
 use std::sync::Arc;
 

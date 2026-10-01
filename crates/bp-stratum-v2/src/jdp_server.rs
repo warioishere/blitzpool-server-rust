@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! JDP-port server: handle + per-connection task. No template broadcast and no
-//! vardiff; each accepted `DeclareMiningJob` is registered in the bridge so the
-//! mining server's `SetCustomMiningJob` handler can cross-check the token.
-//!
-//! - ext 0x0003 is push-only: `SetPayoutDistribution` goes out as a raw frame
-//!   right after `RequestExtensions.Success`, then on every publish.
-//! - Declared payouts are compared positionally against the distribution the
-//!   `distribution_id` TLV names (ext 0x0003/Output Verification).
+//! JDP-port server. Each accepted `DeclareMiningJob` is registered in the bridge
+//! so the mining server's `SetCustomMiningJob` handler can cross-check the token.
+//! ext 0x0003 is push-only: `SetPayoutDistribution` follows `RequestExtensions.Success`
+//! and every publish; declared payouts are checked per ext 0x0003/Output Verification.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};

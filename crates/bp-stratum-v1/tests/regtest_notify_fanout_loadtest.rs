@@ -1,20 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Load test — measures **Segment 2** of the stratum-race latency: from a new
-//! block (`SetNewPrevHash`) to `mining.notify` delivered to N connected miners.
-//!
-//! Not a pass/fail correctness test — it prints a latency distribution showing
-//! whether the fan-out serialises (last miner much later than the first) or
-//! stays flat as N grows. Run it directly:
-//!
-//! ```text
-//! cargo test -p bp-stratum-v1 --test regtest_notify_fanout_loadtest -- --nocapture --test-threads=1
-//! LOADTEST_SIZES=100,500,1000 cargo test ... --nocapture   # custom N set
-//! ```
-//!
-//! The absolute numbers include the block-mine RPC + Core→TDP IPC hop (shared
-//! across all miners); the **spread** (max − min) isolates the per-connection
-//! broadcast cost.
+//! Load test, not pass/fail: prints the new-block to `mining.notify` latency
+//! across N miners. The spread (max − min) isolates per-connection fan-out
+//! cost; the absolute numbers include the shared RPC + IPC hop. Run with
+//! `--nocapture`; `LOADTEST_SIZES=100,500` picks N.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -74,9 +63,9 @@ fn prevhash_of_notify(f: &Value) -> Option<String> {
         .map(String::from)
 }
 
-/// Connect `n` miners, get each to a baseline `mining.notify`, then mine one
-/// block and record — per miner — the elapsed from the block trigger to the
-/// first `mining.notify` carrying a *new* prev-hash. Returns (connected, samples_us).
+/// Connect `n` miners, mine one block, and return `(connected, samples_us)`:
+/// per miner, the time from the trigger to the first notify with a new
+/// prev-hash.
 async fn measure(node: &RegtestNode, addr: SocketAddr, n: usize) -> (usize, Vec<u128>) {
     // Set once, immediately before the block trigger; read by each miner task.
     let t0: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
@@ -145,8 +134,7 @@ async fn measure(node: &RegtestNode, addr: SocketAddr, n: usize) -> (usize, Vec<
             };
             let _ = ready_tx.send(()).await;
 
-            // Wait for a notify with a *different* prev-hash (the new block).
-            // Mempool refreshes keep the same prev-hash → correctly ignored.
+            // A new prev-hash marks the block; mempool refreshes keep the old one.
             let got = tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
                     match read_frame(&mut reader).await {
@@ -189,8 +177,7 @@ async fn measure(node: &RegtestNode, addr: SocketAddr, n: usize) -> (usize, Vec<
     // Collect one result per spawned miner task.
     let mut samples = Vec::with_capacity(n);
     for _ in 0..n {
-        // A failed / timed-out miner yields no sample and is simply excluded
-        // from the distribution (the `connected` count reports the shortfall).
+        // A failed miner yields no sample; `connected` reports the shortfall.
         if let Ok(Some(Some(us))) =
             tokio::time::timeout(Duration::from_secs(60), sample_rx.recv()).await
         {
@@ -301,8 +288,7 @@ async fn notify_fanout_latency_under_load() {
         let server_accept = server.clone();
         let pc = port_config.clone();
         tokio::spawn(async move {
-            // Exits on the first accept error — the listener is dropped at
-            // test teardown, which is what ends this loop.
+            // Ends on the first accept error, i.e. at teardown.
             while let Ok((socket, _)) = listener.accept().await {
                 socket.set_nodelay(true).ok();
                 server_accept.accept_connection(socket, pc.clone());

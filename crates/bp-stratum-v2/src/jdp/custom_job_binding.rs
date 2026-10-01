@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Bind the job a JDC MINES (`SetCustomMiningJob`) to the job it DECLARED.
-//!
-//! Base SV2 ties the two only by `mining_job_token`. Without this check a
-//! mined transaction set could differ from the one the node validated and
-//! earn window share for blocks that cannot land. Fees and block value are
-//! not checked: the split is guarded by [`crate::jdp::payout_distribution`].
-//! `nbits` and `min_ntime` never reach [`DeclaredJob`], so they are not bound.
-//! Only as strong as the optional `job_validator`; Coinbase-only jobs have no
-//! declaration to bind.
+//! Bind the job a JDC MINES (`SetCustomMiningJob`) to the job it DECLARED,
+//! which base SV2 ties only by token: otherwise an unvalidated transaction set
+//! could earn window share for blocks that cannot land. The payout split is
+//! guarded by [`crate::jdp::payout_distribution`]; `nbits`/`min_ntime` are not bound.
 
 use bitcoin::hashes::Hash;
 

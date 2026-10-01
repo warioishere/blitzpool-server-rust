@@ -1,40 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Regtest: SV1 per-mode stream routing — Solo, Group-Solo and Blockparty
-//! through ONE driver.
-//!
-//! Proves the validity-critical behaviour unit tests can't: a connection whose
-//! address resolves to a mode is routed onto that mode's dedicated template
-//! stream by `run_connection` (on `mining.authorize`), and a block it finds is
-//! submitted through that mode's TDP handle and accepted by bitcoin-core.
-//!
-//! Two independent guards make each proof tight:
-//!   1. A recording block-sink captures the `StreamKind` of every block-submit.
-//!      The mode's own kind proves `run_connection` switched (`state.stream`);
-//!      had the swap not fired it would record `Pplns` — the stream every
-//!      connection boots on before its mode is resolved — and the test fails.
-//!   2. The chain advancing proves the mode's handle actually knew the job's
-//!      `template_id` — template_ids collide across streams, so a mis-routed
-//!      submit would be rejected and the height would not move.
-//!
-//! The three modes differ only in the reservation their stream advertises and
-//! in how many outputs the coinbase carries, so they share [`run_scenario`]:
-//!
-//!   * **Solo** pays one output, against a tiny fixed reservation.
-//!   * **Group-Solo** additionally proves a ~50-member P2TR coinbase fits the
-//!     production 10 000-WU reservation.
-//!   * **Blockparty** does the same at 40 members / 8 000 WU — but for a
-//!     different reason: Blockparty has no member cap at all.
-//!
-//! One driver is the point, not a convenience: a shared miner loop keeps the
-//! three modes from drifting apart in how they classify submit responses and
-//! follow a mid-run `mining.notify`.
-//!
-//! The SV2 counterpart is `bp-stratum-v2/tests/regtest_stream_routing.rs`:
-//! same scenario, but the swap is triggered by `OpenStandardMiningChannel` in
-//! `run_mining_connection`. The protocol side is the reason both exist.
-//!
-//! Skipped (with a printed warning) when `bitcoin-node` is not installed.
+//! Regtest: an SV1 connection is routed onto its mode's template stream on
+//! authorize, and its block lands through that mode's TDP handle. The sink
+//! records the stream; the height only moves if the right handle knew the
+//! `template_id`. One driver for all three modes so they cannot drift apart.
 
 #![allow(clippy::print_stderr)]
 
@@ -58,8 +27,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 const REGTEST_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
-/// The per-mode inputs of one scenario. Everything else in [`run_scenario`] is
-/// identical across the three, which is why they share it.
+/// The per-mode inputs of one scenario.
 #[derive(Clone, Copy)]
 struct ModeCase {
     /// The stream the connection must be routed onto.
@@ -93,9 +61,8 @@ const BLOCKPARTY: ModeCase = ModeCase {
     label: "blockparty",
 };
 
-/// Routes every address to `stream` and splits the block's OWN revenue across
-/// `addresses`, so the payout vector consumes the template value exactly
-/// whatever the subsidy and fees happen to be.
+/// Routes every address to `stream` and splits the block's own revenue so the
+/// payouts consume the template value exactly.
 struct FixedResolver {
     stream: StreamKind,
     addresses: Vec<String>,
@@ -128,14 +95,12 @@ fn split_reward(addresses: &[String], reward_sats: u64) -> Vec<PayoutEntry> {
         .collect()
 }
 
-/// Records the routed stream and submits the solution through the handle that
-/// stream owns — the test-side mirror of production's `select_handle`.
+/// Records the routed stream and submits through the handle that stream owns.
 struct RecordingSink {
     tdp_default: TdpHandle,
     tdp_alt: TdpHandle,
-    /// The one stream this scenario gave a dedicated handle to. Held as a
-    /// value and compared, not matched as a mode: a fourth `StreamKind` cannot
-    /// silently fall through to the default handle here.
+    /// The one stream with a dedicated handle in this scenario. Compared, not
+    /// matched, so a fourth `StreamKind` cannot fall through to the default.
     alt: StreamKind,
     recorded: Arc<Mutex<Vec<StreamKind>>>,
 }
@@ -197,10 +162,8 @@ async fn sv1_group_solo_connection_routes_to_group_solo_stream_and_block_accepte
     assert_routed_and_landed(GROUP_SOLO, &outcome);
 }
 
-/// ~50 distinct P2TR (bech32m) members — the worst-case 172-WU output type.
-/// 50 × 43 B = 2150 B of coinbase outputs, which must fit the production
-/// 10 000-WU reservation (2756 B). The validity proof for the documented
-/// "~50 members" capacity of `[group_fees].coinbase_weight_budget`.
+/// 50 P2TR members (the worst-case output type) fit the production 10 000-WU
+/// Group-Solo reservation, backing the documented ~50-member capacity.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sv1_group_solo_max_size_multi_output_coinbase_accepted() {
     let Some(node) = start_node_or_skip(GROUP_SOLO, "max-size multi-output").await else {
@@ -227,19 +190,9 @@ async fn sv1_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
     assert_routed_and_landed(BLOCKPARTY, &outcome);
 }
 
-/// 40 distinct P2TR members against the production 8 000-WU reservation.
-///
-/// Unlike Group-Solo, Blockparty enforces no member cap: `add_member` never
-/// counts, and `CoinbaseReservation::ensure_capacity_for_members` instead
-/// RAISES the reservation as a party grows (high-water, floored at
-/// `[blockparty].coinbase_weight_budget`, capped at 50 000 WU ≈ 285 members).
-/// So the reservation is a floor with headroom, not a ceiling.
-///
-/// That raise reaches bitcoin-core's templates only after ~one TDP cycle, so
-/// what has to hold is that a realistic party never needs it. The floor sizes
-/// to `328 + 188 + (n+1)·172 + 200` WU, i.e. 41 members at 8 000 WU — this
-/// test sits just under that and proves the common case is covered by the
-/// floor alone, with no (lagging) raise in the path.
+/// 40 P2TR members fit the 8 000-WU Blockparty floor alone. Blockparty has no
+/// member cap and raises its reservation as a party grows, but that raise
+/// reaches templates a TDP cycle late, so a realistic party must not need it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sv1_blockparty_max_size_multi_output_coinbase_accepted() {
     let Some(node) = start_node_or_skip(BLOCKPARTY, "max-size multi-output").await else {
@@ -258,8 +211,8 @@ async fn sv1_blockparty_max_size_multi_output_coinbase_accepted() {
 
 // ── driver ──────────────────────────────────────────────────────────────
 
-/// What one scenario observed. The submit tallies are carried out so a failing
-/// assertion can say *why* no block landed instead of only that none did.
+/// What one scenario observed; the tallies let a failure say why no block
+/// landed.
 struct Outcome {
     recorded: Vec<StreamKind>,
     before: u32,
@@ -439,11 +392,8 @@ async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>
         .await
         .expect("write subscribe");
     let sub_resp = read_frame(&mut reader).await;
-    // The extranonce1 (result[1]) the pool hands the miner must come from the
-    // pool-wide collision-free allocator's SV1 partition (worker 1 → top byte
-    // 0x01), NOT from the random session id. The block that lands below is
-    // reconstructed from this exact extranonce1, so its acceptance by
-    // bitcoin-core proves the allocated-prefix path yields valid blocks.
+    // extranonce1 comes from the allocator's SV1 partition (worker 1, 0x01…),
+    // not the session id; the landed block is built from it.
     let en1 = sub_resp["result"][1]
         .as_str()
         .expect("extranonce1 in subscribe response");
@@ -485,14 +435,8 @@ async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>
     let mut job_id_hex = params[0].as_str().expect("jobId").to_string();
     let mut ntime_hex = params[7].as_str().expect("ntime").to_string();
 
-    // Submit nonces until the chain advances (a block landed via the mode's
-    // handle) or the budget runs out. ~50% of nonces are block candidates on
-    // regtest, so this lands within a few iterations.
-    //
-    // The submit responses are classified rather than dropped, and a
-    // `mining.notify` arriving mid-run replaces the job being mined: a run that
-    // crosses a template change must not keep submitting against a replaced job,
-    // and a failure must say why no block landed.
+    // Submit until the chain advances. A mid-run `mining.notify` replaces the
+    // job, so a template change does not leave the loop on a dead job.
     let before = node.current_height().await.expect("height");
     let mut landed = None;
     let mut accepted = 0usize;

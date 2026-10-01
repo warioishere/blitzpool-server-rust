@@ -24,14 +24,9 @@ impl PushKind {
     }
 }
 
-/// Title + body + optional extra fields for a push notification.
-///
-/// FCM wires `title`/`body` into `notification.{title,body}` and
-/// `extras` into `data{}` (plus the `type` derived from `kind` and the
-/// `address` set by the dispatcher). Web-Push / UnifiedPush collapses
-/// the same payload into a pipe-joined plain-text body
-/// (`title|body|tag`) — that's the format existing push clients
-/// (`title|body|difficulty`) already parse.
+/// Title + body + optional extra fields for a push notification. FCM maps
+/// `extras` into `data{}`; Web-Push / UnifiedPush collapses it to the
+/// `title|body|tag` plain text existing push clients parse.
 #[derive(Debug, Clone)]
 pub struct PushPayload {
     pub kind: PushKind,

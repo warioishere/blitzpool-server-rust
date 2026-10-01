@@ -3,16 +3,10 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! End-to-end integration tests for `bp-pplns-engine::distribution`.
-//!
-//! Exercises the full hot path: Redis window read → PG open-balance
-//! read → pure-math distribution build → Redis snapshot write. Plus
-//! in-flight dedup of concurrent callers.
-//!
-//! Gated on both docker-Redis (Port 16379) and docker-PG (Port 15433);
-//! tests skip via `eprintln!` if either is missing. PG state is cleaned
-//! by per-test prefix DELETE; Redis state is isolated by per-test DB
-//! number inside this binary's `bp_test_support::redis_db` range.
+//! End-to-end tests for `bp-pplns-engine::distribution`: window read, ledger
+//! read, build, snapshot write, and in-flight dedup. Need docker Redis
+//! (16379) and PG (15433), skip otherwise; each test owns its addresses and
+//! its Redis DB inside this binary's `bp_test_support::redis_db` range.
 
 use std::sync::Arc;
 
@@ -23,8 +17,7 @@ use bp_pplns_engine::distribution::{
 };
 use bp_pplns_engine::window::{NetworkDifficulty, WindowStore};
 
-/// Pool-output recipient. §4 makes `pay_P` structural, so the weight model
-/// has no distribution without one. Shared by every harness in this file.
+/// Pool-output recipient; the weight model has no distribution without one.
 const FEE_ADDR: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
 use redis::{aio::ConnectionManager, Client};
 use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -41,8 +34,6 @@ struct Harness {
 async fn connect_or_skip(redis_db: u8, address_prefix: &str) -> Option<Harness> {
     let pg_url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
-    // Fold this binary's local number into its own DB range — see
-    // `bp_test_support::redis_db`.
     let redis_db =
         bp_test_support::redis_db_in_range(bp_test_support::redis_db::PPLNS_DISTRIBUTION, redis_db)
             .await;
@@ -96,7 +87,6 @@ async fn connect_or_skip(redis_db: u8, address_prefix: &str) -> Option<Harness> 
         return None;
     }
 
-    // Cleanup any leftover rows from previous test runs.
     let _ = sqlx::query("DELETE FROM pplns_balance WHERE address LIKE $1")
         .bind(format!("{address_prefix}%"))
         .execute(&pool)
@@ -110,8 +100,6 @@ async fn connect_or_skip(redis_db: u8, address_prefix: &str) -> Option<Harness> 
         net_diff,
         AGE_RULE_OFF,
     );
-    // The weight model requires the pool-output recipient (pay_P is
-    // structural) — mirror the production requirement in the harness.
     let cfg = DistributionConfig::from_engine_config(&PplnsEngineConfig {
         fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
         ..PplnsEngineConfig::default()
@@ -152,11 +140,8 @@ async fn cleanup(pool: &PgPool, prefix: &str) {
         .await;
 }
 
-/// Every test owns its OWN pair of addresses.
-///
-/// `pplns_balance` is keyed on the address alone and shared by every test
-/// in this target, so distinct addresses (not the Redis database index) are
-/// what keep one test's `cleanup_addresses` off another's rows.
+/// `pplns_balance` is shared by every test here, so only distinct addresses
+/// keep one test's cleanup off another's rows.
 async fn cleanup_addresses(pool: &PgPool, addresses: &[&str]) {
     for addr in addresses {
         let _ = sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
@@ -168,11 +153,8 @@ async fn cleanup_addresses(pool: &PgPool, addresses: &[&str]) {
 
 // ── Test 1 — end-to-end build returns payouts + writes snapshot ────
 
-/// `max_age_days` for tests that are not about ageing.
-///
-/// Explicitly a very long window rather than `0`: the constructor floors the
-/// value at one day, so a literal `0` would look like "rule off" but mean
-/// "24 hours".
+/// `max_age_days` for tests not about ageing. Not `0`: the constructor
+/// floors it at one day, so `0` would mean 24 hours.
 const AGE_RULE_OFF: u32 = 3650;
 
 #[tokio::test]
@@ -182,8 +164,7 @@ async fn build_with_shares_only_returns_payouts_and_writes_snapshot() {
         None => return,
     };
 
-    // Use valid Bitcoin addresses so they survive the payout-address
-    // sanitisation filter applied before distribution math.
+    // Real addresses, or the sanitize pass drops them.
     const ADDR_A: &str = "bc1qvzf0p407umrsaxmsnq62yudwf27lmsxd8sshzl";
     const ADDR_B: &str = "bc1q2a2z2q02mf38pjmtcfc926a52ssk2mw0ekmz6q";
     cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
@@ -218,7 +199,6 @@ async fn build_with_shares_only_returns_payouts_and_writes_snapshot() {
     };
     assert!(score_of(&addr_a_id) > score_of(&addr_b_id));
 
-    // The schema-2 snapshot must be readable from Redis.
     let snapshot = window
         .read_weight_snapshot_for(&result.payouts_fingerprint())
         .await
@@ -239,7 +219,6 @@ async fn build_folds_open_balances_into_distribution() {
         None => return,
     };
 
-    // Use valid Bitcoin addresses so they survive the payout-address filter.
     const ADDR_MINER: &str = "bc1qymzqcsak0z8zxlxyrqtdw0tvke9sma0gwfaplq";
     const ADDR_DEBTOR: &str = "bc1qhntpnmga5u3c96wqvtxx4a429u5l23unmde3g0";
     cleanup_addresses(&h.pool, &[ADDR_MINER, ADDR_DEBTOR]).await;
@@ -247,8 +226,7 @@ async fn build_folds_open_balances_into_distribution() {
     let window = build_window(&h).await;
     seed_share(&window, ADDR_MINER, 100.0, 1_700_000_000_001).await;
 
-    // Debtor has a -5_000 balance and is NOT in the current window; the
-    // distribution must still carry it.
+    // The debtor is not in the window; the distribution must still carry it.
     seed_open_balance(&h.pool, ADDR_DEBTOR, -5_000, 0).await;
 
     let result = h.builder.build(312_500_000).await.expect("build ok");
@@ -274,8 +252,7 @@ async fn concurrent_builds_for_same_reward_share_one_compute() {
         None => return,
     };
 
-    // A REAL address, or the sanitize pass drops it and every build below
-    // dedups an EMPTY distribution — see `cleanup_addresses`.
+    // A real address, or the sanitize pass leaves an EMPTY distribution.
     const ADDR: &str = "bc1q69dqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq4vkle";
     cleanup_addresses(&h.pool, &[ADDR]).await;
 
@@ -315,9 +292,7 @@ async fn invalidate_all_triggers_fresh_compute() {
         None => return,
     };
 
-    // A REAL address — a prefix placeholder is dropped by the sanitize
-    // pass and the cache identity below would be compared over an EMPTY
-    // distribution.
+    // A real address, or the sanitize pass leaves an EMPTY distribution.
     const ADDR: &str = "bc1q6fdqqqqqqqqqqqqqqqqqqqqqqqqqqqqqz09s7u";
     cleanup_addresses(&h.pool, &[ADDR]).await;
 
@@ -350,7 +325,7 @@ async fn distinct_rewards_each_get_their_own_compute() {
         None => return,
     };
 
-    // A REAL address, for the same reason as the two tests above.
+    // A real address, or the sanitize pass leaves an EMPTY distribution.
     const ADDR: &str = "bc1q6ddqqqqqqqqqqqqqqqqqqqqqqqqqqqqqm7zjxl";
     cleanup_addresses(&h.pool, &[ADDR]).await;
 
@@ -367,10 +342,6 @@ async fn distinct_rewards_each_get_their_own_compute() {
 }
 
 // ── Test 7 — distinct references share ONE window+ledger load ───────
-//
-// The reference-independent half — the Redis window read and the
-// Postgres ledger query — is identical for every build and must be
-// loaded once, not once per caller.
 
 #[tokio::test]
 async fn concurrent_distinct_rewards_share_one_inputs_load() {
@@ -379,7 +350,6 @@ async fn concurrent_distinct_rewards_share_one_inputs_load() {
         None => return,
     };
 
-    // Valid Bitcoin addresses so they survive payout-address sanitisation.
     const ADDR_A: &str = "bc1q0fqgxscjqch5tmqvnf50e0uyfem9sr432z2zx9";
     const ADDR_B: &str = "bc1qvuv4q5jp34mlvc97fh0r4l00jrllmunezpl69k";
     cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
@@ -415,7 +385,6 @@ async fn concurrent_distinct_rewards_share_one_inputs_load() {
          got {loads} loads"
     );
 
-    // Sanity: a build after an invalidation must load fresh again.
     h.builder.invalidate_all();
     let _ = h.builder.build(999_000_000).await.expect("ok");
     assert!(
@@ -429,12 +398,8 @@ async fn concurrent_distinct_rewards_share_one_inputs_load() {
 
 // ── Test 8 — distinct references share ONE fingerprint + snapshot ───
 //
-// The weights fingerprint hashes the settlement INPUTS (scores,
-// balances, fee, dust limits) — not the reference revenue the wire
-// boosts were projected against. Two builds over the same window at
-// different references therefore name the SAME snapshot, which is what
-// lets one snapshot settle the pool's own templates and every JDC's
-// independently-valued job alike.
+// The fingerprint hashes the settlement inputs, not the reference revenue,
+// so one snapshot settles the pool's templates and every JDC's job alike.
 
 #[tokio::test]
 async fn distinct_references_share_one_fingerprinted_snapshot() {
@@ -465,8 +430,7 @@ async fn distinct_references_share_one_fingerprinted_snapshot() {
         .await
         .expect("read ok")
         .expect("snapshot present");
-    // Last writer wins on the shared identity — either reference is a
-    // valid projection base; settlement never reads it as an amount.
+    // Last writer wins; settlement never reads the reference as an amount.
     assert!(
         snap.reference_revenue_sats == 312_500_000 || snap.reference_revenue_sats == 312_499_137
     );
@@ -478,14 +442,8 @@ async fn distinct_references_share_one_fingerprinted_snapshot() {
 
 // ── Test 6 — empty window: refused here, bootstrapped per-miner ──────
 
-/// MONEY: an empty window must not produce a servable distribution. With
-/// `weight_P` flooring at 1 and §4 making the pool output the residual, an
-/// empty entry list would pay the WHOLE block to the fee address, and
-/// settlement would book nothing (every claim is 0 at `score_total == 0`).
-///
-/// The shared build is the one that must refuse: its result is cached by
-/// revenue alone and handed to every PPLNS connection, so it has no single
-/// miner it could name as the claimant.
+/// MONEY: the shared build refuses an empty window, which would otherwise pay
+/// the WHOLE block to the fee address.
 #[tokio::test]
 async fn an_empty_window_is_refused_by_the_shared_build() {
     let h = match connect_or_skip(13, "test_dist_empty_").await {
@@ -508,11 +466,8 @@ async fn an_empty_window_is_refused_by_the_shared_build() {
     cleanup(&h.pool, &h.address_prefix).await;
 }
 
-/// The other half: the per-miner bootstrap build DOES answer, and it pays
-/// the asking miner rather than the pool.
-///
-/// This keeps the refusal above from locking out a fresh pool: the window
-/// fills only from accepted shares, and shares come only from jobs.
+/// The per-miner bootstrap build answers an empty window and pays the asking
+/// miner, not the pool, so a fresh pool can get its first shares.
 #[tokio::test]
 async fn the_bootstrap_build_pays_the_asking_miner() {
     let h = match connect_or_skip(4, "test_dist_boot_").await {
@@ -524,8 +479,7 @@ async fn the_bootstrap_build_pays_the_asking_miner() {
     cleanup_addresses(&h.pool, &[ADDR]).await;
     let claimant = AddressId::new(ADDR).unwrap();
 
-    // Precondition: the shared build really has nothing to work with, so
-    // what follows is the bootstrap and not an ordinary window read.
+    // Precondition: the window is really empty.
     assert!(h.builder.build(T).await.is_err(), "window must be empty");
 
     let result = h
@@ -533,10 +487,8 @@ async fn the_bootstrap_build_pays_the_asking_miner() {
         .build_bootstrap(T, &claimant)
         .await
         .expect("the bootstrap build must answer");
-    // The claimant carries the whole SCORE space — it is the only scored
-    // address. (`entries` may hold more than one: `pplns_balance` is
-    // global to this Postgres and other tests leave open-balance rows
-    // behind, which legitimately enter as balance-only candidates.)
+    // Other tests' open-balance rows may enter as balance-only entries, so
+    // only the score space is pinned to the claimant.
     let entry = result
         .distribution
         .entries
@@ -556,9 +508,8 @@ async fn the_bootstrap_build_pays_the_asking_miner() {
             .map(|(_, s)| *s)
             .sum()
     };
-    // The money assertion: the pool takes its fee and not the block.
-    // `weight_P` carries only the fee whatever the ledger owes, so this
-    // holds regardless of any leftover balance rows.
+    // The pool takes its fee and not the block; `weight_P` carries only the
+    // fee, so leftover balance rows do not matter.
     let fee_only = T * u64::from(result.distribution.fee_ppm) / 1_000_000;
     assert!(
         of(FEE_ADDR).abs_diff(fee_only) <= 2 + paid.len() as u64,
@@ -572,8 +523,7 @@ async fn the_bootstrap_build_pays_the_asking_miner() {
     );
     assert_eq!(paid.iter().map(|(_, s)| *s).sum::<u64>(), T, "Σ == T");
 
-    // And it is bookable — the snapshot landed under its own fingerprint,
-    // so a block found on this job settles like any other.
+    // Bookable: the snapshot landed under its own fingerprint.
     assert!(result.snapshot_written);
     let window = build_window(&h).await;
     assert!(window
@@ -586,12 +536,7 @@ async fn the_bootstrap_build_pays_the_asking_miner() {
     cleanup(&h.pool, &h.address_prefix).await;
 }
 
-// ── Helper — build a fresh WindowStore over the same connection ─────
-//
-// The Harness owns the WindowStore inside the DistributionBuilder, but
-// tests need a separate handle to seed shares + read the snapshot
-// directly. A sibling store against the same Redis DB is fine
-// (ConnectionManager is multiplexed).
+// ── Helper: a sibling WindowStore on the harness's Redis DB ─────────
 
 async fn build_window(h: &Harness) -> WindowStore {
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
@@ -606,8 +551,7 @@ async fn build_window(h: &Harness) -> WindowStore {
 }
 
 fn redis_db_for_prefix(prefix: &str) -> u8 {
-    // Mirrors the manual db assignments in the tests; change this table
-    // when renumbering them.
+    // Must match the numbers the tests pass to `connect_or_skip`.
     match prefix {
         "test_dist_e2e_" => 8,
         "test_dist_ledger_" => 9,
@@ -627,16 +571,8 @@ fn redis_db_for_prefix(prefix: &str) -> u8 {
 
 // ── A failed snapshot write must not collapse the distribution ──────
 //
-// `pplns_payouts` turns any `build_distribution` error into "serve no job",
-// so a build that returns `Err` leaves every miner in the window without one
-// until it recovers. A Redis blip on the snapshot write must therefore not
-// fail the build: losing the snapshot costs a reprocess, losing the
-// distribution costs the miners their hashing time.
-//
-// The write fails for real via a read-only Redis ACL user. It is scoped to
-// THIS connection (a server-global knob like `maxmemory` would break
-// concurrent tests), and reads keep working while every write is refused. A
-// wrong-typed value on the key would not do: the write `DEL`s it first.
+// A build error means no job for any miner; a lost snapshot only a reprocess.
+// The write fails via a read-only ACL user, scoped to this connection.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
@@ -649,22 +585,17 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
     cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
 
     let window = build_window(&h).await;
-    // Seed while writes still work.
     seed_share(&window, ADDR_A, 60.0, 1_700_000_000_001).await;
     seed_share(&window, ADDR_B, 40.0, 1_700_000_000_002).await;
 
     const ACL_USER: &str = "bp_test_readonly_snapshot";
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
-    // The SAME logical DB the harness seeded into, mapped through this
-    // binary's range; the raw local number would point at an empty DB.
     let db = redis_db_for_prefix(&h.address_prefix);
     let db =
         bp_test_support::redis_db_in_range(bp_test_support::redis_db::PPLNS_DISTRIBUTION, db).await;
     let client = Client::open(format!("{redis_base}/{db}")).expect("client");
     let mut admin = ConnectionManager::new(client).await.expect("admin conn");
 
-    // Everything except writes. `-@write` covers DEL/HSET/EXPIRE, so the
-    // snapshot write fails at its first command; HGETALL stays allowed.
     if redis::cmd("ACL")
         .arg("SETUSER")
         .arg(ACL_USER)
@@ -703,8 +634,6 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
         }),
     );
 
-    // Window read + ledger read still work; only the snapshot write is
-    // rejected. The build must survive it.
     let result = ro_builder
         .build(312_500_000)
         .await
@@ -740,20 +669,10 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
 
 // ── The two input reads must fail differently ───────────────────────
 //
-// `load_inputs` reads the window from Redis and the open-balance ledger
-// from Postgres, and the two are not interchangeable.
-//
-// The window IS the shares: without it there is nothing to distribute and
-// nothing may be invented, so the build fails and the resolver serves no
-// job. The ledger is a set of PROMISES on top of that split; one that cannot
-// be read right now still sits in `pplns_balance`. Failing the build over it
-// would blank every PPLNS job during a Postgres fault that only delays
-// repayments by a block, so the build degrades to score-only instead.
-//
-// The pair below pins both halves, with a control on each.
+// An unreadable window fails the build; an unreadable ledger degrades it
+// to score-only. Each half below has its own control.
 
-/// A `PgPool` that will never connect. Used to make the ledger read fail
-/// for real rather than mocking the decision away.
+/// A `PgPool` that never connects, so the ledger read fails for real.
 fn unreachable_pool() -> PgPool {
     PgPoolOptions::new()
         .max_connections(1)
@@ -768,7 +687,6 @@ async fn an_unreadable_ledger_degrades_to_a_score_only_distribution() {
         Some(h) => h,
         None => return,
     };
-    // Own pair: these appear nowhere else that writes `pplns_balance`.
     const ADDR_A: &str = "bc1q307hujcervvdfr73ntlam2f7w65j6gs9zcnf39";
     const ADDR_B: &str = "bc1qywnf55acqpxr0lekg2gmy2s46pzxqze99j0u9y";
     const REWARD: u64 = 312_500_000;
@@ -832,8 +750,6 @@ async fn an_unreadable_ledger_degrades_to_a_score_only_distribution() {
             entry.address.as_str()
         );
     }
-    // Both miners are still paid — this is a real distribution, not a
-    // stand-in, and a block found on it settles from its own snapshot.
     for addr in [ADDR_A, ADDR_B] {
         let id = AddressId::new(addr).unwrap();
         assert!(
@@ -846,7 +762,6 @@ async fn an_unreadable_ledger_degrades_to_a_score_only_distribution() {
         "the degraded distribution is bookable like any other"
     );
 
-    // And the ledger row is untouched: the promise waits for a later block.
     let still_owed: (i64,) =
         sqlx::query_as(r#"SELECT "balanceSats" FROM pplns_balance WHERE address = $1"#)
             .bind(ADDR_A)
@@ -874,15 +789,13 @@ async fn an_unreadable_window_fails_the_build_instead_of_degrading() {
     let window = build_window(&h).await;
     seed_share(&window, ADDR, 100.0, 1_700_000_000_001).await;
 
-    // Control: it builds while the window is readable.
     h.builder
         .build(REWARD)
         .await
         .expect("precondition: the build works before the window is broken");
 
-    // Break the window read for real: overwrite the aggregate HASH with a
-    // STRING, so `HGETALL` answers WRONGTYPE. Deterministic, and local to
-    // this test's Redis DB — unlike a server-global knob.
+    // A STRING on the window key makes `HGETALL` answer WRONGTYPE, local to
+    // this test's Redis DB.
     let mut raw = raw_conn(&h).await;
     let _: () = redis::cmd("SET")
         .arg(bp_pplns_engine::window::KEY_WINDOW_BY_ADDRESS)
@@ -911,8 +824,7 @@ async fn an_unreadable_window_fails_the_build_instead_of_degrading() {
     cleanup_addresses(&h.pool, &[ADDR]).await;
 }
 
-/// A raw connection to the same Redis DB the harness chose — for the
-/// tests that need to corrupt a key rather than go through `WindowStore`.
+/// A raw connection to the harness's Redis DB, for corrupting a key.
 async fn raw_conn(h: &Harness) -> ConnectionManager {
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
     let db = redis_db_for_prefix(&h.address_prefix);

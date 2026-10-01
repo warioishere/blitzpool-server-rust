@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Unified SV1+SV2 listeners: one TCP listener per configured port serves
-//! both protocols, so miners keep their configured `[stratum]` ports.
-//!
-//! [`crate::stratum_v1::build_per_port_servers`] and
-//! [`crate::stratum_v2::build_per_port_servers`] build one server each per
-//! port (same port set, no listener). Each port's [`accept_loop`] peeks the
-//! first byte, classifies it via [`detect`] and hands the socket to the SV1
-//! server or the SV2 one (Noise XK). HTTP is closed with a `WARN`; a TLS
-//! ClientHello is closed silently to keep probe noise out of the logs.
+//! Unified SV1+SV2 listeners: one TCP listener per `[stratum]` port serves
+//! both protocols. Each port's [`accept_loop`] peeks the opening bytes,
+//! classifies them via [`detect`] and hands the socket to the SV1 or SV2
+//! server; HTTP is closed with a `WARN`, TLS probes silently.
 
 use std::sync::{Arc, RwLock};
 
@@ -104,9 +99,9 @@ pub(crate) async fn spawn(
         Arc<crate::device_status_gate::Gate>,
         crate::device_status_gate::SubscribedAddresses,
     )>,
-    // ext 0x0003 §10: a block booked through a Stratum sink's immediate
-    // apply must invalidate the published payout distributions exactly
-    // like a JDP-declared one. Filled once the JDP server exists.
+    // ext 0x0003/Implementation Notes: a block booked through a Stratum
+    // sink's immediate apply must invalidate the published payout
+    // distributions exactly like a JDP-declared one.
     settle: crate::settlement::SettlementSignal,
     // THE JDP bridge: the same `Arc` the JDP server registers into. The JDP
     // server writes declared jobs and allocations, `SetCustomMiningJob`
@@ -294,11 +289,10 @@ fn tune_stratum_socket(socket: &TcpStream, peer: std::net::SocketAddr, port: u16
     if let Err(err) = socket.set_nodelay(true) {
         warn!(%err, ?peer, port, "stratum: set_nodelay(true) failed (continuing)");
     }
-    // Keepalive keeps quiet connections in NAT/firewall tables and detects
-    // a dead peer on an idle connection: probe after 60 s idle, every 20 s,
-    // drop after 4 misses. It only probes a connection with nothing in
-    // flight; the user timeout below covers the rest. The per-socket opt-in
-    // is required; the sysctls only tune the timing.
+    // Keepalive keeps quiet connections in NAT/firewall tables and detects a
+    // dead idle peer; it only probes a connection with nothing in flight, the
+    // user timeout below covers the rest. The per-socket opt-in is required,
+    // the sysctls only tune the timing.
     let keepalive = TcpKeepalive::new()
         .with_time(std::time::Duration::from_secs(60))
         .with_interval(std::time::Duration::from_secs(20))
@@ -381,13 +375,10 @@ enum Detected {
     Tls,
 }
 
-/// Classify a connection by the first bytes it sent, or `None` while they
-/// do not decide it yet.
-///
-/// An SV2 connection opens with a pseudo-random 64-byte EllSwift key (SV2
-/// Protocol Security), so its first byte alone can look like SV1, HTTP or
-/// TLS. Each of those is therefore matched on a multi-byte opening, and
-/// anything else is SV2.
+/// Classify a connection by its opening bytes, `None` while undecided. An
+/// SV2 connection opens with a pseudo-random EllSwift key (SV2 Protocol
+/// Security) whose first byte can look like anything, so SV1, HTTP and TLS
+/// are matched on a multi-byte opening and everything else is SV2.
 fn detect(prefix: &[u8]) -> Option<Detected> {
     match *prefix.first()? {
         0x16 => Some(if *prefix.get(1)? == 0x03 {
@@ -490,14 +481,10 @@ pub(crate) struct PortTemplates {
 }
 
 impl PortTemplates {
-    /// Subscribe BEFORE snapshotting: anything broadcast between the two ends
-    /// up in both, and the assembler dedupes on template_id. The snapshot
-    /// covers the bootstrap pair (NewTemplate + SetNewPrevHash) broadcast
-    /// before a per-port subscriber exists.
-    ///
-    /// Every port carries ALL alt streams: mode is per-address, so a
-    /// Group-Solo / Blockparty member on any port must be routable onto its
-    /// stream.
+    /// Subscribe BEFORE snapshotting: anything broadcast in between lands in
+    /// both and the assembler dedupes on template_id. Every port carries ALL
+    /// alt streams, because mode is per-address and a Group-Solo / Blockparty
+    /// member on any port must be routable onto its stream.
     pub(crate) fn subscribe(
         tdp: &bp_template_distribution::TdpHandle,
         foundation: &FoundationHandles,
@@ -582,10 +569,7 @@ mod tests {
         assert_eq!(detect(&[0x16, 0x03, 0x01, 0x02, 0x00]), Some(Detected::Tls));
     }
 
-    /// An SV2 connection opens with a 64-byte EllSwift key, which is
-    /// pseudo-random (SV2 Protocol Security), so its first byte can be any
-    /// value, including the ones SV1, HTTP and TLS start with. The bytes
-    /// after it decide.
+    /// A pseudo-random SV2 key whose first byte looks like SV1, HTTP or TLS is still SV2.
     #[test]
     fn an_sv2_key_starting_like_another_protocol_is_sv2() {
         for first in [b'{', b' ', b'\n', b'\r', b'G', b'P', 0x16] {

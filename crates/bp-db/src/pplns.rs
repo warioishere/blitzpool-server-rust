@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! PPLNS signed-ledger and payout history.
-//!
-//! - `pplns_balance` — signed `balanceSats` ledger (positive = pool-owes; negative = miner-owes)
-//! - `pplns_payout_history` — idempotent block-payout audit log (UNIQUE blockHeight+address)
+//! PPLNS signed ledger (`pplns_balance`: positive = pool owes, negative =
+//! miner owes) and the idempotent payout history.
 
 use bp_common::{AddressId, Sats};
 use sqlx::{postgres::PgPool, FromRow};
@@ -23,18 +21,10 @@ pub struct PplnsBalanceRow {
     pub last_accepted_share_at: Option<i64>,
 }
 
-/// Guarded single-column UPDATE of `balanceSats`: writes `new_balance`
-/// **only if** the row still holds `expected`. Returns `false` when it
-/// does not — the row moved since the caller read it, and the absolute
-/// value it computed would silently undo whatever moved it.
-///
-/// The dust sweep needs this because it reads its whole candidate set
-/// ONCE per run and then commits pair by pair, so its view of every
-/// not-yet-processed row is stale from the start of the run. The other
-/// writer is the block-found settlement, which locks the rows it settles
-/// (`find_pplns_balances_for_addresses_locked`); this is the matching
-/// half from the sweep's side, where locking the whole candidate set for
-/// the length of a run would be worse than the race.
+/// Writes `new_balance` only if the row still holds `expected`; `false` means
+/// the row moved and the absolute write would undo that change. The dust
+/// sweep reads its candidates once per run, so its view goes stale; locking
+/// them for the whole run would be worse than this compare-and-set.
 pub async fn update_pplns_balance_sats_if_unchanged<'e, E>(
     executor: E,
     address: &AddressId,
@@ -57,22 +47,10 @@ where
     Ok(result.rows_affected() > 0)
 }
 
-/// All `pplns_balance` rows with a non-zero `balanceSats` — an open claim in
-/// either direction, credit or debit.
-///
-/// Two consumers, deliberately one read:
-///
-/// - `bp-pplns-engine::distribution::DistributionBuilder` folds an open claim
-///   into the next block's distribution: a credit raises the address's wire
-///   weight, a debit is paid down out of its score share.
-/// - `bp-pplns-engine::sweep::DustSweepRunner` pair-cancels abandoned credits
-///   against open debits. Which credits count as abandoned is decided there,
-///   in Rust, and nowhere else — this query does not pre-filter by
-///   `lastAcceptedShareAt`, so that test has exactly one implementation.
-///
-/// A row the dust sweep cancelled to zero is inert here: it is excluded by
-/// the predicate. The sweep keeps such rows (they carry `totalPaidSats`),
-/// so this read must not trip over them.
+/// All `pplns_balance` rows with an open claim (non-zero `balanceSats`), read
+/// by both the distribution builder and the dust sweep. Deliberately not
+/// filtered by `lastAcceptedShareAt`: "abandoned" is judged only in
+/// `bp-pplns-engine::sweep`, so that test has one implementation.
 pub async fn find_pplns_balances_with_open_balance(
     pool: &PgPool,
 ) -> Result<Vec<PplnsBalanceRow>, DbError> {
@@ -111,22 +89,10 @@ pub async fn find_pplns_balance(
     .map_err(DbError::from)
 }
 
-/// Bulk-load `pplns_balance` rows for a set of addresses **inside a
-/// transaction, with the rows locked** (`FOR UPDATE`).
-///
-/// The block-found settlement is a read-modify-write: it reads
-/// `balanceSats`, adds its delta and writes the sum back absolutely. With
-/// the read outside the writing transaction, anything that touched the row
-/// in between is silently undone — and there IS another writer, the daily
-/// dust sweep, whose target set (open balance, no recent shares) is
-/// exactly the balance-only entries every distribution carries.
-///
-/// `ORDER BY address` is not cosmetic. `FOR UPDATE` locks rows as the plan
-/// emits them, and the `LockRows` node sits above the `Sort`, so the
-/// ordering fixes the lock ACQUISITION order. Without it two transactions
-/// touching the same two rows from different directions deadlock, and
-/// Postgres aborts one of them. Every other locker of this table must take
-/// its rows in the same ascending-address order.
+/// Load balances `FOR UPDATE` inside the settlement's transaction: it writes
+/// back absolute sums, so an unlocked read would undo a concurrent dust sweep.
+/// `ORDER BY address` fixes lock acquisition order to avoid deadlocks; every
+/// other locker of this table must lock in ascending-address order too.
 pub async fn find_pplns_balances_for_addresses_locked<'e, E>(
     executor: E,
     addresses: &[String],
@@ -153,13 +119,8 @@ where
     .map_err(DbError::from)
 }
 
-/// Bulk-load `pplns_balance` rows for a set of addresses in one round
-/// trip (`address = ANY(...)`), UNLOCKED. Addresses with no row are simply
-/// absent from the result; order is unspecified (callers index by address).
-///
-/// Read-only callers only. Anything that reads a balance in order to write
-/// it back must use [`find_pplns_balances_for_addresses_locked`] inside the
-/// writing transaction.
+/// Unlocked, unordered bulk load for read-only callers. Anything that writes
+/// a balance back must use [`find_pplns_balances_for_addresses_locked`].
 pub async fn find_pplns_balances_for_addresses(
     pool: &PgPool,
     addresses: &[String],
@@ -192,15 +153,9 @@ pub struct PplnsBalanceAggregate {
     /// Credit whose owner has been silent past the cutoff — what the next
     /// sweep tries to close.
     pub abandoned_credit_sats: i64,
-    /// Debit whose owner has been silent past the cutoff.
-    ///
-    /// ⚠️ **Not** the sweep's counterparty pool — that is
-    /// [`Self::debit_sats`], every open debit regardless of age. Keeping the
-    /// cutoff on this side is deliberate: the figure answers "how much of the
-    /// debt is itself abandoned", which is worth seeing, but it must not be
-    /// read as "how much the sweep can pair" — the sweep
-    /// (`bp-pplns-engine::sweep`) reads every open row and judges only the
-    /// credit side; see there for why.
+    /// Debit whose owner has been silent past the cutoff. Not what the sweep
+    /// can pair against: that is [`Self::debit_sats`], since the sweep judges
+    /// only the credit side.
     pub abandoned_debit_sats: i64,
     pub lifetime_paid_sats: i64,
 }
@@ -291,23 +246,11 @@ pub async fn find_pplns_payout_history(
 }
 
 // ── Bulk writes ──────────────────────────────────────────────────────
-//
-// Consumer: `bp-pplns-engine::ledger::apply_distribution` writes both
-// `pplns_payout_history` (audit log) and `pplns_balance` (signed ledger)
-// inside one PG transaction. The functions below are the primitives;
-// the engine composes them with `pool.begin()` / `tx.commit()`.
+// Primitives the ledger apply composes inside one PG transaction.
 
-/// Absolute upsert into `pplns_balance` — sets each row's
-/// `balanceSats`, `totalPaidSats`, and `updatedAt` to the caller-
-/// provided value. Idempotent: running the same input twice converges
-/// to the same row state.
-///
-/// Idempotency contract: callers compute `balance_sats` and
-/// `total_paid_sats` from the *current* row state plus the block's
-/// per-address delta, then call this with those absolute values. The
-/// signed-ledger guarantee (Σ balanceSats ≈ 0 in a steady pool) holds
-/// across the write because nothing else mutates these columns on the
-/// hot path.
+/// Absolute upsert of `balanceSats`/`totalPaidSats`, so a replay converges.
+/// Callers compute the values from the locked current row plus the block's
+/// delta.
 #[derive(Clone, Debug)]
 pub struct BalanceUpsert {
     pub address: String,
@@ -349,13 +292,8 @@ where
     Ok(result.rows_affected())
 }
 
-/// Bulk UPDATE of `lastAcceptedShareAt` for the rows whose addresses
-/// match the input. Rows that don't exist yet are left alone — the
-/// abandoned-balance sweep has nothing to act on for a miner without a
-/// balance row, so a missing row is a no-op.
-///
-/// Consumer: the 60-second touch-buffer flush in
-/// `bp-pplns-engine::ledger::touch_buffer`.
+/// Bulk UPDATE of `lastAcceptedShareAt`. A missing row is not created: the
+/// sweep has nothing to act on for a miner without a balance.
 #[derive(Clone, Debug)]
 pub struct TouchUpdate {
     pub address: String,
@@ -390,23 +328,10 @@ where
     Ok(result.rows_affected())
 }
 
-/// The VALUE-BEARING payout rows already recorded at `block_height`, as
-/// `(address, paidSats)` sorted for comparison.
-///
-/// This is what tells a harmless replay apart from a second, DIFFERENT
-/// block at the same height. `pplns_payout_history` has no `blockHash`
-/// column and is UNIQUE on `(blockHeight, address)`, so height is the only
-/// identity a booked block has, and a plain `EXISTS` on the height cannot
-/// say WHICH block it saw.
-///
-/// Rows with `paidSats = 0` are excluded on purpose: those are the
-/// "late arriver" rows the apply writes for addresses live in the window
-/// but absent from the distribution, and the window moves between attempts.
-/// Including them would make every legitimate replay look like a different
-/// block. What remains is block-determined — the coinbase payments and the
-/// non-zero settlement deltas both follow from the found block's own
-/// coinbase and its frozen snapshot — so it is identical on a replay of the
-/// same block and differs for another one.
+/// Non-zero payout rows at `block_height`, sorted, to tell a replay from a
+/// different block at the same height (the table has no `blockHash`). Zero
+/// "late arriver" rows depend on the moving window, so they are excluded;
+/// the rest follows from the block's own coinbase.
 pub async fn pplns_booked_value_rows_at_height<'e, E>(
     executor: E,
     block_height: i32,
@@ -427,15 +352,9 @@ where
     Ok(rows.into_iter().map(|r| (r.address, r.paid_sats)).collect())
 }
 
-/// Bulk-insert payout-history rows for one block. `ON CONFLICT
-/// ("blockHeight", address) DO NOTHING` guards against double-write on
-/// replay — a partial-success / restart-mid-processing scenario won't
-/// duplicate audit rows.
-///
-/// The dust-sweep cron reuses this with synthetic negative `blockHeight`
-/// values (e.g. `-unix_seconds`) so audit rows for sweep pair-cancels
-/// share the same UNIQUE-constraint protection without colliding with
-/// real block heights.
+/// Payout-history rows for one block; `ON CONFLICT DO NOTHING` makes a replay
+/// harmless. The dust sweep uses synthetic negative heights so its rows never
+/// collide with real blocks.
 #[derive(Clone, Debug)]
 pub struct PayoutHistoryInsert {
     pub block_height: i32,

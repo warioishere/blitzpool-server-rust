@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Hooks for cross-crate orchestration. Group lifecycle events (Redis
-//! round-state cleanup, min-payout config, cron scheduling) are
-//! projected into a small trait so the bin-level wiring can inject
-//! the real implementation (e.g. `bp-group-solo-engine`).
-//!
-//! Tests use [`NoopHooks`] — every callback is a fast no-op returning
-//! sensible defaults.
+//! Group lifecycle side effects (Redis round-state cleanup, cron scheduling)
+//! behind traits, so the binary injects the real implementation and tests
+//! use [`NoopHooks`].
 
 use async_trait::async_trait;
 use bp_common::AddressId;
@@ -44,26 +40,18 @@ pub trait GroupServiceHooks: Send + Sync {
     async fn apply_round_reset_config(&self, group: &PplnsGroupRow);
 }
 
-/// Cross-mode collision reader. The Blockparty service exposes the
-/// connecting-address → group-id lookup so PPLNS-group `create_group`
-/// + `add_member` can refuse an address that's already in a Blockparty
-/// (symmetric to the Blockparty side's PplnsGroup-membership check).
-///
-/// Production wiring binds a `BlockpartyCache` here; deployments
-/// without Blockparty pass `None` and the check short-circuits.
+/// Lets `create_group` and `add_member` refuse an address already in a
+/// Blockparty, mirroring the Blockparty side's group-membership check.
+/// Without Blockparty it stays unwired and the check short-circuits.
 #[async_trait]
 pub trait BlockpartyMembershipReader: Send + Sync {
     async fn is_member(&self, address: &AddressId) -> bool;
 }
 
-/// Fired after a membership change has updated this process's local routing
-/// cache, so OTHER processes (notably the Stratum Front, which lives in a
-/// separate process under the Core/Satellite split) can rebuild theirs.
-/// `kind` names the cache (`"group"` / `"blockparty"`). Best-effort: the
-/// implementation must swallow its own failures — a missed invalidation is
-/// caught by the Front's periodic backstop rebuild, never a hard error on the
-/// mutation path. Left unset (no cross-process listener, e.g. tests) it's
-/// simply not called.
+/// Fired after a membership change so OTHER processes (the Stratum Front)
+/// rebuild their routing cache; `kind` is `"group"` / `"blockparty"`.
+/// Must swallow its own failures: a missed invalidation is caught by the
+/// Front's periodic rebuild, never an error on the mutation path.
 #[async_trait]
 pub trait MembershipChangeNotifier: Send + Sync {
     async fn membership_changed(&self, kind: &str);

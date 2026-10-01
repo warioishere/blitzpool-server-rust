@@ -1,16 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Outbound notification transports.
-//!
-//! Each adapter owns its own configuration + client (HTTP / SMTP) and
-//! exposes a small send-API tailored to the transport. They are
-//! constructed once at startup and shared across the dispatcher via `Arc`.
-//!
-//! Failure semantics: adapters return [`AdapterError`] on hard failures
-//! (config invalid, network down, auth rejected). Caller logs and
-//! continues to the next subscriber — a single bad token never breaks
-//! the fan-out. FCM/Web-Push expose an extra `InvalidRecipient` variant
-//! so the dispatcher can soft-delete the dead subscription row.
+//! Outbound notification transports. Hard failures return [`AdapterError`];
+//! the caller logs and moves on to the next subscriber, so one bad token
+//! never breaks the fan-out.
 
 mod error;
 mod fcm;

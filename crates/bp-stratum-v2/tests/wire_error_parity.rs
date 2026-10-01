@@ -1,31 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! The pool's `SetupConnection.Error` / `*.Error` codes against the ones the
-//! SV2 message crates ship.
-//!
-//! ## Why this is a test and not a refactor
-//!
-//! `stratum_core` re-exports canonical `ERROR_CODE_*` constants from
-//! `common_messages_sv2`, `job_declaration_sv2` and `mining_sv2`. Aliasing the
-//! pool's constants onto them would let a dependency bump change what the
-//! pool writes on the wire with nothing in the diff to see. `stale-chain-tip`
-//! is the one declaration error a JD client retries instead of leaving the
-//! pool over, so that string is not something a `cargo update` gets to decide.
-//!
-//! So the pool keeps its own strings, and this asserts they still agree. A
-//! bump that moves a code fails here instead of shifting a wire meaning
-//! quietly.
-//!
-//! ## Why the same string appears more than once
-//!
-//! Upstream's model is one constant per **(message, code)** pair, not per
-//! string: `mining_sv2` ships `"invalid-channel-id"` three times, once each
-//! for `UpdateChannel`, `SubmitShares` and `SetCustomMiningJob`. The pool
-//! follows the same shape — `ERR_STALE_CHAIN_TIP` exists on the JDP side for
-//! `DeclareMiningJob.Error` and on the mining side for
-//! `SetCustomMiningJob.Error`, and those are two upstream constants that
-//! happen to share a value. Collapsing them by string would merge message
-//! contexts that upstream deliberately keeps apart.
+//! Pins the pool's own `*.Error` code strings against the SV2 message crates'
+//! constants: aliasing them would let a dependency bump change the wire
+//! (e.g. `stale-chain-tip`, the one declaration error a JD client retries)
+//! unseen. Pairs are per (message, code), as upstream keeps them, not per string.
 
 use stratum_core::common_messages_sv2 as common;
 use stratum_core::job_declaration_sv2 as jd;
@@ -49,18 +27,10 @@ const PAIRS: &[(&str, &str, &str)] = &[
         common::ERROR_CODE_SETUP_CONNECTION_UNSUPPORTED_PROTOCOL,
         "SetupConnection.Error / unsupported-protocol (mining and JDP)",
     ),
-    // Cross-message ON PURPOSE, and the only row in this table that is.
-    // The pool raises this on `DeclareMiningJob.Error`, but pairs it with a
-    // `SetupConnection` constant, because `job_declaration_sv2` ships no code
-    // for the condition: a `DeclareMiningJob` arriving on a session that never
-    // negotiated the `DECLARE_TX_DATA` flag. Of the seven codes it does ship,
-    // only `invalid-job` would fit at all, and it says strictly less to
-    // whoever reads the log — SV2 JDP/DeclareMiningJob.Error asks for a
-    // "human-readable error code", and names no list to choose from.
-    //
-    // Still pinned: the pairing stops a dependency bump from changing the
-    // STRING unnoticed. `mining_client::ERR_INVALID_JOB_ID` further down is
-    // absent because upstream ships nothing to pair it with at all.
+    // The only cross-message row: raised on `DeclareMiningJob.Error` for a
+    // session without `DECLARE_TX_DATA`, which `job_declaration_sv2` has no code
+    // for, so it borrows the `SetupConnection` one
+    // (SV2 JDP/DeclareMiningJob.Error names no fixed list).
     (
         jdp_client::ERR_UNSUPPORTED_FEATURE_FLAGS,
         common::ERROR_CODE_SETUP_CONNECTION_UNSUPPORTED_FEATURE_FLAGS,
@@ -183,12 +153,9 @@ fn every_shared_error_code_still_matches_the_sv2_message_crates() {
     }
 }
 
-/// Where the pool knowingly says something else.
-///
-/// Pinned so the divergence stays a decision rather than an accident.
-/// Changing any of these is a wire-behaviour change: a JD client treats
-/// every `DeclareMiningJob.Error` except `stale-chain-tip` as a reason to
-/// leave the pool.
+/// Pins the codes where the pool deliberately diverges from upstream. Changing
+/// one changes the wire: a JD client leaves the pool on every
+/// `DeclareMiningJob.Error` except `stale-chain-tip`.
 #[test]
 fn the_codes_we_diverge_on_are_still_the_ones_we_chose() {
     // A coinbase that violates its referenced payout set. Upstream names
@@ -212,9 +179,7 @@ fn the_codes_we_diverge_on_are_still_the_ones_we_chose() {
     );
 }
 
-/// Codes the pool defines because SV2 has none for what they mean. Pinned so
-/// a later upstream release that DOES name one is noticed here rather than
-/// left to diverge.
+/// Pins the codes the pool defines because SV2 names none for them.
 #[test]
 fn the_pool_only_invents_a_code_where_sv2_names_none() {
     for (ours, label) in [

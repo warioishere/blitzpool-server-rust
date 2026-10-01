@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Pool-wide statistics and difficulty tracking.
-//!
-//! - `pool_share_statistics_entity` — 10-min pool-aggregate (UNIQUE time)
-//! - `pool_rejected_statistics_entity` — pool-aggregate rejects (UNIQUE time+reason)
-//! - `pool_mode_hashrate` — per-mode hashrate buckets (UNIQUE mode+time)
-//! - `network_difficulty_tracker_entity` — singleton via `CHECK (id = 1)`
+//! Pool-wide 10-minute statistics (shares, rejects, per-mode hashrate) and
+//! the singleton network-difficulty tracker.
 
 use bp_common::MiningMode;
 use sqlx::{postgres::PgPool, FromRow};
@@ -13,11 +9,8 @@ use sqlx::{postgres::PgPool, FromRow};
 use crate::DbError;
 
 // ── Time-range readers ───────────────────────────────────────────────
-//
-// Consumed by `bp-api`'s chart / accepted / rejected / workers
-// endpoints. Each function returns the raw rows filtered to
-// `time >= since_ms`; the API layer does slot-bucket aggregation in
-// memory because the right bucket size + format is endpoint-specific.
+// Raw rows from `since_ms` on; the API buckets them in memory because the
+// bucket size is endpoint-specific.
 
 /// All `pool_share_statistics_entity` rows from `since_ms` onward,
 /// ordered by `time ASC`. Drives `/api/info/accepted` and
@@ -80,9 +73,7 @@ pub async fn find_pool_mode_hashrate_since(
     mode: MiningMode,
     since_ms: i64,
 ) -> Result<Vec<PoolModeHashrateRow>, DbError> {
-    // `pool_mode_hashrate.mode` is a varchar; bind the kebab-case
-    // string form rather than the typed enum so sqlx's macro stays
-    // happy without a custom Encode path.
+    // The column is a varchar; binding the string avoids a custom Encode.
     let mode_str = mode.as_str();
     sqlx::query_as!(
         PoolModeHashrateRow,
@@ -248,12 +239,9 @@ pub async fn find_network_difficulty_tracker(
     .map_err(DbError::from)
 }
 
-/// Upsert the singleton network-difficulty tracker (`id = 1`).
-/// Called by the 10-min cron after fetching the latest difficulty
-/// from mempool.space. `previous_difficulty` is rotated from the
-/// existing `currentDifficulty` whenever the value changes;
-/// `last_changed_at` is stamped only on a real change so the bot
-/// can suppress no-op pings.
+/// Upsert the singleton network-difficulty tracker. On a change the old value
+/// rotates into `previousDifficulty`; `lastChangedAt` is stamped only on a
+/// real change so the bot can suppress no-op pings.
 pub async fn upsert_network_difficulty_tracker(
     pool: &PgPool,
     new_current: f64,

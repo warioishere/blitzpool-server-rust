@@ -3,14 +3,8 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! Smoke tests for the API router. Verify that:
-//! 1. `build_router` constructs without panic on a minimal `AppState`.
-//! 2. The "unavailable" paths return 503 with the expected JSON envelope
-//!    when their backing handle isn't wired (no PPLNS engine / no TDP).
-//! 3. The wired `/api/info/version` + `/api/health` endpoints return 200.
-//!
-//! All tests run in-process via `tower::ServiceExt::oneshot` — no
-//! actual HTTP listener is started.
+//! In-process smoke tests for the API router: it builds on a minimal
+//! `AppState`, unwired backends answer 503, and the wire shapes hold.
 
 use std::sync::Arc;
 
@@ -355,11 +349,8 @@ async fn invitation_accept_returns_503_when_service_unwired() {
         return;
     };
     let router = build_router(minimal_state(pool));
-    // `/api/pplns/invitations/open/:token/accept` is rate-limited (10/min);
-    // SmartIpKeyExtractor needs an IP source — set the proxy-style
-    // header so the layer can key by client IP instead of erroring
-    // with 500. A valid JSON body clears the extractor so the handler
-    // reaches the service-unwired 503.
+    // The route is rate-limited, and the limiter needs a client IP or it
+    // answers 500, so the request carries `x-forwarded-for`.
     let resp = router
         .oneshot(
             Request::builder()
@@ -531,11 +522,8 @@ async fn worker_chart_breaks_rejects_down_by_every_reason() {
     let Some(pool) = connect_or_skip().await else {
         return;
     };
-    // A worker page shows the per-reason breakdown against `rejectedCount`.
-    // A reason with a column but no field in `WorkerChartEntry` is a reject
-    // the operator sees in the total and cannot find in the breakdown. Five
-    // distinct counts, so a field wired to the wrong column shows up as a
-    // wrong number rather than a coincidence.
+    // Five distinct counts, so a breakdown field wired to the wrong column
+    // shows up as a wrong number rather than a coincidence.
     let addr = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
     let worker = "chart_breakdown_probe";
     // `client_entity."sessionId"` is varchar(8).

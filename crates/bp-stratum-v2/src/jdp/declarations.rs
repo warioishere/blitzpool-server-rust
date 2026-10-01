@@ -2,10 +2,8 @@
 
 //! Per-connection store of accepted JDP declarations, FIFO-bounded at
 //! [`MAX_DECLARED_JOBS`] (each holds ~1–2 MB of raw transactions).
-//!
-//! `PushSolution` finds its job by `prev_hash` first, then most recent. The
-//! spec (SV2 JDP/PushSolution) asks only for the most recent, so this order
-//! never picks a job the spec would reject.
+//! `PushSolution` matches by `prev_hash` first, then most recent;
+//! SV2 JDP/PushSolution asks only for the most recent, so this never contradicts it.
 
 use std::collections::{HashMap, VecDeque};
 

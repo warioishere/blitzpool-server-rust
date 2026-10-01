@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! What a found block's coinbase ACTUALLY paid — the ground truth the
-//! weight-model settlement books against.
-//!
-//! Settlement under the weight model is `claim(T_actual) −
-//! actually_paid` per address; both operands come from the real
-//! coinbase transaction, never from what any party intended to pay.
-//! This module owns the decomposition so the pool's own block-found
-//! path and the job-declaration path produce identical inputs.
+//! What a found block's coinbase ACTUALLY paid: settlement books
+//! `claim(T_actual) − actually_paid` from the real coinbase, never from what
+//! anyone intended to pay. One decomposition for the pool and JDP paths.
 
 use std::collections::HashMap;
 
@@ -20,10 +15,8 @@ pub struct ActualCoinbase {
     /// (output 0). Aggregated per address, so a script paid twice
     /// counts once with the sum.
     pub paid_by_address: HashMap<String, u64>,
-    /// The pool output's amount (`pay_P`) — output 0 by the §4 output
-    /// order. Kept apart from `paid_by_address` because the fee
-    /// address could double as a miner address, and its two outputs
-    /// must not blend.
+    /// The pool output (`pay_P`, output 0 by §4 order), kept apart because
+    /// the fee address may also mine and its two outputs must not blend.
     pub pool_paid_sats: u64,
     /// `Σ` of ALL output values = the block's actual revenue `T`.
     pub total_value_sats: u64,
@@ -140,7 +133,7 @@ mod tests {
         assert_eq!(empty.percent_of_total(600), 0.0);
     }
 
-    /// `fee address doubling as miner: the two outputs stay separate`
+    /// A fee address that also mines keeps its two outputs separate.
     #[test]
     fn fee_address_as_miner_does_not_blend() {
         let tx = coinbase_with(vec![
@@ -158,7 +151,7 @@ mod tests {
         assert_eq!(actual.paid_by_address[FEE], 600);
     }
 
-    /// `duplicate miner outputs aggregate per address`
+    /// Duplicate miner outputs aggregate per address.
     #[test]
     fn duplicate_outputs_aggregate() {
         let tx = coinbase_with(vec![

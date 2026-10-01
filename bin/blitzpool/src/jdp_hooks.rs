@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Production JDP hooks against the real pool template and bitcoin-core.
-//!
-//! 1. **[`ProductionJdpAllocateResolver`]**: ext 0x0003 gets empty token
-//!    outputs; the base protocol gets one 0-sat designated output, and only
-//!    for a Solo miner whose payout is exactly that output.
-//! 2. **[`TdpTemplateTxProvider`]**: the current template's wtxid->tx map.
-//! 3. **[`TdpCurrentPrevHashProvider`]**: the current TDP prev-hash.
-//! 4. **[`ProductionJdpBlockSink`]**: rebuilds a pushed block, resubmits it,
-//!    and books it only if its header proves work against the pool's target.
+//! Production JDP hooks. [`ProductionJdpAllocateResolver`] gives ext 0x0003
+//! empty token outputs, and the base protocol one 0-sat output only for a Solo
+//! miner who is exactly that output; [`ProductionJdpBlockSink`] books a pushed
+//! block only if its header proves work against the pool's target.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -95,13 +90,10 @@ pub(crate) fn build_jdp_hooks(
 
 // ─── 1. ProductionJdpAllocateResolver ────────────────────────────
 
-/// Answers `AllocateMiningJobToken` from the same payout resolver as the
-/// mining paths, so every payout guard (pending Blockparty, mode fallbacks)
-/// applies here too.
-///
-/// Resolving writes state: for PPLNS the reward lands in the shared
-/// settlement snapshot, so it must be [`ChainView::reference_revenue`], the
-/// value the mining path uses, never an estimate.
+/// Answers `AllocateMiningJobToken` from the mining paths' payout resolver, so
+/// every payout guard applies here too. Resolving writes the PPLNS settlement
+/// snapshot, so the reward must be [`ChainView::reference_revenue`], never an
+/// estimate.
 pub(crate) struct ProductionJdpAllocateResolver {
     payout_resolver: Arc<dyn bp_stratum_v2::hooks::PayoutResolver>,
     chain: Arc<dyn ChainView>,
@@ -127,14 +119,10 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
             });
         }
 
-        // Base protocol (SV2 JDP/AllocateMiningJobToken.Success): one 0-sat
-        // output the JDC fills with the whole revenue.
-        //
-        // Gate 1: the stream must be Solo (off Solo the mining side refuses the
-        // job, fatally for a JDC), checked before resolving so a never-servable
-        // allocate cannot rewrite the PPLNS snapshot. An unknown mode is served:
-        // the mining side's Solo gate still checks later. `match`, not
-        // `!= Solo`, so a new stream kind must be classified deliberately.
+        // SV2 JDP/AllocateMiningJobToken.Success. Gate 1: Solo only (the mining
+        // side refuses others, fatally for a JDC), checked before resolving so a
+        // refused allocate cannot rewrite the PPLNS snapshot. Unknown is served;
+        // `match`, not `!= Solo`, so a new stream kind is classified deliberately.
         let servable = match bp_stratum_v2::hooks::PayoutResolver::resolve_stream_known(
             &*self.payout_resolver,
             &miner_address,
@@ -547,13 +535,10 @@ impl ProductionJdpBlockSink {
         }
     }
 
-    /// Book a proven solution, and settle only where nothing else will.
-    ///
-    /// Settling republishes from the LIVE ledger, so it must follow the ledger
-    /// write: a `Bookable` block is settled by the confirmation watcher after
-    /// the apply. Only [`CandidateBacking::UnbookableDistribution`] settles
-    /// here, since no ledger write ever comes for it. Both stay behind
-    /// [`Self::block_is_proven`], or any JDC could invalidate distributions.
+    /// Book a proven solution. Settling republishes from the LIVE ledger, so a
+    /// `Bookable` block is settled by the confirmation watcher after the apply;
+    /// only [`CandidateBacking::UnbookableDistribution`] settles here. Both stay
+    /// behind [`Self::block_is_proven`], or any JDC could invalidate distributions.
     async fn settle_and_book(
         &self,
         backing: CandidateBacking,
@@ -747,11 +732,9 @@ fn log_booking_status(miner_address: &AddressId, backing: CandidateBacking) {
     }
 }
 
-// ─── 6. ProductionJobValidator (SV2 JDP/Job Declarator Server, node-side
-// validation) ───────
-//
-// Wraps the validation engine that asks bitcoin-core's
-// `job_declaration_protocol` IPC (`checkBlock`) for a consensus verdict.
+// ─── 6. ProductionJobValidator (SV2 JDP/Job Declarator Server) ───────
+// Asks bitcoin-core's `job_declaration_protocol` IPC (`checkBlock`) for a
+// consensus verdict.
 
 use bitcoin_core_sv2::runtime_api::BitcoinCoreVersion;
 use bp_stratum_v2::jdp_server::{

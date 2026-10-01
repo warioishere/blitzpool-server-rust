@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! In-memory cache of customer extranonce overrides, read by the SV2 stratum
-//! server at channel-open.
+//! In-memory cache of customer extranonce overrides, read by the SV2 server.
 //!
-//! The API process writes `pplns_custom_extranonce`; the core (this process)
-//! reloads the whole table on a fixed interval, since it cannot see the other
-//! process's writes. The table holds a handful of rows, so a full reload is one
-//! cheap query; a change applies at the worker's next channel-open.
-//!
-//! The cache is read at channel-open and, for a connection that carries an
-//! override, on each template broadcast. The lookup is allocation-free, so it
-//! adds nothing measurable to those paths.
+//! The API process writes the table, so the core reloads it on an interval; it
+//! holds a handful of rows, and a change applies at the next channel-open.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -21,24 +14,19 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-/// How often the core reloads the override table.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 /// `address -> worker -> prefix`. Nested so `lookup` keys by `&str` at both
 /// levels with no per-call allocation.
 type OverrideMap = HashMap<String, HashMap<String, u32>>;
 
-/// `(address, worker) -> prefix` cache, refreshed off PG in the background.
 pub(crate) struct CustomExtranonceCache {
     map: Arc<RwLock<OverrideMap>>,
-    // Cancels the refresh task when the cache is dropped (process shutdown).
     _refresh: tokio_util::sync::DropGuard,
 }
 
 impl CustomExtranonceCache {
-    /// Load the table once so the cache is warm before serving, then spawn a
-    /// task that reloads every [`REFRESH_INTERVAL`]. Returns an `Arc` suitable
-    /// for the [`CustomExtranonceSource`] hook slot.
+    /// Loads once before returning so the cache is warm before serving.
     pub(crate) async fn spawn(pool: PgPool) -> Arc<Self> {
         let map = Arc::new(RwLock::new(load(&pool).await.unwrap_or_default()));
         let cancel = CancellationToken::new();
@@ -78,17 +66,15 @@ impl CustomExtranonceSource for CustomExtranonceCache {
     }
 }
 
-/// Nested `&str` lookup, allocation-free. Big-endian to match the allocator's
-/// `prefix_to_be_bytes` convention (top byte first), so a customer prefix and an
-/// allocated one share one wire encoding.
+/// Big-endian to match the allocator's `prefix_to_be_bytes`, so a customer
+/// prefix and an allocated one share one wire encoding.
 fn lookup_prefix(map: &OverrideMap, address: &str, worker: &str) -> Option<[u8; 4]> {
     map.get(address)
         .and_then(|workers| workers.get(worker))
         .map(|prefix| prefix.to_be_bytes())
 }
 
-/// Reload the whole override table into a fresh map. `None` on a DB error so
-/// the caller keeps the previous snapshot rather than serving an empty one.
+/// `None` on a DB error, so the caller keeps the previous snapshot.
 async fn load(pool: &PgPool) -> Option<OverrideMap> {
     match bp_db::all_custom_extranonces(pool).await {
         Ok(rows) => {
@@ -123,7 +109,6 @@ mod tests {
             .or_default()
             .insert("rig2".to_string(), 0x0200_0001);
 
-        // Hit → big-endian bytes (top byte first).
         assert_eq!(
             lookup_prefix(&map, "bc1qalice", "rig1"),
             Some([0xC0, 0xDE, 0xBA, 0xBE])
@@ -132,7 +117,6 @@ mod tests {
             lookup_prefix(&map, "bc1qalice", "rig2"),
             Some([0x02, 0x00, 0x00, 0x01])
         );
-        // Misses: unknown worker, unknown address.
         assert_eq!(lookup_prefix(&map, "bc1qalice", "rig3"), None);
         assert_eq!(lookup_prefix(&map, "bc1qbob", "rig1"), None);
     }

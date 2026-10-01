@@ -1,14 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Per-block coinbase-distribution snapshot, persisted to a Redis hash
-//! so `on_block_found` mutates the ledger against the exact state
-//! committed at template-build time, even across a pool restart.
-//!
-//! Hash layout: `schema` (`"3"`), the scalars `weightP`, `feePpm`,
-//! `feeAddress`, `referenceRevenueSats`, `scoreTotal`, `entry_count`, and
-//! per entry `e{i}_addr` / `e{i}_score` / `e{i}_balance` / `e{i}_wire` /
-//! `e{i}_dust`.
-//!
+//! Per-block coinbase-distribution snapshot in a Redis hash, so
+//! `on_block_found` settles against the exact state committed at
+//! template-build time, even across a pool restart.
 //! Callers pass a fully-built `key`; the key scheme is per mode.
 
 use std::collections::HashMap;
@@ -39,29 +33,16 @@ pub struct WeightSnapshotEntry {
     pub balance_sats: i64,
     /// Published §3.1 weight; `0` = no coinbase output (folded/debt).
     pub wire_weight: u64,
-    /// Per-output dust limit — the consensus floor (546). The pool's
-    /// `min_payout` is not this field: it decides at build time who is
-    /// published at all, because a §4 prune pays the withheld value to
-    /// the pool output instead of to the other miners.
+    /// Per-output dust limit (consensus floor). Not the pool's `min_payout`,
+    /// which decides at build time who is published at all, because a §4
+    /// prune pays the withheld value to the pool output.
     pub dust_limit: u32,
 }
 
-/// Persistent form of a weight distribution (schema 3).
-///
-/// This freezes the settlement INPUTS, not the satoshi outcome:
-/// settlement recomputes each address's claim from
-/// `bp_share::claim_sats(score_weight, score_total, fee_ppm, T_actual)`
-/// and books `claim − actually_paid` against the balance. That is
-/// correct at ANY actual revenue, so one snapshot serves the pool's own
-/// templates and every JDC's independently-valued jobs alike. The finder
-/// bonus is a proportion, already inside `score_weight`.
-///
-/// `deny_unknown_fields` is load-bearing: this struct is serialized into
-/// the confirmation-gated pending-block queue, which outlives a deploy by
-/// the whole confirmation window. A blob carrying a field this build does
-/// not know (e.g. `finder_bonus`) would otherwise parse with that value
-/// silently dropped from the settlement math; refused, it is pruned with
-/// a warning and moves no money.
+/// Persistent weight distribution (schema 3): settlement INPUTS, not outcomes,
+/// so `claim(T_actual) − paid` is correct at any revenue, pool or JDC job.
+/// `deny_unknown_fields` is load-bearing: a pending blob with an unknown field
+/// is refused instead of settled with that value silently dropped.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredWeightSnapshot {
@@ -82,15 +63,9 @@ pub struct StoredWeightSnapshot {
 }
 
 impl StoredWeightSnapshot {
-    /// `X` — the satoshi promises this distribution carried on top of
-    /// the pure score split, recomputed the way the build computed it.
-    ///
-    /// Not a stored field on purpose: it is a pure function of what IS
-    /// stored, and one shared [`bp_share::project_extras`] serving both
-    /// build and settlement is what keeps the two from drifting apart.
-    ///
-    /// Only satoshi-denominated promises (ledger balances) reach this; the
-    /// finder bonus is a proportion carried as score weight.
+    /// `X` — the satoshi promises (ledger balances) on top of the score split.
+    /// Recomputed rather than stored so build and settlement share one
+    /// [`bp_share::project_extras`] and cannot drift apart.
     pub fn extras_total(&self) -> i64 {
         let extras = bp_share::extras_from_ledger(
             self.entries
@@ -129,12 +104,9 @@ impl StoredWeightSnapshot {
     }
 }
 
-/// Persist a weight snapshot under `key` with `ttl_seconds`, as one
-/// atomic DEL + HSET + EXPIRE (see `WRITE_SNAPSHOT_LUA`).
-///
-/// The `schema` field keeps a hash of any other format from hydrating
-/// through this parser: its settlement math differs, so the reader treats
-/// it as `SnapshotMissing`, which is logged loudly and books nothing.
+/// Persist a weight snapshot as one atomic DEL + HSET + EXPIRE. The `schema`
+/// field keeps any other format from hydrating through this parser: its
+/// settlement math differs, so the reader treats it as missing.
 pub async fn write_weight_snapshot(
     conn: &mut ConnectionManager,
     key: &str,
@@ -173,19 +145,10 @@ pub async fn write_weight_snapshot(
     Ok(())
 }
 
-/// `DEL` + `HSET` + `EXPIRE` as ONE indivisible step.
-/// `KEYS[1]` = the snapshot key. `ARGV[1]` = TTL seconds, then alternating
-/// field/value pairs.
-///
-/// Atomic so no reader ever sees the key between `DEL` and `HSET`:
-/// [`read_weight_snapshot_with_retry`] takes a missing snapshot as final,
-/// and the caller parks the found block with no settlement inputs. It also
-/// means a fault mid-write cannot leave an existing snapshot deleted.
-///
-/// The `DEL` is needed: a rebuild with FEWER entries has to drop the fields
-/// the longer one left behind. Fields are set one at a time rather than
-/// through `unpack`, to keep the argument count off Lua's C-stack limit at
-/// a full member set.
+/// Atomic so no reader sees the key between `DEL` and `HSET`
+/// ([`read_weight_snapshot_with_retry`] takes missing as final). The `DEL`
+/// drops fields a longer earlier build left; per-field `HSET` instead of
+/// `unpack` stays under Lua's C-stack argument limit.
 const WRITE_SNAPSHOT_LUA: &str = r#"
 redis.call('DEL', KEYS[1])
 for i = 2, #ARGV, 2 do
@@ -228,38 +191,17 @@ pub async fn read_weight_snapshot(
     }
 }
 
-/// How often a transient Redis failure on a block-found snapshot read is
-/// retried before the caller gives up.
-///
-/// That read stands between a found block and its booking, and no caller
-/// has a retry of its own. A connection reset mid-reconnect would
-/// otherwise cost the block. A genuinely missing snapshot (`Ok(None)`)
-/// is NOT retried — it will not appear.
+/// Retries for a transient Redis failure on a block-found snapshot read:
+/// that read stands between a found block and its booking, and no caller
+/// retries on its own. A missing snapshot (`Ok(None)`) is not retried.
 const READ_RETRIES: u32 = 3;
 /// Backoff between those attempts, multiplied by the attempt number.
 const READ_BACKOFF: Duration = Duration::from_millis(80);
 
-/// Resolve the settlement inputs a found block's coinbase was built
-/// from — the READ twin of [`crate::build::build_and_snapshot`], and
-/// the one implementation of it.
-///
-/// It takes the same `snapshot_key` seam the write side takes, for the
-/// same reason: the two engines disagree only on the key scheme
-/// (`pplns:snapshot:…` vs `groupsolo:{groupId}:jobsnapshot:…`), and a
-/// resolution that does not go through the writer's own seam is a
-/// resolution that can drift away from what was written.
-///
-/// **Call this at the block-found instant, never at apply time.** The
-/// key carries a TTL sized for a live job, and both modes' applies can
-/// run far past it — the confirmation-gated ones by design. Resolving
-/// late loses the inputs outright: per-job snapshot keys are excluded
-/// from the Redis→Postgres backup (see `redis_backup::is_per_job_snapshot`),
-/// so nothing else holds them, and the block's own coinbase can only
-/// say who WAS paid, never what the unpaid were owed.
-///
-/// `Ok(None)` is a verdict, not a failure: the key is gone or holds a
-/// schema this build cannot settle from. The caller maps it to its own
-/// terminal error.
+/// The READ twin of [`crate::build::build_and_snapshot`], through the same
+/// `snapshot_key` seam so it cannot drift from what was written. Call it at
+/// the block-found instant, never at apply time: the key's TTL is sized for a
+/// live job and is not backed up. `Ok(None)` is a terminal verdict.
 pub async fn resolve_snapshot_for_block_found(
     conn: &mut ConnectionManager,
     snapshot_key: impl FnOnce(&[u8; 32]) -> String,
@@ -270,11 +212,8 @@ pub async fn resolve_snapshot_for_block_found(
     read_weight_snapshot_with_retry(conn, &key, scope).await
 }
 
-/// [`read_weight_snapshot`] with the block-found retry policy.
-///
-/// The twin of `build::write_with_retry`. Prefer
-/// [`resolve_snapshot_for_block_found`], which pairs the retry with the
-/// key seam; this is exposed for the paths that already hold a key.
+/// [`read_weight_snapshot`] with the block-found retry policy, for paths
+/// that already hold a key; prefer [`resolve_snapshot_for_block_found`].
 pub async fn read_weight_snapshot_with_retry(
     conn: &mut ConnectionManager,
     key: &str,
@@ -332,8 +271,6 @@ fn parse_weight_hash(h: &HashMap<String, String>) -> Option<StoredWeightSnapshot
     })
 }
 
-/// Returns true if the error is a `WRONGTYPE` from Redis (a non-Hash value
-/// on a snapshot key).
 fn is_wrongtype(e: &RedisError) -> bool {
     matches!(
         e.kind(),
@@ -375,8 +312,7 @@ mod tests {
     }
 
     fn weight_hash_of(s: &StoredWeightSnapshot) -> HashMap<String, String> {
-        // Mirror of write_weight_snapshot's field list, so the parse
-        // test exercises the same layout the writer produces.
+        // Mirrors write_weight_snapshot's field list.
         let mut h = HashMap::new();
         h.insert("schema".to_string(), "3".to_string());
         h.insert("weightP".to_string(), s.weight_p.to_string());
@@ -405,11 +341,7 @@ mod tests {
         assert_eq!(parsed, s);
     }
 
-    /// A schema-2 hash (finder bonus in satoshis) must NOT hydrate, even
-    /// though every field the schema-3 parser reads is present and
-    /// well-formed: its `extras_total` differs, so claims would be measured
-    /// against the wrong pot. `None` makes it a `SnapshotMissing`, which
-    /// books nothing.
+    /// A schema-2 hash does not hydrate even with every schema-3 field present.
     #[test]
     fn parse_weight_hash_refuses_a_schema_2_bonus_hash() {
         let s = weight_snapshot_fixture();
@@ -423,9 +355,7 @@ mod tests {
         );
     }
 
-    /// A pending-block JSON blob carrying a `finder_bonus` field is refused
-    /// (`deny_unknown_fields`) rather than parsed with the bonus silently
-    /// dropped from `extras_total`; the same blob without it round-trips.
+    /// A pending blob with an unknown `finder_bonus` field is refused; without it, it round-trips.
     #[test]
     fn a_pending_blob_carrying_the_retired_bonus_is_refused() {
         let s = weight_snapshot_fixture();
@@ -500,10 +430,7 @@ mod tests {
         assert_eq!(s.reference_revenue_sats, 312_500_000);
     }
 
-    /// Settlement measures every claim against `pot − X`, and it
-    /// re-derives `X` here instead of reading it off a stored field.
-    /// It must match the build, or the coinbase and the ledger would split
-    /// two different pots.
+    /// The re-derived `X` matches the build's, so coinbase and ledger split one pot.
     #[test]
     fn extras_total_reproduces_the_build() {
         use std::collections::HashMap as StdMap;
@@ -511,9 +438,8 @@ mod tests {
         let a2 = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
         let fee = AddressId::new("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy").unwrap();
         let shares = StdMap::from([(a1.clone(), 3.0), (a2.clone(), 1.0)]);
-        // The bonus is plain score weight with nothing to project, so what
-        // has to reproduce is the LEDGER side: credits, debts, and a
-        // promise larger than the block.
+        // The bonus is plain score weight; what must reproduce is the ledger
+        // side: credits, debts, and a promise larger than the block.
         for (balances, bonus_ppm) in [
             (StdMap::new(), 0u32),
             (StdMap::from([(a1.clone(), Sats(10_000_000))]), 0),

@@ -1,30 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Confirmation-gated block-found store (Redis) — one shape for every
-//! mode that books against a payout distribution.
-//!
-//! A found block parks its distribution here instead of writing the
-//! ledger immediately. The confirmation watcher (see
-//! [`crate::block_confirmation`]) applies it once the block reaches
-//! `confirmation_depth`, and discards it if it orphaned — so an orphan,
-//! or a candidate that never extends the chain (common on regtest, rare
-//! on mainnet), never books a phantom.
-//!
-//! What is parked are the **inputs**, not a computed result: the
-//! distribution's settlement inputs plus what the block's coinbase
-//! actually paid. Both are immutable, so the apply recomputes from them
-//! and lands on the same satoshis however long the wait was.
-//!
-//! ## Why Redis (not Postgres)
-//!
-//! The store must survive a restart inside the confirmation window.
-//! Valkey is AOF/RDB-persistent and already holds the payout window and
-//! snapshots. Entries have **no TTL**, so `volatile-lru` eviction (which
-//! only evicts keys with an expiry) can never drop them.
+//! Confirmation-gated block-found store: [`crate::block_confirmation`]
+//! applies a parked block at `confirmation_depth` and discards an orphan, so
+//! no phantom is booked. Parked are the immutable **inputs** (settlement
+//! inputs + what the coinbase paid), so the apply recomputes the same sats.
 
 use redis::{aio::ConnectionManager, AsyncCommands, RedisError};
 
-/// Redis HASH holding every not-yet-confirmed block-found.
+/// Redis HASH holding every not-yet-confirmed block-found. It must carry no
+/// TTL: `volatile-lru` evicts only keys with an expiry, so this one survives.
 pub(crate) const PENDING_KEY: &str = "pool:pending_blocks";
 
 /// A block no automatic path can book is parked here rather than
@@ -138,9 +122,7 @@ pub(crate) async fn remove_pending_block(
     conn.hdel::<_, _, ()>(PENDING_KEY, block_hash).await
 }
 
-/// How many blocks are parked under `key`.
-///
-/// One `HLEN`, cheap enough for every confirmation pass. Makes a non-empty
+/// How many blocks are parked under `key`; makes a non-empty
 /// [`UNBOOKABLE_KEY`] visible to the operator.
 pub(crate) async fn count_pending_at(
     conn: &mut ConnectionManager,
@@ -171,8 +153,7 @@ pub(crate) async fn load_pending_blocks(
 mod tests {
     use super::*;
 
-    /// The stored blob must round-trip exactly — it is replayed into the
-    /// ledger once the block confirms.
+    /// The stored blob round-trips exactly.
     #[test]
     fn pending_block_json_round_trip() {
         let pb = PendingBlock {
@@ -196,8 +177,7 @@ mod tests {
         assert_eq!(group.finder, "bcrt1qfinder");
     }
 
-    /// A PPLNS blob carries no group context, and every optional field is
-    /// `serde(default)` so its absence on the wire is not an error.
+    /// A PPLNS blob without group or optional fields still parses.
     #[test]
     fn pplns_blob_has_no_group_context() {
         let json = r#"{"block_hash":"ab","found_at_ms":1,"block_height":2}"#;

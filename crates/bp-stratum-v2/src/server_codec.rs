@@ -1,28 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! SV2 wire-codec for the mining server's per-connection task.
-//!
-//! Translates between the wire-shape types from
-//! [`stratum_core::parsers_sv2`] (`AnyMessage` + per-subprotocol enums)
-//! and the typed `Input` / `OutboundFrame` shapes defined in
-//! [`crate::mining::client`] + [`crate::extensions`].
-//!
-//! The handlers in [`crate::mining::client`] take owned data so they can be
-//! tested without lifetimes; the `stratum_core` wire types borrow from the
-//! codec buffer (`Str0255<'decoder>`, `U256<'decoder>`, ...). This module is
-//! the boundary between the two:
-//!
-//! - [`InboundMiningFrame`] wraps every typed `Input` the per-connection task
-//!   dispatches on, one variant per `handle_*` in [`crate::mining::client`].
-//! - [`decode_mining_inbound`] turns a borrowed `AnyMessage` into an
-//!   [`InboundMiningFrame`], or `Ok(None)` for messages the mining server
-//!   does not handle (logged and ignored).
-//! - [`encode_mining_outbound`] turns a
-//!   [`crate::mining::client::OutboundFrame`] into an `AnyMessageOwned` for
-//!   the Noise writer.
-//!
-//! The JDP sub-protocol has its own codec of the same shape,
-//! [`crate::jdp_server_codec`].
+//! SV2 mining wire-codec: the boundary between the borrowed
+//! [`stratum_core::parsers_sv2`] types and the owned `Input` / `OutboundFrame`
+//! shapes of [`crate::mining::client`], which stay lifetime-free so they test
+//! easily. JDP has its own codec of the same shape, [`crate::jdp_server_codec`].
 
 use stratum_core::mining_sv2::{
     CloseChannel as Sv2CloseChannel, NewExtendedMiningJobOwned as Sv2NewExtMiningJob,
@@ -78,12 +59,9 @@ pub enum InboundMiningFrame {
 
 // ── decode_mining_inbound ───────────────────────────────────────────
 
-/// Translate one wire-shape SV2 message into an [`InboundMiningFrame`] for
-/// the matching `handle_*` in [`crate::mining::client`].
-///
-/// `Ok(None)` means "not a mining-server message" (log + ignore).
-/// `Err(...)` means the frame was malformed; the caller logs and drops the
-/// frame, and the connection survives.
+/// Translate one wire-shape SV2 message into an [`InboundMiningFrame`].
+/// `Ok(None)` is "not a mining-server message" (log + ignore); `Err` is a
+/// malformed frame, which is dropped while the connection survives.
 pub fn decode_mining_inbound(
     msg: AnyMessage<'_>,
 ) -> Result<Option<InboundMiningFrame>, CodecError> {

@@ -2,9 +2,8 @@
 
 #![allow(clippy::print_stderr)]
 
-//! Integration tests for `insert_found_block` — verifies that found-block
-//! records are actually persisted to `blocks_entity` and that the written
-//! columns match what was supplied.
+//! Integration tests for found-block persistence and for
+//! `payout_recorded_at_height`.
 
 use bp_db::{find_found_blocks, insert_found_block};
 use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -137,15 +136,8 @@ async fn drop_history(pool: &PgPool, heights: &[i32]) {
     }
 }
 
-/// MONEY: a block that produced only 0-sat rows is NOT booked, and the
-/// chain-reconcile check has to say so.
-///
-/// The PPLNS apply writes a 0-sat `pending` row for every address live in
-/// the window but absent from the block's distribution ("late arrivers").
-/// A distribution that paid nobody (a coinbase paying 100 % to the pool
-/// output) therefore still leaves rows behind. Under a plain
-/// `EXISTS(SELECT 1 …)` that block would read as booked and `block_reconcile`
-/// would never report it.
+/// MONEY: a block with only 0-sat late-arriver rows is NOT booked, so the
+/// chain reconcile still reports it.
 #[tokio::test]
 async fn zero_sat_rows_alone_do_not_count_as_a_recorded_payout() {
     let Some(pool) = connect_or_skip().await else {

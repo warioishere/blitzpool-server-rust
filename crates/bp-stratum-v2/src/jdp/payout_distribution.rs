@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! ext 0x0003 payout-vector computation and declared-coinbase validation.
-//!
-//! A declared coinbase is compared POSITIONALLY against the ext 0x0003/Payout
-//! Computation vector for `T = Σ declared values` (ext 0x0003/Output
-//! Verification). The vector sums to exactly `T`, so any deviation changes
-//! either the sum or a position, and the compare catches both.
+//! A declared coinbase is compared POSITIONALLY against the vector for
+//! `T = Σ declared values` (ext 0x0003/Output Verification); the vector sums
+//! to exactly `T`, so any deviation moves the sum or a position.
 
 use bitcoin::consensus::{Decodable, Encodable};
 use bitcoin::{Amount, ScriptBuf, TxOut};

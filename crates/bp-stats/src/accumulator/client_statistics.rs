@@ -22,9 +22,8 @@ pub struct ClientStatisticsKey {
     pub slot: TimeSlot,
 }
 
-/// One bucket. `shares` is the **diff sum**; the `*_count`
-/// fields are share counts (integer-valued floats); the `*_diff1` fields
-/// are diff sums broken down by rejection reason.
+/// One bucket. `shares` is the **diff sum**, `*_count` are share counts and
+/// `*_diff1` are diff sums per rejection reason.
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct ClientStatisticsRecord {
     pub shares: f64,
@@ -36,15 +35,12 @@ pub struct ClientStatisticsRecord {
     pub rejected_duplicate_share_diff1: f64,
     pub rejected_low_difficulty_share_count: f64,
     pub rejected_low_difficulty_share_diff1: f64,
-    /// Shares rejected because the miner changed version bits outside the
-    /// mask it negotiated (BIP-310). Its own pair, not folded into
+    /// Version bits rolled outside the negotiated BIP-310 mask. Not folded into
     /// low-difficulty: such a share's proof-of-work may be perfectly good.
     pub rejected_version_rolling_count: f64,
     pub rejected_version_rolling_diff1: f64,
-    /// Shares whose job existed but had been retired past the grace window.
-    /// Its own pair, not folded into job-not-found: this is
-    /// the ordinary tail of a block transition, that one is work the pool
-    /// never had.
+    /// Job retired past the grace window. Not folded into job-not-found: this
+    /// is the normal tail of a block transition, not work the pool never had.
     pub rejected_stale_count: f64,
     pub rejected_stale_diff1: f64,
     /// Highest single accepted share difficulty of the slot. A maximum, not
@@ -53,11 +49,8 @@ pub struct ClientStatisticsRecord {
 }
 
 impl ClientStatisticsRecord {
-    /// Sum of every `*_diff1` field. Used by the coordinator to fan
-    /// rejected-diff totals into `worker_shares_entity`.
-    ///
-    /// A new reason MUST be added here too — the total is what the worker
-    /// row carries, and a missing term silently under-reports it.
+    /// Sum of every `*_diff1` field, written to the worker row. A new reason
+    /// MUST be added here too, or the worker total silently under-reports.
     pub fn rejected_diff_total(&self) -> f64 {
         self.rejected_job_not_found_diff1
             + self.rejected_duplicate_share_diff1
@@ -153,9 +146,6 @@ impl ClientStatisticsAccumulator {
         }
     }
 
-    /// Merge `delta` into the bucket for `key`. The caller batches whatever
-    /// fields are relevant for a single share into one `Record` and
-    /// hands it in.
     pub fn add(&self, key: ClientStatisticsKey, delta: &ClientStatisticsRecord) {
         self.inner.lock().add(key, delta);
     }

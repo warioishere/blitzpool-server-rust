@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `bp_share_hook` trait implementations.
-//!
-//! The session and per-share hook surfaces come from `bp-share-hook`,
-//! decoupled from the wire protocol, so this single impl serves both the
-//! SV1 and SV2 servers.
-//!
-//! ## [`SessionPersistenceHook`]
-//!
-//! `bp_share_hook::SharedSessionPersistence` impl. Fires on every
-//! authorize (register) and disconnect (deregister). Mode-blind. A
-//! register writes NO statement — it only pends the session in the
-//! `RowDebounce`; the row is born by the engine's birth flush once the
-//! session has survived the debounce window, so probe connections that
-//! authorize and hang up never reach Postgres at all. Deregister
-//! soft-deletes only sessions that were actually born.
+//! `bp_share_hook` trait implementations, protocol-blind so one impl serves
+//! both the SV1 and SV2 servers.
 
 use bp_common::now_ms;
 use std::sync::Arc;
@@ -31,8 +18,8 @@ use crate::row_debounce::RowDebounce;
 use crate::touch_buffer::{TouchBuffer, TouchKeyRef};
 
 /// `SharedSessionPersistence` impl: pends the session for the debounced
-/// row birth on register, soft-deletes born sessions on deregister.
-/// Cheap to clone (two `Arc`s under the hood).
+/// row birth on register (no statement), soft-deletes born sessions on
+/// deregister.
 #[derive(Clone)]
 pub struct SessionPersistenceHook {
     pool: PgPool,
@@ -54,8 +41,6 @@ impl SharedSessionPersistence for SessionPersistenceHook {
         worker: &str,
         user_agent: Option<&str>,
     ) {
-        // The authorize timestamp becomes the row's startTime/firstSeen
-        // when (and if) the row is born.
         self.debounce.register(
             address,
             worker,
@@ -67,8 +52,7 @@ impl SharedSessionPersistence for SessionPersistenceHook {
     }
 
     async fn deregister_session(&self, session_id: &str) {
-        // Only a born session owes the table a soft-delete; a probe's
-        // teardown is a pure map removal and costs no statement.
+        // Only a born session owes the table a soft-delete.
         if !self.debounce.deregister(session_id) {
             return;
         }
@@ -82,24 +66,10 @@ impl SharedSessionPersistence for SessionPersistenceHook {
     }
 }
 
-/// `SharedAcceptedShareSink` impl that bumps the per-session
-/// `client:live:*` hash on every accepted share — `updated_at_ms` and
-/// the TTL (so the dead-session sweep doesn't reap it),
-/// `best_difficulty` (max-merged), `current_difficulty` (latest vardiff
-/// target), and `channel_count`. Without this, the live half of
-/// `/api/client/:address` and the hashrate sums read zero for active
-/// sessions.
-///
-/// Buffered: writes land in a shared `TouchBuffer` keyed by
-/// `(address, clientName, sessionId)` and are flushed every 30s by the
-/// engine's background task in one batched script, so the write load is
-/// one entry per active session per flush, not one per share.
-///
-/// The same share also feeds the `HashrateSampler`, which owns the
-/// `hash_rate` field: it accumulates the share's credited difficulty and
-/// writes a self-zeroing 2-min moving average on its own 60 s cadence.
-/// The touch buffer above deliberately does not write `hash_rate` — two
-/// writers on one field would fight.
+/// Bumps the session's `client:live:*` hash (TTL, best/current difficulty,
+/// channel count) on every accepted share, buffered to one write per session
+/// per flush. `hash_rate` is owned by the `HashrateSampler` alone so two
+/// writers never fight over one field.
 #[derive(Clone)]
 pub struct ClientRowTouchSink {
     buffer: Arc<TouchBuffer>,
@@ -115,61 +85,39 @@ impl ClientRowTouchSink {
 #[async_trait]
 impl SharedAcceptedShareSink for ClientRowTouchSink {
     async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
-        // Worker can be empty in some SV2 paths (no `.<name>` suffix in
-        // user_identity); the SV2 session row was registered under the
-        // same "default", so the fallback preserves the PK match. SV1
-        // never sends an empty worker: its authorize parse defaults a
-        // trailing dot to "worker", so its touches hit the born row.
+        // An SV2 user_identity without `.<name>` gives an empty worker; the
+        // session row was registered as "default", so this keeps the PK match.
         let worker = if share.worker.is_empty() {
             "default"
         } else {
             share.worker
         };
-        // Borrowed key — no heap allocation on the hot path. Both sinks
-        // take it by value (it's `Copy`) and materialise an owned key only
-        // when a session first appears in the current flush/sample window.
         let key = TouchKeyRef {
             address: share.address,
             client_name: worker,
             session_id: share.session_id,
         };
-        // `effective_difficulty` is the vardiff target this share was
-        // credited at = the difficulty currently assigned to the
-        // session, so it keeps `current_difficulty` fresh as vardiff
-        // ratchets (for both SV1 + SV2 — this sink is protocol-blind).
+        // `effective_difficulty` is the session's current vardiff target.
         self.buffer.record(
             key,
             share.submission_difficulty as f32,
             Some(share.effective_difficulty as f32),
             share.channel_count as i32,
-            // When the front accepted the share, not when this satellite got
-            // to it: a session's last shares can arrive after its disconnect
-            // soft-deleted the row, and a later stamp there makes
-            // `kill_dead_clients` revive a session that has already gone.
+            // The front's accept time, not ours: a later stamp on a share that
+            // arrives after the disconnect would make `kill_dead_clients`
+            // revive a session that is already gone.
             share.ts_ms,
         );
-        // Live hashrate: accumulate the same credited difficulty into the
-        // sampler's current window. It owns the live hash's `hash_rate` and
-        // writes a self-zeroing moving average — see [`HashrateSampler`].
         self.sampler.record(key, share.effective_difficulty);
     }
 }
 
-/// Length of one difficulty-statistics slot in ms (1 hour). Each
-/// `(address, clientName, slotTime)` row records the maximum share
-/// difficulty seen in that hour — the data behind the per-client
-/// diff-scores chart.
+/// One difficulty-statistics slot (1 hour) in ms.
 const DIFF_STAT_SLOT_MS: i64 = 60 * 60 * 1000;
 
-/// `SharedAcceptedShareSink` that records the per-`(address, worker,
-/// hour-slot)` maximum share difficulty into
-/// `client_difficulty_statistics_entity` (feeds `/api/client/:address/diff-scores`).
-///
-/// Coalesces in memory and writes in BATCHES: the share hot path merges the
-/// per-slot max into `DiffStatBuffer`, and one flush loop upserts the whole
-/// window in a single statement. An inline upsert per new max would burst
-/// after a restart and at every hour rollover, where every miner's first
-/// shares keep raising the max.
+/// Records the per-`(address, worker, hour-slot)` max share difficulty into
+/// `client_difficulty_statistics_entity`, batched: an inline upsert per new
+/// max would burst after a restart and at every hour rollover.
 #[derive(Clone)]
 pub struct ClientDifficultyStatisticsSink {
     buffer: Arc<DiffStatBuffer>,
@@ -190,16 +138,12 @@ impl SharedAcceptedShareSink for ClientDifficultyStatisticsSink {
         }
         // The hour the share was accepted in, not the hour it was consumed in.
         let slot = (share.ts_ms / DIFF_STAT_SLOT_MS) * DIFF_STAT_SLOT_MS;
-        // Empty worker → "default", matching the PK convention the
-        // client-row touch sink uses for the session row.
+        // Same "default" PK convention as the client-row touch sink.
         let worker = if share.worker.is_empty() {
             "default"
         } else {
             share.worker
         };
-        // Borrowed key: no allocation unless this is the slot's first share.
-        // The buffer keeps the running max itself, so there is no second cache
-        // to consult and nothing to await on the hot path.
         self.buffer.record(
             DiffStatKeyRef {
                 address: share.address,

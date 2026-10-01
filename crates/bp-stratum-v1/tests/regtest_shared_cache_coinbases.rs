@@ -1,20 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Regtest: pool-wide MiningJob cache — per-finder coinbase distinctness
-//! end-to-end.
-//!
-//! Three concurrent connections on ONE server (= one shared
-//! `MiningJobCache`):
-//!
-//!   - miner A (address A) and miner B (address B) have DISTINCT payout
-//!     sets — each `mining.notify` coinbase MUST pay its own finder. A
-//!     job-key that missed a payout field would serve miner B the job
-//!     built for miner A and pay the wrong finder on a found block; this
-//!     pins that end-to-end, which the in-crate unit tests cannot.
-//!   - miner C authorizes with miner A's address — its coinbase must be
-//!     BYTE-IDENTICAL to A's (the shared build), proving the memoization
-//!     actually engages through the full server path while job ids stay
-//!     per-connection.
+//! Regtest: through the shared `MiningJobCache`, miners with different
+//! payout sets each get a coinbase paying their own finder (a cache key
+//! missing a payout field would pay the wrong one), while a miner with the
+//! same address gets A's coinbase byte for byte under its own job id.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,9 +27,8 @@ use tokio::net::{TcpListener, TcpStream};
 const ADDR_A: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 const ADDR_B: &str = "bcrt1qyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zs4w3j0";
 
-/// Pays 100% to the connecting address (per-finder distinct payout sets,
-/// the Solo coinbase shape) while keeping every connection on the boot
-/// (PPLNS) stream so all three ride the SAME template.
+/// Pays everything to the connecting address, but keeps every connection
+/// on the boot stream so all three share one template.
 struct PayToSelfResolver;
 
 #[async_trait]
@@ -214,8 +202,6 @@ async fn sv1_shared_cache_keeps_per_finder_coinbases_distinct() {
     let mut miner_c = Miner::connect(addr).await;
     let (en1_a, notify_a) = miner_a.handshake(10, ADDR_A).await;
     let (en1_b, notify_b) = miner_b.handshake(20, ADDR_B).await;
-    // Miner C's own extranonce isn't reassembled below (C is only
-    // checked for coinbase-byte equality against A), so it stays unused.
     let (_en1_c, notify_c) = miner_c.handshake(30, ADDR_A).await;
 
     let (job_a, coinb1_a, coinb2_a) = notify_coinbase_parts(&notify_a);
@@ -226,10 +212,8 @@ async fn sv1_shared_cache_keeps_per_finder_coinbases_distinct() {
     tdp.shutdown().ok();
     node.shutdown().await.ok();
 
-    // ── Distinctness: A and B have different payout sets — each
-    // coinbase must pay ITS OWN finder. Each is reassembled with its
-    // OWN extranonce1 (en1_a / en1_b) so the test exercises the real
-    // per-connection extranonce, not a shared one. ──
+    // ── Distinctness: each coinbase, rebuilt with its own extranonce1,
+    // pays its own finder. ──
     for (name, notify_addr, en1, coinb1, coinb2) in [
         ("A", ADDR_A, &en1_a, &coinb1_a, &coinb2_a),
         ("B", ADDR_B, &en1_b, &coinb1_b, &coinb2_b),
@@ -252,9 +236,7 @@ async fn sv1_shared_cache_keeps_per_finder_coinbases_distinct() {
         "distinct payout sets must never share coinbase bytes"
     );
 
-    // ── Sharing: C authorizes with A's address — same payout set, same
-    // template → byte-identical coinbase from the shared cache, under a
-    // per-connection job id. ──
+    // ── Sharing: C uses A's address, so it gets A's cached coinbase. ──
     assert_eq!(
         (coinb1_a.as_str(), coinb2_a.as_str()),
         (coinb1_c.as_str(), coinb2_c.as_str()),

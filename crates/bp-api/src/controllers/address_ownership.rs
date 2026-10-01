@@ -1,23 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! `/api/address/ownership/*` — prove control of a BTC address by signing a
-//! server-issued challenge with the address's key.
-//!
-//! A generic "this address proved control" primitive: an equivalent option to
-//! the verified-email binding for group-invite eligibility; the
-//! custom-extranonce controller reuses its signature verification.
-//!
-//! Flow: `challenge {address}` returns an exact message to sign → the wallet
-//! signs it (Sparrow/Electrum text-paste, or a hardware wallet) → `verify
-//! {address, signature}` checks the signature against the stored challenge and
-//! records the verified binding.
-//!
-//! Signature families accepted (the server tries each, so the user's wallet /
-//! Sparrow format is irrelevant):
-//!   - BIP-322 (`bip322` crate) — covers taproot `bc1p…` + segwit.
-//!   - Legacy / Electrum / BIP-137 recoverable signatures (`bitcoin::sign_message`)
-//!     — note `is_signed_by_address` only supports P2PKH, so segwit is verified by
-//!     recovering the pubkey and re-deriving the address.
+//! server-issued challenge. An alternative to a verified email for group
+//! eligibility. BIP-322 and BIP-137 recoverable signatures are both tried, so
+//! the wallet's format does not matter.
 
 use std::str::FromStr;
 
@@ -266,15 +252,10 @@ where
 
 // ─── signature verification ──────────────────────────────────────
 
-/// Verify `signature` signs `message` for `address`. Returns `(method,
-/// script_type)` on success. Tries BIP-322 first (covers every type incl.
-/// taproot), then the legacy/Electrum/BIP-137 recoverable path.
-///
-/// `pub(crate)` so the custom-extranonce controller authorises its changes with
-/// the same verification rather than a second copy of it.
-// The per-address-type `match` arms each run a distinct verification (recover +
-// re-derive + compare); an explicit `if` inside each arm reads more clearly
-// than collapsed match guards, so allow the lint.
+/// `(method, script_type)` when `signature` signs `message` for `address`.
+/// BIP-322 first (the only route for taproot), then BIP-137 recoverable,
+/// where segwit is checked by recovering the key and re-deriving the address.
+/// Shared with the custom-extranonce controller.
 #[allow(clippy::collapsible_match)]
 pub(crate) fn verify_message_signature(
     address: &str,
@@ -341,12 +322,9 @@ fn script_type_label(t: AddressType) -> &'static str {
 
 // ─── helpers ─────────────────────────────────────────────────────
 
-/// Parse + validate a mainnet BTC address into a **canonical** `AddressId`.
-/// Rejects testnet / malformed addresses at the API boundary, then normalises
-/// via the single source of truth [`AddressId::normalized`]
-/// (lowercase bech32, preserve case-sensitive Base58) so the ownership row is
-/// keyed identically to what every verification gate looks up — otherwise a
-/// mixed-case Base58 (or upper-case bech32) proof would never match.
+/// Parse an address of the pool's network into a **canonical** `AddressId`
+/// via [`AddressId::normalized`], so the ownership row is keyed exactly as
+/// every verification gate looks it up.
 pub(crate) fn parse_supported_address(raw: &str, network: Network) -> Result<AddressId, ApiError> {
     let trimmed = raw.trim();
     Address::from_str(trimmed)
@@ -399,10 +377,7 @@ mod tests {
         bip322::sign_simple_encoded(address, message, &[wif], None).expect("bip322 signing")
     }
 
-    // Covers the BIP-322 branch of `verify_message_signature` on its success
-    // path; the other tests reach it only on its error return. Taproot matters
-    // most: `MessageSignature::from_base64` cannot represent a taproot
-    // signature, so for `bc1p…` addresses BIP-322 is the ONLY route.
+    // Pins the BIP-322 success path, the only route for taproot addresses.
     #[test]
     fn bip322_signature_verifies_for_segwit_and_taproot() {
         let (sk, _pk, cpk) = test_key();
@@ -428,10 +403,8 @@ mod tests {
         );
     }
 
-    // A P2SH-P2WPKH witness carrying an UNCOMPRESSED key is rejected with
-    // `None`, not a panic. The witness comes straight from the caller's
-    // base64 and the router installs no `CatchPanicLayer`, so the `bip322`
-    // dependency must return an error for it.
+    // A caller-supplied witness with an uncompressed key fails verification
+    // instead of panicking: the router has no `CatchPanicLayer`.
     #[test]
     fn a_crafted_witness_with_an_uncompressed_key_is_rejected_not_fatal() {
         use bitcoin::consensus::encode::serialize;

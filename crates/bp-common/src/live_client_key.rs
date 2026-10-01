@@ -1,62 +1,33 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Key schema for the per-session live-state hashes in Redis.
-//!
-//! One hash per mining session, keyed by the same triple as the
-//! `client_entity` PK (`address`, `clientName`, `sessionId`), holding the
-//! fields that change on every share: hashrate, current vardiff target,
-//! channel count, per-session best difficulty, last-seen timestamp. The
-//! writer is `bp-session-persistence`; the key/field names live here so
-//! readers (`bp-api`, `bp-notifications`, the liveness sweep) share one
-//! schema without depending on the writer crate.
-//!
-//! Two properties of the prefix are load-bearing:
-//!
-//! - It is deliberately OUTSIDE the Redis-backup allowlist (`pplns:*`,
-//!   `groupsolo:*` — see `bin/blitzpool/src/redis_backup.rs`). Live
-//!   session state must never be captured or restored: a `RESTORE`
-//!   re-materialises keys **without a TTL**, which under the prod
-//!   `volatile-lru` eviction policy would resurrect dead sessions as
-//!   immortal keys.
-//! - Every key carries a TTL, so under `volatile-lru` any of them can be
-//!   evicted at any time. A reader must treat a missing key or field as
-//!   "no live data" — and must never write a value derived from that
-//!   absence (a 0 hashrate, an empty session list) back to durable
-//!   storage.
+//! Key schema of the per-session live hashes in Redis, here so readers need not
+//! depend on the writer. The prefix stays outside the backup allowlist: a `RESTORE`
+//! recreates keys without TTL, i.e. immortal dead sessions. Keys can be evicted any
+//! time, so missing means "no live data" and must never be written back as a value.
 
 /// Common prefix of every per-session live hash.
 pub const CLIENT_LIVE_PREFIX: &str = "client:live:";
 
-/// Separator between the key's `address` / `worker` / `session_id`
-/// components. Same unit-separator convention as the `device:live:*`
-/// hash fields: it cannot appear in a Bitcoin address, and worker /
-/// session names that carry one were mangled long before they got here.
+/// Separator between `address` / `worker` / `session_id`; the unit separator
+/// cannot appear in a Bitcoin address.
 pub const KEY_SEP: char = '\u{1f}';
 
-/// Hash field: live hashrate in H/s (2-sample moving average, written by
-/// the sampler every 60 s). May be the ONLY field present — a share can
-/// land after the key expired, and the sampler's write recreates the key
-/// with just this field.
+/// Hash field: live hashrate in H/s. May be the ONLY field present: the
+/// sampler's write can recreate an expired key with just this field.
 pub const F_HASH_RATE: &str = "hash_rate";
 /// Hash field: latest vardiff target observed on an accepted share.
 pub const F_CURRENT_DIFFICULTY: &str = "current_difficulty";
 /// Hash field: channel count of the session's freshest share.
 pub const F_CHANNEL_COUNT: &str = "channel_count";
-/// Hash field: per-session best share difficulty. Monotone WITHIN the
-/// key's life — the writer max-merges against the stored value.
-///
-/// Deliberately ephemeral: a Redis restart or an eviction resets it to
-/// 0. It is scoped to one session and nothing durable reads it. The
-/// all-time best per address lives in `address_settings_entity`; if the
-/// two ever disagree, that is the one to trust.
+/// Hash field: per-session best share difficulty, max-merged within the key's
+/// life and reset by eviction. Nothing durable reads it; the all-time best in
+/// `address_settings_entity` is the one to trust.
 pub const F_BEST_DIFFICULTY: &str = "best_difficulty";
 /// Hash field: epoch-ms timestamp of the freshest accepted share.
 pub const F_UPDATED_AT_MS: &str = "updated_at_ms";
 
-/// Anything that identifies one mining session. The live-hash key is
-/// this triple, built in one place so no call site assembles it by hand.
-/// Implemented for `bp_db`'s row types and for a bare triple, so every
-/// reader passes what it already has.
+/// Anything that identifies one mining session, so the key is built in one
+/// place from whatever a reader already holds.
 pub trait SessionKey {
     fn address(&self) -> &str;
     fn worker(&self) -> &str;
@@ -121,8 +92,7 @@ pub fn scan_pattern_for_address(address: &str) -> String {
 mod tests {
     use super::*;
 
-    // The exact byte layout is pinned: the backup allowlist exclusion,
-    // the SCAN patterns, and every reader parse against it.
+    // Pins the byte layout every reader and SCAN pattern parses against.
     #[test]
     fn key_layout_is_prefix_and_unit_separated_triple() {
         assert_eq!(

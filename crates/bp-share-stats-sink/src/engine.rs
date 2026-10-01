@@ -18,10 +18,8 @@ use crate::flush::{flush_once, Accumulators, Flusher};
 use crate::reader::ReaderView;
 use crate::seed::seed_if_empty;
 
-/// Shared state. The accumulators are mutated by the share-path hooks
-/// from many threads (Stratum-server tasks); the health monitor is
-/// updated by the cron task only. Both live behind `Arc` so the
-/// `ReaderView` can borrow without touching the engine handle.
+/// Accumulators are written by the share hooks from many tasks, the health
+/// monitor only by the flush task; both sit behind `Arc` for `ReaderView`.
 pub struct ShareStatsEngine {
     config: StatsSinkConfig,
     pool: PgPool,
@@ -30,9 +28,8 @@ pub struct ShareStatsEngine {
 }
 
 impl ShareStatsEngine {
-    /// Build the engine WITHOUT starting the cron task. Hook impls can
-    /// be wired up against the returned engine; call
-    /// [`Self::spawn`] when the share path is ready.
+    /// Builds the engine without starting the flush task, so hooks can be
+    /// wired first.
     pub fn new(config: StatsSinkConfig, pool: PgPool) -> Result<Self, SinkError> {
         config.validate()?;
         Ok(Self {
@@ -43,11 +40,8 @@ impl ShareStatsEngine {
         })
     }
 
-    /// Construct the engine and spawn the background flush task. Runs
-    /// the one-shot `seedIfEmpty` migration on entry if
-    /// `config.seed_on_spawn` is true. Returns a handle whose
-    /// [`ShareStatsEngineHandle::shutdown`] drains residuals before
-    /// stopping.
+    /// Builds the engine, runs `seed_if_empty` when `config.seed_on_spawn`,
+    /// and spawns the flush task.
     #[instrument(skip(pool), fields(flush_interval = ?config.flush_interval), name = "stats_sink.spawn")]
     pub async fn spawn(
         config: StatsSinkConfig,
@@ -70,8 +64,7 @@ impl ShareStatsEngine {
         }
     }
 
-    /// Public accessor for the shared accumulators — hook impls clone
-    /// this `Arc` into the share path.
+    /// Hook impls clone this `Arc` into the share path.
     pub fn accumulators(&self) -> Arc<Accumulators> {
         self.accumulators.clone()
     }
@@ -94,9 +87,8 @@ impl ShareStatsEngine {
     }
 }
 
-/// Handle returned by [`ShareStatsEngine::spawn`]. Drop to abort the
-/// task without final-drain; call [`Self::shutdown`] for a clean stop
-/// that flushes residuals before returning.
+/// [`Self::shutdown`] waits for the final drain; dropping the handle only
+/// detaches the task, which then drains on its own.
 pub struct ShareStatsEngineHandle {
     reader: ReaderView,
     shutdown_tx: Option<oneshot::Sender<()>>,
@@ -112,8 +104,7 @@ impl ShareStatsEngineHandle {
         self.reader.accumulators.clone()
     }
 
-    /// Signal shutdown and await final drain. Returns when the
-    /// background task has flushed residuals and exited.
+    /// Returns once the flush task has drained residuals and exited.
     pub async fn shutdown(mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
@@ -137,15 +128,13 @@ async fn run_flush_loop(
     info!("stats_sink flush loop started");
     let start = tokio::time::Instant::now() + cfg.flush_interval + cfg.startup_offset;
     let mut ticker = tokio::time::interval_at(start, cfg.flush_interval);
-    // `interval_at` with `start = now + flush_interval + offset` skips
-    // the t=0 firing AND staggers the loop relative to other 60 s crons
-    // so PG / disk load doesn't all hit on the same instant.
+    // Skips the t=0 firing and staggers this loop against the other 60 s
+    // crons so their PG load does not coincide.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut last_slot = TimeSlot::current();
     loop {
-        // Slot-aligned spot flush: if the slot changed since the last
-        // wake-up, flush immediately so the just-ended slot's residuals
+        // On a slot change flush at once, so the ended slot's residuals
         // commit before the chart-visibility cutoff.
         if cfg.slot_aligned_flush {
             let current = TimeSlot::current();
@@ -169,7 +158,6 @@ async fn run_flush_loop(
         }
     }
 
-    // Final drain — flush any residuals before exiting.
     info!("stats_sink final drain");
     flush_once(&pool, &accs, &health, cfg.client_stats_batch_size).await;
 

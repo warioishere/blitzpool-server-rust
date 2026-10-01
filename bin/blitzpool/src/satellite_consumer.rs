@@ -1,35 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Satellite-side accepted-share stream consumer.
-//!
-//! In `satellite` mode the process holds no Stratum listeners; accepted
-//! shares arrive over the Redis stream the Core's
-//! [`bp_share_stream::ProducingSink`] writes
-//! to. This task drains that stream into the **same**
-//! [`SharedAcceptedShareSink`] impls the engines expose — the shares are
-//! already `share_id`-/mode-stamped by the Core, so the consumer never
-//! touches a mode gate.
-//!
-//! ## Two consumer groups, by durability class
-//!
-//! The accepted sinks split into two [`crate::engines::AcceptedSinkSet`]
-//! classes, each consumed by its own group so a stall in one never blocks
-//! the other's acks:
-//!
-//! - **money** (`PPLNS` + `Group-Solo` window mutations) — order-sensitive
-//!   (window order = consume order) and exactly-once via the per-`share_id`
-//!   dedup marker, so a single ordered consumer.
-//! - **stats-session** (stats accumulators + session-persistence +
-//!   live-mode marker) — order-insensitive.
-//!
-//! ## Delivery
-//!
-//! Each group runs the shared [`StreamConsumer::run`] loop: it `ensure_group`s,
-//! drains any **pending** (delivered-but-unacked) backlog left by a previous
-//! run, then loops on **new** entries. The
-//! transport is at-least-once: a crash between sink-apply and `XACK`
-//! redelivers, and the money sinks dedup on `share_id` so the re-apply is a
-//! no-op. See [`bp_share_stream`].
+//! Satellite-side accepted-share consumer: drains the Core's stream into the
+//! engines' sinks (shares arrive mode-stamped). Two groups so a stall in one
+//! never blocks the other's acks: **money** is single-consumer because window
+//! order = consume order; delivery is at-least-once, money dedups on `share_id`.
 
 use std::sync::Arc;
 
@@ -62,10 +36,8 @@ pub(crate) fn spawn(
     sinks: AcceptedSinkSet,
 ) -> StreamConsumerHandle {
     let cancel = CancellationToken::new();
-    // Each consumer group gets its OWN connection. A group's blocking
-    // `XREAD BLOCK` would otherwise head-of-line-block the other group's
-    // reads (and any command queued behind it) on a shared multiplexed
-    // connection.
+    // Each group gets its OWN connection: a blocking `XREAD BLOCK` would
+    // head-of-line-block the other group on a shared multiplexed connection.
     let money = spawn_group(
         money_redis,
         MONEY_GROUP,
@@ -150,8 +122,7 @@ mod tests {
         false
     }
 
-    /// Both durability-class groups independently consume every published
-    /// share, in order, and shut down cleanly on cancel.
+    /// Both groups consume every share in order and shut down on cancel.
     #[tokio::test]
     async fn both_groups_consume_all_shares_in_order() {
         let Some(conn) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 7).await else {
@@ -196,8 +167,7 @@ mod tests {
         assert_eq!(*aux_seen.lock().await, expected, "aux order preserved");
     }
 
-    /// A delivered-but-unacked backlog (a consumer that read but never
-    /// acked, e.g. crashed mid-apply) is replayed on restart.
+    /// A delivered-but-unacked backlog is replayed on restart.
     #[tokio::test]
     async fn pending_backlog_is_replayed_on_restart() {
         let Some(conn) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 8).await else {

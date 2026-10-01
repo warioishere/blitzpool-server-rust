@@ -1,25 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Best-difficulty cron — runs every 60 s (offset by `:43` so it
-//! doesn't align with slot-boundary jobs).
-//!
-//! Each tick: look up which addresses have a live subscription on any
-//! transport (Telegram, ntfy or push — whether each one wants best-diff is
-//! the dispatcher's per-subscription check), read their persisted
-//! `address_settings.bestDifficulty`
-//! and their `best_difficulty_tracker_entity` row in two bulk reads.
-//! The tracker row is the dedup baseline:
-//!
-//! - no tracker yet → initialise it silently (no push),
-//! - current best `>` tracked best → push, then upsert the tracker,
-//! - current best `<` tracked best → sync the tracker down silently
-//!   (`address_settings` is the source of truth; a drop follows a
-//!   best-difficulty reset),
-//! - equal → nothing.
-//!
-//! Persisting the tracker is what lets `/api/push/status` surface a
-//! real `tracker` block (last-notified best + `lastCheckedAt`) and what
-//! survives a restart without re-notifying.
+//! Best-difficulty cron: notifies a subscribed address when its persisted
+//! best rises past the `best_difficulty_tracker_entity` baseline. The tracker
+//! is persisted so a restart does not re-notify and `/api/push/status` can
+//! show the last-notified best.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -66,12 +50,10 @@ struct TrackerAction {
     upsert: bool,
 }
 
-/// Compare the current persisted best against the tracked baseline.
-///
-/// `tracked == None` means no row exists yet → initialise it silently.
-/// A strict increase notifies; a decrease syncs the tracker down
-/// without notifying (`address_settings` is the source of truth, e.g.
-/// after a best-difficulty reset); an equal value does nothing.
+/// Compare the current persisted best against the tracked baseline. Only a
+/// strict increase over a known baseline notifies; a missing row is created
+/// silently, and a decrease (a best-difficulty reset) syncs the tracker down
+/// silently because `address_settings` is the source of truth.
 fn classify(current: f64, tracked: Option<f64>) -> TrackerAction {
     match tracked {
         None => TrackerAction {

@@ -1,30 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `/api/address/extranonce/*` — let a Solo address set its own extranonce
-//! prefix per worker, authorised by a stored bearer **token**.
-//!
-//! Flow:
-//! 1. `challenge {address}` → an exact message to sign (nonced, 15-min TTL).
-//! 2. sign it with the address key → `token {address, signature}` verifies the
-//!    signature and returns a random **token** (only its hash is stored). The
-//!    signature is one-time; the token is the reusable credential.
-//! 3. `set {address, workers:[…]}` + `Authorization: Bearer <token>` — a
-//!    headless, no-UI call that sets the prefix for one or many workers in a
-//!    single all-or-nothing request. Repeat per change with the same token.
-//!
-//! The feature is Solo-only and cannot move money (the coinbase still pays the
-//! address), so a long-lived token is an acceptable, low-stakes credential. Its
-//! only powers are: set a custom extranonce prefix on the address's own Solo
-//! workers. Re-issuing (a fresh sign) rotates the token, revoking the old one.
-//!
-//! ## Reserved prefix range
-//!
-//! `0x00……` and `0x01……` are rejected: those are the worker partitions the SV2
-//! and SV1 servers allocate from (see `bp_common::extranonce`), so a value there
-//! could later be handed to another miner as well. Workers 2..=255 are unowned —
-//! no allocator ever emits into them — which is what makes a hand-set prefix
-//! safe to hold indefinitely. That leaves `0x02000000..=0xFFFFFFFF`, ~99% of the
-//! space.
+//! `/api/address/extranonce/*`: a Solo address sets its own extranonce prefix
+//! per worker. A signed challenge yields a long-lived bearer token; that is
+//! acceptable because the feature cannot move money. Top bytes owned by the
+//! SV1/SV2 allocators are refused, so a hand-set prefix is never handed out twice.
 
 use axum::{
     extract::State,
@@ -47,13 +26,9 @@ use crate::state::SharedState;
 
 const CHALLENGE_TTL_MINUTES: i64 = 15;
 
-/// Top bytes the SV1/SV2 extranonce allocators own. See the module doc.
-///
-/// Derived from the allocators' worker ids: the rule is "everything up to and
-/// including the highest assigned worker partition", and a third allocator must
-/// widen this gate in the same edit. ⚠️ The DB carries the same bound as the
-/// `pplns_custom_extranonce_prefix_unreserved` check (SQL cannot import a Rust
-/// constant); change both together.
+/// Highest top byte an allocator owns; a new allocator must widen it. The DB
+/// check `pplns_custom_extranonce_prefix_unreserved` carries the same bound,
+/// change both together.
 const RESERVED_TOP_BYTE_MAX: u32 =
     if bp_common::extranonce::SV1_WORKER_ID > bp_common::extranonce::SV2_WORKER_ID {
         bp_common::extranonce::SV1_WORKER_ID
@@ -107,8 +82,7 @@ where
     M: EmailHooks + 'static,
 {
     let address = parse_supported_address(&body.address, state.network)?;
-    // Reject non-Solo addresses up front so a customer isn't handed a message to
-    // sign for a token that could never set a (Solo-only) override.
+    // Up front, so no one signs for a token that could never set an override.
     ensure_solo_eligible(&state.pool, state.pplns.as_deref(), &address).await?;
 
     let now = bp_common::now_ms();
@@ -136,8 +110,7 @@ struct TokenBody {
 #[serde(rename_all = "camelCase")]
 struct TokenResponse {
     address: String,
-    /// The bearer token to present on every `set` call. Store it — only its
-    /// hash is kept server-side, so it can't be recovered later.
+    /// Only its hash is kept server-side, so it cannot be recovered later.
     token: String,
     created_at: i64,
 }
@@ -172,8 +145,8 @@ where
         return Err(en_error("invalid-signature", StatusCode::BAD_REQUEST));
     }
 
-    // Issue a fresh token, store only its hash (overwriting/revoking any prior
-    // one), and consume the challenge so the signature can't be replayed.
+    // Overwrites (revokes) any prior token; consuming the challenge stops a
+    // replay of the signature.
     let token = random_token();
     bp_db::upsert_extranonce_token(&state.pool, &address, &sha256_hex(&token), now).await?;
     bp_db::delete_extranonce_challenge(&state.pool, &address).await?;
@@ -186,8 +159,7 @@ where
 
 // ─── POST /api/address/extranonce/set ────────────────────────────
 
-/// Upper bound on one batch. Generous for any real rig fleet, but bounded
-/// so a single request can't pin the API on an unbounded transaction.
+/// Bounded so one request cannot pin the API on an unbounded transaction.
 const MAX_BATCH_WORKERS: usize = 256;
 
 #[derive(Deserialize)]
@@ -197,9 +169,6 @@ struct SetEntry {
     extranonce: String,
 }
 
-/// Batch body. `address` and the bearer token are carried once for the whole
-/// request — the token is bound to the address anyway, so repeating them per
-/// entry would be redundant and inviting inconsistency.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SetBody {
@@ -223,21 +192,9 @@ struct SetResponse {
     updated_at: i64,
 }
 
-/// Set the extranonce prefix for one or more workers of an address, in a
-/// single all-or-nothing request.
-///
-/// **Auth**: `Authorization: Bearer <token>` — the token from
-/// `/extranonce/token`. Kept in the header rather than the body so it stays
-/// out of request-body logs and is separated from the payload.
-///
-/// **Atomic**: every entry lands or none does, so the fleet never ends up in
-/// a half-applied state nobody asked for.
-///
-/// In-batch conflicts are diagnosed here (naming the offending worker)
-/// rather than left to the database, which could only report the constraint.
-/// A *swap* between two of the address's own workers is explicitly legal —
-/// see [`bp_db::upsert_custom_extranonces_batch`] for how the deferred
-/// constraint makes that work.
+/// All-or-nothing, so a fleet is never left half-applied. The token travels in
+/// the header to stay out of body logs. A swap between two of the address's
+/// own workers is legal, see [`bp_db::upsert_custom_extranonces_batch`].
 async fn set<H, M>(
     State(state): State<SharedState<H, M>>,
     headers: HeaderMap,
@@ -256,8 +213,7 @@ where
         return Err(en_error("batch-too-large", StatusCode::BAD_REQUEST));
     }
 
-    // Normalise + validate every entry BEFORE touching the database, so a
-    // bad entry costs no writes and the error names the entry.
+    // Validated before the database, so the error can name the entry.
     let mut entries: Vec<(String, u32)> = Vec::with_capacity(body.workers.len());
     let mut seen_workers: HashSet<String> = HashSet::with_capacity(body.workers.len());
     let mut seen_prefixes: HashSet<u32> = HashSet::with_capacity(body.workers.len());
@@ -265,8 +221,7 @@ where
         let worker = normalize_worker(&entry.worker);
         let prefix = parse_prefix(&entry.extranonce)?;
         if !seen_prefixes.insert(prefix) {
-            // Two entries in the SAME request claiming one prefix can never
-            // be satisfied — unlike a swap, this is a genuine duplicate.
+            // Unlike a swap, one prefix twice in a request can never be satisfied.
             return Err(en_error(
                 "duplicate-extranonce-in-batch",
                 StatusCode::BAD_REQUEST,
@@ -306,9 +261,8 @@ where
 // ─── helpers ─────────────────────────────────────────────────────
 
 fn challenge_message(address: &str, nonce: &str, now: i64, expires_at: i64) -> String {
-    // Address + nonce + expiry: proves control of THIS address, one-time (the
-    // challenge is consumed and expires), so the signature never becomes a
-    // reusable credential — that's the token's job.
+    // Address-bound and one-time, so the signature never becomes a reusable
+    // credential; that is the token's job.
     format!(
         "Blitzpool extranonce token request\n\
          Address: {address}\n\
@@ -318,8 +272,6 @@ fn challenge_message(address: &str, nonce: &str, now: i64, expires_at: i64) -> S
     )
 }
 
-/// A random 32-byte token, hex-encoded (64 chars). The plaintext is returned to
-/// the customer once; only its hash is stored.
 fn random_token() -> String {
     let mut bytes = [0u8; 32];
     getrandom::getrandom(&mut bytes).expect("OS CSPRNG");
@@ -330,11 +282,8 @@ fn sha256_hex(input: &str) -> String {
     hex::encode(Sha256::digest(input.as_bytes()))
 }
 
-/// Extract the bearer token from `Authorization: Bearer <token>`.
-///
-/// Returns an empty string when the header is absent or malformed —
-/// [`verify_token`] then rejects it as `missing-token`, so a missing header
-/// and an empty token land on the same, unambiguous error.
+/// Empty when absent or malformed, so [`verify_token`] reports both as
+/// `missing-token`.
 fn bearer_token(headers: &HeaderMap) -> String {
     headers
         .get(axum::http::header::AUTHORIZATION)
@@ -345,7 +294,6 @@ fn bearer_token(headers: &HeaderMap) -> String {
         .to_string()
 }
 
-/// Check the presented token against the stored hash for this address.
 async fn verify_token(pool: &PgPool, address: &AddressId, presented: &str) -> Result<(), ApiError> {
     let presented = presented.trim();
     if presented.is_empty() {
@@ -360,13 +308,9 @@ async fn verify_token(pool: &PgPool, address: &AddressId, presented: &str) -> Re
     Ok(())
 }
 
-/// Mirror of the stratum core's worker resolution (`resolve_open_context` in
-/// `bp-stratum-v2`): the worker is whatever follows the FIRST dot of
-/// `user_identity`, taken verbatim, and an absent one becomes `"default"`.
-///
-/// Deliberately does NOT trim or lowercase: the core looks the override up by
-/// the miner's worker bytes as-is, so a normalised row would never match a
-/// miner authorising as `Rig1`.
+/// Mirrors the core's worker resolution: verbatim, empty becomes `"default"`.
+/// No trim or lowercase, since the core looks the override up by the miner's
+/// worker bytes as-is.
 fn normalize_worker(raw: &str) -> String {
     if raw.is_empty() {
         "default".to_string()
@@ -375,7 +319,6 @@ fn normalize_worker(raw: &str) -> String {
     }
 }
 
-/// Parse 8 hex chars into the prefix, rejecting the allocator-owned range.
 fn parse_prefix(raw: &str) -> Result<u32, ApiError> {
     let trimmed = raw.trim();
     let hex = trimmed.strip_prefix("0x").unwrap_or(trimmed);
@@ -393,20 +336,9 @@ fn parse_prefix(raw: &str) -> Result<u32, ApiError> {
     Ok(prefix)
 }
 
-/// Reject an address that can't mine Solo, so it can't set an override the core
-/// would silently never apply (the core gate is `state.stream == Solo`).
-///
-/// Two signals, both false-positive-free (a pure Solo address is in neither):
-///  - **Group / Group-Solo / Blockparty membership** — persistent DB rows, and
-///    membership overrides the port (`resolve_mode`), so it's always non-Solo.
-///  - **Active PPLNS window presence** — an address contributing to the PPLNS
-///    share window right now is mining PPLNS by port, which group membership
-///    can't see. Gated strictly on live window shares; a past PPLNS miner with
-///    only a balance row is not treated as active (it may have switched).
-///
-/// Residual: an *offline* PPLNS miner (aged out of the window, or not yet
-/// connected) still slips through — the core Solo gate drops that safely and
-/// logs it (see `maybe_apply_custom_extranonce`).
+/// Refuses an address that cannot mine Solo, whose override the core would never
+/// apply: group or Blockparty members, and addresses with live PPLNS window
+/// shares. An offline PPLNS miner slips through; the core Solo gate drops that.
 async fn ensure_solo_eligible(
     pool: &PgPool,
     pplns: Option<&bp_pplns_engine::engine::PplnsEngine>,
@@ -421,9 +353,8 @@ async fn ensure_solo_eligible(
     if in_group || in_blockparty {
         return Err(en_error("not-solo-mode", StatusCode::CONFLICT));
     }
-    // Best-effort PPLNS-window check. On a window-read error we log and allow
-    // rather than couple the feature to Redis availability — the core Solo gate
-    // is the actual guarantee, this is just an earlier, clearer rejection.
+    // A read error allows: the core Solo gate is the guarantee, this is only
+    // an earlier, clearer rejection.
     if let Some(engine) = pplns {
         match engine.reader().address_status(address.as_str()).await {
             Ok(status) if pplns_active(status.as_ref()) => {
@@ -439,19 +370,15 @@ async fn ensure_solo_eligible(
     Ok(())
 }
 
-/// Whether a PPLNS address status means the address is *actively* mining PPLNS
-/// (contributing to the current window), and thus not Solo-eligible. Absent
-/// status or zero live shares → not active; a balance-only (past) miner is not
-/// blocked, since it may have switched to Solo.
+/// Live window shares only: a balance-only past miner may have switched to Solo.
 fn pplns_active(status: Option<&bp_pplns_engine::reader::AddressStatus>) -> bool {
     status
         .map(|s| s.current_window_shares > 0.0)
         .unwrap_or(false)
 }
 
-/// The `UNIQUE (address, prefix)` violation is a user error, not a 500: this
-/// address already points another worker at that prefix, which in Solo would
-/// have both workers grinding one search space (same payouts -> same coinbase).
+/// `UNIQUE (address, prefix)` is a user error, not a 500: two Solo workers on
+/// one prefix would grind the same search space.
 fn map_prefix_conflict(err: bp_db::DbError) -> ApiError {
     if let bp_db::DbError::Sqlx(sqlx::Error::Database(ref db_err)) = err {
         if db_err.code().as_deref() == Some("23505")
@@ -483,9 +410,7 @@ mod tests {
         MessageSignature::new(rec, true).to_base64()
     }
 
-    /// The PPLNS-window branch of the Solo guard: block only on LIVE window
-    /// shares, so a Solo address (never in the window) and a past PPLNS miner
-    /// (balance but zero current shares) both pass.
+    /// Only live window shares block; a balance-only past PPLNS miner passes.
     #[test]
     fn pplns_active_gates_on_live_window_shares() {
         use bp_pplns_engine::reader::AddressStatus;
@@ -552,8 +477,7 @@ mod tests {
         assert_eq!(normalize_worker(" spaced "), " spaced ");
     }
 
-    /// The signed challenge is address-bound and verifies with a genuine
-    /// signature, pinning the message format to what actually gets signed.
+    /// The challenge message verifies with a genuine signature, and only its own.
     #[test]
     fn signed_challenge_message_verifies() {
         let sk = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
@@ -569,8 +493,7 @@ mod tests {
         assert!(verify_message_signature(&addr, &msg, &other_sig, Network::Bitcoin).is_none());
     }
 
-    /// Token hashing: the stored hash matches the SHA-256 of the plaintext, a
-    /// wrong token doesn't, and a fresh token is 64 hex chars.
+    /// A token hashes stably, a wrong token does not match, tokens are 64 hex.
     #[test]
     fn token_hashing_round_trips() {
         let token = random_token();
@@ -579,7 +502,6 @@ mod tests {
 
         let hash = sha256_hex(&token);
         assert_eq!(hash.len(), 64);
-        // Same token → same hash; a different token → different hash.
         assert_eq!(sha256_hex(&token), hash);
         assert_ne!(sha256_hex("not-the-token"), hash);
         // Known vector: SHA-256("") = e3b0c442...

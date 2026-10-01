@@ -1,27 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Production wiring for the device-status debounce.
-//!
-//! [`bp_notifications::dispatcher::DeviceStatusGate`] is transport- and
-//! storage-agnostic; this module supplies the concrete pieces it needs
-//! and the task that drives it:
-//!
-//! - [`FrontLiveness`] — "is it connected?" from the union of what the
-//!   Stratum fronts publish ([`crate::live_sessions`]); "when did the pool
-//!   first see this worker?" from `client_entity`.
-//! - [`RedisReportedState`] — what each subscriber was last told,
-//!   persisted so a restart neither repeats an offline message nor
-//!   swallows the matching return.
-//! - [`SubscribedAddresses`] — which addresses have a device-status
-//!   subscriber, so the work scales with subscribers, not miners. Fails
-//!   **open** until loaded once, so a never-loaded filter cannot silence
-//!   every notification.
-//! - [`spawn`] — restores the reported state, seeds the watch list, then
-//!   ticks: resolve what is due, dispatch what the gate releases.
-//!
-//! Both the in-process sink and the Satellite's stream consumer feed the
-//! *same* gate instance, so a process that runs the front and the notify
-//! role together debounces exactly like a split deployment.
+//! Production wiring for [`bp_notifications::dispatcher::DeviceStatusGate`]:
+//! liveness from the fronts, reported state persisted in Redis so a restart
+//! neither repeats nor swallows a message, and a subscriber filter so work
+//! scales with subscribers. In-process and Satellite events feed the same gate.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -75,11 +57,9 @@ const REPORTED_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 /// The concrete gate the binary uses.
 pub(crate) type Gate = DeviceStatusGate<SystemClock, FrontLiveness, RedisReportedState>;
 
-/// Liveness from the fronts, first-seen from the database.
-///
-/// Whether a device is connected **right now** is known first-hand only
-/// by the process holding its socket; a database answer conflates it with
-/// share activity. First-seen is a historical fact no live process holds.
+/// Liveness from the fronts, first-seen from the database: only the process
+/// holding the socket knows "connected right now" first-hand, and first-seen
+/// is history no live process holds.
 pub(crate) struct FrontLiveness {
     pool: PgPool,
     live: RedisLiveSessions,
@@ -225,11 +205,8 @@ impl ReportedStateStore for RedisReportedState {
     }
 }
 
-/// Addresses with at least one device-status subscriber.
-///
-/// Fails **open**: `contains` answers `true` until the set has loaded
-/// once, so a failing query cannot read as "nobody is subscribed" and
-/// silence the whole pool.
+/// Addresses with at least one device-status subscriber. Fails **open** until
+/// loaded once, so a failing query cannot silence the whole pool.
 #[derive(Clone)]
 pub(crate) struct SubscribedAddresses {
     inner: Arc<RwLock<HashSet<String>>>,
@@ -331,15 +308,10 @@ pub(crate) fn spawn(
     DeviceStatusGateHandle { cancel, task }
 }
 
-/// Await `fut` unless shutdown starts first; `None` means stop.
-///
-/// Every await in the sweeper goes through this, so an unreachable Redis
-/// or Postgres cannot hold shutdown (joined without a timeout) until the
-/// process is killed without cleanup.
-///
-/// Dropping a lookup or store mid-flight is safe: no lock is held across
-/// an await, the in-memory schedule is rebuilt from the seed, and the
-/// reported state is persisted.
+/// Await `fut` unless shutdown starts first; `None` means stop. Every sweeper
+/// await goes through this, so an unreachable dependency cannot hold shutdown.
+/// Dropping mid-flight is safe: no lock spans an await and state is
+/// re-derived from the seed and the persisted reported state.
 async fn until_cancelled<T>(cancel: &CancellationToken, fut: impl Future<Output = T>) -> Option<T> {
     tokio::select! {
         biased;
@@ -420,11 +392,9 @@ async fn run_sweeper(
     }
 }
 
-/// Fan out released notices with bounded concurrency.
-///
-/// Cancellation-aware: each notice is a subscription lookup plus HTTP calls
-/// with double-digit-second timeouts, so an unreachable push endpoint can
-/// stretch a batch into minutes, and shutdown must not wait behind it.
+/// Fan out released notices with bounded concurrency. Cancellation-aware: an
+/// unreachable push endpoint can stretch a batch into minutes, and shutdown
+/// must not wait behind it.
 async fn dispatch(
     dispatcher: &Arc<NotificationDispatcher>,
     notices: Vec<DeviceNotice>,
@@ -461,11 +431,9 @@ async fn dispatch(
     }
 }
 
-/// Seed the watch list for `addresses` — every device under them that is
-/// connected now, or was disconnected within [`SEED_LOOKBACK`].
-///
-/// A miner that died during a restart sends no further Stratum event; the
-/// seed is what gets it evaluated again.
+/// Seed the watch list for `addresses`: every device connected now or
+/// disconnected within [`SEED_LOOKBACK`], since a miner that died during a
+/// restart sends no further Stratum event.
 async fn seed_addresses(gate: &Gate, pool: &PgPool, addresses: &[String]) {
     if addresses.is_empty() {
         return;

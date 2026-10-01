@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Wire helpers shared by the SV2 regtests: one frame out, one frame in,
-//! and the polling wait, in one place so a dependency bump lands once.
-//!
-//! Cargo compiles this module into every test binary that declares it, so
-//! a helper one binary does not use is dead code there; the allow is for
-//! that, not for anything unused in the crate.
+//! Wire helpers shared by the SV2 regtests, in one place so a dependency bump
+//! lands once. The allow covers helpers unused by one of the test binaries
+//! this module is compiled into.
 #![allow(dead_code)]
 
 use std::time::Duration;

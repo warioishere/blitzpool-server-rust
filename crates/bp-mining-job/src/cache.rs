@@ -1,57 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Pool-wide memoization of built [`MiningJob`]s.
-//!
-//! On every template broadcast each connection (SV1) / channel (SV2)
-//! builds a `MiningJob` for its resolved payout set. Under PPLNS that set
-//! is identical across connections, so without a cache N connections
-//! repeat the same build, including one [`crate::address_to_script`]
-//! parse per payout output. This cache shares one build as
-//! `Arc<MiningJob>`.
-//!
-//! Two memoization levels:
-//!
-//! 1. **Job level** — the fully-serialized `MiningJob`, keyed by EVERY
-//!    input of [`crate::build_mining_job_from_tdp`]. Key equality means
-//!    input equality means a byte-identical build, so the cache never
-//!    hands out wrong coinbase bytes, and per-finder payout sets
-//!    (Solo / Group-Solo / Blockparty) get distinct keys without any
-//!    per-mode special-casing.
-//! 2. **Payout-outputs level** — the parsed `(sats, script)` outputs,
-//!    keyed by (network, payouts, reward). A job-level miss with a known
-//!    payout set (other SV2 Extended slot size, or a template refresh
-//!    with an unchanged reward) reuses the parsed scripts.
-//!
-//! ## Concurrency
-//!
-//! Both levels are instances of one generic [`CoalescingSlotMap`]. Its
-//! mutex guards ONLY map operations (lookup / insert / prune), never a
-//! build. Each key owns a slot with its own mutex: the first caller
-//! builds as leader under just that slot's lock, so distinct keys
-//! (Solo / Group-Solo, one set per connection) build in parallel while
-//! same-key callers (a PPLNS broadcast) wait and share the leader's
-//! result. A failed build leaves the slot empty; the next caller retries.
-//!
-//! Across the two levels the lock order is job-slot → outputs-map →
-//! outputs-slot: a job-slot leader takes the outputs map lock (released
-//! before it takes the outputs-slot lock) to parse. The two map mutexes
-//! are never held at once, and nothing takes a job-slot while holding an
-//! outputs-slot, so no cycle can form.
-//!
-//! ## Key definition
-//!
-//! The key is defined ONCE as a tuple type ([`JobKeyTuple`] /
-//! [`OutputsKeyTuple`]): hashing and equality both go through the same
-//! tuple, and the owned key's `as_tuple()` destructures the struct
-//! exhaustively — adding a field to the struct without wiring it into
-//! the tuple is a compile error, not a silent key-collision bug.
-//!
-//! Entries are touched on use and lazily pruned after [`ENTRY_TTL`] of
-//! disuse — on lookups AND via [`MiningJobCache::prune_expired`],
-//! which the stratum translator tasks drive on every template update
-//! so memory is reclaimed even when no miner is connected. A job-hit
-//! also touches its backing outputs entry, so the shared parsed
-//! outputs never age out from under a live job.
+//! Pool-wide memoization of built [`MiningJob`]s: connections sharing a payout
+//! set (PPLNS) share one build. The job level is keyed by EVERY build input, so
+//! a hit is always byte-identical; the outputs level reuses parsed scripts.
+//! Lock order job-slot → outputs-map → outputs-slot; builds never run under a map lock.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -66,22 +18,17 @@ use crate::coinbase::{
     PayoutEntry, TdpCoinbaseTemplate,
 };
 
-/// Drop an entry after this long without a hit. Comfortably above the
-/// template-refresh cadence so entries for the CURRENT template never
-/// expire mid-use (every use refreshes the clock).
+/// Drop an entry after this long without a hit. Above the template-refresh
+/// cadence so entries for the current template never expire mid-use.
 const ENTRY_TTL: Duration = Duration::from_secs(120);
 
-/// Minimum spacing between prune sweeps (piggybacked on lookups and
-/// the translator heartbeat).
+/// Minimum spacing between prune sweeps.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(10);
 
 type PayoutOutputs = Vec<(u64, Vec<u8>)>;
 
-// ── Key definition (single source of truth) ─────────────────────────
-
-/// THE job-level cache key, as one tuple type. Both hashing and
-/// equality operate on this tuple, for the borrowed lookup side and
-/// the owned stored side alike — the two can never diverge.
+/// The job-level cache key. Hashing and equality both go through this one
+/// tuple for lookup and stored side, so the two can never diverge.
 type JobKeyTuple<'a> = (
     Network,
     &'a str, // pool_identifier
@@ -123,7 +70,7 @@ fn job_key_tuple<'a>(
     )
 }
 
-/// THE outputs-level cache key: (network, reward, payouts).
+/// The outputs-level cache key: (network, reward, payouts).
 type OutputsKeyTuple<'a> = (Network, u64, &'a [PayoutEntry]);
 
 fn hash_tuple<T: Hash>(tuple: &T) -> u64 {
@@ -132,15 +79,12 @@ fn hash_tuple<T: Hash>(tuple: &T) -> u64 {
     h.finish()
 }
 
-/// Owned copy of every job-build input — the stored side of the cache
-/// key. Compared against lookups via [`JobKeyTuple`] only.
+/// Owned copy of every job-build input, compared via [`JobKeyTuple`] only.
 struct JobKey {
     network: Network,
     pool_identifier: String,
     extranonce_slot_size: usize,
-    /// Shared with the matching [`OutputsKey`] (and across job entries
-    /// of the same payout set) — one allocation per distinct payout
-    /// set, not one per entry.
+    /// Shared with the matching [`OutputsKey`]: one allocation per payout set.
     payouts: Arc<Vec<PayoutEntry>>,
     coinbase_prefix: Vec<u8>,
     coinbase_tx_version: u32,
@@ -153,8 +97,7 @@ struct JobKey {
 }
 
 impl JobKey {
-    /// Exhaustive destructure — adding a JobKey field without adding it
-    /// to the tuple fails to compile, keeping key equality complete.
+    /// Exhaustive destructure: a new field missing from the tuple fails to compile.
     fn as_tuple(&self) -> JobKeyTuple<'_> {
         let JobKey {
             network,
@@ -204,17 +147,13 @@ impl OutputsKey {
     }
 }
 
-// ── Generic coalescing slot map ─────────────────────────────────────
-
-/// Per-key build slot. The slot mutex is the ONLY lock held during a
-/// build: the leader locks it, builds, publishes; same-key followers
-/// block here (not on the map's global lock) and read the result.
+/// Per-key build slot, the only lock held during a build: same-key followers
+/// block here, not on the map lock, and read the leader's result.
 struct ValueSlot<V> {
     value: Mutex<Option<Arc<V>>>,
 }
 
-// Manual, not `#[derive(Default)]`: the slot must default to an EMPTY
-// value regardless of whether `V: Default` (MiningJob has no Default).
+// Manual impl: derive would require `V: Default`, which MiningJob lacks.
 impl<V> Default for ValueSlot<V> {
     fn default() -> Self {
         Self {
@@ -229,25 +168,16 @@ struct SlotEntry<K, V> {
     last_used: Instant,
 }
 
-/// Did [`CoalescingSlotMap::get_or_build`] serve an already-built value,
-/// or run the builder? The caller maps this onto its own hit/built
-/// counters.
+/// Whether [`CoalescingSlotMap::get_or_build`] served a built value or ran the builder.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SlotOutcome {
     Hit,
     Built,
 }
 
-/// A hash-bucketed map with per-key build coalescing + TTL pruning — the
-/// one place the leader/follower slot invariant lives, shared by both
-/// cache levels.
-///
-/// The map mutex guards ONLY map operations (bucket lookup / install /
-/// prune); the actual build runs under the per-key slot lock so distinct
-/// keys build in parallel while same-key callers coalesce. The owned key
-/// `K` is compared against a borrowed lookup via a caller-supplied
-/// predicate and hashed by the caller — the map stays agnostic to the
-/// key/lookup shapes.
+/// Hash-bucketed map with per-key build coalescing and TTL pruning, shared by
+/// both cache levels. The map mutex guards only map operations; builds run
+/// under the per-key slot lock, so distinct keys build in parallel.
 struct CoalescingSlotMap<K, V> {
     inner: Mutex<SlotMapInner<K, V>>,
 }
@@ -268,19 +198,15 @@ impl<K, V> CoalescingSlotMap<K, V> {
     }
 
     fn lock(&self) -> MutexGuard<'_, SlotMapInner<K, V>> {
-        // Recover a poisoned lock: the map is only mutated by single-step
-        // ops, so no cross-op invariant can be left half-applied by a
-        // panic elsewhere.
+        // Poison is safe to recover: map mutations are single-step, so a
+        // panic cannot leave an invariant half-applied.
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Return the value for `hash`/`matches` — from the slot if already
-    /// built (coalescing onto the leader), else build it as the leader
-    /// via `build`, installing a fresh slot keyed by `make_key` on a map
-    /// miss. `now` also drives the rate-limited prune sweep. A failed
-    /// build leaves the slot empty (no negative caching).
+    /// Return the built value for `hash`/`matches`, or build it as leader.
+    /// A failed build leaves the slot empty, so the next caller retries.
     fn get_or_build<E>(
         &self,
         hash: u64,
@@ -289,7 +215,6 @@ impl<K, V> CoalescingSlotMap<K, V> {
         make_key: impl FnOnce() -> K,
         build: impl FnOnce() -> Result<Arc<V>, E>,
     ) -> Result<(Arc<V>, SlotOutcome), E> {
-        // Map phase (map lock only — no build): find or install the slot.
         let slot = {
             let mut inner = self.lock();
             inner.maybe_prune(now);
@@ -315,8 +240,6 @@ impl<K, V> CoalescingSlotMap<K, V> {
             }
         };
 
-        // Build phase (per-key slot lock only): leader builds, same-key
-        // followers block here while other keys proceed in parallel.
         let mut guard = slot
             .value
             .lock()
@@ -329,9 +252,7 @@ impl<K, V> CoalescingSlotMap<K, V> {
         Ok((value, SlotOutcome::Built))
     }
 
-    /// Refresh the `last_used` of the entry for `hash`/`matches` and
-    /// return `project(&key)` if present — keeps an entry warm (and reads
-    /// a shared field off its key) without building.
+    /// Keep an entry warm without building, returning `project(&key)` if present.
     fn touch<R>(
         &self,
         hash: u64,
@@ -376,8 +297,7 @@ impl<K, V> CoalescingSlotMap<K, V> {
             .collect()
     }
 
-    /// Test hook: `last_used` of the sole entry (panics unless exactly
-    /// one exists — the single-payout-set test shape).
+    /// Test hook: `last_used` of the sole entry; panics unless exactly one exists.
     #[cfg(test)]
     fn sole_last_used(&self) -> Instant {
         let inner = self.lock();
@@ -405,23 +325,18 @@ impl<K, V> SlotMapInner<K, V> {
     }
 }
 
-/// Cumulative counters — how often the cache actually built vs served
-/// from memory. Exposed for tests + metrics.
+/// Cumulative counters: how often the cache built vs served from memory.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MiningJobCacheStats {
     /// `get_or_build` calls answered from an already-built slot.
     pub job_hits: u64,
     /// Full job assemblies (serialize + split) that had to run.
     pub jobs_built: u64,
-    /// Payout-output parses (`address_to_script` per output) that had
-    /// to run — the expensive step the cache exists to collapse.
+    /// Payout-output parses that had to run, the expensive step.
     pub outputs_built: u64,
 }
 
-/// Pool-wide `MiningJob` memoization — see the module docs. Cheap to
-/// share via `Arc`; all methods take `&self`. Both levels are
-/// `CoalescingSlotMap`s; this type only wires them together (payouts
-/// Arc sharing, error precedence) and tallies stats.
+/// Pool-wide `MiningJob` memoization; see the module docs.
 pub struct MiningJobCache {
     jobs: CoalescingSlotMap<JobKey, MiningJob>,
     outputs: CoalescingSlotMap<OutputsKey, PayoutOutputs>,
@@ -457,10 +372,8 @@ impl MiningJobCache {
         }
     }
 
-    /// Return the memoized `MiningJob` for these exact build inputs, or
-    /// build (and cache) it. Behaviorally identical to
-    /// [`crate::build_mining_job_from_tdp`] — same result bytes, same
-    /// errors in the same precedence; failed builds are never cached.
+    /// Memoized [`crate::build_mining_job_from_tdp`]: same bytes, same errors
+    /// in the same precedence; failed builds are never cached.
     pub fn get_or_build(
         &self,
         network: Network,
@@ -486,12 +399,8 @@ impl MiningJobCache {
         let reward = template.coinbase_tx_value_remaining;
         let now = Instant::now();
 
-        // Resolve the canonical payouts Arc from the outputs level FIRST.
-        // This also refreshes that entry's `last_used`, so the shared
-        // parsed outputs stay warm alongside this job even on a pure
-        // job-hit (which never reaches the build closure below). Absent
-        // → allocate the payout vec once; the job key and the outputs
-        // entry then share this one allocation.
+        // Touch the outputs level first, even on a pure job-hit, so the
+        // parsed outputs never age out under a live job.
         let payouts_arc = self
             .touch_outputs(network, reward, payouts, now)
             .unwrap_or_else(|| Arc::new(payouts.to_vec()));
@@ -515,9 +424,8 @@ impl MiningJobCache {
                 coinbase_tx_locktime: template.coinbase_tx_locktime,
                 payouts_fingerprint,
             },
-            // Leader build. Error precedence mirrors
-            // build_mining_job_from_tdp: ScriptSigTooLong before
-            // InvalidAddress.
+            // Same error precedence as build_mining_job_from_tdp:
+            // ScriptSigTooLong before InvalidAddress.
             move || -> Result<Arc<MiningJob>, MiningJobError> {
                 let script_sig = checked_tdp_scriptsig(
                     template.coinbase_prefix,
@@ -547,10 +455,8 @@ impl MiningJobCache {
         Ok(job)
     }
 
-    /// Outputs-level lookup over the shared coalescing map. Called only
-    /// by a job-slot leader — the job-slot lock is held across the
-    /// outputs map lock + outputs-slot lock (lock order job-slot →
-    /// outputs-map → outputs-slot, no cycle; see the module docs).
+    /// Outputs-level lookup, called only by a job-slot leader while it holds
+    /// the job-slot lock (lock order in the module docs).
     fn get_or_parse_outputs(
         &self,
         network: Network,
@@ -565,8 +471,6 @@ impl MiningJobCache {
             hash,
             now,
             |k| k.as_tuple() == lookup,
-            // Share the job entry's payouts allocation — one copy per
-            // distinct payout set across both levels.
             move || OutputsKey {
                 network,
                 reward_sats,
@@ -586,11 +490,7 @@ impl MiningJobCache {
         Ok(outputs)
     }
 
-    /// Refresh the `last_used` of the outputs entry for
-    /// (network, reward, payouts) and return its shared payouts Arc, if
-    /// one exists. Called on every `get_or_build`, including a pure
-    /// job-hit, so the backing outputs entry never ages out under a live
-    /// job and a new job entry reuses the one payouts allocation.
+    /// Refresh the outputs entry and return its shared payouts Arc, if any.
     fn touch_outputs(
         &self,
         network: Network,
@@ -604,11 +504,8 @@ impl MiningJobCache {
             .touch(hash, now, |k| k.as_tuple() == lookup, |k| k.payouts.clone())
     }
 
-    /// Drop entries unused for `ENTRY_TTL`, rate-limited to one sweep
-    /// per `PRUNE_INTERVAL` per level. Piggybacked on every lookup AND
-    /// driven by the stratum translator tasks on each template update,
-    /// so memory is reclaimed even when no miner is connected (no
-    /// lookups).
+    /// Drop entries unused for `ENTRY_TTL`. Also driven on template updates,
+    /// so memory is reclaimed when no miner is connected to trigger lookups.
     pub fn prune_expired(&self) {
         let now = Instant::now();
         self.jobs.prune_expired(now);
@@ -623,8 +520,7 @@ impl MiningJobCache {
         }
     }
 
-    /// Test hook: force a sweep at `now` on both levels, bypassing the
-    /// PRUNE_INTERVAL rate limit.
+    /// Test hook: force a sweep at `now` on both levels, bypassing the rate limit.
     #[cfg(test)]
     fn prune_at(&self, now: Instant) {
         self.jobs.force_prune(now);
@@ -637,8 +533,7 @@ impl MiningJobCache {
         (self.jobs.entry_count(), self.outputs.entry_count())
     }
 
-    /// Test hook: `last_used` of the sole outputs entry (panics unless
-    /// exactly one exists — the single-payout-set test shape).
+    /// Test hook: `last_used` of the sole outputs entry.
     #[cfg(test)]
     fn sole_outputs_last_used(&self) -> Instant {
         self.outputs.sole_last_used()
@@ -736,8 +631,6 @@ mod tests {
 
     #[test]
     fn concurrent_same_key_callers_build_exactly_once() {
-        // 8 threads race on one key: exactly one leader builds, the
-        // rest coalesce onto its slot and share the same Arc.
         let (prefix, outputs) = tdp_fixture();
         let payouts = payouts_two_way();
         let cache = Arc::new(MiningJobCache::new());
@@ -769,9 +662,7 @@ mod tests {
 
     #[test]
     fn concurrent_distinct_keys_build_independently() {
-        // 8 threads with 8 distinct payout sets (the Solo/Group-Solo
-        // broadcast-storm shape): all build, none blocks on another
-        // key's slot, and every job pays its own miner.
+        // Distinct payout sets each build their own job.
         let (prefix, outputs) = tdp_fixture();
         let cache = Arc::new(MiningJobCache::new());
 
@@ -782,7 +673,6 @@ mod tests {
                 let outputs = outputs.clone();
                 std::thread::spawn(move || {
                     let tmpl = template(&prefix, &outputs);
-                    // Same addresses, distinct sats split per "finder".
                     let payouts = vec![
                         PayoutEntry {
                             address: MINER_A.to_string(),
@@ -812,8 +702,7 @@ mod tests {
 
     #[test]
     fn different_payout_sets_get_distinct_jobs() {
-        // The per-finder case (Solo / Group-Solo / Blockparty): two
-        // payout sets differing in ONE address must never share bytes.
+        // Payout sets differing in one address must never share bytes.
         let (prefix, outputs) = tdp_fixture();
         let tmpl = template(&prefix, &outputs);
         let cache = MiningJobCache::new();
@@ -841,8 +730,7 @@ mod tests {
 
     #[test]
     fn different_payout_amounts_get_distinct_jobs() {
-        // Same addresses, different sats split (e.g. a Group-Solo
-        // finder bonus moving between members) must be distinct keys.
+        // Same addresses with a different sats split must be distinct keys.
         let (prefix, outputs) = tdp_fixture();
         let tmpl = template(&prefix, &outputs);
         let cache = MiningJobCache::new();
@@ -865,7 +753,6 @@ mod tests {
 
     #[test]
     fn different_slot_sizes_reuse_parsed_outputs() {
-        // SV2 Extended: same payout set, channel-negotiated slot sizes.
         // Each slot size is its own job, but the address parse runs once.
         let (prefix, outputs) = tdp_fixture();
         let tmpl = template(&prefix, &outputs);
@@ -887,7 +774,6 @@ mod tests {
             "outputs parsed once across slot sizes"
         );
 
-        // Both must match their direct-build equivalents.
         for (job, slot) in [(&job_12, 12), (&job_16, 16)] {
             let direct =
                 build_mining_job_from_tdp(Network::Bitcoin, &payouts, &tmpl, "BP", slot, [0u8; 32])
@@ -901,8 +787,7 @@ mod tests {
     fn template_change_is_a_distinct_job_but_reuses_outputs() {
         let (prefix, outputs) = tdp_fixture();
         let tmpl_a = template(&prefix, &outputs);
-        // Same reward, different BIP-34 prefix (next height) — as in a
-        // template refresh where fees happened to cancel out.
+        // Same reward, different BIP-34 prefix (next height).
         let prefix_b = vec![0x03, 0x01, 0x35, 0x0c];
         let tmpl_b = template(&prefix_b, &outputs);
         let payouts = payouts_two_way();
@@ -927,10 +812,8 @@ mod tests {
 
     #[test]
     fn error_precedence_matches_direct_build() {
-        // Oversized TDP prefix (identifier-less scriptsig already > 100
-        // bytes) AND an invalid payout address: both the direct build
-        // and the cache must report ScriptSigTooLong — the scriptsig
-        // check runs before any address parse.
+        // Oversized scriptsig AND an invalid address: both paths must
+        // report ScriptSigTooLong.
         let long_prefix = vec![0x01; 95]; // 95 + 12-byte slot > 100
         let (_, outputs) = tdp_fixture();
         let tmpl = template(&long_prefix, &outputs);
@@ -985,9 +868,7 @@ mod tests {
 
     #[test]
     fn network_is_part_of_the_key() {
-        // Same bech32 string can't be valid on two networks, but the
-        // key must still separate networks so a (theoretical) shared
-        // encoding can never leak a script across networks.
+        // The key separates networks so a script can never leak across them.
         let (prefix, outputs) = tdp_fixture();
         let tmpl = template(&prefix, &outputs);
         let cache = MiningJobCache::new();
@@ -998,8 +879,6 @@ mod tests {
         let job = cache
             .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12, [0u8; 32])
             .unwrap();
-        // Regtest lookup with the same payouts must NOT return the
-        // mainnet job — it fails the parse instead of hitting.
         let regtest = cache.get_or_build(Network::Regtest, &payouts, &tmpl, "BP", 12, [0u8; 32]);
         assert!(regtest.is_err());
         drop(job);
@@ -1017,15 +896,12 @@ mod tests {
             .unwrap();
         assert_eq!(cache.entry_counts(), (1, 1));
 
-        // Within TTL: entries survive a sweep.
         cache.prune_at(Instant::now() + ENTRY_TTL / 2);
         assert_eq!(cache.entry_counts(), (1, 1));
 
-        // Past TTL: both levels are emptied.
         cache.prune_at(Instant::now() + ENTRY_TTL + Duration::from_secs(1));
         assert_eq!(cache.entry_counts(), (0, 0));
 
-        // And a rebuilt entry works fine afterwards.
         let again = cache
             .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12, [0u8; 32])
             .unwrap();
@@ -1035,9 +911,7 @@ mod tests {
 
     #[test]
     fn job_hit_refreshes_backing_outputs_entry() {
-        // A pure job-hit never reaches get_or_parse_outputs, yet it must
-        // still refresh the backing outputs entry's last_used so that entry
-        // does not age out under a live job.
+        // A pure job-hit must still refresh the backing outputs entry.
         let (prefix, outputs) = tdp_fixture();
         let tmpl = template(&prefix, &outputs);
         let payouts = payouts_two_way();
@@ -1048,11 +922,9 @@ mod tests {
             .unwrap();
         let built_at = cache.sole_outputs_last_used();
 
-        // Guarantee the monotonic clock advances so the refresh is
-        // observable (Instant has ns resolution on the CI platform).
+        // Let the clock advance so the refresh is observable.
         std::thread::sleep(Duration::from_millis(2));
 
-        // Pure job-hit: identical key.
         cache
             .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12, [0u8; 32])
             .unwrap();
@@ -1066,9 +938,7 @@ mod tests {
 
     #[test]
     fn job_key_shares_payouts_arc_with_outputs_key() {
-        // The payout vec is stored once per distinct payout set: the
-        // second template's JobKey reuses the outputs entry's Arc
-        // instead of cloning the vec again.
+        // The payout vec is stored once per distinct payout set.
         let (prefix, outputs) = tdp_fixture();
         let tmpl_a = template(&prefix, &outputs);
         let prefix_b = vec![0x03, 0x01, 0x35, 0x0c];

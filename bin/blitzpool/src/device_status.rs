@@ -1,20 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! [`bp_share_hook::DeviceStatusSink`] implementations, fired by SV1 and SV2:
-//!
-//! - [`DispatcherDeviceStatusSink`] — feeds the in-process
-//!   [`crate::device_status_gate::Gate`], which debounces and hands the
-//!   confirmed message to the `NotificationDispatcher`. For a process that
-//!   holds the dispatcher (a front co-located with the `notify` role).
-//! - [`ProducingDeviceStatusSink`] — `XADD`s the event to the Core→Satellite
-//!   `device:status` stream for a split front without a dispatcher; the
-//!   Satellite drains it into its gate. It publishes unfiltered: the front
-//!   holds no subscription state, and device events fire per
-//!   connect/disconnect, not per share.
-//!
-//! `is_returning` is NOT resolved here: only the gate knows whether the
-//! subscriber was told the device was gone, and it sets the flag on the
-//! online path, the only one that reads it.
+//! [`bp_share_hook::DeviceStatusSink`] impls for SV1 and SV2: straight into
+//! the in-process debouncing gate, or onto the `device:status` stream for a
+//! front without a dispatcher. `is_returning` is NOT resolved here: only the
+//! gate knows whether the subscriber was told the device was gone.
 
 use std::sync::Arc;
 
@@ -115,11 +104,9 @@ fn build_event(
     })
 }
 
-/// The device-status sink for both protocols. With an in-process dispatcher
-/// events go straight to its gate; without one they go to the
-/// `device:status` stream for the Satellite. No `gate` means "no co-located
-/// dispatcher", not "notifications off". One instance serves both
-/// protocols, so they cannot be wired to different destinations.
+/// The one device-status sink for both protocols, so they cannot be wired to
+/// different destinations. No `gate` means "no co-located dispatcher", not
+/// "notifications off": events then go to the stream for the Satellite.
 pub(crate) fn stratum_sinks(
     gate: Option<(
         Arc<crate::device_status_gate::Gate>,
@@ -133,12 +120,10 @@ pub(crate) fn stratum_sinks(
     }
 }
 
-/// Feeds both SV1 + SV2 device-status events into the shared
-/// [`Gate`](crate::device_status_gate::Gate). Cheap to clone
-/// (`Arc`-internal).
-///
-/// Nothing is sent here: the gate's sweeper decides when a transition is
-/// real, so a flapping connection does not produce one push per TCP event.
+/// Feeds device-status events into the shared
+/// [`Gate`](crate::device_status_gate::Gate). Nothing is sent here: the
+/// gate's sweeper decides when a transition is real, so a flapping
+/// connection does not produce one push per TCP event.
 #[derive(Clone)]
 pub(crate) struct DispatcherDeviceStatusSink {
     gate: Arc<crate::device_status_gate::Gate>,
@@ -245,8 +230,7 @@ mod tests {
         }
     }
 
-    /// The DTO is what crosses the Core→Satellite boundary, so its serde
-    /// round-trip + reconstruction must preserve every rendered field.
+    /// The wire DTO round-trips every rendered field.
     #[test]
     fn wire_round_trip_preserves_fields() {
         let ev = sample_event();
@@ -265,8 +249,7 @@ mod tests {
         );
     }
 
-    /// A corrupt/empty address on the wire must drop the event, not panic the
-    /// consumer task.
+    /// A corrupt address on the wire drops the event instead of panicking.
     #[test]
     fn into_event_rejects_unparseable_address() {
         let wire = DeviceStatusStreamEvent {

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Wire codecs for SV2 extensions 0x0001 ([`RequestExtensions`]), 0x0002
-//! (Worker-ID TLV, [`parse_worker_id_tlv`]) and 0x0003
-//! ([`SetPayoutDistribution`] plus the `distribution_id` TLV).
-//! 0x0001/0x0003 frames carry their own `extension_type`; the Worker-ID TLV
-//! rides on `SubmitSharesExtended`, whose frame keeps 0x0000.
-//!
-//! **TLV headers are little-endian**: SV2 Overview/Stratum V2 TLV Encoding
-//! Model types them as U16/U8, and U16 is LE in SV2. The big-endian `00 02`
-//! examples there and in ext 0x0002/Extended SubmitSharesExtended Message
-//! Format are treated as the error.
+//! ([`parse_worker_id_tlv`]) and 0x0003 ([`SetPayoutDistribution`]).
+//! **TLV headers are little-endian**, as SV2 Overview/Stratum V2 TLV Encoding Model
+//! types them U16/U8; the spec's big-endian `00 02` examples are taken as the error.
 
 // ── Spec constants ─────────────────────────────────────────────────
 

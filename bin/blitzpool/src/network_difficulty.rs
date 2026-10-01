@@ -1,21 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Keep the PPLNS window's network-difficulty view current.
-//!
-//! The window is capped at `window_factor × networkDifficulty`
-//! ([`bp_pplns_engine::window::WindowStore::window_size`]), so the value
-//! is refreshed periodically; a value read only at boot would make the
-//! window mean "x times the difficulty at the last restart".
-//!
-//! **Why an RPC and not the TDP template stream:** the value is read only
-//! by the trim inside `record_share`, which runs on the `payout` role, and
-//! that process has no TDP feed.
-//!
-//! **Why the guard matters.** `window_size` returns `0.0` for a
-//! non-positive difficulty, and a zero window size disables trimming (the
-//! "no difficulty seeded yet" state). A bad reading would therefore let the
-//! window grow without bound, so a failed or nonsensical reading leaves the
-//! last good value in place.
+//! Keep the PPLNS window's network difficulty current, so the window is
+//! `window_factor ×` today's difficulty, not the one at the last restart.
+//! Read over RPC because the `payout` role that trims has no TDP feed. A bad
+//! reading keeps the last good value: a zero window size disables trimming.
 
 use std::time::Duration;
 
@@ -25,17 +13,11 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
-/// How often the difficulty is re-read.
-///
-/// Bitcoin retargets every 2016 blocks; `getmininginfo` is a cheap local
-/// call, and ten minutes tracks a retarget within about one block.
+/// Ten minutes tracks a retarget within about one block.
 pub(crate) const REFRESH_INTERVAL: Duration = Duration::from_secs(600);
 
-/// Is this reading usable as the live window difficulty?
-///
-/// `None` ⇒ leave the previous value alone. Non-finite or non-positive
-/// values would zero `window_size` and switch trimming off. Magnitude is
-/// deliberately not checked: a retarget can move difficulty by a large factor.
+/// `None` ⇒ keep the previous value: non-finite or non-positive values would
+/// switch trimming off. Magnitude is not checked, a retarget can move it far.
 fn usable_difficulty(raw: f64) -> Option<f64> {
     (raw.is_finite() && raw > 0.0).then_some(raw)
 }
@@ -101,9 +83,7 @@ pub(crate) fn spawn_refresh_task(
 mod tests {
     use super::*;
 
-    /// A bad reading is never written: a zero window size disables the trim,
-    /// so the window would grow without bound and pay a block over an
-    /// ever-widening set of shares.
+    /// A bad reading never reaches the live window.
     #[test]
     fn an_unusable_reading_is_rejected_rather_than_written() {
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -115,8 +95,7 @@ mod tests {
         }
     }
 
-    /// A real reading is accepted at any magnitude, since a retarget can
-    /// move the difficulty by a large factor.
+    /// A real reading is accepted at any magnitude.
     #[test]
     fn any_positive_finite_reading_is_accepted() {
         for good in [1.0, 0.06, 1e-8, 1.2e14, f64::MAX] {
@@ -124,8 +103,7 @@ mod tests {
         }
     }
 
-    /// The handle is shared: a refresh is observable through the clone the
-    /// `WindowStore` holds.
+    /// A refresh is visible through the clone the `WindowStore` holds.
     #[test]
     fn setting_the_handle_is_observed_by_its_clone() {
         let live = NetworkDifficulty::new(1_000.0);

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Foundation handles: [`boot`] builds every long-lived dependency the
-//! engines need, in dependency order.
-//!
-//! 1. **Postgres**, **Redis** (PPLNS window and Group-Solo round state live
-//!    there) and **Bitcoin RPC** (with a `getnetworkinfo` ping): essential,
-//!    a failure is fatal.
-//! 2. **TDP** against the bitcoin-core IPC socket, front role only: fatal on
-//!    failure, since no templates means no jobs.
-//! 3. **GeoIP** and **Metrics**: optional; a failure is logged and the pool
-//!    runs without them.
+//! engines need, in dependency order. Postgres, Redis, Bitcoin RPC and (front
+//! role only) TDP are essential and fatal on failure, since no templates
+//! means no jobs; GeoIP and Metrics are optional.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,30 +28,24 @@ pub(crate) struct FoundationHandles {
     pub(crate) db: Db,
     pub(crate) redis: ConnectionManager,
     pub(crate) bitcoin_rpc: BitcoinRpc,
-    /// **Default** TDP stream — PPLNS-autoscaled reservation. Serves every
-    /// non-Solo payout mode (PPLNS / Group-Solo / Blockparty), plus JDP, the
-    /// bp-api block-template, and the coinbase-budget autoscaler.
-    /// `None` when `--skip-tdp`; consumers treat the missing handle as
-    /// "feature disabled" rather than fatal.
+    /// **Default** TDP stream with the PPLNS-autoscaled reservation; also
+    /// feeds JDP, the bp-api block-template and the autoscaler. `None` under
+    /// `--skip-tdp`, which consumers treat as "feature disabled".
     pub(crate) tdp: Option<TdpHandle>,
-    /// Fixed-reservation **alt** TDP streams keyed by [`StreamKind`] (Solo /
-    /// GroupSolo / Blockparty), each a separate IPC connection against the same
-    /// bitcoind. Their small fixed coinbase reservations reclaim the
-    /// PPLNS-sized block space those modes' blocks would otherwise waste.
-    /// Empty when `--skip-tdp`. Blockparty is present only when `[blockparty]`
-    /// is configured. Routed to per-connection by [`StreamKind::for_mode`].
+    /// Fixed-reservation **alt** TDP streams per [`StreamKind`], each its own
+    /// IPC connection: their small reservations reclaim the PPLNS-sized block
+    /// space those modes would waste. Routed per connection by
+    /// [`StreamKind::for_mode`].
     pub(crate) alt_tdp: HashMap<StreamKind, TdpHandle>,
     pub(crate) geoip: Option<Arc<GeoIpServiceHandle>>,
     pub(crate) metrics: Option<MetricsServiceHandle>,
 }
 
 impl FoundationHandles {
-    /// A dedicated Redis [`ConnectionManager`] for a blocking stream consumer.
-    /// A blocking command (`XREAD BLOCK`) must never share a multiplexed
-    /// connection — it head-of-line-blocks every command queued behind it on
-    /// that one connection. Falls back to the shared handle only if a fresh
-    /// connection can't be opened. `who` labels the consumer in the fallback
-    /// warning.
+    /// A dedicated Redis [`ConnectionManager`] for a blocking stream consumer:
+    /// `XREAD BLOCK` on a multiplexed connection head-of-line-blocks every
+    /// command queued behind it. Falls back to the shared handle only if a
+    /// fresh connection can't be opened.
     pub(crate) async fn dedicated_redis(&self, cfg: &RedisConfig, who: &str) -> ConnectionManager {
         match spawn_redis(cfg).await {
             Ok(c) => c,
@@ -311,10 +299,9 @@ pub(crate) fn bitcoin_network(n: bp_config::Network) -> bitcoin::Network {
 }
 
 /// Derive the bitcoin-core `CoinbaseOutputConstraints` for a coinbase weight
-/// budget. **Single source of truth** for budget→reservation: the boot path
-/// and the runtime autoscaler ([`crate::coinbase_autoscaler`]) both call it,
-/// so core's reservation never drifts from what the trimmer fits. A coinbase
-/// larger than core reserved makes core reject the block.
+/// budget. Boot and [`crate::coinbase_autoscaler`] both call it, so core's
+/// reservation never drifts from what the trimmer fits: a coinbase larger
+/// than core reserved makes core reject the block.
 pub(crate) fn tdp_constraint_for_budget(weight_budget: u32) -> TdpCoinbaseConstraints {
     // Non-witness outputs weigh ~4 × bytes; ceil errs on the side of more
     // headroom.

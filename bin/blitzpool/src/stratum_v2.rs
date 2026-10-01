@@ -1,19 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! SV2 mining-server composition.
-//!
-//! Builds one [`StratumV2MiningServer`] per port, the same port set as
-//! [`crate::stratum_v1`]. The `JdpDeclaredJobRegistry` bridge comes from
-//! [`crate::stratum::spawn`] and is shared by every port so
-//! `SetCustomMiningJob` routing works across ports.
-//!
-//! - Payout resolver: [`crate::payout_resolver::ProductionPayoutResolver`],
-//!   shared with SV1.
-//! - Block sink: [`crate::block_sink::TdpBlockSubmissionSink`], which submits
-//!   via TDP and books the per-mode engine ledger exactly like SV1.
-//! - Share sinks: the shared, mode-gated engine composites.
-//! - Session persistence: [`crate::stratum_v1::ModeGatePopulatingPersistence`],
-//!   so SV2 channels publish into the same mode gate as SV1.
+//! SV2 mining-server composition: one [`StratumV2MiningServer`] per port of
+//! [`crate::stratum_v1`]'s port set, with the same resolver, block sink,
+//! share sinks and mode gate as SV1. The JDP bridge is shared by every port
+//! so `SetCustomMiningJob` routing works across ports.
 
 use std::sync::{Arc, RwLock};
 
@@ -346,8 +336,7 @@ mod tests {
         }
     }
 
-    /// A well-known SV2 test private key, 32 raw bytes hex-encoded (also
-    /// used in `bp-stratum-v2/src/noise.rs` tests). Never a production key.
+    /// A well-known SV2 test private key, 32 raw bytes hex-encoded. Never a production key.
     const TEST_PRIVKEY_HEX: &str =
         "8d698e28310f2e60707bc4f26eebba81915dc4e2c6647e635ed452cbac49c5f6";
 
@@ -386,8 +375,7 @@ mod tests {
         ));
     }
 
-    /// 64 bytes that are not 64 ASCII characters: a multi-byte character
-    /// straddling a two-character hex pair is a decode error, not a panic.
+    /// A multi-byte character in a 64-byte key is a decode error, not a panic.
     #[test]
     fn build_noise_config_rejects_non_ascii() {
         let cfg = min_cfg_with_sv2(Some(format!("€{}", "a".repeat(61))));

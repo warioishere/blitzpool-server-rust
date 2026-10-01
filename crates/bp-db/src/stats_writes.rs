@@ -1,29 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Bulk-write primitives consumed by the share-stats coordinator
-//! (`bp-share-stats-sink`).
-//!
-//! UNNEST-based bulk upserts — every write is **increment-semantic**
-//! (`col = table.col + EXCLUDED.col` on conflict), so partial / retried
-//! flushes are idempotent against the accumulator drain/confirm contract:
-//! a flush that succeeded in PG but never confirmed gets re-included on
-//! the next tick, and `+= snapshot` on both sides keeps the totals
-//! eventually consistent.
-//!
-//! The 8 functions in this file split into three groups:
-//!
-//! 1. **Slot-bucketed stats** (5 tables, 10-minute slot granularity):
-//!    `pool_share_statistics_entity`, `pool_mode_hashrate`,
-//!    `pool_rejected_statistics_entity`, `client_statistics_entity`,
-//!    `client_rejected_statistics_entity`. All use UNNEST + ON CONFLICT
-//!    DO UPDATE with `+ EXCLUDED.col` accumulation.
-//! 2. **Lifetime totals** (2 tables, no slot dim):
-//!    `address_settings_entity` (one upsert folds the `shares` increment
-//!    AND the `bestDifficulty` GREATEST into a single row-write) and
-//!    `worker_shares_entity` (composite-PK INSERT … ON CONFLICT DO UPDATE).
-//! 3. **Seed bootstrap** (2 funcs): `count_worker_shares` +
-//!    `seed_worker_shares_from_client_statistics` for the one-shot boot
-//!    step that seeds worker-share rows from accumulated client statistics.
+//! UNNEST bulk upserts for the share-stats sink. Every write is
+//! increment-semantic (`col + EXCLUDED.col` on conflict), so a flush that
+//! landed in PG but was never confirmed can be re-sent on the next tick and
+//! the totals stay eventually consistent with the accumulator.
 
 use crate::pool::DbError;
 
@@ -185,13 +165,9 @@ pub struct ClientStatsUpsert {
 }
 
 /// Bulk-upsert client-statistics rows. UNIQUE (address, clientName,
-/// sessionId, "time") drives ON CONFLICT; all 11 numeric fields
-/// accumulate via `+ EXCLUDED.col`.
-///
-/// **Caller responsibility**: batch in chunks ≤ 1000 to stay under
-/// the PG parameter limit (each batch sends 15 arrays of length N;
-/// the limit is 65 535 parameters but `UNNEST` itself counts each
-/// inner element). 1000 rows = 15 000 conceptual elements; well safe.
+/// sessionId, "time") drives ON CONFLICT; numeric fields accumulate.
+/// The caller batches in chunks of at most 1000 rows to stay well under
+/// the PG parameter limit.
 pub async fn bulk_upsert_client_statistics_entity<'e, E>(
     executor: E,
     rows: &[ClientStatsUpsert],
@@ -371,12 +347,9 @@ where
 
 // ── 2. Lifetime totals ──────────────────────────────────────────────
 
-/// One row in an `address_settings_entity` bulk-upsert — folds a window's
-/// lifetime share delta and best-difficulty candidate into the single
-/// per-address row in one write. `delta_shares` is ADDED to the stored
-/// total; `best_difficulty` is the window MAX, folded via `GREATEST` (not
-/// added). `user_agent` stamps the firmware of the share that set a new
-/// best. Either side may be zero/`None` on a given tick.
+/// One row in an `address_settings_entity` bulk-upsert. `delta_shares` is
+/// ADDED to the stored total; `best_difficulty` is the window MAX, folded
+/// via `GREATEST`; `user_agent` is the firmware of the share that set it.
 #[derive(Clone, Debug)]
 pub struct AddressSettingsUpsert {
     pub address: String,
@@ -385,27 +358,10 @@ pub struct AddressSettingsUpsert {
     pub user_agent: Option<String>,
 }
 
-/// Bulk-upsert the per-address lifetime row: increment `shares` by the
-/// window delta AND fold the window-max best difficulty in via `GREATEST`
-/// — one write to `address_settings_entity` per address per flush.
-///
-/// - `shares` is increment-semantic (`shares + EXCLUDED.shares`); a
-///   missing row is INSERTed with the delta as its initial value, so a
-///   brand-new address keeps its first flush window of shares.
-/// - `"bestDifficulty"` only grows (`GREATEST`) — re-applying the same
-///   batch is a no-op, keeping partial/retried flushes idempotent.
-/// - `"bestDifficultyUserAgent"` + `"updatedAt"` move ONLY when the best
-///   difficulty actually grows (`"updatedAt"` tracks when a miner last set
-///   a new best). Postgres evaluates every SET RHS against the pre-update
-///   row, so the CASE guards compare against the stored best regardless of
-///   clause order.
-///
-/// The `"allTime*"` triple is the same fold against a second high-water
-/// mark that survives `/bestdiff_reset`, for the public leaderboard. Both
-/// are folded here in one statement so there is a single writer. The reset
-/// and delete endpoints must never lower `"allTimeBestDifficulty"`:
-/// `GREATEST` cannot restore it, since a flush only offers the current
-/// window's max.
+/// Bulk-upsert the per-address lifetime row. The user agent and
+/// `"updatedAt"` move only when the best grows; Postgres evaluates every SET
+/// RHS against the pre-update row, so clause order does not matter. The
+/// `"allTime*"` columns survive `/bestdiff_reset` and must never be lowered.
 pub async fn bulk_upsert_address_settings<'e, E>(
     executor: E,
     rows: &[AddressSettingsUpsert],
@@ -513,9 +469,8 @@ where
 
 // ── 3. Seed bootstrap ──────────────────────────────────────────────
 
-/// Count of rows in `worker_shares_entity`. Used by
-/// `bp-share-stats-sink::seed::seed_if_empty` to detect a fresh-DB
-/// setup that needs the one-shot bootstrap migration.
+/// Count of rows in `worker_shares_entity`; zero means the one-shot seed
+/// still has to run.
 pub async fn count_worker_shares<'e, E>(executor: E) -> Result<i64, DbError>
 where
     E: sqlx::PgExecutor<'e>,
@@ -527,16 +482,10 @@ where
     Ok(row.count)
 }
 
-/// One-shot bootstrap: aggregate `client_statistics_entity` into
-/// initial `worker_shares_entity` rows. Idempotent: ON CONFLICT DO
-/// NOTHING — if rows exist already (concurrent seed by another
-/// instance), the second call is harmless.
-///
-/// Aggregates `shares` (accepted-diff sum) and EVERY `rejected*Diff1`
-/// column into `rejectedShares` (the diff sum across all reject reasons).
-/// A reason added without a term here under-reports the worker row
-/// silently — the same contract [`bp_stats::ClientStatisticsRecord::
-/// rejected_diff_total`] carries on the in-memory side.
+/// One-shot seed of `worker_shares_entity` from `client_statistics_entity`;
+/// ON CONFLICT DO NOTHING makes a concurrent second seed harmless. Every
+/// `rejected*Diff1` column must be summed here, as in
+/// `bp_stats::ClientStatisticsRecord::rejected_diff_total`.
 pub async fn seed_worker_shares_from_client_statistics<'e, E>(executor: E) -> Result<u64, DbError>
 where
     E: sqlx::PgExecutor<'e>,

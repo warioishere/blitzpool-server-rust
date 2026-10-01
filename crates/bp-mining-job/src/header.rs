@@ -3,64 +3,21 @@
 //! Direct 80-byte block-header assembly for the share-validation hot path.
 //! No `bitcoin::Block` / `Transaction` allocations.
 
-/// The lowest `nVersion` bitcoin-core will accept in a block header, read
-/// as a **signed** `i32`. Below it the block is rejected with
-/// `bad-version(0x%08x)` and the pool loses the block silently, because
-/// `submit_solution` is fire-and-forget.
-///
-/// From `ContextualCheckBlockHeader` in core v31.0 (`src/validation.cpp`),
-/// where `CBlockHeader::nVersion` is declared `int32_t`:
-///
-/// ```text
-/// if ((block.nVersion < 2 && DeploymentActiveAfter(..., DEPLOYMENT_HEIGHTINCB)) ||
-///     (block.nVersion < 3 && DeploymentActiveAfter(..., DEPLOYMENT_DERSIG)) ||
-///     (block.nVersion < 4 && DeploymentActiveAfter(..., DEPLOYMENT_CLTV)))
-/// ```
-///
-/// The `< 4` rung is gated on CLTV being active; every network the pool can
-/// reach has it, so 4 is the operative floor.
-///
-/// ⚠️ **This is a property of the resulting version, not of which bits a
-/// miner rolled.** From a template version of `0x20000000`, rolling bit 29
-/// gives `0x00000000` (rejected), bit 31 `0xA0000000` (rejected, negative as
-/// `i32`), bit 30 `0x60000000` (accepted); from `0x30000000` the same bit 29
-/// gives `0x10000000` (accepted). The rolled delta alone cannot tell those
-/// apart.
+/// Lowest `nVersion` core accepts (`bad-version`), compared as a SIGNED `i32`
+/// with CLTV active. Below it the block is lost silently, since
+/// `submit_solution` is fire-and-forget. Check the resulting version: the
+/// rolled bits alone cannot tell an accepted version from a rejected one.
 pub const MIN_CONSENSUS_BLOCK_VERSION: i32 = 4;
 
-/// Whether a block carrying this header version can be submitted at all.
-/// See [`MIN_CONSENSUS_BLOCK_VERSION`].
+/// Whether a block with this version passes [`MIN_CONSENSUS_BLOCK_VERSION`].
 pub fn version_meets_consensus_floor(version: u32) -> bool {
     (version as i32) >= MIN_CONSENSUS_BLOCK_VERSION
 }
 
-/// Assemble the canonical 80-byte block header from a finished `version`.
-///
-/// Wire layout (matches `bitcoin::block::Header::consensus_encode` byte for byte):
-///
-/// | bytes  | field        | encoding  |
-/// |--------|--------------|-----------|
-/// | 0..4   | version      | Int32LE   |
-/// | 4..36  | prev_hash    | 32 raw bytes (already LE per template wire format) |
-/// | 36..68 | merkle_root  | 32 raw bytes (LE) |
-/// | 68..72 | timestamp    | UInt32LE  |
-/// | 72..76 | bits         | UInt32LE  |
-/// | 76..80 | nonce        | UInt32LE  |
-///
-/// ⚠️ **`version` is used verbatim — no version-rolling arithmetic happens
-/// here, deliberately.** BIP-310 specifies
-/// `nVersion = (job_version & ~mask) | (version_bits & mask)`, not an XOR,
-/// and the two protocols reach a finished version differently, so neither
-/// needs a mask here:
-///
-/// - **SV1** submits `version_bits`, a masked subset, so
-///   `bp_stratum_v1::submit` applies BIP-310's reconstruction against the
-///   session's negotiated mask and passes the result.
-/// - **SV2** submits the *full* nVersion (spec: `SubmitSharesStandard.version`
-///   is the "Full nVersion field"), so there is nothing to reconstruct.
-///
-/// A mask parameter would invite XOR semantics back in silently; there is
-/// nothing to pass, so there is no parameter.
+/// Assemble the 80-byte header, byte-identical to `consensus_encode`.
+/// `version` is used verbatim with no mask parameter: SV1 applies BIP-310's
+/// `(job & ~mask) | (bits & mask)` before calling, and SV2 already submits
+/// the full nVersion.
 pub fn build_block_header(
     version: i32,
     prev_hash: &[u8; 32],
@@ -79,17 +36,10 @@ pub fn build_block_header(
     h
 }
 
-/// Whether a share hash is proof of work for a block — the one block-found
-/// gate SV1 and SV2 both run.
-///
-/// Exact: `n_bits` decodes through `bitcoin::Target::from_compact`, the
-/// consensus decoding, and the hash is compared as a little-endian U256, so
-/// the verdict is the one bitcoin-core will reach. A difficulty comparison in
-/// `f64` would call a hash just above the target a block.
-///
-/// `hash_le` is the header's sha256d as it comes out of the hasher (internal,
-/// little-endian order). Reversing it to display order does not bring the
-/// test close to right, it inverts it.
+/// Whether a share hash is a block: the one block-found gate of SV1 and SV2.
+/// Exact U256 comparison against the consensus-decoded target, never an `f64`
+/// difficulty. `hash_le` is the hasher's internal little-endian order;
+/// reversing it to display order inverts the test.
 pub fn meets_network_target(hash_le: &[u8; 32], n_bits: u32) -> bool {
     let target =
         bitcoin::pow::Target::from_compact(bitcoin::pow::CompactTarget::from_consensus(n_bits));
@@ -100,8 +50,7 @@ pub fn meets_network_target(hash_le: &[u8; 32], n_bits: u32) -> bool {
 mod tests {
     use super::*;
 
-    /// The boundary is inclusive and exact: the target itself is a block,
-    /// one above it is not, for every `n_bits` tried.
+    /// The target itself is a block, target + 1 is not.
     #[test]
     fn the_network_target_boundary_is_exact() {
         for n_bits in [0x1d00_ffff_u32, 0x1703_4e33, 0x207f_ffff] {
@@ -129,10 +78,7 @@ mod tests {
         }
     }
 
-    /// Byte order: the genesis target is `0x00000000ffff0000…` in display
-    /// order. A hash with its only set bits just under that must pass, and one
-    /// with a set bit in the top four bytes must not — read in the wrong order
-    /// both verdicts flip.
+    /// The hash is read little-endian; the wrong order flips both verdicts.
     #[test]
     fn the_network_target_reads_the_hash_little_endian() {
         let mut below = [0u8; 32];
@@ -169,9 +115,7 @@ mod tests {
 
     #[test]
     fn the_consensus_floor_is_the_signed_comparison_core_makes() {
-        // Core reads nVersion as int32 and rejects `< 4`. An unsigned
-        // comparison would call 0x80000000 the largest version there is
-        // instead of the smallest.
+        // Unsigned, 0x80000000 would be the largest version, not the smallest.
         assert!(!version_meets_consensus_floor(0));
         assert!(!version_meets_consensus_floor(3));
         assert!(version_meets_consensus_floor(4));

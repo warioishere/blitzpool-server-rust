@@ -3,11 +3,8 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! Integration tests for the Group-Solo payout-history write path.
-//!
-//! Gated on docker-PG at `postgres://postgres:postgres@localhost:15433/public_pool`.
-//! Tests use TX-rollback isolation so parallel runs don't interfere
-//! and the schema-loaded container stays clean.
+//! Integration tests for the Group-Solo payout-history write path, against
+//! the local test PG; each test rolls its transaction back.
 
 use bp_db::{bulk_insert_pplns_group_block_history, GroupPayoutHistoryInsert};
 use sqlx::{postgres::PgPoolOptions, PgPool};

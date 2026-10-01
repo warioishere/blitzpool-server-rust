@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Pure handler layer for the JDP-server per-connection state machine.
-//!
-//! Each `handle_*` mutates `&mut JdpSessionState` and returns a
-//! [`JdpHandlerOutcome`] (outbound frames + [`JdpSessionEvent`]s), like
-//! [`crate::mining::client`]. No I/O: the IO layer (`jdp_server.rs`) resolves
-//! async hooks before the call. Handlers never close the socket; they emit
-//! [`JdpSessionEvent::Disconnect`] so the IO layer can write the pending
-//! `SetupConnection.Error` first (SV2 Overview/SetupConnection.Error).
+//! Pure handler layer for the JDP-server connection state machine: each
+//! `handle_*` mutates the session and returns a [`JdpHandlerOutcome`]. Handlers
+//! never close the socket; they emit [`JdpSessionEvent::Disconnect`] so the IO
+//! layer writes the pending `SetupConnection.Error` first.
 
 use std::collections::{HashMap, HashSet};
 
@@ -414,10 +410,8 @@ pub fn handle_setup_connection(
 
 // ── Handler: RequestExtensions (ext 0x0001) ─────────────────────────
 
-/// Handle ext 0x0001 `RequestExtensions`; dropped before setup, `Error` only
-/// when a non-empty request has nothing supported.
-///
-/// 0x0003 is offered only if `distribution_available`: ext
+/// Dropped before setup; `Error` only when a non-empty request has nothing
+/// supported. 0x0003 is offered only if `distribution_available`: ext
 /// 0x0003/SetPayoutDistribution must be the FIRST message after this exchange.
 pub fn handle_request_extensions(
     state: &mut JdpSessionState,

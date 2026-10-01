@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Share validation and difficulty math — pure, no I/O.
-//!
-//! Difficulty utilities within f64-precision tolerance of `1e-6` relative.
-//!
-//! Targets and hashes are 32-byte **little-endian** U256 — the on-wire
-//! convention for both SV1 (after the edge byte-reversal) and SV2
-//! (`SetTarget.maximum_target`). A hash *meets* a target iff
-//! `hash ≤ target` when both are read MSB-first.
+//! Share validation and difficulty math, pure and without I/O; difficulty
+//! results hold to `1e-6` relative. Targets and hashes are 32-byte
+//! little-endian U256, the wire form of SV1 (after the edge byte reversal)
+//! and SV2; a hash meets a target iff `hash ≤ target`.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -34,11 +30,8 @@ static TRUE_DIFF_ONE: LazyLock<BigUint> = LazyLock::new(|| {
     .expect("TRUE_DIFF_ONE is a valid BigUint literal")
 });
 
-/// [`TRUE_DIFF_ONE`] as an `f64`. The value is `0xffff · 2^208`, i.e. only
-/// 16 significant bits, so it is *exactly* representable as `f64` (the long
-/// decimal literal rounds to the exact value — pinned by
-/// `true_diff_one_f64_is_exact`). Used by the allocation-free `f64`
-/// [`target_to_difficulty`].
+/// [`TRUE_DIFF_ONE`] as an `f64`: `0xffff · 2^208` has 16 significant bits,
+/// so it is exact (pinned by `true_diff_one_f64_is_exact`).
 const TRUE_DIFF_ONE_F64: f64 =
     26959535291011309493156476344723991336010898738574164086137773096960.0;
 
@@ -161,13 +154,8 @@ pub fn sha256d(data: &[u8]) -> [u8; 32] {
     second.into()
 }
 
-/// SHA256d over the concatenation of `parts`, streamed straight into the
-/// hasher so the caller never allocates a joined buffer. Bit-identical to
-/// `sha256d(&parts.concat())` — SHA-256 is a streaming hash, so feeding the
-/// pieces one after another yields the same digest as hashing the whole.
-///
-/// Used on the per-share hot path to hash `coinbase_prefix + extranonce +
-/// suffix` without the per-share `Vec` a concatenation would need.
+/// `sha256d(&parts.concat())` without the joined buffer, for hashing the
+/// coinbase pieces on the per-share hot path.
 pub fn sha256d_from_parts(parts: &[&[u8]]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     for part in parts {
@@ -181,13 +169,9 @@ pub fn sha256d_from_parts(parts: &[&[u8]]) -> [u8; 32] {
 // Weight-proportional payouts (SV2 ext 0x0003 §4)
 // ============================================================================
 
-/// `floor(weight · t / w_total)` with 128-bit intermediates.
-///
-/// SV2 ext 0x0003 §4 mandates ≥128-bit intermediate arithmetic:
-/// `weight · t` reaches `(2^64−1)²  < 2^128`, so the product cannot
-/// overflow, and the quotient is `≤ t`, so the `u64` cast is lossless.
-/// `w_total` MUST be non-zero (§3.1: weight fields are non-0, so any
-/// well-formed distribution has `W ≥ 1`).
+/// `floor(weight · t / w_total)` with the 128-bit intermediates ext 0x0003
+/// §4 mandates; the quotient is `≤ t`, so the `u64` cast is lossless.
+/// `w_total` MUST be non-zero (§3.1 weight fields are non-0).
 pub fn mul_div_floor(weight: u64, t: u64, w_total: u128) -> u64 {
     debug_assert!(w_total > 0, "mul_div_floor: zero weight sum");
     ((weight as u128 * t as u128) / w_total) as u64
@@ -218,19 +202,10 @@ pub struct PayoutAmounts {
     pub pool_pay: u64,
 }
 
-/// Evaluate the SV2 ext 0x0003 §4 formulae:
-///
-/// ```text
-/// W         = weight_p + Σ weights[i]
-/// amount[i] = floor(weights[i] · t / W)
-/// pay[i]    = amount[i]  if amount[i] ≥ dust_limits[i], else pruned
-/// pay_P     = t − Σ pay[i]
-/// ```
-///
-/// This single implementation serves every party the pool controls: the
-/// pool's own coinbase build (with the pool's template revenue), the
-/// job-declaration validator (with the declared coinbase's total), and
-/// tests standing in for a JDC.
+/// The ext 0x0003 §4 formulae: `amount[i] = floor(weights[i]·t/W)`, pruned
+/// below `dust_limits[i]`, and `pay_P = t − Σ pay[i]`. The one
+/// implementation for the pool's coinbase build and the job-declaration
+/// validator, so both compute identical amounts.
 pub fn compute_payout_amounts(
     weight_p: u64,
     weights: &[u64],
@@ -275,21 +250,10 @@ pub const SUBSIDY_HALVING_INTERVAL: u32 = 210_000;
 /// Blocks between subsidy halvings on regtest.
 pub const REGTEST_SUBSIDY_HALVING_INTERVAL: u32 = 150;
 
-/// The block subsidy at `height`, in satoshis — consensus' own rule:
-/// 50 BTC halved once per `halving_interval` blocks, and 0 once the
-/// shift would exhaust a 64-bit value.
-///
-/// This is the floor settlement gates on. A coinbase may pay less than
-/// subsidy + fees, but a total below the subsidy alone means the block
-/// forfeited money it was entitled to; mempool drift or a declared
-/// template cannot cause that, so the gate never fires on a healthy block.
-///
-/// The interval is a parameter because regtest halves every 150 blocks;
-/// the mainnet constant would make every regtest block past 150 look short.
-///
-/// Fails OPEN (returns 0, so nothing is gated) on inputs that cannot
-/// describe a real block: a negative height (the dust sweep's synthetic
-/// audit rows) and a zero interval.
+/// Consensus block subsidy at `height`: the floor settlement gates on, since
+/// a coinbase below the subsidy alone forfeited money no healthy block
+/// would. Fails open (0) on a negative height (the dust sweep's synthetic
+/// rows) or zero interval; the interval is a parameter for regtest.
 pub fn block_subsidy_sats(height: i32, halving_interval: u32) -> u64 {
     if height < 0 || halving_interval == 0 {
         return 0;
@@ -309,15 +273,9 @@ pub fn miner_pot_sats(fee_ppm: u32, t: u64) -> u64 {
     ((t as u128 * miner_ppm) / 1_000_000u128) as u64
 }
 
-/// Ceiling on `X` as a percentage of `pot(t_ref)`: the extras may
-/// promise at most this much of the miners' cut, leaving the rest to be
-/// split by score.
-///
-/// The divisor of the whole projection is `pot − X`, so an `X` at or
-/// above the pot would divide by zero or flip the sign of every boost.
-/// Five percent of headroom also keeps a distribution payable: with the
-/// full pot promised away, every miner without a promise is pruned to
-/// nothing.
+/// Ceiling on `X` as a percentage of `pot(t_ref)`. The projection divides by
+/// `pot − X`, so `X ≥ pot` would divide by zero or flip every boost; the
+/// headroom also keeps miners without a promise from being pruned to nothing.
 const EXTRA_SOLVENCY_PERCENT: i128 = 95;
 
 /// The satoshi promises a weight distribution carries on top of the
@@ -335,16 +293,9 @@ pub struct ExtraProjection {
     pub divisor: u128,
 }
 
-/// Fold a ledger into the `(score_weight, extra_sats)` pairs
-/// [`project_extras`] consumes.
-///
-/// Trivial, and shared anyway: the build reads the pairs off its
-/// candidates and settlement off a stored snapshot, and the two must
-/// agree to the satoshi.
-///
-/// The Group-Solo finder bonus is not folded in: it is a proportion
-/// carried as plain score weight, exact at every revenue, and only
-/// amounts denominated in satoshis need projecting.
+/// Folds a ledger into the pairs [`project_extras`] consumes. Trivial but
+/// shared, because build and settlement must agree to the satoshi. The
+/// Group-Solo finder bonus is score weight, not a satoshi extra.
 pub fn extras_from_ledger<'a>(
     entries: impl IntoIterator<Item = (&'a str, u64, i64)>,
 ) -> Vec<(u64, i64)> {
@@ -354,34 +305,10 @@ pub fn extras_from_ledger<'a>(
         .collect()
 }
 
-/// Resolve the satoshi extras a distribution promises into the values
-/// it can actually honour at `reference_revenue_sats`.
-///
-/// `entries` is `(score_weight, extra_sats)` per address, where
-/// `extra_sats` is the SIGNED sum of everything that address is to
-/// receive beyond its score share: its ledger balance (negative when it
-/// owes the pool). The Group-Solo finder bonus is a proportion carried as
-/// score weight and never reaches this.
-///
-/// Two things are enforced, in this order:
-///
-/// 1. **Solvency.** `X` above `EXTRA_SOLVENCY_PERCENT` of the pot
-///    scales every extra down pro rata. The divisor `pot − X` has to
-///    stay positive, and a promise larger than the block cannot be kept
-///    however the weights are arranged.
-/// 2. **Repayment floor.** A debt can only be collected out of the
-///    payout it shrinks: once an address's weight would go negative
-///    there is nothing left to take, so its extra is floored at
-///    `−score_weight · (pot − X) / score_total` and the remainder stays
-///    on the ledger for the next block. Without the floor the pool
-///    weight goes negative and the block pays out more than it holds.
-///
-/// Deterministic and order-independent (a sum, a per-element scale and
-/// a per-element floor), so settlement reproduces the build's `X` from
-/// the stored snapshot without storing it. Note that a Group-Solo bonus
-/// must be capped BEFORE it is passed in — settlement only ever sees
-/// the capped value, so any scaling of the bonus itself would not be
-/// reproducible from the snapshot.
+/// Resolves signed per-address ledger extras into what the block can honour:
+/// scaled pro rata to the solvency cap, and each debt floored at what its
+/// own payout is worth (the rest stays on the ledger), else the block pays
+/// out more than it holds. Deterministic, so settlement reproduces `X`.
 pub fn project_extras(
     entries: &[(u64, i64)],
     score_total: u64,
@@ -390,9 +317,7 @@ pub fn project_extras(
 ) -> ExtraProjection {
     let pot = miner_pot_sats(fee_ppm, reference_revenue_sats) as i128;
     if pot <= 0 {
-        // Nothing can be promised out of an empty miner cut, in either
-        // direction — and a claim measured against it must come out 0,
-        // not as the mirror image of a debt nobody can be paid from.
+        // An empty miner cut can carry no promise in either direction.
         return ExtraProjection {
             effective: vec![0; entries.len()],
             total: 0,
@@ -403,16 +328,12 @@ pub fn project_extras(
     let mut effective: Vec<i128> = entries.iter().map(|(_, extra)| *extra as i128).collect();
 
     scale_to_cap(&mut effective, solvency_cap);
-    // Bound for the divisor: the floors below only ever RAISE an extra,
-    // so from here `X` can only grow and `pot − X` only shrink. Without
-    // it a ledger where every scoring address is beyond repayment has
-    // no finite solution at all.
+    // The floors only raise extras, so `pot − X` can only shrink from here;
+    // the bound gives a fully-indebted ledger a finite solution.
     let divisor_bound = (pot - sum(&effective)).max(1);
     apply_repayment_floors(&mut effective, entries, score_total, pot, divisor_bound);
-    // Raising the floors gives satoshis back, which can push the
-    // promises over the cap again. One more scale settles it, and it
-    // cannot re-break the floors: a scale shrinks every promise while
-    // `pot − X` grows, and a larger divisor is a looser floor.
+    // Floors can push promises over the cap again. One more scale settles
+    // it without re-breaking the floors: a larger divisor is a looser floor.
     scale_to_cap(&mut effective, solvency_cap);
 
     let total = sum(&effective);
@@ -422,9 +343,8 @@ pub fn project_extras(
             .map(|e| e.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
             .collect(),
         total: total.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
-        // Derived from the FINAL `X` rather than from the solve below,
-        // so the published boosts and the settlement claims are the two
-        // halves of one identity and cannot drift apart.
+        // From the final `X`, so published boosts and settlement claims
+        // cannot drift apart.
         divisor: (pot - total).max(1) as u128,
     }
 }
@@ -433,8 +353,7 @@ fn sum(values: &[i128]) -> i128 {
     values.iter().sum()
 }
 
-/// Scale every promise pro rata until they fit `cap`. A no-op unless
-/// the ledger is insolvent against this block.
+/// Scales every promise pro rata to fit `cap`.
 fn scale_to_cap(effective: &mut [i128], cap: i128) {
     let x = sum(effective);
     if x > cap {
@@ -444,16 +363,10 @@ fn scale_to_cap(effective: &mut [i128], cap: i128) {
     }
 }
 
-/// Pin every debt that cannot be collected out of the payout it shrinks
-/// to exactly what that payout is worth.
-///
-/// Solved rather than iterated: for a known set `F` of pinned addresses
-/// the divisor follows in closed form from `D = pot − X` and
-/// `X = Σ_{i∉F} extra_i − Σ_{i∈F} u_i·D/S`, and the set only grows
-/// (pinning raises `X`, which shrinks `D`, which pins more) — so at
-/// most one pass per address, and one or two in practice. Iterating the
-/// floor instead converges only geometrically and stalls short of the
-/// fixed point for a large debtor.
+/// Pins each uncollectable debt to what its payout is worth. Solved in
+/// closed form per pinned set, which only grows, so at most one pass per
+/// address; iterating the floor converges only geometrically and stalls
+/// short of the fixed point for a large debtor.
 fn apply_repayment_floors(
     effective: &mut [i128],
     entries: &[(u64, i64)],
@@ -481,8 +394,7 @@ fn apply_repayment_floors(
         divisor = if denom > 0 {
             (((pot - free_sum) * s) / denom).clamp(1, divisor_bound)
         } else {
-            // Every scoring address is beyond repayment: no finite
-            // divisor satisfies all the floors, so take the loosest one
+            // Every scorer is beyond repayment: take the loosest divisor
             // and let the caller's zero-clamp absorb the rest.
             divisor_bound
         };
@@ -507,32 +419,10 @@ fn apply_repayment_floors(
     }
 }
 
-/// A miner's settlement claim on a found block: its score share of
-/// whatever the block's miner cut has left after the satoshi promises,
-/// `floor(score_weight · (pot(t_actual) − extras_total) / score_total)`.
-///
-/// `extras_total` is `X` from [`project_extras`] — signed, and the same
-/// value the published weights were projected against. Subtracting it
-/// is what keeps the ledger from inventing money: the coinbase paid
-/// those promises out of this very pot, so a member with no promise of
-/// its own earns a share of the REST, not of the whole. Charging it the
-/// full pot would credit every such member the promises of the others,
-/// block after block.
-///
-/// The finder bonus does not appear here at all: it is a proportion
-/// folded into the finder's score weight at build time, so it is
-/// already inside `score_weight / score_total`.
-///
-/// Settlement books `balance += claim − actually_paid` per address,
-/// with `t_actual` and the paid amounts read from the REAL coinbase of
-/// the found block, so the claim must come from the same raw inputs the
-/// published weights were derived from, never from a projected wire
-/// weight. Signed: promises exceeding the block's own miner cut (the
-/// revenue came in far below the projection) make the residual claim
-/// negative, and the difference is a debt like any other.
-///
-/// Integer-exact; the i128 product `score · pot` stays far below 2^127
-/// for any real score precision and sat amount.
+/// Score share of the miner cut left after the promises `X` (from
+/// [`project_extras`]): the coinbase paid `X` from this pot, so charging the
+/// full pot would credit others' promises. Uses raw inputs, never wire
+/// weights; negative when promises exceed the block's actual miner cut.
 pub fn claim_sats(
     score_weight: u64,
     score_total: u64,
@@ -547,34 +437,10 @@ pub fn claim_sats(
     ((score_weight as i128 * claimable) / score_total as i128) as i64
 }
 
-/// Identity of a weight distribution: the settlement INPUTS, not any
-/// concrete satoshi outcome.
-///
-/// The same distribution legitimately yields different satoshi vectors
-/// for different template revenues (`floor(weight·T/W)`), so the
-/// identity is the thing every outcome is derived FROM: per address its
-/// integer score weight, its ledger balance at build time, and its dust
-/// limit, plus the fee (in parts-per-million) and an optional finder bonus. Settlement re-reads
-/// exactly these inputs from the snapshot stored under this hash and
-/// books `earned(T_actual) − actually_paid` per address.
-///
-/// `fee_address` IS in the preimage: it is the settlement recipient of
-/// everything the coinbase withholds, and the snapshot stored under
-/// this hash is read back to decide which row is the pool's rather than
-/// a miner's. Two distributions that differ only there must not share a
-/// key.
-///
-/// Deliberately NOT in the preimage: the published wire weights and
-/// the reference revenue behind their balance boosts — distributions
-/// that differ only there settle identically and may share a snapshot.
-/// `weight_P` follows the same rule: settlement never reads it, since
-/// what was actually paid comes from the block's own coinbase.
-///
-/// Canonical, domain-tagged, length-prefixed. Entry ORDER is part of
-/// the identity, so the caller must supply a canonical order that does
-/// not itself depend on an excluded input — address order. (The
-/// coinbase output order is NOT canonical: it sorts by wire weight,
-/// which carries the reference revenue through the balance boosts.)
+/// Hash of the settlement inputs (fee, `fee_address`, per-address score,
+/// balance, dust limit), not of wire weights or revenue, which settle
+/// identically. Entry order is hashed: pass address order, never coinbase
+/// order (it sorts by wire weight).
 pub fn weights_fingerprint_from_parts<'a>(
     fee_ppm: u32,
     fee_address: &str,
@@ -623,11 +489,8 @@ pub fn calculate_difficulty(header: &[u8]) -> ShareValidation {
 // Difficulty ↔ Target conversion
 // ============================================================================
 
-/// Interpret 32 little-endian bytes as a non-negative integer and convert
-/// to the nearest `f64`. Bytes beyond `f64`'s 53-bit mantissa fall below
-/// precision — correct, since a difficulty only needs ~15 significant
-/// digits — so the result carries a relative error on the order of `f64`
-/// epsilon (`~1e-15`), far inside the module's documented `1e-6` tolerance.
+/// 32 little-endian bytes as the nearest `f64`; the ~1e-15 relative error is
+/// far inside the module's `1e-6` tolerance.
 fn le_bytes_to_f64(bytes: &[u8; 32]) -> f64 {
     // MSB-first (index 31 down to 0): acc·256 + byte.
     let mut acc = 0.0f64;
@@ -652,15 +515,9 @@ fn biguint_to_le_bytes_32(n: &BigUint) -> [u8; 32] {
     out
 }
 
-/// Convert a target back to a floating-point difficulty:
-/// `difficulty = TRUE_DIFF_ONE / target`, computed directly in `f64`.
-///
-/// `TRUE_DIFF_ONE` (≈ 2^224, 16 significant bits) over a 256-bit target
-/// fits comfortably in `f64`'s ~15–16 significant digits, so no big-integer
-/// arithmetic is needed — keeping this **allocation-free** on the
-/// per-share validation hot path (it runs once per submitted share via
-/// [`calculate_difficulty`]). Accuracy against a big-integer reference is
-/// pinned by `prop_target_to_difficulty_matches_bigint_reference`.
+/// `TRUE_DIFF_ONE / target` in plain `f64`, keeping the once-per-share call
+/// from [`calculate_difficulty`] allocation-free. Accuracy is pinned by
+/// `prop_target_to_difficulty_matches_bigint_reference`.
 pub fn target_to_difficulty(target: &Target) -> Difficulty {
     let divisor = le_bytes_to_f64(&target.0);
     if divisor == 0.0 {
@@ -669,13 +526,9 @@ pub fn target_to_difficulty(target: &Target) -> Difficulty {
     Difficulty(TRUE_DIFF_ONE_F64 / divisor)
 }
 
-/// Convert a floating-point difficulty to a 32-byte LE target.
-/// `target = floor(TRUE_DIFF_ONE / difficulty)`.
-/// Invalid difficulties (≤ 0, NaN, infinite) saturate at `Target::MAX`.
-///
-/// Decomposes `diff` into integer + scaled-fractional BigUints so that
-/// large difficulties (above ~1e10) do not lose precision via integer
-/// overflow of the scaled intermediate value.
+/// `floor(TRUE_DIFF_ONE / difficulty)`; invalid difficulties give
+/// `Target::MAX`. Integer and scaled fraction are split so large
+/// difficulties do not overflow the scaled intermediate.
 pub fn difficulty_to_target(diff: Difficulty) -> Target {
     if !diff.0.is_finite() || diff.0 <= 0.0 {
         return Target::MAX;
@@ -696,18 +549,13 @@ pub fn difficulty_to_target(diff: Difficulty) -> Target {
     Target(biguint_to_le_bytes_32(&target_big))
 }
 
-/// One-slot memo for [`difficulty_to_target`] on the per-share accept
-/// check. A session validates nearly every share at the same difficulty
-/// (it moves only on a vardiff ratchet), so one `(difficulty bits →
-/// target)` slot serves them all and a miss just recomputes. Keyed on the
-/// exact f64 bit pattern, so the cached target is bit-identical to
-/// recomputing: purely a per-share BigUint-divide saving.
+/// One-slot memo for [`difficulty_to_target`]: a session's difficulty
+/// rarely changes, and keying on the exact f64 bits makes a hit
+/// bit-identical to recomputing.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TargetMemo(Option<(u64, Target)>);
 
 impl TargetMemo {
-    /// Target for `diff`: the cached one when `diff` matches the last
-    /// computed difficulty, otherwise `difficulty_to_target(diff)`, cached.
     pub fn target_for(&mut self, diff: Difficulty) -> Target {
         let key = diff.0.to_bits();
         if let Some((cached_key, cached_target)) = self.0 {
@@ -797,9 +645,7 @@ mod tests {
         Target(biguint_to_le_bytes_32(&big))
     }
 
-    /// Scaled big-integer division then `to_f64`: the reference the
-    /// allocation-free `f64` [`target_to_difficulty`] is checked against
-    /// (`prop_target_to_difficulty_matches_bigint_reference`).
+    /// Big-integer reference that [`target_to_difficulty`] is checked against.
     fn target_to_difficulty_bigint_reference(target: &Target) -> f64 {
         let divisor = BigUint::from_bytes_le(&target.0);
         if divisor.is_zero() {
@@ -812,8 +658,6 @@ mod tests {
 
     #[test]
     fn sha256d_from_parts_matches_concatenation() {
-        // Streaming the pieces into the hasher must be bit-identical to hashing
-        // the joined buffer — the invariant the per-share hot path relies on.
         let parts: [&[u8]; 4] = [
             b"coinbase-prefix",
             &[0x01, 0x02, 0x03, 0x04],
@@ -825,7 +669,6 @@ mod tests {
             joined.extend_from_slice(p);
         }
         assert_eq!(sha256d_from_parts(&parts), sha256d(&joined));
-        // Trivial single-part and empty cases hold too.
         assert_eq!(sha256d_from_parts(&[b"x"]), sha256d(b"x"));
         assert_eq!(sha256d_from_parts(&[]), sha256d(&[]));
     }
@@ -890,10 +733,8 @@ mod tests {
 
     #[test]
     fn meets_target_closes_float_precision_gap() {
-        // A hash exactly at the target is accepted by the byte-exact
-        // is_met_by_le, the real acceptance rule, so no float round-trip
-        // gap applies. target_to_difficulty rounds to nearest, so the
-        // recomputed difficulty lands within tolerance of D either way.
+        // Acceptance is the byte-exact `is_met_by_le`, so a hash at the
+        // target passes regardless of float round-trip error.
         for diff in [931.31, 1024.0, 65536.5, 1_000_000.0] {
             let target = difficulty_to_target(Difficulty(diff));
             assert!(target.is_met_by_le(&target.to_le_bytes()));
@@ -951,9 +792,8 @@ mod tests {
 
     #[test]
     fn difficulty_to_target_then_back_round_trips() {
-        // Covers production range (sub-unit CPU miners up to high-diff
-        // ASIC rentals at ~1e14), where a u64 cast of the scaled value
-        // would wrap.
+        // Sub-unit CPU miners up to ~1e14, where a u64 cast of the scaled
+        // value would wrap.
         for diff in [0.06, 1.0, 10.0, 1000.0, 65537.0, 1_000_000.0, 1e10, 1e14] {
             let target = difficulty_to_target(Difficulty(diff));
             let back = target_to_difficulty(&target).0;
@@ -978,14 +818,10 @@ mod tests {
 
     // ---- TargetMemo ----
 
-    /// The memo returns bit-identical results to an uncached
-    /// `difficulty_to_target` and recomputes on a difficulty change — a
-    /// pure performance shim, no behaviour change.
+    /// The memo matches uncached `difficulty_to_target` and recomputes on change.
     #[test]
     fn target_memo_matches_uncached_and_recomputes_on_change() {
         let mut memo = TargetMemo::default();
-        // Across a spread of difficulties (integer, fractional, extreme)
-        // the memoized target must be bit-identical to the uncached path.
         for d in [1.0, 1024.0, 65535.0, 0.5, 1e9, 1234.5678] {
             let direct = difficulty_to_target(Difficulty(d));
             assert_eq!(
@@ -1000,8 +836,6 @@ mod tests {
                 "diff {d}: repeat mismatch"
             );
         }
-        // Switching difficulty must recompute (no stale slot), and
-        // switching back must still yield the correct target.
         let a = memo.target_for(Difficulty(1024.0));
         let b = memo.target_for(Difficulty(2048.0));
         assert_ne!(a, b, "distinct difficulties must map to distinct targets");
@@ -1036,8 +870,7 @@ mod tests {
 
     #[test]
     fn clamp_no_op_when_assigned_target_under_max() {
-        // Hard maxTarget (diff 10_000), assigned target derived from diff 100 → easier
-        // than max-target requires; clamp must lift diff up to satisfy spec.
+        // Diff 100 is easier than the max target allows; clamp lifts it.
         let max_target = difficulty_to_target(Difficulty(10_000.0));
         let result = clamp_difficulty_to_max_target(Difficulty(100.0), &max_target);
         assert!(result.0 >= 10_000.0, "expected clamp up, got {}", result.0);
@@ -1090,10 +923,8 @@ mod tests {
 
     #[test]
     fn calculate_difficulty_genesis_block() {
-        // Bitcoin mainnet genesis header (80 bytes hex). Use the hash check
-        // as the primary assertion — that's what proves SHA256d + byte
-        // order are right. The share-difficulty value follows from the
-        // hash and is just sanity-checked to be in the expected range.
+        // Mainnet genesis header; the hash proves SHA256d and byte order,
+        // the difficulty is only range-checked.
         let header_hex = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c";
         let header = hex::decode(header_hex).unwrap();
         let result = calculate_difficulty(&header);
@@ -1106,9 +937,7 @@ mod tests {
             "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
         );
 
-        // Genesis *share* difficulty (≈ TRUE_DIFF_ONE / genesis_hash) is
-        // ≈ 2536, NOT 1.0 — 1.0 would be if the hash hit the target
-        // exactly; in fact it lands meaningfully below.
+        // The genesis hash lands well below the diff-1 target, so ≈ 2536.
         let d = result.submission_difficulty.0;
         assert!(
             (2500.0..2600.0).contains(&d),
@@ -1142,8 +971,6 @@ mod tests {
 
         #[test]
         fn prop_target_to_difficulty_matches_bigint_reference(target_le: [u8; 32]) {
-            // The f64 target_to_difficulty agrees with the scaled
-            // big-integer reference over arbitrary targets.
             let target = Target(target_le);
             let got = target_to_difficulty(&target).0;
             let want = target_to_difficulty_bigint_reference(&target);
@@ -1151,9 +978,7 @@ mod tests {
             if want == f64::MAX || got == f64::MAX {
                 prop_assert_eq!(want, got);
             } else {
-                // The residual is the reference's scaled-integer
-                // truncation; the f64 method matches the frozen reference
-                // values to 1e-9 (`target_to_difficulty_frozen_reference_values`).
+                // The residual is the reference's own scaled truncation.
                 let rel = (got - want).abs() / want;
                 prop_assert!(rel < 1e-5, "target={:?} got={} want={} rel={}", target_le, got, want, rel);
             }
@@ -1290,18 +1115,15 @@ mod tests {
         assert_eq!(claim_sats(0, 0, 0, 1000, 0), 0);
     }
 
-    /// The promises the coinbase already paid out come off the pot
-    /// BEFORE it is split by score — otherwise every member without a
-    /// promise is credited a share of everyone else's.
+    /// Promises already paid by the coinbase come off the pot before the
+    /// score split.
     #[test]
     fn claim_sats_excludes_the_promised_extras() {
         // Half the shares, no fee, T = 1000, 200 promised away.
         assert_eq!(claim_sats(500, 1000, 0, 1000, 200), 400);
-        // A net DEBT enlarges the pot: what one member repays is what
-        // the others are owed.
+        // A net debt enlarges the pot.
         assert_eq!(claim_sats(500, 1000, 0, 1000, -200), 600);
-        // Promises beyond the block's own miner cut leave a negative
-        // residual, which is a debt like any other.
+        // Promises beyond the miner cut leave a negative residual (a debt).
         assert_eq!(claim_sats(500, 1000, 0, 1000, 1400), -200);
     }
 
@@ -1318,8 +1140,7 @@ mod tests {
                 .map(|p| claim_sats(*p, total, fee_ppm, t, extras))
                 .sum();
             let fee_floor = (t as u128 * fee_ppm as u128 / 1_000_000) as i64;
-            // Σ claims is the pot minus the extras: the extras were
-            // already paid out of the same coinbase.
+            // The extras were paid out of the same coinbase.
             assert!(
                 sum + fee_floor + extras <= t as i64,
                 "claims + fee + extras exceeded revenue at extras={extras}"
@@ -1329,8 +1150,7 @@ mod tests {
 
     // ---- extras projection ----
 
-    /// Ordinary case: nothing to cap, `X` is the plain sum and the
-    /// divisor is what is left of the pot.
+    /// A solvent ledger passes through unchanged.
     #[test]
     fn project_extras_passes_through_a_solvent_ledger() {
         let p = project_extras(&[(500, 10_000), (500, -4_000)], 1000, 0, 1_000_000);
@@ -1339,9 +1159,8 @@ mod tests {
         assert_eq!(p.divisor, 1_000_000 - 6_000);
     }
 
-    /// Promises above 95 % of the pot scale down pro rata, and the
-    /// divisor survives — a distribution that divides by `pot − X` has
-    /// no answer at all once `X` reaches the pot.
+    /// Promises above 95 % of the pot scale down pro rata; the divisor stays
+    /// positive.
     #[test]
     fn project_extras_scales_an_insolvent_ledger_pro_rata() {
         let pot = 1_000_000i64;
@@ -1352,8 +1171,7 @@ mod tests {
         assert_eq!(p.divisor, (pot - p.total) as u128);
     }
 
-    /// Scaling is idempotent, which is what lets settlement re-derive
-    /// `X` from a snapshot that already holds capped values.
+    /// Scaling is idempotent, so settlement re-derives `X` from capped values.
     #[test]
     fn project_extras_scaling_is_idempotent() {
         let first = project_extras(&[(500, 900_000), (500, 900_000)], 1000, 0, 1_000_000);
@@ -1367,10 +1185,7 @@ mod tests {
         assert_eq!(first.effective, again.effective);
     }
 
-    /// A debt is only collectable out of the payout it shrinks. Beyond
-    /// that the weight would go negative, the pool weight with it, and
-    /// the block would promise more than it holds — so the extra is
-    /// floored and the rest waits for the next block.
+    /// A debt is floored at what the debtor's payout can repay.
     #[test]
     fn project_extras_floors_a_debt_at_what_the_payout_can_repay() {
         let pot = 1_000_000u64;
@@ -1385,8 +1200,7 @@ mod tests {
         assert_eq!(500 + boost, 0, "wire weight lands exactly at zero");
     }
 
-    /// A ledger of pure debt never triggers the solvency scale — the
-    /// divisor only grows.
+    /// A net debt never triggers the solvency scale.
     #[test]
     fn project_extras_never_scales_a_net_debt() {
         let p = project_extras(&[(1000, -100)], 1000, 0, 1_000_000);
@@ -1394,8 +1208,7 @@ mod tests {
         assert_eq!(p.divisor, 1_000_100);
     }
 
-    /// With no scores there is nothing to floor against; the projection
-    /// must still terminate with a usable divisor.
+    /// Without scores the projection still yields a usable divisor.
     #[test]
     fn project_extras_without_scores_is_well_defined() {
         let p = project_extras(&[(0, -5_000)], 0, 0, 1_000_000);
@@ -1405,10 +1218,7 @@ mod tests {
 
     // ---- weights fingerprint (v3) ----
 
-    /// `identical inputs agree, any input change disagrees`
-    ///
-    /// The finder bonus is carried as plain score weight, so a change to
-    /// it is a changed `score_weight`, covered by `weight` below.
+    /// Identical inputs agree; any input change disagrees.
     #[test]
     fn weights_fingerprint_binds_every_input() {
         let base = || {
@@ -1472,43 +1282,32 @@ mod tests {
         }
     }
 
-    /// Regtest halves every 150 blocks, so the interval has to be a
-    /// parameter: with the mainnet constant, every regtest block past
-    /// 150 would look like it had burned part of its own subsidy and
-    /// the settlement gate would refuse to book it.
+    /// Regtest uses its own 150-block halving schedule.
     #[test]
     fn regtest_uses_its_own_shorter_schedule() {
         const R: u32 = REGTEST_SUBSIDY_HALVING_INTERVAL;
         assert_eq!(block_subsidy_sats(149, R), 5_000_000_000);
         assert_eq!(block_subsidy_sats(150, R), 2_500_000_000);
         assert_eq!(block_subsidy_sats(300, R), 1_250_000_000);
-        // The regtest heights the pool's own harnesses mine at would be
-        // over-estimated by a factor of 4 under the mainnet schedule.
         assert!(block_subsidy_sats(500, R) < block_subsidy_sats(500, SUBSIDY_HALVING_INTERVAL));
     }
 
-    /// The subsidy runs out at the 33rd halving — 50 BTC is only about
-    /// 2^32 satoshis, so the last payable one is a single sat. The 64
-    /// guard is there for the SHIFT (`u64 >> 64` is undefined), not for
-    /// the money, and it has to hold at the far end of the height type.
+    /// The subsidy runs out at the 33rd halving, and the 64-halving shift
+    /// guard holds at the far end of the height type.
     #[test]
     fn subsidy_runs_out_and_the_shift_guard_holds() {
         const I: u32 = SUBSIDY_HALVING_INTERVAL;
         assert_eq!(block_subsidy_sats(32 * I as i32, I), 1);
         assert_eq!(block_subsidy_sats(33 * I as i32, I), 0);
         assert_eq!(block_subsidy_sats(i32::MAX, I), 0);
-        // Regtest reaches the shift guard at a height a test could
-        // plausibly mine to, so it must not panic there either.
+        // Regtest reaches the shift guard at a minable height.
         assert_eq!(
             block_subsidy_sats(64 * REGTEST_SUBSIDY_HALVING_INTERVAL as i32, 150),
             0
         );
     }
 
-    /// The gate must fail OPEN on anything that cannot describe a real
-    /// block, since a floor computed from nonsense would refuse to book a
-    /// good one. The dust sweep mints synthetic negative heights for its
-    /// audit rows.
+    /// Impossible inputs fail open, so a nonsense floor cannot block a booking.
     #[test]
     fn subsidy_fails_open_on_impossible_inputs() {
         assert_eq!(block_subsidy_sats(-1, SUBSIDY_HALVING_INTERVAL), 0);

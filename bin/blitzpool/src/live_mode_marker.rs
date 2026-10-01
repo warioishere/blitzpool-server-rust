@@ -1,18 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Per-address live mode marker written to Redis on every accepted share.
-//!
-//! `/api/pplns/mode/:address` reads `miner:{address}:mode` as the
-//! authoritative current-port marker (5-min TTL); when it's absent /
-//! expired the controller falls back to retrospective state derived
-//! from PPLNS window membership + group DB, which lags by hours after
-//! a port switch.
-//!
-//! The marker is debounced by [`MarkDebouncer`] — same-mode writes
-//! within 60 s are skipped, mode changes always go through (port-switch
-//! detection is the whole point of the marker). The Redis SET errors are
-//! best-effort: failure to write is logged but never blocks the share
-//! path.
+//! Per-address live mode marker, written best-effort on accepted shares (a
+//! failed write never blocks the share path). `/api/pplns/mode/:address` trusts
+//! it over the state-based derivation, which lags by hours after a port switch,
+//! so a mode change always bypasses the debounce.
 
 use std::sync::Arc;
 
@@ -24,16 +15,11 @@ use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use tracing::warn;
 
-/// 5 min. The marker's authority window — after this, the controller
-/// falls back to the state-based mode derivation.
+/// The marker's authority window; after it the API falls back to state.
 const MARKER_TTL_SECONDS: u64 = 5 * 60;
 
-/// `SharedAcceptedShareSink` that writes `miner:{address}:mode` after
-/// every accepted share, debounced to ≤ one write per minute per
-/// (address, mode) pair.
 pub(crate) struct LiveModeMarkerSink {
-    /// Cloned per write: `ConnectionManager` is internally multiplexed, so
-    /// no `Mutex` serializes marker writes on the hot path.
+    /// Cloned per write: multiplexed, so no `Mutex` on the hot path.
     redis: ConnectionManager,
     debouncer: Arc<MarkDebouncer>,
 }
@@ -129,7 +115,6 @@ mod tests {
 
         let sink = LiveModeMarkerSink::new(redis.clone(), Arc::new(MarkDebouncer::new()));
 
-        // Cleanup leftover key from a prior failed run.
         let _: () = redis::cmd("DEL")
             .arg(format!("miner:{address}:mode"))
             .query_async(&mut redis)
@@ -155,7 +140,6 @@ mod tests {
             "TTL must be in (0, MARKER_TTL_SECONDS] but was {ttl}"
         );
 
-        // Cleanup.
         let _: () = redis::cmd("DEL")
             .arg(format!("miner:{address}:mode"))
             .query_async(&mut redis)

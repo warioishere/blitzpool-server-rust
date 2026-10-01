@@ -1,20 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Satellite-side device-status stream consumer.
-//!
-//! Device-status events (miner online/offline) originate on the Stratum
-//! **front**, but the `NotificationDispatcher` lives on the Satellite. A split
-//! front therefore publishes each event to the `device:status` stream (see
-//! [`crate::device_status::ProducingDeviceStatusSink`]); this task drains that
-//! stream and feeds each event into the same
-//! [`Gate`](crate::device_status_gate::Gate) a dispatcher-holding process
-//! feeds directly. The gate's sweeper — not this task — is what sends.
-//!
-//! Notify-only (no ledger), so at-least-once delivery is harmless: a redelivery
-//! after a crash-before-`XACK` just re-sends one online/offline push, which is
-//! cosmetic. Tail-start ($) so a first run doesn't re-fire buffered history. The
-//! loop is [`bp_share_stream::StreamConsumer::run`]; this file supplies only
-//! the per-event handler.
+//! Satellite-side device-status stream consumer: device events originate on
+//! the Stratum front, the dispatcher lives here, so this feeds the stream into
+//! the same [`Gate`](crate::device_status_gate::Gate). Notify-only, so an
+//! at-least-once redelivery costs at most one duplicate push.
 
 use std::sync::Arc;
 
@@ -31,12 +20,9 @@ const BATCH: usize = 64;
 const GROUP: &str = "device-status";
 const CONSUMER: &str = "c1";
 
-/// Feeds each device-status event into the gate. Events that don't
-/// reconstruct into a notify payload (`into_event` → `None`) are dropped.
 struct DeviceStatusHandler {
     gate: Arc<crate::device_status_gate::Gate>,
-    /// Same subscriber filter the in-process sink applies — a split
-    /// front cannot know who is subscribed, so the drop happens here.
+    /// A split front cannot know who is subscribed, so the filter runs here.
     subscribers: crate::device_status_gate::SubscribedAddresses,
 }
 
@@ -52,10 +38,7 @@ impl StreamEntryHandler<DeviceStatusStreamEvent> for DeviceStatusHandler {
     }
 }
 
-/// Spawn the device-status stream consumer. Owns the gate + a Redis
-/// handle. Tail-start ($): a freshly-created group must not replay history (it
-/// would re-fire every buffered online/offline push); existing groups keep
-/// their offset.
+/// Tail-start: a fresh group must not replay buffered online/offline pushes.
 pub(crate) fn spawn(
     redis: ConnectionManager,
     gate: Arc<crate::device_status_gate::Gate>,
@@ -81,19 +64,13 @@ mod tests {
 
     const ADDR: &str = "bcrt1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l";
 
-    /// Over real Redis: online + offline events from the split front's
-    /// producing sink round-trip through XREADGROUP with the wire format
-    /// intact and are acked, the same path [`spawn`] runs.
+    /// Producer-sink events round-trip through XREADGROUP intact and are acked.
     #[tokio::test]
     async fn producing_sink_events_round_trip_and_ack() {
-        // Tests in this binary run in parallel and FLUSHDB their index on
-        // entry, so each needs its own DB number.
         let Some(redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 11).await else {
             eprintln!("redis unreachable — skipping device-status round-trip test");
             return;
         };
-        // Split front (no dispatcher) → publishes to DEVICE_STATUS_STREAM_KEY.
-        // Building the event needs no Postgres.
         let sink = ProducingDeviceStatusSink::new(redis.clone());
         sink.on_device_event(ADDR, "rig1", "sid-online", Some("cpuminer/2.5"), true)
             .await;

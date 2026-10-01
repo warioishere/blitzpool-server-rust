@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Group-Solo group, members, history, invitations, join-requests.
-//!
-//! - `pplns_group` — group config (UUID PK)
-//! - `pplns_group_member` — auto-id row, UNIQUE on address (one membership per address pool-wide)
-//! - `pplns_group_block_history` — UNIQUE (groupId, blockHeight, address)
-//! - `pplns_group_invitation` — token PK + status FSM
-//! - `pplns_group_join_request` — UUID PK + status FSM
+//! Group-Solo groups, members, block history, invitations and join-requests.
+//! `pplns_group_member` is UNIQUE on address: one membership per address
+//! pool-wide.
 
 use bp_common::{AddressId, Sats};
 use sqlx::{postgres::PgPool, FromRow};
@@ -258,11 +254,8 @@ pub async fn find_recent_group_block_history(
 }
 
 // ── Group-Solo payout-history writes ────────────────────────────────
-//
-// Consumer: `bp_group_solo_engine::history::apply_distribution` writes
-// one block's `pplns_group_block_history` rows inside one PG
-// transaction. There is no balance table behind it — Group-Solo pays
-// what the coinbase pays and owes nothing afterwards.
+// No balance table behind these: Group-Solo pays what the coinbase pays
+// and owes nothing afterwards.
 
 /// Bulk-insert block-history rows for one block-found. `ON CONFLICT
 /// ("groupId", "blockHeight", address) DO NOTHING` gates replays.
@@ -458,15 +451,10 @@ pub async fn find_group_join_request(
 }
 
 // ── Group-mgmt service-layer writes ─────────────────────────────────
-//
-// Consumed by `bp-group-mgmt-engine`'s GroupService /
-// PplnsGroupInvitationService / PplnsGroupJoinRequestService.
 
-/// INSERT a freshly-built `pplns_group` row. `active` and `isPublic` are
-/// set by the caller: a new group starts private, and active whenever its
+/// INSERT a new `pplns_group` row and return it read back. The caller sets
+/// `active` and `isPublic`: a new group starts private, and active when its
 /// creator alone meets `MIN_MEMBERS_ACTIVE`.
-/// Returns the full row read back (so the caller can attach it to the
-/// API response without a follow-up SELECT).
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_pplns_group<'e, E>(
     executor: E,
@@ -670,14 +658,9 @@ where
     Ok(result.rows_affected())
 }
 
-/// Partial-update DTO for `update_round_reset_config`.
-///
-/// - `Untouched` — column stays as is (field absent from request)
-/// - `Clear` — column is set to NULL or zero (field explicitly null)
-/// - `Set(value)` — column is overwritten (field set to a value)
-///
-/// `hour_local` is always `Set(0)`: calendar resets fire at midnight local
-/// time.
+/// Partial-update DTO for `update_round_reset_config`: `Untouched` keeps the
+/// column, `Clear` sets NULL or zero, `Set` overwrites. `hour_local` is always
+/// `Set(0)`: calendar resets fire at local midnight.
 #[derive(Clone, Debug, Default)]
 pub struct RoundResetConfigPatch {
     pub preset: PatchField<String>,
@@ -698,12 +681,8 @@ pub enum PatchField<T> {
     Set(T),
 }
 
-/// Apply the per-field round-reset config patch + `isPublic` toggle as one
-/// UPDATE: `Untouched` fields keep their column, the other two states map
-/// to `column = NULL` / `column = value` via `CASE WHEN $flag` chains.
-///
-/// Returns the freshly-read row so callers can attach it directly
-/// to the API response.
+/// Apply the round-reset patch + `isPublic` toggle as one UPDATE and return
+/// the row read back.
 #[allow(clippy::too_many_arguments)]
 pub async fn update_pplns_group_round_reset_config(
     pool: &PgPool,
@@ -1312,11 +1291,9 @@ where
 
 // ── Join-requests ───────────────────────────────────────────────────
 
-/// INSERT a fresh join-request row. The `id` is server-generated
-/// (`gen_random_uuid()` DEFAULT). Returns the read-back row. The
-/// unique partial index on `(groupId, address) WHERE status='pending'`
-/// makes a concurrent duplicate raise PG SQLSTATE `23505`; the caller
-/// surfaces that as a `'request-pending'` service error.
+/// INSERT a join-request and return it read back. A concurrent duplicate
+/// hits the pending-only unique index and raises SQLSTATE `23505`, which the
+/// caller maps to `'request-pending'`.
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_pplns_group_join_request<'e, E>(
     executor: E,

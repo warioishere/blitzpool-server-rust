@@ -307,12 +307,9 @@ struct WorkerEntry {
     channel_count: i32,
     start_time: String,
     last_seen: String,
-    /// The custom extranonce prefix stored for this worker (8 hex chars), or
-    /// `null` when it runs on the pool-allocated one. This is the **stored
-    /// configuration** from `pplns_custom_extranonce`, not proof that the
-    /// prefix is in effect: whether a live connection carries it depends on
-    /// the stratum core's Solo / Extended / primary-channel gates, which live
-    /// in another process and leave no trace in this table.
+    /// The stored custom extranonce prefix (8 hex chars), `null` for the
+    /// pool-allocated one. Stored configuration only, not proof it is in
+    /// effect: the stratum core's channel gates decide that in another process.
     extranonce: Option<String>,
 }
 
@@ -342,10 +339,8 @@ where
             let settings = find_address_settings(&s.pool, &addr).await?;
             let best_difficulty = settings.as_ref().map(|x| x.best_difficulty.floor() as u64);
             let total_shares = settings.map(|x| x.shares).unwrap_or(0.0);
-            // Custom extranonce overrides, keyed by worker. One query for the
-            // address (a handful of rows at most), then a map lookup per
-            // worker — the same worker on two sessions gets the same prefix,
-            // which is exactly what the override means.
+            // Keyed by worker: the same worker on two sessions gets the same
+            // prefix, which is what the override means.
             let overrides: BTreeMap<String, String> =
                 bp_db::find_custom_extranonces_for_address(&s.pool, &addr)
                     .await?
@@ -435,14 +430,10 @@ where
 
 // ─── GET /api/client/:address/:worker ────────────────────────────
 
-/// Per-slot chart entry for a worker page. Carries the hashrate
-/// (`data`), the raw accepted-share weight, and the per-reason
-/// rejection breakdowns (count + diff-1) the worker tile renders.
-///
-/// **One field pair per `bp_stats::RejectedReason` is a contract.** The
-/// tile shows these against `rejectedCount`, so a reason with no pair here
-/// is a reject the operator sees in the total and cannot find in the
-/// breakdown.
+/// Per-slot chart entry for a worker page: hashrate, accepted weight and
+/// per-reason rejects. **One field pair per `bp_stats::RejectedReason` is a
+/// contract**: a reason missing here is a reject the operator sees in the
+/// total and cannot find in the breakdown.
 #[derive(Serialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 struct WorkerChartEntry {
@@ -648,8 +639,7 @@ where
 
 // ─── POST mutations: reset / delete-stats / delete-all ───────────
 //
-// Three admin-style endpoints that purge per-address data.
-// Unauthenticated — token gating sits on the reverse proxy.
+// Unauthenticated here: token gating sits on the reverse proxy.
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -786,12 +776,8 @@ where
     .await
     .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
     // The address-settings row is EMPTIED, not deleted: dropping it would
-    // take `allTimeBestDifficulty` with it, and that is the one value no
-    // path may lower. `purge_address_stats` already
-    // zeroed the resettable best above; this clears the remaining
-    // per-address state. What stays behind is the leaderboard record,
-    // which carries no address — only a difficulty, a firmware string and
-    // a timestamp.
+    // take `allTimeBestDifficulty` with it, the one value no path may lower.
+    // What stays is the leaderboard record, which carries no address.
     sqlx::query!(
         r#"UPDATE address_settings_entity
            SET shares = 0,
@@ -817,10 +803,8 @@ where
 
 // ─── GET /api/client/:address/diff-scores ────────────────────────
 //
-// Hourly maximum share-difficulty (sourced from
-// `client_difficulty_statistics_entity.maxDifficulty`) over the
-// requested range. Always emits a contiguous hour-aligned bucket list
-// so the chart x-axis doesn't gap.
+// Hourly max share difficulty over the range, as a contiguous
+// hour-aligned bucket list so the chart x-axis does not gap.
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -922,19 +906,8 @@ where
 
 // ─── GET /api/client/:address/best-difficulty/today ──────────────
 //
-// The address's best share difficulty since `since` (epoch ms), which
-// the caller sets to its own local midnight. Read from the same hourly
-// rows as `diff-scores` (`client_difficulty_statistics_entity`), maxed
-// over every worker of the address.
-//
-// The filter is `"slotTime" >= since`, with no flooring to the hour: a
-// value from before the caller's midnight must never show after the
-// reset. The rows are UTC hours, so for a timezone with a half- or
-// quarter-hour offset the partial hour right after local midnight is
-// not counted.
-//
-// Not cached: `since` differs per timezone, and the query is a range
-// scan on the `(address, "slotTime")` index.
+// Best share since the caller's local midnight `since`: not floored to the
+// hour, so nothing pre-midnight shows; not cached, as `since` varies by zone.
 
 /// Oldest `since` accepted, relative to now. A local midnight is at most
 /// 24 h back, 25 h on a DST fall-back day; the extra hour is room for

@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `PplnsEngine` — top-level wiring of the PPLNS service-engine.
-//!
-//! Owns the Postgres pool, the Redis-backed `WindowStore`, the
-//! `DistributionBuilder` (with its inflight cache), the touch-buffer
-//! flush background task, and the daily 03:00-UTC dust-sweep background
-//! task.
-//!
-//! Construction:
+//! `PplnsEngine`: wires the Postgres pool, the Redis window, the distribution
+//! builder and the touch-flush and daily dust-sweep background tasks.
 //!
 //! ```no_run
 //! # use bp_pplns_engine::{config::PplnsEngineConfig, engine::PplnsEngine};
@@ -22,19 +16,6 @@
 //! # let _ = engine;
 //! # Ok(()) }
 //! ```
-//!
-//! Public API:
-//!
-//! - [`PplnsEngine::record_share`] — hot path; called per accepted share
-//!   *after* the stratum layer has resolved mode = PPLNS.
-//! - [`PplnsEngine::build_distribution`] — called by the
-//!   template-build path (and the JDP coinbase-outputs request path),
-//!   wraps the inflight cache.
-//! - [`PplnsEngine::on_block_found`] — called when a PPLNS-mode finder
-//!   wins a block; settles against the snapshot persisted at
-//!   template-build time and applies the ledger TX.
-//! - [`PplnsEngine::shutdown`] — flips the cancel watch so background
-//!   tasks exit cleanly.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -110,16 +91,8 @@ pub enum EngineError {
 }
 
 impl EngineError {
-    /// Would retrying this ever succeed?
-    ///
-    /// The confirmation watcher re-applies a pending block every tick
-    /// until the apply returns `Ok`. That suits a database blip, not a
-    /// verdict: an expired snapshot, a coinbase below its own subsidy or
-    /// an unparsable address fail the same way forever, so retrying would
-    /// hide the block behind a repeating warning.
-    ///
-    /// Terminal means no automatic path can book the block; the operator
-    /// reprocess reads the block's own coinbase off the chain.
+    /// True when retrying can never succeed, so the confirmation watcher must stop
+    /// re-applying and leave the block to the operator reprocess.
     pub fn is_terminal(&self) -> bool {
         match self {
             EngineError::Config(_)
@@ -128,14 +101,8 @@ impl EngineError {
             | EngineError::NoPayoutFingerprint { .. }
             | EngineError::RevenueBelowSubsidy { .. }
             | EngineError::Address(_) => true,
-            // A ledger error is usually infrastructure, but one of them is a
-            // verdict: a height that already carries a different block's
-            // payout rows will still carry them next tick. `LedgerError`
-            // owns that distinction so this engine and Group-Solo cannot
-            // disagree about it.
+            // `LedgerError` decides, so this engine and Group-Solo cannot disagree.
             EngineError::Ledger(e) => e.is_terminal(),
-            // Infrastructure, and the in-flight guard — all of these
-            // clear on their own.
             EngineError::Redis(_)
             | EngineError::Window(_)
             | EngineError::Db(_)
@@ -146,8 +113,7 @@ impl EngineError {
     }
 }
 
-/// Top-level handle. Cloneable (`Arc<Inner>`); callers share one
-/// engine across the whole pool.
+/// Top-level handle, shared across the whole pool.
 #[derive(Clone)]
 pub struct PplnsEngine {
     inner: Arc<Inner>,
@@ -164,13 +130,7 @@ struct Inner {
 }
 
 impl PplnsEngine {
-    /// Validate config, wire dependencies, spawn the two background
-    /// tasks (touch-buffer flush + daily dust-sweep), return a handle.
-    ///
-    /// The caller owns the `ConnectionManager` lifecycle indirectly:
-    /// the engine clones it into the `WindowStore`; on `shutdown` the
-    /// background tasks exit and the engine's last `Arc` drop closes
-    /// the connection.
+    /// Validate config, wire dependencies and spawn the ledger background tasks.
     pub async fn spawn(
         config: PplnsEngineConfig,
         redis: ConnectionManager,
@@ -180,12 +140,8 @@ impl PplnsEngine {
         Self::spawn_inner(config, redis, pool, net_diff, true).await
     }
 
-    /// Core-mode constructor: same wiring, but *without* the background
-    /// crons (touch-buffer flush + dust-sweep). The Core only reads the
-    /// window and builds distributions (`build_distribution`, which still
-    /// writes the snapshot key); all ledger-mutating crons run on the
-    /// Satellite. `record_share` is unaffected and unused on the Core
-    /// (the share path produces to the stream instead).
+    /// Core-mode constructor without the background tasks: those write the
+    /// ledger, which is the Satellite's job; the Core only builds distributions.
     pub async fn spawn_core(
         config: PplnsEngineConfig,
         redis: ConnectionManager,
@@ -210,18 +166,10 @@ impl PplnsEngine {
             net_diff,
             config.abandoned_balance_days,
         );
-        // Cold-start safety: if the by-address aggregate is empty but buckets
-        // exist (lost key), rebuild it once from the buckets. After this the
-        // hash is kept current incrementally; there is no periodic full recalc.
         window.bootstrap_window_if_needed().await?;
-        // Convert bucket-id scores to timestamps. Must run before the first
-        // trim, or the age rule reads ids as 1970 and drops the whole window.
-        // Idempotent.
-        //
-        // Deliberately NOT gated on `background_tasks`: the trim runs wherever
-        // the share stream is consumed, which this constructor cannot see
-        // (a Stats satellite without Front consumes it too). The cost is one
-        // empty ZRANGEBYSCORE per boot.
+        // Must run before the first trim, or the age rule reads ids as 1970 and
+        // drops the whole window. Not gated on `background_tasks`: the trim runs
+        // wherever the share stream is consumed, which this constructor cannot see.
         window.restamp_legacy_bucket_scores().await?;
         let dist_cfg = DistributionConfig::from_engine_config(&config);
         let distribution_builder = DistributionBuilder::new(pool.clone(), window.clone(), dist_cfg);
@@ -231,14 +179,7 @@ impl PplnsEngine {
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
 
-        // JoinHandles are not tracked: shutdown is signalled by `cancel_tx`
-        // and the tasks self-terminate. Callers needing precise join
-        // semantics wrap the engine in their own supervisor.
-        //
-        // Core mode (`background_tasks == false`) skips them entirely:
-        // touch-flush + dust-sweep write the ledger, which is the
-        // Satellite's job. The cancel channel is still wired so
-        // `shutdown` stays a no-op-safe call in either mode.
+        // JoinHandles are not tracked: the tasks exit on `cancel_tx`.
         if background_tasks {
             std::mem::drop(spawn_flush_task(
                 pool.clone(),
@@ -277,13 +218,8 @@ impl PplnsEngine {
         })
     }
 
-    /// Hot path. Called per accepted share AFTER the stratum layer has
-    /// resolved mode = PPLNS.
-    ///
-    /// Atomically appends the share to the window (one Lua script),
-    /// records the `lastAcceptedShareAt` touch (60s-buffered to PG),
-    /// and invalidates the distribution cache so the next
-    /// `build_distribution` call sees the new share.
+    /// Hot path, per accepted PPLNS share: append to the window, buffer the
+    /// last-share touch and invalidate the distribution cache.
     pub async fn record_share(
         &self,
         share_id: Option<&str>,
@@ -297,14 +233,11 @@ impl PplnsEngine {
             .record_share(share_id, address, difficulty, timestamp_ms)
             .await?;
         if !applied {
-            // Deduped redelivery: the window already counts this share, so
-            // the touch + cache-invalidate would be redundant work (and a
-            // redundant lastAcceptedShareAt bump). Skip them.
+            // Deduped redelivery: the window already counts this share.
             return Ok(());
         }
         self.inner.touch_buffer.mark(address, timestamp_ms as i64);
-        // A new share changes the window, and the cache is keyed by reward,
-        // so every entry is stale: drop them all (one HashMap::clear).
+        // The cache is keyed by reward, so a new share makes every entry stale.
         self.inner.distribution_builder.invalidate_all();
         Ok(())
     }
@@ -315,16 +248,14 @@ impl PplnsEngine {
         self.inner.distribution_builder.live_budget()
     }
 
-    /// Drop all cached distributions. The autoscaler driver calls this right
-    /// after changing the live budget so the next build re-runs the trimmer
-    /// against the new value instead of serving a stale cached result.
+    /// Drop all cached distributions, so a changed live budget takes effect on the
+    /// next build.
     pub fn invalidate_distribution_cache(&self) {
         self.inner.distribution_builder.invalidate_all();
     }
 
-    /// Build the current PPLNS payout distribution for a given
-    /// `block_reward_sats`. Wraps the inflight cache, persists a
-    /// snapshot to Redis so `on_block_found` can replay deterministically.
+    /// Build (or serve cached) the PPLNS distribution for `block_reward_sats`; the
+    /// build persists the snapshot `on_block_found` settles against.
     pub async fn build_distribution(
         &self,
         block_reward_sats: u64,
@@ -336,15 +267,10 @@ impl PplnsEngine {
             .map_err(EngineError::Distribution)
     }
 
-    /// The empty-window answer for one asking miner — see
-    /// [`crate::distribution::DistributionBuilder::build_bootstrap`].
-    ///
-    /// Only valid after [`Self::build_distribution`] answered
-    /// [`bp_pplns::WeightBuildError::NoScoredMiners`]. The caller is the
-    /// payout resolver, which is the only place that knows which miner is
-    /// asking; the pool-wide JDP publisher must NOT use this — it builds
-    /// one distribution for every job-declaring client at once and has
-    /// nobody to name.
+    /// The empty-window answer for one asking miner, valid only after
+    /// [`Self::build_distribution`] answered [`bp_pplns::WeightBuildError::NoScoredMiners`].
+    /// Not for the pool-wide JDP publisher: it serves every client at once and
+    /// has no miner to name. See [`crate::distribution::DistributionBuilder::build_bootstrap`].
     pub async fn build_bootstrap_distribution(
         &self,
         block_reward_sats: u64,
@@ -357,21 +283,10 @@ impl PplnsEngine {
             .map_err(EngineError::Distribution)
     }
 
-    /// Look up the settlement inputs the found block's coinbase was built
-    /// from, so the Core can stamp them into the block-found event.
-    ///
-    /// Resolved at the block-found instant, like Group-Solo's namesake,
-    /// while the snapshot key is still alive. The confirmation-gated apply
-    /// runs `confirmation_depth` blocks later, which can outlast
-    /// [`crate::config::PplnsEngineConfig::snapshot_ttl_secs`] (counted from
-    /// when the winning job was built). Per-job snapshot keys are not backed
-    /// up, and the block's coinbase says who WAS paid, never what the unpaid
-    /// were owed, so without this the withheld claims would be lost.
-    ///
-    /// `weights_fingerprint` is the identity of the winning job's payout
-    /// list, carried on the job the share was built on. The build that
-    /// produced that list stored its snapshot under it, and nothing else
-    /// writes that key.
+    /// Settlement inputs of the winning job's payout list, resolved at found-time
+    /// like Group-Solo's namesake: the confirmed apply can outlast
+    /// [`crate::config::PplnsEngineConfig::snapshot_ttl_secs`], and the coinbase alone
+    /// cannot tell what the unpaid were owed.
     pub async fn weight_snapshot_for_block_found(
         &self,
         weights_fingerprint: &[u8; 32],
@@ -387,20 +302,10 @@ impl PplnsEngine {
         .ok_or(EngineError::SnapshotMissingForPayouts)
     }
 
-    /// Apply a found block: settle `claim(T_actual) − paid` per address
-    /// against the block's OWN coinbase, then write the payout history.
-    ///
-    /// `snapshot` is the distribution's settlement inputs. The Core
-    /// resolves them at found-time and both paths carry them in — the
-    /// confirmation-gated one in the parked blob, the immediate one
-    /// straight through. `None` means that resolution failed (a Redis
-    /// blip); the fingerprint is then read back here as a second chance.
-    ///
-    /// Idempotent on redelivery without a guard of its own:
-    /// [`crate::ledger::apply_distribution`] checks the height's existing
-    /// payout history first. A redelivery whose value rows match what is
-    /// booked writes nothing and reports `history_inserted == 0`; one whose
-    /// rows differ is an error, never a second booking.
+    /// Settle `claim(T_actual) − paid` per address against the block's OWN coinbase.
+    /// `snapshot` is `None` only when found-time resolution failed; the fingerprint is
+    /// then read back as a second chance. Idempotent via
+    /// [`crate::ledger::apply_distribution`]: a differing redelivery errors, never rebooks.
     pub async fn on_block_found(
         &self,
         block_height: i32,
@@ -431,10 +336,6 @@ impl PplnsEngine {
         snapshot: Option<StoredWeightSnapshot>,
         payouts_fingerprint: Option<[u8; 32]>,
     ) -> Result<ApplyDistributionResult, EngineError> {
-        // 1. Snapshot source: the blob the Core resolved at found-time,
-        //    else a late read under the fingerprint (fallback for a Redis
-        //    blip at the found instant; the key may have expired by now,
-        //    see `weight_snapshot_for_block_found`).
         let snapshot = match snapshot {
             Some(s) => s,
             None => {
@@ -444,9 +345,8 @@ impl PplnsEngine {
                 self.weight_snapshot_for_block_found(&fingerprint)
                     .await
                     .map_err(|e| match e {
-                        // At apply time the missing key means the TTL won:
-                        // report it as the block-scoped failure the
-                        // operator reprocess keys off.
+                        // At apply time the TTL won: report the block-scoped
+                        // failure the operator reprocess keys off.
                         EngineError::SnapshotMissingForPayouts => {
                             EngineError::SnapshotMissing { block_height }
                         }
@@ -455,10 +355,8 @@ impl PplnsEngine {
             }
         };
 
-        // The one hard gate: a coinbase that pays less than its own
-        // subsidy destroyed money it was entitled to. No mempool drift,
-        // stale projection base or job-declaring client's template can
-        // produce that, so such a block is not booked blind.
+        // The one hard gate: no honest template pays less than its own subsidy,
+        // so such a block is not booked blind.
         let subsidy = block_subsidy_sats(block_height, self.inner.config.subsidy_halving_interval);
         if actual.total_value_sats < subsidy {
             error!(
@@ -473,14 +371,10 @@ impl PplnsEngine {
                 subsidy,
             });
         }
-        // 2. Settle. The balance write is absolute (`current + delta`), so
-        //    `current` MUST be read under `FOR UPDATE` in the same
-        //    transaction that writes it, or the daily dust sweep (which
-        //    targets exactly the balance-only entries a distribution
-        //    carries) could commit in between and be undone. The Redis
-        //    window read stays OUTSIDE the transaction: it only decides
-        //    which addresses get a 0-sat late-arriver audit row, and a
-        //    Redis stall must not hold a PG transaction open.
+        // The balance write is absolute, so `current` MUST be read `FOR UPDATE`
+        // in the writing transaction, or a dust sweep committing in between is
+        // undone. The window read stays outside: it only picks late-arriver rows,
+        // and a Redis stall must not hold a PG transaction open.
         let now_ms = chrono::Utc::now().timestamp_millis();
         let current_window = self.inner.window.read_window_by_address().await?;
         let addresses = Self::addresses_to_settle(&snapshot, actual);
@@ -498,9 +392,8 @@ impl PplnsEngine {
             apply_distribution(&mut tx, block_height, &audit_rows, &balance_writes, now_ms).await?;
         tx.commit().await.map_err(LedgerError::from)?;
 
-        // The weight snapshot is NOT consumed: it legitimately serves
-        // every block built from its distribution (settlement is a delta
-        // from the REAL coinbase). It expires by TTL.
+        // The snapshot is not consumed: it serves every block built from its
+        // distribution, and expires by TTL.
         self.inner.distribution_builder.invalidate_all();
 
         info!(
@@ -512,22 +405,16 @@ impl PplnsEngine {
         Ok(outcome)
     }
 
-    /// Every address this block settles, in the order the balance rows
-    /// must be LOCKED.
-    ///
-    /// Sorted, and that is load-bearing: `FOR UPDATE` acquires row locks
-    /// in the order the plan emits them, so a stable ordering here (and
-    /// the matching `ORDER BY address` in the query) is what keeps two
-    /// transactions touching the same two rows from deadlocking.
+    /// Every address this block settles, sorted: together with the query's
+    /// `ORDER BY address` this fixes the `FOR UPDATE` lock order, which keeps two
+    /// transactions on the same rows from deadlocking.
     fn addresses_to_settle(
         snapshot: &StoredWeightSnapshot,
         actual: &ActualCoinbase,
     ) -> Vec<String> {
         let mut set: std::collections::HashSet<String> =
             snapshot.entries.iter().map(|e| e.address.clone()).collect();
-        // Paid addresses outside the snapshot are settled too (they can
-        // only be 0-value script matches or operator surprises — logged
-        // in the builder — but the lifetime totals must not miss them).
+        // Paid addresses outside the snapshot too: lifetime totals must not miss them.
         set.extend(actual.paid_by_address.keys().cloned());
         set.remove(&snapshot.fee_address);
         let mut addresses: Vec<String> = set.into_iter().collect();
@@ -535,20 +422,10 @@ impl PplnsEngine {
         addresses
     }
 
-    /// The weight-model settlement: per snapshot entry compute the
-    /// claim from the raw inputs (`claim_sats(score, S, fee, T)`), read
-    /// what the coinbase actually paid the address, and book the
-    /// difference as a balance DELTA against the current ledger.
-    ///
-    /// Every case reduces to that one rule: an exactly-paid miner books
-    /// `0`; a dust-pruned or blockspace-folded miner books the full
-    /// claim as credit; a debt-carrying miner's claim pays the debt
-    /// down; an overpaid miner (revenue drifted below the projection)
-    /// books the overshoot as debt. The pool/fee output has no balance
-    /// row — `T − Σ claims` is the pool's by construction.
-    ///
-    /// Pure: `existing` comes in already read and LOCKED by the caller's
-    /// transaction, so the dust sweep cannot commit between read and write.
+    /// Per snapshot entry, book `claim_sats(score, S, fee, T) − paid` as a balance
+    /// delta: one rule covers exactly-paid, withheld, indebted and overpaid miners.
+    /// The fee output has no balance row; `T − Σ claims` is the pool's by construction.
+    /// `existing` must already be locked by the caller's transaction.
     fn build_writes_from_weight_snapshot(
         snapshot: &StoredWeightSnapshot,
         current_window: &HashMap<String, f64>,
@@ -561,20 +438,14 @@ impl PplnsEngine {
         let mut balance_writes: Vec<BalanceWrite> = Vec::new();
         let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        // The promises this distribution carried, recomputed exactly as
-        // the build did. Subtracting them is what keeps the ledger from
-        // inventing money: the coinbase paid those satoshis out of this
-        // same pot, so a miner without a promise of its own earns a
-        // share of the REST — charging it the full pot would credit it
-        // the others' promises on every block.
+        // The coinbase paid the carried promises out of this same pot, so claims
+        // are shares of the rest; using the full pot would invent money.
         let extras_total = snapshot.extras_total();
 
         for entry in &snapshot.entries {
             if entry.address == snapshot.fee_address {
-                // The fee address should never appear as a miner entry
-                // (the builder routes the pool share via weight_P), but
-                // if it does, its payment attribution is inseparable
-                // from the pool output — skip rather than misbook.
+                // Its payment is inseparable from the pool output: skip
+                // rather than misbook.
                 warn!(
                     address = %entry.address,
                     "weight settlement: fee address doubles as miner entry — skipping its row"
@@ -615,7 +486,6 @@ impl PplnsEngine {
             } else if delta != 0 {
                 audit_rows.push(pending_row(addr_id.clone(), Sats(delta)));
             } else {
-                // No payment, no ledger movement — nothing to record.
                 continue;
             }
             emitted.insert(entry.address.clone());
@@ -626,10 +496,8 @@ impl PplnsEngine {
             });
         }
 
-        // Coinbase outputs paying an address the snapshot does not know.
-        // With positional §7.1 validation this cannot happen for value-
-        // carrying outputs; surface loudly if it ever does, and book the
-        // payment into the lifetime total without inventing a claim.
+        // Outputs paying an address the snapshot does not know: book the payment
+        // into the lifetime total without inventing a claim.
         for (addr_str, paid) in &actual.paid_by_address {
             if *paid == 0 || emitted.contains(addr_str) || *addr_str == snapshot.fee_address {
                 continue;
@@ -684,22 +552,16 @@ impl PplnsEngine {
         Ok((audit_rows, balance_writes))
     }
 
-    /// Drop one cached distribution entry, so admin tooling can force a
-    /// recompute for one reward.
+    /// Drop one cached distribution, forcing a recompute for that reward.
     pub fn invalidate_distribution(&self, block_reward_sats: u64) {
         self.inner
             .distribution_builder
             .invalidate(block_reward_sats);
     }
 
-    /// Signal both background tasks to exit. Best-effort: the tasks
-    /// drain their final state (touch buffer flush, no final sweep)
-    /// before returning. The engine remains usable for synchronous
-    /// API calls until the underlying pool/redis connections are
-    /// dropped.
+    /// Signal the background tasks to exit; the touch buffer flushes once more.
     pub fn shutdown(&self) {
-        // `watch::Sender::send` returns Err if all receivers have
-        // dropped — fine, the tasks already exited.
+        // Err only when the tasks already exited.
         let _ = self.inner.cancel_tx.send(true);
     }
 
@@ -728,7 +590,6 @@ mod tests {
 
     #[test]
     fn engine_error_carries_source_variants() {
-        // Sanity: confirm the `From` impls compose. No runtime needed.
         fn _accepts_db(e: DbError) -> EngineError {
             EngineError::from(e)
         }

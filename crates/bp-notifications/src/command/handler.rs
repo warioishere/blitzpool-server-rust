@@ -1,21 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Dispatch a parsed [`Command`] against bp-db + the right adapter.
+//! Dispatch a parsed [`Command`] against bp-db and reply on the transport it came in on.
 //!
-//! The handler owns:
-//!
-//! - the `PgPool` (subscription reads + writes),
-//! - an optional Telegram adapter (used when the originating transport
-//!   is Telegram),
-//! - an optional ntfy adapter (used when the originating transport is
-//!   ntfy),
-//! - an in-memory map of per-chat Telegram languages (chat-language is
-//!   not persisted on the Telegram side — it lives for the process
-//!   lifetime, shared with the hourly-stats cron).
-//!
-//! The two listener loops (`listener::telegram`, `listener::ntfy`)
-//! parse incoming text via [`crate::command::parser::parse_command`] and call
-//! [`CommandHandler::dispatch`] with the matching [`Transport`].
+//! Telegram chat languages are not persisted; they live in a process-lifetime
+//! map shared with the hourly-stats cron.
 
 use std::collections::HashMap;
 use std::sync::Arc;

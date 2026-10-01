@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Invitation service — open-invite links.
-//!
-//! **Open** — admin generates a TTL-limited shareable link; multi-use;
-//! anyone whose joining address is verified (email OR signature) can claim
-//! it until TTL or manual revoke.
-//!
-//! Authentication: open-accept requires the link token AND a verified
-//! address (email or signature). Admin paths (create, list, revoke)
-//! require the group admin-token verified by [`GroupService`].
+//! Open-invite links: TTL-limited and multi-use. Claiming needs the link
+//! token AND an address verified by email or signature; admin paths
+//! (create, list, revoke) need the group admin token checked by
+//! [`GroupService`].
 
 use std::sync::Arc;
 
@@ -249,8 +244,6 @@ impl<H: GroupServiceHooks> InvitationService<H> {
         }
         let normalized =
             normalize_address(address).map_err(|_| InvitationServiceError::InvalidAddress)?;
-        // Unified onboarding gate: the joining address must be verified by a
-        // confirmed email OR a signature ownership proof.
         if !bp_db::is_address_verified(&self.pool, &normalized).await? {
             return Err(InvitationServiceError::EmailNotVerified);
         }

@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Response types for `getnetworkinfo`, `getmininginfo`, `getblockheader`,
-//! `getblock`, `getrawtransaction`.
-//!
-//! Fields mirror the JSON output of bitcoin-core v29+. Fields that may be
-//! absent in older / newer versions are wrapped in `Option`. Unknown
-//! fields are silently ignored by `serde` so new fields in future
-//! bitcoind releases do not break parsing.
+//! Bitcoin Core RPC response types (v29+ JSON). Fields that may be absent in
+//! other versions are `Option`; unknown fields are ignored so new Core
+//! releases do not break parsing.
 
 use serde::{Deserialize, Serialize};
 
@@ -40,8 +36,7 @@ pub struct NetworkInfo {
     pub incrementalfee: f64,
     #[serde(default)]
     pub localaddresses: Vec<LocalAddress>,
-    /// Free-form warning string (typically "" or a soft-fork notice).
-    /// In some bitcoind builds this becomes an array of strings; accept either.
+    /// A string or, in some bitcoind builds, an array of strings.
     #[serde(default)]
     pub warnings: serde_json::Value,
 }
@@ -74,9 +69,9 @@ pub struct MiningInfo {
     pub currentblockweight: Option<u64>,
     #[serde(default)]
     pub currentblocktx: Option<u64>,
-    /// Current network difficulty as a float (used for the `/api/network` response shape).
+    /// Current network difficulty.
     pub difficulty: f64,
-    /// Estimated network hash rate in H/s (`networkhashps`).
+    /// Estimated network hash rate in H/s.
     pub networkhashps: f64,
     pub pooledtx: u64,
     /// "main" | "test" | "signet" | "regtest"
@@ -93,12 +88,8 @@ pub struct MiningInfo {
 pub struct BlockHeaderInfo {
     /// Block hash (hex, big-endian display order).
     pub hash: String,
-    /// Confirmations of this block on the **active** chain:
-    /// `>= 1` when it is in the best chain (depth = this value),
-    /// `-1` when the header is known but NOT on the active chain
-    /// (i.e. the block was orphaned / reorged out). The block-found
-    /// confirmation watcher treats `>= confirmation_depth` as confirmed
-    /// and `< 0` as orphaned.
+    /// Depth on the active chain (`>= 1`), or `-1` when the header is known
+    /// but reorged out. The confirmation watcher decides on this field.
     pub confirmations: i64,
     /// Block height. Present for blocks on the active chain.
     #[serde(default)]
@@ -109,11 +100,7 @@ pub struct BlockHeaderInfo {
 mod tests {
     use super::*;
 
-    // ---- Fixture-based parsing tests ----
-    //
-    // These exercise only the deserialization of bitcoin-core's RPC output
-    // (the HTTP path is covered by the regtests) — they catch shape-drift
-    // between the struct definitions and the JSON the daemon emits.
+    // Fixture parsing only; the HTTP path is covered by the regtests.
 
     #[test]
     fn block_header_in_chain_parses_positive_confirmations() {
@@ -125,8 +112,7 @@ mod tests {
 
     #[test]
     fn block_header_orphaned_parses_negative_confirmations() {
-        // A header known to the node but NOT on the active chain reports
-        // confirmations = -1 (and may omit height).
+        // Off the active chain: confirmations = -1, height may be absent.
         let json = r#"{"hash":"00000000000000000001dead","confirmations":-1}"#;
         let h: BlockHeaderInfo = serde_json::from_str(json).unwrap();
         assert_eq!(h.confirmations, -1);
@@ -203,8 +189,7 @@ mod tests {
 
     #[test]
     fn mining_info_parses_minimal_subset() {
-        // Older / pruned builds might omit currentblock*. The struct
-        // marks those optional so this still parses.
+        // Some builds omit currentblock*.
         let json = r#"{
             "blocks": 851234,
             "difficulty": 79351641.4,
@@ -223,8 +208,8 @@ mod tests {
 // getblock (verbosity 1) / getrawtransaction (verbose)
 // ---------------------------------------------------------------------------
 
-/// `getblock <hash> 1` — the fields the pool reads. Verbosity 1 lists txids
-/// only, so a caller after the coinbase does not pull the whole block.
+/// `getblock <hash> 1`: txids only, so reading the coinbase does not pull
+/// the whole block.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockTxids {
     pub hash: String,
