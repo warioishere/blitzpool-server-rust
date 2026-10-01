@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Block-found history and RPC block-hex cache.
-//!
-//! - `blocks_entity` — append-only block-find log
-//! - `rpc_block_entity` — block-hex cache keyed by height with optional `lockedBy`
+//! Block-found history: `blocks_entity`, an append-only block-find log.
 
 use sqlx::{postgres::PgPool, FromRow};
 
@@ -116,22 +113,4 @@ pub async fn find_found_blocks(pool: &PgPool) -> Result<Vec<FoundBlockRow>, DbEr
     .fetch_all(pool)
     .await
     .map_err(DbError::from)
-}
-
-/// Hard-delete all `rpc_block_entity` rows except the one with the
-/// highest `blockHeight`. The table is a short-lived block-hex cache;
-/// only the current tip is ever needed, so older entries are pruned
-/// on the daily cleanup cron.
-pub async fn delete_old_rpc_blocks<'e, E>(executor: E) -> Result<u64, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    let r = sqlx::query!(
-        r#"DELETE FROM rpc_block_entity
-           WHERE "blockHeight" < (SELECT MAX("blockHeight") FROM rpc_block_entity)"#
-    )
-    .execute(executor)
-    .await
-    .map_err(DbError::from)?;
-    Ok(r.rows_affected())
 }

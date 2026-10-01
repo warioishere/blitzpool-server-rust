@@ -48,7 +48,6 @@ pub(crate) mod offsets {
     pub(crate) const KILL_DEAD: Duration = Duration::from_secs(0);
     pub(crate) const STATS_SINK_FLUSH: Duration = Duration::from_secs(17);
     pub(crate) const OLD_STATS_CLEANUP: Duration = Duration::from_secs(7);
-    pub(crate) const OLD_BLOCKS_CLEANUP: Duration = Duration::from_secs(13);
     pub(crate) const NETWORK_DIFFICULTY: Duration = Duration::from_secs(23);
     pub(crate) const HOURLY_STATS: Duration = Duration::from_secs(31);
     pub(crate) const BEST_DIFFICULTY: Duration = Duration::from_secs(37);
@@ -85,8 +84,6 @@ struct Inner {
     /// Hourly stats purge.
     old_stats_cancel: Option<CancellationToken>,
     old_stats_join: Option<JoinHandle<()>>,
-    old_blocks_cancel: Option<CancellationToken>,
-    old_blocks_join: Option<JoinHandle<()>>,
     invitation_expiry_shutdown: Option<watch::Sender<bool>>,
     join_request_expiry_shutdown: Option<watch::Sender<bool>>,
     // ── Notification crons (`notify` role); `None` when this process does
@@ -121,7 +118,6 @@ impl CronHandles {
                 maintenance = inner.ran_maintenance,
                 kill_dead = inner.kill_dead_cancel.is_some(),
                 old_stats_cleanup = inner.old_stats_cancel.is_some(),
-                old_blocks_cleanup = inner.old_blocks_cancel.is_some(),
                 invitation_expiry = inner.invitation_expiry_shutdown.is_some(),
                 join_request_expiry = inner.join_request_expiry_shutdown.is_some(),
                 stale_push_cleanup = inner.stale_push_cancel.is_some(),
@@ -147,9 +143,6 @@ impl CronHandles {
             c.cancel();
         }
         if let Some(c) = inner.old_stats_cancel {
-            c.cancel();
-        }
-        if let Some(c) = inner.old_blocks_cancel {
             c.cancel();
         }
         if let Some(c) = inner.stale_push_cancel {
@@ -181,11 +174,6 @@ impl CronHandles {
         if let Some(join) = inner.old_stats_join {
             if let Err(err) = join.await {
                 warn!(%err, "crons: old_stats_cleanup join failed");
-            }
-        }
-        if let Some(join) = inner.old_blocks_join {
-            if let Err(err) = join.await {
-                warn!(%err, "crons: old_blocks_cleanup join failed");
             }
         }
         if let Some(join) = inner.stale_push_join {
@@ -220,13 +208,6 @@ pub(crate) async fn spawn(
     let (old_stats_cancel, old_stats_join) = if run_maintenance {
         let c = CancellationToken::new();
         let j = spawn_old_stats_cleanup(pool.clone(), c.clone());
-        (Some(c), Some(j))
-    } else {
-        (None, None)
-    };
-    let (old_blocks_cancel, old_blocks_join) = if run_maintenance {
-        let c = CancellationToken::new();
-        let j = spawn_old_blocks_cleanup(pool.clone(), c.clone());
         (Some(c), Some(j))
     } else {
         (None, None)
@@ -313,8 +294,6 @@ pub(crate) async fn spawn(
             kill_dead_join,
             old_stats_cancel,
             old_stats_join,
-            old_blocks_cancel,
-            old_blocks_join,
             stale_push_cancel,
             stale_push_join,
             invitation_expiry_shutdown,
@@ -521,10 +500,9 @@ async fn sweep_repair_half(
     Ok(n)
 }
 
-// ─── Cleanup cron tasks (hourly stats purge + daily block purge) ──
+// ─── Cleanup cron tasks (hourly stats purge + weekly push purge) ──
 
 const HOURLY_TICK: Duration = Duration::from_secs(60 * 60);
-const DAILY_TICK: Duration = Duration::from_secs(24 * 60 * 60);
 const WEEKLY_TICK: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// 90-day inactivity threshold: subscriptions whose `lastNotificationAt`
 /// (or `createdAt` when never notified) is older than this are hard-deleted.
@@ -608,30 +586,6 @@ pub(crate) fn spawn_old_stats_cleanup(pool: PgPool, cancel: CancellationToken) -
             }
         }
         info!("crons.old_stats_cleanup: loop stopped");
-    })
-}
-
-/// Daily cron: purge all rpc_block_entity rows except the tip.
-pub(crate) fn spawn_old_blocks_cleanup(pool: PgPool, cancel: CancellationToken) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ticker = staggered_interval(DAILY_TICK, offsets::OLD_BLOCKS_CLEANUP);
-        info!("crons.old_blocks_cleanup: loop started");
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    info!("crons.old_blocks_cleanup: cancelled");
-                    break;
-                }
-                _ = ticker.tick() => {
-                    match bp_db::delete_old_rpc_blocks(&pool).await {
-                        Ok(0) => {}
-                        Ok(n) => info!(count = n, "crons.old_blocks_cleanup: purged"),
-                        Err(err) => warn!(%err, "delete_old_rpc_blocks"),
-                    }
-                }
-            }
-        }
-        info!("crons.old_blocks_cleanup: loop stopped");
     })
 }
 

@@ -40,8 +40,8 @@ pub use address_ownership::{
     OwnershipChallengeRow,
 };
 pub use block::{
-    delete_old_rpc_blocks, find_found_blocks, found_block_miner_at_height, insert_found_block,
-    payout_recorded_at_height, FoundBlockRow,
+    find_found_blocks, found_block_miner_at_height, insert_found_block, payout_recorded_at_height,
+    FoundBlockRow,
 };
 pub use blockparty::{
     delete_blockparty_join_link, delete_blockparty_member, delete_blockparty_members_for_group,
