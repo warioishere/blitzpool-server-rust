@@ -15,7 +15,7 @@ use moka::future::Cache;
 use serde::Serialize;
 
 /// Wrapped moka cache + the per-endpoint TTL table. Each value carries its
-/// own TTL, which [`EntryTtl`] hands to moka.
+/// own TTL, which `EntryTtl` hands to moka.
 #[derive(Clone)]
 pub struct ResponseCache {
     inner: Cache<String, (Bytes, Duration)>,
