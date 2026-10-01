@@ -123,6 +123,8 @@ async fn invalidate_group_cache(state: &SharedState, id: Uuid) {
         "GROUP_REJECTED_",
         "GROUP_DISTRIBUTION_",
         "GROUP_BEST_DIFFICULTY_",
+        "GROUP_MAX_DIFFICULTY_",
+        "GROUP_WINDOW_TIMELINE_",
         "GROUP_HISTORY_",
         "GROUP_INVITATIONS_",
         "GROUP_JOIN_REQUESTS_",
@@ -1919,6 +1921,55 @@ mod tests {
 
     fn parse_include_decided(s: Option<&str>) -> bool {
         s.map(|v| v == "1" || v == "true").unwrap_or(false)
+    }
+
+    /// Every group-scoped cache key is dropped by a group mutation; a key
+    /// left out serves the pre-change body until its TTL.
+    #[tokio::test]
+    async fn a_group_mutation_drops_every_group_scoped_cache_key() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1/unused")
+            .expect("lazy pool");
+        let state: SharedState = std::sync::Arc::new(crate::state::AppState::new(pool, "0.0.0"));
+        let id = Uuid::new_v4();
+        let keys: Vec<String> = [
+            "GROUP_PUBLIC_DETAIL_",
+            "GROUP_DETAIL_",
+            "GROUP_HASHRATE_",
+            "GROUP_CHART_",
+            "GROUP_ACCEPTED_",
+            "GROUP_REJECTED_",
+            "GROUP_DISTRIBUTION_",
+            "GROUP_BEST_DIFFICULTY_",
+            "GROUP_HISTORY_",
+            "GROUP_INVITATIONS_",
+            "GROUP_JOIN_REQUESTS_",
+            "GROUP_OPEN_INVITE_ACTIVE_",
+            "GROUP_WINDOW_TIMELINE_",
+        ]
+        .iter()
+        .map(|p| format!("{p}{id}"))
+        .chain([format!("GROUP_MAX_DIFFICULTY_{id}_24h")])
+        .collect();
+        let cached = |key: String, v: u8| {
+            let state = state.clone();
+            async move {
+                state
+                    .cache
+                    .get_or_fetch_secs(key, 600, async move { Ok::<_, ()>(v) })
+                    .await
+                    .unwrap()
+            }
+        };
+        for key in &keys {
+            cached(key.clone(), 1).await;
+        }
+
+        invalidate_group_cache(&state, id).await;
+
+        for key in &keys {
+            assert_eq!(&cached(key.clone(), 2).await[..], b"2", "{key} survived");
+        }
     }
 
     /// An unknown `finderBonusSats` key is refused, not a silent no-op.
