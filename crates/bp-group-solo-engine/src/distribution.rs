@@ -9,19 +9,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bp_coinbase_snapshot::{
-    build_and_snapshot, share_map_from_redis_hash, BuildRequest, StoredWeightSnapshot,
-};
+use bp_coinbase_snapshot::{build_and_snapshot, share_map_from_redis_hash, BuildRequest};
 use bp_common::{AddressId, Sats};
 use bp_db::{find_group, DbError};
 use bp_inflight_cache::InflightResultCache;
 use bp_pplns::{WeightBuildError, WeightDistribution, WithheldValue};
 use sqlx::PgPool;
 use thiserror::Error;
-use tracing::warn;
 use uuid::Uuid;
 
-use crate::round::snapshot::write_weight_snapshot;
 use crate::round::{GroupRoundStore, RoundError};
 
 /// Default cache TTL for `DistributionBuilder::build` (30 s).
@@ -218,23 +214,6 @@ async fn compute_distribution(
         config.snapshot_ttl_secs,
     )
     .await?;
-
-    // The per-(group, finder) key is written alongside for the manual
-    // reprocess path. Best-effort: the fingerprint key above is the one
-    // a booking resolves, and it alone decides `snapshot_written`.
-    let snapshot = StoredWeightSnapshot::from_distribution(&built.distribution);
-    let mut conn_finder = round.connection_for_snapshot();
-    if let Err(err) = write_weight_snapshot(
-        &mut conn_finder,
-        &group_key,
-        finder_address.as_str(),
-        &snapshot,
-        config.snapshot_ttl_secs,
-    )
-    .await
-    {
-        warn!(%err, %group_id, "group-solo per-finder snapshot write failed");
-    }
 
     Ok(DistributionResult {
         group_id,

@@ -158,16 +158,16 @@ async fn reset_scheduled_wipes_redis_pg_state_and_stamps() {
 
     let round = GroupRoundStore::new(conn);
     let group_key = group_id.to_string();
-    // Pre-state: shares + snapshot.
+    // Pre-state: shares + the snapshot of a job still being mined.
     round
         .record_share(None, &group_key, "test_reset_a", 100.0, 1)
         .await
         .unwrap();
+    let job_key = snapshot::key_for_fingerprint(&group_key, &[0x5au8; 32]);
     let mut snap_conn = round.connection_for_snapshot();
-    snapshot::write_weight_snapshot(
+    bp_coinbase_snapshot::snapshot::write_weight_snapshot(
         &mut snap_conn,
-        &group_key,
-        "test_reset_finder",
+        &job_key,
         &bp_coinbase_snapshot::StoredWeightSnapshot {
             entries: vec![],
             score_total: 0,
@@ -188,12 +188,13 @@ async fn reset_scheduled_wipes_redis_pg_state_and_stamps() {
 
     // Redis state wiped.
     assert!(round.read_by_address(&group_key).await.unwrap().is_empty());
+    // A job built before the reset can still find a block; its snapshot stays.
     let mut snap_conn = round.connection_for_snapshot();
     assert!(
-        snapshot::read_weight_snapshot(&mut snap_conn, &group_key, "test_reset_finder")
+        bp_coinbase_snapshot::snapshot::read_weight_snapshot(&mut snap_conn, &job_key)
             .await
             .unwrap()
-            .is_none()
+            .is_some()
     );
 
     // lastRoundResetAt stamped to clock's now_ms.

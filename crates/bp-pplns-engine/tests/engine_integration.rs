@@ -1142,7 +1142,7 @@ async fn unknown_fingerprint_refuses_instead_of_booking_the_shared_key() {
 // payout-history guard is what turns a redelivery into a no-op.
 
 #[tokio::test]
-async fn apply_consumes_the_fingerprinted_snapshot_so_redelivery_fails_closed() {
+async fn a_redelivered_apply_books_nothing_and_the_snapshot_outlives_its_block() {
     let _guard = balance_table_lock().lock().await;
     let h = match spawn_or_skip(17, "test_engine_consume_").await {
         Some(h) => h,

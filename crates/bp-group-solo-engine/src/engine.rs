@@ -29,7 +29,6 @@ use crate::history::{
 };
 use crate::reset::{spawn_per_group_task, GroupResetRunner, ResetError, ResetSchedule};
 
-use crate::round::snapshot::{delete_all_for_group, delete_snapshot_for};
 use crate::round::{GroupRoundStore, RoundError, WINDOW_BUCKET_MS};
 
 #[derive(Debug, Error)]
@@ -593,14 +592,13 @@ impl GroupSoloEngine {
     ) -> Result<ApplyDistributionResult, EngineError> {
         let group_key = group_id.to_string();
 
-        // 1. Snapshot source: event-carried, else the fingerprint key,
-        //    else the per-(group, finder) key (tests / manual path).
+        // 1. Snapshot source: event-carried, else the fingerprint key.
         let snapshot = match snapshot {
             Some(s) => s,
             None => {
-                let mut conn = self.inner.round.connection_for_snapshot();
                 let read = match weights_fingerprint.filter(|fp| fp != &[0u8; 32]) {
                     Some(fp) => {
+                        let mut conn = self.inner.round.connection_for_snapshot();
                         bp_coinbase_snapshot::resolve_snapshot_for_block_found(
                             &mut conn,
                             |fp| crate::round::snapshot::key_for_fingerprint(&group_key, fp),
@@ -609,14 +607,7 @@ impl GroupSoloEngine {
                         )
                         .await?
                     }
-                    None => {
-                        crate::round::snapshot::read_weight_snapshot(
-                            &mut conn,
-                            &group_key,
-                            finder_address.as_str(),
-                        )
-                        .await?
-                    }
+                    None => None,
                 };
                 read.ok_or(EngineError::SnapshotMissing {
                     group_id,
@@ -705,23 +696,8 @@ impl GroupSoloEngine {
             }
         }
 
-        let mut conn = self.inner.round.connection_for_snapshot();
-        if let Err(e) = delete_all_for_group(&mut conn, &group_key).await {
-            warn!(
-                %group_id,
-                error = %e,
-                "delete_all_snapshots_for_group failed — non-fatal, TTL fallback"
-            );
-        }
-        if let Some(fp) = weights_fingerprint {
-            if let Err(e) = delete_snapshot_for(&mut conn, &group_key, &fp).await {
-                warn!(
-                    %group_id,
-                    error = %e,
-                    "delete_snapshot_for failed — non-fatal, TTL fallback"
-                );
-            }
-        }
+        // The snapshot is not consumed: jobs built from its distribution may
+        // still be mined, and it expires by TTL, as PPLNS does.
         self.inner.distribution_builder.invalidate_all();
 
         info!(

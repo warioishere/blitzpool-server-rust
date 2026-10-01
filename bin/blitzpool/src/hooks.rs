@@ -19,7 +19,6 @@ use bp_group_mgmt_engine::{
     EmailHooks, GroupServiceHooks, JoinDecisionEmailContext, JoinDecisionOutcome,
 };
 use bp_group_solo_engine::engine::GroupSoloEngine;
-use bp_group_solo_engine::round::snapshot as group_solo_snapshot;
 use bp_notifications::adapter::{
     AdapterError, FcmAdapter, FcmConfig, FcmServiceAccount, SmtpAdapter,
     SmtpConfig as NotifSmtpConfig, VapidConfig, WebPushAdapter,
@@ -295,8 +294,6 @@ impl GroupServiceHooks for ProductionGroupServiceHooks {
         kicked_address: &AddressId,
         _remaining_addresses: &[AddressId],
     ) {
-        let group_id_str = group_id.to_string();
-
         // Redis: drop the address from the payout source of the group's
         // mode (PROP round or both window lanes), its reject counter, the
         // inactivity clock and, if it was theirs, the best share.
@@ -323,23 +320,6 @@ impl GroupServiceHooks for ProductionGroupServiceHooks {
             }
         }
 
-        // Redis: delete the kicked member's per-finder snapshot (TTL fallback otherwise).
-        let mut snap_conn = self.group_solo.round().connection_for_snapshot();
-        if let Err(err) = group_solo_snapshot::delete_snapshot(
-            &mut snap_conn,
-            &group_id_str,
-            kicked_address.as_str(),
-        )
-        .await
-        {
-            warn!(
-                %err,
-                %group_id,
-                address = %kicked_address.as_str(),
-                "group-hooks: delete kicked-member snapshot failed (best-effort)"
-            );
-        }
-
         // Nothing to settle in Postgres: `forget_member` removed their
         // shares from the round, so the next distribution splits between
         // whoever is left. That is the redistribution.
@@ -361,7 +341,7 @@ impl GroupServiceHooks for ProductionGroupServiceHooks {
                 );
             }
         }
-        // Redis: delete every snapshot of this group, per-finder and per-job.
+        // Redis: delete every snapshot of this group.
         // Other wipes spare the per-job keys because they back live jobs;
         // a dissolved group can book no block, so they go too.
         let mut snap_conn = self.group_solo.round().connection_for_snapshot();

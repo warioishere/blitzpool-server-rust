@@ -66,11 +66,7 @@ async fn round_state(
         .read_by_address(group_key)
         .await
         .expect("read_by_address");
-    let total = engine
-        .round()
-        .read_total(group_key)
-        .await
-        .expect("read_total");
+    let total = by_addr.values().sum();
     (by_addr, total)
 }
 

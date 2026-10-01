@@ -27,7 +27,6 @@ const FEE_ADDR: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
 /// Parseable addresses: a shape-only placeholder is dropped by the build's
 /// sanitize pass and leaves an empty share map that proves nothing.
 const FINDER_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
-const FINDER_B: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
 
 struct Harness {
     pool: PgPool,
@@ -309,55 +308,6 @@ async fn finder_bonus_from_db_row_is_applied() {
         (diff - expected).abs() <= 2,
         "finder bonus in the receipt diff: {diff}, expected {expected}"
     );
-
-    cleanup_group(&h.pool, h.group_id).await;
-}
-
-// ── Test 4 — per-finder snapshot isolation ─────────────────────────
-
-#[tokio::test]
-async fn per_finder_snapshots_are_isolated() {
-    let h = match spawn_or_skip(3, None).await {
-        Some(h) => h,
-        None => return,
-    };
-    let finder1 = AddressId::new(FINDER_A).unwrap();
-    let finder2 = AddressId::new(FINDER_B).unwrap();
-    h.round
-        .record_share(None, &h.group_id.to_string(), finder1.as_str(), 50.0, 1)
-        .await
-        .unwrap();
-    h.round
-        .record_share(None, &h.group_id.to_string(), finder2.as_str(), 50.0, 2)
-        .await
-        .unwrap();
-
-    h.builder
-        .build(h.group_id, 312_500_000, &finder1)
-        .await
-        .expect("ok");
-    h.builder
-        .build(h.group_id, 312_500_000, &finder2)
-        .await
-        .expect("ok");
-
-    let mut conn = h.round.connection_for_snapshot();
-    let s1 = bp_group_solo_engine::round::snapshot::read_weight_snapshot(
-        &mut conn,
-        &h.group_id.to_string(),
-        finder1.as_str(),
-    )
-    .await
-    .unwrap();
-    let s2 = bp_group_solo_engine::round::snapshot::read_weight_snapshot(
-        &mut conn,
-        &h.group_id.to_string(),
-        finder2.as_str(),
-    )
-    .await
-    .unwrap();
-    assert!(s1.is_some());
-    assert!(s2.is_some());
 
     cleanup_group(&h.pool, h.group_id).await;
 }

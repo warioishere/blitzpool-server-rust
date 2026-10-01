@@ -8,9 +8,8 @@
 
 use bp_group_mgmt::group::PayoutMode;
 use bp_group_solo_engine::round::{
-    key_applied, key_best_share, key_by_address, key_counter, key_last_accepted_share_at,
-    key_rejected_shares, key_total, key_window_buckets, key_window_by_address, snapshot,
-    GroupRoundStore, WindowLane, WINDOW_BUCKET_MS,
+    key_applied, key_best_share, key_by_address, key_last_accepted_share_at, key_rejected_shares,
+    key_window_buckets, key_window_by_address, GroupRoundStore, WindowLane, WINDOW_BUCKET_MS,
 };
 use redis::{aio::ConnectionManager, AsyncCommands, Client};
 
@@ -79,8 +78,6 @@ async fn record_share_writes_all_keys() {
         .expect("ok");
 
     let mut conn = conn;
-    let total_str: String = conn.get(key_total(group)).await.unwrap();
-    assert!((total_str.parse::<f64>().unwrap() - 100.0).abs() < 1e-9);
     let by_addr: f64 = conn
         .hget::<_, _, String>(key_by_address(group), addr)
         .await
@@ -95,12 +92,6 @@ async fn record_share_writes_all_keys() {
         .parse()
         .unwrap();
     assert_eq!(last_at, 1_700_000_000_000);
-    // The counter key is unused and must stay unwritten.
-    let counter_exists: bool = conn.exists(key_counter(group)).await.unwrap();
-    assert!(
-        !counter_exists,
-        "the per-group counter is legacy and must no longer be written"
-    );
 }
 
 // ── Test 2 — record_reject increments per-address rejected ─────────
@@ -176,9 +167,7 @@ async fn reset_for_block_found_preserves_last_accepted_share_at() {
     store.reset_for_block_found(group).await.unwrap();
 
     let mut conn = conn;
-    let total_exists: bool = conn.exists(key_total(group)).await.unwrap();
     let by_addr_exists: bool = conn.exists(key_by_address(group)).await.unwrap();
-    let counter_exists: bool = conn.exists(key_counter(group)).await.unwrap();
     let best_exists: bool = conn.exists(key_best_share(group)).await.unwrap();
     let applied_exists: bool = conn.exists(key_applied(group)).await.unwrap();
     let last_at_exists: bool = conn
@@ -186,9 +175,7 @@ async fn reset_for_block_found_preserves_last_accepted_share_at() {
         .await
         .unwrap();
 
-    assert!(!total_exists, "total wiped");
     assert!(!by_addr_exists, "by-address wiped");
-    assert!(!counter_exists, "the legacy counter key is cleared");
     assert!(!best_exists, "best-share wiped");
     assert!(
         last_at_exists,
@@ -310,9 +297,6 @@ async fn forget_member_subtracts_contribution() {
         .await
         .unwrap();
     assert!(!last_at_has_a, "last-accepted-share-at slot deleted");
-
-    let total = store.read_total(group).await.unwrap();
-    assert!((total - 40.0).abs() < 1e-9, "total decremented");
 }
 
 // ── Test 8 — round_stats composes per-address + rejected ───────────
@@ -343,104 +327,6 @@ async fn read_round_stats_returns_per_address_and_rejected() {
     assert!((stats.total_shares - 100.0).abs() < 1e-9);
     assert!((stats.total_rejected - 5.0).abs() < 1e-9);
     assert_eq!(stats.per_address.len(), 2);
-}
-
-// ── Test 9 — snapshot roundtrip per (group, finder) ────────────────
-
-#[tokio::test]
-async fn snapshot_roundtrip_per_group_and_finder() {
-    let mut conn = match connect_or_skip(8).await {
-        Some(c) => c,
-        None => return,
-    };
-    let group = "g_snap1";
-    let finder = "bc1qfinder";
-    let snap = bp_coinbase_snapshot::StoredWeightSnapshot {
-        entries: vec![bp_coinbase_snapshot::WeightSnapshotEntry {
-            address: "bc1qminer".to_string(),
-            score_weight: 1_000_000_000_000,
-            balance_sats: 0,
-            wire_weight: 1_000_000_000_000,
-            dust_limit: 546,
-        }],
-        score_total: 1_000_000_000_000,
-        weight_p: 15_228_426_395,
-        fee_ppm: 15_000,
-        fee_address: "bc1qfee".to_string(),
-        reference_revenue_sats: 312_500_000,
-    };
-
-    snapshot::write_weight_snapshot(&mut conn, group, finder, &snap, 60)
-        .await
-        .expect("write ok");
-    let parsed = snapshot::read_weight_snapshot(&mut conn, group, finder)
-        .await
-        .expect("read ok")
-        .expect("present");
-    assert_eq!(parsed.reference_revenue_sats, 312_500_000);
-    assert_eq!(parsed.entries.len(), 1);
-
-    snapshot::delete_snapshot(&mut conn, group, finder)
-        .await
-        .expect("delete ok");
-    assert!(snapshot::read_weight_snapshot(&mut conn, group, finder)
-        .await
-        .unwrap()
-        .is_none());
-}
-
-// ── Test 10 — delete_all_for_group via SCAN+DEL ────────────────────
-
-#[tokio::test]
-async fn delete_all_snapshots_for_group_scans_and_deletes() {
-    let mut conn = match connect_or_skip(9).await {
-        Some(c) => c,
-        None => return,
-    };
-    let group = "g_snap_del";
-    let snap = bp_coinbase_snapshot::StoredWeightSnapshot {
-        entries: vec![bp_coinbase_snapshot::WeightSnapshotEntry {
-            address: "bc1qminer".to_string(),
-            score_weight: 1_000_000_000_000,
-            balance_sats: 0,
-            wire_weight: 1_000_000_000_000,
-            dust_limit: 546,
-        }],
-        score_total: 1_000_000_000_000,
-        weight_p: 15_228_426_395,
-        fee_ppm: 15_000,
-        fee_address: "bc1qfee".to_string(),
-        reference_revenue_sats: 312_500_000,
-    };
-    // Write snapshots for 3 different finders.
-    for finder in &["bc1qf1", "bc1qf2", "bc1qf3"] {
-        snapshot::write_weight_snapshot(&mut conn, group, finder, &snap, 60)
-            .await
-            .unwrap();
-    }
-    // Plus one snapshot for an UNRELATED group — must survive.
-    snapshot::write_weight_snapshot(&mut conn, "g_other", "bc1qf1", &snap, 60)
-        .await
-        .unwrap();
-
-    let deleted = snapshot::delete_all_for_group(&mut conn, group)
-        .await
-        .expect("scan+del ok");
-    assert_eq!(deleted, 3);
-
-    // Confirm: target group's snapshots gone, other group's survives.
-    for finder in &["bc1qf1", "bc1qf2", "bc1qf3"] {
-        assert!(snapshot::read_weight_snapshot(&mut conn, group, finder)
-            .await
-            .unwrap()
-            .is_none());
-    }
-    assert!(
-        snapshot::read_weight_snapshot(&mut conn, "g_other", "bc1qf1")
-            .await
-            .unwrap()
-            .is_some()
-    );
 }
 
 // ── Test 11 — multiple groups are isolated ─────────────────────────
@@ -511,14 +397,6 @@ async fn record_share_is_idempotent_per_share_id() {
         "two distinct share_ids recorded in the dedup set"
     );
 
-    let total: f64 = conn
-        .get::<_, String>(key_total(group))
-        .await
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert!((total - 200.0).abs() < 1e-9, "total={total}, expected 200");
-
     let by: f64 = conn
         .hget::<_, _, String>(key_by_address(group), addr)
         .await
@@ -570,11 +448,6 @@ async fn a_redelivered_share_is_still_deduped_across_a_round_reset() {
     );
 
     let mut conn = conn;
-    let total_exists: bool = conn.exists(key_total(group)).await.unwrap();
-    assert!(
-        !total_exists,
-        "the redelivery must not resurrect the wiped round's total"
-    );
     let by_exists: bool = conn.exists(key_by_address(group)).await.unwrap();
     assert!(
         !by_exists,

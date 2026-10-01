@@ -24,12 +24,6 @@ fn key(group_id: &str, suffix: &str) -> String {
     format!("groupsolo:{group_id}:{suffix}")
 }
 
-pub fn key_counter(group_id: &str) -> String {
-    key(group_id, "counter")
-}
-pub fn key_total(group_id: &str) -> String {
-    key(group_id, "total")
-}
 pub fn key_by_address(group_id: &str) -> String {
     key(group_id, "by-address")
 }
@@ -122,20 +116,19 @@ pub const WINDOW_BUCKET_MS: i64 = 60 * 60 * 1000;
 const DEDUP_KEEP: i64 = 100_000;
 
 /// Append one accepted share to the PROP round; returns 0 on a deduped no-op.
-/// `KEYS` = total, by-address, last-accepted-share-at, applied; `ARGV` =
+/// `KEYS` = by-address, last-accepted-share-at, applied; `ARGV` =
 /// difficulty, address, timestamp_ms, share_id (empty ⇒ no dedup), keep-count.
 /// The dedup marker is written in the same script so a crash before ack cannot double-count.
 const RECORD_SHARE_LUA: &str = r#"
 local has_dedup = ARGV[4] ~= ''
-if has_dedup and redis.call('ZSCORE', KEYS[4], ARGV[4]) then
+if has_dedup and redis.call('ZSCORE', KEYS[3], ARGV[4]) then
     return 0
 end
-redis.call('INCRBYFLOAT', KEYS[1], ARGV[1])
-redis.call('HINCRBYFLOAT', KEYS[2], ARGV[2], ARGV[1])
-redis.call('HSET', KEYS[3], ARGV[2], ARGV[3])
+redis.call('HINCRBYFLOAT', KEYS[1], ARGV[2], ARGV[1])
+redis.call('HSET', KEYS[2], ARGV[2], ARGV[3])
 if has_dedup then
-    redis.call('ZADD', KEYS[4], ARGV[3], ARGV[4])
-    redis.call('ZREMRANGEBYRANK', KEYS[4], 0, -tonumber(ARGV[5]) - 1)
+    redis.call('ZADD', KEYS[3], ARGV[3], ARGV[4])
+    redis.call('ZREMRANGEBYRANK', KEYS[3], 0, -tonumber(ARGV[5]) - 1)
 end
 return 1
 "#;
@@ -261,7 +254,6 @@ impl GroupRoundStore {
         let mut conn = self.conn.clone();
 
         let applied: i64 = redis::Script::new(RECORD_SHARE_LUA)
-            .key(key_total(group_id))
             .key(key_by_address(group_id))
             .key(key_last_accepted_share_at(group_id))
             .key(key_applied(group_id))
@@ -569,19 +561,15 @@ impl GroupRoundStore {
     // ── Round-reset paths ──────────────────────────────────────────
 
     /// Block-found reset: wipe round state but keep
-    /// `last-accepted-share-at` (the inactivity clock survives). Caller
-    /// drains snapshots separately via
-    /// [`snapshot::delete_all_for_group`].
+    /// `last-accepted-share-at` (the inactivity clock survives).
     pub async fn reset_for_block_found(&self, group_id: &str) -> Result<(), RoundError> {
         let mut conn = self.conn.clone();
         let keys = vec![
-            key_total(group_id),
             key_by_address(group_id),
             key_rejected_shares(group_id),
             key_best_share(group_id),
             // NOT `key_applied`: an un-ACKed satellite batch would otherwise be
-            // reapplied into the fresh round on redelivery. `key_counter` is unused.
-            key_counter(group_id),
+            // reapplied into the fresh round on redelivery.
         ];
         let _: i64 = conn.del(keys).await?;
         self.delete_window_keys(&mut conn, group_id).await?;
@@ -589,18 +577,15 @@ impl GroupRoundStore {
     }
 
     /// Scheduled (calendar-aligned) reset: wipe everything including
-    /// `last-accepted-share-at`. Caller deletes the per-finder snapshots
-    /// separately.
+    /// `last-accepted-share-at`.
     pub async fn reset_full(&self, group_id: &str) -> Result<(), RoundError> {
         let mut conn = self.conn.clone();
         let keys = vec![
-            key_total(group_id),
             key_by_address(group_id),
             key_rejected_shares(group_id),
             key_best_share(group_id),
             key_last_accepted_share_at(group_id),
             // NOT `key_applied`: see `reset_for_block_found`.
-            key_counter(group_id),
         ];
         let _: i64 = conn.del(keys).await?;
         self.delete_window_keys(&mut conn, group_id).await?;
@@ -638,12 +623,6 @@ impl GroupRoundStore {
             .into_iter()
             .filter_map(|(addr, v)| v.parse::<f64>().ok().map(|d| (addr, d)))
             .collect())
-    }
-
-    pub async fn read_total(&self, group_id: &str) -> Result<f64, RoundError> {
-        let mut conn = self.conn.clone();
-        let s: Option<String> = conn.get(key_total(group_id)).await?;
-        Ok(s.as_deref().and_then(|v| v.parse().ok()).unwrap_or(0.0))
     }
 
     pub async fn read_last_accepted_share_at(
@@ -712,12 +691,6 @@ impl GroupRoundStore {
                 // A plain pipeline suffices: admin flows are serialized at the
                 // engine level, so nothing else mutates this address meanwhile.
                 let mut pipe = redis::pipe();
-                if removed_diff > 0.0 {
-                    pipe.cmd("INCRBYFLOAT")
-                        .arg(key_total(group_id))
-                        .arg(-removed_diff)
-                        .ignore();
-                }
                 pipe.hdel(key_by_address(group_id), address)
                     .ignore()
                     .hdel(key_rejected_shares(group_id), address)
@@ -782,8 +755,6 @@ mod tests {
 
     #[test]
     fn key_helpers_format_correctly() {
-        assert_eq!(key_counter("g1"), "groupsolo:g1:counter");
-        assert_eq!(key_total("g1"), "groupsolo:g1:total");
         assert_eq!(key_by_address("g1"), "groupsolo:g1:by-address");
         assert_eq!(key_rejected_shares("g1"), "groupsolo:g1:rejected-shares");
         assert_eq!(
@@ -811,15 +782,6 @@ mod tests {
         assert_eq!(
             format!("{}42", rejected.bucket_prefix("g1")),
             rejected.bucket_key("g1", 42)
-        );
-    }
-
-    #[test]
-    fn key_helpers_support_uuid_group_id() {
-        let g = "550e8400-e29b-41d4-a716-446655440000";
-        assert_eq!(
-            key_counter(g),
-            "groupsolo:550e8400-e29b-41d4-a716-446655440000:counter"
         );
     }
 

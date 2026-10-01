@@ -556,11 +556,11 @@ async fn an_unknown_payout_list_resolves_to_nothing() {
     drop_harness(h).await;
 }
 
-// ── Test 3b4 — the apply consumes only its own payout-list snapshot ──
+// ── Test 3b4 — an apply leaves every payout-list snapshot in place ──
 // Each member mines its own job; a second block found before the next
 // rebuild must still resolve its distribution.
 #[tokio::test]
-async fn apply_deletes_only_the_payout_list_it_booked() {
+async fn a_redelivered_apply_books_nothing_and_snapshots_outlive_their_blocks() {
     let h = match spawn_or_skip(17, None).await {
         Some(h) => h,
         None => return,
@@ -599,26 +599,31 @@ async fn apply_deletes_only_the_payout_list_it_booked() {
         "the two jobs must carry different payout lists, else this proves nothing"
     );
 
-    h.engine
-        .on_block_found(
+    let actual = actual_paying_exactly(&booked, reward);
+    let apply = || {
+        h.engine.on_block_found(
             h.group_id,
             9_995_021,
-            &actual_paying_exactly(&booked, reward),
+            &actual,
             &finder,
             None,
             Some(booked.payouts_fingerprint()),
         )
-        .await
-        .expect("apply ok");
-
-    // Consumed, so a redelivered event cannot book it twice.
+    };
+    let first = apply().await.expect("apply ok");
     assert!(
-        h.engine
-            .weight_snapshot_for_block_found(h.group_id, &finder, &booked.payouts_fingerprint())
-            .await
-            .is_err(),
-        "the applied block's own payout list must be consumed"
+        first.history_inserted >= 1,
+        "precondition: the block booked"
     );
+    let again = apply()
+        .await
+        .expect("a redelivery is a no-op, not an error");
+    assert_eq!(again.history_inserted, 0, "a redelivery must write nothing");
+
+    h.engine
+        .weight_snapshot_for_block_found(h.group_id, &finder, &booked.payouts_fingerprint())
+        .await
+        .expect("the booked job's distribution expires by TTL, not by the apply");
     h.engine
         .weight_snapshot_for_block_found(h.group_id, &finder, &still_live.payouts_fingerprint())
         .await

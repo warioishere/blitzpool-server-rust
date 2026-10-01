@@ -19,7 +19,6 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::round::snapshot::delete_all_for_group;
 use crate::round::{GroupRoundStore, RoundError};
 
 /// A scheduled reset is skipped if `lastRoundResetAt` is this recent,
@@ -272,8 +271,6 @@ impl<C: Clock> GroupResetRunner<C> {
         let group_key = group_id.to_string();
 
         self.round.reset_full(&group_key).await?;
-        let mut conn = self.round.connection_for_snapshot();
-        delete_all_for_group(&mut conn, &group_key).await?;
         // Stamp last so the debounce on the next tick reads the fresh value.
         update_pplns_group_last_reset_at(&self.pool, group_id, now_ms).await?;
 
