@@ -249,7 +249,7 @@ async fn pending_party_admin_routes_block_to_pool_fee_accepted_by_core() {
 
 // ─── Shared driver ────────────────────────────────────────────────
 
-fn service(pg: &PgPool, fee_address: &str) -> Arc<BlockpartyService<AllVerified>> {
+fn service(pg: &PgPool, fee_address: &str) -> Arc<BlockpartyService> {
     Arc::new(BlockpartyService::new(
         pg.clone(),
         Arc::new(AllVerified),

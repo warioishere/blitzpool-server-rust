@@ -4,14 +4,11 @@
 //! share/block hooks, and the routing cache read on every share. The pure
 //! math and status FSM live in [`bp_blockparty`].
 
-mod api;
 mod cache;
 mod error;
 mod hooks;
 mod service;
 mod util;
-
-pub use api::BlockpartyApi;
 
 pub use cache::{AdminCacheEntry, BlockpartyCache};
 pub use error::BlockpartyServiceError;

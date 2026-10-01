@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bp_blockparty_engine::{
-    BlockpartyApi, BlockpartyHooks, BlockpartyService, BlockpartyServiceConfig, CoinbaseReservation,
+    BlockpartyHooks, BlockpartyService, BlockpartyServiceConfig, CoinbaseReservation,
 };
 use bp_common::{AddressId, MiningMode, Sats, StreamKind};
 use bp_config::AppConfig;
@@ -52,7 +52,7 @@ pub(crate) enum BlockpartySpawnError {
 }
 
 pub(crate) struct SharedBlockparty {
-    pub(crate) service: Arc<dyn BlockpartyApi>,
+    pub(crate) service: Arc<BlockpartyService>,
     /// Membership reader — handed to `GroupService::set_blockparty_reader`
     /// so the PPLNS-group side rejects addresses already in a Blockparty.
     pub(crate) membership_reader: Arc<dyn bp_group_mgmt_engine::BlockpartyMembershipReader>,
@@ -157,11 +157,11 @@ pub(crate) fn resolve_group_fees(
 /// gate). Reads the producer-stamped `share.mode`, so it needs no mode gate
 /// and runs unchanged on the Satellite.
 pub(crate) struct BlockpartyAcceptedShareSink {
-    service: Arc<dyn BlockpartyApi>,
+    service: Arc<BlockpartyService>,
 }
 
 impl BlockpartyAcceptedShareSink {
-    pub(crate) fn new(service: Arc<dyn BlockpartyApi>) -> Self {
+    pub(crate) fn new(service: Arc<BlockpartyService>) -> Self {
         Self { service }
     }
 }

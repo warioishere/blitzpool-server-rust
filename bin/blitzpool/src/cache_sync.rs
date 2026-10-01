@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bp_blockparty_engine::BlockpartyApi;
+use bp_blockparty_engine::BlockpartyService;
 use bp_group_mgmt_engine::MembershipChangeNotifier;
 use bp_share_stream::{
     cache_kind, CacheInvalidation, StreamConsumer, StreamProducer, CACHE_INVALIDATION_STREAM_KEY,
@@ -88,7 +88,7 @@ impl CacheSyncHandle {
 pub(crate) fn spawn(
     redis: ConnectionManager,
     group: SharedGroupService,
-    blockparty: Option<Arc<dyn BlockpartyApi>>,
+    blockparty: Option<Arc<BlockpartyService>>,
     gate: Arc<BlitzpoolModeGate>,
     // The Front's JDP payout registry, once `jdp::spawn` has attached it.
     // Empty on a Front without JDP enabled — a settlement then has nothing
@@ -228,7 +228,7 @@ async fn reconcile_gate_modes(group: &SharedGroupService, gate: &Arc<BlitzpoolMo
     }
 }
 
-async fn rebuild_blockparty(blockparty: Option<&Arc<dyn BlockpartyApi>>) {
+async fn rebuild_blockparty(blockparty: Option<&Arc<BlockpartyService>>) {
     let Some(bp) = blockparty else {
         return;
     };

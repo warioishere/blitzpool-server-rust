@@ -84,9 +84,9 @@ pub struct PendingPartyFeeRoute {
 
 // ─── Service struct ────────────────────────────────────────────────
 
-pub struct BlockpartyService<H: BlockpartyHooks> {
+pub struct BlockpartyService {
     pool: PgPool,
-    hooks: Arc<H>,
+    hooks: Arc<dyn BlockpartyHooks>,
     cache: BlockpartyCache,
     /// Read-only; for the mode-collision check against PPLNS groups.
     pplns_cache: PplnsAddressCache,
@@ -99,10 +99,10 @@ pub struct BlockpartyService<H: BlockpartyHooks> {
         Arc<std::sync::OnceLock<Arc<dyn bp_group_mgmt_engine::MembershipChangeNotifier>>>,
 }
 
-impl<H: BlockpartyHooks> BlockpartyService<H> {
+impl BlockpartyService {
     pub fn new(
         pool: PgPool,
-        hooks: Arc<H>,
+        hooks: Arc<dyn BlockpartyHooks>,
         pplns_cache: PplnsAddressCache,
         config: BlockpartyServiceConfig,
     ) -> Self {
@@ -144,10 +144,6 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
 
     pub fn cache(&self) -> BlockpartyCache {
         self.cache.clone()
-    }
-
-    pub fn hooks(&self) -> &H {
-        &self.hooks
     }
 
     pub fn pool(&self) -> &PgPool {

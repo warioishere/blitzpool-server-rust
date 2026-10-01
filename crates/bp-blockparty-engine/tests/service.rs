@@ -76,7 +76,7 @@ fn config() -> BlockpartyServiceConfig {
     }
 }
 
-fn svc(pool: &PgPool) -> BlockpartyService<AllVerified> {
+fn svc(pool: &PgPool) -> BlockpartyService {
     BlockpartyService::new(
         pool.clone(),
         Arc::new(AllVerified),
@@ -95,7 +95,7 @@ impl BlockpartyHooks for NoEmail {
     }
 }
 
-fn svc_no_email(pool: &PgPool) -> BlockpartyService<NoEmail> {
+fn svc_no_email(pool: &PgPool) -> BlockpartyService {
     BlockpartyService::new(
         pool.clone(),
         Arc::new(NoEmail),

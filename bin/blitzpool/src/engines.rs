@@ -52,7 +52,7 @@ pub(crate) struct EngineHandles {
     pub(crate) rejected_sink: Option<Arc<dyn SharedRejectedShareSink>>,
     pub(crate) session_persistence_hook: SessionPersistenceHook,
     /// `None` unless Blockparty is configured.
-    pub(crate) blockparty: Option<Arc<dyn bp_blockparty_engine::BlockpartyApi>>,
+    pub(crate) blockparty: Option<Arc<bp_blockparty_engine::BlockpartyService>>,
 }
 
 #[derive(Debug, Error)]

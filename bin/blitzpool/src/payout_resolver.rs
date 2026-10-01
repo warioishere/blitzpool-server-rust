@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bp_blockparty::CoinbaseDistributionEntry;
-use bp_blockparty_engine::BlockpartyApi;
+use bp_blockparty_engine::BlockpartyService;
 use bp_common::{AddressId, MiningMode, Sats};
 use bp_group_solo_engine::engine::GroupSoloEngine;
 // Re-exported so the wiring keeps one import path for the solo split.
@@ -31,7 +31,7 @@ pub(crate) struct ProductionPayoutResolver {
     solo_fee: SoloFeeConfig,
     /// When `None`, the Blockparty arm serves no job and the pending-fee guard
     /// falls through to Solo.
-    blockparty: Option<Arc<dyn BlockpartyApi>>,
+    blockparty: Option<Arc<BlockpartyService>>,
 }
 
 impl ProductionPayoutResolver {
@@ -40,7 +40,7 @@ impl ProductionPayoutResolver {
         pplns: Option<PplnsEngine>,
         group_solo: GroupSoloEngine,
         solo_fee: SoloFeeConfig,
-        blockparty: Option<Arc<dyn BlockpartyApi>>,
+        blockparty: Option<Arc<BlockpartyService>>,
     ) -> Self {
         Self {
             mode_gate,
@@ -118,7 +118,7 @@ impl ProductionPayoutResolver {
 /// The members' split, or no job when it cannot be built: only the admin
 /// hashes, so a solo coinbase would pay the admin the whole block.
 async fn blockparty_payouts(
-    blockparty: Option<&dyn BlockpartyApi>,
+    blockparty: Option<&BlockpartyService>,
     miner_address: &str,
     reward_sats: u64,
     group_id_str: Option<&str>,
@@ -983,7 +983,7 @@ mod tests {
 
     const BP_ADMIN: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
-    fn blockparty_service(pool: sqlx::PgPool) -> Arc<dyn BlockpartyApi> {
+    fn blockparty_service(pool: sqlx::PgPool) -> Arc<BlockpartyService> {
         Arc::new(bp_blockparty_engine::BlockpartyService::new(
             pool,
             Arc::new(bp_blockparty_engine::NoopHooks::default()),
@@ -994,7 +994,7 @@ mod tests {
 
     /// The admin is the only one hashing, so a solo coinbase here would pay
     /// the whole block to the admin and nothing to the members.
-    async fn assert_no_job(svc: Option<&dyn BlockpartyApi>, group_id: Option<&str>, case: &str) {
+    async fn assert_no_job(svc: Option<&BlockpartyService>, group_id: Option<&str>, case: &str) {
         let resolved = blockparty_payouts(svc, BP_ADMIN, TEST_REWARD, group_id).await;
         assert!(
             resolved.is_none(),

@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use bp_bitcoin::BitcoinRpc;
-use bp_blockparty_engine::BlockpartyApi;
+use bp_blockparty_engine::BlockpartyService;
 use bp_geoip::GeoIpService;
 use bp_group_mgmt_engine::{
     EmailHooks, GroupService, GroupServiceHooks, InvitationService, JoinRequestService,
@@ -40,9 +40,8 @@ pub struct AppState<H: GroupServiceHooks + 'static, M: EmailHooks + 'static> {
     pub group_service: Option<Arc<GroupService<H>>>,
     pub invitation_service: Option<Arc<InvitationService<H>>>,
     pub join_request_service: Option<Arc<JoinRequestService<H, M>>>,
-    /// Blockparty service handle, type-erased so the bp-api AppState
-    /// doesn't need a third generic param for `BlockpartyHooks`.
-    pub blockparty: Option<Arc<dyn BlockpartyApi>>,
+    /// Blockparty service handle; `None` when Blockparty is not configured.
+    pub blockparty: Option<Arc<BlockpartyService>>,
     pub tdp: Option<TdpHandle>,
     /// Age (ms) past which `/api/health` reports the TDP snapshot stale.
     /// Generous by default so a brief bitcoin-core restart does not flip health.

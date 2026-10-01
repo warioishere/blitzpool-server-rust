@@ -12,7 +12,6 @@ use axum::{
     routing::{delete, get, patch, post},
     Router,
 };
-use bp_blockparty::BlockpartyStatus;
 use bp_common::AddressId;
 use bp_db::{
     BlockpartyBlockHistoryRow, BlockpartyGroupRow, BlockpartyMemberRow, BlockpartySplitSnapshot,
@@ -222,7 +221,7 @@ fn member_token(headers: &HeaderMap) -> Option<String> {
 
 fn require_blockparty<H, M>(
     state: &SharedState<H, M>,
-) -> Result<&dyn bp_blockparty_engine::BlockpartyApi, ApiError>
+) -> Result<&bp_blockparty_engine::BlockpartyService, ApiError>
 where
     H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
     M: bp_group_mgmt_engine::EmailHooks + 'static,
@@ -391,7 +390,7 @@ where
     let is_admin = match token.as_deref() {
         None => false,
         Some(t) => {
-            svc.verify_admin_token(id, Some(t)).await?;
+            svc.require_admin_token(id, Some(t)).await?;
             true
         }
     };
@@ -429,7 +428,7 @@ where
     M: bp_group_mgmt_engine::EmailHooks + 'static,
 {
     require_blockparty(&state)?
-        .verify_admin_token(id, admin_token(&headers).as_deref())
+        .require_admin_token(id, admin_token(&headers).as_deref())
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -458,7 +457,7 @@ where
 {
     let svc = require_blockparty(&state)?;
     let viewer = normalize(&address)?;
-    svc.verify_member_token(id, &viewer, member_token(&headers).as_deref())
+    svc.require_member_token(id, &viewer, member_token(&headers).as_deref())
         .await?;
     let group = svc.get_group(id).await?.ok_or(ApiError::NotFound)?;
     let members = svc.list_members(id).await?;
@@ -608,7 +607,7 @@ where
     for s in body.splits {
         updates.push((normalize(&s.address)?, s.percent_bp));
     }
-    svc.update_splits(id, updates, admin_token(&headers).as_deref())
+    svc.update_splits(id, &updates, admin_token(&headers).as_deref())
         .await?;
     Ok(Json(&OK))
 }
@@ -825,11 +824,6 @@ where
         .await?;
     Ok(Json(&OK))
 }
-
-// Silence the unused-variant warning on BlockpartyStatus import — it
-// flows through the BlockpartyApi trait surface but isn't named here.
-#[allow(dead_code)]
-fn _status_ref(_: BlockpartyStatus) {}
 
 // ─── Tests ─────────────────────────────────────────────────────────
 

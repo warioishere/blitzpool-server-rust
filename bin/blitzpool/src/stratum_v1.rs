@@ -258,7 +258,7 @@ impl<H: GroupServiceHooks + Send + Sync + 'static> GroupLookup for GroupService<
 
 // ─── BlockpartyAdminLookup trait (admin → routable-party-id) ───────
 
-/// Narrow admin lookup over `BlockpartyApi`, like [`GroupLookup`]: "is this
+/// Narrow admin lookup over `BlockpartyService`, like [`GroupLookup`]: "is this
 /// address the admin of a **routable** (Ready/Active) Blockparty?". Only
 /// the admin hashes in Blockparty; members are payout recipients, so the
 /// mode resolves admin-keyed.
@@ -269,12 +269,12 @@ pub(crate) trait BlockpartyAdminLookup: Send + Sync {
     async fn routable_group_id_for_admin(&self, address: &AddressId) -> Option<Uuid>;
 }
 
-/// Adapter wrapping the production `Arc<dyn BlockpartyApi>` into the narrow
+/// Adapter wrapping the production `Arc<BlockpartyService>` into the narrow
 /// [`BlockpartyAdminLookup`] surface.
-pub(crate) struct BlockpartyApiAdminLookup(pub Arc<dyn bp_blockparty_engine::BlockpartyApi>);
+pub(crate) struct BlockpartyServiceAdminLookup(pub Arc<bp_blockparty_engine::BlockpartyService>);
 
 #[async_trait]
-impl BlockpartyAdminLookup for BlockpartyApiAdminLookup {
+impl BlockpartyAdminLookup for BlockpartyServiceAdminLookup {
     async fn routable_group_id_for_admin(&self, address: &AddressId) -> Option<Uuid> {
         self.0.routable_group_id_for_admin(address).await
     }
@@ -310,7 +310,7 @@ impl ModeGatePopulatingPersistence {
         let blockparty: Option<Arc<dyn BlockpartyAdminLookup>> = engines
             .blockparty
             .clone()
-            .map(|bp| Arc::new(BlockpartyApiAdminLookup(bp)) as Arc<dyn BlockpartyAdminLookup>);
+            .map(|bp| Arc::new(BlockpartyServiceAdminLookup(bp)) as Arc<dyn BlockpartyAdminLookup>);
         Arc::new(Self::new(
             port_payout_mode,
             engines.mode_gate.clone(),
