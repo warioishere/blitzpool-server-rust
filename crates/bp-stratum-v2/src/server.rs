@@ -103,12 +103,11 @@ struct Inner {
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
     // PPLNS stream (PPLNS-autoscaled) — every connection boots here before
     // its payout mode is resolved.
-    template_tx: broadcast::Sender<TemplateBroadcast>,
-    current_template: Arc<Mutex<Option<Arc<ActiveTemplate>>>>,
+    pplns_stream: TemplateStream,
     // Fixed-reservation alt streams (Solo / GroupSolo / Blockparty) keyed by
     // StreamKind — a connection switches onto one when its OpenChannel address
     // resolves to that mode. Each fed by its own translator off its TDP handle.
-    alt_streams: HashMap<StreamKind, AltStream>,
+    alt_streams: HashMap<StreamKind, TemplateStream>,
     // POOL-WIDE extranonce-prefix allocator, shared by every port. Standard
     // channels cannot roll their own extranonce, and ports share a coinbase,
     // so a second allocator would hand out the same prefixes and two miners
@@ -119,23 +118,63 @@ struct Inner {
     // the whole pool rather than per channel per broadcast.
     job_cache: Arc<MiningJobCache>,
     cancel: CancellationToken,
-    translator_join: Mutex<Option<JoinHandle<()>>>,
-    alt_translator_joins: Mutex<Vec<JoinHandle<()>>>,
+    /// One translator per stream, PPLNS first; drained once on shutdown.
+    translator_joins: Mutex<Vec<JoinHandle<()>>>,
 }
 
-/// One fixed-reservation alt template stream: the broadcast sender per-connection
-/// tasks subscribe to + the current-template snapshot a freshly-routed connection
-/// boots from. Mirrors the PPLNS stream's `template_tx` / `current_template`.
-struct AltStream {
+/// One template stream: the broadcast sender per-connection tasks subscribe
+/// to + the current-template snapshot a freshly-routed connection boots from.
+struct TemplateStream {
     template_tx: broadcast::Sender<TemplateBroadcast>,
     current_template: Arc<Mutex<Option<Arc<ActiveTemplate>>>>,
 }
 
+impl TemplateStream {
+    /// Start the stream's translator off its TDP feed.
+    fn spawn(
+        updates_rx: broadcast::Receiver<TemplateUpdate>,
+        initial_snapshot: bp_template_distribution::TemplateSnapshot,
+        job_cache: &Arc<MiningJobCache>,
+        cancel: &CancellationToken,
+    ) -> (Self, JoinHandle<()>) {
+        let (template_tx, _) = broadcast::channel(TEMPLATE_BROADCAST_CAPACITY);
+        let current_template = Arc::new(Mutex::new(None::<Arc<ActiveTemplate>>));
+        let join = tokio::spawn(run_translator(
+            updates_rx,
+            initial_snapshot,
+            template_tx.clone(),
+            current_template.clone(),
+            job_cache.clone(),
+            cancel.clone(),
+        ));
+        let stream = Self {
+            template_tx,
+            current_template,
+        };
+        (stream, join)
+    }
+
+    fn current(&self) -> Option<Arc<ActiveTemplate>> {
+        self.current_template
+            .lock()
+            .expect("current_template mutex poisoned")
+            .clone()
+    }
+
+    /// A connection's own subscription plus the snapshot to boot from.
+    fn handle(&self) -> StreamHandle {
+        StreamHandle {
+            rx: self.template_tx.subscribe(),
+            initial: self.current(),
+        }
+    }
+}
+
 /// A single connection's claim on one alt stream — its own broadcast receiver
 /// plus the snapshot to boot from. The per-connection task holds a
-/// `HashMap<StreamKind, AltStreamHandle>` and `remove`s the matching entry when
+/// `HashMap<StreamKind, StreamHandle>` and `remove`s the matching entry when
 /// it swaps onto that stream.
-struct AltStreamHandle {
+struct StreamHandle {
     rx: broadcast::Receiver<TemplateBroadcast>,
     initial: Option<Arc<ActiveTemplate>>,
 }
@@ -161,39 +200,18 @@ impl StratumV2MiningServer {
         job_cache: Arc<MiningJobCache>,
     ) -> Self {
         let server_config = Arc::new(server_config);
-        let (template_tx, _) = broadcast::channel(TEMPLATE_BROADCAST_CAPACITY);
-        let current_template = Arc::new(Mutex::new(None::<Arc<ActiveTemplate>>));
         let cancel = CancellationToken::new();
 
-        let translator_join = tokio::spawn(run_translator(
-            updates_rx,
-            initial_snapshot,
-            template_tx.clone(),
-            current_template.clone(),
-            job_cache.clone(),
-            cancel.clone(),
-        ));
+        let (pplns_stream, pplns_join) =
+            TemplateStream::spawn(updates_rx, initial_snapshot, &job_cache, &cancel);
+        let mut translator_joins = vec![pplns_join];
         // One translator per alt stream, each off its own TDP handle.
         let mut alt_map = HashMap::with_capacity(alt_streams.len());
-        let mut alt_joins = Vec::with_capacity(alt_streams.len());
         for (kind, alt_updates_rx, alt_initial_snapshot) in alt_streams {
-            let (alt_tx, _) = broadcast::channel(TEMPLATE_BROADCAST_CAPACITY);
-            let alt_current = Arc::new(Mutex::new(None::<Arc<ActiveTemplate>>));
-            alt_joins.push(tokio::spawn(run_translator(
-                alt_updates_rx,
-                alt_initial_snapshot,
-                alt_tx.clone(),
-                alt_current.clone(),
-                job_cache.clone(),
-                cancel.clone(),
-            )));
-            alt_map.insert(
-                kind,
-                AltStream {
-                    template_tx: alt_tx,
-                    current_template: alt_current,
-                },
-            );
+            let (stream, join) =
+                TemplateStream::spawn(alt_updates_rx, alt_initial_snapshot, &job_cache, &cancel);
+            translator_joins.push(join);
+            alt_map.insert(kind, stream);
         }
 
         Self {
@@ -202,14 +220,12 @@ impl StratumV2MiningServer {
                 noise_config,
                 hooks,
                 bridge,
-                template_tx,
-                current_template,
+                pplns_stream,
                 alt_streams: alt_map,
                 extranonce,
                 job_cache,
                 cancel,
-                translator_join: Mutex::new(Some(translator_join)),
-                alt_translator_joins: Mutex::new(alt_joins),
+                translator_joins: Mutex::new(translator_joins),
             }),
         }
     }
@@ -217,18 +233,14 @@ impl StratumV2MiningServer {
     /// Snapshot of the latest assembled template. `None` until the
     /// translator pairs its first `NewTemplate` + `SetNewPrevHash`.
     pub fn current_template(&self) -> Option<Arc<ActiveTemplate>> {
-        self.inner
-            .current_template
-            .lock()
-            .expect("current_template mutex poisoned")
-            .clone()
+        self.inner.pplns_stream.current()
     }
 
     /// Subscribe to template broadcasts. Each subscriber sees its own
     /// copy. Used by tests + the per-connection task; production
     /// `accept_connection` does this internally.
     pub fn subscribe_templates(&self) -> broadcast::Receiver<TemplateBroadcast> {
-        self.inner.template_tx.subscribe()
+        self.inner.pplns_stream.template_tx.subscribe()
     }
 
     /// Extranonce prefixes held across every server sharing the allocator.
@@ -245,29 +257,18 @@ impl StratumV2MiningServer {
         let noise_config = self.inner.noise_config.clone();
         let hooks = self.inner.hooks.clone();
         let bridge = self.inner.bridge.clone();
-        let template_rx = self.inner.template_tx.subscribe();
-        let initial_template = self
-            .inner
-            .current_template
-            .lock()
-            .expect("current_template mutex poisoned")
-            .clone();
+        let StreamHandle {
+            rx: template_rx,
+            initial: initial_template,
+        } = self.inner.pplns_stream.handle();
         // Per-connection handle on every alt stream: a fresh broadcast
         // subscription + the current-template snapshot. The connection swaps
         // onto exactly one of these (if any) once its mode resolves.
-        let alt_streams: HashMap<StreamKind, AltStreamHandle> = self
+        let alt_streams: HashMap<StreamKind, StreamHandle> = self
             .inner
             .alt_streams
             .iter()
-            .map(|(kind, alt)| {
-                let rx = alt.template_tx.subscribe();
-                let initial = alt
-                    .current_template
-                    .lock()
-                    .expect("alt current_template mutex poisoned")
-                    .clone();
-                (*kind, AltStreamHandle { rx, initial })
-            })
+            .map(|(kind, alt)| (*kind, alt.handle()))
             .collect();
         let cancel = self.inner.cancel.clone();
         let extranonce = ConnectionExtranonce::new(self.inner.extranonce.clone());
@@ -302,36 +303,19 @@ impl StratumV2MiningServer {
     /// [`ServerConfig::shutdown_drain_timeout`].
     pub async fn shutdown(&self) {
         self.inner.cancel.cancel();
-        let handle = self
-            .inner
-            .translator_join
-            .lock()
-            .expect("translator_join mutex poisoned")
-            .take();
-        if let Some(h) = handle {
-            let drain_timeout = self.inner.server_config.shutdown_drain_timeout;
+        let handles = std::mem::take(
+            &mut *self
+                .inner
+                .translator_joins
+                .lock()
+                .expect("translator_joins mutex poisoned"),
+        );
+        let drain_timeout = self.inner.server_config.shutdown_drain_timeout;
+        for h in handles {
             match tokio::time::timeout(drain_timeout, h).await {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => warn!("sv2 translator task panicked during shutdown: {err}"),
-                Err(_) => warn!(
-                    "sv2 translator didn't drain within {:?}, detaching",
-                    drain_timeout
-                ),
-            }
-        }
-        let alt_handles = std::mem::take(
-            &mut *self
-                .inner
-                .alt_translator_joins
-                .lock()
-                .expect("alt_translator_joins mutex poisoned"),
-        );
-        for h in alt_handles {
-            let drain_timeout = self.inner.server_config.shutdown_drain_timeout;
-            match tokio::time::timeout(drain_timeout, h).await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => warn!("sv2 alt translator panicked during shutdown: {err}"),
-                Err(_) => warn!("sv2 alt translator didn't drain within {drain_timeout:?}"),
+                Err(_) => warn!("sv2 translator didn't drain within {drain_timeout:?}, detaching"),
             }
         }
     }
@@ -438,7 +422,7 @@ async fn run_mining_connection(
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
     mut template_rx: broadcast::Receiver<TemplateBroadcast>,
     initial_template: Option<Arc<ActiveTemplate>>,
-    mut alt_streams: HashMap<StreamKind, AltStreamHandle>,
+    mut alt_streams: HashMap<StreamKind, StreamHandle>,
     extranonce: ConnectionExtranonce,
     job_cache: Arc<MiningJobCache>,
     socket: TcpStream,
@@ -1771,7 +1755,7 @@ mod tests {
             Arc::new(MiningJobCache::new()),
         );
         server.shutdown().await;
-        // Second call is a no-op (translator_join already taken).
+        // Second call is a no-op (the translator handles are already taken).
         server.shutdown().await;
     }
 
