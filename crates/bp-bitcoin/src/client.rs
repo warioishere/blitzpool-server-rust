@@ -129,6 +129,38 @@ impl BitcoinRpc {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, RpcError> {
+        let (envelope, _) = self.exchange(method, params).await?;
+        Ok(envelope.result.unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Generic RPC entry point for methods without a typed helper.
+    pub async fn call<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<T, RpcError> {
+        let (envelope, status_err) = self.exchange(method, params).await?;
+        match envelope.result {
+            None | Some(serde_json::Value::Null) => Err(RpcError::BitcoinCore(RpcErrorDetail {
+                code: 0,
+                message: "RPC envelope had neither result nor error".to_string(),
+            })),
+            Some(value) => serde_json::from_value(value).map_err(|parse_err| match status_err {
+                Some(http) => RpcError::Http(http),
+                None => RpcError::Json(parse_err),
+            }),
+        }
+    }
+
+    /// One request; an error envelope is returned as `BitcoinCore`. Core sends
+    /// application errors (e.g. `-5 Block not found`) with HTTP 500 and the
+    /// envelope in the body, so the body is parsed regardless of status; the
+    /// status error is only the fallback for a body that is not an envelope.
+    async fn exchange(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<(RawRpcResponse, Option<reqwest::Error>), RpcError> {
         let id = self.inner.request_id.fetch_add(1, Ordering::Relaxed);
         let request = RpcRequest {
             jsonrpc: "1.0",
@@ -148,72 +180,17 @@ impl BitcoinRpc {
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Err(RpcError::Unauthorized);
         }
-        // See `call`: parse the envelope regardless of HTTP status.
         let status_err = resp.error_for_status_ref().err();
         let body = resp.bytes().await?;
         match serde_json::from_slice::<RawRpcResponse>(&body) {
-            Ok(envelope) => {
-                if let Some(err) = envelope.error {
-                    return Err(RpcError::BitcoinCore(err));
-                }
-                Ok(envelope.result.unwrap_or(serde_json::Value::Null))
-            }
-            Err(parse_err) => match status_err {
-                Some(http) => Err(RpcError::Http(http)),
-                None => Err(RpcError::Json(parse_err)),
-            },
-        }
-    }
-
-    /// Generic RPC entry point for methods without a typed helper.
-    pub async fn call<T: DeserializeOwned>(
-        &self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<T, RpcError> {
-        let id = self.inner.request_id.fetch_add(1, Ordering::Relaxed);
-        let request = RpcRequest {
-            jsonrpc: "1.0",
-            id,
-            method,
-            params,
-        };
-
-        let (user, password) = self.resolve_auth()?;
-        let mut req = self
-            .inner
-            .http
-            .post(&self.inner.config.url)
-            .basic_auth(user, Some(password));
-        req = req.json(&request);
-
-        let resp = req.send().await?;
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(RpcError::Unauthorized);
-        }
-        // Core returns application errors (e.g. `-5 Block not found`) with
-        // HTTP 500 and the error envelope in the body. Parse the body
-        // regardless of status so the code surfaces as `BitcoinCore`; the
-        // transport error is only the fallback for a non-envelope body.
-        let status_err = resp.error_for_status_ref().err();
-        let body = resp.bytes().await?;
-        match serde_json::from_slice::<RpcResponse<T>>(&body) {
-            Ok(RpcResponse { error: Some(e), .. }) => Err(RpcError::BitcoinCore(e)),
-            Ok(RpcResponse {
-                result: Some(r), ..
-            }) => Ok(r),
-            Ok(RpcResponse {
-                result: None,
-                error: None,
-                ..
-            }) => Err(RpcError::BitcoinCore(RpcErrorDetail {
-                code: 0,
-                message: "RPC envelope had neither result nor error".to_string(),
-            })),
-            Err(parse_err) => match status_err {
-                Some(http) => Err(RpcError::Http(http)),
-                None => Err(RpcError::Json(parse_err)),
-            },
+            Ok(RawRpcResponse {
+                error: Some(err), ..
+            }) => Err(RpcError::BitcoinCore(err)),
+            Ok(envelope) => Ok((envelope, status_err)),
+            Err(parse_err) => Err(match status_err {
+                Some(http) => RpcError::Http(http),
+                None => RpcError::Json(parse_err),
+            }),
         }
     }
 
@@ -249,16 +226,7 @@ struct RpcRequest<'a> {
     params: serde_json::Value,
 }
 
-#[derive(Deserialize)]
-struct RpcResponse<T> {
-    result: Option<T>,
-    error: Option<RpcErrorDetail>,
-    #[allow(dead_code)]
-    id: serde_json::Value,
-}
-
-/// Envelope for [`BitcoinRpc::call_raw`], which reads a `null` result as
-/// success where the typed [`RpcResponse`] would reject it.
+/// The JSON-RPC response envelope, result left untyped.
 #[derive(Deserialize)]
 struct RawRpcResponse {
     result: Option<serde_json::Value>,
@@ -290,7 +258,7 @@ mod tests {
     #[test]
     fn rpc_response_envelope_decodes_success() {
         let json = r#"{"result": {"answer": 42}, "error": null, "id": 1}"#;
-        let env: RpcResponse<serde_json::Value> = serde_json::from_str(json).unwrap();
+        let env: RawRpcResponse = serde_json::from_str(json).unwrap();
         assert!(env.error.is_none());
         assert_eq!(env.result.as_ref().unwrap()["answer"], 42);
     }
@@ -298,7 +266,7 @@ mod tests {
     #[test]
     fn rpc_response_envelope_decodes_error() {
         let json = r#"{"result": null, "error": {"code": -8, "message": "bad param"}, "id": 1}"#;
-        let env: RpcResponse<serde_json::Value> = serde_json::from_str(json).unwrap();
+        let env: RawRpcResponse = serde_json::from_str(json).unwrap();
         let e = env.error.unwrap();
         assert_eq!(e.code, -8);
         assert_eq!(e.message, "bad param");
