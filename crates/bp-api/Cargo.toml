@@ -26,6 +26,7 @@ bp-template-distribution = { workspace = true }
 bp-bitcoin = { workspace = true }
 bp-geoip = { workspace = true }
 bp-config = { workspace = true }
+bp-mining-mode = { workspace = true }
 
 # Async runtime + HTTP server.
 tokio = { workspace = true }

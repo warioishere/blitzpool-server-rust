@@ -233,8 +233,8 @@ async fn mode(
         .get_or_fetch::<ModeResponse, _, ApiError>(key, TtlKind::PplnsMode, async move {
             let resolved = crate::mode::resolve_address_mode(&s, &addr).await?;
             Ok(ModeResponse {
-                mode: resolved.mode.as_str(),
-                group_id: resolved.group_id.map(|g| g.to_string()),
+                mode: resolved.mode().as_str(),
+                group_id: resolved.group_id().map(|g| g.to_string()),
             })
         })
         .await?;

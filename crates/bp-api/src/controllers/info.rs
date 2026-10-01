@@ -15,6 +15,7 @@ use bp_db::{
     find_found_blocks, find_high_scores, find_network_difficulty_tracker,
     find_pool_mode_hashrate_since,
 };
+use bp_mining_mode::MiningModeResult;
 use serde::Serialize;
 
 use crate::error::ApiError;
@@ -404,60 +405,50 @@ async fn client_block_template(
                 let resolved = crate::mode::resolve_address_mode(&s, &addr).await?;
 
                 let mut previewed_finder: Option<String> = None;
-                let payouts: Vec<PayoutInfoEntry> = match resolved.mode {
-                    MiningMode::GroupSolo => {
-                        let gid = resolved
-                            .group_id
-                            .expect("group-solo resolves with its group");
-                        match s.group_solo.as_ref() {
-                            Some(engine) => {
-                                let window = engine
-                                    .reader()
-                                    .round_stats(gid)
-                                    .await
-                                    .map(|stats| stats.per_address)
-                                    .unwrap_or_default();
-                                let finder = preview_finder(&addr, &window);
-                                previewed_finder = Some(finder.as_str().to_string());
-                                match engine.build_distribution(gid, reward_sats, &finder).await {
-                                    Ok(dist) => payout_info_at(&dist, reward_sats),
-                                    Err(_) => Vec::new(),
-                                }
-                            }
-                            None => Vec::new(),
-                        }
-                    }
-                    MiningMode::Blockparty => {
-                        let gid = resolved
-                            .group_id
-                            .expect("blockparty resolves with its group");
-                        match s.blockparty.as_ref() {
-                            Some(bp) => match bp
-                                .build_payouts(gid, bp_common::Sats(reward_sats as i64))
+                let payouts: Vec<PayoutInfoEntry> = match resolved {
+                    MiningModeResult::GroupSolo(gid) => match s.group_solo.as_ref() {
+                        Some(engine) => {
+                            let window = engine
+                                .reader()
+                                .round_stats(gid)
                                 .await
-                            {
-                                Ok(Some(dist)) => dist
-                                    .payouts
-                                    .iter()
-                                    .map(|p| PayoutInfoEntry {
-                                        address: p.address.as_str().to_string(),
-                                        percent: p.percent,
-                                        sats: p.sats.0 as u64,
-                                    })
-                                    .collect(),
-                                _ => Vec::new(),
-                            },
-                            None => Vec::new(),
+                                .map(|stats| stats.per_address)
+                                .unwrap_or_default();
+                            let finder = preview_finder(&addr, &window);
+                            previewed_finder = Some(finder.as_str().to_string());
+                            match engine.build_distribution(gid, reward_sats, &finder).await {
+                                Ok(dist) => payout_info_at(&dist, reward_sats),
+                                Err(_) => Vec::new(),
+                            }
                         }
-                    }
-                    MiningMode::Pplns => match s.pplns.as_ref() {
+                        None => Vec::new(),
+                    },
+                    MiningModeResult::Blockparty(gid) => match s.blockparty.as_ref() {
+                        Some(bp) => match bp
+                            .build_payouts(gid, bp_common::Sats(reward_sats as i64))
+                            .await
+                        {
+                            Ok(Some(dist)) => dist
+                                .payouts
+                                .iter()
+                                .map(|p| PayoutInfoEntry {
+                                    address: p.address.as_str().to_string(),
+                                    percent: p.percent,
+                                    sats: p.sats.0 as u64,
+                                })
+                                .collect(),
+                            _ => Vec::new(),
+                        },
+                        None => Vec::new(),
+                    },
+                    MiningModeResult::Pplns => match s.pplns.as_ref() {
                         Some(engine) => match engine.build_distribution(reward_sats).await {
                             Ok(dist) => payout_info_at(&dist, reward_sats),
                             Err(_) => Vec::new(),
                         },
                         None => Vec::new(),
                     },
-                    MiningMode::Solo => {
+                    MiningModeResult::Solo => {
                         // Exactly what the payout resolver builds, solo fee
                         // included, so the preview matches the real coinbase.
                         bp_mining_job::solo_payouts(addr.as_str(), &s.solo_fee, reward_sats)
@@ -475,9 +466,9 @@ async fn client_block_template(
                 };
                 Ok(ClientBlockTemplateResponse {
                     block_template: template,
-                    mode: resolved.mode.as_str(),
+                    mode: resolved.mode().as_str(),
                     payout_information: payouts,
-                    group_id: resolved.group_id.map(|g| g.to_string()),
+                    group_id: resolved.group_id().map(|g| g.to_string()),
                     block_hex,
                     coinbase_tx_hex,
                     preview_finder: previewed_finder,

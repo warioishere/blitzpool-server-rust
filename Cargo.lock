@@ -607,6 +607,7 @@ dependencies = [
  "bp-group-mgmt-engine",
  "bp-group-solo-engine",
  "bp-mining-job",
+ "bp-mining-mode",
  "bp-pplns-engine",
  "bp-share",
  "bp-stats",
