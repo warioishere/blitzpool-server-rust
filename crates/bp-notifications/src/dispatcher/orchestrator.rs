@@ -448,48 +448,58 @@ async fn send_telegram_device_status(
     event: DeviceStatusEvent,
     subs: Vec<TelegramSubscriptionRow>,
 ) {
-    let fmt_addr = short_address(event.address.as_str());
-    let tasks = subs.into_iter().map(|sub| {
-        let adapter = Arc::clone(&adapter);
-        let pool = pool.clone();
-        let chat_languages = chat_languages.clone();
-        let event = event.clone();
-        let fmt_addr = fmt_addr.clone();
-        async move {
-            let lang = chat_language(&chat_languages, sub.telegram_chat_id).await;
-            let chat_count = count_chat_subscriptions(&pool, sub.telegram_chat_id).await;
-            let include_address = chat_count > 1;
-            let time_str = format_device_time(DEVICE_TIMEZONE, event.timestamp, lang);
-            let address_suffix_de = if include_address {
-                Some(format!(" – Adresse {fmt_addr}"))
-            } else {
-                None
-            };
-            let address_suffix_en = if include_address {
-                Some(format!(" – address {fmt_addr}"))
-            } else {
-                None
-            };
-            let suffix_str = match lang {
-                Language::De => address_suffix_de.as_deref(),
-                Language::En => address_suffix_en.as_deref(),
-            };
-            let text = DeviceStatusText::build(&DeviceStatusArgs {
+    let (address, timestamp) = (event.address.clone(), event.timestamp);
+    send_telegram_device(
+        adapter,
+        pool,
+        chat_languages,
+        &address,
+        timestamp,
+        subs,
+        "telegram-device",
+        |lang, time_formatted, address_suffix| {
+            DeviceStatusText::build(&DeviceStatusArgs {
                 language: lang,
-                time_formatted: &time_str,
+                time_formatted,
                 user_agent: event.user_agent.as_deref(),
                 worker_name: event.worker_name.as_deref(),
                 is_online: event.is_online,
                 is_returning: event.is_returning,
-                address_suffix: suffix_str,
-            });
-            log_adapter_send(
-                "telegram-device",
-                adapter
-                    .send_text(sub.telegram_chat_id, text.pick(lang))
-                    .await,
-            );
-        }
+                address_suffix,
+            })
+            .pick(lang)
+            .to_string()
+        },
+    )
+    .await;
+}
+
+/// One Telegram device notice per chat, in the chat's language and the pool's
+/// timezone. The address is named only when the chat follows more than one.
+#[allow(clippy::too_many_arguments)]
+async fn send_telegram_device(
+    adapter: Arc<TelegramAdapter>,
+    pool: PgPool,
+    chat_languages: ChatLanguageMap,
+    address: &AddressId,
+    timestamp: DateTime<Utc>,
+    subs: Vec<TelegramSubscriptionRow>,
+    label: &'static str,
+    render: impl Fn(Language, &str, Option<&str>) -> String,
+) {
+    let fmt_addr = short_address(address.as_str());
+    let (adapter, pool, chat_languages, fmt_addr, render) =
+        (&adapter, &pool, &chat_languages, &fmt_addr, &render);
+    let tasks = subs.into_iter().map(|sub| async move {
+        let lang = chat_language(chat_languages, sub.telegram_chat_id).await;
+        let chat_count = count_chat_subscriptions(pool, sub.telegram_chat_id).await;
+        let time_str = format_device_time(DEVICE_TIMEZONE, timestamp, lang);
+        let suffix = (chat_count > 1).then(|| match lang {
+            Language::De => format!(" – Adresse {fmt_addr}"),
+            Language::En => format!(" – address {fmt_addr}"),
+        });
+        let text = render(lang, &time_str, suffix.as_deref());
+        log_adapter_send(label, adapter.send_text(sub.telegram_chat_id, &text).await);
     });
     join_all(tasks).await;
 }
@@ -501,38 +511,28 @@ async fn send_telegram_device_partial(
     partial: DevicePartial,
     subs: Vec<TelegramSubscriptionRow>,
 ) {
-    let fmt_addr = short_address(partial.address.as_str());
-    let tasks = subs.into_iter().map(|sub| {
-        let adapter = Arc::clone(&adapter);
-        let pool = pool.clone();
-        let chat_languages = chat_languages.clone();
-        let partial = partial.clone();
-        let fmt_addr = fmt_addr.clone();
-        async move {
-            let lang = chat_language(&chat_languages, sub.telegram_chat_id).await;
-            let chat_count = count_chat_subscriptions(&pool, sub.telegram_chat_id).await;
-            let time_str = format_device_time(DEVICE_TIMEZONE, partial.timestamp, lang);
-            let suffix = (chat_count > 1).then(|| match lang {
-                Language::De => format!(" – Adresse {fmt_addr}"),
-                Language::En => format!(" – address {fmt_addr}"),
-            });
-            let text = DevicePartialText::build(&DevicePartialArgs {
+    send_telegram_device(
+        adapter,
+        pool,
+        chat_languages,
+        &partial.address,
+        partial.timestamp,
+        subs,
+        "telegram-device-partial",
+        |lang, time_formatted, address_suffix| {
+            DevicePartialText::build(&DevicePartialArgs {
                 language: lang,
-                time_formatted: &time_str,
+                time_formatted,
                 worker_name: partial.worker_name.as_deref(),
                 remaining: partial.remaining,
                 before: partial.before,
-                address_suffix: suffix.as_deref(),
-            });
-            log_adapter_send(
-                "telegram-device-partial",
-                adapter
-                    .send_text(sub.telegram_chat_id, text.pick(lang))
-                    .await,
-            );
-        }
-    });
-    join_all(tasks).await;
+                address_suffix,
+            })
+            .pick(lang)
+            .to_string()
+        },
+    )
+    .await;
 }
 
 /// Push payload for a partial loss. `status` is deliberately neither
@@ -606,39 +606,29 @@ async fn send_telegram_device_aggregate(
     agg: DeviceAggregate,
     subs: Vec<TelegramSubscriptionRow>,
 ) {
-    let fmt_addr = short_address(agg.address.as_str());
-    let tasks = subs.into_iter().map(|sub| {
-        let adapter = Arc::clone(&adapter);
-        let pool = pool.clone();
-        let chat_languages = chat_languages.clone();
-        let agg = agg.clone();
-        let fmt_addr = fmt_addr.clone();
-        async move {
-            let lang = chat_language(&chat_languages, sub.telegram_chat_id).await;
-            let chat_count = count_chat_subscriptions(&pool, sub.telegram_chat_id).await;
-            let time_str = format_device_time(DEVICE_TIMEZONE, agg.timestamp, lang);
-            let suffix = (chat_count > 1).then(|| match lang {
-                Language::De => format!(" – Adresse {fmt_addr}"),
-                Language::En => format!(" – address {fmt_addr}"),
-            });
-            let text = DeviceAggregateText::build(&DeviceAggregateArgs {
+    send_telegram_device(
+        adapter,
+        pool,
+        chat_languages,
+        &agg.address,
+        agg.timestamp,
+        subs,
+        "telegram-device-agg",
+        |lang, time_formatted, address_suffix| {
+            DeviceAggregateText::build(&DeviceAggregateArgs {
                 language: lang,
-                time_formatted: &time_str,
+                time_formatted,
                 went_offline: &agg.went_offline,
                 came_back: &agg.came_back,
                 first_seen: &agg.first_seen,
                 reduced: &agg.reduced,
-                address_suffix: suffix.as_deref(),
-            });
-            log_adapter_send(
-                "telegram-device-agg",
-                adapter
-                    .send_text(sub.telegram_chat_id, text.pick(lang))
-                    .await,
-            );
-        }
-    });
-    join_all(tasks).await;
+                address_suffix,
+            })
+            .pick(lang)
+            .to_string()
+        },
+    )
+    .await;
 }
 
 /// Push payload for an aggregate. Carries the same key set as the single
