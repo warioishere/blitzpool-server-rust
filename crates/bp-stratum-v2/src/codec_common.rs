@@ -43,6 +43,11 @@ pub enum CodecError {
     InvalidUtf8(String),
 }
 
+/// The SV2 name of a message, for the wrong-sub-protocol error.
+pub(crate) fn message_name(m: &impl stratum_core::parsers_sv2::IsSv2Message) -> &'static str {
+    stratum_core::parsers_sv2::message_type_to_name(m.message_type())
+}
+
 impl CodecError {
     /// Wrap any `Debug` conversion failure as [`CodecError::Conversion`].
     pub(crate) fn from_conv<E: core::fmt::Debug>(e: E) -> Self {

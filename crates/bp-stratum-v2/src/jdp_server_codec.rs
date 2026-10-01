@@ -77,20 +77,9 @@ fn decode_job_declaration(m: JobDeclaration<'_>) -> Result<InboundJdpFrame, Code
         JobDeclaration::PushSolution(m) => {
             Ok(InboundJdpFrame::PushSolution(decode_push_solution(m)?))
         }
-        other => Err(CodecError::NotForThisSubProtocol(jdp_variant_name(&other))),
-    }
-}
-
-fn jdp_variant_name(m: &JobDeclaration<'_>) -> &'static str {
-    match m {
-        JobDeclaration::AllocateMiningJobToken(_) => "AllocateMiningJobToken",
-        JobDeclaration::AllocateMiningJobTokenSuccess(_) => "AllocateMiningJobTokenSuccess",
-        JobDeclaration::DeclareMiningJob(_) => "DeclareMiningJob",
-        JobDeclaration::DeclareMiningJobError(_) => "DeclareMiningJobError",
-        JobDeclaration::DeclareMiningJobSuccess(_) => "DeclareMiningJobSuccess",
-        JobDeclaration::ProvideMissingTransactions(_) => "ProvideMissingTransactions",
-        JobDeclaration::ProvideMissingTransactionsSuccess(_) => "ProvideMissingTransactionsSuccess",
-        JobDeclaration::PushSolution(_) => "PushSolution",
+        other => Err(CodecError::NotForThisSubProtocol(
+            crate::codec_common::message_name(&other),
+        )),
     }
 }
 

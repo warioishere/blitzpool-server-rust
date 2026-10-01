@@ -100,35 +100,9 @@ fn decode_mining_message(m: Mining<'_>) -> Result<InboundMiningFrame, CodecError
         Mining::SetCustomMiningJob(m) => Ok(InboundMiningFrame::SetCustomMiningJob(
             decode_set_custom_mining_job(m)?,
         )),
-        other => Err(CodecError::NotForThisSubProtocol(mining_variant_name(
-            &other,
-        ))),
-    }
-}
-
-fn mining_variant_name(m: &Mining<'_>) -> &'static str {
-    match m {
-        Mining::CloseChannel(_) => "CloseChannel",
-        Mining::NewExtendedMiningJob(_) => "NewExtendedMiningJob",
-        Mining::NewMiningJob(_) => "NewMiningJob",
-        Mining::OpenExtendedMiningChannel(_) => "OpenExtendedMiningChannel",
-        Mining::OpenExtendedMiningChannelSuccess(_) => "OpenExtendedMiningChannelSuccess",
-        Mining::OpenMiningChannelError(_) => "OpenMiningChannelError",
-        Mining::OpenStandardMiningChannel(_) => "OpenStandardMiningChannel",
-        Mining::OpenStandardMiningChannelSuccess(_) => "OpenStandardMiningChannelSuccess",
-        Mining::SetCustomMiningJob(_) => "SetCustomMiningJob",
-        Mining::SetCustomMiningJobError(_) => "SetCustomMiningJobError",
-        Mining::SetCustomMiningJobSuccess(_) => "SetCustomMiningJobSuccess",
-        Mining::SetExtranoncePrefix(_) => "SetExtranoncePrefix",
-        Mining::SetGroupChannel(_) => "SetGroupChannel",
-        Mining::SetNewPrevHash(_) => "SetNewPrevHash",
-        Mining::SetTarget(_) => "SetTarget",
-        Mining::SubmitSharesError(_) => "SubmitSharesError",
-        Mining::SubmitSharesExtended(_) => "SubmitSharesExtended",
-        Mining::SubmitSharesStandard(_) => "SubmitSharesStandard",
-        Mining::SubmitSharesSuccess(_) => "SubmitSharesSuccess",
-        Mining::UpdateChannel(_) => "UpdateChannel",
-        Mining::UpdateChannelError(_) => "UpdateChannelError",
+        other => Err(CodecError::NotForThisSubProtocol(
+            crate::codec_common::message_name(&other),
+        )),
     }
 }
 
@@ -459,6 +433,23 @@ mod tests {
     use stratum_core::parsers_sv2::{
         CommonMessagesOwned, ExtensionsNegotiationOwned, ExtensionsOwned,
     };
+
+    /// A server-to-client message arriving inbound is refused by its SV2 name.
+    #[test]
+    fn a_message_of_the_other_direction_is_refused_by_name() {
+        let msg = AnyMessage::Mining(Mining::SubmitSharesSuccess(
+            stratum_core::mining_sv2::SubmitSharesSuccess {
+                channel_id: 1,
+                last_sequence_number: 1,
+                new_submits_accepted_count: 1,
+                new_shares_sum: 1,
+            },
+        ));
+        assert!(matches!(
+            decode_mining_inbound(msg),
+            Err(CodecError::NotForThisSubProtocol("SubmitSharesSuccess"))
+        ));
+    }
 
     // ── decode_setup_connection ────────────────────────────────────
 
