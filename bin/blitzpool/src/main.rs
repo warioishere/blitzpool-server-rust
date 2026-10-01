@@ -414,7 +414,8 @@ async fn main() -> ExitCode {
         // arm and the pending-fee guard.
         engines.blockparty = Some(bp.service.clone());
         // The first share of a routable admin promotes the party READY →
-        // ACTIVE. In-process on the front; the satellite adds it below.
+        // ACTIVE. Only here: the front's party cache is the one cache_sync
+        // keeps current, so a party created after a satellite booted is seen.
         if let Some(accepted_sink) = engines.accepted_sink.as_ref() {
             accepted_sink.push(Arc::new(
                 crate::blockparty_service::BlockpartyAcceptedShareSink::new(bp.service.clone()),
@@ -617,19 +618,13 @@ async fn main() -> ExitCode {
     // Drain the accepted-share stream into the engine sinks, two consumer
     // groups by durability class.
     let satellite_consumer = if consumes_streams {
-        let mut sinks = engines::build_accepted_sinks(
+        let sinks = engines::build_accepted_sinks(
             engines.pplns.as_ref(),
             &engines.group_solo,
             &engines.stats,
             &engines.session_persistence,
             handles.redis.clone(),
         );
-        // Blockparty auto-promote is order-insensitive, so it joins aux.
-        if let Some(bp) = blockparty.as_ref() {
-            sinks.aux.push(Arc::new(
-                crate::blockparty_service::BlockpartyAcceptedShareSink::new(bp.service.clone()),
-            ));
-        }
         // Dedicated connections: a blocking XREAD would head-of-line-block a
         // shared multiplexed one.
         let money_redis = handles.dedicated_redis(&cfg.redis, "satellite-money").await;
