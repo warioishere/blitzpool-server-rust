@@ -568,6 +568,18 @@ impl<C: Clock + Clone> MiningSessionState<C> {
     /// A fresh vardiff engine for a newly opened channel. It is seeded with the
     /// opening difficulty because that is all a share-less channel's silence
     /// can be measured against.
+    /// Register an opened channel with its vardiff engine; the first one
+    /// becomes the primary channel.
+    fn add_channel(&mut self, channel_id: u32, channel: ChannelState, difficulty: Difficulty) {
+        self.channels.insert(channel_id, channel);
+        let engine = self.new_channel_vardiff(difficulty);
+        self.vardiff.insert(channel_id, engine);
+        if self.primary_channel.is_none() {
+            self.primary_channel = Some(channel_id);
+        }
+        self.session_difficulty = difficulty;
+    }
+
     fn new_channel_vardiff(&self, assigned_difficulty: Difficulty) -> VarDiffEngine<C> {
         VarDiffEngine::new(
             self.clock.clone(),
@@ -729,13 +741,7 @@ pub fn handle_open_standard_mining_channel<C: Clock + Clone>(
         input.max_target,
         state.job_lifecycle,
     );
-    state.channels.insert(channel_id, channel);
-    let engine = state.new_channel_vardiff(ctx.assigned_difficulty);
-    state.vardiff.insert(channel_id, engine);
-    if state.primary_channel.is_none() {
-        state.primary_channel = Some(channel_id);
-    }
-    state.session_difficulty = ctx.assigned_difficulty;
+    state.add_channel(channel_id, channel, ctx.assigned_difficulty);
 
     // Standard channels are never grouped: a header-only device can't process
     // the group-addressed `NewExtendedMiningJob` a group rides.
@@ -825,13 +831,7 @@ pub fn handle_open_extended_mining_channel<C: Clock + Clone>(
         input.max_target,
         state.job_lifecycle,
     );
-    state.channels.insert(channel_id, channel);
-    let engine = state.new_channel_vardiff(ctx.assigned_difficulty);
-    state.vardiff.insert(channel_id, engine);
-    if state.primary_channel.is_none() {
-        state.primary_channel = Some(channel_id);
-    }
-    state.session_difficulty = ctx.assigned_difficulty;
+    state.add_channel(channel_id, channel, ctx.assigned_difficulty);
 
     let group_channel_id =
         assign_channel_to_group(state, channel_id, prefix_len + rollable_size as usize);
@@ -995,6 +995,31 @@ fn feed_vardiff<C: Clock>(
     }
 }
 
+/// The submitting channel, or the error frame: an unknown channel is
+/// `invalid-channel-id`, a submit of the other channel kind `invalid-job-id`.
+fn submit_channel(
+    channels: &mut HashMap<u32, ChannelState>,
+    channel_id: u32,
+    sequence_number: u32,
+    kind: ChannelKind,
+) -> Result<&mut ChannelState, HandlerOutcome> {
+    let Some(channel) = channels.get_mut(&channel_id) else {
+        return Err(submit_error(
+            channel_id,
+            sequence_number,
+            ERR_INVALID_CHANNEL_ID,
+        ));
+    };
+    if channel.kind != kind {
+        return Err(submit_error(
+            channel_id,
+            sequence_number,
+            ERR_INVALID_JOB_ID,
+        ));
+    }
+    Ok(channel)
+}
+
 /// Stamp the channel's vardiff liveness heartbeat for any submission, whatever
 /// its outcome. Every submit path must call it before any early-return reject,
 /// so a reject burst from a hashing miner is never misread as silence.
@@ -1013,20 +1038,15 @@ pub fn handle_submit_shares_standard<C: Clock>(
     now_ms: u64,
 ) -> HandlerOutcome {
     stamp_submission_heartbeat(state, submission.channel_id);
-    let Some(channel) = state.channels.get_mut(&submission.channel_id) else {
-        return submit_error(
-            submission.channel_id,
-            submission.sequence_number,
-            ERR_INVALID_CHANNEL_ID,
-        );
+    let channel = match submit_channel(
+        &mut state.channels,
+        submission.channel_id,
+        submission.sequence_number,
+        ChannelKind::Standard,
+    ) {
+        Ok(channel) => channel,
+        Err(refused) => return refused,
     };
-    if channel.kind != ChannelKind::Standard {
-        return submit_error(
-            submission.channel_id,
-            submission.sequence_number,
-            "invalid-job-id",
-        );
-    }
 
     // Classify first so retired-but-known jobs get `stale-share`; `None` (never
     // sent or aged past retention) is the real `invalid-job-id`.
@@ -1080,20 +1100,15 @@ pub fn handle_submit_shares_extended<C: Clock>(
         .contains(&crate::extensions::SV2_EXTENSION_TYPE_WORKER_ID);
     let share_logs = state.share_logs;
     stamp_submission_heartbeat(state, submission.channel_id);
-    let Some(channel) = state.channels.get_mut(&submission.channel_id) else {
-        return submit_error(
-            submission.channel_id,
-            submission.sequence_number,
-            ERR_INVALID_CHANNEL_ID,
-        );
+    let channel = match submit_channel(
+        &mut state.channels,
+        submission.channel_id,
+        submission.sequence_number,
+        ChannelKind::Extended,
+    ) {
+        Ok(channel) => channel,
+        Err(refused) => return refused,
     };
-    if channel.kind != ChannelKind::Extended {
-        return submit_error(
-            submission.channel_id,
-            submission.sequence_number,
-            "invalid-job-id",
-        );
-    }
 
     let Some(frozen_difficulty) = channel
         .extended_jobs
