@@ -77,13 +77,6 @@ pub fn chart_slot_boundaries(since_ms: i64) -> Vec<i64> {
     slot_boundaries(since_ms, cutoff)
 }
 
-/// Chart-visibility cutoff in epoch milliseconds — exposed so chart
-/// handlers can filter their raw DB rows against the same boundary
-/// that [`chart_slot_boundaries`] uses.
-pub fn chart_visibility_cutoff_ms() -> i64 {
-    bp_stats::slot::chart_visibility_cutoff_slot().as_millis()
-}
-
 /// Slot-end boundaries for the window `[since_ms, until_ms)`. Slots are
 /// end-labeled: the boundary `14:00:00.000Z` is the slot `[13:50, 14:00)`.
 pub fn slot_boundaries(since_ms: i64, until_ms: i64) -> Vec<i64> {

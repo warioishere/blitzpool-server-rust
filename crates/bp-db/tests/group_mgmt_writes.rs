@@ -11,7 +11,7 @@ use bp_db::{
     count_pplns_group_join_requests_pending_for_address, count_pplns_group_members_for_group,
     delete_pplns_group_invitation_by_token, delete_pplns_group_member,
     delete_pplns_group_members_for_group, expire_pending_pplns_group_invitations,
-    expire_pending_pplns_group_join_requests, find_all_pplns_group_members, find_group,
+    expire_pending_pplns_group_join_requests, find_group,
     find_pplns_group_active_open_invite_for_group, find_pplns_group_by_name_not_dissolved,
     find_pplns_group_creator_member, find_pplns_group_invitation_pending_directed,
     find_pplns_group_invitations_pending_for_address_directed,
@@ -482,40 +482,6 @@ async fn insert_member_and_delete_roundtrip() {
         .execute(&pool)
         .await
         .ok();
-}
-
-#[tokio::test]
-async fn find_all_members_returns_all_groups() {
-    let pool = match connect_or_skip().await {
-        Some(p) => p,
-        None => return,
-    };
-    let g1 = Uuid::new_v4();
-    let g2 = Uuid::new_v4();
-    let n1 = format!("all1-{}", g1);
-    let n2 = format!("all2-{}", g2);
-    insert_pplns_group(&pool, g1, &n1, &addr("a_c1"), "h", false, false, "prop", 1)
-        .await
-        .expect("g1");
-    insert_pplns_group(&pool, g2, &n2, &addr("a_c2"), "h", false, false, "prop", 1)
-        .await
-        .expect("g2");
-    let m_addr = format!("all_m_unique_{}", g1);
-    insert_pplns_group_member(&pool, g1, &addr(&m_addr), "creator", 2)
-        .await
-        .expect("m1");
-
-    let all = find_all_pplns_group_members(&pool).await.expect("all");
-    assert!(all.iter().any(|m| m.address.as_str() == m_addr));
-
-    delete_pplns_group_members_for_group(&pool, g1).await.ok();
-    for id in [g1, g2] {
-        sqlx::query("DELETE FROM pplns_group WHERE id = $1")
-            .bind(id)
-            .execute(&pool)
-            .await
-            .ok();
-    }
 }
 
 // ─── Invitations ───────────────────────────────────────────────────────────

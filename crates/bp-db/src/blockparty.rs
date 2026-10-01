@@ -459,28 +459,6 @@ pub async fn insert_blockparty_member(
     .map_err(DbError::from)
 }
 
-pub async fn update_blockparty_member_percent_bp(
-    pool: &PgPool,
-    group_id: Uuid,
-    address: &AddressId,
-    percent_bp: i32,
-    updated_at: i64,
-) -> Result<u64, DbError> {
-    sqlx::query!(
-        r#"UPDATE blockparty_member
-           SET "percentBp" = $3, "updatedAt" = $4
-           WHERE "groupId" = $1 AND address = $2"#,
-        group_id,
-        address.as_str(),
-        percent_bp,
-        updated_at,
-    )
-    .execute(pool)
-    .await
-    .map(|r| r.rows_affected())
-    .map_err(DbError::from)
-}
-
 pub async fn update_blockparty_member_confirmed<'e, E>(
     executor: E,
     group_id: Uuid,

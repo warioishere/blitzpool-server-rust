@@ -134,46 +134,6 @@ pub async fn find_active_sessions_for_addresses(
 // ── Time-range readers ───────────────────────────────────────────────
 // Raw rows only: bucketing is endpoint-specific, so the API layer does it.
 
-/// Pool-wide `client_statistics_entity` rows from `since_ms` on, by time.
-pub async fn find_client_statistics_since(
-    pool: &PgPool,
-    since_ms: i64,
-) -> Result<Vec<ClientStatisticsRow>, DbError> {
-    sqlx::query_as!(
-        ClientStatisticsRow,
-        r#"SELECT
-            "deletedAt" AS "deleted_at?",
-            "createdAt" AS "created_at!",
-            "updatedAt" AS "updated_at!",
-            id AS "id!",
-            address AS "address!: AddressId",
-            "clientName" AS "client_name!",
-            "sessionId" AS "session_id!",
-            "time" AS "time!",
-            shares AS "shares!",
-            "acceptedCount" AS "accepted_count!",
-            "rejectedCount" AS "rejected_count!",
-            "rejectedJobNotFoundCount" AS "rejected_job_not_found_count!",
-            "rejectedJobNotFoundDiff1" AS "rejected_job_not_found_diff1!",
-            "rejectedDuplicateShareCount" AS "rejected_duplicate_share_count!",
-            "rejectedDuplicateShareDiff1" AS "rejected_duplicate_share_diff1!",
-            "rejectedLowDifficultyShareCount" AS "rejected_low_difficulty_share_count!",
-            "rejectedLowDifficultyShareDiff1" AS "rejected_low_difficulty_share_diff1!",
-            "rejectedVersionRollingCount" AS "rejected_version_rolling_count!",
-            "rejectedVersionRollingDiff1" AS "rejected_version_rolling_diff1!",
-            "rejectedStaleCount" AS "rejected_stale_count!",
-            "rejectedStaleDiff1" AS "rejected_stale_diff1!",
-            "maxDifficulty" AS "max_difficulty!"
-           FROM client_statistics_entity
-           WHERE "deletedAt" IS NULL AND "time" >= $1
-           ORDER BY "time" ASC"#,
-        since_ms,
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(DbError::from)
-}
-
 /// Minimal projection for counting distinct workers per slot; unordered
 /// because the caller buckets into a map, so PG skips a sort.
 #[derive(Clone, Debug, FromRow)]
@@ -203,7 +163,7 @@ where
     .map_err(DbError::from)
 }
 
-/// [`find_client_statistics_since`] for one address.
+/// One address's `client_statistics_entity` rows from `since_ms` on, by time.
 pub async fn find_client_statistics_since_for_address(
     pool: &PgPool,
     address: &AddressId,
@@ -401,30 +361,6 @@ pub struct ClientRejectedStatisticsRow {
     pub reason: String,
     pub count: f32,
     pub shares: f32,
-}
-
-pub async fn find_client_rejected_statistics(
-    pool: &PgPool,
-    id: i32,
-) -> Result<Option<ClientRejectedStatisticsRow>, DbError> {
-    sqlx::query_as!(
-        ClientRejectedStatisticsRow,
-        r#"SELECT
-            "deletedAt" AS "deleted_at?",
-            "createdAt" AS "created_at!",
-            "updatedAt" AS "updated_at!",
-            id AS "id!",
-            address AS "address!: AddressId",
-            "time" AS "time!",
-            reason AS "reason!",
-            count AS "count!",
-            shares AS "shares!"
-           FROM client_rejected_statistics_entity WHERE id = $1 LIMIT 1"#,
-        id
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(DbError::from)
 }
 
 #[derive(Clone, Debug, FromRow)]

@@ -40,9 +40,8 @@ pub use address_ownership::{
     OwnershipChallengeRow,
 };
 pub use block::{
-    delete_old_rpc_blocks, find_block, find_found_blocks, find_rpc_block,
-    found_block_miner_at_height, insert_found_block, payout_recorded_at_height, BlocksRow,
-    FoundBlockRow, RpcBlockRow,
+    delete_old_rpc_blocks, find_found_blocks, found_block_miner_at_height, insert_found_block,
+    payout_recorded_at_height, FoundBlockRow,
 };
 pub use blockparty::{
     delete_blockparty_join_link, delete_blockparty_member, delete_blockparty_members_for_group,
@@ -55,18 +54,17 @@ pub use blockparty::{
     set_blockparty_confirmation_requested, update_blockparty_group_dissolved,
     update_blockparty_group_last_share_and_status, update_blockparty_group_rental_hint,
     update_blockparty_group_status, update_blockparty_member_confirmed,
-    update_blockparty_member_percent_bp, upsert_blockparty_join_link, BlockpartyBlockHistoryRow,
-    BlockpartyGroupRow, BlockpartyJoinLinkRow, BlockpartyMemberRow, BlockpartySplitSnapshot,
+    upsert_blockparty_join_link, BlockpartyBlockHistoryRow, BlockpartyGroupRow,
+    BlockpartyJoinLinkRow, BlockpartyMemberRow, BlockpartySplitSnapshot,
 };
 pub use client::{
     bulk_upsert_client_difficulty_statistics, bulk_upsert_clients, delete_client_for_session,
     delete_old_client_difficulty_statistics, delete_old_client_rejected_statistics,
     delete_old_client_statistics, delete_old_clients, delete_old_pool_mode_hashrate,
     device_first_seen, device_watch_seed, find_active_session_keys,
-    find_active_sessions_for_addresses, find_client, find_client_rejected_statistics,
-    find_client_rejected_statistics_since_for_address, find_client_statistics_since,
-    find_client_statistics_since_for_address, find_clients_by_address,
-    find_max_difficulty_since_for_addresses, find_pool_worker_rows_since,
+    find_active_sessions_for_addresses, find_client,
+    find_client_rejected_statistics_since_for_address, find_client_statistics_since_for_address,
+    find_clients_by_address, find_max_difficulty_since_for_addresses, find_pool_worker_rows_since,
     find_recently_deleted_sessions, find_stale_active_sessions, find_worker_shares,
     revive_sessions, soft_delete_sessions, update_sv2_user_agent_by_address, upsert_client,
     ClientRejectedStatisticsRow, ClientRow, ClientStatisticsRow, ClientUpsert, DeletedSessionRow,
@@ -89,9 +87,8 @@ pub use group::{
     count_pplns_group_members_for_group, delete_pplns_group_block_history_for_group,
     delete_pplns_group_invitation_by_token, delete_pplns_group_member,
     delete_pplns_group_members_for_group, expire_pending_pplns_group_invitations,
-    expire_pending_pplns_group_join_requests, find_all_pplns_group_member_addresses,
-    find_all_pplns_group_members, find_group, find_group_block_history, find_group_invitation,
-    find_group_join_request, find_group_member, find_group_member_by_address,
+    expire_pending_pplns_group_join_requests, find_all_pplns_group_member_addresses, find_group,
+    find_group_invitation, find_group_member_by_address,
     find_pplns_group_active_open_invite_for_group, find_pplns_group_by_name_not_dissolved,
     find_pplns_group_creator_member, find_pplns_group_invitation_pending_directed,
     find_pplns_group_invitations_pending_for_address_directed,
@@ -116,9 +113,8 @@ pub use notification::{
     delete_push_subscriptions_by_address_and_type, delete_stale_push_subscriptions,
     delete_telegram_subscription_by_chat_address, find_addresses_for_ntfy_listener,
     find_addresses_with_push_subscription, find_best_difficulty_scan_addresses,
-    find_device_notification_addresses, find_ntfy_subscription, find_ntfy_subscription_by_address,
-    find_ntfy_subscriptions_with_hourly_enabled, find_push_subscription,
-    find_push_subscriptions_by_address, find_telegram_subscription,
+    find_device_notification_addresses, find_ntfy_subscription_by_address,
+    find_ntfy_subscriptions_with_hourly_enabled, find_push_subscriptions_by_address,
     find_telegram_subscriptions_by_address, find_telegram_subscriptions_by_chat,
     find_telegram_subscriptions_with_hourly_enabled, promote_telegram_default_if_none,
     set_telegram_default_subscription, set_telegram_hourly_flags, update_ntfy_sub_best_diff_flag,
@@ -130,20 +126,17 @@ pub use notification::{
     TelegramSubscriptionRow,
 };
 pub use pool_stats::{
-    find_network_difficulty_tracker, find_pool_mode_hashrate, find_pool_mode_hashrate_since,
-    find_pool_rejected_statistics, find_pool_rejected_statistics_since, find_pool_share_statistics,
-    find_pool_share_statistics_since, upsert_network_difficulty_tracker,
-    NetworkDifficultyTrackerRow, PoolModeHashrateRow, PoolRejectedStatisticsRow,
-    PoolShareStatisticsRow,
+    find_network_difficulty_tracker, find_pool_mode_hashrate_since,
+    find_pool_rejected_statistics_since, find_pool_share_statistics_since,
+    upsert_network_difficulty_tracker, NetworkDifficultyTrackerRow, PoolModeHashrateRow,
+    PoolRejectedStatisticsRow, PoolShareStatisticsRow,
 };
 pub use pplns::{
     aggregate_pplns_balances, bulk_insert_pplns_payout_history,
     bulk_update_pplns_last_accepted_share_at, bulk_upsert_pplns_balances, find_pplns_balance,
-    find_pplns_balances_for_addresses, find_pplns_balances_for_addresses_locked,
-    find_pplns_balances_with_open_balance, find_pplns_payout_history,
+    find_pplns_balances_for_addresses_locked, find_pplns_balances_with_open_balance,
     pplns_booked_value_rows_at_height, update_pplns_balance_sats_if_unchanged, BalanceUpsert,
-    PayoutHistoryInsert, PplnsBalanceAggregate, PplnsBalanceRow, PplnsPayoutHistoryRow,
-    TouchUpdate,
+    PayoutHistoryInsert, PplnsBalanceAggregate, PplnsBalanceRow, TouchUpdate,
 };
 pub use stats_writes::{
     bulk_upsert_address_settings, bulk_upsert_client_rejected_statistics_entity,

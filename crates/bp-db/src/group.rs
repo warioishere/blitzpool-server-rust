@@ -107,26 +107,6 @@ pub struct PplnsGroupMemberRow {
     pub joined_at: i64,
 }
 
-pub async fn find_group_member(
-    pool: &PgPool,
-    id: i32,
-) -> Result<Option<PplnsGroupMemberRow>, DbError> {
-    sqlx::query_as!(
-        PplnsGroupMemberRow,
-        r#"SELECT
-            id AS "id!",
-            "groupId" AS "group_id!",
-            address AS "address!: AddressId",
-            role AS "role!",
-            "joinedAt" AS "joined_at!"
-           FROM pplns_group_member WHERE id = $1 LIMIT 1"#,
-        id
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(DbError::from)
-}
-
 /// Lookup the membership row by address. An address can be a
 /// member of at most one group at a time (a UNIQUE on `address` in
 /// the schema enforces this), so the return is `Option`.
@@ -194,31 +174,6 @@ pub struct PplnsGroupBlockHistoryRow {
     pub created_at: i64,
     #[sqlx(rename = "rowType")]
     pub row_type: String,
-}
-
-pub async fn find_group_block_history(
-    pool: &PgPool,
-    id: i32,
-) -> Result<Option<PplnsGroupBlockHistoryRow>, DbError> {
-    sqlx::query_as!(
-        PplnsGroupBlockHistoryRow,
-        r#"SELECT
-            id AS "id!",
-            "groupId" AS "group_id!",
-            "blockHeight" AS "block_height!",
-            address AS "address!: AddressId",
-            "paidSats" AS "paid_sats!: Sats",
-            percent AS "percent!",
-            "sharesInRound" AS "shares_in_round!",
-            "totalSharesInRound" AS "total_shares_in_round!",
-            "createdAt" AS "created_at!",
-            "rowType" AS "row_type!"
-           FROM pplns_group_block_history WHERE id = $1 LIMIT 1"#,
-        id
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(DbError::from)
 }
 
 /// Most recent `limit` payout rows for a group, newest first. Powers
@@ -424,30 +379,6 @@ pub struct PplnsGroupJoinRequestRow {
     pub decided_at: Option<i64>,
     #[sqlx(rename = "decidedByAdminTokenHash")]
     pub decided_by_admin_token_hash: Option<String>,
-}
-
-pub async fn find_group_join_request(
-    pool: &PgPool,
-    id: Uuid,
-) -> Result<Option<PplnsGroupJoinRequestRow>, DbError> {
-    sqlx::query_as!(
-        PplnsGroupJoinRequestRow,
-        r#"SELECT
-            id AS "id!",
-            "groupId" AS "group_id!",
-            address AS "address!: AddressId",
-            email AS "email!",
-            message AS "message?",
-            status AS "status!",
-            "createdAt" AS "created_at!",
-            "decidedAt" AS "decided_at?",
-            "decidedByAdminTokenHash" AS "decided_by_admin_token_hash?"
-           FROM pplns_group_join_request WHERE id = $1 LIMIT 1"#,
-        id
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(DbError::from)
 }
 
 // ── Group-mgmt service-layer writes ─────────────────────────────────
@@ -960,27 +891,6 @@ pub async fn find_pplns_group_creator_member(
         group_id,
     )
     .fetch_optional(pool)
-    .await
-    .map_err(DbError::from)
-}
-
-/// All member rows pool-wide — drives the address-cache rebuild. The
-/// caller pairs each row's `groupId` against [`list_active_pplns_groups`]
-/// to mask out members of dissolved groups.
-pub async fn find_all_pplns_group_members(
-    pool: &PgPool,
-) -> Result<Vec<PplnsGroupMemberRow>, DbError> {
-    sqlx::query_as!(
-        PplnsGroupMemberRow,
-        r#"SELECT
-            id AS "id!",
-            "groupId" AS "group_id!",
-            address AS "address!: AddressId",
-            role AS "role!",
-            "joinedAt" AS "joined_at!"
-           FROM pplns_group_member"#,
-    )
-    .fetch_all(pool)
     .await
     .map_err(DbError::from)
 }

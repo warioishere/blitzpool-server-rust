@@ -5,29 +5,9 @@
 //! - `blocks_entity` — append-only block-find log
 //! - `rpc_block_entity` — block-hex cache keyed by height with optional `lockedBy`
 
-use bp_common::AddressId;
 use sqlx::{postgres::PgPool, FromRow};
 
 use crate::DbError;
-
-#[derive(Clone, Debug, FromRow)]
-pub struct BlocksRow {
-    #[sqlx(rename = "deletedAt")]
-    pub deleted_at: Option<i64>,
-    #[sqlx(rename = "createdAt")]
-    pub created_at: i64,
-    #[sqlx(rename = "updatedAt")]
-    pub updated_at: i64,
-    pub id: i32,
-    pub height: i64,
-    #[sqlx(rename = "minerAddress")]
-    pub miner_address: AddressId,
-    pub worker: String,
-    #[sqlx(rename = "sessionId")]
-    pub session_id: String,
-    #[sqlx(rename = "blockData")]
-    pub block_data: String,
-}
 
 /// Subset of `blocks_entity` columns surfaced by `/api/info` →
 /// `blockData`. Selects the four fields the pool-info endpoint needs
@@ -138,36 +118,6 @@ pub async fn find_found_blocks(pool: &PgPool) -> Result<Vec<FoundBlockRow>, DbEr
     .map_err(DbError::from)
 }
 
-pub async fn find_block(pool: &PgPool, id: i32) -> Result<Option<BlocksRow>, DbError> {
-    sqlx::query_as!(
-        BlocksRow,
-        r#"SELECT
-            "deletedAt" AS "deleted_at?",
-            "createdAt" AS "created_at!",
-            "updatedAt" AS "updated_at!",
-            id AS "id!",
-            height AS "height!",
-            "minerAddress" AS "miner_address!: AddressId",
-            worker AS "worker!",
-            "sessionId" AS "session_id!",
-            "blockData" AS "block_data!"
-           FROM blocks_entity WHERE id = $1 LIMIT 1"#,
-        id
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(DbError::from)
-}
-
-#[derive(Clone, Debug, FromRow)]
-pub struct RpcBlockRow {
-    #[sqlx(rename = "blockHeight")]
-    pub block_height: i64,
-    #[sqlx(rename = "lockedBy")]
-    pub locked_by: Option<String>,
-    pub data: Option<String>,
-}
-
 /// Hard-delete all `rpc_block_entity` rows except the one with the
 /// highest `blockHeight`. The table is a short-lived block-hex cache;
 /// only the current tip is ever needed, so older entries are pruned
@@ -184,22 +134,4 @@ where
     .await
     .map_err(DbError::from)?;
     Ok(r.rows_affected())
-}
-
-pub async fn find_rpc_block(
-    pool: &PgPool,
-    block_height: i64,
-) -> Result<Option<RpcBlockRow>, DbError> {
-    sqlx::query_as!(
-        RpcBlockRow,
-        r#"SELECT
-            "blockHeight" AS "block_height!",
-            "lockedBy" AS "locked_by?",
-            data AS "data?"
-           FROM rpc_block_entity WHERE "blockHeight" = $1 LIMIT 1"#,
-        block_height
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(DbError::from)
 }

@@ -110,29 +110,6 @@ pub struct PoolShareStatisticsRow {
     pub max_difficulty: f32,
 }
 
-pub async fn find_pool_share_statistics(
-    pool: &PgPool,
-    id: i32,
-) -> Result<Option<PoolShareStatisticsRow>, DbError> {
-    sqlx::query_as!(
-        PoolShareStatisticsRow,
-        r#"SELECT
-            "deletedAt" AS "deleted_at?",
-            "createdAt" AS "created_at!",
-            "updatedAt" AS "updated_at!",
-            id AS "id!",
-            "time" AS "time!",
-            accepted AS "accepted!",
-            rejected AS "rejected!",
-            "maxDifficulty" AS "max_difficulty!"
-           FROM pool_share_statistics_entity WHERE id = $1 LIMIT 1"#,
-        id
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(DbError::from)
-}
-
 #[derive(Clone, Debug, FromRow)]
 pub struct PoolRejectedStatisticsRow {
     #[sqlx(rename = "deletedAt")]
@@ -147,53 +124,12 @@ pub struct PoolRejectedStatisticsRow {
     pub count: f32,
 }
 
-pub async fn find_pool_rejected_statistics(
-    pool: &PgPool,
-    id: i32,
-) -> Result<Option<PoolRejectedStatisticsRow>, DbError> {
-    sqlx::query_as!(
-        PoolRejectedStatisticsRow,
-        r#"SELECT
-            "deletedAt" AS "deleted_at?",
-            "createdAt" AS "created_at!",
-            "updatedAt" AS "updated_at!",
-            id AS "id!",
-            "time" AS "time!",
-            reason AS "reason!",
-            count AS "count!"
-           FROM pool_rejected_statistics_entity WHERE id = $1 LIMIT 1"#,
-        id
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(DbError::from)
-}
-
 #[derive(Clone, Debug, FromRow)]
 pub struct PoolModeHashrateRow {
     pub id: i32,
     pub mode: MiningMode,
     pub time: i64,
     pub diff: f32,
-}
-
-pub async fn find_pool_mode_hashrate(
-    pool: &PgPool,
-    id: i32,
-) -> Result<Option<PoolModeHashrateRow>, DbError> {
-    sqlx::query_as!(
-        PoolModeHashrateRow,
-        r#"SELECT
-            id AS "id!",
-            mode AS "mode!: MiningMode",
-            "time" AS "time!",
-            diff AS "diff!"
-           FROM pool_mode_hashrate WHERE id = $1 LIMIT 1"#,
-        id
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(DbError::from)
 }
 
 #[derive(Clone, Debug, FromRow)]

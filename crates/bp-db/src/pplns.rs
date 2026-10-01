@@ -119,28 +119,6 @@ where
     .map_err(DbError::from)
 }
 
-/// Unlocked, unordered bulk load for read-only callers. Anything that writes
-/// a balance back must use [`find_pplns_balances_for_addresses_locked`].
-pub async fn find_pplns_balances_for_addresses(
-    pool: &PgPool,
-    addresses: &[String],
-) -> Result<Vec<PplnsBalanceRow>, DbError> {
-    sqlx::query_as!(
-        PplnsBalanceRow,
-        r#"SELECT
-            address AS "address!: AddressId",
-            "balanceSats" AS "balance_sats!: Sats",
-            "totalPaidSats" AS "total_paid_sats!: Sats",
-            "updatedAt" AS "updated_at!",
-            "lastAcceptedShareAt" AS "last_accepted_share_at?"
-           FROM pplns_balance WHERE address = ANY($1::text[])"#,
-        addresses
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(DbError::from)
-}
-
 /// Aggregate roll-up of the `pplns_balance` table — credits, debits,
 /// row counts, abandoned-bucket subtotals and lifetime payout — all
 /// in one PG round-trip, so no balance rows cross the wire.
@@ -204,45 +182,6 @@ pub async fn aggregate_pplns_balances(
         abandoned_debit_sats: row.abandoned_debit,
         lifetime_paid_sats: row.lifetime_paid,
     })
-}
-
-#[derive(Clone, Debug, FromRow)]
-pub struct PplnsPayoutHistoryRow {
-    pub id: i32,
-    #[sqlx(rename = "blockHeight")]
-    pub block_height: i32,
-    pub address: AddressId,
-    #[sqlx(rename = "paidSats")]
-    pub paid_sats: Sats,
-    pub percent: f32,
-    #[sqlx(rename = "createdAt")]
-    pub created_at: i64,
-    /// Row-source discriminator, kept as a raw `String` at the data layer;
-    /// the typed wire values live in `bp_coinbase_snapshot::PayoutRowType`.
-    #[sqlx(rename = "rowType")]
-    pub row_type: String,
-}
-
-pub async fn find_pplns_payout_history(
-    pool: &PgPool,
-    id: i32,
-) -> Result<Option<PplnsPayoutHistoryRow>, DbError> {
-    sqlx::query_as!(
-        PplnsPayoutHistoryRow,
-        r#"SELECT
-            id AS "id!",
-            "blockHeight" AS "block_height!",
-            address AS "address!: AddressId",
-            "paidSats" AS "paid_sats!: Sats",
-            percent AS "percent!",
-            "createdAt" AS "created_at!",
-            "rowType" AS "row_type!"
-           FROM pplns_payout_history WHERE id = $1 LIMIT 1"#,
-        id
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(DbError::from)
 }
 
 // ── Bulk writes ──────────────────────────────────────────────────────

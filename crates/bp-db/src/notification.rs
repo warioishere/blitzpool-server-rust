@@ -33,32 +33,6 @@ pub struct TelegramSubscriptionRow {
     pub hourly_workers_enabled: bool,
 }
 
-pub async fn find_telegram_subscription(
-    pool: &PgPool,
-    id: i32,
-) -> Result<Option<TelegramSubscriptionRow>, DbError> {
-    sqlx::query_as!(
-        TelegramSubscriptionRow,
-        r#"SELECT
-            "deletedAt" AS "deleted_at?",
-            "createdAt" AS "created_at!",
-            "updatedAt" AS "updated_at!",
-            id AS "id!",
-            address AS "address!: AddressId",
-            "telegramChatId" AS "telegram_chat_id!",
-            "bestDiffNotificationsEnabled" AS "best_diff_notifications_enabled!",
-            "isDefault" AS "is_default!",
-            "deviceNotificationsEnabled" AS "device_notifications_enabled!",
-            "hourlyStatsEnabled" AS "hourly_stats_enabled!",
-            "hourlyWorkersEnabled" AS "hourly_workers_enabled!"
-           FROM telegram_subscriptions_entity WHERE id = $1 LIMIT 1"#,
-        id
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(DbError::from)
-}
-
 /// All non-soft-deleted Telegram subscriptions for `address`. Multiple
 /// chats can subscribe to the same address (e.g. owner + family),
 /// hence `Vec`. Callers filter on `best_diff_notifications_enabled`
@@ -169,31 +143,6 @@ pub struct NtfySubscriptionRow {
     pub hourly_workers_enabled: bool,
 }
 
-pub async fn find_ntfy_subscription(
-    pool: &PgPool,
-    id: i32,
-) -> Result<Option<NtfySubscriptionRow>, DbError> {
-    sqlx::query_as!(
-        NtfySubscriptionRow,
-        r#"SELECT
-            "deletedAt" AS "deleted_at?",
-            "createdAt" AS "created_at!",
-            "updatedAt" AS "updated_at!",
-            id AS "id!",
-            address AS "address!: AddressId",
-            language AS "language!",
-            "bestDiffNotificationsEnabled" AS "best_diff_notifications_enabled!",
-            "deviceNotificationsEnabled" AS "device_notifications_enabled!",
-            "hourlyStatsEnabled" AS "hourly_stats_enabled!",
-            "hourlyWorkersEnabled" AS "hourly_workers_enabled!"
-           FROM ntfy_subscriptions_entity WHERE id = $1 LIMIT 1"#,
-        id
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(DbError::from)
-}
-
 /// All ntfy subscriptions where the hourly cron should fire — either
 /// `hourlyStatsEnabled` OR `hourlyWorkersEnabled` is true.
 pub async fn find_ntfy_subscriptions_with_hourly_enabled(
@@ -279,34 +228,6 @@ pub struct PushSubscriptionRow {
     pub subscription_type: String,
     #[sqlx(rename = "networkDiffNotificationsEnabled")]
     pub network_diff_notifications_enabled: bool,
-}
-
-pub async fn find_push_subscription(
-    pool: &PgPool,
-    id: i32,
-) -> Result<Option<PushSubscriptionRow>, DbError> {
-    sqlx::query_as!(
-        PushSubscriptionRow,
-        r#"SELECT
-            "deletedAt" AS "deleted_at?",
-            "createdAt" AS "created_at!",
-            "updatedAt" AS "updated_at!",
-            id AS "id!",
-            address AS "address!: AddressId",
-            endpoint AS "endpoint!",
-            platform AS "platform!",
-            "lastNotificationAt" AS "last_notification_at?",
-            "bestDiffNotificationsEnabled" AS "best_diff_notifications_enabled!",
-            "deviceNotificationsEnabled" AS "device_notifications_enabled!",
-            "blockNotificationsEnabled" AS "block_notifications_enabled!",
-            "subscriptionType" AS "subscription_type!",
-            "networkDiffNotificationsEnabled" AS "network_diff_notifications_enabled!"
-           FROM push_subscription_entity WHERE id = $1 LIMIT 1"#,
-        id
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(DbError::from)
 }
 
 /// All non-soft-deleted push subscriptions for `address`. Returns

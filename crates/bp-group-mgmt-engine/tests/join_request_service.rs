@@ -353,11 +353,13 @@ async fn expire_join_requests_once_flips_stale_pending() {
 
     let n = expire_join_requests_once(&pool).await.expect("sweep");
     assert!(n >= 1);
-    let after = bp_db::find_group_join_request(&pool, row.id)
-        .await
-        .expect("look")
-        .expect("present");
-    assert_eq!(after.status, "expired");
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM pplns_group_join_request WHERE id = $1")
+            .bind(row.id)
+            .fetch_one(&pool)
+            .await
+            .expect("present");
+    assert_eq!(status, "expired");
     cleanup_group(&pool, group_id).await;
     delete_email_for(&pool, &requester).await;
 }
