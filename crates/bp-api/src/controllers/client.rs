@@ -842,6 +842,22 @@ struct DiffScoresResponse {
     slot_data: Vec<DiffScoreSlot>,
 }
 
+/// Cache lifetime of a `diff-scores` response: longer ranges are cached
+/// longer, but never past the next full hour. The response ends in an hourly
+/// bucket, and scoreboard periods start on the hour, so a response cached
+/// across that boundary would hide the new period's first bucket.
+fn diff_scores_ttl_secs(range_label: &str, now_ms: i64) -> u64 {
+    const HOUR_MS: i64 = 3_600_000;
+    let by_range: u64 = match range_label {
+        "7d" => 1800,
+        "30d" => 7200,
+        _ => 300,
+    };
+    let until_next_hour_ms = HOUR_MS - now_ms.rem_euclid(HOUR_MS);
+    let until_next_hour = u64::try_from(until_next_hour_ms / 1000).unwrap_or(1).max(1);
+    by_range.min(until_next_hour)
+}
+
 async fn diff_scores<H, M>(
     State(state): State<SharedState<H, M>>,
     Path(address): Path<String>,
@@ -854,12 +870,7 @@ where
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     let range_label = q.range.clone().unwrap_or_else(|| "1d".to_string());
     let key = format!("CLIENT_DIFF_SCORES_{}_{}", addr.as_str(), range_label);
-    // Longer ranges scan more rows — cache them proportionally longer.
-    let ttl_secs: u64 = match range_label.as_str() {
-        "7d" => 1800,
-        "30d" => 7200,
-        _ => 300,
-    };
+    let ttl_secs = diff_scores_ttl_secs(&range_label, bp_common::now_ms());
     let s = state.clone();
     let bytes = state
         .cache
@@ -988,6 +999,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cached `diff-scores` response never outlives the hour bucket it ends
+    /// in, so a scoreboard period starting on the hour sees its first bucket
+    /// on the next fetch.
+    #[test]
+    fn a_diff_scores_response_expires_at_the_next_full_hour() {
+        let hour = 3_600_000_i64;
+        let just_before = 1_790_805_540_000_i64; // 21:59:00 UTC
+        for range in ["1d", "7d", "30d"] {
+            assert_eq!(diff_scores_ttl_secs(range, just_before), 60, "{range}");
+        }
+        // Mid-hour the range's own lifetime still applies when it is shorter.
+        assert_eq!(
+            diff_scores_ttl_secs("1d", 1_790_802_000_000 + hour / 2),
+            300
+        );
+        assert_eq!(diff_scores_ttl_secs("30d", 1_790_802_000_000), 3600);
+    }
 
     const S: i64 = 600_000;
     const T0: i64 = 1_700_000_400_000;
