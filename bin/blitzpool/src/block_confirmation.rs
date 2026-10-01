@@ -575,7 +575,7 @@ mod declared_block_booking_regtest {
             // The gate decides which engine books; its default for an unknown
             // address is SOLO, which books nothing.
             let gate = Arc::new(crate::engines::BlitzpoolModeGate::new());
-            gate.set_mode(&miners[0], bp_mining_mode::MiningModeResult::pplns());
+            gate.set_mode(&miners[0], bp_mining_mode::MiningModeResult::Pplns);
 
             let node = RegtestNode::start_with(regtest_cfg)
                 .await
@@ -1380,7 +1380,7 @@ mod declared_block_booking_regtest {
             let gate = Arc::new(crate::engines::BlitzpoolModeGate::new());
             gate.set_mode(
                 &members[0],
-                bp_mining_mode::MiningModeResult::group_solo(group_id.to_string()),
+                bp_mining_mode::MiningModeResult::GroupSolo(group_id),
             );
 
             let node = RegtestNode::start_with(regtest_cfg)

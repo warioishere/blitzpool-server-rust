@@ -1,60 +1,34 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use bp_common::MiningMode;
+use uuid::Uuid;
 
-/// Outcome of a mining-mode resolution for one address. `group_id` is set only
-/// for Group-Solo and Blockparty: the group's canonical UUID from
-/// `pplns_group`, as the `/api/pplns/mode/:address` JSON contract expects.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MiningModeResult {
-    pub mode: MiningMode,
-    pub group_id: Option<String>,
+/// Outcome of a mining-mode resolution for one address. Group-Solo and
+/// Blockparty carry their group, so no consumer has to handle a group mode
+/// without one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MiningModeResult {
+    Solo,
+    Pplns,
+    GroupSolo(Uuid),
+    Blockparty(Uuid),
 }
 
 impl MiningModeResult {
-    pub fn solo() -> Self {
-        Self {
-            mode: MiningMode::Solo,
-            group_id: None,
+    pub fn mode(self) -> MiningMode {
+        match self {
+            Self::Solo => MiningMode::Solo,
+            Self::Pplns => MiningMode::Pplns,
+            Self::GroupSolo(_) => MiningMode::GroupSolo,
+            Self::Blockparty(_) => MiningMode::Blockparty,
         }
     }
 
-    pub fn pplns() -> Self {
-        Self {
-            mode: MiningMode::Pplns,
-            group_id: None,
+    /// The group stamped onto shares and found blocks for this mode.
+    pub fn group_id(self) -> Option<Uuid> {
+        match self {
+            Self::Solo | Self::Pplns => None,
+            Self::GroupSolo(g) | Self::Blockparty(g) => Some(g),
         }
-    }
-
-    pub fn group_solo(group_id: impl Into<String>) -> Self {
-        Self {
-            mode: MiningMode::GroupSolo,
-            group_id: Some(group_id.into()),
-        }
-    }
-
-    pub fn blockparty(group_id: impl Into<String>) -> Self {
-        Self {
-            mode: MiningMode::Blockparty,
-            group_id: Some(group_id.into()),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn constructors_set_expected_fields() {
-        assert_eq!(MiningModeResult::solo().mode, MiningMode::Solo);
-        assert!(MiningModeResult::solo().group_id.is_none());
-
-        assert_eq!(MiningModeResult::pplns().mode, MiningMode::Pplns);
-        assert!(MiningModeResult::pplns().group_id.is_none());
-
-        let g = MiningModeResult::group_solo("grp-1");
-        assert_eq!(g.mode, MiningMode::GroupSolo);
-        assert_eq!(g.group_id.as_deref(), Some("grp-1"));
     }
 }

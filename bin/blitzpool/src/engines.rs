@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use bp_common::{AddressId, MiningMode, Sats};
+use bp_common::{AddressId, Sats};
 use bp_config::{AppConfig, PplnsConfig as TomlPplnsConfig, Role};
 use bp_group_solo_engine::config::GroupSoloEngineConfig;
 use bp_group_solo_engine::engine::GroupSoloEngine;
@@ -338,7 +338,7 @@ impl BlitzpoolModeGate {
         guard
             .entry(address.to_string())
             .and_modify(|e| {
-                e.mode = result.clone();
+                e.mode = result;
                 e.count += 1;
             })
             .or_insert(RefcountedMode {
@@ -360,8 +360,7 @@ impl BlitzpoolModeGate {
 
     /// Solo when the gate has never been told.
     pub(crate) fn lookup_mode(&self, address: &str) -> MiningModeResult {
-        self.lookup_known(address)
-            .unwrap_or_else(MiningModeResult::solo)
+        self.lookup_known(address).unwrap_or(MiningModeResult::Solo)
     }
 
     /// `None` without a live session, which differs from Solo: the port is the
@@ -370,22 +369,23 @@ impl BlitzpoolModeGate {
     /// precedes the mining channel) must use this.
     pub(crate) fn lookup_known(&self, address: &str) -> Option<MiningModeResult> {
         let guard = self.inner.lock().expect("mode-gate mutex poisoned");
-        guard.get(address).map(|e| e.mode.clone())
+        guard.get(address).map(|e| e.mode)
     }
 
     /// Solo records no payout rows, so a Solo block without them is normal;
     /// in every other mode a missing row is a real miss.
     pub(crate) fn keeps_a_payout_ledger(&self, address: &str) -> bool {
-        !matches!(self.lookup_mode(address).mode, MiningMode::Solo)
+        !matches!(self.lookup_mode(address), MiningModeResult::Solo)
     }
 
     /// Group-Solo `group_id` only: a Blockparty address carries one too, but
     /// it is not a Group-Solo group.
     pub(crate) fn group_for_address(&self, address: &str) -> Option<Uuid> {
-        let r = self.lookup_mode(address);
-        match r.mode {
-            MiningMode::GroupSolo => r.group_id.and_then(|s| Uuid::parse_str(&s).ok()),
-            MiningMode::Solo | MiningMode::Pplns | MiningMode::Blockparty => None,
+        match self.lookup_mode(address) {
+            MiningModeResult::GroupSolo(g) => Some(g),
+            MiningModeResult::Solo | MiningModeResult::Pplns | MiningModeResult::Blockparty(_) => {
+                None
+            }
         }
     }
 
@@ -395,8 +395,13 @@ impl BlitzpoolModeGate {
         let guard = self.inner.lock().expect("mode-gate mutex poisoned");
         guard
             .iter()
-            .filter(|(_, e)| matches!(e.mode.mode, MiningMode::Solo | MiningMode::GroupSolo))
-            .map(|(a, e)| (a.clone(), e.mode.clone()))
+            .filter(|(_, e)| {
+                matches!(
+                    e.mode,
+                    MiningModeResult::Solo | MiningModeResult::GroupSolo(_)
+                )
+            })
+            .map(|(a, e)| (a.clone(), e.mode))
             .collect()
     }
 
@@ -441,10 +446,13 @@ impl SharedAcceptedShareSink for CompositeAcceptedShareSink {
         // mode-gated sinks read share.mode.
         let share_id = self.sequencer.next_id();
         let resolved = self.gate.lookup_mode(share.address);
+        let mut group_buf = Uuid::encode_buffer();
         let share = SharedAcceptedShare {
             share_id: &share_id,
-            mode: resolved.mode,
-            group_id: resolved.group_id.as_deref(),
+            mode: resolved.mode(),
+            group_id: resolved
+                .group_id()
+                .map(|g| &*g.hyphenated().encode_lower(&mut group_buf)),
             ..share
         };
         for (i, sink) in snapshot.iter().enumerate() {
@@ -704,6 +712,47 @@ mod tests {
         }
     }
 
+    struct GroupIdSink(std::sync::Mutex<Vec<(MiningMode, Option<String>)>>);
+
+    #[async_trait]
+    impl SharedAcceptedShareSink for GroupIdSink {
+        async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
+            let seen = (share.mode, share.group_id.map(str::to_string));
+            self.0.lock().unwrap().push(seen);
+        }
+    }
+
+    /// Pins the stamped `group_id` to the group's canonical string, the form
+    /// the Group-Solo and Blockparty sinks parse back.
+    #[tokio::test]
+    async fn composite_stamps_the_group_of_both_group_modes() {
+        let composite = empty_composite();
+        let sink = Arc::new(GroupIdSink(std::sync::Mutex::new(Vec::new())));
+        composite.push(sink.clone());
+        let (gs, bp) = (Uuid::new_v4(), Uuid::new_v4());
+        let addr = test_share().address;
+
+        composite
+            .gate
+            .set_mode(addr, MiningModeResult::GroupSolo(gs));
+        composite.record_accepted(test_share()).await;
+        composite
+            .gate
+            .set_mode(addr, MiningModeResult::Blockparty(bp));
+        composite.record_accepted(test_share()).await;
+        composite.gate.set_mode(addr, MiningModeResult::Pplns);
+        composite.record_accepted(test_share()).await;
+
+        assert_eq!(
+            *sink.0.lock().unwrap(),
+            vec![
+                (MiningMode::GroupSolo, Some(gs.to_string())),
+                (MiningMode::Blockparty, Some(bp.to_string())),
+                (MiningMode::Pplns, None),
+            ]
+        );
+    }
+
     fn empty_composite() -> CompositeAcceptedShareSink {
         CompositeAcceptedShareSink {
             sinks: ArcSwap::new(Arc::new(Vec::new())),
@@ -783,7 +832,7 @@ mod tests {
 
         let gate = Arc::new(BlitzpoolModeGate::new());
         let addr = "bc1qproducingsink";
-        gate.set_mode(addr, MiningModeResult::pplns());
+        gate.set_mode(addr, MiningModeResult::Pplns);
 
         let composite = build_producing_composite(gate, conn.clone(), 7);
 
@@ -818,7 +867,7 @@ mod tests {
     }
 
     fn mode_of(gate: &BlitzpoolModeGate, address: &str) -> MiningMode {
-        gate.lookup_mode(address).mode
+        gate.lookup_mode(address).mode()
     }
 
     /// Pins that `lookup_known` tells an undecided address apart from Solo,
@@ -839,15 +888,15 @@ mod tests {
              test would pass with both answers collapsed"
         );
 
-        gate.set_mode("bc1qsolo", MiningModeResult::solo());
+        gate.set_mode("bc1qsolo", MiningModeResult::Solo);
         assert_eq!(
-            gate.lookup_known("bc1qsolo").map(|r| r.mode),
+            gate.lookup_known("bc1qsolo").map(|r| r.mode()),
             Some(MiningMode::Solo)
         );
 
-        gate.set_mode("bc1qpplns", MiningModeResult::pplns());
+        gate.set_mode("bc1qpplns", MiningModeResult::Pplns);
         assert_eq!(
-            gate.lookup_known("bc1qpplns").map(|r| r.mode),
+            gate.lookup_known("bc1qpplns").map(|r| r.mode()),
             Some(MiningMode::Pplns)
         );
 
@@ -865,7 +914,7 @@ mod tests {
     #[test]
     fn mode_gate_pplns_path() {
         let gate = BlitzpoolModeGate::new();
-        gate.set_mode("bc1qpplns", MiningModeResult::pplns());
+        gate.set_mode("bc1qpplns", MiningModeResult::Pplns);
         assert_eq!(mode_of(&gate, "bc1qpplns"), MiningMode::Pplns);
         assert_eq!(gate.group_for_address("bc1qpplns"), None);
     }
@@ -874,23 +923,15 @@ mod tests {
     fn mode_gate_group_solo_path_extracts_uuid() {
         let gate = BlitzpoolModeGate::new();
         let group_id = Uuid::new_v4();
-        gate.set_mode("bc1qgs", MiningModeResult::group_solo(group_id.to_string()));
+        gate.set_mode("bc1qgs", MiningModeResult::GroupSolo(group_id));
         assert_eq!(mode_of(&gate, "bc1qgs"), MiningMode::GroupSolo);
         assert_eq!(gate.group_for_address("bc1qgs"), Some(group_id));
     }
 
     #[test]
-    fn mode_gate_group_solo_with_invalid_uuid_returns_none() {
-        let gate = BlitzpoolModeGate::new();
-        gate.set_mode("bc1qgs", MiningModeResult::group_solo("not-a-uuid"));
-        assert_eq!(gate.group_for_address("bc1qgs"), None);
-        assert_eq!(mode_of(&gate, "bc1qgs"), MiningMode::GroupSolo);
-    }
-
-    #[test]
     fn mode_gate_clear_drops_the_entry_when_refcount_zero() {
         let gate = BlitzpoolModeGate::new();
-        gate.set_mode("bc1q", MiningModeResult::pplns());
+        gate.set_mode("bc1q", MiningModeResult::Pplns);
         assert_eq!(mode_of(&gate, "bc1q"), MiningMode::Pplns);
         gate.clear_mode("bc1q");
         assert_eq!(mode_of(&gate, "bc1q"), MiningMode::Solo);
@@ -899,19 +940,16 @@ mod tests {
     #[test]
     fn override_mode_flips_connected_solo_to_group_without_touching_refcount() {
         let gate = BlitzpoolModeGate::new();
-        gate.set_mode("bc1qsolo", MiningModeResult::solo());
-        gate.set_mode("bc1qpplns", MiningModeResult::pplns());
+        gate.set_mode("bc1qsolo", MiningModeResult::Solo);
+        gate.set_mode("bc1qpplns", MiningModeResult::Pplns);
         let group_id = Uuid::new_v4();
 
         let cands = gate.group_transition_candidates();
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].0, "bc1qsolo");
-        assert_eq!(cands[0].1.mode, MiningMode::Solo);
+        assert_eq!(cands[0].1, MiningModeResult::Solo);
 
-        gate.override_mode(
-            "bc1qsolo",
-            MiningModeResult::group_solo(group_id.to_string()),
-        );
+        gate.override_mode("bc1qsolo", MiningModeResult::GroupSolo(group_id));
         assert_eq!(mode_of(&gate, "bc1qsolo"), MiningMode::GroupSolo);
         assert_eq!(gate.group_for_address("bc1qsolo"), Some(group_id));
 
@@ -919,19 +957,16 @@ mod tests {
         gate.clear_mode("bc1qsolo");
         assert_eq!(mode_of(&gate, "bc1qsolo"), MiningMode::Solo);
 
-        gate.override_mode(
-            "bc1qabsent",
-            MiningModeResult::group_solo(group_id.to_string()),
-        );
+        gate.override_mode("bc1qabsent", MiningModeResult::GroupSolo(group_id));
         assert_eq!(mode_of(&gate, "bc1qabsent"), MiningMode::Solo);
     }
 
     #[test]
     fn mode_gate_last_write_wins_on_mode_while_refcount_increments() {
         let gate = BlitzpoolModeGate::new();
-        gate.set_mode("bc1q", MiningModeResult::pplns());
+        gate.set_mode("bc1q", MiningModeResult::Pplns);
         let group_id = Uuid::new_v4();
-        gate.set_mode("bc1q", MiningModeResult::group_solo(group_id.to_string()));
+        gate.set_mode("bc1q", MiningModeResult::GroupSolo(group_id));
         assert_eq!(mode_of(&gate, "bc1q"), MiningMode::GroupSolo);
         assert_eq!(gate.group_for_address("bc1q"), Some(group_id));
         gate.clear_mode("bc1q");
@@ -951,8 +986,8 @@ mod tests {
     fn mode_gate_refcount_balances_under_parallel_connections() {
         // The first disconnect must not drop the mode the second still uses.
         let gate = BlitzpoolModeGate::new();
-        gate.set_mode("bc1q", MiningModeResult::pplns());
-        gate.set_mode("bc1q", MiningModeResult::pplns());
+        gate.set_mode("bc1q", MiningModeResult::Pplns);
+        gate.set_mode("bc1q", MiningModeResult::Pplns);
         gate.clear_mode("bc1q");
         assert_eq!(mode_of(&gate, "bc1q"), MiningMode::Pplns);
         gate.clear_mode("bc1q");

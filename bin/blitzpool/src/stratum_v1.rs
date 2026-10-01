@@ -348,14 +348,14 @@ impl ModeGatePopulatingPersistence {
         };
         // Group-Solo membership wins (active group only).
         if let Some(group_id) = self.group_lookup.group_for_address(&address_id).await {
-            return MiningModeResult::group_solo(group_id.to_string());
+            return MiningModeResult::GroupSolo(group_id);
         }
         // Blockparty: the connecting address is the admin of a routable
         // (Ready/Active) party. Only the admin hashes; the coinbase splits
         // to the members. Resolved admin-keyed, independent of the port.
         if let Some(bp) = self.blockparty.as_ref() {
             if let Some(group_id) = bp.routable_group_id_for_admin(&address_id).await {
-                return MiningModeResult::blockparty(group_id.to_string());
+                return MiningModeResult::Blockparty(group_id);
             }
         }
         // Otherwise the port's payout mode (Solo / Pplns).
@@ -399,12 +399,12 @@ impl SharedSessionPersistence for ModeGatePopulatingPersistence {
 /// carry Solo or Pplns.
 fn mode_from_port(m: MiningMode) -> MiningModeResult {
     match m {
-        MiningMode::Pplns => MiningModeResult::pplns(),
-        MiningMode::Solo => MiningModeResult::solo(),
+        MiningMode::Pplns => MiningModeResult::Pplns,
+        MiningMode::Solo => MiningModeResult::Solo,
         // Group-Solo and Blockparty are per-address modes; a port naming
         // either is a misconfiguration, and solo keeps the coinbase
         // spendable.
-        MiningMode::GroupSolo | MiningMode::Blockparty => MiningModeResult::solo(),
+        MiningMode::GroupSolo | MiningMode::Blockparty => MiningModeResult::Solo,
     }
 }
 
@@ -541,11 +541,14 @@ mod tests {
 
     #[test]
     fn mode_from_port_maps_each_variant() {
-        assert_eq!(mode_from_port(MiningMode::Solo).mode, MiningMode::Solo);
-        assert_eq!(mode_from_port(MiningMode::Pplns).mode, MiningMode::Pplns);
+        assert_eq!(mode_from_port(MiningMode::Solo).mode(), MiningMode::Solo);
+        assert_eq!(mode_from_port(MiningMode::Pplns).mode(), MiningMode::Pplns);
         // GroupSolo port -> defensive solo (port configs never carry
         // GroupSolo; group membership is per-address).
-        assert_eq!(mode_from_port(MiningMode::GroupSolo).mode, MiningMode::Solo);
+        assert_eq!(
+            mode_from_port(MiningMode::GroupSolo).mode(),
+            MiningMode::Solo
+        );
     }
 
     #[test]
@@ -651,7 +654,7 @@ mod tests {
             .register_session("sess1", "bcrt1qabc", "w1", None)
             .await;
         // PPLNS port + non-group address → PPLNS mode published.
-        assert_eq!(gate.lookup_mode("bcrt1qabc").mode, MiningMode::Pplns);
+        assert_eq!(gate.lookup_mode("bcrt1qabc").mode(), MiningMode::Pplns);
         // Inner persistence forwarded.
         let calls = inner.register_calls.lock().await;
         assert_eq!(calls.len(), 1);
@@ -698,12 +701,15 @@ mod tests {
         wrapper
             .register_session("s1", "bcrt1qadmin", "w", None)
             .await;
-        assert_eq!(gate.lookup_mode("bcrt1qadmin").mode, MiningMode::Blockparty);
+        assert_eq!(
+            gate.lookup_mode("bcrt1qadmin").mode(),
+            MiningMode::Blockparty
+        );
         // A non-admin address falls through to the port mode (Solo).
         wrapper
             .register_session("s2", "bcrt1qother", "w", None)
             .await;
-        assert_eq!(gate.lookup_mode("bcrt1qother").mode, MiningMode::Solo);
+        assert_eq!(gate.lookup_mode("bcrt1qother").mode(), MiningMode::Solo);
     }
 
     #[tokio::test]
@@ -721,16 +727,16 @@ mod tests {
         // Two parallel registers for the same address → refcount == 2.
         wrapper.register_session("s1", "bcrt1qa", "w", None).await;
         wrapper.register_session("s2", "bcrt1qa", "w", None).await;
-        assert_eq!(gate.lookup_mode("bcrt1qa").mode, MiningMode::Pplns);
+        assert_eq!(gate.lookup_mode("bcrt1qa").mode(), MiningMode::Pplns);
 
         // Single deregister → refcount drops to 1, mode still cached.
         wrapper.deregister_session("s1").await;
-        assert_eq!(gate.lookup_mode("bcrt1qa").mode, MiningMode::Pplns);
+        assert_eq!(gate.lookup_mode("bcrt1qa").mode(), MiningMode::Pplns);
         assert_eq!(inner.deregister_calls.lock().await.len(), 1);
 
         // Second deregister → refcount returns to 0, entry cleared.
         wrapper.deregister_session("s2").await;
-        assert_eq!(gate.lookup_mode("bcrt1qa").mode, MiningMode::Solo);
+        assert_eq!(gate.lookup_mode("bcrt1qa").mode(), MiningMode::Solo);
         assert_eq!(inner.deregister_calls.lock().await.len(), 2);
     }
 

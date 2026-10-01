@@ -870,6 +870,7 @@ version = "2.3.8"
 dependencies = [
  "bp-common",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

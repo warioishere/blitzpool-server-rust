@@ -11,6 +11,7 @@ use bp_blockparty::CoinbaseDistributionEntry;
 use bp_blockparty_engine::BlockpartyService;
 use bp_common::{AddressId, MiningMode, Sats};
 use bp_group_solo_engine::engine::GroupSoloEngine;
+use bp_mining_mode::MiningModeResult;
 // Re-exported so the wiring keeps one import path for the solo split.
 pub(crate) use bp_mining_job::SoloFeeConfig;
 use bp_mining_job::{solo_payouts, PayoutEntry, ResolvedPayouts};
@@ -60,9 +61,9 @@ impl ProductionPayoutResolver {
         reward_sats: u64,
     ) -> (ResolvedPayouts, bool) {
         let result = self.mode_gate.lookup_mode(miner_address);
-        let vouchable = books_without_a_snapshot(result.mode);
-        match result.mode {
-            MiningMode::Solo => {
+        let vouchable = books_without_a_snapshot(result.mode());
+        match result {
+            MiningModeResult::Solo => {
                 // An admin of an unconfirmed Blockparty routes as Solo but
                 // the coinbase pays the pool-fee address, so the admin cannot
                 // take the whole reward before members confirm the splits.
@@ -81,33 +82,19 @@ impl ProductionPayoutResolver {
                     vouchable,
                 )
             }
-            MiningMode::Pplns => self.pplns_payouts(miner_address, reward_sats).await,
-            MiningMode::Blockparty => {
+            MiningModeResult::Pplns => self.pplns_payouts(miner_address, reward_sats).await,
+            MiningModeResult::Blockparty(group_id) => {
                 let resolved = blockparty_payouts(
                     self.blockparty.as_deref(),
                     miner_address,
                     reward_sats,
-                    result.group_id.as_deref(),
+                    group_id,
                 )
                 .await;
                 let bookable = vouchable && !resolved.is_none();
                 (resolved, bookable)
             }
-            MiningMode::GroupSolo => {
-                let Some(gid_str) = result.group_id.as_deref() else {
-                    error!(
-                        miner_address,
-                        "GroupSolo mode published WITHOUT a group_id; serving NO JOB"
-                    );
-                    return (ResolvedPayouts::none(), false);
-                };
-                let Ok(group_id) = Uuid::parse_str(gid_str) else {
-                    error!(
-                        miner_address,
-                        gid_str, "GroupSolo group_id failed to parse as UUID; serving NO JOB"
-                    );
-                    return (ResolvedPayouts::none(), false);
-                };
+            MiningModeResult::GroupSolo(group_id) => {
                 self.group_solo_payouts(miner_address, reward_sats, group_id)
                     .await
             }
@@ -121,26 +108,12 @@ async fn blockparty_payouts(
     blockparty: Option<&BlockpartyService>,
     miner_address: &str,
     reward_sats: u64,
-    group_id_str: Option<&str>,
+    group_id: Uuid,
 ) -> ResolvedPayouts {
     let Some(svc) = blockparty else {
         error!(
             miner_address,
             "Blockparty mode in gate but service handle not wired; serving NO JOB"
-        );
-        return ResolvedPayouts::none();
-    };
-    let Some(gid_str) = group_id_str else {
-        error!(
-            miner_address,
-            "Blockparty mode published WITHOUT a group_id; serving NO JOB"
-        );
-        return ResolvedPayouts::none();
-    };
-    let Ok(group_id) = Uuid::parse_str(gid_str) else {
-        error!(
-            miner_address,
-            gid_str, "Blockparty group_id failed to parse as UUID; serving NO JOB"
         );
         return ResolvedPayouts::none();
     };
@@ -446,7 +419,7 @@ impl bp_stratum_v1::PayoutResolver for ProductionPayoutResolver {
     fn resolve_stream(&self, miner_address: &str) -> bp_common::StreamKind {
         // Same lookup as payout resolution, so a pending Blockparty admin
         // routes to the Solo stream.
-        bp_common::StreamKind::for_mode(self.mode_gate.lookup_mode(miner_address).mode)
+        bp_common::StreamKind::for_mode(self.mode_gate.lookup_mode(miner_address).mode())
     }
 }
 
@@ -463,7 +436,7 @@ impl bp_stratum_v2::hooks::PayoutResolver for ProductionPayoutResolver {
     }
 
     fn resolve_stream(&self, miner_address: &AddressId) -> bp_common::StreamKind {
-        bp_common::StreamKind::for_mode(self.mode_gate.lookup_mode(miner_address.as_str()).mode)
+        bp_common::StreamKind::for_mode(self.mode_gate.lookup_mode(miner_address.as_str()).mode())
     }
 
     /// `None` (not Solo) for an address the gate has not learned yet: JDP
@@ -471,7 +444,7 @@ impl bp_stratum_v2::hooks::PayoutResolver for ProductionPayoutResolver {
     fn resolve_stream_known(&self, miner_address: &AddressId) -> Option<bp_common::StreamKind> {
         self.mode_gate
             .lookup_known(miner_address.as_str())
-            .map(|result| bp_common::StreamKind::for_mode(result.mode))
+            .map(|result| bp_common::StreamKind::for_mode(result.mode()))
     }
 }
 
@@ -599,7 +572,7 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
         // `lookup_mode`: this runs at allocate time, before a mining session
         // exists, and `lookup_mode` would guess Solo.
         let known = self.resolver.mode_gate.lookup_known(miner_address.as_str());
-        let mode = known.as_ref().map(|r| r.mode);
+        let mode = known.map(MiningModeResult::mode);
         let tailored = match jdp_distribution_for(mode) {
             JdpDistributionFor::ModeUnknown => {
                 debug!(
@@ -631,16 +604,8 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
         };
         let built = match tailored {
             TailoredMode::GroupSolo => {
-                // `known` is Some here, but no `expect`: no panic on the money path.
-                let Some(group_id) = known
-                    .as_ref()
-                    .and_then(|r| r.group_id.as_deref())
-                    .and_then(|gid| Uuid::parse_str(gid).ok())
-                else {
-                    warn!(
-                        miner = miner_address.as_str(),
-                        "jdp distribution source: group-solo miner without a usable group id"
-                    );
+                // `known` is GroupSolo here, but no `expect`: no panic on the money path.
+                let Some(MiningModeResult::GroupSolo(group_id)) = known else {
                     return TailoredDistribution::Unavailable;
                 };
                 match self
@@ -994,7 +959,7 @@ mod tests {
 
     /// The admin is the only one hashing, so a solo coinbase here would pay
     /// the whole block to the admin and nothing to the members.
-    async fn assert_no_job(svc: Option<&BlockpartyService>, group_id: Option<&str>, case: &str) {
+    async fn assert_no_job(svc: Option<&BlockpartyService>, group_id: Uuid, case: &str) {
         let resolved = blockparty_payouts(svc, BP_ADMIN, TEST_REWARD, group_id).await;
         assert!(
             resolved.is_none(),
@@ -1005,8 +970,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_blockparty_without_a_buildable_split_serves_no_job() {
-        let gid = Uuid::new_v4().to_string();
-        assert_no_job(None, Some(&gid), "service not wired").await;
+        let gid = Uuid::new_v4();
+        assert_no_job(None, gid, "service not wired").await;
 
         let unreachable = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
@@ -1015,14 +980,12 @@ mod tests {
             .expect("a lazily-connected pool parses its url");
         let svc = blockparty_service(unreachable);
         assert!(
-            svc.build_payouts(Uuid::parse_str(&gid).unwrap(), Sats(TEST_REWARD as i64))
+            svc.build_payouts(gid, Sats(TEST_REWARD as i64))
                 .await
                 .is_err(),
             "precondition: the split build must fail on this pool"
         );
-        assert_no_job(Some(svc.as_ref()), Some(&gid), "database error").await;
-        assert_no_job(Some(svc.as_ref()), None, "no group id").await;
-        assert_no_job(Some(svc.as_ref()), Some("not-a-uuid"), "bad group id").await;
+        assert_no_job(Some(svc.as_ref()), gid, "database error").await;
     }
 
     #[tokio::test]
@@ -1039,12 +1002,7 @@ mod tests {
             ),
             "precondition: a fresh group id must resolve to no group"
         );
-        assert_no_job(
-            Some(svc.as_ref()),
-            Some(&gid.to_string()),
-            "group not found",
-        )
-        .await;
+        assert_no_job(Some(svc.as_ref()), gid, "group not found").await;
     }
 
     #[test]

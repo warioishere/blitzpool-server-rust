@@ -14,6 +14,7 @@ use bp_coinbase_snapshot::ActualCoinbase;
 use bp_common::{AddressId, MiningMode, StreamKind};
 use bp_config::{AppConfig, Role};
 use bp_group_solo_engine::engine::GroupSoloEngine;
+use bp_mining_mode::MiningModeResult;
 use bp_notifications::dispatcher::NotificationDispatcher;
 use bp_pplns_engine::engine::PplnsEngine;
 use bp_share_stream::{StreamProducer, BLOCK_FOUND_STREAM_KEY};
@@ -432,13 +433,7 @@ impl TdpBlockSubmissionSink {
         // (`SetCustomMiningJob`): there is no pool distribution to find.
         let job_payouts_fingerprint = pplns_payouts_fingerprint.filter(|fp| fp != &[0u8; 32]);
         let weight_snapshot = self
-            .resolve_weight_snapshot(
-                resolved.mode,
-                &address,
-                resolved.group_id.as_deref(),
-                job_payouts_fingerprint,
-                height,
-            )
+            .resolve_weight_snapshot(resolved, &address, job_payouts_fingerprint, height)
             .await;
 
         let event = BlockFoundEvent {
@@ -449,8 +444,8 @@ impl TdpBlockSubmissionSink {
             reward_sats: booking.wire_reward_sats(),
             block_hash: Some(block_hash),
             block_data,
-            mode: resolved.mode,
-            group_id: resolved.group_id,
+            mode: resolved.mode(),
+            group_id: resolved.group_id().map(|g| g.to_string()),
             height,
             weight_snapshot,
             actual_coinbase,
@@ -487,9 +482,8 @@ impl TdpBlockSubmissionSink {
     /// was, because a JD-client coinbase must not be reprocessed, a miss must.
     async fn resolve_weight_snapshot(
         &self,
-        mode: MiningMode,
+        mode: MiningModeResult,
         address: &str,
-        group_id: Option<&str>,
         payouts_fingerprint: Option<[u8; 32]>,
         height: i32,
     ) -> Option<bp_coinbase_snapshot::StoredWeightSnapshot> {
@@ -510,8 +504,8 @@ impl TdpBlockSubmissionSink {
         match mode {
             // Solo writes no ledger; Blockparty recomputes its fixed shares
             // from the DB. Neither has a snapshot to carry.
-            MiningMode::Solo | MiningMode::Blockparty => None,
-            MiningMode::Pplns => {
+            MiningModeResult::Solo | MiningModeResult::Blockparty(_) => None,
+            MiningModeResult::Pplns => {
                 let engine = self.applier.pplns.as_ref().or_else(|| {
                     warn!(
                         address,
@@ -538,7 +532,7 @@ impl TdpBlockSubmissionSink {
                     }
                 }
             }
-            MiningMode::GroupSolo => {
+            MiningModeResult::GroupSolo(group_uuid) => {
                 let engine = self.applier.group_solo.as_ref().or_else(|| {
                     warn!(
                         address,
@@ -546,24 +540,13 @@ impl TdpBlockSubmissionSink {
                     );
                     None
                 })?;
-                let Some(group_id_str) = group_id else {
-                    warn!(
-                        address,
-                        height,
-                        "block-found: Group-Solo mode but the mode-gate returned no group_id"
-                    );
-                    return None;
-                };
                 let fingerprint = fingerprint()?;
-                let (Ok(finder), Ok(group_uuid)) = (
-                    AddressId::new(address.to_string()),
-                    uuid::Uuid::parse_str(group_id_str),
-                ) else {
+                let Ok(finder) = AddressId::new(address.to_string()) else {
                     warn!(
                         address,
-                        group_id = group_id_str,
+                        %group_uuid,
                         height,
-                        "block-found: Group-Solo finder address or group_id failed to parse"
+                        "block-found: Group-Solo finder address failed to parse"
                     );
                     return None;
                 };
@@ -576,7 +559,7 @@ impl TdpBlockSubmissionSink {
                         error!(
                             %err,
                             address,
-                            group_id = group_id_str,
+                            %group_uuid,
                             height,
                             fingerprint = %hex::encode(fingerprint),
                             "block-found: Group-Solo distribution lookup failed — the block is \

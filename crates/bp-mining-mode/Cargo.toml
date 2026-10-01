@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 bp-common = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

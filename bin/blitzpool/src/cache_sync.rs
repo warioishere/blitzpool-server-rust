@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use bp_common::{AddressId, MiningMode};
+use bp_common::AddressId;
 use bp_mining_mode::MiningModeResult;
 
 use crate::engines::BlitzpoolModeGate;
@@ -208,13 +208,13 @@ async fn reconcile_gate_modes(group: &SharedGroupService, gate: &Arc<BlitzpoolMo
             .await
             .filter(|e| e.active)
             .map(|e| e.group_id);
-        match (current.mode, active_group) {
-            (MiningMode::Solo, Some(group_id)) => {
-                gate.override_mode(&address, MiningModeResult::group_solo(group_id.to_string()));
+        match (current, active_group) {
+            (MiningModeResult::Solo, Some(group_id)) => {
+                gate.override_mode(&address, MiningModeResult::GroupSolo(group_id));
                 upgraded += 1;
             }
-            (MiningMode::GroupSolo, None) => {
-                gate.override_mode(&address, MiningModeResult::solo());
+            (MiningModeResult::GroupSolo(_), None) => {
+                gate.override_mode(&address, MiningModeResult::Solo);
                 downgraded += 1;
             }
             _ => {}
