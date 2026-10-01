@@ -5,6 +5,7 @@
 //! `pplns:snapshot:<fingerprint>` so a found block settles against them. The
 //! window+ledger inputs are cached apart from the reward, so N rewards cost one read.
 
+pub use bp_coinbase_snapshot::BuiltDistribution;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -13,7 +14,7 @@ use std::time::Duration;
 use bp_coinbase_snapshot::{build_and_snapshot, BuildRequest};
 use bp_common::{AddressId, Sats};
 use bp_db::{find_pplns_balances_with_open_balance, PplnsBalanceRow};
-use bp_pplns::{WeightBuildError, WeightDistribution};
+use bp_pplns::WeightBuildError;
 use sqlx::PgPool;
 use thiserror::Error;
 use tracing::error;
@@ -56,26 +57,6 @@ pub struct DistributionInputs {
     pub balances: HashMap<AddressId, Sats>,
 }
 
-/// Result of one distribution build.
-#[derive(Clone, Debug)]
-pub struct DistributionResult {
-    /// The weight distribution; every consumer derives satoshis from it via
-    /// the ext 0x0003 formula ([`WeightDistribution::payout_entries_at`]).
-    pub distribution: WeightDistribution,
-    /// `false`: the build is still a valid coinbase, but its snapshot key
-    /// does not exist, so a caller MUST NOT promise automatic booking of a
-    /// block found on it. Failing the build instead would leave miners jobless.
-    pub snapshot_written: bool,
-}
-
-impl DistributionResult {
-    /// The snapshot key ([`bp_share::weights_fingerprint_from_parts`]); a
-    /// found block carries it back so settlement reads exactly these inputs.
-    pub fn payouts_fingerprint(&self) -> [u8; 32] {
-        self.distribution.fingerprint
-    }
-}
-
 /// Knobs for the distribution path, from [`crate::config::PplnsEngineConfig`].
 /// `coinbase_weight_budget` is a [`LiveBudget`] so the autoscaler can move it.
 #[derive(Clone, Debug)]
@@ -104,7 +85,7 @@ pub struct DistributionBuilder {
     pool: PgPool,
     window: WindowStore,
     config: DistributionConfig,
-    cache: InflightResultCache<u64, DistributionResult, DistributionError>,
+    cache: InflightResultCache<u64, BuiltDistribution, DistributionError>,
     /// Keyed by `()`: there is exactly one payout window.
     inputs_cache: InflightResultCache<(), DistributionInputs, DistributionError>,
     inputs_loads: Arc<AtomicU64>,
@@ -141,7 +122,7 @@ impl DistributionBuilder {
     pub async fn build(
         &self,
         reference_revenue_sats: u64,
-    ) -> Result<Arc<DistributionResult>, Arc<DistributionError>> {
+    ) -> Result<Arc<BuiltDistribution>, Arc<DistributionError>> {
         let pool = self.pool.clone();
         let window = self.window.clone();
         let window_for_inputs = self.window.clone();
@@ -173,7 +154,7 @@ impl DistributionBuilder {
         &self,
         reference_revenue_sats: u64,
         claimant: &AddressId,
-    ) -> Result<Arc<DistributionResult>, Arc<DistributionError>> {
+    ) -> Result<Arc<BuiltDistribution>, Arc<DistributionError>> {
         let pool = self.pool.clone();
         let window_for_inputs = self.window.clone();
         let inputs_loads = self.inputs_loads.clone();
@@ -253,7 +234,7 @@ async fn build_from_inputs(
     config: &DistributionConfig,
     reference_revenue_sats: u64,
     bootstrap_claimant: Option<&AddressId>,
-) -> Result<DistributionResult, DistributionError> {
+) -> Result<BuiltDistribution, DistributionError> {
     let fee_address = config
         .fee_address
         .as_ref()
@@ -286,10 +267,7 @@ async fn build_from_inputs(
         .coinbase_weight_budget
         .record_sample(built.distribution.budget_telemetry);
 
-    Ok(DistributionResult {
-        distribution: built.distribution,
-        snapshot_written: built.snapshot_written,
-    })
+    Ok(built)
 }
 
 fn open_balance_rows_to_balance_map(rows: &[PplnsBalanceRow]) -> HashMap<AddressId, Sats> {
@@ -303,7 +281,6 @@ fn open_balance_rows_to_balance_map(rows: &[PplnsBalanceRow]) -> HashMap<Address
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bp_pplns::{build_weight_distribution, WeightDistributionInput};
 
     #[test]
     fn distribution_config_from_engine_config_carries_fields() {
@@ -347,35 +324,5 @@ mod tests {
         assert_eq!(map.len(), 2);
         assert_eq!(map[&AddressId::new("bc1qcredit").unwrap()].0, 5_000);
         assert_eq!(map[&AddressId::new("bc1qdebit").unwrap()].0, -5_000);
-    }
-
-    #[test]
-    fn distribution_result_is_cloneable() {
-        let shares = HashMap::from([(
-            AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap(),
-            1.0,
-        )]);
-        let balances = HashMap::new();
-        let fee = AddressId::new("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy").unwrap();
-        let distribution = build_weight_distribution(WeightDistributionInput {
-            address_shares: &shares,
-            balances: &balances,
-            fee_percent: 1.5,
-            fee_address: &fee,
-            coinbase_weight_budget: 50_000,
-            min_payout_sats: Some(Sats(5_000)),
-            finder_bonus_ppm: 0,
-            finder_address: None,
-            reference_revenue_sats: 312_500_000,
-            withheld_value: bp_pplns::WithheldValue::ToOtherMiners,
-        })
-        .unwrap();
-        let result = DistributionResult {
-            distribution,
-            snapshot_written: true,
-        };
-        let cloned = result.clone();
-        assert_eq!(cloned.distribution.reference_revenue_sats, 312_500_000);
-        assert_eq!(cloned.payouts_fingerprint(), result.payouts_fingerprint());
     }
 }

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bp_blockparty::CoinbaseDistributionEntry;
 use bp_blockparty_engine::BlockpartyService;
+use bp_coinbase_snapshot::BuiltDistribution;
 use bp_common::{AddressId, MiningMode, Sats};
 use bp_group_solo_engine::engine::GroupSoloEngine;
 use bp_mining_mode::MiningModeResult;
@@ -98,6 +99,56 @@ impl ProductionPayoutResolver {
                 self.group_solo_payouts(miner_address, reward_sats, group_id)
                     .await
             }
+        }
+    }
+}
+
+/// A PPLNS or Group-Solo build as this template's coinbase list, plus whether a
+/// block found on it can be booked. Evaluated with ext 0x0003/Payout Computation
+/// at this template's revenue, the same formula a JDC runs with its own. A build
+/// without its snapshot still stands (failing would hand this miner the whole
+/// block), but names a missing key, so the block is not bookable.
+fn lower_built(
+    scope: &'static str,
+    group_id: Option<Uuid>,
+    built: &BuiltDistribution,
+    miner_address: &str,
+    reward_sats: u64,
+) -> (ResolvedPayouts, bool) {
+    if !built.snapshot_written {
+        warn!(
+            scope,
+            ?group_id,
+            miner_address,
+            reward_sats,
+            "distribution built but its snapshot did not land — the coinbase stands, \
+             a block found on it cannot be booked automatically"
+        );
+    }
+    match built.distribution.payout_entries_at(reward_sats) {
+        Ok(entries) => (
+            ResolvedPayouts {
+                entries: entries
+                    .into_iter()
+                    .map(|(address, sats)| PayoutEntry {
+                        address: address.into_inner(),
+                        sats,
+                    })
+                    .collect(),
+                payouts_fingerprint: built.payouts_fingerprint(),
+            },
+            built.snapshot_written,
+        ),
+        Err(err) => {
+            error!(
+                %err,
+                scope,
+                ?group_id,
+                miner_address,
+                reward_sats,
+                "ext 0x0003/Payout Computation evaluation failed; serving NO JOB"
+            );
+            (ResolvedPayouts::none(), false)
         }
     }
 }
@@ -277,45 +328,7 @@ impl ProductionPayoutResolver {
             }
         };
         match built {
-            // A build can succeed without its snapshot: the coinbase stands
-            // (failing would hand this miner the whole block), but the
-            // fingerprint names a missing key, so the block is not bookable.
-            Some(result) => {
-                if !result.snapshot_written {
-                    warn!(
-                        miner_address,
-                        reward_sats,
-                        "PPLNS distribution built but its snapshot did not land — the coinbase \
-                         stands, a block found on it cannot be booked automatically"
-                    );
-                }
-                // ext 0x0003/Payout Computation at this template's revenue,
-                // the same formula a JDC runs with its own template value.
-                match result.distribution.payout_entries_at(reward_sats) {
-                    Ok(entries) => (
-                        ResolvedPayouts {
-                            entries: entries
-                                .into_iter()
-                                .map(|(address, sats)| PayoutEntry {
-                                    address: address.into_inner(),
-                                    sats,
-                                })
-                                .collect(),
-                            payouts_fingerprint: result.payouts_fingerprint(),
-                        },
-                        result.snapshot_written,
-                    ),
-                    Err(err) => {
-                        error!(
-                            %err,
-                            miner_address,
-                            reward_sats,
-                            "PPLNS ext 0x0003/Payout Computation evaluation failed; serving NO JOB"
-                        );
-                        (ResolvedPayouts::none(), false)
-                    }
-                }
-            }
+            Some(result) => lower_built("PPLNS", None, &result, miner_address, reward_sats),
             None => (ResolvedPayouts::none(), false),
         }
     }
@@ -356,43 +369,13 @@ impl ProductionPayoutResolver {
             .build_distribution(group_id, reward_sats, &finder)
             .await
         {
-            Ok(result) => {
-                if !result.snapshot_written {
-                    warn!(
-                        miner_address,
-                        %group_id,
-                        reward_sats,
-                        "Group-Solo distribution built but its snapshot did not land — the \
-                         coinbase stands, a block found on it cannot be booked automatically"
-                    );
-                }
-                // ext 0x0003/Payout Computation at this template's revenue.
-                match result.distribution.payout_entries_at(reward_sats) {
-                    Ok(entries) => (
-                        ResolvedPayouts {
-                            entries: entries
-                                .into_iter()
-                                .map(|(address, sats)| PayoutEntry {
-                                    address: address.into_inner(),
-                                    sats,
-                                })
-                                .collect(),
-                            payouts_fingerprint: result.payouts_fingerprint(),
-                        },
-                        result.snapshot_written,
-                    ),
-                    Err(err) => {
-                        error!(
-                            %err,
-                            miner_address,
-                            %group_id,
-                            reward_sats,
-                            "Group-Solo ext 0x0003/Payout Computation evaluation failed; serving NO JOB"
-                        );
-                        (ResolvedPayouts::none(), false)
-                    }
-                }
-            }
+            Ok(result) => lower_built(
+                "Group-Solo",
+                Some(group_id),
+                &result,
+                miner_address,
+                reward_sats,
+            ),
             Err(err) => {
                 error!(
                     %err,
@@ -1003,6 +986,61 @@ mod tests {
             "precondition: a fresh group id must resolve to no group"
         );
         assert_no_job(Some(svc.as_ref()), gid, "group not found").await;
+    }
+
+    /// Pins what PPLNS and Group-Solo hand the job builder: the §4 list at
+    /// this revenue, the fingerprint, and bookable only with the snapshot.
+    #[test]
+    fn a_built_distribution_lowers_to_its_payout_list() {
+        use std::collections::HashMap;
+        let a = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string()).unwrap();
+        let b = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq".to_string()).unwrap();
+        let fee = AddressId::new("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy".to_string()).unwrap();
+        let shares = HashMap::from([(a.clone(), 60.0), (b.clone(), 40.0)]);
+        let distribution = bp_pplns::build_weight_distribution(bp_pplns::WeightDistributionInput {
+            address_shares: &shares,
+            balances: &HashMap::new(),
+            fee_percent: 1.5,
+            fee_address: &fee,
+            coinbase_weight_budget: 50_000,
+            min_payout_sats: Some(Sats(5_000)),
+            finder_bonus_ppm: 0,
+            finder_address: None,
+            reference_revenue_sats: TEST_REWARD,
+            withheld_value: bp_pplns::WithheldValue::ToOtherMiners,
+        })
+        .unwrap();
+        let reward = TEST_REWARD + 12_345;
+        let expected: Vec<(String, u64)> = distribution
+            .payout_entries_at(reward)
+            .unwrap()
+            .into_iter()
+            .map(|(addr, sats)| (addr.into_inner(), sats))
+            .collect();
+        assert_eq!(
+            expected.len(),
+            3,
+            "precondition: pool output plus both miners"
+        );
+
+        for snapshot_written in [true, false] {
+            let built = BuiltDistribution {
+                distribution: distribution.clone(),
+                snapshot_written,
+            };
+            let (resolved, bookable) = lower_built("PPLNS", None, &built, "m", reward);
+            let got: Vec<(String, u64)> = resolved
+                .entries
+                .into_iter()
+                .map(|p| (p.address, p.sats))
+                .collect();
+            assert_eq!(
+                got, expected,
+                "the coinbase stands with or without the snapshot"
+            );
+            assert_eq!(resolved.payouts_fingerprint, distribution.fingerprint);
+            assert_eq!(bookable, snapshot_written);
+        }
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! Group-Solo owes nothing between blocks. Builds are cached per
 //! `(group, reward, finder)` because each session is its own prospective finder.
 
+pub use bp_coinbase_snapshot::BuiltDistribution;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +14,7 @@ use bp_coinbase_snapshot::{build_and_snapshot, share_map_from_redis_hash, BuildR
 use bp_common::{AddressId, Sats};
 use bp_db::{find_group, DbError};
 use bp_inflight_cache::InflightResultCache;
-use bp_pplns::{WeightBuildError, WeightDistribution, WithheldValue};
+use bp_pplns::{WeightBuildError, WithheldValue};
 use sqlx::PgPool;
 use thiserror::Error;
 use uuid::Uuid;
@@ -47,29 +48,6 @@ pub enum DistributionError {
 /// Cache key — concurrent calls with the same triple share one compute.
 type CacheKey = (Uuid, u64, String);
 
-/// Result of one Group-Solo distribution build. Cloneable via `Arc`
-/// in the in-flight cache.
-#[derive(Clone, Debug)]
-pub struct DistributionResult {
-    pub group_id: Uuid,
-    pub finder_address: AddressId,
-    /// The weight-native distribution; concrete satoshis come from
-    /// [`WeightDistribution::payout_entries_at`] at the caller's revenue.
-    pub distribution: WeightDistribution,
-    /// Did the weight snapshot under the fingerprint actually get
-    /// written (after retries)? `false` → the distribution still
-    /// becomes a coinbase, but a block found on it cannot be booked
-    /// automatically — never promise a booking on `false`.
-    pub snapshot_written: bool,
-}
-
-impl DistributionResult {
-    /// The snapshot key this build landed under.
-    pub fn payouts_fingerprint(&self) -> [u8; 32] {
-        self.distribution.fingerprint
-    }
-}
-
 /// Engine-wide knobs for the distribution path. Per-group settings
 /// (finder bonus) live in the DB row, NOT here.
 #[derive(Clone, Debug)]
@@ -98,7 +76,7 @@ pub struct DistributionBuilder {
     pool: PgPool,
     round: GroupRoundStore,
     config: DistributionConfig,
-    cache: InflightResultCache<CacheKey, DistributionResult, DistributionError>,
+    cache: InflightResultCache<CacheKey, BuiltDistribution, DistributionError>,
 }
 
 impl DistributionBuilder {
@@ -128,7 +106,7 @@ impl DistributionBuilder {
         group_id: Uuid,
         block_reward_sats: u64,
         finder_address: &AddressId,
-    ) -> Result<Arc<DistributionResult>, Arc<DistributionError>> {
+    ) -> Result<Arc<BuiltDistribution>, Arc<DistributionError>> {
         let key: CacheKey = (
             group_id,
             block_reward_sats,
@@ -160,7 +138,7 @@ async fn compute_distribution(
     group_id: Uuid,
     block_reward_sats: u64,
     finder_address: &AddressId,
-) -> Result<DistributionResult, DistributionError> {
+) -> Result<BuiltDistribution, DistributionError> {
     // 1. Per-group config: the finder bonus lives in the DB row as a
     //    FRACTION of the miner cut (ppm), because a proportion is what §4
     //    can pay exactly at any revenue.
@@ -215,18 +193,12 @@ async fn compute_distribution(
     )
     .await?;
 
-    Ok(DistributionResult {
-        group_id,
-        finder_address: finder_address.clone(),
-        distribution: built.distribution,
-        snapshot_written: built.snapshot_written,
-    })
+    Ok(built)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bp_pplns::{build_weight_distribution, WeightDistributionInput};
 
     #[test]
     fn distribution_config_from_engine_config_carries_fields() {
@@ -245,35 +217,5 @@ mod tests {
         assert!((dist_cfg.fee_percent - 1.5).abs() < 1e-9);
         assert_eq!(dist_cfg.coinbase_weight_budget, 60_000);
         assert_eq!(dist_cfg.snapshot_ttl_secs, 1800);
-    }
-
-    #[test]
-    fn distribution_result_is_cloneable() {
-        let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
-        let fee = AddressId::new("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy").unwrap();
-        let shares = HashMap::from([(finder.clone(), 2.0)]);
-        let balances = HashMap::new();
-        let distribution = build_weight_distribution(WeightDistributionInput {
-            address_shares: &shares,
-            balances: &balances,
-            fee_percent: 1.0,
-            fee_address: &fee,
-            coinbase_weight_budget: 50_000,
-            min_payout_sats: Some(Sats(5_000)),
-            finder_bonus_ppm: 160_000,
-            finder_address: Some(&finder),
-            reference_revenue_sats: 312_500_000,
-            withheld_value: WithheldValue::ToPool,
-        })
-        .unwrap();
-        let r = DistributionResult {
-            group_id: Uuid::new_v4(),
-            finder_address: finder,
-            distribution,
-            snapshot_written: true,
-        };
-        let cloned = r.clone();
-        assert_eq!(cloned.payouts_fingerprint(), r.payouts_fingerprint());
-        assert_eq!(cloned.distribution.reference_revenue_sats, 312_500_000);
     }
 }

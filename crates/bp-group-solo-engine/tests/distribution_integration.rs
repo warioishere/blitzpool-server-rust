@@ -166,7 +166,6 @@ async fn build_with_shares_returns_payouts_and_writes_snapshot() {
         .await
         .expect("ok");
     assert_eq!(result.distribution.reference_revenue_sats, 312_500_000);
-    assert_eq!(result.finder_address, addr_a);
     assert!(
         result.distribution.published().count() > 0,
         "expected published payout weights"
@@ -336,7 +335,7 @@ async fn concurrent_same_finder_builds_share_one_compute() {
             b.build(group_id, 312_500_000, &f).await
         }));
     }
-    let mut shared: Option<Arc<bp_group_solo_engine::distribution::DistributionResult>> = None;
+    let mut shared: Option<Arc<bp_coinbase_snapshot::BuiltDistribution>> = None;
     for h2 in handles {
         let r = h2.await.unwrap().expect("ok");
         if let Some(prev) = &shared {

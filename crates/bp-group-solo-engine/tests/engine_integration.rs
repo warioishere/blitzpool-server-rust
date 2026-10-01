@@ -167,7 +167,7 @@ async fn drop_harness(h: Harness) {
 /// A coinbase that pays exactly the distribution's §4 vector at revenue
 /// `t`, as every honestly built Group-Solo job does.
 fn actual_paying_exactly(
-    dist: &bp_group_solo_engine::distribution::DistributionResult,
+    dist: &bp_coinbase_snapshot::BuiltDistribution,
     t: u64,
 ) -> bp_coinbase_snapshot::ActualCoinbase {
     let entries = dist

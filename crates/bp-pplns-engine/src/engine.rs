@@ -32,7 +32,7 @@ use tracing::{error, info, warn};
 
 use crate::config::{ConfigError, PplnsEngineConfig};
 use crate::distribution::{
-    DistributionBuilder, DistributionConfig, DistributionError, DistributionResult,
+    BuiltDistribution, DistributionBuilder, DistributionConfig, DistributionError,
 };
 use crate::ledger::touch_buffer::{spawn_flush_task, TouchBuffer};
 use crate::ledger::{
@@ -256,7 +256,7 @@ impl PplnsEngine {
     pub async fn build_distribution(
         &self,
         block_reward_sats: u64,
-    ) -> Result<Arc<DistributionResult>, EngineError> {
+    ) -> Result<Arc<BuiltDistribution>, EngineError> {
         self.inner
             .distribution_builder
             .build(block_reward_sats)
@@ -272,7 +272,7 @@ impl PplnsEngine {
         &self,
         block_reward_sats: u64,
         claimant: &AddressId,
-    ) -> Result<Arc<DistributionResult>, EngineError> {
+    ) -> Result<Arc<BuiltDistribution>, EngineError> {
         self.inner
             .distribution_builder
             .build_bootstrap(block_reward_sats, claimant)

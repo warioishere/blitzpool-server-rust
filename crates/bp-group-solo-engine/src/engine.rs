@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::config::{ConfigError, GroupSoloEngineConfig};
 use crate::distribution::{
-    DistributionBuilder, DistributionConfig, DistributionError, DistributionResult,
+    BuiltDistribution, DistributionBuilder, DistributionConfig, DistributionError,
 };
 use crate::history::{
     apply_distribution, ApplyDistributionResult, AuditRow, GroupPayoutRowType, LedgerError,
@@ -510,7 +510,7 @@ impl GroupSoloEngine {
         group_id: Uuid,
         block_reward_sats: u64,
         finder_address: &AddressId,
-    ) -> Result<Arc<DistributionResult>, EngineError> {
+    ) -> Result<Arc<BuiltDistribution>, EngineError> {
         self.inner
             .distribution_builder
             .build(group_id, block_reward_sats, finder_address)

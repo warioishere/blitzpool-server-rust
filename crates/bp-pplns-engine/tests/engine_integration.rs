@@ -141,7 +141,7 @@ async fn cleanup(pool: &PgPool, prefix: &str) {
 /// A coinbase paying exactly the distribution's §4 vector at revenue `t`;
 /// small rounding deltas against the claim formula are expected.
 fn actual_paying_exactly(
-    dist: &bp_pplns_engine::distribution::DistributionResult,
+    dist: &bp_coinbase_snapshot::BuiltDistribution,
     t: u64,
 ) -> bp_coinbase_snapshot::ActualCoinbase {
     let entries = dist

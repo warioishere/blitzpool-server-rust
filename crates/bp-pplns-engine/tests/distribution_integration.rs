@@ -13,7 +13,7 @@ use std::sync::Arc;
 use bp_common::AddressId;
 use bp_pplns_engine::config::PplnsEngineConfig;
 use bp_pplns_engine::distribution::{
-    DistributionBuilder, DistributionConfig, DistributionError, DistributionResult,
+    BuiltDistribution, DistributionBuilder, DistributionConfig, DistributionError,
 };
 use bp_pplns_engine::window::{NetworkDifficulty, WindowStore};
 
@@ -266,7 +266,7 @@ async fn concurrent_builds_for_same_reward_share_one_compute() {
         handles.push(tokio::spawn(async move { b.build(312_500_000).await }));
     }
 
-    let mut shared_result: Option<Arc<DistributionResult>> = None;
+    let mut shared_result: Option<Arc<BuiltDistribution>> = None;
     for handle in handles {
         let result = handle.await.unwrap().expect("ok");
         if let Some(ref prev) = shared_result {

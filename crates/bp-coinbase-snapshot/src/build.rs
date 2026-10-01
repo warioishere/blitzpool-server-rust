@@ -51,12 +51,21 @@ pub struct BuildRequest<'a> {
 }
 
 /// A built distribution plus whether its snapshot actually landed.
+#[derive(Clone, Debug)]
 pub struct BuiltDistribution {
     pub distribution: WeightDistribution,
     /// `false` → the distribution still becomes a coinbase, but a block
     /// found on it cannot be booked automatically. Never promise a
     /// booking on `false`.
     pub snapshot_written: bool,
+}
+
+impl BuiltDistribution {
+    /// The snapshot key ([`bp_share::weights_fingerprint_from_parts`]); a
+    /// found block carries it back so settlement reads exactly these inputs.
+    pub fn payouts_fingerprint(&self) -> [u8; 32] {
+        self.distribution.fingerprint
+    }
 }
 
 /// Sanitize, build, persist. A failed snapshot write does not fail the build:
