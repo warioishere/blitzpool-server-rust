@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use bp_db::PplnsGroupMemberRow;
-use bp_group_mgmt::{invitation::InvitationKind, token::InvitationToken};
+use bp_group_mgmt::{token::InvitationToken, OPEN_INVITE_TYPE};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -120,9 +120,6 @@ impl<H: GroupServiceHooks> InvitationService<H> {
             &mut *tx,
             token.as_str(),
             group_id,
-            None,
-            None,
-            InvitationKind::Open.as_str(),
             approval_required,
             now,
             expires_at,
@@ -187,8 +184,7 @@ impl<H: GroupServiceHooks> InvitationService<H> {
         let Some(invitation) = invitation else {
             return Ok(None);
         };
-        if invitation.invite_type != InvitationKind::Open.as_str() || invitation.status != "pending"
-        {
+        if invitation.invite_type != OPEN_INVITE_TYPE || invitation.status != "pending" {
             return Ok(None);
         }
         let now = now_ms();
@@ -220,7 +216,7 @@ impl<H: GroupServiceHooks> InvitationService<H> {
     ) -> Result<PplnsGroupMemberRow, InvitationServiceError> {
         let invitation = bp_db::find_group_invitation(&self.pool, token).await?;
         let mut invitation = invitation.ok_or(InvitationServiceError::NotFound)?;
-        if invitation.invite_type != InvitationKind::Open.as_str() {
+        if invitation.invite_type != OPEN_INVITE_TYPE {
             return Err(InvitationServiceError::NotFound);
         }
         if invitation.status != "pending" {

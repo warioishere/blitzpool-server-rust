@@ -127,31 +127,22 @@ pub(crate) fn invitation_to_api_error(e: bp_group_mgmt_engine::InvitationService
     use bp_group_mgmt_engine::InvitationServiceError as I;
     let code: &'static str = match e.code() {
         "not-found" => "not-found",
-        "already-declined" => "already-declined",
-        "inconsistent" => "inconsistent",
         "expired" => "expired",
         "group-dissolved" => "group-dissolved",
-        "invitation-pending" => "invitation-pending",
         "email-not-verified" => "email-not-verified",
         "invalid-address" => "invalid-address",
         "address-in-group" => "address-in-group",
         "already-member" => "already-member",
-        "invalid-ttl" => "invalid-ttl",
         "approval-required" => "approval-required",
-        "config-missing" => "config-missing",
         _ => "internal-error",
     };
     let status = match e {
         I::NotFound => StatusCode::NOT_FOUND,
-        I::Expired
-        | I::AlreadyDeclined
-        | I::GroupDissolved
-        | I::InvitationPending
-        | I::AddressInGroup
-        | I::AlreadyMember => StatusCode::CONFLICT,
+        I::Expired | I::GroupDissolved | I::AddressInGroup | I::AlreadyMember => {
+            StatusCode::CONFLICT
+        }
         I::EmailNotVerified | I::ApprovalRequired => StatusCode::FORBIDDEN,
-        I::InvalidAddress | I::InvalidTtl => StatusCode::BAD_REQUEST,
-        I::ConfigMissing | I::Inconsistent => StatusCode::INTERNAL_SERVER_ERROR,
+        I::InvalidAddress => StatusCode::BAD_REQUEST,
         I::GroupService(g) => return ApiError::from(g),
         I::Db(_) | I::Token(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };

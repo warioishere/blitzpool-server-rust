@@ -19,5 +19,3 @@ const MS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
 /// Share silence required before an active party may dissolve; covers a
 /// rental refund and re-buy so a failed rental does not strand members.
 pub const DISSOLVE_COOLDOWN_MS: i64 = 7 * MS_PER_DAY;
-
-pub const DEFAULT_INVITATION_TTL_DAYS: i64 = 7;

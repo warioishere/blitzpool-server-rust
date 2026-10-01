@@ -98,16 +98,10 @@ impl GroupServiceError {
 pub enum InvitationServiceError {
     #[error("invitation not found")]
     NotFound,
-    #[error("invitation already declined")]
-    AlreadyDeclined,
-    #[error("invitation accepted but member row missing — DB inconsistency")]
-    Inconsistent,
     #[error("invitation expired")]
     Expired,
     #[error("group has been dissolved")]
     GroupDissolved,
-    #[error("invitation for this address already pending")]
-    InvitationPending,
     #[error("address has no verified email binding")]
     EmailNotVerified,
     #[error("address is invalid or missing")]
@@ -116,12 +110,8 @@ pub enum InvitationServiceError {
     AddressInGroup,
     #[error("address is already a member of this group")]
     AlreadyMember,
-    #[error("invalid TTL preset")]
-    InvalidTtl,
     #[error("link requires admin approval — submit a join request instead")]
     ApprovalRequired,
-    #[error("required configuration is missing (POOL_BASE_URL)")]
-    ConfigMissing,
     #[error("group-service error: {0}")]
     GroupService(#[from] GroupServiceError),
     #[error("database error: {0}")]
@@ -134,18 +124,13 @@ impl InvitationServiceError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::NotFound => "not-found",
-            Self::AlreadyDeclined => "already-declined",
-            Self::Inconsistent => "inconsistent",
             Self::Expired => "expired",
             Self::GroupDissolved => "group-dissolved",
-            Self::InvitationPending => "invitation-pending",
             Self::EmailNotVerified => "email-not-verified",
             Self::InvalidAddress => "invalid-address",
             Self::AddressInGroup => "address-in-group",
             Self::AlreadyMember => "already-member",
-            Self::InvalidTtl => "invalid-ttl",
             Self::ApprovalRequired => "approval-required",
-            Self::ConfigMissing => "config-missing",
             // Surface the inner GroupServiceError code verbatim so the
             // UI sees the same vocabulary regardless of which service
             // tripped.

@@ -929,17 +929,12 @@ pub async fn list_active_pplns_group_flags(
 
 // ── Invitations ─────────────────────────────────────────────────────
 
-/// INSERT a fresh invitation row. `inviteType` is `"directed"` for
-/// admin-targeted invites (with `address` + `email`) and `"open"` for
-/// shareable links (both `None`). Returns the read-back row.
-#[allow(clippy::too_many_arguments)]
+/// INSERT a fresh open invite (shareable link, no address or email).
+/// Returns the read-back row.
 pub async fn insert_pplns_group_invitation<'e, E>(
     executor: E,
     token: &str,
     group_id: Uuid,
-    address: Option<&AddressId>,
-    email: Option<&str>,
-    invite_type: &str,
     approval_required: bool,
     created_at_ms: i64,
     expires_at_ms: i64,
@@ -952,7 +947,7 @@ where
         r#"INSERT INTO pplns_group_invitation
              (token, "groupId", address, email, status, "createdAt",
               "expiresAt", "inviteType", "approvalRequired")
-           VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8)
+           VALUES ($1, $2, NULL, NULL, 'pending', $3, $4, 'open', $5)
            RETURNING
             token AS "token!",
             "groupId" AS "group_id!",
@@ -966,11 +961,8 @@ where
             "approvalRequired" AS "approval_required!""#,
         token,
         group_id,
-        address.map(|a| a.as_str()),
-        email,
         created_at_ms,
         expires_at_ms,
-        invite_type,
         approval_required,
     )
     .fetch_one(executor)
@@ -1002,123 +994,6 @@ where
     .await
     .map_err(DbError::from)?;
     Ok(result.rows_affected())
-}
-
-/// Hard-DELETE one invitation by token, for an admin cancelling a directed
-/// invitation before the recipient acts on it (not an audit event worth
-/// keeping).
-pub async fn delete_pplns_group_invitation_by_token<'e, E>(
-    executor: E,
-    token: &str,
-) -> Result<u64, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    let result = sqlx::query!(
-        r#"DELETE FROM pplns_group_invitation WHERE token = $1"#,
-        token,
-    )
-    .execute(executor)
-    .await
-    .map_err(DbError::from)?;
-    Ok(result.rows_affected())
-}
-
-/// Find one pending directed invitation for (`groupId`, `address`):
-/// enforces "no double invite while pending" and locates the row to cancel.
-pub async fn find_pplns_group_invitation_pending_directed(
-    pool: &PgPool,
-    group_id: Uuid,
-    address: &AddressId,
-) -> Result<Option<PplnsGroupInvitationRow>, DbError> {
-    sqlx::query_as!(
-        PplnsGroupInvitationRow,
-        r#"SELECT
-            token AS "token!",
-            "groupId" AS "group_id!",
-            address AS "address?: AddressId",
-            email AS "email?",
-            status AS "status!",
-            "createdAt" AS "created_at!",
-            "expiresAt" AS "expires_at!",
-            "respondedAt" AS "responded_at?",
-            "inviteType" AS "invite_type!",
-            "approvalRequired" AS "approval_required!"
-           FROM pplns_group_invitation
-           WHERE "groupId" = $1
-             AND address = $2
-             AND status = 'pending'
-             AND "inviteType" = 'directed'
-           LIMIT 1"#,
-        group_id,
-        address.as_str(),
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(DbError::from)
-}
-
-/// All pending directed invitations for one group (admin panel). The
-/// caller filters out past-`expiresAt` rows in-memory because the cron
-/// will eventually flip those to `expired`.
-pub async fn find_pplns_group_invitations_pending_for_group_directed(
-    pool: &PgPool,
-    group_id: Uuid,
-) -> Result<Vec<PplnsGroupInvitationRow>, DbError> {
-    sqlx::query_as!(
-        PplnsGroupInvitationRow,
-        r#"SELECT
-            token AS "token!",
-            "groupId" AS "group_id!",
-            address AS "address?: AddressId",
-            email AS "email?",
-            status AS "status!",
-            "createdAt" AS "created_at!",
-            "expiresAt" AS "expires_at!",
-            "respondedAt" AS "responded_at?",
-            "inviteType" AS "invite_type!",
-            "approvalRequired" AS "approval_required!"
-           FROM pplns_group_invitation
-           WHERE "groupId" = $1
-             AND status = 'pending'
-             AND "inviteType" = 'directed'
-           ORDER BY "createdAt" DESC"#,
-        group_id,
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(DbError::from)
-}
-
-/// All pending directed invitations for one address — drives the
-/// "you have pending invitations" banner on the public dashboard.
-pub async fn find_pplns_group_invitations_pending_for_address_directed(
-    pool: &PgPool,
-    address: &AddressId,
-) -> Result<Vec<PplnsGroupInvitationRow>, DbError> {
-    sqlx::query_as!(
-        PplnsGroupInvitationRow,
-        r#"SELECT
-            token AS "token!",
-            "groupId" AS "group_id!",
-            address AS "address?: AddressId",
-            email AS "email?",
-            status AS "status!",
-            "createdAt" AS "created_at!",
-            "expiresAt" AS "expires_at!",
-            "respondedAt" AS "responded_at?",
-            "inviteType" AS "invite_type!",
-            "approvalRequired" AS "approval_required!"
-           FROM pplns_group_invitation
-           WHERE address = $1
-             AND status = 'pending'
-             AND "inviteType" = 'directed'
-           ORDER BY "createdAt" DESC"#,
-        address.as_str(),
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(DbError::from)
 }
 
 /// Find the active (`pending`, type=`open`) open-invite for a group,

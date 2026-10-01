@@ -9,14 +9,10 @@
 use bp_common::AddressId;
 use bp_db::{
     count_pplns_group_join_requests_pending_for_address, count_pplns_group_members_for_group,
-    delete_pplns_group_invitation_by_token, delete_pplns_group_member,
-    delete_pplns_group_members_for_group, expire_pending_pplns_group_invitations,
-    expire_pending_pplns_group_join_requests, find_group,
+    delete_pplns_group_member, delete_pplns_group_members_for_group,
+    expire_pending_pplns_group_invitations, expire_pending_pplns_group_join_requests, find_group,
     find_pplns_group_active_open_invite_for_group, find_pplns_group_by_name_not_dissolved,
-    find_pplns_group_creator_member, find_pplns_group_invitation_pending_directed,
-    find_pplns_group_invitations_pending_for_address_directed,
-    find_pplns_group_invitations_pending_for_group_directed,
-    find_pplns_group_join_request_most_recent_rejected,
+    find_pplns_group_creator_member, find_pplns_group_join_request_most_recent_rejected,
     find_pplns_group_join_request_pending_in_group, find_pplns_group_member_in_group,
     insert_pplns_group, insert_pplns_group_invitation, insert_pplns_group_join_request,
     insert_pplns_group_member, list_active_pplns_groups, list_pplns_group_join_requests_for_group,
@@ -486,8 +482,16 @@ async fn insert_member_and_delete_roundtrip() {
 
 // ─── Invitations ───────────────────────────────────────────────────────────
 
+async fn invitation_status(pool: &sqlx::PgPool, token: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM pplns_group_invitation WHERE token = $1")
+        .bind(token)
+        .fetch_one(pool)
+        .await
+        .expect("invitation row")
+}
+
 #[tokio::test]
-async fn directed_invitation_lifecycle() {
+async fn invitation_status_update_by_token() {
     let pool = match connect_or_skip().await {
         Some(p) => p,
         None => return,
@@ -499,52 +503,20 @@ async fn directed_invitation_lifecycle() {
         .expect("g");
 
     let token = format!("tok-d-{}", gid);
-    let inv = insert_pplns_group_invitation(
-        &pool,
-        &token,
-        gid,
-        Some(&addr("invitee")),
-        Some("foo@bar.example"),
-        "directed",
-        false,
-        100,
-        100 + 7 * 86_400_000,
-    )
-    .await
-    .expect("ins");
+    let inv = insert_pplns_group_invitation(&pool, &token, gid, false, 100, 100 + 7 * 86_400_000)
+        .await
+        .expect("ins");
     assert_eq!(inv.status, "pending");
-    assert_eq!(inv.invite_type, "directed");
+    assert_eq!(inv.invite_type, "open");
     assert!(!inv.approval_required);
 
-    // Pending lookup
-    let pending = find_pplns_group_invitation_pending_directed(&pool, gid, &addr("invitee"))
-        .await
-        .expect("pending")
-        .expect("present");
-    assert_eq!(pending.token, token);
+    assert_eq!(invitation_status(&pool, &token).await, "pending");
 
-    // Mark accepted
     let n = update_pplns_group_invitation_status_by_token(&pool, &token, "accepted", Some(200))
         .await
         .expect("upd");
     assert_eq!(n, 1);
-
-    // Now no longer pending
-    let gone = find_pplns_group_invitation_pending_directed(&pool, gid, &addr("invitee"))
-        .await
-        .expect("lookup");
-    assert!(gone.is_none());
-
-    // For-group + for-address list should also exclude the accepted row
-    let by_group = find_pplns_group_invitations_pending_for_group_directed(&pool, gid)
-        .await
-        .expect("g");
-    assert!(!by_group.iter().any(|r| r.token == token));
-    let by_addr =
-        find_pplns_group_invitations_pending_for_address_directed(&pool, &addr("invitee"))
-            .await
-            .expect("a");
-    assert!(!by_addr.iter().any(|r| r.token == token));
+    assert_eq!(invitation_status(&pool, &token).await, "accepted");
 
     sqlx::query("DELETE FROM pplns_group_invitation WHERE token = $1")
         .bind(&token)
@@ -582,7 +554,7 @@ async fn open_invite_revoke_replaces_atomically() {
 
     // Two open invites in succession — second should leave only itself active.
     let t1 = format!("open-1-{}", gid);
-    insert_pplns_group_invitation(&pool, &t1, gid, None, None, "open", false, 100, 1_000_000)
+    insert_pplns_group_invitation(&pool, &t1, gid, false, 100, 1_000_000)
         .await
         .expect("o1");
     let revoked = revoke_pending_open_invites_for_group(&pool, gid, 150)
@@ -590,7 +562,7 @@ async fn open_invite_revoke_replaces_atomically() {
         .expect("rev");
     assert_eq!(revoked, 1);
     let t2 = format!("open-2-{}", gid);
-    insert_pplns_group_invitation(&pool, &t2, gid, None, None, "open", true, 200, 2_000_000)
+    insert_pplns_group_invitation(&pool, &t2, gid, true, 200, 2_000_000)
         .await
         .expect("o2");
 
@@ -627,87 +599,25 @@ async fn expire_invitations_only_flips_past_due() {
 
     let past = format!("past-{}", gid);
     let fresh = format!("fresh-{}", gid);
-    insert_pplns_group_invitation(
-        &pool,
-        &past,
-        gid,
-        Some(&addr("past_target")),
-        Some("p@x"),
-        "directed",
-        false,
-        1,
-        100,
-    )
-    .await
-    .expect("p");
-    insert_pplns_group_invitation(
-        &pool,
-        &fresh,
-        gid,
-        Some(&addr("fresh_target")),
-        Some("f@x"),
-        "directed",
-        false,
-        1,
-        10_000_000_000_000,
-    )
-    .await
-    .expect("f");
+    insert_pplns_group_invitation(&pool, &past, gid, false, 1, 100)
+        .await
+        .expect("p");
+    insert_pplns_group_invitation(&pool, &fresh, gid, false, 1, 10_000_000_000_000)
+        .await
+        .expect("f");
 
     let flipped = expire_pending_pplns_group_invitations(&pool, 1_000)
         .await
         .expect("exp");
     assert!(flipped >= 1); // at least the `past` row; other test rows may share the sweep
-    let past_now = find_pplns_group_invitations_pending_for_group_directed(&pool, gid)
-        .await
-        .expect("by-g");
-    // The `past` row is no longer pending.
-    assert!(!past_now.iter().any(|r| r.token == past));
-    // The `fresh` row still is.
-    assert!(past_now.iter().any(|r| r.token == fresh));
+    assert_eq!(invitation_status(&pool, &past).await, "expired");
+    assert_eq!(invitation_status(&pool, &fresh).await, "pending");
 
     sqlx::query("DELETE FROM pplns_group_invitation WHERE \"groupId\" = $1")
         .bind(gid)
         .execute(&pool)
         .await
         .ok();
-    sqlx::query("DELETE FROM pplns_group WHERE id = $1")
-        .bind(gid)
-        .execute(&pool)
-        .await
-        .ok();
-}
-
-#[tokio::test]
-async fn delete_invitation_by_token_removes_row() {
-    let pool = match connect_or_skip().await {
-        Some(p) => p,
-        None => return,
-    };
-    let gid = Uuid::new_v4();
-    let n = format!("delinv-{}", gid);
-    insert_pplns_group(&pool, gid, &n, &addr("del_c"), "h", false, false, "prop", 1)
-        .await
-        .expect("g");
-    let token = format!("rm-{}", gid);
-    insert_pplns_group_invitation(
-        &pool,
-        &token,
-        gid,
-        Some(&addr("rm_target")),
-        Some("x@x"),
-        "directed",
-        false,
-        1,
-        2,
-    )
-    .await
-    .expect("ins");
-    let n = delete_pplns_group_invitation_by_token(&pool, &token)
-        .await
-        .expect("del");
-    assert_eq!(n, 1);
-
     sqlx::query("DELETE FROM pplns_group WHERE id = $1")
         .bind(gid)
         .execute(&pool)

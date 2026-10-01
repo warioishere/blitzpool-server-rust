@@ -16,8 +16,7 @@ use bp_config::AppConfig;
 use bp_db::Db;
 use bp_db::{delete_pplns_group_block_history_for_group, PplnsGroupRow};
 use bp_group_mgmt_engine::{
-    EmailHooks, GroupServiceHooks, InvitationEmailContext, JoinDecisionEmailContext,
-    JoinDecisionOutcome,
+    EmailHooks, GroupServiceHooks, JoinDecisionEmailContext, JoinDecisionOutcome,
 };
 use bp_group_solo_engine::engine::GroupSoloEngine;
 use bp_group_solo_engine::round::snapshot as group_solo_snapshot;
@@ -26,10 +25,9 @@ use bp_notifications::adapter::{
     SmtpConfig as NotifSmtpConfig, VapidConfig, WebPushAdapter,
 };
 use bp_notifications::template::{
-    render_binding_change, render_invitation, render_join_decision, render_verification,
-    BindingChangeContext as TplBindingChangeContext, InvitationContext as TplInvitationContext,
-    JoinDecision as TplJoinDecision, JoinDecisionContext as TplJoinDecisionContext,
-    VerificationContext as TplVerificationContext,
+    render_binding_change, render_join_decision, render_verification,
+    BindingChangeContext as TplBindingChangeContext, JoinDecision as TplJoinDecision,
+    JoinDecisionContext as TplJoinDecisionContext, VerificationContext as TplVerificationContext,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use thiserror::Error;
@@ -231,29 +229,6 @@ impl SmtpInvitationEmailHooks {
 
 #[async_trait]
 impl EmailHooks for SmtpInvitationEmailHooks {
-    async fn send_invitation(&self, ctx: InvitationEmailContext) {
-        let Some(smtp) = self.smtp.as_ref() else {
-            return;
-        };
-        let tpl_ctx = TplInvitationContext {
-            address: ctx.address.clone(),
-            group_name: ctx.group_name.clone(),
-            inviter_address: ctx.inviter_address.clone(),
-            invite_url: ctx.accept_url.clone(),
-            expires_at: epoch_ms_to_utc(ctx.expires_at_ms),
-        };
-        let content = render_invitation(&tpl_ctx);
-        if let Err(err) = smtp.send_email(&ctx.to_email, &content).await {
-            warn!(
-                %err,
-                to = %ctx.to_email,
-                address = %ctx.address,
-                group = %ctx.group_name,
-                "smtp: send_invitation failed (best-effort)"
-            );
-        }
-    }
-
     async fn send_join_decision(&self, ctx: JoinDecisionEmailContext) {
         let Some(smtp) = self.smtp.as_ref() else {
             return;

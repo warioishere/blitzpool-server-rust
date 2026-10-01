@@ -21,8 +21,7 @@ pub use cron::{
     spawn_join_request_expiry_cron,
 };
 pub use email_hooks::{
-    CapturingEmailHooks, EmailHooks, InvitationEmailContext, JoinDecisionEmailContext,
-    JoinDecisionOutcome, NoopEmailHooks,
+    CapturingEmailHooks, EmailHooks, JoinDecisionEmailContext, JoinDecisionOutcome, NoopEmailHooks,
 };
 pub use error::{GroupServiceError, InvitationServiceError, JoinRequestServiceError};
 pub use hooks::{

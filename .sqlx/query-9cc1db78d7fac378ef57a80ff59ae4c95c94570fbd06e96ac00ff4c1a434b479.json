@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO pplns_group_invitation\n             (token, \"groupId\", address, email, status, \"createdAt\",\n              \"expiresAt\", \"inviteType\", \"approvalRequired\")\n           VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8)\n           RETURNING\n            token AS \"token!\",\n            \"groupId\" AS \"group_id!\",\n            address AS \"address?: AddressId\",\n            email AS \"email?\",\n            status AS \"status!\",\n            \"createdAt\" AS \"created_at!\",\n            \"expiresAt\" AS \"expires_at!\",\n            \"respondedAt\" AS \"responded_at?\",\n            \"inviteType\" AS \"invite_type!\",\n            \"approvalRequired\" AS \"approval_required!\"",
+  "query": "INSERT INTO pplns_group_invitation\n             (token, \"groupId\", address, email, status, \"createdAt\",\n              \"expiresAt\", \"inviteType\", \"approvalRequired\")\n           VALUES ($1, $2, NULL, NULL, 'pending', $3, $4, 'open', $5)\n           RETURNING\n            token AS \"token!\",\n            \"groupId\" AS \"group_id!\",\n            address AS \"address?: AddressId\",\n            email AS \"email?\",\n            status AS \"status!\",\n            \"createdAt\" AS \"created_at!\",\n            \"expiresAt\" AS \"expires_at!\",\n            \"respondedAt\" AS \"responded_at?\",\n            \"inviteType\" AS \"invite_type!\",\n            \"approvalRequired\" AS \"approval_required!\"",
   "describe": {
     "columns": [
       {
@@ -58,11 +58,8 @@
       "Left": [
         "Varchar",
         "Uuid",
-        "Varchar",
-        "Varchar",
         "Int8",
         "Int8",
-        "Varchar",
         "Bool"
       ]
     },
@@ -79,5 +76,5 @@
       false
     ]
   },
-  "hash": "61ca81e03c0f836feca27984298091113b8e38e3f244a73ebc430112df089e34"
+  "hash": "9cc1db78d7fac378ef57a80ff59ae4c95c94570fbd06e96ac00ff4c1a434b479"
 }

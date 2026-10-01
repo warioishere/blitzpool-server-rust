@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Activation, kick and expiry thresholds for groups, invitations and
-//! join requests.
+//! Activation, kick and expiry thresholds for groups and join requests.
 
 /// Members at or above which a group is active; the stratum layer refuses
 /// Group-Solo connections for inactive groups. `1` lets a group mine with
@@ -19,9 +18,6 @@ pub const MAX_RESET_INTERVAL_DAYS: u32 = 365;
 /// the proportional split is meaningless, so more is a typo. Mirrors
 /// `bp_pplns::MAX_FINDER_BONUS_PPM`, which is what the build clamps to.
 pub const MAX_FINDER_BONUS_PPM: i32 = 500_000;
-
-/// How long a directed invitation stays valid before auto-expiring.
-pub const INVITATION_TTL_DAYS: u32 = 7;
 
 /// How long an unanswered join-request lingers before the cron sweeps
 /// it. The admin can still approve/reject during this window.

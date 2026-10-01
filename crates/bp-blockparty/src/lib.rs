@@ -10,8 +10,8 @@ mod status;
 
 pub use bp_common::DUST_LIMIT_SATS;
 pub use constants::{
-    DEFAULT_INVITATION_TTL_DAYS, DISSOLVE_COOLDOWN_MS, EMAIL_MAX_LEN, MAX_PERCENT_BP,
-    MIN_PERCENT_BP, NAME_MAX_LEN, NAME_MIN_LEN, TOTAL_PERCENT_BP,
+    DISSOLVE_COOLDOWN_MS, EMAIL_MAX_LEN, MAX_PERCENT_BP, MIN_PERCENT_BP, NAME_MAX_LEN,
+    NAME_MIN_LEN, TOTAL_PERCENT_BP,
 };
 pub use distribution::{
     build_blockparty_distribution, BlockpartyDistributionInput, BlockpartyDistributionResult,
