@@ -986,9 +986,7 @@ fn feed_vardiff<C: Clock>(
                 RejectReason::InvalidJobId
                 | RejectReason::StaleShare
                 | RejectReason::DuplicateShare => true,
-                RejectReason::DifficultyTooLow
-                | RejectReason::BadExtranonceSize
-                | RejectReason::InvalidChannelId => false,
+                RejectReason::DifficultyTooLow | RejectReason::BadExtranonceSize => false,
             };
             if demonstrates_target {
                 engine.note_target_reached();

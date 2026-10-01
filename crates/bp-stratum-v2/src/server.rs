@@ -571,10 +571,10 @@ async fn run_mining_connection(
                 // The dispatch consumes the frame; the identity is kept for the
                 // refusal log below.
                 let open_identity = match &inbound {
-                    InboundMiningFrame::OpenStandardMiningChannel(input, _) => {
+                    InboundMiningFrame::OpenStandardMiningChannel(input) => {
                         Some(input.user_identity.clone())
                     }
-                    InboundMiningFrame::OpenExtendedMiningChannel(input, _) => {
+                    InboundMiningFrame::OpenExtendedMiningChannel(input) => {
                         Some(input.user_identity.clone())
                     }
                     _ => None,
@@ -1057,11 +1057,11 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
     match inbound {
         InboundMiningFrame::SetupConnection(input) => handle_setup_connection(state, &input),
         InboundMiningFrame::RequestExtensions(input) => handle_request_extensions(state, &input),
-        InboundMiningFrame::OpenStandardMiningChannel(input, _placeholder_prefix) => {
+        InboundMiningFrame::OpenStandardMiningChannel(input) => {
             let prefix = extranonce.allocate(state.next_channel_id);
             handle_open_standard_mining_channel(state, &input, prefix)
         }
-        InboundMiningFrame::OpenExtendedMiningChannel(input, _placeholder_prefix) => {
+        InboundMiningFrame::OpenExtendedMiningChannel(input) => {
             let prefix = extranonce.allocate(state.next_channel_id);
             handle_open_extended_mining_channel(state, &input, prefix)
         }
@@ -2336,7 +2336,6 @@ mod tests {
                 nominal_hash_rate: 1_000.0,
                 max_target: [0xFF; 32],
             },
-            Vec::new(),
         );
         let _ = dispatch_inbound_frame(&mut s, open, &alloc, &bridge, 0);
         let cid = s.primary_channel.expect("channel opened");
@@ -2377,7 +2376,6 @@ mod tests {
                     nominal_hash_rate: 1_000.0,
                     max_target: [0xFF; 32],
                 },
-                Vec::new(),
             )
         };
 
@@ -2427,7 +2425,6 @@ mod tests {
                     max_target: [0xFF; 32],
                     min_extranonce_size: 8,
                 },
-                Vec::new(),
             );
             let _ = dispatch_inbound_frame(&mut s, open, &alloc, &bridge, 0);
         }
@@ -2475,7 +2472,6 @@ mod tests {
                     nominal_hash_rate: 1_000.0,
                     max_target: [0xFF; 32],
                 },
-                Vec::new(),
             );
             let _ = dispatch_inbound_frame(&mut s, open, &alloc, &bridge, 0);
             let cid = s.primary_channel.expect("channel opened");
@@ -2532,7 +2528,6 @@ mod tests {
                 max_target: [0xFF; 32],
                 min_extranonce_size: 8,
             },
-            Vec::new(),
         );
         let _ = dispatch_inbound_frame(&mut s, open, &alloc, &bridge, 0);
         let cid = s.primary_channel.expect("extended channel opened");
@@ -2800,7 +2795,6 @@ mod tests {
                     max_target: [0xFF; 32],
                     min_extranonce_size: 8,
                 },
-                Vec::new(),
             ),
             &alloc,
             &bridge,

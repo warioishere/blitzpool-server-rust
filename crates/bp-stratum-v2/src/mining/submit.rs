@@ -50,7 +50,6 @@ pub const ERR_BAD_EXTRANONCE_SIZE: &str = "bad-extranonce-size";
 /// [`Self::wire_code`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectReason {
-    InvalidChannelId,
     InvalidJobId,
     /// Distinct from [`Self::DuplicateShare`] so the stats fan-out can
     /// bucket them separately.
@@ -64,7 +63,6 @@ pub enum RejectReason {
 impl RejectReason {
     pub fn wire_code(self) -> &'static str {
         match self {
-            RejectReason::InvalidChannelId => ERR_INVALID_CHANNEL_ID,
             RejectReason::InvalidJobId => ERR_INVALID_JOB_ID,
             RejectReason::StaleShare => ERR_STALE_SHARE,
             RejectReason::DuplicateShare => ERR_DUPLICATE_SHARE,
@@ -593,10 +591,6 @@ mod tests {
 
     #[test]
     fn reject_reason_wire_codes_match_sv2_spec_literals() {
-        assert_eq!(
-            RejectReason::InvalidChannelId.wire_code(),
-            "invalid-channel-id"
-        );
         assert_eq!(RejectReason::InvalidJobId.wire_code(), "invalid-job-id");
         assert_eq!(RejectReason::StaleShare.wire_code(), "stale-share");
         assert_eq!(RejectReason::DuplicateShare.wire_code(), "duplicate-share");

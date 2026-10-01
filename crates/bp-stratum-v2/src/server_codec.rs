@@ -48,8 +48,8 @@ use crate::mining::submit::{SubmitSharesExtendedInput, SubmitSharesStandardInput
 pub enum InboundMiningFrame {
     SetupConnection(SetupConnectionInput),
     RequestExtensions(LocalRequestExtensions),
-    OpenStandardMiningChannel(OpenStandardMiningChannelInput, Vec<u8>),
-    OpenExtendedMiningChannel(OpenExtendedMiningChannelInput, Vec<u8>),
+    OpenStandardMiningChannel(OpenStandardMiningChannelInput),
+    OpenExtendedMiningChannel(OpenExtendedMiningChannelInput),
     UpdateChannel(UpdateChannelInput),
     CloseChannel(CloseChannelInput),
     SubmitSharesStandard(SubmitSharesStandardInput),
@@ -81,14 +81,12 @@ pub fn decode_mining_inbound(
 
 fn decode_mining_message(m: Mining<'_>) -> Result<InboundMiningFrame, CodecError> {
     match m {
-        Mining::OpenStandardMiningChannel(m) => {
-            let (input, prefix) = decode_open_std_channel(m)?;
-            Ok(InboundMiningFrame::OpenStandardMiningChannel(input, prefix))
-        }
-        Mining::OpenExtendedMiningChannel(m) => {
-            let (input, prefix) = decode_open_ext_channel(m)?;
-            Ok(InboundMiningFrame::OpenExtendedMiningChannel(input, prefix))
-        }
+        Mining::OpenStandardMiningChannel(m) => Ok(InboundMiningFrame::OpenStandardMiningChannel(
+            decode_open_std_channel(m)?,
+        )),
+        Mining::OpenExtendedMiningChannel(m) => Ok(InboundMiningFrame::OpenExtendedMiningChannel(
+            decode_open_ext_channel(m)?,
+        )),
         Mining::UpdateChannel(m) => {
             Ok(InboundMiningFrame::UpdateChannel(decode_update_channel(m)?))
         }
@@ -138,33 +136,25 @@ fn mining_variant_name(m: &Mining<'_>) -> &'static str {
 
 fn decode_open_std_channel(
     m: Sv2OpenStdChannel<'_>,
-) -> Result<(OpenStandardMiningChannelInput, Vec<u8>), CodecError> {
-    let extranonce_prefix = Vec::new(); // OpenChannel.request doesn't carry one — pool allocates
-    Ok((
-        OpenStandardMiningChannelInput {
-            request_id: m.get_request_id_as_u32(),
-            user_identity: utf8_from_bytes(m.user_identity.as_bytes())?,
-            nominal_hash_rate: m.nominal_hash_rate,
-            max_target: bytes_to_32(m.max_target.as_bytes())?,
-        },
-        extranonce_prefix,
-    ))
+) -> Result<OpenStandardMiningChannelInput, CodecError> {
+    Ok(OpenStandardMiningChannelInput {
+        request_id: m.get_request_id_as_u32(),
+        user_identity: utf8_from_bytes(m.user_identity.as_bytes())?,
+        nominal_hash_rate: m.nominal_hash_rate,
+        max_target: bytes_to_32(m.max_target.as_bytes())?,
+    })
 }
 
 fn decode_open_ext_channel(
     m: Sv2OpenExtChannel<'_>,
-) -> Result<(OpenExtendedMiningChannelInput, Vec<u8>), CodecError> {
-    let extranonce_prefix = Vec::new();
-    Ok((
-        OpenExtendedMiningChannelInput {
-            request_id: m.get_request_id_as_u32(),
-            user_identity: utf8_from_bytes(m.user_identity.as_bytes())?,
-            nominal_hash_rate: m.nominal_hash_rate,
-            max_target: bytes_to_32(m.max_target.as_bytes())?,
-            min_extranonce_size: m.min_extranonce_size,
-        },
-        extranonce_prefix,
-    ))
+) -> Result<OpenExtendedMiningChannelInput, CodecError> {
+    Ok(OpenExtendedMiningChannelInput {
+        request_id: m.get_request_id_as_u32(),
+        user_identity: utf8_from_bytes(m.user_identity.as_bytes())?,
+        nominal_hash_rate: m.nominal_hash_rate,
+        max_target: bytes_to_32(m.max_target.as_bytes())?,
+        min_extranonce_size: m.min_extranonce_size,
+    })
 }
 
 fn decode_update_channel(m: Sv2UpdateChannel<'_>) -> Result<UpdateChannelInput, CodecError> {
@@ -571,7 +561,7 @@ mod tests {
         }));
         let out = decode_mining_inbound(msg).unwrap().unwrap();
         match out {
-            InboundMiningFrame::OpenStandardMiningChannel(i, _) => {
+            InboundMiningFrame::OpenStandardMiningChannel(i) => {
                 assert_eq!(i.request_id, 42);
                 assert_eq!(i.user_identity, "miner.worker1");
                 assert!((i.nominal_hash_rate - 1_000_000.0).abs() < 1.0);
@@ -594,7 +584,7 @@ mod tests {
         }));
         let out = decode_mining_inbound(msg).unwrap().unwrap();
         match out {
-            InboundMiningFrame::OpenExtendedMiningChannel(i, _) => {
+            InboundMiningFrame::OpenExtendedMiningChannel(i) => {
                 assert_eq!(i.request_id, 99);
                 assert_eq!(i.user_identity, "miner.ext");
                 assert_eq!(i.min_extranonce_size, 8);

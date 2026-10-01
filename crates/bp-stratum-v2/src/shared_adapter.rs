@@ -50,7 +50,7 @@ fn map_sv2_reject(reason: RejectReason) -> Option<RejectedReason> {
         RejectReason::InvalidJobId => Some(RejectedReason::JobNotFound),
         RejectReason::DuplicateShare => Some(RejectedReason::DuplicateShare),
         RejectReason::DifficultyTooLow => Some(RejectedReason::LowDifficulty),
-        RejectReason::InvalidChannelId | RejectReason::BadExtranonceSize => None,
+        RejectReason::BadExtranonceSize => None,
     }
 }
 
@@ -143,12 +143,12 @@ mod tests {
 
     /// A protocol-validity reject never reaches the stats sink.
     #[test]
-    fn a_channel_id_reject_is_not_forwarded() {
+    fn a_protocol_validity_reject_is_not_forwarded() {
         let r = shared_rejected(
             Some("a"),
             Some("w"),
             "s",
-            RejectReason::InvalidChannelId,
+            RejectReason::BadExtranonceSize,
             Difficulty(1.0),
         );
         assert!(r.is_none());
@@ -172,7 +172,6 @@ mod tests {
             map_sv2_reject(RejectReason::DifficultyTooLow),
             Some(RejectedReason::LowDifficulty)
         );
-        assert_eq!(map_sv2_reject(RejectReason::InvalidChannelId), None);
         assert_eq!(map_sv2_reject(RejectReason::BadExtranonceSize), None);
     }
 }
