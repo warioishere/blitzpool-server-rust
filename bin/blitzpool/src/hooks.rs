@@ -24,7 +24,7 @@ use bp_api::email_hooks::{
 use bp_common::AddressId;
 use bp_config::AppConfig;
 use bp_db::Db;
-use bp_db::{delete_pplns_group_block_history_for_group, find_address_email, PplnsGroupRow};
+use bp_db::{delete_pplns_group_block_history_for_group, PplnsGroupRow};
 use bp_group_mgmt_engine::{
     EmailHooks, GroupServiceHooks, InvitationEmailContext, JoinDecisionEmailContext,
     JoinDecisionOutcome,
@@ -450,11 +450,6 @@ fn epoch_ms_to_utc(ms: i64) -> DateTime<Utc> {
     Utc.timestamp_millis_opt(ms)
         .single()
         .unwrap_or_else(Utc::now)
-}
-
-// Keeps the `find_address_email` import in use.
-async fn _ensure_find_address_email_resolves(db: &Db, addr: &AddressId) {
-    let _ = find_address_email(db.pool(), addr).await;
 }
 
 #[cfg(test)]
