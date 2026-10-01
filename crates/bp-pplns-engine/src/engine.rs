@@ -430,10 +430,21 @@ impl PplnsEngine {
         existing: &HashMap<String, PplnsBalanceRow>,
     ) -> Result<(Vec<AuditRow>, Vec<BalanceWrite>), EngineError> {
         let t = actual.total_value_sats;
+        let in_snapshot: std::collections::HashSet<&str> = snapshot
+            .entries
+            .iter()
+            .map(|e| e.address.as_str())
+            .collect();
+        let paid_to = |address: &str| actual.paid_by_address.get(address).copied().unwrap_or(0);
+        // Current balance and lifetime total; a missing row is zero on both.
+        let row_of = |address: &str| {
+            existing
+                .get(address)
+                .map_or((0, 0), |r| (r.balance_sats.0, r.total_paid_sats.0))
+        };
 
         let mut audit_rows: Vec<AuditRow> = Vec::new();
         let mut balance_writes: Vec<BalanceWrite> = Vec::new();
-        let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // The coinbase paid the carried promises out of this same pot, so claims
         // are shares of the rest; using the full pot would invent money.
@@ -456,21 +467,8 @@ impl PplnsEngine {
                 t,
                 extras_total,
             );
-            let paid = actual
-                .paid_by_address
-                .get(&entry.address)
-                .copied()
-                .unwrap_or(0);
+            let paid = paid_to(&entry.address);
             let delta = claim - paid as i64;
-
-            let current = existing
-                .get(&entry.address)
-                .map(|r| r.balance_sats.0)
-                .unwrap_or(0);
-            let prev_total_paid = existing
-                .get(&entry.address)
-                .map(|r| r.total_paid_sats.0)
-                .unwrap_or(0);
 
             let addr_id = AddressId::new(entry.address.clone())?;
             if paid > 0 {
@@ -485,7 +483,7 @@ impl PplnsEngine {
             } else {
                 continue;
             }
-            emitted.insert(entry.address.clone());
+            let (current, prev_total_paid) = row_of(&entry.address);
             balance_writes.push(BalanceWrite {
                 address: addr_id,
                 balance_sats: Sats(current + delta),
@@ -495,47 +493,40 @@ impl PplnsEngine {
 
         // Outputs paying an address the snapshot does not know: book the payment
         // into the lifetime total without inventing a claim.
-        for (addr_str, paid) in &actual.paid_by_address {
-            if *paid == 0 || emitted.contains(addr_str) || *addr_str == snapshot.fee_address {
+        for (addr_str, &paid) in &actual.paid_by_address {
+            if paid == 0
+                || *addr_str == snapshot.fee_address
+                || in_snapshot.contains(addr_str.as_str())
+            {
                 continue;
             }
-            if !snapshot.entries.iter().any(|e| &e.address == addr_str) {
-                warn!(
-                    address = %addr_str,
-                    paid,
-                    "weight settlement: coinbase paid an address outside the distribution"
-                );
-                let Ok(addr_id) = AddressId::new(addr_str.clone()) else {
-                    continue;
-                };
-                let current = existing
-                    .get(addr_str)
-                    .map(|r| r.balance_sats.0)
-                    .unwrap_or(0);
-                let prev_total_paid = existing
-                    .get(addr_str)
-                    .map(|r| r.total_paid_sats.0)
-                    .unwrap_or(0);
-                audit_rows.push(AuditRow {
-                    address: addr_id.clone(),
-                    paid_sats: Sats(*paid as i64),
-                    percent: actual.percent_of_total(*paid),
-                    row_type: PayoutRowType::Coinbase,
-                });
-                emitted.insert(addr_str.clone());
-                balance_writes.push(BalanceWrite {
-                    address: addr_id,
-                    balance_sats: Sats(current - *paid as i64),
-                    total_paid_sats: Sats(prev_total_paid + *paid as i64),
-                });
-            }
+            warn!(
+                address = %addr_str,
+                paid,
+                "weight settlement: coinbase paid an address outside the distribution"
+            );
+            let Ok(addr_id) = AddressId::new(addr_str.clone()) else {
+                continue;
+            };
+            let (current, prev_total_paid) = row_of(addr_str);
+            audit_rows.push(AuditRow {
+                address: addr_id.clone(),
+                paid_sats: Sats(paid as i64),
+                percent: actual.percent_of_total(paid),
+                row_type: PayoutRowType::Coinbase,
+            });
+            balance_writes.push(BalanceWrite {
+                address: addr_id,
+                balance_sats: Sats(current - paid as i64),
+                total_paid_sats: Sats(prev_total_paid + paid as i64),
+            });
         }
 
-        // Late arrivers: active in the window, unknown to the snapshot.
+        // Late arrivers: active in the window, unknown to the snapshot, unpaid.
         for addr_str in current_window.keys() {
-            if emitted.contains(addr_str)
-                || addr_str == &snapshot.fee_address
-                || snapshot.entries.iter().any(|e| &e.address == addr_str)
+            if *addr_str == snapshot.fee_address
+                || in_snapshot.contains(addr_str.as_str())
+                || paid_to(addr_str) > 0
             {
                 continue;
             }
@@ -543,7 +534,6 @@ impl PplnsEngine {
                 continue;
             };
             audit_rows.push(pending_row(addr_id, Sats(0)));
-            emitted.insert(addr_str.clone());
         }
 
         Ok((audit_rows, balance_writes))
@@ -577,6 +567,7 @@ impl PplnsEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bp_coinbase_snapshot::WeightSnapshotEntry;
 
     #[test]
     fn engine_error_carries_source_variants() {
@@ -589,6 +580,142 @@ mod tests {
         fn _accepts_ledger(e: LedgerError) -> EngineError {
             EngineError::from(e)
         }
+    }
+
+    fn snap_entry(address: &str, score_weight: u64, balance_sats: i64) -> WeightSnapshotEntry {
+        WeightSnapshotEntry {
+            address: address.to_string(),
+            score_weight,
+            balance_sats,
+            wire_weight: score_weight,
+            dust_limit: 546,
+        }
+    }
+
+    fn balance_row(address: &str, balance: i64, total_paid: i64) -> (String, PplnsBalanceRow) {
+        let row = PplnsBalanceRow {
+            address: AddressId::new(address.to_string()).unwrap(),
+            balance_sats: Sats(balance),
+            total_paid_sats: Sats(total_paid),
+            updated_at: 0,
+            last_accepted_share_at: None,
+        };
+        (address.to_string(), row)
+    }
+
+    /// Pins every branch of the settlement writes: exactly paid, withheld,
+    /// overpaid, indebted, nothing owed, fee address as an entry, paid outside
+    /// the snapshot (valid, invalid, zero, fee), late arrivers.
+    #[test]
+    fn settlement_writes_cover_every_branch() {
+        const FEE: &str = "fee_addr";
+        let snapshot = StoredWeightSnapshot {
+            entries: vec![
+                snap_entry("exact", 400, 0),
+                snap_entry("withheld", 300, 0),
+                snap_entry("overpaid", 200, 0),
+                snap_entry("indebted", 100, -500),
+                snap_entry("owed_nothing", 0, 0),
+                snap_entry(FEE, 50, 0),
+            ],
+            weight_p: 10,
+            fee_ppm: 10_000,
+            fee_address: FEE.to_string(),
+            reference_revenue_sats: 1_000_000,
+            score_total: 1_050,
+        };
+        let paid = |pairs: &[(&str, u64)]| -> HashMap<String, u64> {
+            pairs.iter().map(|(a, s)| (a.to_string(), *s)).collect()
+        };
+        let actual = ActualCoinbase {
+            paid_by_address: paid(&[
+                ("exact", 377_333),
+                ("overpaid", 300_000),
+                ("outsider", 1_000),
+                ("bad address", 2_000),
+                ("zero_outsider", 0),
+                (FEE, 7_000),
+            ]),
+            pool_paid_sats: 10_000,
+            total_value_sats: 1_000_000,
+        };
+        let window: HashMap<String, f64> = [
+            ("exact", 1.0),
+            ("late", 2.0),
+            ("outsider", 3.0),
+            (FEE, 4.0),
+            ("bad late", 5.0),
+            ("owed_nothing", 6.0),
+            ("zero_outsider", 7.0),
+        ]
+        .iter()
+        .map(|(a, d)| (a.to_string(), *d))
+        .collect();
+        let existing: HashMap<String, PplnsBalanceRow> = [
+            balance_row("exact", 100, 5_000),
+            balance_row("indebted", -500, 0),
+            balance_row("outsider", 50, 10),
+        ]
+        .into_iter()
+        .collect();
+
+        let (audit, writes) =
+            PplnsEngine::build_writes_from_weight_snapshot(&snapshot, &window, &actual, &existing)
+                .expect("writes");
+
+        // Snapshot entries come first, in snapshot order.
+        let head: Vec<&str> = audit.iter().take(4).map(|r| r.address.as_str()).collect();
+        assert_eq!(head, ["exact", "withheld", "overpaid", "indebted"]);
+
+        let mut audit: Vec<String> = audit
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} {} {:.4} {}",
+                    r.address.as_str(),
+                    r.paid_sats.0,
+                    r.percent,
+                    r.row_type.as_wire()
+                )
+            })
+            .collect();
+        audit.sort();
+        let mut writes: Vec<String> = writes
+            .iter()
+            .map(|w| {
+                format!(
+                    "{} {} {}",
+                    w.address.as_str(),
+                    w.balance_sats.0,
+                    w.total_paid_sats.0
+                )
+            })
+            .collect();
+        writes.sort();
+        assert_eq!(
+            audit,
+            [
+                "exact 377333 37.7333 coinbase",
+                "indebted 94333 0.0000 pending",
+                "late 0 0.0000 pending",
+                "outsider 1000 0.1000 coinbase",
+                "overpaid 300000 30.0000 coinbase",
+                "withheld 283000 0.0000 pending",
+                "zero_outsider 0 0.0000 pending",
+            ],
+            "audit rows"
+        );
+        assert_eq!(
+            writes,
+            [
+                "exact 100 382333",
+                "indebted 93833 0",
+                "outsider -950 1010",
+                "overpaid -111334 300000",
+                "withheld 283000 0",
+            ],
+            "balance writes"
+        );
     }
 
     #[test]
