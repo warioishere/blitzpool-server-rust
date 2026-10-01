@@ -197,188 +197,126 @@ impl NotificationDispatcher {
     /// wording differs from the other two: the owner of three rigs must not
     /// read "offline" when two are still working.
     pub async fn notify_device_partial(&self, partial: &DevicePartial) {
-        let (telegram_subs, _ntfy_sub, push_subs) = self.load_subs(&partial.address).await;
-
-        let mut tasks = Vec::new();
-        let telegram_dev: Vec<_> = telegram_subs
-            .iter()
-            .filter(|s| s.device_notifications_enabled)
-            .cloned()
-            .collect();
-        if !telegram_dev.is_empty() {
-            if let Some(adapter) = &self.telegram {
-                tasks.push(Box::pin(send_telegram_device_partial(
-                    Arc::clone(adapter),
-                    self.pool.clone(),
-                    self.chat_languages.clone(),
+        self.notify_device(
+            &partial.address,
+            |adapter, pool, langs, subs| {
+                Box::pin(send_telegram_device_partial(
+                    adapter,
+                    pool,
+                    langs,
                     partial.clone(),
-                    telegram_dev,
-                )) as TaskFuture);
-            }
-        }
-        let fcm_dev: Vec<_> = push_subs
-            .iter()
-            .filter(|s| {
-                s.subscription_type.eq_ignore_ascii_case(PUSH_TYPE_FCM)
-                    && s.device_notifications_enabled
-            })
-            .cloned()
-            .collect();
-        if !fcm_dev.is_empty() {
-            tasks.push(Box::pin(fan_push(
-                self.clone_push_handles(),
-                self.pool.clone(),
-                partial.address.clone(),
-                fcm_dev,
-                device_partial_fcm_payload(partial),
-            )) as TaskFuture);
-        }
-        let unified_dev: Vec<_> = push_subs
-            .iter()
-            .filter(|s| {
-                s.subscription_type.eq_ignore_ascii_case(PUSH_TYPE_UNIFIED)
-                    && s.device_notifications_enabled
-            })
-            .cloned()
-            .collect();
-        if !unified_dev.is_empty() {
-            tasks.push(Box::pin(fan_push(
-                self.clone_push_handles(),
-                self.pool.clone(),
-                partial.address.clone(),
-                unified_dev,
-                device_partial_unified_payload(partial),
-            )) as TaskFuture);
-        }
-
-        join_all(tasks).await;
+                    subs,
+                ))
+            },
+            || device_partial_fcm_payload(partial),
+            || device_partial_unified_payload(partial),
+        )
+        .await;
     }
 
     /// Several transitions on one address, collapsed into one message.
     /// Same transports and same per-subscriber filtering as the single
     /// form — only the rendered text differs.
     pub async fn notify_device_aggregate(&self, agg: &DeviceAggregate) {
-        let (telegram_subs, _ntfy_sub, push_subs) = self.load_subs(&agg.address).await;
-
-        let mut tasks = Vec::new();
-        let telegram_dev: Vec<_> = telegram_subs
-            .iter()
-            .filter(|s| s.device_notifications_enabled)
-            .cloned()
-            .collect();
-        if !telegram_dev.is_empty() {
-            if let Some(adapter) = &self.telegram {
-                tasks.push(Box::pin(send_telegram_device_aggregate(
-                    Arc::clone(adapter),
-                    self.pool.clone(),
-                    self.chat_languages.clone(),
+        self.notify_device(
+            &agg.address,
+            |adapter, pool, langs, subs| {
+                Box::pin(send_telegram_device_aggregate(
+                    adapter,
+                    pool,
+                    langs,
                     agg.clone(),
-                    telegram_dev,
-                )) as TaskFuture);
-            }
-        }
-
-        // The two push transports do NOT share a payload: FCM turns `tag`
-        // into `data.status` and merges `extras`, while UnifiedPush flattens
-        // to `title|body|tag`. One payload for both would change that shape.
-        let fcm_dev: Vec<_> = push_subs
-            .iter()
-            .filter(|s| {
-                s.subscription_type.eq_ignore_ascii_case(PUSH_TYPE_FCM)
-                    && s.device_notifications_enabled
-            })
-            .cloned()
-            .collect();
-        if !fcm_dev.is_empty() {
-            tasks.push(Box::pin(fan_push(
-                self.clone_push_handles(),
-                self.pool.clone(),
-                agg.address.clone(),
-                fcm_dev,
-                device_aggregate_fcm_payload(agg),
-            )) as TaskFuture);
-        }
-        let unified_dev: Vec<_> = push_subs
-            .iter()
-            .filter(|s| {
-                s.subscription_type.eq_ignore_ascii_case(PUSH_TYPE_UNIFIED)
-                    && s.device_notifications_enabled
-            })
-            .cloned()
-            .collect();
-        if !unified_dev.is_empty() {
-            tasks.push(Box::pin(fan_push(
-                self.clone_push_handles(),
-                self.pool.clone(),
-                agg.address.clone(),
-                unified_dev,
-                device_aggregate_unified_payload(agg),
-            )) as TaskFuture);
-        }
-
-        join_all(tasks).await;
+                    subs,
+                ))
+            },
+            || device_aggregate_fcm_payload(agg),
+            || device_aggregate_unified_payload(agg),
+        )
+        .await;
     }
 
     /// Worker on `address` connected or disconnected. Routes to
     /// Telegram + FCM + UnifiedPush (ntfy intentionally skipped — the
     /// topic model doesn't carry per-user device subscriptions cleanly).
     pub async fn notify_device_status(&self, event: &DeviceStatusEvent) {
-        let (telegram_subs, _ntfy_sub, push_subs) = self.load_subs(&event.address).await;
+        self.notify_device(
+            &event.address,
+            |adapter, pool, langs, subs| {
+                Box::pin(send_telegram_device_status(
+                    adapter,
+                    pool,
+                    langs,
+                    event.clone(),
+                    subs,
+                ))
+            },
+            || device_status_fcm_payload(event),
+            || device_status_unified_payload(event),
+        )
+        .await;
+    }
+
+    /// Route one device notice to every device-enabled subscription. The two
+    /// push transports do NOT share a payload: FCM turns `tag` into
+    /// `data.status` and merges `extras`, while UnifiedPush flattens to
+    /// `title|body|tag`. Payloads are built only for a transport with subscribers.
+    async fn notify_device(
+        &self,
+        address: &AddressId,
+        telegram: impl FnOnce(
+            Arc<TelegramAdapter>,
+            PgPool,
+            ChatLanguageMap,
+            Vec<TelegramSubscriptionRow>,
+        ) -> TaskFuture,
+        fcm_payload: impl FnOnce() -> PushPayload,
+        unified_payload: impl FnOnce() -> PushPayload,
+    ) {
+        let (telegram_subs, _ntfy_sub, push_subs) = self.load_subs(address).await;
 
         let mut tasks = Vec::new();
         let telegram_dev: Vec<_> = telegram_subs
-            .iter()
+            .into_iter()
             .filter(|s| s.device_notifications_enabled)
-            .cloned()
             .collect();
         if !telegram_dev.is_empty() {
             if let Some(adapter) = &self.telegram {
-                tasks.push(Box::pin(send_telegram_device_status(
+                tasks.push(telegram(
                     Arc::clone(adapter),
                     self.pool.clone(),
                     self.chat_languages.clone(),
-                    event.clone(),
                     telegram_dev,
-                )) as TaskFuture);
+                ));
             }
         }
-        // FCM + UnifiedPush device-status both go through the
-        // push-subscription table, filtered by `subscription_type`.
-        let fcm_dev: Vec<_> = push_subs
-            .iter()
-            .filter(|s| {
-                s.subscription_type.eq_ignore_ascii_case(PUSH_TYPE_FCM)
-                    && s.device_notifications_enabled
-            })
-            .cloned()
-            .collect();
+        let push_of = |kind: &str| -> Vec<PushSubscriptionRow> {
+            push_subs
+                .iter()
+                .filter(|s| {
+                    s.subscription_type.eq_ignore_ascii_case(kind) && s.device_notifications_enabled
+                })
+                .cloned()
+                .collect()
+        };
+        let fcm_dev = push_of(PUSH_TYPE_FCM);
         if !fcm_dev.is_empty() {
-            if let Some(adapter) = &self.fcm {
-                tasks.push(Box::pin(send_fcm_device_status(
-                    Arc::clone(adapter),
-                    self.pool.clone(),
-                    event.clone(),
-                    fcm_dev,
-                )) as TaskFuture);
-            }
+            tasks.push(Box::pin(fan_push(
+                self.clone_push_handles(),
+                self.pool.clone(),
+                address.clone(),
+                fcm_dev,
+                fcm_payload(),
+            )) as TaskFuture);
         }
-        let unified_dev: Vec<_> = push_subs
-            .iter()
-            .filter(|s| {
-                s.subscription_type.eq_ignore_ascii_case(PUSH_TYPE_UNIFIED)
-                    && s.device_notifications_enabled
-            })
-            .cloned()
-            .collect();
+        let unified_dev = push_of(PUSH_TYPE_UNIFIED);
         if !unified_dev.is_empty() {
-            if let Some(adapter) = &self.web_push {
-                tasks.push(Box::pin(send_web_push_device_status(
-                    Arc::clone(adapter),
-                    self.pool.clone(),
-                    event.clone(),
-                    unified_dev,
-                )) as TaskFuture);
-            }
+            tasks.push(Box::pin(fan_push(
+                self.clone_push_handles(),
+                self.pool.clone(),
+                address.clone(),
+                unified_dev,
+                unified_payload(),
+            )) as TaskFuture);
         }
 
         join_all(tasks).await;
@@ -838,12 +776,7 @@ async fn send_push_best_diff(
     fan_push(handles, pool, address, subs, payload).await;
 }
 
-async fn send_fcm_device_status(
-    adapter: Arc<FcmAdapter>,
-    pool: PgPool,
-    event: DeviceStatusEvent,
-    subs: Vec<PushSubscriptionRow>,
-) {
+fn device_status_fcm_payload(event: &DeviceStatusEvent) -> PushPayload {
     // FCM device-status payload uses UTC + plain locale ("en-US");
     // `DEVICE_TIMEZONE` is for the telegram + ntfy paths.
     let worker = event
@@ -854,9 +787,9 @@ async fn send_fcm_device_status(
         .user_agent
         .clone()
         .unwrap_or_else(|| "Unknown".to_string());
-    let (title, body) = device_status_title_body(&event);
+    let (title, body) = device_status_title_body(event);
 
-    let payload = PushPayload {
+    PushPayload {
         kind: PushKind::DeviceStatus,
         title: title.to_string(),
         body,
@@ -873,26 +806,7 @@ async fn send_fcm_device_status(
                 event.timestamp.timestamp_millis().to_string(),
             ),
         ],
-    };
-
-    let tasks = subs.into_iter().map(|sub| {
-        let adapter = Arc::clone(&adapter);
-        let pool = pool.clone();
-        let payload = payload.clone();
-        let address = event.address.clone();
-        async move {
-            push_fcm(
-                &adapter,
-                &pool,
-                &address,
-                &sub,
-                &payload,
-                "fcm device-status",
-            )
-            .await;
-        }
-    });
-    join_all(tasks).await;
+    }
 }
 
 /// Shared device-status title + body for the push transports (FCM +
@@ -915,40 +829,17 @@ fn device_status_title_body(event: &DeviceStatusEvent) -> (&'static str, String)
     (title, format!("{agent} ({worker}) at {time_str}"))
 }
 
-async fn send_web_push_device_status(
-    adapter: Arc<WebPushAdapter>,
-    pool: PgPool,
-    event: DeviceStatusEvent,
-    subs: Vec<PushSubscriptionRow>,
-) {
-    let (title, body) = device_status_title_body(&event);
+fn device_status_unified_payload(event: &DeviceStatusEvent) -> PushPayload {
+    let (title, body) = device_status_title_body(event);
     // Empty trailing tag → the wire body is `title|body|`, the shape
     // UnifiedPush device-status clients already parse.
-    let payload = PushPayload {
+    PushPayload {
         kind: PushKind::DeviceStatus,
         title: title.to_string(),
         body,
         tag: String::new(),
         extras: Vec::new(),
-    };
-    let tasks = subs.into_iter().map(|sub| {
-        let adapter = Arc::clone(&adapter);
-        let pool = pool.clone();
-        let payload = payload.clone();
-        let address = event.address.clone();
-        async move {
-            push_web(
-                &adapter,
-                &pool,
-                &address,
-                &sub,
-                &payload,
-                "unified push device-status",
-            )
-            .await;
-        }
-    });
-    join_all(tasks).await;
+    }
 }
 
 async fn fan_push(
@@ -1144,15 +1035,9 @@ mod tests {
     /// The FCM aggregate payload carries every data key the single form sends.
     #[test]
     fn aggregate_fcm_payload_keeps_the_single_events_data_keys() {
-        let single = {
-            let event = device_event(false, false);
-            let (_, body) = device_status_title_body(&event);
-            let _ = body;
-            // Mirror of `send_fcm_device_status`'s extras.
-            vec!["isReturning", "workerName", "userAgent", "timestamp"]
-        };
+        let single = device_status_fcm_payload(&device_event(false, false));
         let agg = device_aggregate_fcm_payload(&aggregate(&["a", "b"], &[]));
-        for key in single {
+        for (key, _) in &single.extras {
             assert!(
                 agg.extras.iter().any(|(k, _)| k == key),
                 "aggregate payload dropped `{key}`, which shipped clients read"
@@ -1196,6 +1081,34 @@ mod tests {
                 .map(|(_, v)| v.as_str()),
             Some("false")
         );
+    }
+
+    /// Pins both device-status payloads, the shapes shipped clients parse.
+    #[test]
+    fn device_status_payloads_keep_their_wire_shape() {
+        let fcm = device_status_fcm_payload(&device_event(true, true));
+        assert_eq!(fcm.title, "Device Back Online");
+        assert_eq!(fcm.body, "bitaxe (rig1) at 11/14/23, 10:13 PM");
+        assert_eq!(fcm.tag, "online");
+        assert_eq!(
+            fcm.extras,
+            vec![
+                ("isReturning".to_string(), "true".to_string()),
+                ("workerName".to_string(), "rig1".to_string()),
+                ("userAgent".to_string(), "bitaxe".to_string()),
+                ("timestamp".to_string(), "1700000000000".to_string()),
+            ]
+        );
+        assert_eq!(
+            device_status_fcm_payload(&device_event(false, false)).tag,
+            "offline"
+        );
+
+        let unified = device_status_unified_payload(&device_event(false, false));
+        assert_eq!(unified.title, "Device Offline");
+        assert_eq!(unified.body, "bitaxe (rig1) at 11/14/23, 10:13 PM");
+        assert!(unified.tag.is_empty());
+        assert!(unified.extras.is_empty());
     }
 
     /// The UnifiedPush aggregate keeps the empty trailing `tag` field.
