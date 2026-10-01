@@ -150,29 +150,7 @@ impl IntoResponse for ApiError {
 impl From<bp_group_mgmt_engine::GroupServiceError> for ApiError {
     fn from(e: bp_group_mgmt_engine::GroupServiceError) -> Self {
         use bp_group_mgmt_engine::GroupServiceError as G;
-        let code: &'static str = match e.code() {
-            "missing-token" => "missing-token",
-            "not-found" => "not-found",
-            "invalid-token" => "invalid-token",
-            "invalid-name" => "invalid-name",
-            "invalid-address" => "invalid-address",
-            "name-taken" => "name-taken",
-            "address-in-group" => "address-in-group",
-            "address-in-blockparty" => "address-in-blockparty",
-            "already-member" => "already-member",
-            "not-member" => "not-member",
-            "creator-cannot-be-removed" => "creator-cannot-be-removed",
-            "already-creator" => "already-creator",
-            "member-still-active" => "member-still-active",
-            "invalid-interval" => "invalid-interval",
-            "invalid-preset" => "invalid-preset",
-            "invalid-timezone" => "invalid-timezone",
-            "invalid-bonus" => "invalid-bonus",
-            "invalid-max-members" => "invalid-max-members",
-            "group-full" => "group-full",
-            "incomplete-schedule" => "incomplete-schedule",
-            _ => "internal-error",
-        };
+        let code = e.code();
         let status = match e {
             G::MissingToken | G::InvalidToken => StatusCode::UNAUTHORIZED,
             G::NotFound | G::NotMember => StatusCode::NOT_FOUND,
@@ -204,32 +182,7 @@ impl From<bp_group_mgmt_engine::GroupServiceError> for ApiError {
 impl From<bp_blockparty_engine::BlockpartyServiceError> for ApiError {
     fn from(e: bp_blockparty_engine::BlockpartyServiceError) -> Self {
         use bp_blockparty_engine::BlockpartyServiceError as B;
-        let code: &'static str = match e.code() {
-            "missing-token" => "missing-token",
-            "invalid-token" => "invalid-token",
-            "missing-member-token" => "missing-member-token",
-            "invalid-member-token" => "invalid-member-token",
-            "member-not-confirmed" => "member-not-confirmed",
-            "not-found" => "not-found",
-            "not-member" => "not-member",
-            "invalid-name" => "invalid-name",
-            "invalid-address" => "invalid-address",
-            "invalid-email" => "invalid-email",
-            "invalid-percent" => "invalid-percent",
-            "invalid-splits-sum" => "invalid-splits-sum",
-            "invalid-state" => "invalid-state",
-            "name-taken" => "name-taken",
-            "admin-address-taken" => "admin-address-taken",
-            "address-in-blockparty" => "address-in-blockparty",
-            "address-in-pplns-group" => "address-in-pplns-group",
-            "email-not-verified" => "email-not-verified",
-            "admin-cannot-rejoin" => "admin-cannot-rejoin",
-            "admin-cannot-be-removed" => "admin-cannot-be-removed",
-            "not-editable" => "not-editable",
-            "no-members" => "no-members",
-            "dissolve-cooldown" => "dissolve-cooldown",
-            _ => "internal-error",
-        };
+        let code = e.code();
         let status = match e {
             B::MissingToken | B::InvalidToken | B::MissingMemberToken | B::InvalidMemberToken => {
                 StatusCode::UNAUTHORIZED

@@ -105,17 +105,7 @@ async fn open_public(
 pub(crate) fn invitation_to_api_error(e: bp_group_mgmt_engine::InvitationServiceError) -> ApiError {
     use axum::http::StatusCode;
     use bp_group_mgmt_engine::InvitationServiceError as I;
-    let code: &'static str = match e.code() {
-        "not-found" => "not-found",
-        "expired" => "expired",
-        "group-dissolved" => "group-dissolved",
-        "email-not-verified" => "email-not-verified",
-        "invalid-address" => "invalid-address",
-        "address-in-group" => "address-in-group",
-        "already-member" => "already-member",
-        "approval-required" => "approval-required",
-        _ => "internal-error",
-    };
+    let code = e.code();
     let status = match e {
         I::NotFound => StatusCode::NOT_FOUND,
         I::Expired | I::GroupDissolved | I::AddressInGroup | I::AlreadyMember => {

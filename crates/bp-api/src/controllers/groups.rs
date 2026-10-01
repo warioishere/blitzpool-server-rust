@@ -1689,18 +1689,7 @@ async fn join_requests_by_address(
 fn jr_to_api_error(e: bp_group_mgmt_engine::JoinRequestServiceError) -> ApiError {
     use axum::http::StatusCode;
     use bp_group_mgmt_engine::JoinRequestServiceError as J;
-    let code: &'static str = match e.code() {
-        "not-found" => "not-found",
-        "invalid-address" => "invalid-address",
-        "email-not-verified" => "email-not-verified",
-        "already-member" => "already-member",
-        "address-in-group" => "address-in-group",
-        "too-many-pending" => "too-many-pending",
-        "reject-cooldown" => "reject-cooldown",
-        "request-pending" => "request-pending",
-        "group-dissolved" => "group-dissolved",
-        _ => "internal-error",
-    };
+    let code = e.code();
     let status = match e {
         J::NotFound => StatusCode::NOT_FOUND,
         J::AlreadyMember | J::AddressInGroup | J::RequestPending | J::GroupDissolved => {
