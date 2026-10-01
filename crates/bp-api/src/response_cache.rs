@@ -14,11 +14,25 @@ use bytes::Bytes;
 use moka::future::Cache;
 use serde::Serialize;
 
-/// Wrapped moka cache + the per-endpoint TTL table.
+/// Wrapped moka cache + the per-endpoint TTL table. Each value carries its
+/// own TTL, which [`EntryTtl`] hands to moka.
 #[derive(Clone)]
 pub struct ResponseCache {
-    inner: Cache<String, Bytes>,
+    inner: Cache<String, (Bytes, Duration)>,
     ttls: Arc<ApiCacheConfig>,
+}
+
+struct EntryTtl;
+
+impl moka::Expiry<String, (Bytes, Duration)> for EntryTtl {
+    fn expire_after_create(
+        &self,
+        _key: &String,
+        value: &(Bytes, Duration),
+        _created_at: std::time::Instant,
+    ) -> Option<Duration> {
+        Some(value.1)
+    }
 }
 
 /// Identifies which configured TTL applies to a cache write.
@@ -76,6 +90,7 @@ impl ResponseCache {
         let inner = Cache::builder()
             .max_capacity(cfg.max_entries)
             .support_invalidation_closures()
+            .expire_after(EntryTtl)
             .build();
         Self {
             inner,
@@ -161,25 +176,16 @@ impl ResponseCache {
         T: Serialize,
         F: std::future::Future<Output = Result<T, E>>,
     {
-        if let Some(hit) = self.inner.get(&key).await {
+        if let Some((hit, _)) = self.inner.get(&key).await {
             return Ok(hit);
         }
         let value = compute.await?;
         let bytes = Bytes::from(serde_json::to_vec(&value).expect("serialize cached value"));
         if ttl_secs > 0 {
-            self.insert_with_ttl(key, bytes.clone(), Duration::from_secs(ttl_secs))
-                .await;
+            let ttl = Duration::from_secs(ttl_secs);
+            self.inner.insert(key, (bytes.clone(), ttl)).await;
         }
         Ok(bytes)
-    }
-
-    async fn insert_with_ttl(&self, key: String, value: Bytes, ttl: Duration) {
-        self.inner.insert(key.clone(), value).await;
-        let cache = self.inner.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(ttl).await;
-            cache.invalidate(&key).await;
-        });
     }
 
     /// Drop a single cached entry.
@@ -260,6 +266,34 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    /// An entry lives for its own TTL: neither an earlier entry under the same
+    /// key shortens it, nor does it outlive its TTL.
+    #[tokio::test]
+    async fn an_entry_lives_for_its_own_ttl() {
+        let cache = ResponseCache::new(cfg(60));
+        let fetch = |ttl: u64, v: u64| {
+            cache.get_or_fetch_secs::<_, _, ()>("K".to_string(), ttl, async move { Ok(v) })
+        };
+        fetch(1, 1).await.unwrap();
+        cache.invalidate("K").await;
+        fetch(60, 2).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert_eq!(
+            &fetch(60, 3).await.unwrap()[..],
+            b"2",
+            "the 60 s entry was cut short"
+        );
+
+        cache.invalidate("K").await;
+        fetch(1, 5).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert_eq!(
+            &fetch(1, 6).await.unwrap()[..],
+            b"6",
+            "a 1 s entry outlived its TTL"
+        );
     }
 
     #[tokio::test]
