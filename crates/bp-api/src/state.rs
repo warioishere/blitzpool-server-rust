@@ -10,9 +10,7 @@ use std::sync::Arc;
 use bp_bitcoin::BitcoinRpc;
 use bp_blockparty_engine::BlockpartyService;
 use bp_geoip::GeoIpService;
-use bp_group_mgmt_engine::{
-    EmailHooks, GroupService, GroupServiceHooks, InvitationService, JoinRequestService,
-};
+use bp_group_mgmt_engine::{GroupService, InvitationService, JoinRequestService};
 use bp_group_solo_engine::engine::GroupSoloEngine;
 use bp_pplns_engine::engine::PplnsEngine;
 use bp_template_distribution::TdpHandle;
@@ -24,9 +22,8 @@ use crate::email_hooks::EmailVerificationHooks;
 use crate::response_cache::ResponseCache;
 
 /// Inner appstate fields. Wrapped in an `Arc` for cheap cloning into
-/// the axum router. The generic pair `<H, M>` is the hook trait + email
-/// trait — the concrete impl is injected at bin level.
-pub struct AppState<H: GroupServiceHooks + 'static, M: EmailHooks + 'static> {
+/// the axum router; the hook impls are injected at bin level.
+pub struct AppState {
     pub pool: PgPool,
     /// Redis connection — used by the mode endpoint to read the live
     /// port-marker (`miner:{address}:mode`, 5-min TTL) as step 1 of
@@ -37,9 +34,9 @@ pub struct AppState<H: GroupServiceHooks + 'static, M: EmailHooks + 'static> {
     /// is the live value the autoscaler persists, not the configured floor.
     pub pplns_budget_autoscaled: bool,
     pub group_solo: Option<Arc<GroupSoloEngine>>,
-    pub group_service: Option<Arc<GroupService<H>>>,
-    pub invitation_service: Option<Arc<InvitationService<H>>>,
-    pub join_request_service: Option<Arc<JoinRequestService<H, M>>>,
+    pub group_service: Option<Arc<GroupService>>,
+    pub invitation_service: Option<Arc<InvitationService>>,
+    pub join_request_service: Option<Arc<JoinRequestService>>,
     /// Blockparty service handle; `None` when Blockparty is not configured.
     pub blockparty: Option<Arc<BlockpartyService>>,
     pub tdp: Option<TdpHandle>,
@@ -80,7 +77,7 @@ pub struct AppState<H: GroupServiceHooks + 'static, M: EmailHooks + 'static> {
     pub cache: ResponseCache,
 }
 
-impl<H: GroupServiceHooks + 'static, M: EmailHooks + 'static> AppState<H, M> {
+impl AppState {
     /// Construct with only the PG pool — every other dep optional.
     /// Use the builder-style `with_*` methods to add subsystems.
     pub fn new(pool: PgPool, pool_version: &'static str) -> Self {
@@ -111,5 +108,5 @@ impl<H: GroupServiceHooks + 'static, M: EmailHooks + 'static> AppState<H, M> {
     }
 }
 
-/// Shared appstate alias — handlers consume `State<SharedState<H, M>>`.
-pub type SharedState<H, M> = Arc<AppState<H, M>>;
+/// Shared appstate alias — handlers consume `State<SharedState>`.
+pub type SharedState = Arc<AppState>;

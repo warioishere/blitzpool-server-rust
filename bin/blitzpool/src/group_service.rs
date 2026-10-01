@@ -13,7 +13,7 @@ use thiserror::Error;
 use tracing::info;
 
 use crate::boot::FoundationHandles;
-use crate::hooks::{ProductionGroupServiceHooks, ProductionHooks};
+use crate::hooks::ProductionHooks;
 
 pub(crate) const KICK_INACTIVITY_DAYS: u32 = 14;
 
@@ -25,7 +25,7 @@ pub(crate) enum GroupServiceSpawnError {
 
 #[derive(Clone)]
 pub(crate) struct SharedGroupService {
-    pub(crate) service: Arc<GroupService<ProductionGroupServiceHooks>>,
+    pub(crate) service: Arc<GroupService>,
 }
 
 /// A failed cache rebuild is fatal: Stratum and API need it at first share.

@@ -14,7 +14,6 @@ use uuid::Uuid;
 
 use crate::email_hooks::{EmailHooks, JoinDecisionEmailContext, JoinDecisionOutcome};
 use crate::error::JoinRequestServiceError;
-use crate::hooks::GroupServiceHooks;
 use crate::service::GroupService;
 use crate::util::normalize_address;
 use bp_common::now_ms;
@@ -57,18 +56,18 @@ pub struct PendingForAddressView {
 
 /// Top-level join-request service.
 #[derive(Clone)]
-pub struct JoinRequestService<H: GroupServiceHooks, M: EmailHooks> {
+pub struct JoinRequestService {
     pool: PgPool,
-    group_service: Arc<GroupService<H>>,
-    email: Arc<M>,
+    group_service: Arc<GroupService>,
+    email: Arc<dyn EmailHooks>,
     config: JoinRequestServiceConfig,
 }
 
-impl<H: GroupServiceHooks, M: EmailHooks> JoinRequestService<H, M> {
+impl JoinRequestService {
     pub fn new(
         pool: PgPool,
-        group_service: Arc<GroupService<H>>,
-        email: Arc<M>,
+        group_service: Arc<GroupService>,
+        email: Arc<dyn EmailHooks>,
         config: JoinRequestServiceConfig,
     ) -> Self {
         Self {

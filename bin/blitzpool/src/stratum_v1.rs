@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use bp_common::{AddressId, MiningMode};
 use bp_config::AppConfig;
-use bp_group_mgmt_engine::{GroupService, GroupServiceHooks};
+use bp_group_mgmt_engine::GroupService;
 use bp_mining_mode::MiningModeResult;
 use bp_share_hook::SharedSessionPersistence;
 use bp_stratum_v1::{PortConfig, ServerConfig, ServerHooks, SharedExtranonce, StratumV1Server};
@@ -236,8 +236,8 @@ fn build_port_hooks(
 
 // ─── GroupLookup trait (group_id resolution) ──────────────────────
 
-/// Address → active-group-id lookup. Decouples the wrapper from the
-/// `GroupService<H>` generic so unit tests need no `PgPool`.
+/// Address → active-group-id lookup, a trait so unit tests need no
+/// `PgPool`.
 #[async_trait]
 pub(crate) trait GroupLookup: Send + Sync {
     /// Cache-only lookup. Returns `Some(group_id)` only when the
@@ -247,7 +247,7 @@ pub(crate) trait GroupLookup: Send + Sync {
 }
 
 #[async_trait]
-impl<H: GroupServiceHooks + Send + Sync + 'static> GroupLookup for GroupService<H> {
+impl GroupLookup for GroupService {
     async fn group_for_address(&self, address: &AddressId) -> Option<Uuid> {
         self.get_group_for_address(address)
             .await

@@ -13,7 +13,6 @@ use axum::{
     Router,
 };
 use bp_common::AddressId;
-use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -36,24 +35,20 @@ const RESERVED_TOP_BYTE_MAX: u32 =
         bp_common::extranonce::SV2_WORKER_ID
     };
 
-pub(crate) fn routes<H, M>() -> Router<SharedState<H, M>>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+pub(crate) fn routes() -> Router<SharedState> {
     Router::new()
         .route(
             // Rate-limited to match the ownership challenge: 5/min per client IP.
             "/api/address/extranonce/challenge",
-            post(challenge::<H, M>).layer(rate_limit::per_minute_layer(5)),
+            post(challenge).layer(rate_limit::per_minute_layer(5)),
         )
         .route(
             "/api/address/extranonce/token",
-            post(token::<H, M>).layer(rate_limit::per_minute_layer(5)),
+            post(token).layer(rate_limit::per_minute_layer(5)),
         )
         .route(
             "/api/address/extranonce/set",
-            post(set::<H, M>).layer(rate_limit::per_minute_layer(30)),
+            post(set).layer(rate_limit::per_minute_layer(30)),
         )
 }
 
@@ -73,14 +68,10 @@ struct ChallengeResponse {
     expires_at: i64,
 }
 
-async fn challenge<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn challenge(
+    State(state): State<SharedState>,
     Json(body): Json<ChallengeBody>,
-) -> Result<Json<ChallengeResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<ChallengeResponse>, ApiError> {
     let address = parse_supported_address(&body.address, state.network)?;
     // Up front, so no one signs for a token that could never set an override.
     ensure_solo_eligible(&state.pool, state.pplns.as_deref(), &address).await?;
@@ -115,14 +106,10 @@ struct TokenResponse {
     created_at: i64,
 }
 
-async fn token<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn token(
+    State(state): State<SharedState>,
     Json(body): Json<TokenBody>,
-) -> Result<Json<TokenResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<TokenResponse>, ApiError> {
     let address = parse_supported_address(&body.address, state.network)?;
     let signature = body.signature.trim();
     if signature.is_empty() {
@@ -195,15 +182,11 @@ struct SetResponse {
 /// All-or-nothing, so a fleet is never left half-applied. The token travels in
 /// the header to stay out of body logs. A swap between two of the address's
 /// own workers is legal, see [`bp_db::upsert_custom_extranonces_batch`].
-async fn set<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn set(
+    State(state): State<SharedState>,
     headers: HeaderMap,
     Json(body): Json<SetBody>,
-) -> Result<Json<SetResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<SetResponse>, ApiError> {
     let address = parse_supported_address(&body.address, state.network)?;
 
     if body.workers.is_empty() {

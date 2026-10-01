@@ -12,7 +12,6 @@ use axum::{
 };
 use bp_common::AddressId;
 use bp_db::PushSubscriptionRow;
-use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -24,19 +23,15 @@ const UNIFIED_PUSH: &str = "unified_push";
 const FCM: &str = "fcm";
 const MIN_FCM_TOKEN_LEN: usize = 100;
 
-pub(crate) fn routes<H, M>() -> Router<SharedState<H, M>>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+pub(crate) fn routes() -> Router<SharedState> {
     Router::new()
         .route("/api/push/info", get(info))
-        .route("/api/push/register", post(register::<H, M>))
-        .route("/api/push/unregister", post(unregister::<H, M>))
-        .route("/api/push/status/:address", get(status::<H, M>))
-        .route("/api/push/configure", post(configure::<H, M>))
-        .route("/api/push/fcm/register", post(register_fcm::<H, M>))
-        .route("/api/push/fcm/unregister", post(unregister_fcm::<H, M>))
+        .route("/api/push/register", post(register))
+        .route("/api/push/unregister", post(unregister))
+        .route("/api/push/status/:address", get(status))
+        .route("/api/push/configure", post(configure))
+        .route("/api/push/fcm/register", post(register_fcm))
+        .route("/api/push/fcm/unregister", post(unregister_fcm))
 }
 
 // ─── GET /api/push/info ──────────────────────────────────────────
@@ -209,14 +204,10 @@ struct SubscriptionSummary {
     created_at: String,
 }
 
-async fn register<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn register(
+    State(state): State<SharedState>,
     Json(body): Json<RegisterBody>,
-) -> Result<Json<RegisterResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<RegisterResponse>, ApiError> {
     let (address, endpoint) = require_address_and(body.address, body.endpoint, "endpoint")?;
     let platform = normalise_platform(body.platform, "unknown");
     validate_miner_address(&state, &address).await?;
@@ -250,14 +241,10 @@ struct OkResponse {
     success: bool,
 }
 
-async fn unregister<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn unregister(
+    State(state): State<SharedState>,
     Json(body): Json<UnregisterBody>,
-) -> Result<Json<OkResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<OkResponse>, ApiError> {
     let address = parse_address(body.address)?;
     if let Some(endpoint) = body.endpoint.as_deref().filter(|e| !e.is_empty()) {
         bp_db::delete_push_subscription_by_endpoint(&state.pool, &address, endpoint)
@@ -303,14 +290,10 @@ struct TrackerInfo {
     last_checked_at: String,
 }
 
-async fn status<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn status(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
-) -> Result<Json<StatusResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<StatusResponse>, ApiError> {
     let addr = AddressId::new(address.clone()).map_err(|_| ApiError::InvalidAddress)?;
     let subs = bp_db::find_push_subscriptions_by_address(&state.pool, &addr)
         .await
@@ -356,14 +339,10 @@ struct ConfigureBody {
     network_diff_notifications: Option<bool>,
 }
 
-async fn configure<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn configure(
+    State(state): State<SharedState>,
     Json(body): Json<ConfigureBody>,
-) -> Result<Json<OkResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<OkResponse>, ApiError> {
     let (address, endpoint) = require_address_and(body.address, body.endpoint, "endpoint")?;
     bp_db::update_push_subscription_preferences(
         &state.pool,
@@ -397,14 +376,10 @@ struct FcmRegisterResponse {
     subscription: SubscriptionSummary,
 }
 
-async fn register_fcm<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn register_fcm(
+    State(state): State<SharedState>,
     Json(body): Json<FcmRegisterBody>,
-) -> Result<Json<FcmRegisterResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<FcmRegisterResponse>, ApiError> {
     let (address, token) = require_address_and(body.address, body.token, "token")?;
     let platform = normalise_platform(body.platform, "fcm");
     validate_miner_address(&state, &address).await?;
@@ -436,14 +411,10 @@ struct FcmUnregisterBody {
     token: Option<String>,
 }
 
-async fn unregister_fcm<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn unregister_fcm(
+    State(state): State<SharedState>,
     Json(body): Json<FcmUnregisterBody>,
-) -> Result<Json<OkResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<OkResponse>, ApiError> {
     let address = parse_address(body.address)?;
     if let Some(token) = body.token.as_deref().filter(|t| !t.is_empty()) {
         bp_db::delete_push_subscription_by_endpoint_and_type(&state.pool, &address, token, FCM)
@@ -508,14 +479,7 @@ fn normalise_platform(raw: Option<String>, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
-async fn validate_miner_address<H, M>(
-    state: &SharedState<H, M>,
-    address: &AddressId,
-) -> Result<(), ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn validate_miner_address(state: &SharedState, address: &AddressId) -> Result<(), ApiError> {
     let row = bp_db::find_address_settings(&state.pool, address).await?;
     if row.is_none() {
         return Err(push_error("not-active-miner", StatusCode::FORBIDDEN));

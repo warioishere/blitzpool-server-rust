@@ -103,7 +103,7 @@ async fn delete_email_for(pool: &PgPool, address: &str) {
         .await;
 }
 
-fn build_services(pool: PgPool) -> (Arc<GroupService<NoopHooks>>, InvitationService<NoopHooks>) {
+fn build_services(pool: PgPool) -> (Arc<GroupService>, InvitationService) {
     let group = Arc::new(GroupService::new(
         pool.clone(),
         Arc::new(NoopHooks),

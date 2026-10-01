@@ -115,7 +115,7 @@ async fn wrong_token_after_warm_admin(name: &str, path: &str) -> Option<(StatusC
         .await
         .expect("open invite");
 
-    let mut state = AppState::<NoopHooks, NoopEmailHooks>::new(pool.clone(), "0.0.0");
+    let mut state = AppState::new(pool.clone(), "0.0.0");
     state.group_service = Some(group_svc);
     state.invitation_service = Some(inv_svc);
     state.join_request_service = Some(jr_svc);

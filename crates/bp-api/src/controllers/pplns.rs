@@ -9,28 +9,23 @@ use axum::{
     Router,
 };
 use bp_common::AddressId;
-use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 use crate::response_cache::{JsonBytes, TtlKind};
 use crate::state::{AppState, SharedState};
 
-pub(crate) fn routes<H, M>() -> Router<SharedState<H, M>>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+pub(crate) fn routes() -> Router<SharedState> {
     Router::new()
-        .route("/api/pplns", get(root::<H, M>))
-        .route("/api/pplns/mode/:address", get(mode::<H, M>))
-        .route("/api/pplns/status", get(status::<H, M>))
-        .route("/api/pplns/fees", get(fees::<H, M>))
-        .route("/api/pplns/distribution", get(distribution::<H, M>))
-        .route("/api/pplns/ledger", get(ledger::<H, M>))
-        .route("/api/pplns/chart", get(chart::<H, M>))
-        .route("/api/pplns/:address", get(address_summary::<H, M>))
-        .route("/api/pplns/:address/history", get(address_history::<H, M>))
+        .route("/api/pplns", get(root))
+        .route("/api/pplns/mode/:address", get(mode))
+        .route("/api/pplns/status", get(status))
+        .route("/api/pplns/fees", get(fees))
+        .route("/api/pplns/distribution", get(distribution))
+        .route("/api/pplns/ledger", get(ledger))
+        .route("/api/pplns/chart", get(chart))
+        .route("/api/pplns/:address", get(address_summary))
+        .route("/api/pplns/:address/history", get(address_history))
 }
 
 // ─── /api/pplns/chart ────────────────────────────────────────────
@@ -47,14 +42,10 @@ struct RangeQuery {
     range: Option<String>,
 }
 
-async fn chart<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn chart(
+    State(state): State<SharedState>,
     Query(q): Query<RangeQuery>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let range = Range::parse(q.range.as_deref())?;
     let key = format!("PPLNS_CHART_{}", range.label());
     let s = state.clone();
@@ -90,13 +81,7 @@ fn chart_points(
 
 // ─── helpers ──────────────────────────────────────────────────────
 
-fn require_pplns<H, M>(
-    state: &SharedState<H, M>,
-) -> Result<&bp_pplns_engine::engine::PplnsEngine, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+fn require_pplns(state: &SharedState) -> Result<&bp_pplns_engine::engine::PplnsEngine, ApiError> {
     state
         .pplns
         .as_deref()
@@ -146,11 +131,7 @@ struct RootResponse {
     user_agents: Vec<UserAgentEntry>,
 }
 
-async fn status<H, M>(State(state): State<SharedState<H, M>>) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn status(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
     let s = state.clone();
     let bytes = state
         .cache
@@ -174,11 +155,7 @@ where
     Ok(JsonBytes(bytes))
 }
 
-async fn root<H, M>(State(state): State<SharedState<H, M>>) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn root(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
     let s = state.clone();
     let bytes = state
         .cache
@@ -191,11 +168,7 @@ where
     Ok(JsonBytes(bytes))
 }
 
-async fn root_inner<H, M>(state: &SharedState<H, M>) -> Result<RootResponse, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn root_inner(state: &SharedState) -> Result<RootResponse, ApiError> {
     let engine = require_pplns(state)?;
     let ws = engine.reader().window_stats().await?;
     let dist = engine.reader().current_distribution().await?;
@@ -248,14 +221,10 @@ struct ModeResponse {
     group_id: Option<String>,
 }
 
-async fn mode<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn mode(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     let key = format!("PPLNS_MODE_{}", addr.as_str());
     let s = state.clone();
@@ -300,11 +269,7 @@ struct FeesResponse {
     min_difficulty: u64,
 }
 
-async fn fees<H, M>(State(state): State<SharedState<H, M>>) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn fees(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
     use bp_pplns_engine::{
         max_coinbase_outputs, COINBASE_BASE_WEIGHT, COINBASE_OUTPUT_WEIGHT,
         COINBASE_WITNESS_COMMITMENT_WEIGHT, DUST_LIMIT_SATS,
@@ -362,11 +327,7 @@ where
 /// The PPLNS coinbase weight budget in force: with the autoscaler on, the live
 /// value another process persists in Redis. Otherwise, or when the key is
 /// missing or unreadable, the config budget (a leftover key would be stale).
-async fn live_pplns_budget<H, M>(state: &AppState<H, M>, config_budget: u32) -> u32
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn live_pplns_budget(state: &AppState, config_budget: u32) -> u32 {
     if !state.pplns_budget_autoscaled {
         return config_budget;
     }
@@ -400,11 +361,7 @@ struct DistributionEntry {
     percent: f64,
 }
 
-async fn distribution<H, M>(State(state): State<SharedState<H, M>>) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn distribution(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
     let s = state.clone();
     let bytes = state
         .cache
@@ -445,11 +402,7 @@ struct LedgerResponse {
     abandoned_days: u32,
 }
 
-async fn ledger<H, M>(State(state): State<SharedState<H, M>>) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn ledger(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
     let s = state.clone();
     let bytes = state
         .cache
@@ -489,14 +442,10 @@ struct AddressSummary {
     balance_label: &'static str,
 }
 
-async fn address_summary<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn address_summary(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let key = format!("PPLNS_ADDRESS_{address}");
     let s = state.clone();
     let bytes = state
@@ -557,15 +506,11 @@ struct HistoryEntry {
     created_at: String,
 }
 
-async fn address_history<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn address_history(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
     Query(q): Query<HistoryQuery>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     // No address-shape validation — malformed addresses return an empty list.
     let limit = q
         .limit
@@ -639,7 +584,6 @@ mod tests {
     /// The fees endpoint reports the live budget only while the autoscaler is on.
     #[tokio::test]
     async fn live_budget_is_read_only_while_the_autoscaler_is_on() {
-        use bp_group_mgmt_engine::{NoopEmailHooks, NoopHooks};
         use redis::AsyncCommands;
 
         let Some(mut redis) =
@@ -661,7 +605,7 @@ mod tests {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://unused@127.0.0.1/unused")
             .expect("lazy pool");
-        let mut state = AppState::<NoopHooks, NoopEmailHooks>::new(pool, "0.0.0");
+        let mut state = AppState::new(pool, "0.0.0");
         state.redis = Some(redis.clone());
 
         state.pplns_budget_autoscaled = false;

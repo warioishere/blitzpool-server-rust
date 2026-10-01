@@ -13,7 +13,6 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::InvitationServiceError;
-use crate::hooks::GroupServiceHooks;
 use crate::service::GroupService;
 use crate::util::normalize_address;
 use bp_common::now_ms;
@@ -83,13 +82,13 @@ pub struct OpenInviteActive {
 
 /// Top-level invitation service (open-invite links only).
 #[derive(Clone)]
-pub struct InvitationService<H: GroupServiceHooks> {
+pub struct InvitationService {
     pool: PgPool,
-    group_service: Arc<GroupService<H>>,
+    group_service: Arc<GroupService>,
 }
 
-impl<H: GroupServiceHooks> InvitationService<H> {
-    pub fn new(pool: PgPool, group_service: Arc<GroupService<H>>) -> Self {
+impl InvitationService {
+    pub fn new(pool: PgPool, group_service: Arc<GroupService>) -> Self {
         Self {
             pool,
             group_service,

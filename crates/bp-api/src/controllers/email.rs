@@ -14,7 +14,6 @@ use axum::{
 };
 use base64::Engine;
 use bp_common::AddressId;
-use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
 use serde::{Deserialize, Serialize};
 
 use crate::email_hooks::{BindingChangeContext, VerificationContext};
@@ -24,19 +23,15 @@ use crate::state::SharedState;
 
 const VERIFICATION_TTL_HOURS: i64 = 24;
 
-pub(crate) fn routes<H, M>() -> Router<SharedState<H, M>>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+pub(crate) fn routes() -> Router<SharedState> {
     Router::new()
         .route(
             // Rate-limited: 5 register attempts per minute per client IP.
             "/api/email/register",
-            post(register::<H, M>).layer(rate_limit::per_minute_layer(5)),
+            post(register).layer(rate_limit::per_minute_layer(5)),
         )
-        .route("/api/email/verify/:token", get(verify::<H, M>))
-        .route("/api/email/by-address/:address", get(by_address::<H, M>))
+        .route("/api/email/verify/:token", get(verify))
+        .route("/api/email/by-address/:address", get(by_address))
 }
 
 // ─── POST /api/email/register ────────────────────────────────────
@@ -56,14 +51,10 @@ struct RegisterResponse {
     verification_sent: bool,
 }
 
-async fn register<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn register(
+    State(state): State<SharedState>,
     Json(body): Json<RegisterBody>,
-) -> Result<Json<RegisterResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<RegisterResponse>, ApiError> {
     // Canonicalise (lowercase bech32, preserve Base58) so the binding is keyed
     // identically to what every verification gate looks up — otherwise a
     // mixed-case Base58 / upper-case bech32 email binding would never match.
@@ -141,14 +132,10 @@ struct VerifyResponse {
     verified_at: String,
 }
 
-async fn verify<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn verify(
+    State(state): State<SharedState>,
     Path(token): Path<String>,
-) -> Result<Json<VerifyResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<VerifyResponse>, ApiError> {
     let pending = bp_db::find_email_verification(&state.pool, &token)
         .await?
         .ok_or_else(|| email_error("not-found", StatusCode::NOT_FOUND))?;
@@ -188,14 +175,10 @@ struct ByAddressResponse {
     verified_at: Option<String>,
 }
 
-async fn by_address<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn by_address(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
-) -> Result<Json<ByAddressResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<ByAddressResponse>, ApiError> {
     // Invalid address returns the empty shape since the lookup
     // naturally returns null (no 4xx on bad address). Canonicalise so the
     // lookup key matches the (canonical) stored binding.

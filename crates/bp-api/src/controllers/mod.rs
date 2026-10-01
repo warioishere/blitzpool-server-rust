@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Per-controller handler modules. Routing helpers in each module
-//! return an axum `Router<SharedState<H, M>>` so `crate::lib` can
+//! return an axum `Router<SharedState>` so `crate::lib` can
 //! merge them into the public root router.
 
 pub(crate) mod address_ownership;

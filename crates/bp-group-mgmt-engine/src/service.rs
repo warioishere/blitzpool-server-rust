@@ -55,9 +55,9 @@ pub struct UpdateRoundResetSettings {
 
 /// Top-level group-management service.
 #[derive(Clone)]
-pub struct GroupService<H: GroupServiceHooks> {
+pub struct GroupService {
     pool: PgPool,
-    hooks: Arc<H>,
+    hooks: Arc<dyn GroupServiceHooks>,
     address_cache: AddressCache,
     kick_inactivity_days: u32,
     /// HARD member ceiling: how many payout outputs the Group-Solo coinbase
@@ -74,14 +74,14 @@ pub struct GroupService<H: GroupServiceHooks> {
     change_notifier: Arc<std::sync::OnceLock<Arc<dyn crate::hooks::MembershipChangeNotifier>>>,
 }
 
-impl<H: GroupServiceHooks> GroupService<H> {
+impl GroupService {
     /// Call [`Self::rebuild_cache`] once at startup, before share submits.
     /// `coinbase_max_members` (`bp_pplns::max_coinbase_outputs`) is a
     /// constructor argument, not a setter, so the service cannot be wired
     /// without the cap the ledger-free Group-Solo payout depends on.
     pub fn new(
         pool: PgPool,
-        hooks: Arc<H>,
+        hooks: Arc<dyn GroupServiceHooks>,
         kick_inactivity_days: u32,
         coinbase_max_members: u64,
     ) -> Self {

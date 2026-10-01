@@ -8,7 +8,6 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -16,19 +15,12 @@ use crate::error::ApiError;
 use crate::middleware::rate_limit;
 use crate::state::SharedState;
 
-pub(crate) fn routes<H, M>() -> Router<SharedState<H, M>>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+pub(crate) fn routes() -> Router<SharedState> {
     Router::new()
-        .route(
-            "/api/pplns/invitations/open/:token",
-            get(open_public::<H, M>),
-        )
+        .route("/api/pplns/invitations/open/:token", get(open_public))
         .route(
             "/api/pplns/invitations/open/:token/accept",
-            post(accept_open::<H, M>).layer(rate_limit::per_minute_layer(10)),
+            post(accept_open).layer(rate_limit::per_minute_layer(10)),
         )
 }
 
@@ -50,15 +42,11 @@ struct AcceptOpenBody {
     address: String,
 }
 
-async fn accept_open<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn accept_open(
+    State(state): State<SharedState>,
     Path(token): Path<String>,
     Json(body): Json<AcceptOpenBody>,
-) -> Result<Json<MemberCreatedResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<MemberCreatedResponse>, ApiError> {
     let svc = require_invitation(&state)?;
     let member = svc
         .accept_open_invite(&token, &body.address)
@@ -72,13 +60,9 @@ where
     }))
 }
 
-fn require_invitation<H, M>(
-    state: &SharedState<H, M>,
-) -> Result<&bp_group_mgmt_engine::InvitationService<H>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+fn require_invitation(
+    state: &SharedState,
+) -> Result<&bp_group_mgmt_engine::InvitationService, ApiError> {
     state
         .invitation_service
         .as_deref()
@@ -98,14 +82,10 @@ struct OpenInviteResponse {
     approval_required: bool,
 }
 
-async fn open_public<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn open_public(
+    State(state): State<SharedState>,
     Path(token): Path<String>,
-) -> Result<Json<OpenInviteResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<OpenInviteResponse>, ApiError> {
     let svc = require_invitation(&state)?;
     let view = svc
         .get_open_invite_public(&token)

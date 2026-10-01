@@ -12,7 +12,6 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
 use uuid::Uuid;
 
 use crate::error::ApiError;
@@ -31,16 +30,12 @@ pub struct AdminAuth {
 /// Validate the `x-admin-token` header against the `:id` path parameter.
 /// Reads `Path<HashMap<..>>` because the bound routes have different path
 /// shapes, which a typed `Path<Uuid>` would reject.
-pub async fn require_admin<H, M>(
-    State(state): State<SharedState<H, M>>,
+pub async fn require_admin(
+    State(state): State<SharedState>,
     Path(params): Path<HashMap<String, String>>,
     mut request: Request,
     next: Next,
-) -> Result<Response, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Response, ApiError> {
     let svc = state
         .group_service
         .as_deref()

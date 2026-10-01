@@ -6,7 +6,6 @@
 //! lags by hours after a port switch, since window shares outlive it.
 
 use bp_common::{AddressId, MiningMode};
-use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
 use redis::AsyncCommands;
 use uuid::Uuid;
 
@@ -29,25 +28,17 @@ impl AddressMode {
     }
 }
 
-pub(crate) async fn resolve_address_mode<H, M>(
-    s: &AppState<H, M>,
+pub(crate) async fn resolve_address_mode(
+    s: &AppState,
     address: &AddressId,
-) -> Result<AddressMode, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<AddressMode, ApiError> {
     let marker = read_live_marker(s, address).await;
     resolve_with_marker(s, address, marker).await
 }
 
 /// The live marker, if one is set and names a known mode. A Redis error or
 /// an unknown value reads as no marker: the state fallback still answers.
-async fn read_live_marker<H, M>(s: &AppState<H, M>, address: &AddressId) -> Option<MiningMode>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn read_live_marker(s: &AppState, address: &AddressId) -> Option<MiningMode> {
     let mut redis = s.redis.clone()?;
     let raw: Option<String> = redis
         .get(format!("miner:{}:mode", address.as_str()))
@@ -56,15 +47,11 @@ where
     raw?.parse().ok()
 }
 
-async fn resolve_with_marker<H, M>(
-    s: &AppState<H, M>,
+async fn resolve_with_marker(
+    s: &AppState,
     address: &AddressId,
     marker: Option<MiningMode>,
-) -> Result<AddressMode, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<AddressMode, ApiError> {
     match marker {
         Some(MiningMode::Solo) => return Ok(AddressMode::ungrouped(MiningMode::Solo)),
         Some(MiningMode::Pplns) => return Ok(AddressMode::ungrouped(MiningMode::Pplns)),
@@ -97,14 +84,10 @@ where
     Ok(AddressMode::ungrouped(MiningMode::Solo))
 }
 
-async fn group_solo_group<H, M>(
-    s: &AppState<H, M>,
+async fn group_solo_group(
+    s: &AppState,
     address: &AddressId,
-) -> Result<Option<AddressMode>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Option<AddressMode>, ApiError> {
     Ok(bp_db::find_group_member_by_address(&s.pool, address)
         .await?
         .map(|member| AddressMode {
@@ -113,11 +96,7 @@ where
         }))
 }
 
-async fn blockparty_group<H, M>(s: &AppState<H, M>, address: &AddressId) -> Option<AddressMode>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn blockparty_group(s: &AppState, address: &AddressId) -> Option<AddressMode> {
     let group_id = s
         .blockparty
         .as_ref()?
@@ -132,7 +111,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bp_group_mgmt_engine::{NoopEmailHooks, NoopHooks};
 
     // An address no fixture ever writes, so the state fallback finds
     // nothing for it and answers Solo.
@@ -145,7 +123,7 @@ mod tests {
         let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
             return;
         };
-        let s = AppState::<NoopHooks, NoopEmailHooks>::new(pool, "0.0.0");
+        let s = AppState::new(pool, "0.0.0");
         let address = AddressId::new(ADDR).unwrap();
 
         let with_marker = resolve_with_marker(&s, &address, Some(MiningMode::Pplns))
@@ -167,7 +145,7 @@ mod tests {
         let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
             return;
         };
-        let s = AppState::<NoopHooks, NoopEmailHooks>::new(pool, "0.0.0");
+        let s = AppState::new(pool, "0.0.0");
         let address = AddressId::new(ADDR).unwrap();
 
         for marker in [MiningMode::GroupSolo, MiningMode::Blockparty] {

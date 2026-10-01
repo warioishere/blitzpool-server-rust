@@ -139,14 +139,10 @@ fn member_views(
 
 /// The email-less member addresses that have an ownership proof, in one
 /// query instead of one per member.
-async fn ownership_set_for_members<H, M>(
-    state: &SharedState<H, M>,
+async fn ownership_set_for_members(
+    state: &SharedState,
     members: &[BlockpartyMemberRow],
-) -> Result<std::collections::HashSet<String>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
+) -> Result<std::collections::HashSet<String>, ApiError> {
     let addrs: Vec<String> = members
         .iter()
         .filter(|m| m.email.trim().is_empty())
@@ -219,13 +215,9 @@ fn member_token(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_owned())
 }
 
-fn require_blockparty<H, M>(
-    state: &SharedState<H, M>,
-) -> Result<&bp_blockparty_engine::BlockpartyService, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
+fn require_blockparty(
+    state: &SharedState,
+) -> Result<&bp_blockparty_engine::BlockpartyService, ApiError> {
     state
         .blockparty
         .as_deref()
@@ -247,65 +239,52 @@ const OK: Ok = Ok { ok: true };
 
 // ─── Router ────────────────────────────────────────────────────────
 
-pub(crate) fn routes<H, M>() -> Router<SharedState<H, M>>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
+pub(crate) fn routes() -> Router<SharedState> {
     Router::new()
         // ── Reads ────────────────────────────────────────────────
         // NB: no public directory listing — blockparty is invite-only, so the
         // group id is not enumerable. Detail/by-address need the id up front.
-        .route(
-            "/api/blockparty/by-address/:address",
-            get(by_address::<H, M>),
-        )
-        .route("/api/blockparty/:id", get(detail::<H, M>))
-        .route("/api/blockparty/:id/history", get(history::<H, M>))
-        .route("/api/blockparty/:id/admin-check", get(admin_check::<H, M>))
-        .route(
-            "/api/blockparty/:id/member-view/:address",
-            get(member_view::<H, M>),
-        )
+        .route("/api/blockparty/by-address/:address", get(by_address))
+        .route("/api/blockparty/:id", get(detail))
+        .route("/api/blockparty/:id/history", get(history))
+        .route("/api/blockparty/:id/admin-check", get(admin_check))
+        .route("/api/blockparty/:id/member-view/:address", get(member_view))
         // ── Admin lifecycle ──────────────────────────────────────
-        .route("/api/blockparty", post(create::<H, M>))
-        .route("/api/blockparty/:id/splits", patch(update_splits::<H, M>))
+        .route("/api/blockparty", post(create))
+        .route("/api/blockparty/:id/splits", patch(update_splits))
         .route(
             "/api/blockparty/:id/request-confirmation",
-            post(request_confirmation::<H, M>),
+            post(request_confirmation),
         )
-        .route(
-            "/api/blockparty/:id/rental-hint",
-            patch(update_rental_hint::<H, M>),
-        )
+        .route("/api/blockparty/:id/rental-hint", patch(update_rental_hint))
         .route(
             "/api/blockparty/:id/join-link",
-            get(active_join_link::<H, M>)
-                .post(create_join_link::<H, M>)
-                .delete(revoke_join_link::<H, M>),
+            get(active_join_link)
+                .post(create_join_link)
+                .delete(revoke_join_link),
         )
         .route(
             // Public self-service join — throttled per client IP (matches the
             // group-solo open-invite accept). Covers both the POST join (DB
             // write + member-token mint) and the GET context (token probing).
             "/api/blockparty/join/:token",
-            get(get_join_context::<H, M>)
-                .post(join_via_link::<H, M>)
+            get(get_join_context)
+                .post(join_via_link)
                 .layer(rate_limit::per_minute_layer(10)),
         )
         .route(
             "/api/blockparty/:id/members/:address",
-            delete(remove_member::<H, M>),
+            delete(remove_member),
         )
         .route(
             "/api/blockparty/:id/transition-confirming",
-            post(transition_confirming::<H, M>),
+            post(transition_confirming),
         )
-        .route("/api/blockparty/:id/dissolve", post(dissolve::<H, M>))
+        .route("/api/blockparty/:id/dissolve", post(dissolve))
         // ── Member-token gated ───────────────────────────────────
         .route(
             "/api/blockparty/:id/members/:address/reconfirm",
-            post(reconfirm_member::<H, M>),
+            post(reconfirm_member),
         )
 }
 
@@ -331,14 +310,10 @@ enum ByAddressResponse {
     },
 }
 
-async fn by_address<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn by_address(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
-) -> Result<Json<ByAddressResponse>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
+) -> Result<Json<ByAddressResponse>, ApiError> {
     let svc = require_blockparty(&state)?;
     let addr = normalize(&address)?;
     let Some(group_id) = svc.member_group_id(&addr).await else {
@@ -375,16 +350,12 @@ struct DetailResponse {
     members: Vec<MemberPublicView>,
 }
 
-async fn detail<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn detail(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Query(q): Query<ViewerQuery>,
     headers: HeaderMap,
-) -> Result<Json<DetailResponse>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
+) -> Result<Json<DetailResponse>, ApiError> {
     let svc = require_blockparty(&state)?;
     let token = admin_token(&headers);
     let is_admin = match token.as_deref() {
@@ -418,43 +389,31 @@ where
 /// 204 when `x-blockparty-admin-token` is this party's admin token; 401 when
 /// missing or wrong, 404 for an unknown or dissolved party. Same contract as
 /// `GET /api/pplns/groups/:id/admin-check`.
-async fn admin_check<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn admin_check(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-) -> Result<StatusCode, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
+) -> Result<StatusCode, ApiError> {
     require_blockparty(&state)?
         .require_admin_token(id, admin_token(&headers).as_deref())
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn history<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn history(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Vec<HistoryRowView>>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
+) -> Result<Json<Vec<HistoryRowView>>, ApiError> {
     let svc = require_blockparty(&state)?;
     let rows = svc.get_history(id).await?;
     Ok(Json(rows.into_iter().map(HistoryRowView::from).collect()))
 }
 
-async fn member_view<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn member_view(
+    State(state): State<SharedState>,
     Path((id, address)): Path<(Uuid, String)>,
     headers: HeaderMap,
-) -> Result<Json<DetailResponse>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
+) -> Result<Json<DetailResponse>, ApiError> {
     let svc = require_blockparty(&state)?;
     let viewer = normalize(&address)?;
     svc.require_member_token(id, &viewer, member_token(&headers).as_deref())
@@ -493,14 +452,10 @@ struct CreateResponse {
     pool_fee_percent: f64,
 }
 
-async fn create<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn create(
+    State(state): State<SharedState>,
     Json(body): Json<CreateBody>,
-) -> Result<Json<CreateResponse>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
+) -> Result<Json<CreateResponse>, ApiError> {
     let svc = require_blockparty(&state)?;
     let res = svc
         .create_group(&body.name, &body.admin_address, body.admin_percent_bp)
@@ -516,30 +471,22 @@ where
 /// members may now confirm their split (button next to Save Splits). Flips the
 /// group's `confirmationRequestedAt` so the member dashboard starts surfacing
 /// the confirm prompt.
-async fn request_confirmation<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn request_confirmation(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-) -> Result<Json<&'static Ok>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
+) -> Result<Json<&'static Ok>, ApiError> {
     let svc = require_blockparty(&state)?;
     svc.request_member_confirmation(id, admin_token(&headers).as_deref())
         .await?;
     Ok(Json(&OK))
 }
 
-async fn dissolve<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn dissolve(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-) -> Result<Json<&'static Ok>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
+) -> Result<Json<&'static Ok>, ApiError> {
     let svc = require_blockparty(&state)?;
     svc.dissolve_group(id, admin_token(&headers).as_deref())
         .await?;
@@ -560,16 +507,12 @@ struct RentalHintResponse {
 
 /// `PATCH /:id/rental-hint` — admin updates the free-form hint string.
 /// Trims + truncates to 64 chars; stores `null` for blank/empty input.
-async fn update_rental_hint<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn update_rental_hint(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<RentalHintBody>,
-) -> Result<Json<RentalHintResponse>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
+) -> Result<Json<RentalHintResponse>, ApiError> {
     let svc = require_blockparty(&state)?;
     let rental_provider_hint = svc
         .update_rental_hint(id, body.hint.as_deref(), admin_token(&headers).as_deref())
@@ -592,16 +535,12 @@ struct SplitUpdate {
     percent_bp: i32,
 }
 
-async fn update_splits<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn update_splits(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<UpdateSplitsBody>,
-) -> Result<Json<&'static Ok>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
+) -> Result<Json<&'static Ok>, ApiError> {
     let svc = require_blockparty(&state)?;
     let mut updates = Vec::with_capacity(body.splits.len());
     for s in body.splits {
@@ -628,16 +567,12 @@ struct JoinLinkResponse {
 
 /// `POST /api/blockparty/:id/join-link` (admin) — create/replace the group's
 /// single self-service join link. UI builds `/blockparty/join/<token>` from it.
-async fn create_join_link<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn create_join_link(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<JoinLinkBody>,
-) -> Result<Json<JoinLinkResponse>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
+) -> Result<Json<JoinLinkResponse>, ApiError> {
     let ttl = OpenInviteTtl::parse(&body.ttl).ok_or(ApiError::Invitation {
         code: "invalid-ttl",
         status: StatusCode::BAD_REQUEST,
@@ -650,15 +585,11 @@ where
 }
 
 /// `DELETE /api/blockparty/:id/join-link` (admin) — revoke the join link.
-async fn revoke_join_link<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn revoke_join_link(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-) -> Result<StatusCode, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
+) -> Result<StatusCode, ApiError> {
     let svc = require_blockparty(&state)?;
     svc.revoke_join_link(id, admin_token(&headers).as_deref())
         .await?;
@@ -676,15 +607,11 @@ struct ActiveJoinLinkResponse {
 /// `GET /api/blockparty/:id/join-link` (admin) — the group's active join link,
 /// so the admin UI can re-display the shareable link + expiry without minting a
 /// fresh one. `{ active: false }` when none / expired.
-async fn active_join_link<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn active_join_link(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-) -> Result<Json<ActiveJoinLinkResponse>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
+) -> Result<Json<ActiveJoinLinkResponse>, ApiError> {
     let svc = require_blockparty(&state)?;
     let active = svc
         .active_join_link(id, admin_token(&headers).as_deref())
@@ -712,14 +639,10 @@ struct JoinContextResponse {
 }
 
 /// `GET /api/blockparty/join/:token` (public) — the join landing page context.
-async fn get_join_context<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn get_join_context(
+    State(state): State<SharedState>,
     Path(token): Path<String>,
-) -> Result<Json<JoinContextResponse>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
+) -> Result<Json<JoinContextResponse>, ApiError> {
     let svc = require_blockparty(&state)?;
     let (group, expires_at) = svc
         .join_link_group(&token)
@@ -747,15 +670,11 @@ struct JoinResponse {
 
 /// `POST /api/blockparty/join/:token` (public) — self-join. Address proves itself
 /// (email OR signature); returns the one-shot member token + group id.
-async fn join_via_link<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn join_via_link(
+    State(state): State<SharedState>,
     Path(token): Path<String>,
     Json(body): Json<JoinBody>,
-) -> Result<Json<JoinResponse>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
+) -> Result<Json<JoinResponse>, ApiError> {
     let svc = require_blockparty(&state)?;
     let (member_token, group_id) = svc.join_via_link(&token, &body.address).await?;
     Ok(Json(JoinResponse {
@@ -764,15 +683,11 @@ where
     }))
 }
 
-async fn remove_member<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn remove_member(
+    State(state): State<SharedState>,
     Path((id, address)): Path<(Uuid, String)>,
     headers: HeaderMap,
-) -> Result<Json<&'static Ok>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
+) -> Result<Json<&'static Ok>, ApiError> {
     let svc = require_blockparty(&state)?;
     svc.remove_member(id, &address, admin_token(&headers).as_deref())
         .await?;
@@ -785,15 +700,11 @@ struct TransitionResponse {
     status: Option<String>,
 }
 
-async fn transition_confirming<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn transition_confirming(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-) -> Result<Json<TransitionResponse>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
+) -> Result<Json<TransitionResponse>, ApiError> {
     let svc = require_blockparty(&state)?;
     let _ = svc
         .transition_to_confirming(id, admin_token(&headers).as_deref())
@@ -809,15 +720,11 @@ where
 
 // ─── Member-token gated ────────────────────────────────────────────
 
-async fn reconfirm_member<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn reconfirm_member(
+    State(state): State<SharedState>,
     Path((id, address)): Path<(Uuid, String)>,
     headers: HeaderMap,
-) -> Result<Json<&'static Ok>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
+) -> Result<Json<&'static Ok>, ApiError> {
     let svc = require_blockparty(&state)?;
     let addr = normalize(&address)?;
     svc.confirm_as_member(id, &addr, member_token(&headers).as_deref())

@@ -15,43 +15,35 @@ use bp_db::{
     find_found_blocks, find_high_scores, find_network_difficulty_tracker,
     find_pool_mode_hashrate_since,
 };
-use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
 use serde::Serialize;
 
 use crate::error::ApiError;
 use crate::response_cache::{JsonBytes, TtlKind};
 use crate::state::SharedState;
 
-pub(crate) fn routes<H, M>() -> Router<SharedState<H, M>>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+pub(crate) fn routes() -> Router<SharedState> {
     Router::new()
-        .route("/api/info", get(info::<H, M>))
-        .route("/api/info/chart/mode/:mode", get(chart_mode::<H, M>))
-        .route("/api/info/version", get(version::<H, M>))
-        .route("/api/info/core", get(core::<H, M>))
-        .route("/api/info/peers", get(peers::<H, M>))
-        .route("/api/info/difficulty", get(difficulty::<H, M>))
-        .route("/api/info/block-template", get(block_template::<H, M>))
-        .route(
-            "/api/info/next-block-reward",
-            get(next_block_reward::<H, M>),
-        )
+        .route("/api/info", get(info))
+        .route("/api/info/chart/mode/:mode", get(chart_mode))
+        .route("/api/info/version", get(version))
+        .route("/api/info/core", get(core))
+        .route("/api/info/peers", get(peers))
+        .route("/api/info/difficulty", get(difficulty))
+        .route("/api/info/block-template", get(block_template))
+        .route("/api/info/next-block-reward", get(next_block_reward))
         .route(
             "/api/client/:address/block-template",
-            get(client_block_template::<H, M>),
+            get(client_block_template),
         )
-        .route("/api/info/chart", get(chart::<H, M>))
-        .route("/api/info/accepted", get(accepted::<H, M>))
-        .route("/api/info/max-difficulty", get(max_difficulty::<H, M>))
-        .route("/api/info/workers", get(workers::<H, M>))
-        .route("/api/info/rejected", get(rejected::<H, M>))
-        .route("/api/info/shares", get(shares::<H, M>))
-        .route("/api/pool", get(pool::<H, M>))
-        .route("/api/network", get(network::<H, M>))
-        .route("/api/health", get(health::<H, M>))
+        .route("/api/info/chart", get(chart))
+        .route("/api/info/accepted", get(accepted))
+        .route("/api/info/max-difficulty", get(max_difficulty))
+        .route("/api/info/workers", get(workers))
+        .route("/api/info/rejected", get(rejected))
+        .route("/api/info/shares", get(shares))
+        .route("/api/pool", get(pool))
+        .route("/api/network", get(network))
+        .route("/api/health", get(health))
 }
 
 // ─── /api/info/version ────────────────────────────────────────────
@@ -62,13 +54,7 @@ struct VersionResponse {
     version: String,
 }
 
-async fn version<H, M>(
-    State(state): State<SharedState<H, M>>,
-) -> Result<Json<VersionResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn version(State(state): State<SharedState>) -> Result<Json<VersionResponse>, ApiError> {
     Ok(Json(VersionResponse {
         version: format!("v{}", state.pool_version),
     }))
@@ -76,11 +62,7 @@ where
 
 // ─── /api/info/core ───────────────────────────────────────────────
 
-async fn core<H, M>(State(state): State<SharedState<H, M>>) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn core(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
     let s = state.clone();
     let bytes = state
         .cache
@@ -114,11 +96,7 @@ struct PeerEntry {
     pingtime: Option<f64>,
 }
 
-async fn peers<H, M>(State(state): State<SharedState<H, M>>) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn peers(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
     let s = state.clone();
     let bytes = state
         .cache
@@ -253,13 +231,9 @@ struct DifficultyResponse {
     updated_at: String,
 }
 
-async fn difficulty<H, M>(
-    State(state): State<SharedState<H, M>>,
-) -> Result<Json<DifficultyResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn difficulty(
+    State(state): State<SharedState>,
+) -> Result<Json<DifficultyResponse>, ApiError> {
     let row = find_network_difficulty_tracker(&state.pool)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -272,13 +246,9 @@ where
 
 // ─── /api/info/block-template ────────────────────────────────────
 
-async fn block_template<H, M>(
-    State(state): State<SharedState<H, M>>,
-) -> Result<Json<serde_json::Value>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn block_template(
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     // Raw `getblocktemplate` passthrough: the UI's template preview needs
     // the whole document, not the SV2 subset a TDP snapshot carries.
     let rpc = state
@@ -305,13 +275,9 @@ struct NextBlockReward {
     height: u64,
 }
 
-async fn next_block_reward<H, M>(
-    State(state): State<SharedState<H, M>>,
-) -> Result<Json<NextBlockReward>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn next_block_reward(
+    State(state): State<SharedState>,
+) -> Result<Json<NextBlockReward>, ApiError> {
     let rpc = state
         .bitcoin_rpc
         .as_ref()
@@ -369,14 +335,10 @@ struct ClientBlockTemplateResponse {
     preview_finder: Option<String>,
 }
 
-async fn client_block_template<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn client_block_template(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     use bp_common::AddressId;
 
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
@@ -698,11 +660,7 @@ struct PoolResponse {
     fee: i64,
 }
 
-async fn pool<H, M>(State(state): State<SharedState<H, M>>) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn pool(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
     let s = state.clone();
     let bytes = state
         .cache
@@ -750,11 +708,7 @@ where
 
 // ─── /api/network ─────────────────────────────────────────────────
 
-async fn network<H, M>(State(state): State<SharedState<H, M>>) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn network(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
     let rpc = state
         .bitcoin_rpc
         .as_ref()
@@ -789,13 +743,7 @@ struct HealthChecks {
     tdp: Option<&'static str>,
 }
 
-async fn health<H, M>(
-    State(state): State<SharedState<H, M>>,
-) -> Result<Json<HealthResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn health(State(state): State<SharedState>) -> Result<Json<HealthResponse>, ApiError> {
     let now = chrono::Utc::now();
     let uptime_ms = (now.timestamp_millis() - state.start_time.timestamp_millis()).max(0) as u64;
     let database = sqlx::query_scalar::<_, i32>("SELECT 1")
@@ -905,14 +853,10 @@ struct RangeQuery {
 use crate::time_range::SLOT_SECONDS;
 use bp_common::HASHES_PER_DIFFICULTY_1;
 
-async fn chart<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn chart(
+    State(state): State<SharedState>,
     Query(q): Query<RangeQuery>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let range = Range::parse(q.range.as_deref())?;
     let key = format!("SITE_HASHRATE_GRAPH_{}", range.label());
     let s = state.clone();
@@ -939,14 +883,10 @@ where
 
 // ─── /api/info/accepted ───────────────────────────────────────────
 
-async fn accepted<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn accepted(
+    State(state): State<SharedState>,
     Query(q): Query<RangeQuery>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let range = Range::parse(q.range.as_deref())?;
     let key = format!("POOL_ACCEPTED_STATS_{}", range.label());
     let s = state.clone();
@@ -966,14 +906,10 @@ where
 
 // ─── /api/info/max-difficulty ─────────────────────────────────────
 
-async fn max_difficulty<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn max_difficulty(
+    State(state): State<SharedState>,
     Query(q): Query<RangeQuery>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let range = Range::parse(q.range.as_deref())?;
     let key = format!("POOL_MAX_DIFFICULTY_{}", range.label());
     let s = state.clone();
@@ -993,14 +929,10 @@ where
 
 // ─── /api/info/workers ────────────────────────────────────────────
 
-async fn workers<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn workers(
+    State(state): State<SharedState>,
     Query(q): Query<RangeQuery>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let range = Range::parse(q.range.as_deref())?;
     let key = format!("POOL_WORKER_STATS_{}", range.label());
     let s = state.clone();
@@ -1073,14 +1005,10 @@ pub(crate) fn normalise_reject_reason(raw: &str) -> &'static str {
     }
 }
 
-async fn rejected<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn rejected(
+    State(state): State<SharedState>,
     Query(q): Query<RangeQuery>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let range = Range::parse(q.range.as_deref())?;
     let key = format!("POOL_REJECTED_STATS_{}", range.label());
     let s = state.clone();
@@ -1197,11 +1125,7 @@ struct SharesResponse {
     rejected_since_block: f64,
 }
 
-async fn shares<H, M>(State(state): State<SharedState<H, M>>) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn shares(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
     let s = state.clone();
     let bytes = state
         .cache
@@ -1307,11 +1231,7 @@ struct InfoResponse {
     uptime: String,
 }
 
-async fn info<H, M>(State(state): State<SharedState<H, M>>) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn info(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
     let s = state.clone();
     let bytes = state
         .cache
@@ -1376,15 +1296,11 @@ where
 //
 // Unknown `:mode` answers an empty array.
 
-async fn chart_mode<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn chart_mode(
+    State(state): State<SharedState>,
     Path(mode_str): Path<String>,
     Query(q): Query<RangeQuery>,
-) -> Result<Json<Vec<ChartPoint>>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<Vec<ChartPoint>>, ApiError> {
     let mode: MiningMode = match mode_str.parse() {
         Ok(m) => m,
         Err(_) => return Ok(Json(Vec::new())),

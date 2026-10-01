@@ -21,17 +21,12 @@ pub use error::ApiError;
 pub use state::{AppState, SharedState};
 
 use axum::Router;
-use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 
 /// Build the root router from a [`SharedState`]. The state is shared
 /// across handlers via `Arc`.
-pub fn build_router<H, M>(state: SharedState<H, M>) -> Router
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+pub fn build_router(state: SharedState) -> Router {
     Router::new()
         .merge(controllers::info::routes())
         .merge(controllers::pplns::routes())

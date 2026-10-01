@@ -15,51 +15,34 @@ use bp_db::{
     find_address_settings, find_client, find_client_statistics_since_for_address,
     find_clients_by_address, find_worker_shares, reset_address_settings_best_difficulty,
 };
-use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
 use serde::Serialize;
 
 use crate::error::ApiError;
 use crate::response_cache::{JsonBytes, TtlKind};
 use crate::state::SharedState;
 
-pub(crate) fn routes<H, M>() -> Router<SharedState<H, M>>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+pub(crate) fn routes() -> Router<SharedState> {
     Router::new()
-        .route("/api/client/:address", get(by_address::<H, M>))
-        .route(
-            "/api/client/:address/worker-shares",
-            get(worker_shares::<H, M>),
-        )
-        .route("/api/client/:address/chart", get(chart::<H, M>))
-        .route("/api/client/:address/accepted", get(accepted::<H, M>))
-        .route(
-            "/api/client/:address/max-difficulty",
-            get(max_difficulty::<H, M>),
-        )
-        .route("/api/client/:address/workers", get(workers::<H, M>))
-        .route("/api/client/:address/rejected", get(rejected::<H, M>))
-        .route("/api/client/:address/diff-scores", get(diff_scores::<H, M>))
+        .route("/api/client/:address", get(by_address))
+        .route("/api/client/:address/worker-shares", get(worker_shares))
+        .route("/api/client/:address/chart", get(chart))
+        .route("/api/client/:address/accepted", get(accepted))
+        .route("/api/client/:address/max-difficulty", get(max_difficulty))
+        .route("/api/client/:address/workers", get(workers))
+        .route("/api/client/:address/rejected", get(rejected))
+        .route("/api/client/:address/diff-scores", get(diff_scores))
         .route(
             "/api/client/:address/best-difficulty/today",
-            get(best_difficulty_today::<H, M>),
+            get(best_difficulty_today),
         )
-        .route("/api/client/:address/reset", post(reset_address::<H, M>))
-        .route(
-            "/api/client/:address/delete-stats",
-            post(delete_stats::<H, M>),
-        )
-        .route("/api/client/:address/delete-all", post(delete_all::<H, M>))
+        .route("/api/client/:address/reset", post(reset_address))
+        .route("/api/client/:address/delete-stats", post(delete_stats))
+        .route("/api/client/:address/delete-all", post(delete_all))
         // The triple-segment routes must come AFTER the specific
         // chart/accepted/workers/rejected paths so axum picks the
         // specific match first.
-        .route("/api/client/:address/:worker", get(by_worker::<H, M>))
-        .route(
-            "/api/client/:address/:worker/:session",
-            get(by_session::<H, M>),
-        )
+        .route("/api/client/:address/:worker", get(by_worker))
+        .route("/api/client/:address/:worker/:session", get(by_session))
 }
 
 // ─── time-range chart endpoints ──────────────────────────────────
@@ -82,15 +65,11 @@ struct RangeQuery {
 use crate::time_range::SLOT_SECONDS;
 use bp_common::HASHES_PER_DIFFICULTY_1;
 
-async fn chart<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn chart(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
     Query(q): Query<RangeQuery>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     let range = Range::parse(q.range.as_deref())?;
     let key = format!("CLIENT_CHART_{}_{}", addr.as_str(), range.label());
@@ -125,15 +104,11 @@ fn chart_points(
         .collect()
 }
 
-async fn accepted<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn accepted(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
     Query(q): Query<RangeQuery>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     let range = Range::parse(q.range.as_deref())?;
     let key = format!("CLIENT_ACCEPTED_{}_{}", addr.as_str(), range.label());
@@ -160,15 +135,11 @@ where
 
 /// The highest single share difficulty of the address in each 10-minute
 /// slot, over all its workers.
-async fn max_difficulty<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn max_difficulty(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
     Query(q): Query<RangeQuery>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     let range = Range::parse(q.range.as_deref())?;
     let key = format!("CLIENT_MAX_DIFFICULTY_{}_{}", addr.as_str(), range.label());
@@ -188,15 +159,11 @@ where
     Ok(JsonBytes(bytes))
 }
 
-async fn workers<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn workers(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
     Query(q): Query<RangeQuery>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     let range = Range::parse(q.range.as_deref())?;
     let key = format!("CLIENT_WORKERS_{}_{}", addr.as_str(), range.label());
@@ -240,15 +207,11 @@ fn worker_slots<'a>(
     })
 }
 
-async fn rejected<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn rejected(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
     Query(q): Query<RangeQuery>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     let range = Range::parse(q.range.as_deref())?;
     let key = format!("CLIENT_REJECTED_{}_{}", addr.as_str(), range.label());
@@ -313,14 +276,10 @@ struct WorkerEntry {
     extranonce: Option<String>,
 }
 
-async fn by_address<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn by_address(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     let key = format!("CLIENT_INFO_{}", addr.as_str());
     let s = state.clone();
@@ -390,14 +349,10 @@ struct WorkerShareEntry {
     total_rejected: i64,
 }
 
-async fn worker_shares<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn worker_shares(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     let key = format!("CLIENT_WORKER_SHARES_{}", addr.as_str());
     let s = state.clone();
@@ -472,15 +427,11 @@ struct WorkerResponse {
     chart_data: Vec<WorkerChartEntry>,
 }
 
-async fn by_worker<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn by_worker(
+    State(state): State<SharedState>,
     Path((address, worker)): Path<(String, String)>,
     Query(q): Query<RangeQuery>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     let range = Range::parse(q.range.as_deref())?;
     let key = format!(
@@ -566,14 +517,10 @@ struct SessionResponse {
     start_time: String,
 }
 
-async fn by_session<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn by_session(
+    State(state): State<SharedState>,
     Path((address, worker, session)): Path<(String, String, String)>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     let key = format!(
         "CLIENT_WORKER_SESSION_{}_{}_{}",
@@ -653,11 +600,7 @@ struct StatusResponse {
 
 /// Drop every cached entry whose key references `addr`. Called by
 /// the three mutating endpoints so the next read sees fresh data.
-async fn invalidate_address_cache<H, M>(state: &SharedState<H, M>, addr: &AddressId)
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn invalidate_address_cache(state: &SharedState, addr: &AddressId) {
     for prefix in [
         "CLIENT_INFO_",
         "CLIENT_CHART_",
@@ -675,14 +618,10 @@ where
     }
 }
 
-async fn reset_address<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn reset_address(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
-) -> Result<Json<StatusResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<StatusResponse>, ApiError> {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     // Clears the per-address value and the notification baseline. The
     // public `allTimeBestDifficulty` is untouched by design.
@@ -740,14 +679,10 @@ async fn purge_address_stats(pool: &sqlx::PgPool, addr: &AddressId) -> Result<()
     Ok(())
 }
 
-async fn delete_stats<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn delete_stats(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
-) -> Result<Json<StatusResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<StatusResponse>, ApiError> {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     purge_address_stats(&state.pool, &addr).await?;
     invalidate_address_cache(&state, &addr).await;
@@ -757,14 +692,10 @@ where
     }))
 }
 
-async fn delete_all<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn delete_all(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
-) -> Result<Json<StatusResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<StatusResponse>, ApiError> {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     purge_address_stats(&state.pool, &addr).await?;
     // Hard-delete the client rows.
@@ -842,15 +773,11 @@ fn diff_scores_ttl_secs(range_label: &str, now_ms: i64) -> u64 {
     by_range.min(until_next_hour)
 }
 
-async fn diff_scores<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn diff_scores(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
     Query(q): Query<DiffScoresQuery>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     let range_label = q.range.clone().unwrap_or_else(|| "1d".to_string());
     let key = format!("CLIENT_DIFF_SCORES_{}_{}", addr.as_str(), range_label);
@@ -931,15 +858,11 @@ struct BestDifficultyTodayResponse {
     best_difficulty: f64,
 }
 
-async fn best_difficulty_today<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn best_difficulty_today(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
     Query(q): Query<BestDifficultyTodayQuery>,
-) -> Result<Json<BestDifficultyTodayResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<BestDifficultyTodayResponse>, ApiError> {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     let since: i64 = q
         .since

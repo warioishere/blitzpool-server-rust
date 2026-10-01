@@ -38,9 +38,8 @@ use crate::boot::FoundationHandles;
 use crate::engines::EngineHandles;
 
 /// Every production hook impl, handed to the bp-api `AppState` and the
-/// engine wiring. `group_service` and `invitation_email` are concrete types
-/// because `AppState` is generic over them; the SMTP wrapper holds an
-/// `Option` so its type does not depend on `[smtp]`.
+/// engine wiring. The SMTP wrapper holds an `Option`, so one type serves
+/// with and without `[smtp]`.
 pub(crate) struct ProductionHooks {
     pub(crate) email_verification: Arc<dyn EmailVerificationHooks>,
     pub(crate) invitation_email: Arc<SmtpInvitationEmailHooks>,

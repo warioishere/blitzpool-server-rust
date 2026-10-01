@@ -22,7 +22,6 @@ use bitcoin::{
     Address, CompressedPublicKey, Network,
 };
 use bp_common::AddressId;
-use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
@@ -31,26 +30,19 @@ use crate::state::SharedState;
 
 const CHALLENGE_TTL_MINUTES: i64 = 15;
 
-pub(crate) fn routes<H, M>() -> Router<SharedState<H, M>>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+pub(crate) fn routes() -> Router<SharedState> {
     Router::new()
         .route(
             // Rate-limited: 5 challenge requests per minute per client IP.
             "/api/address/ownership/challenge",
-            post(challenge::<H, M>).layer(rate_limit::per_minute_layer(5)),
+            post(challenge).layer(rate_limit::per_minute_layer(5)),
         )
         .route(
             "/api/address/ownership/verify",
-            post(verify::<H, M>).layer(rate_limit::per_minute_layer(5)),
+            post(verify).layer(rate_limit::per_minute_layer(5)),
         )
-        .route("/api/address/ownership/:address", get(by_address::<H, M>))
-        .route(
-            "/api/address/verified/:address",
-            get(verified_status::<H, M>),
-        )
+        .route("/api/address/ownership/:address", get(by_address))
+        .route("/api/address/verified/:address", get(verified_status))
 }
 
 // ─── POST /api/address/ownership/challenge ───────────────────────
@@ -69,14 +61,10 @@ struct ChallengeResponse {
     expires_at: i64,
 }
 
-async fn challenge<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn challenge(
+    State(state): State<SharedState>,
     Json(body): Json<ChallengeBody>,
-) -> Result<Json<ChallengeResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<ChallengeResponse>, ApiError> {
     let address = parse_supported_address(&body.address, state.network)?;
     let addr_str = address.as_str().to_string();
 
@@ -119,14 +107,10 @@ struct VerifyResponse {
     verified_at: i64,
 }
 
-async fn verify<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn verify(
+    State(state): State<SharedState>,
     Json(body): Json<VerifyBody>,
-) -> Result<Json<VerifyResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<VerifyResponse>, ApiError> {
     let address = parse_supported_address(&body.address, state.network)?;
     let signature = body.signature.trim();
     if signature.is_empty() {
@@ -179,14 +163,10 @@ struct ByAddressResponse {
     verified_at: Option<i64>,
 }
 
-async fn by_address<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn by_address(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
-) -> Result<Json<ByAddressResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<ByAddressResponse>, ApiError> {
     let Ok(addr) = AddressId::normalized(&address) else {
         return Ok(Json(ByAddressResponse {
             verified: false,
@@ -223,14 +203,10 @@ struct VerifiedStatusResponse {
     signature_verified: bool,
 }
 
-async fn verified_status<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn verified_status(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
-) -> Result<Json<VerifiedStatusResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<VerifiedStatusResponse>, ApiError> {
     let Ok(addr) = AddressId::normalized(&address) else {
         return Ok(Json(VerifiedStatusResponse {
             verified: false,

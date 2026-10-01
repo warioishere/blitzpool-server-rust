@@ -11,7 +11,6 @@ use std::sync::Arc;
 use axum::body::to_bytes;
 use axum::http::{Request, StatusCode};
 use bp_api::{build_router, AppState};
-use bp_group_mgmt_engine::{NoopEmailHooks, NoopHooks};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use tower::ServiceExt;
 
@@ -40,21 +39,21 @@ async fn connect_or_skip() -> Option<PgPool> {
     }
 }
 
-fn minimal_state(pool: PgPool) -> Arc<AppState<NoopHooks, NoopEmailHooks>> {
-    Arc::new(AppState::<NoopHooks, NoopEmailHooks>::new(pool, "0.0.0"))
+fn minimal_state(pool: PgPool) -> Arc<AppState> {
+    Arc::new(AppState::new(pool, "0.0.0"))
 }
 
 /// State with a live-store handle — for endpoints that read the
 /// `client:live:*` hashes. Borrowed NO-FLUSH index: these tests write
 /// nothing to Redis and tolerate any content, so no flushing sibling is
 /// harmed and none can harm them. `None` = Redis unreachable → skip.
-async fn state_with_live_store(pool: PgPool) -> Option<Arc<AppState<NoopHooks, NoopEmailHooks>>> {
+async fn state_with_live_store(pool: PgPool) -> Option<Arc<AppState>> {
     let redis = bp_test_support::connect_redis_in_range_no_flush(
         bp_test_support::redis_db::SESSION_PERSISTENCE,
         31,
     )
     .await?;
-    let mut state = AppState::<NoopHooks, NoopEmailHooks>::new(pool, "0.0.0");
+    let mut state = AppState::new(pool, "0.0.0");
     state.redis = Some(redis);
     Some(Arc::new(state))
 }

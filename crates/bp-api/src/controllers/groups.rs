@@ -17,9 +17,7 @@ use axum::{
 use bp_common::AddressId;
 use bp_db::PatchField;
 use bp_group_mgmt::group::{PayoutMode, RoundResetPreset};
-use bp_group_mgmt_engine::{
-    EmailHooks, GroupService, GroupServiceHooks, OpenInviteTtl, UpdateRoundResetSettings,
-};
+use bp_group_mgmt_engine::{GroupService, OpenInviteTtl, UpdateRoundResetSettings};
 use bp_group_solo_engine::reader::WindowTimeline;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -31,109 +29,81 @@ use crate::response_cache::{JsonBytes, TtlKind};
 use crate::state::SharedState;
 use crate::utils::{build_member_labels, member_id};
 
-pub(crate) fn routes<H, M>(state: SharedState<H, M>) -> Router<SharedState<H, M>>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+pub(crate) fn routes(state: SharedState) -> Router<SharedState> {
     // `route_layer` applies only to routes registered before it, so every
     // admin route must be added above the layer call.
     let admin_routes = Router::new()
         // ─── admin writers ───────────────────────────────────────
-        .route("/api/pplns/groups/:id/transfer", post(transfer::<H, M>))
-        .route(
-            "/api/pplns/groups/:id/settings",
-            patch(update_settings::<H, M>),
-        )
-        .route("/api/pplns/groups/:id", delete(dissolve::<H, M>))
+        .route("/api/pplns/groups/:id/transfer", post(transfer))
+        .route("/api/pplns/groups/:id/settings", patch(update_settings))
+        .route("/api/pplns/groups/:id", delete(dissolve))
         .route(
             "/api/pplns/groups/:id/invitations/open",
-            post(create_open_invite::<H, M>)
+            post(create_open_invite)
                 .layer(rate_limit::per_minute_layer(5))
-                .delete(revoke_open_invite::<H, M>),
+                .delete(revoke_open_invite),
         )
         .route(
             "/api/pplns/groups/:id/members/:address",
-            delete(remove_member::<H, M>),
+            delete(remove_member),
         )
         .route(
             "/api/pplns/groups/:id/join-requests/:req_id/approve",
-            post(approve_join_request::<H, M>),
+            post(approve_join_request),
         )
         .route(
             "/api/pplns/groups/:id/join-requests/:req_id/reject",
-            post(reject_join_request::<H, M>),
+            post(reject_join_request),
         )
-        .route_layer(axum::middleware::from_fn_with_state(
-            state,
-            require_admin::<H, M>,
-        ));
+        .route_layer(axum::middleware::from_fn_with_state(state, require_admin));
 
     let public_routes = Router::new()
-        .route("/api/pplns/groups/public", get(list_public::<H, M>))
+        .route("/api/pplns/groups/public", get(list_public))
         .route(
             "/api/pplns/groups/coinbase-capacity",
-            get(coinbase_capacity::<H, M>),
+            get(coinbase_capacity),
         )
         .route(
             "/api/pplns/groups/join-requests/by-address/:address",
-            get(join_requests_by_address::<H, M>),
+            get(join_requests_by_address),
         )
-        .route("/api/pplns/groups/public/:id", get(public_one::<H, M>))
-        .route(
-            "/api/pplns/groups/by-address/:address",
-            get(by_address::<H, M>),
-        )
-        .route(
-            "/api/pplns/groups/membership/:address",
-            get(membership::<H, M>),
-        )
-        .route(
-            "/api/pplns/groups/:id/admin-check",
-            get(admin_check::<H, M>),
-        )
-        .route("/api/pplns/groups/:id/hashrate", get(hashrate::<H, M>))
-        .route("/api/pplns/groups/:id/chart", get(group_chart::<H, M>))
-        .route(
-            "/api/pplns/groups/:id/accepted",
-            get(group_accepted::<H, M>),
-        )
-        .route(
-            "/api/pplns/groups/:id/rejected",
-            get(group_rejected::<H, M>),
-        )
+        .route("/api/pplns/groups/public/:id", get(public_one))
+        .route("/api/pplns/groups/by-address/:address", get(by_address))
+        .route("/api/pplns/groups/membership/:address", get(membership))
+        .route("/api/pplns/groups/:id/admin-check", get(admin_check))
+        .route("/api/pplns/groups/:id/hashrate", get(hashrate))
+        .route("/api/pplns/groups/:id/chart", get(group_chart))
+        .route("/api/pplns/groups/:id/accepted", get(group_accepted))
+        .route("/api/pplns/groups/:id/rejected", get(group_rejected))
         .route(
             "/api/pplns/groups/:id/max-difficulty",
-            get(group_max_difficulty::<H, M>),
+            get(group_max_difficulty),
         )
-        .route(
-            "/api/pplns/groups/:id/distribution",
-            get(distribution::<H, M>),
-        )
+        .route("/api/pplns/groups/:id/distribution", get(distribution))
         .route(
             "/api/pplns/groups/:id/window-timeline",
-            get(window_timeline::<H, M>),
+            get(window_timeline),
         )
         .route(
             "/api/pplns/groups/:id/best-difficulty",
-            get(best_difficulty::<H, M>),
+            get(best_difficulty),
         )
-        .route("/api/pplns/groups/:id/history", get(history::<H, M>))
+        .route("/api/pplns/groups/:id/history", get(history))
         .route(
             "/api/pplns/groups/:id/invitations/open/active",
-            get(open_invite_active::<H, M>),
+            get(open_invite_active),
         )
         .route(
             "/api/pplns/groups/:id/join-requests",
-            get(list_join_requests::<H, M>),
+            get(list_join_requests),
         )
-        .route("/api/pplns/groups", post(create::<H, M>))
+        .route("/api/pplns/groups", post(create))
         .route(
             "/api/pplns/groups/public/:id/join-request",
-            post(create_join_request::<H, M>).layer(rate_limit::per_minute_layer(10)),
+            post(create_join_request).layer(rate_limit::per_minute_layer(10)),
         )
         // Last, so the more specific paths above win the route-match.
-        .route("/api/pplns/groups/:id", get(by_id::<H, M>));
+        .route("/api/pplns/groups/:id", get(by_id));
 
     admin_routes.merge(public_routes)
 }
@@ -141,11 +111,7 @@ where
 // ─── cache invalidation helpers ──────────────────────────────────
 
 /// Called by every mutating endpoint so the next read is fresh, not TTL-old.
-async fn invalidate_group_cache<H, M>(state: &SharedState<H, M>, id: Uuid)
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn invalidate_group_cache(state: &SharedState, id: Uuid) {
     let id_str = id.to_string();
     state.cache.invalidate_prefix("GROUP_PUBLIC_LIST").await;
     for prefix in [
@@ -174,11 +140,7 @@ where
 }
 
 /// For membership changes, so the by-address lookups re-resolve immediately.
-async fn invalidate_address_group_cache<H, M>(state: &SharedState<H, M>, address: &AddressId)
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn invalidate_address_group_cache(state: &SharedState, address: &AddressId) {
     let key = format!("GROUP_BY_ADDRESS_{}", address.as_str());
     state.cache.invalidate_prefix(&key).await;
     let jr = format!("GROUP_JOIN_REQUESTS_BY_ADDR_{}", address.as_str());
@@ -214,14 +176,10 @@ struct CreateGroupResponse {
     members: Vec<InitialMember>,
 }
 
-async fn create<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn create(
+    State(state): State<SharedState>,
     Json(body): Json<CreateGroupBody>,
-) -> Result<(StatusCode, Json<CreateGroupResponse>), ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<(StatusCode, Json<CreateGroupResponse>), ApiError> {
     let svc = require_group_service(&state)?;
     // Immutable, so validated up front.
     let mode = match body.mode.as_deref() {
@@ -264,16 +222,12 @@ struct TransferResponse {
     admin_token: String,
 }
 
-async fn transfer<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn transfer(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Extension(auth): Extension<AdminAuth>,
     Json(body): Json<TransferBody>,
-) -> Result<Json<TransferResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<TransferResponse>, ApiError> {
     let svc = require_group_service(&state)?;
     let res = svc
         .transfer_creator(id, &body.to_address, Some(&auth.admin_token))
@@ -318,16 +272,12 @@ fn lift_patch<T: Clone, R>(field: &Option<Option<T>>, map: impl Fn(&T) -> R) -> 
     }
 }
 
-async fn update_settings<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn update_settings(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Extension(auth): Extension<AdminAuth>,
     Json(body): Json<UpdateSettingsBody>,
-) -> Result<Json<GroupSummary>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<GroupSummary>, ApiError> {
     let svc = require_group_service(&state)?;
     // The finder bonus is a fraction of the miner cut, so it cannot exceed
     // the block by construction; its range check lives in the service layer.
@@ -388,13 +338,9 @@ struct GroupCoinbaseCapacity {
 /// Uses [`max_coinbase_outputs`](bp_pplns_engine::max_coinbase_outputs), the
 /// same ceiling `GroupService` refuses a join against. The autoscaled PPLNS
 /// budget is a different one.
-async fn coinbase_capacity<H, M>(
-    State(state): State<SharedState<H, M>>,
-) -> Result<Json<GroupCoinbaseCapacity>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn coinbase_capacity(
+    State(state): State<SharedState>,
+) -> Result<Json<GroupCoinbaseCapacity>, ApiError> {
     let engine = state
         .group_solo
         .as_ref()
@@ -414,15 +360,11 @@ struct DissolveResponse {
     dissolved: bool,
 }
 
-async fn dissolve<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn dissolve(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Extension(auth): Extension<AdminAuth>,
-) -> Result<Json<DissolveResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<DissolveResponse>, ApiError> {
     let svc = require_group_service(&state)?;
     svc.dissolve_group(id, Some(&auth.admin_token)).await?;
     invalidate_group_cache(&state, id).await;
@@ -447,16 +389,12 @@ struct CreateOpenInviteResponse {
     link: String,
 }
 
-async fn create_open_invite<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn create_open_invite(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Extension(auth): Extension<AdminAuth>,
     Json(body): Json<CreateOpenInviteBody>,
-) -> Result<(StatusCode, Json<CreateOpenInviteResponse>), ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<(StatusCode, Json<CreateOpenInviteResponse>), ApiError> {
     let inv_svc = require_invitation_service(&state)?;
     let ttl = OpenInviteTtl::parse(&body.ttl).ok_or(ApiError::Invitation {
         code: "invalid-ttl",
@@ -489,15 +427,11 @@ struct OpenInviteRevokedResponse {
     revoked: bool,
 }
 
-async fn revoke_open_invite<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn revoke_open_invite(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Extension(auth): Extension<AdminAuth>,
-) -> Result<Json<OpenInviteRevokedResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<OpenInviteRevokedResponse>, ApiError> {
     let inv_svc = require_invitation_service(&state)?;
     inv_svc
         .revoke_open_invite(id, Some(&auth.admin_token))
@@ -513,15 +447,11 @@ struct RemovedResponse {
     removed: bool,
 }
 
-async fn remove_member<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn remove_member(
+    State(state): State<SharedState>,
     Path((id, address)): Path<(Uuid, String)>,
     Extension(auth): Extension<AdminAuth>,
-) -> Result<Json<RemovedResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<RemovedResponse>, ApiError> {
     let svc = require_group_service(&state)?;
     svc.remove_member(id, &address, Some(&auth.admin_token))
         .await?;
@@ -543,15 +473,11 @@ struct RejectedResponse {
     rejected: bool,
 }
 
-async fn approve_join_request<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn approve_join_request(
+    State(state): State<SharedState>,
     Path((id, req_id)): Path<(Uuid, Uuid)>,
     Extension(auth): Extension<AdminAuth>,
-) -> Result<Json<ApprovedResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<ApprovedResponse>, ApiError> {
     let jr_svc = require_join_request_service(&state)?;
     jr_svc
         .approve_request(id, req_id, Some(&auth.admin_token))
@@ -567,15 +493,11 @@ where
     Ok(Json(ApprovedResponse { approved: true }))
 }
 
-async fn reject_join_request<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn reject_join_request(
+    State(state): State<SharedState>,
     Path((id, req_id)): Path<(Uuid, Uuid)>,
     Extension(auth): Extension<AdminAuth>,
-) -> Result<Json<RejectedResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<RejectedResponse>, ApiError> {
     let jr_svc = require_join_request_service(&state)?;
     jr_svc
         .reject_request(id, req_id, Some(&auth.admin_token))
@@ -606,15 +528,11 @@ struct CreateJoinRequestResponse {
     created_at: String,
 }
 
-async fn create_join_request<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn create_join_request(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Json(body): Json<CreateJoinRequestBody>,
-) -> Result<(StatusCode, Json<CreateJoinRequestResponse>), ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<(StatusCode, Json<CreateJoinRequestResponse>), ApiError> {
     let svc = require_join_request_service(&state)?;
     let row = svc
         .create_join_request(id, &body.address, body.message.as_deref())
@@ -637,37 +555,25 @@ where
 
 // ─── helpers ──────────────────────────────────────────────────────
 
-fn require_group_service<H, M>(state: &SharedState<H, M>) -> Result<&GroupService<H>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+fn require_group_service(state: &SharedState) -> Result<&GroupService, ApiError> {
     state
         .group_service
         .as_deref()
         .ok_or(ApiError::Unavailable("group-service not wired"))
 }
 
-fn require_invitation_service<H, M>(
-    state: &SharedState<H, M>,
-) -> Result<&bp_group_mgmt_engine::InvitationService<H>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+fn require_invitation_service(
+    state: &SharedState,
+) -> Result<&bp_group_mgmt_engine::InvitationService, ApiError> {
     state
         .invitation_service
         .as_deref()
         .ok_or(ApiError::Unavailable("invitation-service not wired"))
 }
 
-fn require_join_request_service<H, M>(
-    state: &SharedState<H, M>,
-) -> Result<&bp_group_mgmt_engine::JoinRequestService<H, M>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+fn require_join_request_service(
+    state: &SharedState,
+) -> Result<&bp_group_mgmt_engine::JoinRequestService, ApiError> {
     state
         .join_request_service
         .as_deref()
@@ -681,15 +587,11 @@ fn admin_token(headers: &HeaderMap) -> Option<&str> {
 /// `None` without the header, an error when it is wrong. Call BEFORE a cache
 /// lookup keyed on the admin flag: a check inside the cached computation runs
 /// only on a miss, so any token would read a real admin's cached body.
-async fn verified_admin_token<'h, H, M>(
-    state: &SharedState<H, M>,
+async fn verified_admin_token<'h>(
+    state: &SharedState,
     id: Uuid,
     headers: &'h HeaderMap,
-) -> Result<Option<&'h str>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Option<&'h str>, ApiError> {
     let Some(token) = admin_token(headers) else {
         return Ok(None);
     };
@@ -799,14 +701,10 @@ struct PublicGroupEntry {
     total_hashrate: f64,
 }
 
-async fn list_public<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn list_public(
+    State(state): State<SharedState>,
     Query(q): Query<PublicListQuery>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let page = q.page.unwrap_or(1).max(1);
     let page_size = q.page_size.unwrap_or(50).clamp(1, 100);
     let key = format!("GROUP_PUBLIC_LIST_{page}_{page_size}");
@@ -902,14 +800,10 @@ struct RecentBlock {
     row_type: String,
 }
 
-async fn public_one<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn public_one(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let key = format!("GROUP_PUBLIC_DETAIL_{id}");
     let s = state.clone();
     let bytes = state
@@ -1010,16 +904,12 @@ struct MemberEntry {
     verified_via: Option<&'static str>,
 }
 
-async fn by_id<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn by_id(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Query(q): Query<ViewerQuery>,
     headers: HeaderMap,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     // Admin flag and viewer are both in the cache key, so neither view leaks
     // into the other.
     let is_admin = verified_admin_token(&state, id, &headers).await?.is_some();
@@ -1153,15 +1043,11 @@ fn zeroed(addrs: &[AddressId]) -> HashMap<String, f64> {
 
 // ─── GET /api/groups/by-address/:address ─────────────────────────
 
-async fn by_address<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn by_address(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
     headers: HeaderMap,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     let member = bp_db::find_group_member_by_address(&state.pool, &addr)
         .await?
@@ -1194,14 +1080,10 @@ enum MembershipResponse {
     },
 }
 
-async fn membership<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn membership(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
-) -> Result<Json<MembershipResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<MembershipResponse>, ApiError> {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     let none = || Json(MembershipResponse::None { group_id: None });
     let Some(member) = bp_db::find_group_member_by_address(&state.pool, &addr).await? else {
@@ -1224,15 +1106,11 @@ where
 
 /// 204 when `x-admin-token` is this group's admin token; 401 when missing or
 /// wrong, 404 for an unknown or dissolved group. Nothing else is read.
-async fn admin_check<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn admin_check(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-) -> Result<StatusCode, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<StatusCode, ApiError> {
     require_group_service(&state)?
         .require_admin_token(id, admin_token(&headers))
         .await?;
@@ -1259,14 +1137,10 @@ struct MemberHashrate {
     hashrate: f64,
 }
 
-async fn hashrate<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn hashrate(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let key = format!("GROUP_HASHRATE_{id}");
     let s = state.clone();
     let bytes = state
@@ -1328,14 +1202,10 @@ struct DistributionEntry {
     total_rejected: f64,
 }
 
-async fn distribution<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn distribution(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let key = format!("GROUP_DISTRIBUTION_{id}");
     let s = state.clone();
     let bytes = state
@@ -1502,14 +1372,10 @@ fn build_window_timeline_response(
     }
 }
 
-async fn window_timeline<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn window_timeline(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let key = format!("GROUP_WINDOW_TIMELINE_{id}");
     let s = state.clone();
     let bytes = state
@@ -1542,14 +1408,10 @@ struct BestDifficultyResponse {
     time: Option<String>,
 }
 
-async fn best_difficulty<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn best_difficulty(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let key = format!("GROUP_BEST_DIFFICULTY_{id}");
     let s = state.clone();
     let bytes = state
@@ -1606,15 +1468,11 @@ struct HistoryEntry {
     row_type: String,
 }
 
-async fn history<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn history(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Query(q): Query<HistoryQuery>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let limit = q.limit.unwrap_or(100).clamp(1, 500);
     let key = format!("GROUP_HISTORY_{id}_{limit}");
     let s = state.clone();
@@ -1655,15 +1513,11 @@ struct OpenActiveResponse {
     link: Option<String>,
 }
 
-async fn open_invite_active<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn open_invite_active(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     // Only the admin variant carries the token, so the cache key includes
     // `is_admin` to keep it from reaching a public viewer.
     let token = verified_admin_token(&state, id, &headers)
@@ -1737,16 +1591,12 @@ struct JoinRequestEntry {
     decided_at: Option<String>,
 }
 
-async fn list_join_requests<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn list_join_requests(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Query(q): Query<JoinRequestsQuery>,
     headers: HeaderMap,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let token = verified_admin_token(&state, id, &headers)
         .await?
         .map(str::to_string);
@@ -1802,14 +1652,10 @@ struct AddressJoinRequestEntry {
     created_at: String,
 }
 
-async fn join_requests_by_address<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn join_requests_by_address(
+    State(state): State<SharedState>,
     Path(address): Path<String>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let key = format!("GROUP_JOIN_REQUESTS_BY_ADDR_{address}");
     let s = state.clone();
     let bytes = state
@@ -1885,28 +1731,20 @@ struct GroupRangeQuery {
     range: Option<String>,
 }
 
-async fn collect_group_member_addresses<H, M>(
-    state: &SharedState<H, M>,
+async fn collect_group_member_addresses(
+    state: &SharedState,
     id: Uuid,
-) -> Result<Vec<AddressId>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Vec<AddressId>, ApiError> {
     let svc = require_group_service(state)?;
     let members = svc.list_members(id).await?;
     Ok(members.into_iter().map(|m| m.address).collect())
 }
 
-async fn group_chart<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn group_chart(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Query(q): Query<GroupRangeQuery>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let range = Range::parse(q.range.as_deref())?;
     let key = format!("GROUP_CHART_{id}_{}", range.label());
     let s = state.clone();
@@ -1939,15 +1777,11 @@ where
     Ok(JsonBytes(bytes))
 }
 
-async fn group_accepted<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn group_accepted(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Query(q): Query<GroupRangeQuery>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let range = Range::parse(q.range.as_deref())?;
     let key = format!("GROUP_ACCEPTED_{id}_{}", range.label());
     let s = state.clone();
@@ -1974,15 +1808,11 @@ where
     Ok(JsonBytes(bytes))
 }
 
-async fn group_max_difficulty<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn group_max_difficulty(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Query(q): Query<GroupRangeQuery>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let range = Range::parse(q.range.as_deref())?;
     let key = format!("GROUP_MAX_DIFFICULTY_{id}_{}", range.label());
     let s = state.clone();
@@ -2002,15 +1832,11 @@ where
     Ok(JsonBytes(bytes))
 }
 
-async fn group_rejected<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn group_rejected(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Query(q): Query<GroupRangeQuery>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<JsonBytes, ApiError> {
     let range = Range::parse(q.range.as_deref())?;
     let key = format!("GROUP_REJECTED_{id}_{}", range.label());
     let s = state.clone();

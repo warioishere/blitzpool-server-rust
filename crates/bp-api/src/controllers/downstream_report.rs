@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use axum::{extract::State, response::Json, routing::post, Router};
-use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 
@@ -23,15 +22,8 @@ const TTL_MS: i64 = 5 * 60 * 1000;
 static STORE: Lazy<Mutex<HashMap<String, (DownstreamMinerReport, i64)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-pub(crate) fn routes<H, M>() -> Router<SharedState<H, M>>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
-    Router::new().route(
-        "/api/downstream-report",
-        post(receive::<H, M>).get(list::<H, M>),
-    )
+pub(crate) fn routes() -> Router<SharedState> {
+    Router::new().route("/api/downstream-report", post(receive).get(list))
 }
 
 /// Wire shape for downstream miner reports.
@@ -69,14 +61,10 @@ struct AcceptedResponse {
     accepted: usize,
 }
 
-async fn receive<H, M>(
-    State(state): State<SharedState<H, M>>,
+async fn receive(
+    State(state): State<SharedState>,
     Json(report): Json<DownstreamMinerReport>,
-) -> Result<Json<AcceptedResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+) -> Result<Json<AcceptedResponse>, ApiError> {
     let now = bp_common::now_ms();
     let accepted = report.miners.len();
     let key = report.jdc_user_identity.clone();
@@ -124,13 +112,9 @@ fn normalize_vendor(raw: &str) -> String {
     }
 }
 
-async fn list<H, M>(
-    State(_state): State<SharedState<H, M>>,
-) -> Result<Json<Vec<DownstreamMinerReport>>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
+async fn list(
+    State(_state): State<SharedState>,
+) -> Result<Json<Vec<DownstreamMinerReport>>, ApiError> {
     let now = bp_common::now_ms();
     let mut store = STORE
         .lock()

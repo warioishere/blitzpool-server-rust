@@ -86,11 +86,7 @@ async fn delete_email_for(pool: &PgPool, address: &str) {
 fn build_services(
     pool: PgPool,
     limits: JoinRequestLimits,
-) -> (
-    Arc<GroupService<NoopHooks>>,
-    JoinRequestService<NoopHooks, CapturingEmailHooks>,
-    CapturingEmailHooks,
-) {
+) -> (Arc<GroupService>, JoinRequestService, CapturingEmailHooks) {
     let group = Arc::new(GroupService::new(
         pool.clone(),
         Arc::new(NoopHooks),
@@ -111,7 +107,7 @@ fn build_services(
 }
 
 async fn create_public_group(
-    group_svc: &Arc<GroupService<NoopHooks>>,
+    group_svc: &Arc<GroupService>,
     pool: &PgPool,
     suffix: &str,
 ) -> (Uuid, String) {

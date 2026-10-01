@@ -19,7 +19,7 @@ use tracing::{info, warn};
 use crate::boot::FoundationHandles;
 use crate::engines::EngineHandles;
 use crate::group_service::SharedGroupService;
-use crate::hooks::{ProductionGroupServiceHooks, ProductionHooks, SmtpInvitationEmailHooks};
+use crate::hooks::ProductionHooks;
 
 #[derive(Debug, Error)]
 pub(crate) enum ApiServerError {
@@ -81,7 +81,7 @@ fn build_app_state(
     production_hooks: &ProductionHooks,
     group_service: &SharedGroupService,
     blockparty: Option<&crate::blockparty_service::SharedBlockparty>,
-) -> Arc<AppState<ProductionGroupServiceHooks, SmtpInvitationEmailHooks>> {
+) -> Arc<AppState> {
     let pool = foundation.db.pool().clone();
     let group_service = group_service.service.clone();
     let invitation_service = Arc::new(InvitationService::new(pool.clone(), group_service.clone()));

@@ -12,7 +12,7 @@ use axum::body::to_bytes;
 use axum::http::{Request, StatusCode};
 use bp_api::{build_router, AppState};
 use bp_blockparty_engine::{BlockpartyService, BlockpartyServiceConfig};
-use bp_group_mgmt_engine::{AddressCache, GroupService, NoopEmailHooks, NoopHooks};
+use bp_group_mgmt_engine::{AddressCache, GroupService, NoopHooks};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -82,7 +82,7 @@ async fn group_solo_membership_and_admin_check() {
     let created = svc.create_group(name, creator).await.expect("create group");
     let id = created.group.id;
 
-    let mut state = AppState::<NoopHooks, NoopEmailHooks>::new(pool.clone(), "0.0.0");
+    let mut state = AppState::new(pool.clone(), "0.0.0");
     state.group_service = Some(svc);
     let app = build_router(Arc::new(state));
 
@@ -157,7 +157,7 @@ async fn blockparty_admin_check() {
         .expect("create party");
     let id = created.group.id;
 
-    let mut state = AppState::<NoopHooks, NoopEmailHooks>::new(pool.clone(), "0.0.0");
+    let mut state = AppState::new(pool.clone(), "0.0.0");
     state.blockparty = Some(svc);
     let app = build_router(Arc::new(state));
 
