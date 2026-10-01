@@ -315,6 +315,40 @@ struct PayoutInfoEntry {
     sats: u64,
 }
 
+impl PayoutInfoEntry {
+    /// One coinbase output, with its share of `reward_sats` in percent.
+    fn of_reward(address: String, sats: u64, reward_sats: u64) -> Self {
+        let percent = if reward_sats == 0 {
+            0.0
+        } else {
+            (sats as f64) * 100.0 / (reward_sats as f64)
+        };
+        Self {
+            address,
+            percent,
+            sats,
+        }
+    }
+}
+
+/// What the real coinbase pays at this revenue, or nothing if the §4
+/// evaluation fails.
+fn payout_info_at(
+    built: &bp_coinbase_snapshot::BuiltDistribution,
+    reward_sats: u64,
+) -> Vec<PayoutInfoEntry> {
+    built
+        .distribution
+        .payout_entries_at(reward_sats)
+        .map(|entries| {
+            entries
+                .into_iter()
+                .map(|(a, sats)| PayoutInfoEntry::of_reward(a.into_inner(), sats, reward_sats))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ClientBlockTemplateResponse {
@@ -386,25 +420,7 @@ async fn client_block_template(
                                 let finder = preview_finder(&addr, &window);
                                 previewed_finder = Some(finder.as_str().to_string());
                                 match engine.build_distribution(gid, reward_sats, &finder).await {
-                                    // What the real coinbase pays at this revenue.
-                                    Ok(dist) => dist
-                                        .distribution
-                                        .payout_entries_at(reward_sats)
-                                        .map(|entries| {
-                                            entries
-                                                .into_iter()
-                                                .map(|(address, sats)| PayoutInfoEntry {
-                                                    percent: if reward_sats == 0 {
-                                                        0.0
-                                                    } else {
-                                                        (sats as f64) * 100.0 / (reward_sats as f64)
-                                                    },
-                                                    address: address.as_str().to_string(),
-                                                    sats,
-                                                })
-                                                .collect()
-                                        })
-                                        .unwrap_or_default(),
+                                    Ok(dist) => payout_info_at(&dist, reward_sats),
                                     Err(_) => Vec::new(),
                                 }
                             }
@@ -436,25 +452,7 @@ async fn client_block_template(
                     }
                     MiningMode::Pplns => match s.pplns.as_ref() {
                         Some(engine) => match engine.build_distribution(reward_sats).await {
-                            // What the real coinbase pays at this revenue.
-                            Ok(dist) => dist
-                                .distribution
-                                .payout_entries_at(reward_sats)
-                                .map(|entries| {
-                                    entries
-                                        .into_iter()
-                                        .map(|(address, sats)| PayoutInfoEntry {
-                                            percent: if reward_sats == 0 {
-                                                0.0
-                                            } else {
-                                                (sats as f64) * 100.0 / (reward_sats as f64)
-                                            },
-                                            address: address.as_str().to_string(),
-                                            sats,
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
+                            Ok(dist) => payout_info_at(&dist, reward_sats),
                             Err(_) => Vec::new(),
                         },
                         None => Vec::new(),
@@ -464,15 +462,7 @@ async fn client_block_template(
                         // included, so the preview matches the real coinbase.
                         bp_mining_job::solo_payouts(addr.as_str(), &s.solo_fee, reward_sats)
                             .into_iter()
-                            .map(|p| PayoutInfoEntry {
-                                percent: if reward_sats == 0 {
-                                    0.0
-                                } else {
-                                    (p.sats as f64) * 100.0 / (reward_sats as f64)
-                                },
-                                address: p.address,
-                                sats: p.sats,
-                            })
+                            .map(|p| PayoutInfoEntry::of_reward(p.address, p.sats, reward_sats))
                             .collect()
                     }
                 };
@@ -1452,6 +1442,16 @@ mod tests {
     }
 
     use super::*;
+
+    /// A preview row's percent is its share of the reward; a zero reward
+    /// shows 0 % instead of dividing by zero.
+    #[test]
+    fn a_preview_row_is_its_share_of_the_reward() {
+        let row = PayoutInfoEntry::of_reward("a".into(), 25, 100);
+        assert_eq!((row.address.as_str(), row.sats), ("a", 25));
+        assert!((row.percent - 25.0).abs() < 1e-12);
+        assert_eq!(PayoutInfoEntry::of_reward("a".into(), 25, 0).percent, 0.0);
+    }
 
     #[test]
     fn format_uptime_seconds_only() {
