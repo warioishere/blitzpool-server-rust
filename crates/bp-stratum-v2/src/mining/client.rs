@@ -437,9 +437,6 @@ pub struct MiningSessionState<C: Clock> {
     // hands it to the frame parser as `&[u16]` on every inbound frame.
     pub negotiated_extensions: Vec<u16>,
 
-    // Connection initial difficulty; live retargeting is per channel in `vardiff`.
-    pub session_difficulty: Difficulty,
-
     // Channels
     pub channels: HashMap<u32, ChannelState>,
     pub primary_channel: Option<u32>,
@@ -516,11 +513,6 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             requires_standard_jobs: false,
             is_tdp_client: false,
             negotiated_extensions: Vec::new(),
-            session_difficulty: Difficulty(
-                port.initial_difficulty
-                    .as_f64()
-                    .max(port.min_difficulty.as_f64()),
-            ),
             channels: HashMap::new(),
             primary_channel: None,
             next_channel_id: 1,
@@ -577,7 +569,6 @@ impl<C: Clock + Clone> MiningSessionState<C> {
         if self.primary_channel.is_none() {
             self.primary_channel = Some(channel_id);
         }
-        self.session_difficulty = difficulty;
     }
 
     fn new_channel_vardiff(&self, assigned_difficulty: Difficulty) -> VarDiffEngine<C> {
@@ -3067,7 +3058,6 @@ pub(crate) mod tests {
         // Simulate a vardiff move: session target is high (1024) while the
         // in-flight job is frozen at an easy target the share can meet.
         let easy = Difficulty(1.0 / 4_294_967_296.0);
-        s.session_difficulty = Difficulty(1024.0);
         {
             let ch = s.channels.get_mut(&channel_id).unwrap();
             ch.session_difficulty = Difficulty(1024.0);

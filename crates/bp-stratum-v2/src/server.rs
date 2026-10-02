@@ -1272,7 +1272,10 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                     .get(&channel_id)
                     .map(|c| c.extranonce_prefix.len())
                     .unwrap_or(0);
-                let session_diff = state.session_difficulty.as_f64();
+                let session_diff = state
+                    .channels
+                    .get(&channel_id)
+                    .map_or(0.0, |c| c.session_difficulty.as_f64());
                 tracing::info!(
                     session_id_hex,
                     channel_id,
@@ -1382,12 +1385,14 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
             SessionEvent::ShareRejected { channel_id, reject } => {
                 let address_opt = state.address.as_ref().map(|a| a.as_str());
                 let worker_opt = state.address.as_ref().map(|_| state.worker_name.as_str());
-                // The channel's current difficulty, which vardiff moves; the
-                // session field only holds the difficulty at the last open.
-                let difficulty = state
+                // Weighted with the channel's current difficulty, which vardiff moves.
+                let Some(difficulty) = state
                     .channels
                     .get(&channel_id)
-                    .map_or(state.session_difficulty, |c| c.session_difficulty);
+                    .map(|c| c.session_difficulty)
+                else {
+                    continue;
+                };
                 if let Some(share) = crate::shared_adapter::shared_rejected(
                     address_opt,
                     worker_opt,
@@ -2019,7 +2024,17 @@ mod tests {
     async fn share_rejected_event_fires_rejected_sink() {
         let recording = RecordingHooks::new();
         let hooks = recording.clone().into_server_hooks();
-        let state = fresh_session_with_address();
+        let mut state = fresh_session_with_address();
+        state.channels.insert(
+            1,
+            crate::mining::channel::ChannelState::new_standard(
+                1,
+                vec![0; 4],
+                Difficulty(1024.0),
+                [0xFF; 32],
+                bp_jobs_lifecycle::LifecycleConfig::DEFAULT,
+            ),
+        );
         let events = vec![SessionEvent::ShareRejected {
             channel_id: 1,
             reject: ShareReject::from(RejectReason::StaleShare),
@@ -2041,18 +2056,13 @@ mod tests {
         let mut channel = crate::mining::channel::ChannelState::new_standard(
             1,
             vec![0; 4],
-            state.session_difficulty,
+            Difficulty(1024.0),
             [0xFF; 32],
             bp_jobs_lifecycle::LifecycleConfig::DEFAULT,
         );
         // Vardiff retargeted the channel after it opened.
         channel.session_difficulty = Difficulty(4096.0);
         state.channels.insert(1, channel);
-        assert_ne!(
-            state.session_difficulty.as_f64(),
-            4096.0,
-            "precondition: the session still holds the opening difficulty"
-        );
 
         let events = vec![SessionEvent::ShareRejected {
             channel_id: 1,
