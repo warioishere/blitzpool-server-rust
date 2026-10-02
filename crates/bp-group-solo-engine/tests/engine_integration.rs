@@ -1093,7 +1093,7 @@ async fn window_mode_record_path_trims_aged_buckets() {
 // not be a rate of anything.
 #[tokio::test]
 async fn window_mode_reject_is_windowed_not_tallied() {
-    let h = match spawn_or_skip(20, None).await {
+    let h = match spawn_or_skip(22, None).await {
         Some(h) => h,
         None => return,
     };
@@ -1146,7 +1146,7 @@ async fn window_mode_reject_is_windowed_not_tallied() {
 // `round_stats` reads the same `read_payout_shares` as the distribution.
 #[tokio::test]
 async fn window_mode_kick_drops_the_member_from_the_payout_source() {
-    let h = match spawn_or_skip(21, None).await {
+    let h = match spawn_or_skip(23, None).await {
         Some(h) => h,
         None => return,
     };
