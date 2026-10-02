@@ -133,7 +133,7 @@ bs58 = { version = "0.5", features = ["check"] }
 
 # Hashing + big integer arithmetic (pure math, no Bitcoin-crate dep needed)
 sha2 = { version = "0.10", features = ["asm"] }
-num-bigint = "0.4"
+num-bigint = "0.5"
 num-traits = "0.2"
 
 # CSPRNG byte fill — used for admin/invitation token generation in
