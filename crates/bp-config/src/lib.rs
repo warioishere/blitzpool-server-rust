@@ -252,8 +252,6 @@ pub struct ApiCacheConfig {
     #[serde(default = "ttl_60")]
     pub client_rejected_secs: u64,
     #[serde(default = "ttl_60")]
-    pub client_diff_scores_secs: u64,
-    #[serde(default = "ttl_60")]
     pub client_worker_group_secs: u64,
     #[serde(default = "ttl_60")]
     pub client_worker_session_secs: u64,
@@ -282,8 +280,6 @@ pub struct ApiCacheConfig {
     // ─── Group endpoints ────────────────────────────────────────
     #[serde(default = "ttl_60")]
     pub group_public_list_secs: u64,
-    #[serde(default = "ttl_60")]
-    pub group_by_address_secs: u64,
     #[serde(default = "ttl_60")]
     pub group_detail_secs: u64,
     #[serde(default = "ttl_60")]
@@ -333,7 +329,6 @@ impl Default for ApiCacheConfig {
             client_workers_secs: ttl_60(),
             client_accepted_secs: ttl_60(),
             client_rejected_secs: ttl_60(),
-            client_diff_scores_secs: ttl_60(),
             client_worker_group_secs: ttl_60(),
             client_worker_session_secs: ttl_60(),
 
@@ -348,7 +343,6 @@ impl Default for ApiCacheConfig {
             pplns_address_history_secs: ttl_60(),
 
             group_public_list_secs: ttl_60(),
-            group_by_address_secs: ttl_60(),
             group_detail_secs: ttl_60(),
             group_public_detail_secs: ttl_60(),
             group_hashrate_secs: ttl_60(),

@@ -93,7 +93,6 @@ client_worker_shares_secs   = 60    # /api/client/:address/worker-shares
 client_workers_secs         = 60    # /api/client/:address/workers
 client_accepted_secs        = 60    # /api/client/:address/accepted
 client_rejected_secs        = 60    # /api/client/:address/rejected
-client_diff_scores_secs     = 60    # /api/client/:address/diff-scores
 client_worker_group_secs    = 60    # /api/client/:address/:worker
 client_worker_session_secs  = 60    # /api/client/:address/:worker/:session
 
@@ -110,7 +109,6 @@ pplns_address_history_secs  = 60    # /api/pplns/:address/history
 
 # Group endpoints
 group_public_list_secs      = 60    # /api/pplns/groups/public
-group_by_address_secs       = 60    # /api/pplns/groups/by-address/:address
 group_detail_secs           = 60    # /api/pplns/groups/:id
 group_public_detail_secs    = 60    # /api/pplns/groups/public/:id
 group_hashrate_secs         = 60    # /api/pplns/groups/:id/hashrate

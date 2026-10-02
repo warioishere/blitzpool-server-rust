@@ -54,7 +54,6 @@ pub enum TtlKind {
     ClientWorkers,
     ClientAccepted,
     ClientRejected,
-    ClientDiffScores,
     ClientWorkerGroup,
     ClientWorkerSession,
 
@@ -69,7 +68,6 @@ pub enum TtlKind {
     PplnsAddressHistory,
 
     GroupPublicList,
-    GroupByAddress,
     GroupDetail,
     GroupPublicDetail,
     GroupHashrate,
@@ -116,7 +114,6 @@ impl ResponseCache {
             TtlKind::ClientWorkers => self.ttls.client_workers_secs,
             TtlKind::ClientAccepted => self.ttls.client_accepted_secs,
             TtlKind::ClientRejected => self.ttls.client_rejected_secs,
-            TtlKind::ClientDiffScores => self.ttls.client_diff_scores_secs,
             TtlKind::ClientWorkerGroup => self.ttls.client_worker_group_secs,
             TtlKind::ClientWorkerSession => self.ttls.client_worker_session_secs,
 
@@ -131,7 +128,6 @@ impl ResponseCache {
             TtlKind::PplnsAddressHistory => self.ttls.pplns_address_history_secs,
 
             TtlKind::GroupPublicList => self.ttls.group_public_list_secs,
-            TtlKind::GroupByAddress => self.ttls.group_by_address_secs,
             TtlKind::GroupDetail => self.ttls.group_detail_secs,
             TtlKind::GroupPublicDetail => self.ttls.group_public_detail_secs,
             TtlKind::GroupHashrate => self.ttls.group_hashrate_secs,

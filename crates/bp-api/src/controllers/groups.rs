@@ -141,10 +141,8 @@ async fn invalidate_group_cache(state: &SharedState, id: Uuid) {
     }
 }
 
-/// For membership changes, so the by-address lookups re-resolve immediately.
+/// For membership changes, so the join-request lookup re-resolves immediately.
 async fn invalidate_address_group_cache(state: &SharedState, address: &AddressId) {
-    let key = format!("GROUP_BY_ADDRESS_{}", address.as_str());
-    state.cache.invalidate_prefix(&key).await;
     let jr = format!("GROUP_JOIN_REQUESTS_BY_ADDR_{}", address.as_str());
     state.cache.invalidate(&jr).await;
 }
@@ -491,7 +489,6 @@ async fn approve_join_request(
         .cache
         .invalidate_prefix("GROUP_JOIN_REQUESTS_BY_ADDR_")
         .await;
-    state.cache.invalidate_prefix("GROUP_BY_ADDRESS_").await;
     Ok(Json(ApprovedResponse { approved: true }))
 }
 
