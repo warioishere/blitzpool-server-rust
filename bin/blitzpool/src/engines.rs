@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use bp_blockparty_engine::{BlockpartyPayoutConfig, BlockpartyPayouts};
 use bp_common::{AddressId, Sats};
 use bp_config::{AppConfig, PplnsConfig as TomlPplnsConfig, Role};
 use bp_group_solo_engine::config::GroupSoloEngineConfig;
@@ -51,8 +52,10 @@ pub(crate) struct EngineHandles {
     pub(crate) accepted_sink: Option<Arc<CompositeAcceptedShareSink>>,
     pub(crate) rejected_sink: Option<Arc<dyn SharedRejectedShareSink>>,
     pub(crate) session_persistence_hook: SessionPersistenceHook,
-    /// `None` unless Blockparty is configured.
-    pub(crate) blockparty: Option<Arc<bp_blockparty_engine::BlockpartyService>>,
+    /// The DB-only Blockparty half every role may hold; `None` unless
+    /// Blockparty is configured. The cache-carrying service is front/API
+    /// only, see [`crate::membership::Membership`].
+    pub(crate) blockparty_payouts: Option<BlockpartyPayouts>,
 }
 
 #[derive(Debug, Error)]
@@ -99,6 +102,7 @@ pub(crate) async fn spawn(
     let group_solo = spawn_group_solo(cfg, handles, read_only).await?;
     let stats = spawn_stats(handles).await?;
     let session_persistence = spawn_session_persistence(handles).await?;
+    let blockparty_payouts = blockparty_payouts(cfg, handles)?;
 
     let (accepted_sink, rejected_sink) = if cfg.has_role(Role::Front) {
         let core_epoch = fetch_core_epoch(&handles.redis).await?;
@@ -126,9 +130,7 @@ pub(crate) async fn spawn(
         accepted_sink,
         rejected_sink,
         session_persistence_hook,
-        // Filled in later: Blockparty needs the GroupService built after the
-        // engines.
-        blockparty: None,
+        blockparty_payouts,
     })
 }
 
@@ -260,6 +262,30 @@ fn to_group_solo_engine_config(cfg: &AppConfig) -> Result<GroupSoloEngineConfig,
     };
     let validated = base.try_new()?;
     Ok(validated)
+}
+
+// ─── Blockparty payouts ──────────────────────────────────────────
+
+/// Fees from the same resolver as Group-Solo, so one config knob applies to
+/// both.
+fn blockparty_payouts(
+    cfg: &AppConfig,
+    handles: &FoundationHandles,
+) -> Result<Option<BlockpartyPayouts>, EngineError> {
+    let Some(bp_cfg) = cfg.blockparty.as_ref() else {
+        info!("blockparty: feature disabled (no `[blockparty]` config block)");
+        return Ok(None);
+    };
+    let (fee_address, fee_percent) = crate::blockparty_service::resolve_group_fees(cfg)
+        .map_err(|(raw, err)| EngineError::InvalidAddress(raw, err))?;
+    Ok(Some(BlockpartyPayouts::new(
+        handles.db.pool().clone(),
+        BlockpartyPayoutConfig {
+            fee_address,
+            fee_percent,
+            min_payout_sats: Sats(bp_cfg.min_payout_sats),
+        },
+    )))
 }
 
 // ─── ShareStats engine ───────────────────────────────────────────

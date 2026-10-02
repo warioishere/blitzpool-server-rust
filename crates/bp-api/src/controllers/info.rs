@@ -425,6 +425,7 @@ async fn client_block_template(
                     },
                     MiningModeResult::Blockparty(gid) => match s.blockparty.as_ref() {
                         Some(bp) => match bp
+                            .payouts()
                             .build_payouts(gid, bp_common::Sats(reward_sats as i64))
                             .await
                         {

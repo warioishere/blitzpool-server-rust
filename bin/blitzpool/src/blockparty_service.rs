@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bp_blockparty_engine::{
-    BlockpartyHooks, BlockpartyService, BlockpartyServiceConfig, CoinbaseReservation,
+    BlockpartyHooks, BlockpartyPayouts, BlockpartyService, CoinbaseReservation,
 };
-use bp_common::{AddressId, MiningMode, Sats, StreamKind};
+use bp_common::{AddressId, MiningMode, StreamKind};
 use bp_config::AppConfig;
 use bp_db::{find_address_email, Db};
 use bp_share_hook::{SharedAcceptedShare, SharedAcceptedShareSink};
@@ -47,8 +47,6 @@ impl BlockpartyHooks for ProductionBlockpartyHooks {
 pub(crate) enum BlockpartySpawnError {
     #[error("blockparty cache rebuild failed: {0}")]
     Rebuild(#[from] bp_blockparty_engine::BlockpartyServiceError),
-    #[error("invalid blockparty fee_address: {0}")]
-    InvalidFeeAddress(String),
 }
 
 pub(crate) struct SharedBlockparty {
@@ -58,31 +56,14 @@ pub(crate) struct SharedBlockparty {
     pub(crate) membership_reader: Arc<dyn bp_group_mgmt_engine::BlockpartyMembershipReader>,
 }
 
-/// Construct the production Blockparty handles when the feature is
-/// configured. `None` cleanly disables every Blockparty code path. The
-/// routing cache is warmed only where it is read (`warm_cache`: front, API).
+/// The cache-carrying Blockparty service over `payouts`, for the roles in
+/// [`crate::membership::Membership`].
 pub(crate) async fn spawn(
     cfg: &AppConfig,
     foundation: &FoundationHandles,
+    payouts: &BlockpartyPayouts,
     group_service: &SharedGroupService,
-    warm_cache: bool,
-) -> Result<Option<SharedBlockparty>, BlockpartySpawnError> {
-    let Some(bp_cfg) = cfg.blockparty.as_ref() else {
-        info!("blockparty: feature disabled (no `[blockparty]` config block)");
-        return Ok(None);
-    };
-
-    // Fee config flows from the shared `[group_fees]` lane (with
-    // fallback to `[pplns]`) — both Group-Solo and Blockparty read
-    // the same resolver so a single config knob applies everywhere.
-    let (fee_address, fee_percent) =
-        resolve_group_fees(cfg).map_err(|(raw, _)| BlockpartySpawnError::InvalidFeeAddress(raw))?;
-    let svc_config = BlockpartyServiceConfig {
-        fee_address,
-        fee_percent,
-        min_payout_sats: Sats(bp_cfg.min_payout_sats),
-    };
-
+) -> Result<SharedBlockparty, BlockpartySpawnError> {
     let hooks = Arc::new(ProductionBlockpartyHooks {
         db: foundation.db.clone(),
     });
@@ -94,32 +75,33 @@ pub(crate) async fn spawn(
     // Size the reservation to a party's roster when it reaches Ready. The
     // configured budget is the floor the stream booted with; without the
     // Blockparty TDP stream (`--skip-tdp`) it stays fixed there.
-    let reservation: Option<Arc<dyn CoinbaseReservation>> =
-        foundation.alt_tdp.get(&StreamKind::Blockparty).map(|tdp| {
+    let reservation: Option<Arc<dyn CoinbaseReservation>> = foundation
+        .alt_tdp
+        .get(&StreamKind::Blockparty)
+        .zip(cfg.blockparty.as_ref())
+        .map(|(tdp, bp_cfg)| {
             Arc::new(crate::blockparty_reservation::TdpCoinbaseReservation::new(
                 tdp.clone(),
                 bp_cfg.coinbase_weight_budget,
             )) as Arc<dyn CoinbaseReservation>
         });
 
+    info!("blockparty: loading routing cache");
     let concrete = Arc::new(
-        BlockpartyService::new(foundation.db.pool().clone(), hooks, pplns_cache, svc_config)
+        BlockpartyService::load(payouts.clone(), hooks, pplns_cache)
+            .await?
             .with_coinbase_reservation(reservation),
     );
-    if warm_cache {
-        info!("blockparty: rebuilding routing cache");
-        concrete.rebuild_cache().await?;
-        info!("blockparty: routing cache warm");
-    }
+    info!("blockparty: routing cache warm");
     // Stash the routing cache as a membership reader for the
     // GroupService bidirectional collision check.
     let membership_reader: Arc<dyn bp_group_mgmt_engine::BlockpartyMembershipReader> =
         Arc::new(concrete.cache());
 
-    Ok(Some(SharedBlockparty {
+    Ok(SharedBlockparty {
         service: concrete,
         membership_reader,
-    }))
+    })
 }
 
 /// Resolve the shared Group-Solo + Blockparty fee: `[group_fees]` wins when
@@ -158,8 +140,8 @@ pub(crate) fn resolve_group_fees(
 
 /// Calls `on_share_accepted` for every Blockparty share: the first promotes
 /// READY → ACTIVE, later ones refresh `lastShareAt` (the dissolve-cooldown
-/// gate). Reads the producer-stamped `share.mode`, so it needs no mode gate
-/// and runs unchanged on the Satellite.
+/// gate). Reads the producer-stamped `share.mode`, so it needs no mode gate.
+/// Front only: it reads the admin from the routing cache.
 pub(crate) struct BlockpartyAcceptedShareSink {
     service: Arc<BlockpartyService>,
 }

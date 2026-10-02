@@ -103,13 +103,12 @@ async fn delete_email_for(pool: &PgPool, address: &str) {
         .await;
 }
 
-fn build_services(pool: PgPool) -> (Arc<GroupService>, InvitationService) {
-    let group = Arc::new(GroupService::new(
-        pool.clone(),
-        Arc::new(NoopHooks),
-        14,
-        TEST_COINBASE_CAP,
-    ));
+async fn build_services(pool: PgPool) -> (Arc<GroupService>, InvitationService) {
+    let group = Arc::new(
+        GroupService::load(pool.clone(), Arc::new(NoopHooks), 14, TEST_COINBASE_CAP)
+            .await
+            .expect("load group service"),
+    );
     let invitation = InvitationService::new(pool, group.clone());
     (group, invitation)
 }
@@ -122,7 +121,7 @@ async fn open_invite_create_revoke_and_replace_atomic() {
         Some(p) => p,
         None => return,
     };
-    let (group_svc, inv_svc) = build_services(pool.clone());
+    let (group_svc, inv_svc) = build_services(pool.clone()).await;
     let creator = format!("bc1qcr{}", Uuid::new_v4().simple());
     let g = group_svc
         .create_group(&format!("oi-{}", Uuid::new_v4()), &creator)
@@ -181,7 +180,7 @@ async fn accept_open_invite_creates_member() {
         Some(p) => p,
         None => return,
     };
-    let (group_svc, inv_svc) = build_services(pool.clone());
+    let (group_svc, inv_svc) = build_services(pool.clone()).await;
     let creator = format!("bc1qcr{}", Uuid::new_v4().simple());
     let joiner = format!("bc1qjoin{}", Uuid::new_v4().simple());
     seed_verified_email(&pool, &joiner, "joiner@example.com").await;
@@ -219,7 +218,7 @@ async fn accept_open_invite_creates_member_via_signature() {
         Some(p) => p,
         None => return,
     };
-    let (group_svc, inv_svc) = build_services(pool.clone());
+    let (group_svc, inv_svc) = build_services(pool.clone()).await;
     let creator = format!("bc1qcr{}", Uuid::new_v4().simple());
     let joiner = format!("bc1qjoin{}", Uuid::new_v4().simple());
     // No verified email, only a signature proof: must still be admitted.
@@ -252,7 +251,7 @@ async fn accept_open_invite_blocks_approval_required() {
         Some(p) => p,
         None => return,
     };
-    let (group_svc, inv_svc) = build_services(pool.clone());
+    let (group_svc, inv_svc) = build_services(pool.clone()).await;
     let creator = format!("bc1qcr{}", Uuid::new_v4().simple());
     let joiner = format!("bc1qjoin{}", Uuid::new_v4().simple());
     seed_verified_email(&pool, &joiner, "j@x").await;
@@ -284,7 +283,7 @@ async fn get_open_invite_public_omits_admin_data() {
         Some(p) => p,
         None => return,
     };
-    let (group_svc, inv_svc) = build_services(pool.clone());
+    let (group_svc, inv_svc) = build_services(pool.clone()).await;
     let creator = format!("bc1qcr{}", Uuid::new_v4().simple());
     let g = group_svc
         .create_group(&format!("pub-{}", Uuid::new_v4()), &creator)

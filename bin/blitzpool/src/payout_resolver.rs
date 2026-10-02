@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bp_blockparty::CoinbaseDistributionEntry;
-use bp_blockparty_engine::BlockpartyService;
+use bp_blockparty_engine::{BlockpartyPayouts, BlockpartyService};
 use bp_coinbase_snapshot::BuiltDistribution;
 use bp_common::{AddressId, MiningMode, Sats};
 use bp_group_solo_engine::engine::GroupSoloEngine;
@@ -86,7 +86,7 @@ impl ProductionPayoutResolver {
             MiningModeResult::Pplns => self.pplns_payouts(miner_address, reward_sats).await,
             MiningModeResult::Blockparty(group_id) => {
                 let resolved = blockparty_payouts(
-                    self.blockparty.as_deref(),
+                    self.blockparty.as_deref().map(BlockpartyService::payouts),
                     miner_address,
                     reward_sats,
                     group_id,
@@ -155,7 +155,7 @@ fn lower_built(
 /// The members' split, or no job when it cannot be built: only the admin
 /// hashes, so a solo coinbase would pay the admin the whole block.
 async fn blockparty_payouts(
-    blockparty: Option<&BlockpartyService>,
+    blockparty: Option<&BlockpartyPayouts>,
     miner_address: &str,
     reward_sats: u64,
     group_id: Uuid,
@@ -933,18 +933,16 @@ mod tests {
 
     const BP_ADMIN: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
-    fn blockparty_service(pool: sqlx::PgPool) -> Arc<BlockpartyService> {
-        Arc::new(bp_blockparty_engine::BlockpartyService::new(
+    fn blockparty_payouts_on(pool: sqlx::PgPool) -> BlockpartyPayouts {
+        BlockpartyPayouts::new(
             pool,
-            Arc::new(bp_blockparty_engine::NoopHooks::default()),
-            bp_group_mgmt_engine::AddressCache::new(),
-            bp_blockparty_engine::BlockpartyServiceConfig::default(),
-        ))
+            bp_blockparty_engine::BlockpartyPayoutConfig::default(),
+        )
     }
 
     /// The admin is the only one hashing, so a solo coinbase here would pay
     /// the whole block to the admin and nothing to the members.
-    async fn assert_no_job(svc: Option<&BlockpartyService>, group_id: Uuid, case: &str) {
+    async fn assert_no_job(svc: Option<&BlockpartyPayouts>, group_id: Uuid, case: &str) {
         let resolved = blockparty_payouts(svc, BP_ADMIN, TEST_REWARD, group_id).await;
         assert!(
             resolved.is_none(),
@@ -963,14 +961,14 @@ mod tests {
             .acquire_timeout(std::time::Duration::from_millis(300))
             .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/nope")
             .expect("a lazily-connected pool parses its url");
-        let svc = blockparty_service(unreachable);
+        let svc = blockparty_payouts_on(unreachable);
         assert!(
             svc.build_payouts(gid, Sats(TEST_REWARD as i64))
                 .await
                 .is_err(),
             "precondition: the split build must fail on this pool"
         );
-        assert_no_job(Some(svc.as_ref()), gid, "database error").await;
+        assert_no_job(Some(&svc), gid, "database error").await;
     }
 
     #[tokio::test]
@@ -978,7 +976,7 @@ mod tests {
         let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
             return;
         };
-        let svc = blockparty_service(pool);
+        let svc = blockparty_payouts_on(pool);
         let gid = Uuid::new_v4();
         assert!(
             matches!(
@@ -987,7 +985,7 @@ mod tests {
             ),
             "precondition: a fresh group id must resolve to no group"
         );
-        assert_no_job(Some(svc.as_ref()), gid, "group not found").await;
+        assert_no_job(Some(&svc), gid, "group not found").await;
     }
 
     /// Pins what PPLNS and Group-Solo hand the job builder: the §4 list at

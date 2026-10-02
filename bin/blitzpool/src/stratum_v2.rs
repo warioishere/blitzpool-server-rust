@@ -25,8 +25,8 @@ use tracing::{info, warn};
 
 use crate::boot::FoundationHandles;
 use crate::engines::EngineHandles;
-use crate::group_service::SharedGroupService;
-use crate::stratum_v1::{self, GroupLookup, ModeGatePopulatingPersistence};
+use crate::membership::Membership;
+use crate::stratum_v1::{self, ModeGatePopulatingPersistence};
 
 /// Per-port SV2 mining server, like [`crate::stratum_v1::Sv1PortServer`].
 /// Carries the SV2 `PortConfig` the unified accept loop passes to
@@ -103,7 +103,7 @@ pub(crate) fn build_per_port_servers(
     cfg: &AppConfig,
     foundation: &FoundationHandles,
     engines: &EngineHandles,
-    group_service: &SharedGroupService,
+    membership: &Membership,
     noise_config: NoiseConfig,
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
     payout_resolver: Arc<dyn PayoutResolver>,
@@ -123,7 +123,6 @@ pub(crate) fn build_per_port_servers(
     let network = crate::boot::bitcoin_network(cfg.network);
     // SV1's port enumeration is the canonical port list.
     let sv1_port_configs = stratum_v1::build_port_configs(cfg);
-    let lookup: Arc<dyn GroupLookup> = group_service.service.clone();
     // TDP submit plus engine ledger and dispatcher fan-out, as for SV1.
     let block_sink: Arc<dyn Sv2BlockSink> = crate::block_sink::TdpBlockSubmissionSink::wired(
         tdp.clone(),
@@ -148,7 +147,7 @@ pub(crate) fn build_per_port_servers(
             payout_resolver.clone(),
             block_sink.clone(),
             engines,
-            lookup.clone(),
+            membership,
             device_status_sink.clone(),
             Arc::clone(&live_sessions),
             custom_extranonce.clone(),
@@ -212,7 +211,7 @@ fn build_port_hooks(
     payout_resolver: Arc<dyn PayoutResolver>,
     block_sink: Arc<dyn Sv2BlockSink>,
     engines: &EngineHandles,
-    group_lookup: Arc<dyn GroupLookup>,
+    membership: &Membership,
     device_status_sink: Arc<dyn bp_share_hook::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
     custom_extranonce: Arc<dyn bp_stratum_v2::hooks::CustomExtranonceSource>,
@@ -233,7 +232,7 @@ fn build_port_hooks(
         session_persistence: ModeGatePopulatingPersistence::for_port(
             port_payout_mode,
             engines,
-            group_lookup,
+            membership,
             live_sessions,
         ),
         device_status_sink,

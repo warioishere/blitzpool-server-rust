@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bp_blockparty_engine::{
-    BlockpartyHooks, BlockpartyService, BlockpartyServiceConfig, BlockpartyServiceError,
-    CoinbaseReservation,
+    BlockpartyHooks, BlockpartyPayoutConfig, BlockpartyPayouts, BlockpartyService,
+    BlockpartyServiceError, CoinbaseReservation,
 };
 use bp_common::{AddressId, Sats};
 use bp_group_mgmt_engine::{AddressCache as PplnsAddressCache, OpenInviteTtl};
@@ -68,21 +68,22 @@ impl CoinbaseReservation for RecordingReservation {
     }
 }
 
-fn config() -> BlockpartyServiceConfig {
-    BlockpartyServiceConfig {
+fn config() -> BlockpartyPayoutConfig {
+    BlockpartyPayoutConfig {
         fee_address: Some(addr("bc1qfeexxxx")),
         fee_percent: 2.0,
         min_payout_sats: Sats(5_000),
     }
 }
 
-fn svc(pool: &PgPool) -> BlockpartyService {
-    BlockpartyService::new(
-        pool.clone(),
+async fn svc(pool: &PgPool) -> BlockpartyService {
+    BlockpartyService::load(
+        BlockpartyPayouts::new(pool.clone(), config()),
         Arc::new(AllVerified),
         PplnsAddressCache::new(),
-        config(),
     )
+    .await
+    .expect("load blockparty service")
 }
 
 // No address has a verified email, forcing the signature-ownership branch.
@@ -95,13 +96,14 @@ impl BlockpartyHooks for NoEmail {
     }
 }
 
-fn svc_no_email(pool: &PgPool) -> BlockpartyService {
-    BlockpartyService::new(
-        pool.clone(),
+async fn svc_no_email(pool: &PgPool) -> BlockpartyService {
+    BlockpartyService::load(
+        BlockpartyPayouts::new(pool.clone(), config()),
         Arc::new(NoEmail),
         PplnsAddressCache::new(),
-        config(),
     )
+    .await
+    .expect("load blockparty service")
 }
 
 /// Seeds a signature-ownership proof stored verbatim (case-preserved), as the
@@ -150,7 +152,7 @@ async fn create_group_seeds_draft_and_routing_cache() {
     let admin = "bc1qadmincreate1";
     cleanup(&pool, name, admin).await;
 
-    let svc = svc(&pool);
+    let svc = svc(&pool).await;
     let res = svc
         .create_group(name, admin, 10_000)
         .await
@@ -183,7 +185,7 @@ async fn add_member_flips_to_confirming_and_inserts_member_cache() {
         .execute(&pool)
         .await;
 
-    let svc = svc(&pool);
+    let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
     svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
         .await
@@ -217,7 +219,7 @@ async fn join_via_link_adds_unconfirmed_member_and_mints_token() {
         .execute(&pool)
         .await;
 
-    let svc = svc(&pool);
+    let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
 
     // Admin mints a join link; Carol self-joins via it (no admin token).
@@ -289,7 +291,7 @@ async fn join_via_link_admits_signature_verified_email_less_base58_address() {
     delete_signature(&pool, admin).await;
     seed_signature(&pool, admin).await;
 
-    let svc = svc_no_email(&pool);
+    let svc = svc_no_email(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
     let link = svc
         .create_join_link(
@@ -342,7 +344,7 @@ async fn join_via_link_rejects_unverified_address() {
     delete_signature(&pool, admin).await;
     seed_signature(&pool, admin).await;
 
-    let svc = svc_no_email(&pool);
+    let svc = svc_no_email(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
     let link = svc
         .create_join_link(
@@ -383,7 +385,7 @@ async fn create_group_admits_signature_verified_email_less_admin() {
     delete_signature(&pool, admin).await;
     seed_signature(&pool, admin).await;
 
-    let svc = svc_no_email(&pool);
+    let svc = svc_no_email(&pool).await;
     let create = svc
         .create_group(name, admin, 10_000)
         .await
@@ -410,7 +412,7 @@ async fn create_group_rejects_unverified_admin() {
     cleanup(&pool, name, admin).await;
     delete_signature(&pool, admin).await;
 
-    let svc = svc_no_email(&pool);
+    let svc = svc_no_email(&pool).await;
     let err = svc
         .create_group(name, admin, 10_000)
         .await
@@ -443,7 +445,7 @@ async fn request_member_confirmation_stamps_flag_and_is_admin_gated() {
     let admin = "bc1qadminreqconfirm1";
     cleanup(&pool, name, admin).await;
 
-    let svc = svc(&pool);
+    let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 10_000).await.expect("create");
 
     let g = svc.get_group(create.group.id).await.unwrap().unwrap();
@@ -481,7 +483,7 @@ async fn mark_member_confirmed_promotes_to_ready_and_unblocks_routing() {
         .execute(&pool)
         .await;
 
-    let svc = svc(&pool);
+    let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
     svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
         .await
@@ -528,7 +530,7 @@ async fn on_share_accepted_promotes_ready_to_active_only() {
         .execute(&pool)
         .await;
 
-    let svc = svc(&pool);
+    let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
     let admin_addr = addr(admin);
 
@@ -575,7 +577,7 @@ async fn dissolve_blocked_during_active_cooldown() {
         .execute(&pool)
         .await;
 
-    let svc = svc(&pool);
+    let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
     svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
         .await
@@ -634,7 +636,7 @@ async fn dissolve_frees_every_address_for_the_next_party() {
         .execute(&pool)
         .await;
 
-    let svc = svc(&pool);
+    let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
     svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
         .await
@@ -694,7 +696,7 @@ async fn on_block_found_is_idempotent_on_duplicate_hash() {
     let admin = "bc1qadminbf6xx";
     cleanup(&pool, name, admin).await;
 
-    let svc = svc(&pool);
+    let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 10_000).await.expect("create");
     let splits = vec![bp_db::BlockpartySplitSnapshot {
         address: admin.to_owned(),
@@ -705,6 +707,7 @@ async fn on_block_found_is_idempotent_on_duplicate_hash() {
     let hash = "0000000000000000abcdef1234567890abcdef1234567890abcdef1234567890";
 
     let r1 = svc
+        .payouts()
         .on_block_found(
             create.group.id,
             900_000,
@@ -719,6 +722,7 @@ async fn on_block_found_is_idempotent_on_duplicate_hash() {
     assert!(r1.is_some());
 
     let r2 = svc
+        .payouts()
         .on_block_found(
             create.group.id,
             900_000,
@@ -750,7 +754,7 @@ async fn name_collision_rejects_second_create() {
     cleanup(&pool, name, admin_a).await;
     cleanup(&pool, name, admin_b).await;
 
-    let svc = svc(&pool);
+    let svc = svc(&pool).await;
     svc.create_group(name, admin_a, 10_000)
         .await
         .expect("first");
@@ -779,12 +783,13 @@ async fn ready_transition_sizes_coinbase_reservation_to_roster() {
         .await;
 
     let calls = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
-    let svc = BlockpartyService::new(
-        pool.clone(),
+    let svc = BlockpartyService::load(
+        BlockpartyPayouts::new(pool.clone(), config()),
         Arc::new(AllVerified),
         PplnsAddressCache::new(),
-        config(),
     )
+    .await
+    .expect("load blockparty service")
     .with_coinbase_reservation(Some(Arc::new(RecordingReservation {
         calls: calls.clone(),
     })));
@@ -834,7 +839,7 @@ async fn update_splits_confirms_admin_and_resets_non_admin() {
         .execute(&pool)
         .await;
 
-    let svc = svc(&pool);
+    let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
     svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
         .await
@@ -906,7 +911,7 @@ async fn update_rental_hint_sets_cleans_and_clears() {
     let admin = "bc1qadminrentalhint1";
     cleanup(&pool, name, admin).await;
 
-    let svc = svc(&pool);
+    let svc = svc(&pool).await;
     let create = svc
         .create_group(name, admin, 10_000)
         .await

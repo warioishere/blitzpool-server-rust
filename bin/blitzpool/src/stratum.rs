@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 
 use crate::boot::FoundationHandles;
 use crate::engines::EngineHandles;
-use crate::group_service::SharedGroupService;
+use crate::membership::Membership;
 use crate::stratum_v1::{self, StratumV1SpawnError};
 use crate::stratum_v2::{self, StratumV2SpawnError};
 
@@ -93,7 +93,7 @@ pub(crate) async fn spawn(
     cfg: &AppConfig,
     foundation: &FoundationHandles,
     engines: &EngineHandles,
-    group_service: &SharedGroupService,
+    membership: &Membership,
     dispatcher: Option<Arc<NotificationDispatcher>>,
     gate: Option<(
         Arc<crate::device_status_gate::Gate>,
@@ -124,7 +124,7 @@ pub(crate) async fn spawn(
             dev_fee_address: cfg.solo.dev_fee_address.clone(),
             dev_fee_percent: cfg.solo.dev_fee_percent.unwrap_or(0.0),
         },
-        engines.blockparty.clone(),
+        membership.blockparty_service(),
     ));
     let sv1_resolver: Arc<dyn bp_stratum_v1::PayoutResolver> = production_resolver.clone();
     let sv2_resolver: Arc<dyn bp_stratum_v2::hooks::PayoutResolver> = production_resolver;
@@ -151,7 +151,7 @@ pub(crate) async fn spawn(
         cfg,
         foundation,
         engines,
-        group_service,
+        membership,
         sv1_resolver,
         dispatcher.clone(),
         Arc::clone(&device_status),
@@ -168,7 +168,7 @@ pub(crate) async fn spawn(
         cfg,
         foundation,
         engines,
-        group_service,
+        membership,
         noise_config,
         bridge,
         sv2_resolver,

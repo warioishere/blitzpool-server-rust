@@ -8,46 +8,23 @@
 use std::sync::Arc;
 
 use bp_blockparty::{
-    build_blockparty_distribution, BlockpartyDistributionInput, BlockpartyDistributionResult,
-    BlockpartyMemberInput, BlockpartyStatus, DISSOLVE_COOLDOWN_MS, MAX_PERCENT_BP, MIN_PERCENT_BP,
-    NAME_MAX_LEN, NAME_MIN_LEN, TOTAL_PERCENT_BP,
+    BlockpartyStatus, DISSOLVE_COOLDOWN_MS, MAX_PERCENT_BP, MIN_PERCENT_BP, NAME_MAX_LEN,
+    NAME_MIN_LEN, TOTAL_PERCENT_BP,
 };
 use bp_common::AddressId;
-use bp_db::{
-    BlockpartyBlockHistoryRow, BlockpartyGroupRow, BlockpartyMemberRow, BlockpartySplitSnapshot,
-};
+use bp_db::{BlockpartyBlockHistoryRow, BlockpartyGroupRow, BlockpartyMemberRow};
 use bp_group_mgmt::token::{AdminToken, InvitationToken, TokenHash};
 use bp_group_mgmt_engine::{AddressCache as PplnsAddressCache, OpenInviteTtl};
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::cache::BlockpartyCache;
 use crate::error::BlockpartyServiceError;
 use crate::hooks::BlockpartyHooks;
+use crate::payouts::BlockpartyPayouts;
 use crate::util::normalize_address;
 use bp_common::now_ms;
 
 // ─── Config + result types ─────────────────────────────────────────
-
-/// Fee address and percent are resolved by the boot layer and passed in.
-#[derive(Clone, Debug)]
-pub struct BlockpartyServiceConfig {
-    pub fee_address: Option<AddressId>,
-    pub fee_percent: f64,
-    /// Dust floor per member output; clamped to at least
-    /// `bp_blockparty::DUST_LIMIT_SATS`.
-    pub min_payout_sats: bp_common::Sats,
-}
-
-impl Default for BlockpartyServiceConfig {
-    fn default() -> Self {
-        Self {
-            fee_address: None,
-            fee_percent: 2.0,
-            min_payout_sats: bp_common::Sats(5_000),
-        }
-    }
-}
 
 /// Re-sizes the Blockparty coinbase reservation at `Confirming → Ready`,
 /// when the roster becomes routable. High-water only. A raise reaches
@@ -84,13 +61,15 @@ pub struct PendingPartyFeeRoute {
 
 // ─── Service struct ────────────────────────────────────────────────
 
+/// Exists only with a warm routing cache: [`Self::load`] is the sole
+/// constructor, so a process that never reads the cache holds
+/// [`BlockpartyPayouts`] instead and cannot reach a cold one.
 pub struct BlockpartyService {
-    pool: PgPool,
+    payouts: BlockpartyPayouts,
     hooks: Arc<dyn BlockpartyHooks>,
     cache: BlockpartyCache,
     /// Read-only; for the mode-collision check against PPLNS groups.
     pplns_cache: PplnsAddressCache,
-    config: BlockpartyServiceConfig,
     /// `None` in tests and when the Blockparty TDP stream is not wired.
     reservation: Option<Arc<dyn CoinbaseReservation>>,
     /// Publishes a `"blockparty"` invalidation on every mutation so a
@@ -100,21 +79,22 @@ pub struct BlockpartyService {
 }
 
 impl BlockpartyService {
-    pub fn new(
-        pool: PgPool,
+    /// Builds the service and fills its routing cache from PG.
+    pub async fn load(
+        payouts: BlockpartyPayouts,
         hooks: Arc<dyn BlockpartyHooks>,
         pplns_cache: PplnsAddressCache,
-        config: BlockpartyServiceConfig,
-    ) -> Self {
-        Self {
-            pool,
+    ) -> Result<Self, BlockpartyServiceError> {
+        let service = Self {
+            payouts,
             hooks,
             cache: BlockpartyCache::new(),
             pplns_cache,
-            config,
             reservation: None,
             change_notifier: Arc::new(std::sync::OnceLock::new()),
-        }
+        };
+        service.rebuild_cache().await?;
+        Ok(service)
     }
 
     /// Set-once. Wire on the process hosting the API writers.
@@ -146,22 +126,15 @@ impl BlockpartyService {
         self.cache.clone()
     }
 
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
+    /// The DB-only payout half, shared with processes that hold no cache.
+    pub fn payouts(&self) -> &BlockpartyPayouts {
+        &self.payouts
     }
 
-    /// Full rebuild from PG. Call once at boot before shares are routed;
-    /// the state-transition methods keep the cache in sync afterwards.
+    /// Full rebuild from PG; the state-transition methods keep the cache in
+    /// sync between rebuilds.
     pub async fn rebuild_cache(&self) -> Result<(), BlockpartyServiceError> {
-        self.cache.rebuild(&self.pool).await
-    }
-
-    pub fn pool_fee_percent(&self) -> f64 {
-        self.config.fee_percent
-    }
-
-    pub fn fee_address(&self) -> Option<&AddressId> {
-        self.config.fee_address.as_ref()
+        self.cache.rebuild(&self.payouts.pool).await
     }
 
     // ─── Read paths (cache-backed, stratum hot path) ───────────────
@@ -178,7 +151,7 @@ impl BlockpartyService {
         address: &AddressId,
     ) -> Option<PendingPartyFeeRoute> {
         let _gid = self.cache.pending_fee_route_admin(address).await?;
-        let fee_address = self.config.fee_address.clone()?;
+        let fee_address = self.payouts.config.fee_address.clone()?;
         Some(PendingPartyFeeRoute { fee_address })
     }
 
@@ -191,52 +164,21 @@ impl BlockpartyService {
         &self,
         group_id: Uuid,
     ) -> Result<Option<BlockpartyGroupRow>, BlockpartyServiceError> {
-        Ok(bp_db::find_blockparty_group(&self.pool, group_id).await?)
+        Ok(bp_db::find_blockparty_group(&self.payouts.pool, group_id).await?)
     }
 
     pub async fn list_members(
         &self,
         group_id: Uuid,
     ) -> Result<Vec<BlockpartyMemberRow>, BlockpartyServiceError> {
-        Ok(bp_db::list_blockparty_members_for_group(&self.pool, group_id).await?)
+        Ok(bp_db::list_blockparty_members_for_group(&self.payouts.pool, group_id).await?)
     }
 
     pub async fn get_history(
         &self,
         group_id: Uuid,
     ) -> Result<Vec<BlockpartyBlockHistoryRow>, BlockpartyServiceError> {
-        Ok(bp_db::list_blockparty_block_history(&self.pool, group_id).await?)
-    }
-
-    /// Coinbase distribution over the current roster; `Ok(None)` when the
-    /// group does not exist.
-    pub async fn build_payouts(
-        &self,
-        group_id: Uuid,
-        block_reward_sats: bp_common::Sats,
-    ) -> Result<Option<BlockpartyDistributionResult>, BlockpartyServiceError> {
-        if bp_db::find_blockparty_group(&self.pool, group_id)
-            .await?
-            .is_none()
-        {
-            return Ok(None);
-        }
-        let members = bp_db::list_blockparty_members_for_group(&self.pool, group_id).await?;
-        let inputs: Vec<BlockpartyMemberInput<'_>> = members
-            .iter()
-            .map(|m| BlockpartyMemberInput {
-                address: &m.address,
-                percent_bp: m.percent_bp,
-            })
-            .collect();
-        let result = build_blockparty_distribution(BlockpartyDistributionInput {
-            members: &inputs,
-            block_reward_sats,
-            pool_fee_address: self.config.fee_address.as_ref(),
-            pool_fee_percent: self.config.fee_percent,
-            min_payout_sats: self.config.min_payout_sats,
-        });
-        Ok(Some(result))
+        Ok(bp_db::list_blockparty_block_history(&self.payouts.pool, group_id).await?)
     }
 
     // ─── Token gating ──────────────────────────────────────────────
@@ -249,7 +191,7 @@ impl BlockpartyService {
         token: Option<&str>,
     ) -> Result<BlockpartyGroupRow, BlockpartyServiceError> {
         let provided = token.ok_or(BlockpartyServiceError::MissingToken)?;
-        let group = bp_db::find_blockparty_group(&self.pool, group_id)
+        let group = bp_db::find_blockparty_group(&self.payouts.pool, group_id)
             .await?
             .ok_or(BlockpartyServiceError::NotFound)?;
         if group.status == BlockpartyStatus::Dissolved.as_str() {
@@ -269,7 +211,7 @@ impl BlockpartyService {
         token: Option<&str>,
     ) -> Result<BlockpartyMemberRow, BlockpartyServiceError> {
         let provided = token.ok_or(BlockpartyServiceError::MissingMemberToken)?;
-        let member = bp_db::find_blockparty_member_in_group(&self.pool, group_id, address)
+        let member = bp_db::find_blockparty_member_in_group(&self.payouts.pool, group_id, address)
             .await?
             .ok_or(BlockpartyServiceError::NotMember)?;
         let stored_hex = member
@@ -301,7 +243,7 @@ impl BlockpartyService {
         // signature-only admin stores "".
         let admin_email = self.hooks.verified_email_for(&admin_addr).await;
         if admin_email.is_none()
-            && !bp_db::is_address_ownership_verified(&self.pool, &admin_addr).await?
+            && !bp_db::is_address_ownership_verified(&self.payouts.pool, &admin_addr).await?
         {
             return Err(BlockpartyServiceError::EmailNotVerified);
         }
@@ -312,19 +254,19 @@ impl BlockpartyService {
         if self.pplns_cache.get(&admin_addr).await.is_some() {
             return Err(BlockpartyServiceError::AddressInPplnsGroup);
         }
-        if bp_db::find_blockparty_group_by_name(&self.pool, name)
+        if bp_db::find_blockparty_group_by_name(&self.payouts.pool, name)
             .await?
             .is_some()
         {
             return Err(BlockpartyServiceError::NameTaken);
         }
-        if bp_db::find_blockparty_group_by_admin_address(&self.pool, &admin_addr)
+        if bp_db::find_blockparty_group_by_admin_address(&self.payouts.pool, &admin_addr)
             .await?
             .is_some()
         {
             return Err(BlockpartyServiceError::AdminAddressTaken);
         }
-        if bp_db::find_blockparty_member_by_address(&self.pool, &admin_addr)
+        if bp_db::find_blockparty_member_by_address(&self.payouts.pool, &admin_addr)
             .await?
             .is_some()
         {
@@ -337,7 +279,7 @@ impl BlockpartyService {
         let id = Uuid::new_v4();
 
         let group = bp_db::insert_blockparty_group(
-            &self.pool,
+            &self.payouts.pool,
             id,
             name,
             &admin_addr,
@@ -349,7 +291,7 @@ impl BlockpartyService {
 
         // Creating the party is the admin's confirmation.
         let admin_member = bp_db::insert_blockparty_member(
-            &self.pool,
+            &self.payouts.pool,
             id,
             &admin_addr,
             &admin_email,
@@ -368,7 +310,7 @@ impl BlockpartyService {
             group,
             admin_member,
             admin_token: admin_token.into_inner(),
-            pool_fee_percent: self.config.fee_percent,
+            pool_fee_percent: self.payouts.config.fee_percent,
         })
     }
 
@@ -389,7 +331,7 @@ impl BlockpartyService {
         if address == group.admin_address {
             return Err(BlockpartyServiceError::AdminCannotRejoin);
         }
-        if bp_db::find_blockparty_member_by_address(&self.pool, &address)
+        if bp_db::find_blockparty_member_by_address(&self.payouts.pool, &address)
             .await?
             .is_some()
         {
@@ -401,14 +343,21 @@ impl BlockpartyService {
 
         // Confirmed email or signature ownership proof required.
         let email = self.hooks.verified_email_for(&address).await;
-        if email.is_none() && !bp_db::is_address_ownership_verified(&self.pool, &address).await? {
+        if email.is_none()
+            && !bp_db::is_address_ownership_verified(&self.payouts.pool, &address).await?
+        {
             return Err(BlockpartyServiceError::EmailNotVerified);
         }
         let email = email.map(|e| e.to_ascii_lowercase()).unwrap_or_default();
 
         let now = now_ms();
         let inserted = match bp_db::insert_blockparty_member(
-            &self.pool, group_id, &address, &email, percent_bp, "member",
+            &self.payouts.pool,
+            group_id,
+            &address,
+            &email,
+            percent_bp,
+            "member",
             None, // confirmed_at = null; member must accept invitation
             now,
         )
@@ -427,7 +376,7 @@ impl BlockpartyService {
 
         if group.status == BlockpartyStatus::Draft.as_str() {
             bp_db::update_blockparty_group_status(
-                &self.pool,
+                &self.payouts.pool,
                 group_id,
                 BlockpartyStatus::Confirming.as_str(),
                 now,
@@ -455,8 +404,14 @@ impl BlockpartyService {
         let now = now_ms();
         let expires_at = now + ttl.as_ms();
         let link = InvitationToken::generate()?;
-        bp_db::upsert_blockparty_join_link(&self.pool, group_id, link.as_str(), expires_at, now)
-            .await?;
+        bp_db::upsert_blockparty_join_link(
+            &self.payouts.pool,
+            group_id,
+            link.as_str(),
+            expires_at,
+            now,
+        )
+        .await?;
         Ok(link.as_str().to_owned())
     }
 
@@ -469,7 +424,8 @@ impl BlockpartyService {
     ) -> Result<(), BlockpartyServiceError> {
         let group = self.require_admin_token(group_id, token).await?;
         assert_editable(&group)?;
-        bp_db::set_blockparty_confirmation_requested(&self.pool, group_id, now_ms()).await?;
+        bp_db::set_blockparty_confirmation_requested(&self.payouts.pool, group_id, now_ms())
+            .await?;
         Ok(())
     }
 
@@ -479,7 +435,7 @@ impl BlockpartyService {
         token: Option<&str>,
     ) -> Result<(), BlockpartyServiceError> {
         let _ = self.require_admin_token(group_id, token).await?;
-        bp_db::delete_blockparty_join_link(&self.pool, group_id).await?;
+        bp_db::delete_blockparty_join_link(&self.payouts.pool, group_id).await?;
         Ok(())
     }
 
@@ -491,7 +447,7 @@ impl BlockpartyService {
         token: Option<&str>,
     ) -> Result<Option<(String, i64)>, BlockpartyServiceError> {
         let _ = self.require_admin_token(group_id, token).await?;
-        let link = bp_db::find_blockparty_join_link_for_group(&self.pool, group_id).await?;
+        let link = bp_db::find_blockparty_join_link_for_group(&self.payouts.pool, group_id).await?;
         Ok(link
             .filter(|l| l.expires_at >= now_ms())
             .map(|l| (l.token, l.expires_at)))
@@ -505,7 +461,7 @@ impl BlockpartyService {
         link_token: &str,
         member_address: &str,
     ) -> Result<(String, Uuid), BlockpartyServiceError> {
-        let link = bp_db::find_blockparty_join_link_by_token(&self.pool, link_token)
+        let link = bp_db::find_blockparty_join_link_by_token(&self.payouts.pool, link_token)
             .await?
             .ok_or(BlockpartyServiceError::NotFound)?;
         let now = now_ms();
@@ -513,7 +469,7 @@ impl BlockpartyService {
         if link.expires_at < now {
             return Err(BlockpartyServiceError::NotFound);
         }
-        let group = bp_db::find_blockparty_group(&self.pool, link.group_id)
+        let group = bp_db::find_blockparty_group(&self.payouts.pool, link.group_id)
             .await?
             .ok_or(BlockpartyServiceError::NotFound)?;
         assert_editable(&group)?;
@@ -522,7 +478,7 @@ impl BlockpartyService {
         if address == group.admin_address {
             return Err(BlockpartyServiceError::AdminCannotRejoin);
         }
-        if bp_db::find_blockparty_member_by_address(&self.pool, &address)
+        if bp_db::find_blockparty_member_by_address(&self.payouts.pool, &address)
             .await?
             .is_some()
         {
@@ -533,13 +489,22 @@ impl BlockpartyService {
         }
 
         let email = self.hooks.verified_email_for(&address).await;
-        if email.is_none() && !bp_db::is_address_ownership_verified(&self.pool, &address).await? {
+        if email.is_none()
+            && !bp_db::is_address_ownership_verified(&self.payouts.pool, &address).await?
+        {
             return Err(BlockpartyServiceError::EmailNotVerified);
         }
         let email = email.map(|e| e.to_ascii_lowercase()).unwrap_or_default();
 
         match bp_db::insert_blockparty_member(
-            &self.pool, group.id, &address, &email, 0, "member", None, now,
+            &self.payouts.pool,
+            group.id,
+            &address,
+            &email,
+            0,
+            "member",
+            None,
+            now,
         )
         .await
         {
@@ -555,7 +520,7 @@ impl BlockpartyService {
         let t = InvitationToken::generate()?;
         let hash = t.hash();
         bp_db::update_blockparty_member_confirmed(
-            &self.pool,
+            &self.payouts.pool,
             group.id,
             &address,
             None,
@@ -566,7 +531,7 @@ impl BlockpartyService {
 
         if group.status == BlockpartyStatus::Draft.as_str() {
             bp_db::update_blockparty_group_status(
-                &self.pool,
+                &self.payouts.pool,
                 group.id,
                 BlockpartyStatus::Confirming.as_str(),
                 now,
@@ -588,14 +553,16 @@ impl BlockpartyService {
         &self,
         link_token: &str,
     ) -> Result<Option<(BlockpartyGroupRow, i64)>, BlockpartyServiceError> {
-        let link = match bp_db::find_blockparty_join_link_by_token(&self.pool, link_token).await? {
+        let link = match bp_db::find_blockparty_join_link_by_token(&self.payouts.pool, link_token)
+            .await?
+        {
             Some(l) => l,
             None => return Ok(None),
         };
         if link.expires_at < now_ms() {
             return Ok(None);
         }
-        let group = bp_db::find_blockparty_group(&self.pool, link.group_id).await?;
+        let group = bp_db::find_blockparty_group(&self.payouts.pool, link.group_id).await?;
         Ok(group
             .filter(|g| g.dissolved_at.is_none())
             .map(|g| (g, link.expires_at)))
@@ -613,7 +580,8 @@ impl BlockpartyService {
         if address == group.admin_address {
             return Err(BlockpartyServiceError::AdminCannotBeRemoved);
         }
-        let affected = bp_db::delete_blockparty_member(&self.pool, group_id, &address).await?;
+        let affected =
+            bp_db::delete_blockparty_member(&self.payouts.pool, group_id, &address).await?;
         if affected == 0 {
             return Err(BlockpartyServiceError::NotMember);
         }
@@ -639,7 +607,12 @@ impl BlockpartyService {
         }
 
         let now = now_ms();
-        let mut tx = self.pool.begin().await.map_err(bp_db::DbError::from)?;
+        let mut tx = self
+            .payouts
+            .pool
+            .begin()
+            .await
+            .map_err(bp_db::DbError::from)?;
         for (addr, pct) in updates {
             let affected = sqlx::query!(
                 r#"UPDATE blockparty_member
@@ -695,7 +668,7 @@ impl BlockpartyService {
         group_id: Uuid,
         address: &AddressId,
     ) -> Result<MarkMemberConfirmedResult, BlockpartyServiceError> {
-        let member = bp_db::find_blockparty_member_in_group(&self.pool, group_id, address)
+        let member = bp_db::find_blockparty_member_in_group(&self.payouts.pool, group_id, address)
             .await?
             .ok_or(BlockpartyServiceError::NotMember)?;
 
@@ -716,7 +689,12 @@ impl BlockpartyService {
 
         // One TX with the status recompute: a crash between them would leave
         // a fully-confirmed party stuck in confirming, never routable.
-        let mut tx = self.pool.begin().await.map_err(bp_db::DbError::from)?;
+        let mut tx = self
+            .payouts
+            .pool
+            .begin()
+            .await
+            .map_err(bp_db::DbError::from)?;
         bp_db::update_blockparty_member_confirmed(
             &mut *tx,
             group_id,
@@ -750,7 +728,12 @@ impl BlockpartyService {
         }
         let now = now_ms();
         // Atomic confirm + status recompute — see mark_member_confirmed.
-        let mut tx = self.pool.begin().await.map_err(bp_db::DbError::from)?;
+        let mut tx = self
+            .payouts
+            .pool
+            .begin()
+            .await
+            .map_err(bp_db::DbError::from)?;
         bp_db::update_blockparty_member_confirmed(
             &mut *tx,
             group_id,
@@ -786,7 +769,8 @@ impl BlockpartyService {
             }
             BlockpartyStatus::Draft => {}
         }
-        let members = bp_db::list_blockparty_members_for_group(&self.pool, group_id).await?;
+        let members =
+            bp_db::list_blockparty_members_for_group(&self.payouts.pool, group_id).await?;
         if members.is_empty() {
             return Err(BlockpartyServiceError::NoMembers);
         }
@@ -796,7 +780,7 @@ impl BlockpartyService {
         }
         let now = now_ms();
         bp_db::update_blockparty_group_status(
-            &self.pool,
+            &self.payouts.pool,
             group_id,
             BlockpartyStatus::Confirming.as_str(),
             now,
@@ -812,7 +796,12 @@ impl BlockpartyService {
     /// [`recompute_status_in_tx`] in a standalone TX, then the cache update
     /// the module invariant requires.
     async fn recompute_status(&self, group_id: Uuid) -> Result<(), BlockpartyServiceError> {
-        let mut tx = self.pool.begin().await.map_err(bp_db::DbError::from)?;
+        let mut tx = self
+            .payouts
+            .pool
+            .begin()
+            .await
+            .map_err(bp_db::DbError::from)?;
         let outcome = recompute_status_in_tx(&mut tx, group_id, now_ms()).await?;
         tx.commit().await.map_err(bp_db::DbError::from)?;
         if let Some(o) = outcome {
@@ -866,7 +855,12 @@ impl BlockpartyService {
         // otherwise lock them out of every later party, and the
         // custom-extranonce Solo check reads the same rows.
         let now = now_ms();
-        let mut tx = self.pool.begin().await.map_err(bp_db::DbError::from)?;
+        let mut tx = self
+            .payouts
+            .pool
+            .begin()
+            .await
+            .map_err(bp_db::DbError::from)?;
         bp_db::delete_blockparty_members_for_group(&mut *tx, group_id).await?;
         bp_db::delete_blockparty_join_link(&mut *tx, group_id).await?;
         bp_db::update_blockparty_group_dissolved(&mut *tx, group_id, now, now).await?;
@@ -897,7 +891,7 @@ impl BlockpartyService {
             }
         });
         bp_db::update_blockparty_group_rental_hint(
-            &self.pool,
+            &self.payouts.pool,
             group_id,
             cleaned.as_deref(),
             now_ms(),
@@ -917,7 +911,8 @@ impl BlockpartyService {
         let Some(entry) = self.cache.get_admin(admin_address).await else {
             return Ok(());
         };
-        let Some(group) = bp_db::find_blockparty_group(&self.pool, entry.group_id).await? else {
+        let Some(group) = bp_db::find_blockparty_group(&self.payouts.pool, entry.group_id).await?
+        else {
             return Ok(());
         };
         if group.status == BlockpartyStatus::Dissolved.as_str() {
@@ -935,7 +930,7 @@ impl BlockpartyService {
         };
         let now = now_ms();
         bp_db::update_blockparty_group_last_share_and_status(
-            &self.pool,
+            &self.payouts.pool,
             entry.group_id,
             now,
             next.as_str(),
@@ -948,34 +943,6 @@ impl BlockpartyService {
                 .await;
         }
         Ok(())
-    }
-
-    /// Idempotent via UNIQUE(groupId, blockHash): `None` on replay.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn on_block_found(
-        &self,
-        group_id: Uuid,
-        block_height: i32,
-        block_hash: &str,
-        coinbase_value_sats: bp_common::Sats,
-        pool_fee_sats: bp_common::Sats,
-        splits: &[BlockpartySplitSnapshot],
-        found_at: Option<i64>,
-    ) -> Result<Option<BlockpartyBlockHistoryRow>, BlockpartyServiceError> {
-        let now = now_ms();
-        let row = bp_db::insert_blockparty_block_history(
-            &self.pool,
-            group_id,
-            block_height,
-            block_hash,
-            found_at.unwrap_or(now),
-            coinbase_value_sats,
-            pool_fee_sats,
-            splits,
-            now,
-        )
-        .await?;
-        Ok(row)
     }
 }
 

@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::block_sink::TdpBlockSubmissionSink;
 use crate::boot::FoundationHandles;
 use crate::engines::{BlitzpoolModeGate, EngineHandles};
-use crate::group_service::SharedGroupService;
+use crate::membership::Membership;
 
 /// Per-port SV1 server, one per enabled `[stratum]`/`[pplns]` port.
 /// [`crate::stratum::spawn`] binds one listener per port and dispatches on
@@ -53,7 +53,7 @@ pub(crate) fn build_per_port_servers(
     cfg: &AppConfig,
     foundation: &FoundationHandles,
     engines: &EngineHandles,
-    group_service: &SharedGroupService,
+    membership: &Membership,
     payout_resolver: Arc<dyn bp_stratum_v1::PayoutResolver>,
     dispatcher: Option<Arc<bp_notifications::dispatcher::NotificationDispatcher>>,
     device_status_sink: Arc<dyn bp_share_hook::DeviceStatusSink>,
@@ -92,7 +92,6 @@ pub(crate) fn build_per_port_servers(
             })?;
     }
 
-    let lookup: Arc<dyn GroupLookup> = group_service.service.clone();
     let mut out: Vec<Sv1PortServer> = Vec::with_capacity(port_configs.len());
 
     // One pool-wide extranonce1 allocator across every SV1 port, so no two
@@ -105,7 +104,7 @@ pub(crate) fn build_per_port_servers(
             block_sink.clone(),
             payout_resolver.clone(),
             engines,
-            lookup.clone(),
+            membership,
             device_status_sink.clone(),
             Arc::clone(&live_sessions),
         );
@@ -207,7 +206,7 @@ fn build_port_hooks(
     block_sink: Arc<dyn bp_stratum_v1::BlockSubmissionSink>,
     payout_resolver: Arc<dyn bp_stratum_v1::PayoutResolver>,
     engines: &EngineHandles,
-    group_lookup: Arc<dyn GroupLookup>,
+    membership: &Membership,
     device_status_sink: Arc<dyn bp_share_hook::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
 ) -> ServerHooks {
@@ -226,7 +225,7 @@ fn build_port_hooks(
         session_persistence: ModeGatePopulatingPersistence::for_port(
             port_payout_mode,
             engines,
-            group_lookup,
+            membership,
             live_sessions,
         ),
         payout_resolver,
@@ -304,12 +303,12 @@ impl ModeGatePopulatingPersistence {
     pub(crate) fn for_port(
         port_payout_mode: MiningMode,
         engines: &EngineHandles,
-        group_lookup: Arc<dyn GroupLookup>,
+        membership: &Membership,
         live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
     ) -> Arc<dyn SharedSessionPersistence> {
-        let blockparty: Option<Arc<dyn BlockpartyAdminLookup>> = engines
-            .blockparty
-            .clone()
+        let group_lookup: Arc<dyn GroupLookup> = membership.group.service.clone();
+        let blockparty: Option<Arc<dyn BlockpartyAdminLookup>> = membership
+            .blockparty_service()
             .map(|bp| Arc::new(BlockpartyServiceAdminLookup(bp)) as Arc<dyn BlockpartyAdminLookup>);
         Arc::new(Self::new(
             port_payout_mode,

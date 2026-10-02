@@ -18,8 +18,8 @@ use tracing::{info, warn};
 
 use crate::boot::FoundationHandles;
 use crate::engines::EngineHandles;
-use crate::group_service::SharedGroupService;
 use crate::hooks::ProductionHooks;
+use crate::membership::Membership;
 
 #[derive(Debug, Error)]
 pub(crate) enum ApiServerError {
@@ -42,17 +42,9 @@ pub(crate) async fn spawn(
     foundation: &FoundationHandles,
     engines: &EngineHandles,
     production_hooks: &ProductionHooks,
-    group_service: &SharedGroupService,
-    blockparty: Option<&crate::blockparty_service::SharedBlockparty>,
+    membership: &Membership,
 ) -> Result<ApiServerHandle, ApiServerError> {
-    let state = build_app_state(
-        cfg,
-        foundation,
-        engines,
-        production_hooks,
-        group_service,
-        blockparty,
-    );
+    let state = build_app_state(cfg, foundation, engines, production_hooks, membership);
     let router = build_router(state);
 
     let addr: SocketAddr = ([0, 0, 0, 0], cfg.api.port).into();
@@ -79,11 +71,10 @@ fn build_app_state(
     foundation: &FoundationHandles,
     engines: &EngineHandles,
     production_hooks: &ProductionHooks,
-    group_service: &SharedGroupService,
-    blockparty: Option<&crate::blockparty_service::SharedBlockparty>,
+    membership: &Membership,
 ) -> Arc<AppState> {
     let pool = foundation.db.pool().clone();
-    let group_service = group_service.service.clone();
+    let group_service = membership.group.service.clone();
     let invitation_service = Arc::new(InvitationService::new(pool.clone(), group_service.clone()));
     let join_request_service = Arc::new(JoinRequestService::new(
         pool.clone(),
@@ -114,7 +105,7 @@ fn build_app_state(
         group_service: Some(group_service),
         invitation_service: Some(invitation_service),
         join_request_service: Some(join_request_service),
-        blockparty: blockparty.map(|bp| bp.service.clone()),
+        blockparty: membership.blockparty_service(),
         tdp: tdp_clone,
         tdp_staleness_threshold_ms: (cfg.tdp.staleness_threshold_secs as i64) * 1000,
         bitcoin_rpc: bitcoin_rpc_arc,

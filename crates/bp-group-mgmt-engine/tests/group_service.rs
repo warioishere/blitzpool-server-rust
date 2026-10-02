@@ -117,7 +117,9 @@ async fn create_group_happy_path_returns_token_and_seeds_creator() {
         None => return,
     };
     let hooks = TestHooks::new(None);
-    let svc = GroupService::new(pool.clone(), Arc::new(hooks.clone()), 14, TEST_COINBASE_CAP);
+    let svc = GroupService::load(pool.clone(), Arc::new(hooks.clone()), 14, TEST_COINBASE_CAP)
+        .await
+        .expect("load group service");
     let name = format!("test-create-{}", Uuid::new_v4());
     let creator = format!("bc1qcreator{}", Uuid::new_v4().simple());
     let result = svc.create_group(&name, &creator).await.expect("create");
@@ -140,7 +142,9 @@ async fn create_group_defaults_to_prop_mode() {
         None => return,
     };
     let hooks = TestHooks::new(None);
-    let svc = GroupService::new(pool.clone(), Arc::new(hooks), 14, TEST_COINBASE_CAP);
+    let svc = GroupService::load(pool.clone(), Arc::new(hooks), 14, TEST_COINBASE_CAP)
+        .await
+        .expect("load group service");
     let name = format!("test-mode-default-{}", Uuid::new_v4());
     let creator = format!("bc1qpropdef{}", Uuid::new_v4().simple());
     let result = svc.create_group(&name, &creator).await.expect("create");
@@ -156,7 +160,9 @@ async fn create_group_with_window_mode_persists_window() {
         None => return,
     };
     let hooks = TestHooks::new(None);
-    let svc = GroupService::new(pool.clone(), Arc::new(hooks), 14, TEST_COINBASE_CAP);
+    let svc = GroupService::load(pool.clone(), Arc::new(hooks), 14, TEST_COINBASE_CAP)
+        .await
+        .expect("load group service");
     let name = format!("test-mode-window-{}", Uuid::new_v4());
     let creator = format!("bc1qwindow{}", Uuid::new_v4().simple());
     let result = svc
@@ -182,12 +188,14 @@ async fn create_group_rejects_invalid_name() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(
+    let svc = GroupService::load(
         pool.clone(),
         Arc::new(TestHooks::new(None)),
         14,
         TEST_COINBASE_CAP,
-    );
+    )
+    .await
+    .expect("load group service");
     let err = svc
         .create_group("ab", "bc1qx")
         .await
@@ -207,12 +215,14 @@ async fn create_group_rejects_duplicate_name() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(
+    let svc = GroupService::load(
         pool.clone(),
         Arc::new(TestHooks::new(None)),
         14,
         TEST_COINBASE_CAP,
-    );
+    )
+    .await
+    .expect("load group service");
     let name = format!("dup-{}", Uuid::new_v4());
     let first = svc
         .create_group(&name, &format!("bc1qfirst{}", Uuid::new_v4().simple()))
@@ -232,12 +242,14 @@ async fn create_group_rejects_address_already_in_group() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(
+    let svc = GroupService::load(
         pool.clone(),
         Arc::new(TestHooks::new(None)),
         14,
         TEST_COINBASE_CAP,
-    );
+    )
+    .await
+    .expect("load group service");
     let shared_addr = format!("bc1qshared{}", Uuid::new_v4().simple());
     let g1 = svc
         .create_group(&format!("a-{}", Uuid::new_v4()), &shared_addr)
@@ -259,12 +271,14 @@ async fn group_active_from_creation_and_stays_after_add() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(
+    let svc = GroupService::load(
         pool.clone(),
         Arc::new(TestHooks::new(None)),
         14,
         TEST_COINBASE_CAP,
-    );
+    )
+    .await
+    .expect("load group service");
     let creator = format!("bc1qcr{}", Uuid::new_v4().simple());
     let new_member = format!("bc1qnew{}", Uuid::new_v4().simple());
     let g = svc
@@ -292,12 +306,14 @@ async fn add_member_rejects_address_in_other_group() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(
+    let svc = GroupService::load(
         pool.clone(),
         Arc::new(TestHooks::new(None)),
         14,
         TEST_COINBASE_CAP,
-    );
+    )
+    .await
+    .expect("load group service");
     let g1_creator = format!("bc1qg1cr{}", Uuid::new_v4().simple());
     let g2_creator = format!("bc1qg2cr{}", Uuid::new_v4().simple());
     let shared = format!("bc1qshared{}", Uuid::new_v4().simple());
@@ -329,12 +345,14 @@ async fn require_admin_token_rejects_invalid() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(
+    let svc = GroupService::load(
         pool.clone(),
         Arc::new(TestHooks::new(None)),
         14,
         TEST_COINBASE_CAP,
-    );
+    )
+    .await
+    .expect("load group service");
     let g = svc
         .create_group(
             &format!("auth-{}", Uuid::new_v4()),
@@ -369,12 +387,14 @@ async fn remove_member_creator_rejected() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(
+    let svc = GroupService::load(
         pool.clone(),
         Arc::new(TestHooks::new(None)),
         14,
         TEST_COINBASE_CAP,
-    );
+    )
+    .await
+    .expect("load group service");
     let creator = format!("bc1qrmc{}", Uuid::new_v4().simple());
     let g = svc
         .create_group(&format!("rm-{}", Uuid::new_v4()), &creator)
@@ -396,12 +416,14 @@ async fn remove_member_inactivity_guard_then_kick_succeeds() {
     };
     // First with last_active = now (still active): expect StillActive
     let hooks_active = TestHooks::new(Some(now_ms()));
-    let svc_active = GroupService::new(
+    let svc_active = GroupService::load(
         pool.clone(),
         Arc::new(hooks_active.clone()),
         14,
         TEST_COINBASE_CAP,
-    );
+    )
+    .await
+    .expect("load group service");
     let creator = format!("bc1qrmkc{}", Uuid::new_v4().simple());
     let target = format!("bc1qrmkt{}", Uuid::new_v4().simple());
     let g = svc_active
@@ -420,12 +442,14 @@ async fn remove_member_inactivity_guard_then_kick_succeeds() {
 
     // Now with last_active 30 days ago: kick succeeds.
     let hooks_old = TestHooks::new(Some(now_ms() - 30 * 86_400_000));
-    let svc_old = GroupService::new(
+    let svc_old = GroupService::load(
         pool.clone(),
         Arc::new(hooks_old.clone()),
         14,
         TEST_COINBASE_CAP,
-    );
+    )
+    .await
+    .expect("load group service");
     svc_old
         .remove_member(g.group.id, &target, Some(&g.admin_token))
         .await
@@ -449,7 +473,9 @@ async fn remove_member_keeps_group_active_down_to_creator() {
     };
     // last_active = 30 days ago so the kick-inactivity guard passes.
     let hooks = TestHooks::new(Some(now_ms() - 30 * 86_400_000));
-    let svc = GroupService::new(pool.clone(), Arc::new(hooks), 14, TEST_COINBASE_CAP);
+    let svc = GroupService::load(pool.clone(), Arc::new(hooks), 14, TEST_COINBASE_CAP)
+        .await
+        .expect("load group service");
     let creator = format!("bc1qrmact_c{}", Uuid::new_v4().simple());
     let member = format!("bc1qrmact_m{}", Uuid::new_v4().simple());
     let g = svc
@@ -481,12 +507,14 @@ async fn transfer_creator_rotates_role_and_token() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(
+    let svc = GroupService::load(
         pool.clone(),
         Arc::new(TestHooks::new(None)),
         14,
         TEST_COINBASE_CAP,
-    );
+    )
+    .await
+    .expect("load group service");
     let old_creator = format!("bc1qtcold{}", Uuid::new_v4().simple());
     let new_creator = format!("bc1qtcnew{}", Uuid::new_v4().simple());
     let g = svc
@@ -542,12 +570,14 @@ async fn transfer_creator_rejects_non_member() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(
+    let svc = GroupService::load(
         pool.clone(),
         Arc::new(TestHooks::new(None)),
         14,
         TEST_COINBASE_CAP,
-    );
+    )
+    .await
+    .expect("load group service");
     let g = svc
         .create_group(
             &format!("tcnm-{}", Uuid::new_v4()),
@@ -573,7 +603,9 @@ async fn update_round_reset_config_applies_and_fires_hook() {
         None => return,
     };
     let hooks = TestHooks::new(None);
-    let svc = GroupService::new(pool.clone(), Arc::new(hooks.clone()), 14, TEST_COINBASE_CAP);
+    let svc = GroupService::load(pool.clone(), Arc::new(hooks.clone()), 14, TEST_COINBASE_CAP)
+        .await
+        .expect("load group service");
     let g = svc
         .create_group(
             &format!("rr-{}", Uuid::new_v4()),
@@ -613,12 +645,14 @@ async fn update_round_reset_rejects_invalid_timezone() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(
+    let svc = GroupService::load(
         pool.clone(),
         Arc::new(TestHooks::new(None)),
         14,
         TEST_COINBASE_CAP,
-    );
+    )
+    .await
+    .expect("load group service");
     let g = svc
         .create_group(
             &format!("rrbad-{}", Uuid::new_v4()),
@@ -648,12 +682,14 @@ async fn update_round_reset_rejects_a_bonus_past_the_ppm_cap() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(
+    let svc = GroupService::load(
         pool.clone(),
         Arc::new(TestHooks::new(None)),
         14,
         TEST_COINBASE_CAP,
-    );
+    )
+    .await
+    .expect("load group service");
     let g = svc
         .create_group(
             &format!("rrlow-{}", Uuid::new_v4()),
@@ -685,7 +721,9 @@ async fn dissolve_group_removes_members_and_marks_row() {
         None => return,
     };
     let hooks = TestHooks::new(None);
-    let svc = GroupService::new(pool.clone(), Arc::new(hooks.clone()), 14, TEST_COINBASE_CAP);
+    let svc = GroupService::load(pool.clone(), Arc::new(hooks.clone()), 14, TEST_COINBASE_CAP)
+        .await
+        .expect("load group service");
     let g = svc
         .create_group(
             &format!("diss-{}", Uuid::new_v4()),
@@ -725,12 +763,14 @@ async fn address_cache_reflects_membership_changes() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(
+    let svc = GroupService::load(
         pool.clone(),
         Arc::new(TestHooks::new(None)),
         14,
         TEST_COINBASE_CAP,
-    );
+    )
+    .await
+    .expect("load group service");
     let creator = format!("bc1qcc{}", Uuid::new_v4().simple());
     let cache_addr = AddressId::new(creator.to_lowercase()).unwrap();
     let g = svc
@@ -770,12 +810,14 @@ async fn address_cache_rebuild_skips_invalid_address_member() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(
+    let svc = GroupService::load(
         pool.clone(),
         Arc::new(TestHooks::new(None)),
         14,
         TEST_COINBASE_CAP,
-    );
+    )
+    .await
+    .expect("load group service");
     let creator = format!("bc1qok{}", Uuid::new_v4().simple());
     let good_addr = AddressId::new(creator.to_lowercase()).unwrap();
     let g = svc
@@ -832,7 +874,9 @@ async fn null_max_members_still_stops_at_the_coinbase_ceiling() {
         None => return,
     };
     // Ceiling 2: the creator plus exactly one more.
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(None)), 14, 2);
+    let svc = GroupService::load(pool.clone(), Arc::new(TestHooks::new(None)), 14, 2)
+        .await
+        .expect("load group service");
     let g = svc
         .create_group(
             &format!("cap-null-{}", Uuid::new_v4()),
@@ -864,7 +908,9 @@ async fn operator_max_members_still_binds_below_the_ceiling() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(None)), 14, 50);
+    let svc = GroupService::load(pool.clone(), Arc::new(TestHooks::new(None)), 14, 50)
+        .await
+        .expect("load group service");
     let g = svc
         .create_group(
             &format!("cap-op-{}", Uuid::new_v4()),
@@ -902,7 +948,9 @@ async fn max_members_above_the_coinbase_ceiling_is_refused() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(None)), 14, 52);
+    let svc = GroupService::load(pool.clone(), Arc::new(TestHooks::new(None)), 14, 52)
+        .await
+        .expect("load group service");
     let g = svc
         .create_group(
             &format!("cap-patch-{}", Uuid::new_v4()),

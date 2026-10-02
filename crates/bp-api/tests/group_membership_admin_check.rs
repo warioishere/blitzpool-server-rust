@@ -11,7 +11,7 @@ use std::sync::Arc;
 use axum::body::to_bytes;
 use axum::http::{Request, StatusCode};
 use bp_api::{build_router, AppState};
-use bp_blockparty_engine::{BlockpartyService, BlockpartyServiceConfig};
+use bp_blockparty_engine::{BlockpartyPayoutConfig, BlockpartyPayouts, BlockpartyService};
 use bp_group_mgmt_engine::{AddressCache, GroupService, NoopHooks};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use tower::ServiceExt;
@@ -73,12 +73,11 @@ async fn group_solo_membership_and_admin_check() {
         .bind(name)
         .execute(&pool)
         .await;
-    let svc = Arc::new(GroupService::new(
-        pool.clone(),
-        Arc::new(NoopHooks),
-        14,
-        10_000,
-    ));
+    let svc = Arc::new(
+        GroupService::load(pool.clone(), Arc::new(NoopHooks), 14, 10_000)
+            .await
+            .expect("load group service"),
+    );
     let created = svc.create_group(name, creator).await.expect("create group");
     let id = created.group.id;
 
@@ -141,16 +140,22 @@ async fn blockparty_admin_check() {
         .bind(name)
         .execute(&pool)
         .await;
-    let svc = Arc::new(BlockpartyService::new(
-        pool.clone(),
-        Arc::new(bp_blockparty_engine::NoopHooks::default()),
-        AddressCache::new(),
-        BlockpartyServiceConfig {
-            fee_address: None,
-            fee_percent: 0.0,
-            min_payout_sats: bp_common::Sats(5_000),
-        },
-    ));
+    let svc = Arc::new(
+        BlockpartyService::load(
+            BlockpartyPayouts::new(
+                pool.clone(),
+                BlockpartyPayoutConfig {
+                    fee_address: None,
+                    fee_percent: 0.0,
+                    min_payout_sats: bp_common::Sats(5_000),
+                },
+            ),
+            Arc::new(bp_blockparty_engine::NoopHooks::default()),
+            AddressCache::new(),
+        )
+        .await
+        .expect("load blockparty service"),
+    );
     let created = svc
         .create_group(name, admin, 10_000)
         .await

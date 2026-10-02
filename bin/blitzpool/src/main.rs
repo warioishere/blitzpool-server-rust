@@ -39,6 +39,7 @@ mod jdp_hooks;
 mod listeners;
 mod live_mode_marker;
 mod live_sessions;
+mod membership;
 mod network_difficulty;
 mod payout_resolver;
 mod pending_blocks;
@@ -296,7 +297,7 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let mut engines = match engines::spawn(&cfg, &handles).await {
+    let engines = match engines::spawn(&cfg, &handles).await {
         Ok(e) => e,
         Err(err) => {
             tracing::error!(%err, "engine spawn failed");
@@ -390,87 +391,74 @@ async fn main() -> ExitCode {
         )
     });
 
-    // Only the front (routing) and the API (group endpoints) read the group
-    // and Blockparty caches; the other roles skip the boot warm-up.
-    let reads_caches = is_front || is_api;
-    let group_service = match group_service::spawn(
-        &handles,
-        &production_hooks,
-        &engines.group_solo,
-        reads_caches,
-    )
-    .await
-    {
-        Ok(g) => g,
-        Err(err) => {
-            tracing::error!(%err, "group-service spawn failed");
-            eprintln!("blitzpool: {err}");
-            print_group_service_error_help(&err);
-            return ExitCode::from(7);
-        }
-    };
-
-    let blockparty =
-        match blockparty_service::spawn(&cfg, &handles, &group_service, reads_caches).await {
-            Ok(bp) => bp,
-            Err(err) => {
-                tracing::error!(%err, "blockparty spawn failed");
-                eprintln!("blitzpool: {err}");
-                return ExitCode::from(11);
+    // The group and Blockparty routing caches exist only where they are read:
+    // the front's routing and the API's group endpoints.
+    let membership = if is_front || is_api {
+        let group =
+            match group_service::spawn(&handles, &production_hooks, &engines.group_solo).await {
+                Ok(g) => g,
+                Err(err) => {
+                    tracing::error!(%err, "group-service spawn failed");
+                    eprintln!("blitzpool: {err}");
+                    print_group_service_error_help(&err);
+                    return ExitCode::from(7);
+                }
+            };
+        let blockparty = match engines.blockparty_payouts.as_ref() {
+            Some(payouts) => {
+                match blockparty_service::spawn(&cfg, &handles, payouts, &group).await {
+                    Ok(bp) => Some(bp),
+                    Err(err) => {
+                        tracing::error!(%err, "blockparty spawn failed");
+                        eprintln!("blitzpool: {err}");
+                        return ExitCode::from(11);
+                    }
+                }
             }
+            None => None,
         };
-    if let Some(ref bp) = blockparty {
-        // Before stratum::spawn, so its payout resolver gets the Blockparty
-        // arm and the pending-fee guard.
-        engines.blockparty = Some(bp.service.clone());
-        // The first share of a routable admin promotes the party READY →
-        // ACTIVE. Only here: the front's party cache is the one cache_sync
-        // keeps current, so a party created after a satellite booted is seen.
-        if let Some(accepted_sink) = engines.accepted_sink.as_ref() {
-            accepted_sink.push(Arc::new(
-                crate::blockparty_service::BlockpartyAcceptedShareSink::new(bp.service.clone()),
-            ));
+        if let Some(ref bp) = blockparty {
+            // The first share of a routable admin promotes the party READY →
+            // ACTIVE. Only on the front: the accepted composite exists there,
+            // and its party cache is the one cache_sync keeps current.
+            if let Some(accepted_sink) = engines.accepted_sink.as_ref() {
+                accepted_sink.push(Arc::new(
+                    crate::blockparty_service::BlockpartyAcceptedShareSink::new(bp.service.clone()),
+                ));
+            }
+            // Group joins refuse addresses already in a Blockparty.
+            group
+                .service
+                .set_blockparty_reader(bp.membership_reader.clone());
         }
-        // Group joins refuse addresses already in a Blockparty.
-        group_service
-            .service
-            .set_blockparty_reader(bp.membership_reader.clone());
-    }
+        Some(membership::Membership { group, blockparty })
+    } else {
+        None
+    };
 
     // The API writes memberships, so it publishes every group/party change to
     // `cache:invalidate`; the front rebuilds its routing from it without a
     // restart.
-    if is_api {
-        let notifier = Arc::new(crate::cache_sync::StreamCacheNotifier::new(
-            handles.redis.clone(),
-        ));
-        group_service.service.set_change_notifier(notifier.clone());
-        if let Some(bp) = blockparty.as_ref() {
-            bp.service.set_change_notifier(notifier);
-        }
-    }
-
-    let api = if is_api {
-        match api_server::spawn(
-            &cfg,
-            &handles,
-            &engines,
-            &production_hooks,
-            &group_service,
-            blockparty.as_ref(),
-        )
-        .await
-        {
-            Ok(h) => Some(h),
-            Err(err) => {
-                tracing::error!(%err, "api server bind failed");
-                eprintln!("blitzpool: {err}");
-                print_api_error_help(&err);
-                return ExitCode::from(6);
+    let api = match membership.as_ref().filter(|_| is_api) {
+        Some(m) => {
+            let notifier = Arc::new(crate::cache_sync::StreamCacheNotifier::new(
+                handles.redis.clone(),
+            ));
+            m.group.service.set_change_notifier(notifier.clone());
+            if let Some(bp) = m.blockparty.as_ref() {
+                bp.service.set_change_notifier(notifier);
+            }
+            match api_server::spawn(&cfg, &handles, &engines, &production_hooks, m).await {
+                Ok(h) => Some(h),
+                Err(err) => {
+                    tracing::error!(%err, "api server bind failed");
+                    eprintln!("blitzpool: {err}");
+                    print_api_error_help(&err);
+                    return ExitCode::from(6);
+                }
             }
         }
-    } else {
-        None
+        None => None,
     };
     log_api_summary(api.as_ref(), is_api);
 
@@ -489,12 +477,12 @@ async fn main() -> ExitCode {
     // bridge would leave the mining side reading a registry nobody writes.
     let jdp_bridge = stratum_v2::build_bridge();
 
-    let stratum = if is_front {
-        match stratum::spawn(
+    let stratum = match membership.as_ref().filter(|_| is_front) {
+        Some(m) => match stratum::spawn(
             &cfg,
             &handles,
             &engines,
-            &group_service,
+            m,
             dispatcher.clone(),
             device_status_gate.clone(),
             settle_signal.clone(),
@@ -509,9 +497,8 @@ async fn main() -> ExitCode {
                 print_stratum_error_help(&err);
                 return ExitCode::from(8);
             }
-        }
-    } else {
-        None
+        },
+        None => None,
     };
     log_stratum_summary(stratum.as_ref(), is_front);
 
@@ -650,7 +637,7 @@ async fn main() -> ExitCode {
         let applier = crate::block_sink::BlockFoundApplier::new(
             engines.pplns.clone(),
             Some(engines.group_solo.clone()),
-            engines.blockparty.clone(),
+            engines.blockparty_payouts.clone(),
             None,
             Some(handles.redis.clone()),
             Some(settle_signal.clone()),
@@ -755,18 +742,19 @@ async fn main() -> ExitCode {
 
     // Keep the front's routing caches in sync with membership changes made
     // by the api, from `cache:invalidate` plus a periodic rebuild.
-    let cache_sync = if is_front {
-        // Dedicated: the blocking XREAD would stall the per-share `XADD`.
-        let cache_conn = handles.dedicated_redis(&cfg.redis, "cache-sync").await;
-        Some(crate::cache_sync::spawn(
-            cache_conn,
-            group_service.clone(),
-            blockparty.as_ref().map(|bp| bp.service.clone()),
-            engines.mode_gate.clone(),
-            settle_signal.registry_slot(),
-        ))
-    } else {
-        None
+    let cache_sync = match membership.as_ref().filter(|_| is_front) {
+        Some(m) => {
+            // Dedicated: the blocking XREAD would stall the per-share `XADD`.
+            let cache_conn = handles.dedicated_redis(&cfg.redis, "cache-sync").await;
+            Some(crate::cache_sync::spawn(
+                cache_conn,
+                m.group.clone(),
+                m.blockparty_service(),
+                engines.mode_gate.clone(),
+                settle_signal.registry_slot(),
+            ))
+        }
+        None => None,
     };
 
     let any_consume = consumes_streams || consumes_notify_streams;
@@ -808,7 +796,9 @@ async fn main() -> ExitCode {
                             dev_fee_address: cfg.solo.dev_fee_address.clone(),
                             dev_fee_percent: cfg.solo.dev_fee_percent.unwrap_or(0.0),
                         },
-                        engines.blockparty.clone(),
+                        membership
+                            .as_ref()
+                            .and_then(membership::Membership::blockparty_service),
                     ));
                 // Needed to rebuild a full block for `submitblock`. Spawned
                 // before jdp::spawn so it subscribes before the first NewTemplate.

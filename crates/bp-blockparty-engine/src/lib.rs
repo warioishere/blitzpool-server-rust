@@ -7,13 +7,15 @@
 mod cache;
 mod error;
 mod hooks;
+mod payouts;
 mod service;
 mod util;
 
 pub use cache::{AdminCacheEntry, BlockpartyCache};
 pub use error::BlockpartyServiceError;
 pub use hooks::{BlockpartyHooks, NoopHooks};
+pub use payouts::{BlockpartyPayoutConfig, BlockpartyPayouts};
 pub use service::{
-    BlockpartyCreateResult, BlockpartyService, BlockpartyServiceConfig, CoinbaseReservation,
-    MarkMemberConfirmedResult, PendingPartyFeeRoute,
+    BlockpartyCreateResult, BlockpartyService, CoinbaseReservation, MarkMemberConfirmedResult,
+    PendingPartyFeeRoute,
 };

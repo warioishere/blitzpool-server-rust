@@ -75,17 +75,18 @@ pub struct GroupService {
 }
 
 impl GroupService {
-    /// Call [`Self::rebuild_cache`] once at startup, before share submits.
-    /// `coinbase_max_members` (`bp_pplns::max_coinbase_outputs`) is a
-    /// constructor argument, not a setter, so the service cannot be wired
-    /// without the cap the ledger-free Group-Solo payout depends on.
-    pub fn new(
+    /// Builds the service and fills its address cache from PG; there is no
+    /// other constructor, so a process holding a `GroupService` holds a warm
+    /// cache. `coinbase_max_members` (`bp_pplns::max_coinbase_outputs`) is an
+    /// argument, not a setter, so the service cannot be wired without the cap
+    /// the ledger-free Group-Solo payout depends on.
+    pub async fn load(
         pool: PgPool,
         hooks: Arc<dyn GroupServiceHooks>,
         kick_inactivity_days: u32,
         coinbase_max_members: u64,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, GroupServiceError> {
+        let service = Self {
             pool,
             hooks,
             address_cache: AddressCache::new(),
@@ -93,7 +94,9 @@ impl GroupService {
             coinbase_max_members,
             blockparty_reader: Arc::new(std::sync::OnceLock::new()),
             change_notifier: Arc::new(std::sync::OnceLock::new()),
-        }
+        };
+        service.rebuild_cache().await?;
+        Ok(service)
     }
 
     /// The hard member ceiling this service enforces — how many payout
@@ -130,8 +133,8 @@ impl GroupService {
 
     /// Rebuild the local cache after a membership change, then fire the
     /// cross-process invalidation (best-effort). `"group"` matches
-    /// `bp_share_stream::cache_kind::GROUP`. The boot warm-up
-    /// ([`Self::rebuild_cache`]) deliberately does NOT notify.
+    /// `bp_share_stream::cache_kind::GROUP`. [`Self::load`] and
+    /// [`Self::rebuild_cache`] deliberately do NOT notify.
     async fn rebuild_and_notify(&self) -> Result<(), GroupServiceError> {
         self.address_cache.rebuild(&self.pool).await?;
         if let Some(n) = self.change_notifier.get() {

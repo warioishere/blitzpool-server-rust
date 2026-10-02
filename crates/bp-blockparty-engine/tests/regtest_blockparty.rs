@@ -12,7 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bp_blockparty_engine::{BlockpartyHooks, BlockpartyService, BlockpartyServiceConfig};
+use bp_blockparty_engine::{
+    BlockpartyHooks, BlockpartyPayoutConfig, BlockpartyPayouts, BlockpartyService,
+};
 use bp_common::{AddressId, Sats};
 use bp_group_mgmt_engine::AddressCache as PplnsAddressCache;
 use bp_mining_job::PayoutEntry;
@@ -56,7 +58,7 @@ async fn blockparty_ready_party_pays_members_and_history_is_idempotent() {
     let name = format!("bp-regtest-lifecycle-{}", uuid::Uuid::new_v4());
     cleanup_blockparty_rows(&pg, &[&addr_admin, &addr_bob]).await;
 
-    let svc = service(&pg, &addr_fee);
+    let svc = service(&pg, &addr_fee).await;
 
     // ── Lifecycle: create → add_member → confirm → READY ────────
     let create = svc
@@ -92,6 +94,7 @@ async fn blockparty_ready_party_pays_members_and_history_is_idempotent() {
     // ── Build distribution from the live service ─────────────────
     let reward_sats = template.coinbase_tx_value_remaining;
     let dist = svc
+        .payouts()
         .build_payouts(group_id, Sats(reward_sats as i64))
         .await
         .expect("build_payouts")
@@ -127,6 +130,7 @@ async fn blockparty_ready_party_pays_members_and_history_is_idempotent() {
 
     // ── on_block_found: write history + verify idempotency ───────
     let first = svc
+        .payouts()
         .on_block_found(
             group_id,
             mined.height as i32,
@@ -140,6 +144,7 @@ async fn blockparty_ready_party_pays_members_and_history_is_idempotent() {
         .expect("on_block_found first call");
     assert!(first.is_some(), "first call must insert history row");
     let replay = svc
+        .payouts()
         .on_block_found(
             group_id,
             mined.height as i32,
@@ -185,7 +190,7 @@ async fn pending_party_admin_routes_block_to_pool_fee_accepted_by_core() {
     cleanup_blockparty_rows(&pg, &[&addr_admin, &addr_bob]).await;
 
     let fee_addr_id = AddressId::new(addr_fee.clone()).expect("fee addr");
-    let svc = service(&pg, &addr_fee);
+    let svc = service(&pg, &addr_fee).await;
 
     // Create + add member but DON'T confirm Bob. Status: CONFIRMING.
     let create = svc
@@ -249,17 +254,23 @@ async fn pending_party_admin_routes_block_to_pool_fee_accepted_by_core() {
 
 // ─── Shared driver ────────────────────────────────────────────────
 
-fn service(pg: &PgPool, fee_address: &str) -> Arc<BlockpartyService> {
-    Arc::new(BlockpartyService::new(
-        pg.clone(),
-        Arc::new(AllVerified),
-        PplnsAddressCache::new(),
-        BlockpartyServiceConfig {
-            fee_address: Some(AddressId::new(fee_address.to_string()).expect("fee addr")),
-            fee_percent: 2.0,
-            min_payout_sats: Sats(5_000),
-        },
-    ))
+async fn service(pg: &PgPool, fee_address: &str) -> Arc<BlockpartyService> {
+    Arc::new(
+        BlockpartyService::load(
+            BlockpartyPayouts::new(
+                pg.clone(),
+                BlockpartyPayoutConfig {
+                    fee_address: Some(AddressId::new(fee_address.to_string()).expect("fee addr")),
+                    fee_percent: 2.0,
+                    min_payout_sats: Sats(5_000),
+                },
+            ),
+            Arc::new(AllVerified),
+            PplnsAddressCache::new(),
+        )
+        .await
+        .expect("load blockparty service"),
+    )
 }
 
 /// Boot a regtest node past IBD + maturity, attach a `TdpHandle`, drain the

@@ -83,16 +83,15 @@ async fn delete_email_for(pool: &PgPool, address: &str) {
         .await;
 }
 
-fn build_services(
+async fn build_services(
     pool: PgPool,
     limits: JoinRequestLimits,
 ) -> (Arc<GroupService>, JoinRequestService, CapturingEmailHooks) {
-    let group = Arc::new(GroupService::new(
-        pool.clone(),
-        Arc::new(NoopHooks),
-        14,
-        TEST_COINBASE_CAP,
-    ));
+    let group = Arc::new(
+        GroupService::load(pool.clone(), Arc::new(NoopHooks), 14, TEST_COINBASE_CAP)
+            .await
+            .expect("load group service"),
+    );
     let email = CapturingEmailHooks::new();
     let svc = JoinRequestService::new(
         pool,
@@ -141,7 +140,7 @@ async fn create_join_request_happy_path() {
         Some(p) => p,
         None => return,
     };
-    let (group_svc, svc, _email) = build_services(pool.clone(), JoinRequestLimits::default());
+    let (group_svc, svc, _email) = build_services(pool.clone(), JoinRequestLimits::default()).await;
     let suffix = Uuid::new_v4().simple().to_string();
     let (group_id, _admin) = create_public_group(&group_svc, &pool, &suffix).await;
     let requester = format!("bc1qreq{suffix}");
@@ -166,7 +165,7 @@ async fn create_join_request_rejects_private_group_as_not_found() {
         Some(p) => p,
         None => return,
     };
-    let (group_svc, svc, _email) = build_services(pool.clone(), JoinRequestLimits::default());
+    let (group_svc, svc, _email) = build_services(pool.clone(), JoinRequestLimits::default()).await;
     let suffix = Uuid::new_v4().simple().to_string();
     let creator = format!("bc1qpr{suffix}");
     let g = group_svc
@@ -190,7 +189,7 @@ async fn create_join_request_rejects_unverified_email() {
         Some(p) => p,
         None => return,
     };
-    let (group_svc, svc, _email) = build_services(pool.clone(), JoinRequestLimits::default());
+    let (group_svc, svc, _email) = build_services(pool.clone(), JoinRequestLimits::default()).await;
     let suffix = Uuid::new_v4().simple().to_string();
     let (group_id, _admin) = create_public_group(&group_svc, &pool, &suffix).await;
     let requester = format!("bc1qreq{suffix}");
@@ -208,7 +207,7 @@ async fn create_join_request_dup_pending_surfaces_clean_error() {
         Some(p) => p,
         None => return,
     };
-    let (group_svc, svc, _email) = build_services(pool.clone(), JoinRequestLimits::default());
+    let (group_svc, svc, _email) = build_services(pool.clone(), JoinRequestLimits::default()).await;
     let suffix = Uuid::new_v4().simple().to_string();
     let (group_id, _admin) = create_public_group(&group_svc, &pool, &suffix).await;
     let requester = format!("bc1qreq{suffix}");
@@ -233,7 +232,7 @@ async fn approve_request_adds_member_and_sends_email() {
         Some(p) => p,
         None => return,
     };
-    let (group_svc, svc, email) = build_services(pool.clone(), JoinRequestLimits::default());
+    let (group_svc, svc, email) = build_services(pool.clone(), JoinRequestLimits::default()).await;
     let suffix = Uuid::new_v4().simple().to_string();
     let (group_id, admin_token) = create_public_group(&group_svc, &pool, &suffix).await;
     let requester = format!("bc1qreq{suffix}");
@@ -266,7 +265,7 @@ async fn reject_request_marks_row_and_sends_email() {
         Some(p) => p,
         None => return,
     };
-    let (group_svc, svc, email) = build_services(pool.clone(), JoinRequestLimits::default());
+    let (group_svc, svc, email) = build_services(pool.clone(), JoinRequestLimits::default()).await;
     let suffix = Uuid::new_v4().simple().to_string();
     let (group_id, admin_token) = create_public_group(&group_svc, &pool, &suffix).await;
     let requester = format!("bc1qreq{suffix}");
@@ -295,7 +294,7 @@ async fn list_for_group_filters_by_decided() {
         Some(p) => p,
         None => return,
     };
-    let (group_svc, svc, _email) = build_services(pool.clone(), JoinRequestLimits::default());
+    let (group_svc, svc, _email) = build_services(pool.clone(), JoinRequestLimits::default()).await;
     let suffix = Uuid::new_v4().simple().to_string();
     let (group_id, admin_token) = create_public_group(&group_svc, &pool, &suffix).await;
     let r1 = format!("bc1qreqa{suffix}");
@@ -329,7 +328,7 @@ async fn expire_join_requests_once_flips_stale_pending() {
         Some(p) => p,
         None => return,
     };
-    let (group_svc, svc, _email) = build_services(pool.clone(), JoinRequestLimits::default());
+    let (group_svc, svc, _email) = build_services(pool.clone(), JoinRequestLimits::default()).await;
     let suffix = Uuid::new_v4().simple().to_string();
     let (group_id, _admin) = create_public_group(&group_svc, &pool, &suffix).await;
     let requester = format!("bc1qreq{suffix}");

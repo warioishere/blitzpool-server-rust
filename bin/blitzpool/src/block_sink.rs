@@ -165,7 +165,7 @@ pub(crate) struct TdpBlockSubmissionSink {
 pub(crate) struct BlockFoundApplier {
     pplns: Option<PplnsEngine>,
     group_solo: Option<GroupSoloEngine>,
-    blockparty: Option<Arc<bp_blockparty_engine::BlockpartyService>>,
+    blockparty: Option<bp_blockparty_engine::BlockpartyPayouts>,
     dispatcher: Option<Arc<NotificationDispatcher>>,
     /// Pending-block store: a block is parked here by hash and settled by the
     /// confirmation watcher at `confirmation_depth`.
@@ -219,7 +219,7 @@ impl TdpBlockSubmissionSink {
             engines.group_solo.clone(),
             dispatcher,
         )
-        .with_blockparty(engines.blockparty.clone())
+        .with_blockparty(engines.blockparty_payouts.clone())
         .with_redis(foundation.redis.clone())
         .with_settle_handle(settle);
         if cfg.has_role(Role::Front) {
@@ -288,7 +288,7 @@ impl TdpBlockSubmissionSink {
 
     pub(crate) fn with_blockparty(
         mut self,
-        blockparty: Option<Arc<bp_blockparty_engine::BlockpartyService>>,
+        blockparty: Option<bp_blockparty_engine::BlockpartyPayouts>,
     ) -> Self {
         self.applier.blockparty = blockparty;
         self
@@ -550,7 +550,7 @@ impl BlockFoundApplier {
     pub(crate) fn new(
         pplns: Option<PplnsEngine>,
         group_solo: Option<GroupSoloEngine>,
-        blockparty: Option<Arc<bp_blockparty_engine::BlockpartyService>>,
+        blockparty: Option<bp_blockparty_engine::BlockpartyPayouts>,
         dispatcher: Option<Arc<NotificationDispatcher>>,
         redis: Option<ConnectionManager>,
         settle: Option<crate::settlement::SettlementSignal>,
