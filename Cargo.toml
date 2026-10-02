@@ -222,9 +222,11 @@ lettre = { version = "0.11", default-features = false, features = [
     "hostname",
 ] }
 
-# JWT signing for FCM (RS256 with the service-account RSA key) and for
-# VAPID (ES256 with the pool's P-256 private key). One crate, both algos.
-jsonwebtoken = "9"
+# JWT signing for FCM (RS256 with the service-account RSA key) and VAPID
+# (ES256 with the pool's P-256 key), with ring, the TLS provider already in
+# the tree.
+ring = "0.17"
+rustls-pki-types = "1"
 
 # Base64 + base64url encoding for VAPID `k=` header + general use.
 base64 = "0.22"

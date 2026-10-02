@@ -6,12 +6,12 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use super::error::{AdapterError, AdapterResult};
+use super::jwt::JwtKey;
 use super::payload::PushPayload;
 
 const FCM_SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
@@ -57,9 +57,8 @@ pub struct FcmAdapter {
     service_account: FcmServiceAccount,
     cached_token: Arc<Mutex<Option<CachedToken>>>,
     send_url: String,
-    /// Pre-built encoding key: RSA PEM parsing is non-trivial, so it
-    /// happens once at construction.
-    encoding_key: EncodingKey,
+    /// Parsed once at construction.
+    signing_key: Arc<JwtKey>,
 }
 
 impl FcmAdapter {
@@ -68,7 +67,7 @@ impl FcmAdapter {
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|e| AdapterError::Config(format!("reqwest client build: {e}")))?;
-        let encoding_key = EncodingKey::from_rsa_pem(config.service_account.private_key.as_bytes())
+        let signing_key = JwtKey::rs256_from_pem(&config.service_account.private_key)
             .map_err(|e| AdapterError::Config(format!("RSA PEM key: {e}")))?;
         let send_url = format!(
             "https://fcm.googleapis.com/v1/projects/{}/messages:send",
@@ -79,7 +78,7 @@ impl FcmAdapter {
             service_account: config.service_account,
             cached_token: Arc::new(Mutex::new(None)),
             send_url,
-            encoding_key,
+            signing_key: Arc::new(signing_key),
         })
     }
 
@@ -161,7 +160,8 @@ impl FcmAdapter {
             exp: now + 3600,
         };
 
-        jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &self.encoding_key)
+        self.signing_key
+            .sign(&claims)
             .map_err(|e| AdapterError::Encoding(format!("JWT encode: {e}")))
     }
 

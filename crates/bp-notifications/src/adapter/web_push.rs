@@ -8,12 +8,12 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use reqwest::Client;
 use serde::Serialize;
 use tracing::warn;
 
 use super::error::{AdapterError, AdapterResult};
+use super::jwt::JwtKey;
 use super::payload::PushPayload;
 
 #[derive(Debug, Clone)]
@@ -47,7 +47,7 @@ pub struct WebPushAdapter {
 }
 
 struct VapidKey {
-    encoding_key: EncodingKey,
+    signing_key: JwtKey,
     public_key_b64url: String,
     subject: String,
 }
@@ -210,7 +210,9 @@ fn mint_vapid_jwt(vapid: &VapidKey, audience: &str) -> AdapterResult<String> {
         exp,
         sub: &vapid.subject,
     };
-    jsonwebtoken::encode(&Header::new(Algorithm::ES256), &claims, &vapid.encoding_key)
+    vapid
+        .signing_key
+        .sign(&claims)
         .map_err(|e| AdapterError::Encoding(format!("JWT encode: {e}")))
 }
 
@@ -220,7 +222,7 @@ fn mint_vapid_jwt(vapid: &VapidKey, audience: &str) -> AdapterResult<String> {
 fn build_vapid_key(cfg: VapidConfig) -> Result<VapidKey, String> {
     let der = raw_vapid_to_pkcs8_der(&cfg.private_key_b64url, &cfg.public_key_b64url)?;
     let key = VapidKey {
-        encoding_key: EncodingKey::from_ec_der(&der),
+        signing_key: JwtKey::es256_from_pkcs8(&der)?,
         public_key_b64url: cfg.public_key_b64url,
         subject: cfg.subject,
     };

@@ -6,6 +6,7 @@
 
 mod error;
 mod fcm;
+mod jwt;
 mod ntfy;
 mod payload;
 mod smtp;

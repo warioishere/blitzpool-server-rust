@@ -37,7 +37,8 @@ bp-http = { workspace = true }
 lettre = { workspace = true }
 
 # JWT signing for FCM (RS256) + VAPID (ES256).
-jsonwebtoken = { workspace = true }
+ring = { workspace = true }
+rustls-pki-types = { workspace = true }
 
 # Base64-url encoding for VAPID `k=` header.
 base64 = { workspace = true }
