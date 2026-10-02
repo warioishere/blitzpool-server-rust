@@ -516,6 +516,20 @@ async fn client_reset_best_difficulty_succeeds() {
     assert_eq!(json["status"], "reset");
 }
 
+async fn purge_probe(pool: &sqlx::PgPool, addr: &str, worker: &str, session: &str) {
+    for table in ["client_statistics_entity", "client_entity"] {
+        let _ = sqlx::query(&format!(
+            r#"DELETE FROM {table}
+               WHERE address = $1 AND "clientName" = $2 AND "sessionId" = $3"#
+        ))
+        .bind(addr)
+        .bind(worker)
+        .bind(session)
+        .execute(pool)
+        .await;
+    }
+}
+
 #[tokio::test]
 async fn worker_chart_breaks_rejects_down_by_every_reason() {
     let Some(pool) = connect_or_skip().await else {
@@ -534,6 +548,8 @@ async fn worker_chart_breaks_rejects_down_by_every_reason() {
         .previous()
         .as_millis();
 
+    // A run that panicked between seed and cleanup left these rows behind.
+    purge_probe(&pool, addr, worker, session).await;
     let mut tx = pool.begin().await.expect("begin");
     sqlx::query(
         r#"INSERT INTO client_entity (address, "clientName", "sessionId", "startTime")
@@ -584,24 +600,7 @@ async fn worker_chart_breaks_rejects_down_by_every_reason() {
     let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
 
     // Clean up before asserting, so a failure doesn't poison the next run.
-    let _ = sqlx::query(
-        r#"DELETE FROM client_statistics_entity
-           WHERE address = $1 AND "clientName" = $2 AND "sessionId" = $3"#,
-    )
-    .bind(addr)
-    .bind(worker)
-    .bind(session)
-    .execute(&pool)
-    .await;
-    let _ = sqlx::query(
-        r#"DELETE FROM client_entity
-           WHERE address = $1 AND "clientName" = $2 AND "sessionId" = $3"#,
-    )
-    .bind(addr)
-    .bind(worker)
-    .bind(session)
-    .execute(&pool)
-    .await;
+    purge_probe(&pool, addr, worker, session).await;
 
     assert_eq!(status, StatusCode::OK);
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
