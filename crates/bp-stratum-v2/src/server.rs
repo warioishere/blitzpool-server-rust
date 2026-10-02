@@ -1382,13 +1382,18 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
             SessionEvent::ShareRejected { channel_id, reject } => {
                 let address_opt = state.address.as_ref().map(|a| a.as_str());
                 let worker_opt = state.address.as_ref().map(|_| state.worker_name.as_str());
-                let _ = channel_id;
+                // The channel's current difficulty, which vardiff moves; the
+                // session field only holds the difficulty at the last open.
+                let difficulty = state
+                    .channels
+                    .get(&channel_id)
+                    .map_or(state.session_difficulty, |c| c.session_difficulty);
                 if let Some(share) = crate::shared_adapter::shared_rejected(
                     address_opt,
                     worker_opt,
                     session_id_hex,
                     reject.reason,
-                    state.session_difficulty,
+                    difficulty,
                 ) {
                     hooks.rejected_sink.record_rejected(share).await;
                 }
@@ -2024,6 +2029,37 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].reason, bp_share_hook::RejectedReason::Stale);
         assert_eq!(records[0].address.as_deref(), Some(ADDR));
+    }
+
+    /// A reject is weighted with its channel's current difficulty, as SV1 and
+    /// SRI weigh share work, not the session's difficulty at open.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reject_carries_its_channels_current_difficulty() {
+        let recording = RecordingHooks::new();
+        let hooks = recording.clone().into_server_hooks();
+        let mut state = fresh_session_with_address();
+        let mut channel = crate::mining::channel::ChannelState::new_standard(
+            1,
+            vec![0; 4],
+            state.session_difficulty,
+            [0xFF; 32],
+            bp_jobs_lifecycle::LifecycleConfig::DEFAULT,
+        );
+        // Vardiff retargeted the channel after it opened.
+        channel.session_difficulty = Difficulty(4096.0);
+        state.channels.insert(1, channel);
+        assert_ne!(
+            state.session_difficulty.as_f64(),
+            4096.0,
+            "precondition: the session still holds the opening difficulty"
+        );
+
+        let events = vec![SessionEvent::ShareRejected {
+            channel_id: 1,
+            reject: ShareReject::from(RejectReason::StaleShare),
+        }];
+        apply_session_events_generic(events, "sess-1", &state, &hooks).await;
+        assert_eq!(recording.rejected.lock().unwrap()[0].difficulty, 4096.0);
     }
 
     #[tokio::test(flavor = "current_thread")]
