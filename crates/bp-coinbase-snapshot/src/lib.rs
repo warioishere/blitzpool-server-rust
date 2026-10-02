@@ -15,7 +15,9 @@ use bp_common::AddressId;
 use tracing::warn;
 
 pub use actual::ActualCoinbase;
-pub use budget::{read_coinbase_budget, write_coinbase_budget, PPLNS_COINBASE_BUDGET_KEY};
+pub use budget::{
+    is_wrongtype, read_coinbase_budget, write_coinbase_budget, PPLNS_COINBASE_BUDGET_KEY,
+};
 pub use build::{sanitize_and_build, BuildRequest, BuiltDistribution};
 pub use ledger::{ApplyDistributionResult, LedgerError, PayoutRowType};
 

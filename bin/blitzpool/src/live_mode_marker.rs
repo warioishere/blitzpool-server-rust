@@ -75,7 +75,7 @@ mod tests {
     async fn connect_or_skip() -> Option<ConnectionManager> {
         let url = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_DEFAULT_URL.to_string());
         let client = redis::Client::open(url).ok()?;
-        let mgr_fut = ConnectionManager::new(client);
+        let mgr_fut = bp_test_support::connection_manager(client);
         match tokio::time::timeout(std::time::Duration::from_secs(2), mgr_fut).await {
             Ok(Ok(mgr)) => Some(mgr),
             _ => None,

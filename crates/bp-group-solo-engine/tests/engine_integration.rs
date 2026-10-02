@@ -60,7 +60,7 @@ async fn spawn_or_skip(redis_db: u8, finder_bonus_ppm: Option<i32>) -> Option<Ha
     };
     let conn = match tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        ConnectionManager::new(client),
+        bp_test_support::connection_manager(client),
     )
     .await
     {
@@ -999,7 +999,7 @@ async fn connect_redis_or_skip(redis_db: u8) -> Option<ConnectionManager> {
     let client = Client::open(format!("{redis_base}/{redis_db}")).ok()?;
     let mut conn = match tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        ConnectionManager::new(client),
+        bp_test_support::connection_manager(client),
     )
     .await
     {

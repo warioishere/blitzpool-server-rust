@@ -14,7 +14,7 @@ use bp_group_solo_engine::distribution::{
     DistributionBuilder, DistributionConfig, DistributionError,
 };
 use bp_group_solo_engine::round::GroupRoundStore;
-use redis::{aio::ConnectionManager, Client};
+use redis::Client;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use uuid::Uuid;
 
@@ -72,7 +72,7 @@ async fn spawn_or_skip(redis_db: u8, finder_bonus_ppm: Option<i32>) -> Option<Ha
     };
     let mut conn = match tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        ConnectionManager::new(client),
+        bp_test_support::connection_manager(client),
     )
     .await
     {
@@ -213,7 +213,7 @@ async fn build_for_nonexistent_group_returns_group_not_found() {
     };
     let mut conn = match tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        ConnectionManager::new(client),
+        bp_test_support::connection_manager(client),
     )
     .await
     {

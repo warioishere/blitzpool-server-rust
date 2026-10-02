@@ -23,5 +23,6 @@ bp-mining-job = { workspace = true }
 bp-template-distribution = { workspace = true }
 bp-regtest-harness = { workspace = true }
 redis = { workspace = true }
+bp-share-stream = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }

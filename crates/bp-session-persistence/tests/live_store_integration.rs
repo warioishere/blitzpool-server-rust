@@ -496,7 +496,7 @@ async fn redis_down_does_not_hang_the_flush() {
         redis::Client::open(format!("redis://127.0.0.1:{port}/{db}")).expect("proxied client");
     let manager = match tokio::time::timeout(
         Duration::from_secs(2),
-        redis::aio::ConnectionManager::new(client),
+        bp_test_support::connection_manager(client),
     )
     .await
     {

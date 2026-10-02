@@ -68,7 +68,7 @@ async fn connect_or_skip(redis_db: u8, address_prefix: &str) -> Option<Harness> 
     };
     let mut conn = match tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        ConnectionManager::new(client),
+        bp_test_support::connection_manager(client),
     )
     .await
     {
@@ -545,7 +545,9 @@ async fn build_window(h: &Harness) -> WindowStore {
         bp_test_support::redis_db_in_range(bp_test_support::redis_db::PPLNS_DISTRIBUTION, db).await;
     let url = format!("{redis_base}/{db}");
     let client = Client::open(url).expect("client");
-    let conn = ConnectionManager::new(client).await.expect("conn");
+    let conn = bp_test_support::connection_manager(client)
+        .await
+        .expect("conn");
     let nd = NetworkDifficulty::new(1_000_000.0);
     WindowStore::new(conn, 4.0, 100, nd, AGE_RULE_OFF)
 }
@@ -594,7 +596,9 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
     let db =
         bp_test_support::redis_db_in_range(bp_test_support::redis_db::PPLNS_DISTRIBUTION, db).await;
     let client = Client::open(format!("{redis_base}/{db}")).expect("client");
-    let mut admin = ConnectionManager::new(client).await.expect("admin conn");
+    let mut admin = bp_test_support::connection_manager(client)
+        .await
+        .expect("admin conn");
 
     if redis::cmd("ACL")
         .arg("SETUSER")
@@ -616,7 +620,7 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
 
     let ro_url = redis_base.replacen("redis://", &format!("redis://{ACL_USER}:readonlypw@"), 1);
     let ro_client = Client::open(format!("{ro_url}/{db}")).expect("read-only client");
-    let ro_conn = ConnectionManager::new(ro_client)
+    let ro_conn = bp_test_support::connection_manager(ro_client)
         .await
         .expect("read-only conn");
     let ro_builder = DistributionBuilder::new(
@@ -831,5 +835,7 @@ async fn raw_conn(h: &Harness) -> ConnectionManager {
     let db =
         bp_test_support::redis_db_in_range(bp_test_support::redis_db::PPLNS_DISTRIBUTION, db).await;
     let client = Client::open(format!("{redis_base}/{db}")).expect("client");
-    ConnectionManager::new(client).await.expect("conn")
+    bp_test_support::connection_manager(client)
+        .await
+        .expect("conn")
 }

@@ -28,6 +28,16 @@ use tokio::sync::mpsc;
 /// Field name carrying the JSON-encoded share in each stream entry.
 const FIELD: &str = "d";
 
+/// The settings every pool connection uses: no response and no connect
+/// timeout. A consumer's `XREAD … BLOCK` holds the reply for up to its block
+/// time, longer than the client's 500 ms default, which would fail every idle
+/// read.
+pub fn connection_manager_config() -> redis::aio::ConnectionManagerConfig {
+    redis::aio::ConnectionManagerConfig::new()
+        .set_response_timeout(None)
+        .set_connection_timeout(None)
+}
+
 /// Approximate `MAXLEN ~` cap: hours of buffer for a Satellite outage before
 /// the oldest entries are trimmed. A breach costs fairness, not funds (the
 /// coinbase already paid the window).
@@ -412,7 +422,7 @@ impl<T: DeserializeOwned> StreamConsumer<T> {
             .ok_or_else(|| StreamError::MissingField {
                 id: entry.id.clone(),
             })?;
-        let json: String = redis::from_redis_value(raw)?;
+        let json: String = redis::from_redis_value_ref(raw).map_err(RedisError::from)?;
         Ok(serde_json::from_str(&json)?)
     }
 
@@ -494,7 +504,7 @@ mod tests {
         let client = Client::open(url).ok()?;
         let mut conn = match tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            ConnectionManager::new(client),
+            ConnectionManager::new_with_config(client, crate::connection_manager_config()),
         )
         .await
         {
@@ -514,6 +524,40 @@ mod tests {
         Some(conn)
     }
 
+    /// An idle `XREADGROUP … BLOCK 1000` returns empty on a connection built
+    /// with [`connection_manager_config`]; on the client's default config the
+    /// same read fails at its 500 ms response timeout (negative control).
+    #[tokio::test]
+    async fn an_idle_blocking_read_outlasts_the_default_response_timeout() {
+        let Some(_flushed) = connect_or_skip(16).await else {
+            return;
+        };
+        let db =
+            bp_test_support::redis_db_in_range(bp_test_support::redis_db::SHARE_STREAM, 16).await;
+        let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
+        let client = Client::open(format!("{base}/{db}")).expect("client");
+
+        let ours = ConnectionManager::new_with_config(client.clone(), connection_manager_config())
+            .await
+            .expect("pool-config connection");
+        let consumer: StreamConsumer<SharedAcceptedShareOwned> =
+            StreamConsumer::new(ours, "test:idle-block", "g", "c");
+        consumer.ensure_group_at_tail().await.expect("group");
+        let idle = consumer.read_new(10, 1000).await.expect("idle read");
+        assert!(idle.is_empty());
+
+        let default =
+            ConnectionManager::new_with_config(client, redis::aio::ConnectionManagerConfig::new())
+                .await
+                .expect("default connection");
+        let consumer: StreamConsumer<SharedAcceptedShareOwned> =
+            StreamConsumer::new(default, "test:idle-block", "g", "c");
+        assert!(
+            consumer.read_new(10, 1000).await.is_err(),
+            "precondition: the default config must time the idle read out"
+        );
+    }
+
     /// Second, non-flushing connection to the same DB: a blocking
     /// `XREADGROUP … BLOCK` would otherwise head-of-line-block an `XADD` on
     /// the shared multiplexed connection.
@@ -526,7 +570,7 @@ mod tests {
         let client = Client::open(url).ok()?;
         match tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            ConnectionManager::new(client),
+            ConnectionManager::new_with_config(client, crate::connection_manager_config()),
         )
         .await
         {

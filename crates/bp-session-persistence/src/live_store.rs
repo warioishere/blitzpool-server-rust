@@ -142,7 +142,7 @@ impl LiveSessionStore {
                 result?;
                 Ok(())
             }
-            Err(_) => Err((redis::ErrorKind::IoError, "live-store write timed out").into()),
+            Err(_) => Err((redis::ErrorKind::Io, "live-store write timed out").into()),
         }
     }
 

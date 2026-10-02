@@ -47,11 +47,10 @@ pub async fn read_coinbase_budget(
     }
 }
 
-fn is_wrongtype(e: &RedisError) -> bool {
-    matches!(
-        e.kind(),
-        redis::ErrorKind::TypeError | redis::ErrorKind::ResponseError
-    ) && e.to_string().to_ascii_uppercase().contains("WRONGTYPE")
+/// The server refused the command because the key holds another type. Read
+/// paths treat that as a missing value, so a legacy key never crashes them.
+pub fn is_wrongtype(e: &RedisError) -> bool {
+    e.code() == Some("WRONGTYPE")
 }
 
 #[cfg(test)]
@@ -66,7 +65,7 @@ mod tests {
         // erroring.
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            ConnectionManager::new(client),
+            bp_test_support::connection_manager(client),
         )
         .await
         .ok()?
@@ -99,6 +98,27 @@ mod tests {
             read_coinbase_budget(&mut c, key).await.unwrap(),
             Some(200_000)
         );
+
+        let _: () = c.del(key).await.unwrap();
+    }
+
+    /// A hash under the budget key answers `GET` with WRONGTYPE; the read
+    /// treats it as missing. The raw `GET` shows the error is really there.
+    #[tokio::test]
+    #[allow(clippy::print_stderr)]
+    async fn a_wrong_typed_key_reads_as_missing() {
+        let Some(mut c) = conn().await else {
+            eprintln!("skipping: no local Redis");
+            return;
+        };
+        let key = "test:coinbase_budget:wrongtype";
+        let _: () = c.del(key).await.unwrap();
+        let _: () = c.hset(key, "field", "1").await.unwrap();
+
+        let raw: Result<Option<String>, RedisError> = c.get(key).await;
+        let err = raw.expect_err("precondition: GET on a hash must fail");
+        assert!(is_wrongtype(&err), "{err:?}");
+        assert_eq!(read_coinbase_budget(&mut c, key).await.unwrap(), None);
 
         let _: () = c.del(key).await.unwrap();
     }

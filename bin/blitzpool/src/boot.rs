@@ -219,24 +219,30 @@ pub(crate) async fn spawn_redis(cfg: &RedisConfig) -> Result<ConnectionManager, 
         password_set = cfg.password.is_some(),
         "redis: connecting"
     );
-    let client = redis::Client::open(redis_connection_info(cfg))?;
-    let manager = ConnectionManager::new(client).await?;
+    let client = redis::Client::open(redis_connection_info(cfg)?)?;
+    let manager =
+        ConnectionManager::new_with_config(client, bp_share_stream::connection_manager_config())
+            .await?;
     info!("redis: connected");
     Ok(manager)
 }
 
 /// Typed connection info, so a password needs no URL encoding. An empty
 /// password means none, the same as an empty password in a `redis://` URL.
-fn redis_connection_info(cfg: &RedisConfig) -> redis::ConnectionInfo {
-    redis::ConnectionInfo {
-        addr: redis::ConnectionAddr::Tcp(cfg.host.clone(), cfg.port),
-        redis: redis::RedisConnectionInfo {
-            db: i64::from(cfg.db),
-            username: None,
-            password: cfg.password.clone().filter(|pw| !pw.is_empty()),
-            protocol: redis::ProtocolVersion::RESP2,
-        },
+fn redis_connection_info(cfg: &RedisConfig) -> redis::RedisResult<redis::ConnectionInfo> {
+    let mut settings = redis::RedisConnectionInfo::default()
+        .set_db(i64::from(cfg.db))
+        .set_protocol(redis::ProtocolVersion::RESP2);
+    if let Some(password) = cfg.password.as_deref().filter(|pw| !pw.is_empty()) {
+        settings = settings.set_password(password);
     }
+    Ok(
+        redis::IntoConnectionInfo::into_connection_info(redis::ConnectionAddr::Tcp(
+            cfg.host.clone(),
+            cfg.port,
+        ))?
+        .set_redis_settings(settings),
+    )
 }
 
 // ─── Bitcoin RPC ──────────────────────────────────────────────────
@@ -463,11 +469,12 @@ mod tests {
     }
 
     fn assert_same_redis_info(a: &redis::ConnectionInfo, b: &redis::ConnectionInfo) {
-        assert_eq!(a.addr, b.addr);
-        assert_eq!(a.redis.db, b.redis.db);
-        assert_eq!(a.redis.username, b.redis.username);
-        assert_eq!(a.redis.password, b.redis.password);
-        assert_eq!(a.redis.protocol, b.redis.protocol);
+        assert_eq!(a.addr(), b.addr());
+        let (a, b) = (a.redis_settings(), b.redis_settings());
+        assert_eq!(a.db(), b.db());
+        assert_eq!(a.username(), b.username());
+        assert_eq!(a.password(), b.password());
+        assert_eq!(a.protocol(), b.protocol());
     }
 
     #[test]
@@ -478,9 +485,9 @@ mod tests {
             password: None,
             db: 3,
         };
-        let info = redis_connection_info(&cfg);
+        let info = redis_connection_info(&cfg).unwrap();
         assert_same_redis_info(&info, &redis_info_from_url("redis://h:6379/3"));
-        assert_eq!(info.redis.password, None);
+        assert_eq!(info.redis_settings().password(), None);
     }
 
     #[test]
@@ -491,7 +498,7 @@ mod tests {
             password: Some("redis".into()),
             db: 0,
         };
-        let info = redis_connection_info(&cfg);
+        let info = redis_connection_info(&cfg).unwrap();
         assert_same_redis_info(&info, &redis_info_from_url("redis://:redis@h:6379/0"));
     }
 
@@ -503,8 +510,8 @@ mod tests {
             password: Some("p@ss:w/o?r#d%20 x".into()),
             db: 1,
         };
-        let info = redis_connection_info(&cfg);
-        assert_eq!(info.redis.password.as_deref(), Some("p@ss:w/o?r#d%20 x"));
+        let info = redis_connection_info(&cfg).unwrap();
+        assert_eq!(info.redis_settings().password(), Some("p@ss:w/o?r#d%20 x"));
         assert_same_redis_info(
             &info,
             &redis_info_from_url("redis://:p%40ss%3Aw%2Fo%3Fr%23d%2520%20x@h:6379/1"),
@@ -519,9 +526,9 @@ mod tests {
             password: Some(String::new()),
             db: 0,
         };
-        let info = redis_connection_info(&cfg);
+        let info = redis_connection_info(&cfg).unwrap();
         assert_same_redis_info(&info, &redis_info_from_url("redis://:@h:6379/0"));
-        assert_eq!(info.redis.password, None);
+        assert_eq!(info.redis_settings().password(), None);
     }
 
     // ── TDP coinbase constraints coupling ─────────────────────────

@@ -1,6 +1,10 @@
 # reqwest has no bundled TLS crypto provider here; building a client before
 # one is installed panics. bp_http::client_builder installs it.
+# A redis ConnectionManager on the client defaults times out every idle
+# blocking stream read at 500 ms; bp_share_stream::connection_manager_config
+# is the pool's setting.
 disallowed-methods = [
+    { path = "redis::aio::ConnectionManager::new", reason = "use ConnectionManager::new_with_config(client, bp_share_stream::connection_manager_config()), or bp_test_support::connection_manager in tests" },
     { path = "reqwest::Client::builder", reason = "use bp_http::client_builder" },
     { path = "reqwest::Client::new", reason = "use bp_http::client_builder" },
     { path = "reqwest::get", reason = "use bp_http::client_builder" },

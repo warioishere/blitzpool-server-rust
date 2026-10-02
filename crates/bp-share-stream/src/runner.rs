@@ -251,7 +251,7 @@ mod tests {
         let client = Client::open(format!("{base}/{db}")).ok()?;
         let mut conn = match tokio::time::timeout(
             Duration::from_secs(2),
-            ConnectionManager::new(client),
+            ConnectionManager::new_with_config(client, crate::connection_manager_config()),
         )
         .await
         {

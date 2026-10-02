@@ -73,7 +73,7 @@ async fn connect_or_skip(redis_db: u8, prefix: &str) -> Option<(ConnectionManage
     };
     let mut conn = match tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        ConnectionManager::new(client),
+        bp_test_support::connection_manager(client),
     )
     .await
     {

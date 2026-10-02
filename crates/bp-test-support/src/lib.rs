@@ -327,6 +327,13 @@ pub mod redis_db {
     pub const BLITZPOOL_BIN_2: u16 = 17 * RANGE;
 }
 
+/// A test connection with the pool's own settings
+/// ([`bp_share_stream::connection_manager_config`]), so a blocking stream read
+/// behaves as it does in production.
+pub async fn connection_manager(client: Client) -> redis::RedisResult<ConnectionManager> {
+    ConnectionManager::new_with_config(client, bp_share_stream::connection_manager_config()).await
+}
+
 /// CI's Valkey service has only 16 databases and cannot be given
 /// `--databases`. Indexes are folded into what the server offers, because a
 /// failed `SELECT` would read as "Redis unreachable" and silently skip.
@@ -341,7 +348,7 @@ async fn redis_database_count() -> u16 {
                 return fallback;
             };
             let Ok(Ok(mut conn)) =
-                tokio::time::timeout(Duration::from_secs(2), ConnectionManager::new(client)).await
+                tokio::time::timeout(Duration::from_secs(2), connection_manager(client)).await
             else {
                 return fallback;
             };
@@ -379,7 +386,7 @@ pub async fn connect_redis_in_range_no_flush(base: u16, test_db: u8) -> Option<C
         Ok(c) => c,
         Err(e) => return skip_or_fail(format!("redis client open {url}: {e}")),
     };
-    match tokio::time::timeout(Duration::from_secs(2), ConnectionManager::new(client)).await {
+    match tokio::time::timeout(Duration::from_secs(2), connection_manager(client)).await {
         Ok(Ok(c)) => Some(c),
         Ok(Err(e)) => skip_or_fail(format!("redis connect {url}: {e}")),
         Err(_) => skip_or_fail(format!("redis connect timed out at {url}")),
@@ -405,7 +412,7 @@ async fn connect_redis_or_skip_raw(test_db: u16) -> Option<ConnectionManager> {
         Err(e) => return skip_or_fail(format!("redis client open {url}: {e}")),
     };
     let mut conn =
-        match tokio::time::timeout(Duration::from_secs(2), ConnectionManager::new(client)).await {
+        match tokio::time::timeout(Duration::from_secs(2), connection_manager(client)).await {
             Ok(Ok(c)) => c,
             Ok(Err(e)) => return skip_or_fail(format!("redis connect {url}: {e}")),
             Err(_) => return skip_or_fail(format!("redis connect timed out at {url}")),

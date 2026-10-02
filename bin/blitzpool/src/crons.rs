@@ -971,7 +971,7 @@ mod sweep_tests {
         let client = redis::Client::open(format!("redis://127.0.0.1:{port}/0")).expect("client");
         let manager = match tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            redis::aio::ConnectionManager::new(client),
+            bp_test_support::connection_manager(client),
         )
         .await
         {

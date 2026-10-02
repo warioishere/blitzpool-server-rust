@@ -166,7 +166,7 @@ pub async fn read_weight_snapshot(
 ) -> Result<Option<StoredWeightSnapshot>, RedisError> {
     let hash: HashMap<String, String> = match conn.hgetall(key).await {
         Ok(h) => h,
-        Err(e) if is_wrongtype(&e) => {
+        Err(e) if bp_coinbase_snapshot::is_wrongtype(&e) => {
             warn!(
                 key,
                 error = %e,
@@ -256,13 +256,6 @@ fn parse_weight_hash(h: &HashMap<String, String>) -> Option<StoredWeightSnapshot
         reference_revenue_sats,
         score_total,
     })
-}
-
-fn is_wrongtype(e: &RedisError) -> bool {
-    matches!(
-        e.kind(),
-        redis::ErrorKind::TypeError | redis::ErrorKind::ResponseError
-    ) && e.to_string().contains("WRONGTYPE")
 }
 
 #[cfg(test)]

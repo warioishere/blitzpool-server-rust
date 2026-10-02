@@ -35,5 +35,6 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+bp-test-support = { workspace = true }
 # Async test runtime for the Redis-backed budget persistence tests.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

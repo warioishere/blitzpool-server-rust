@@ -232,7 +232,7 @@ mod degrade_tests {
             0.0
         );
 
-        let redis: redis::RedisError = (redis::ErrorKind::IoError, "connection reset").into();
+        let redis: redis::RedisError = (redis::ErrorKind::Io, "connection reset").into();
         assert_eq!(
             or_degraded(Err::<f64, _>(LiveReadError::Redis(redis)), || 0.0).expect("degraded"),
             0.0
