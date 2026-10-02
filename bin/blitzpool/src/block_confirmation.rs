@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Confirmation watcher: applies a block parked in [`crate::pending_blocks`]
-//! (PPLNS and Group-Solo) once it is `confirmation_depth` deep and discards an
-//! orphan, so the ledger never books a block the chain dropped. Blockparty is
-//! exempt: its fixed percentages are recomputed from the DB, so orphans drift nothing.
+//! (every booking mode) once it is `confirmation_depth` deep and discards an
+//! orphan, so no mode books a block the chain dropped.
 
 use std::time::Duration;
 
 use bp_bitcoin::{BitcoinRpc, RpcError};
+use bp_blockparty_engine::BlockpartyPayouts;
 use bp_group_solo_engine::engine::GroupSoloEngine;
 use bp_pplns_engine::engine::PplnsEngine;
 use bp_template_distribution::{TdpHandle, TemplateUpdate};
@@ -45,12 +45,14 @@ impl BlockConfirmationHandle {
 /// Spawn the confirmation watcher for whichever engines are present. A TDP
 /// `SetNewPrevHash` wakes it on a new tip; without a feed (Satellite) the
 /// fallback timer alone drives it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn(
     tdp: Option<TdpHandle>,
     bitcoin_rpc: BitcoinRpc,
     redis: ConnectionManager,
     pplns: Option<PplnsEngine>,
     group_solo: Option<GroupSoloEngine>,
+    blockparty: Option<BlockpartyPayouts>,
     confirmation_depth: u32,
     // ext 0x0003/Implementation Notes settlement: a gated apply IS a
     // settlement, so the published distributions must be invalidated with it
@@ -76,20 +78,26 @@ pub(crate) fn spawn(
             tdp_driven = rx.is_some(),
             pplns = pplns.is_some(),
             group_solo = group_solo.is_some(),
+            blockparty = blockparty.is_some(),
             "block-confirmation: watcher started"
         );
+        let settlers = Settlers {
+            pplns: pplns.as_ref(),
+            group_solo: group_solo.as_ref(),
+            blockparty: blockparty.as_ref(),
+        };
 
         loop {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
                 _ = tick.tick() => {
-                    reconcile(&bitcoin_rpc, &redis, pplns.as_ref(), group_solo.as_ref(), confirmation_depth, settle.as_ref(), &mut last_unbookable).await;
+                    reconcile(&bitcoin_rpc, &redis, &settlers, confirmation_depth, settle.as_ref(), &mut last_unbookable).await;
                 }
                 ev = next_tip_signal(&mut rx) => match ev {
                     // A new chain tip — re-check every parked block's depth.
                     Ok(TemplateUpdate::SetNewPrevHash(_)) => {
-                        reconcile(&bitcoin_rpc, &redis, pplns.as_ref(), group_solo.as_ref(), confirmation_depth, settle.as_ref(), &mut last_unbookable).await;
+                        reconcile(&bitcoin_rpc, &redis, &settlers, confirmation_depth, settle.as_ref(), &mut last_unbookable).await;
                     }
                     // NewTemplate / tx-data responses aren't new-block ticks.
                     Ok(_) => {}
@@ -132,7 +140,7 @@ enum BlockStatus {
     Unknown,
 }
 
-/// Classify a parked block by its header. Shared by both modes.
+/// Classify a parked block by its header. Shared by every mode.
 async fn classify_block(bitcoin_rpc: &BitcoinRpc, block_hash: &str, depth: i64) -> BlockStatus {
     match bitcoin_rpc.get_block_header(block_hash).await {
         Ok(h) if h.confirmations >= depth => BlockStatus::Confirmed,
@@ -216,14 +224,13 @@ async fn report_parked_depths(conn: &mut ConnectionManager, last_unbookable: &mu
     }
 }
 
-/// One reconciliation pass over the pending store, one loop for both modes:
+/// One reconciliation pass over the pending store, one loop for every mode:
 /// the parked blob carries the settlement inputs either way, and `group`
 /// decides which engine settles them.
 async fn reconcile(
     bitcoin_rpc: &BitcoinRpc,
     redis: &ConnectionManager,
-    pplns: Option<&PplnsEngine>,
-    group_solo: Option<&GroupSoloEngine>,
+    settlers: &Settlers<'_>,
     confirmation_depth: u32,
     // See `spawn`: a gated apply IS a settlement event.
     settle: Option<&crate::settlement::SettlementSignal>,
@@ -253,16 +260,7 @@ async fn reconcile(
             continue;
         };
 
-        let applied = settle_block(
-            pplns,
-            group_solo,
-            pb.mode(),
-            pb.block_height,
-            &actual,
-            pb.weight_snapshot.clone(),
-            pb.payouts_fingerprint,
-        )
-        .await;
+        let applied = settle_block(settlers, &pb, &actual).await;
 
         match applied {
             Ok(history_inserted) => {
@@ -311,22 +309,27 @@ async fn reconcile(
     report_parked_depths(&mut conn, last_unbookable).await;
 }
 
-/// Book one block into its mode's engine. Both the watcher and the immediate
-/// apply ([`crate::block_sink`]) run this one settlement. Returns the
-/// engine's `history_inserted`; handling a failure is the caller's call,
+/// The engines a process can settle with; `None` where this process does not
+/// book that mode.
+pub(crate) struct Settlers<'a> {
+    pub(crate) pplns: Option<&'a PplnsEngine>,
+    pub(crate) group_solo: Option<&'a GroupSoloEngine>,
+    pub(crate) blockparty: Option<&'a BlockpartyPayouts>,
+}
+
+/// Book one parked block into its mode's engine. Both the watcher and the
+/// immediate apply ([`crate::block_sink`]) run this one settlement. Returns
+/// the engine's `history_inserted`; handling a failure is the caller's call,
 /// since only the watcher has a parked entry to leave in place.
 pub(crate) async fn settle_block(
-    pplns: Option<&PplnsEngine>,
-    group_solo: Option<&GroupSoloEngine>,
-    mode: SettlementMode<'_>,
-    height: i32,
+    settlers: &Settlers<'_>,
+    pb: &PendingBlock,
     actual: &bp_coinbase_snapshot::ActualCoinbase,
-    weight_snapshot: Option<bp_pplns_engine::window::snapshot::StoredWeightSnapshot>,
-    payouts_fingerprint: Option<[u8; 32]>,
 ) -> Result<u64, SettleFailure> {
-    match mode {
+    let height = pb.block_height;
+    match pb.mode() {
         SettlementMode::GroupSolo(group) => {
-            let engine = group_solo.ok_or(SettleFailure::NoEngine)?;
+            let engine = settlers.group_solo.ok_or(SettleFailure::NoEngine)?;
             let Ok(group_uuid) = uuid::Uuid::parse_str(&group.group_id) else {
                 return Err(SettleFailure::UnusableGroup);
             };
@@ -337,9 +340,43 @@ pub(crate) async fn settle_block(
                 .map(|o| o.history_inserted)
                 .map_err(|e| SettleFailure::Engine(SettleError::GroupSolo(e)))
         }
-        SettlementMode::Pplns => pplns
+        SettlementMode::Blockparty(group) => {
+            let payouts = settlers.blockparty.ok_or(SettleFailure::NoEngine)?;
+            let Ok(group_uuid) = uuid::Uuid::parse_str(&group.group_id) else {
+                return Err(SettleFailure::UnusableGroup);
+            };
+            // The split is recomputed from the roster, which cannot change
+            // while the party is routable, so it is the one the coinbase paid.
+            let reward = bp_common::Sats(actual.total_value_sats as i64);
+            let blockparty_err = |e| SettleFailure::Engine(SettleError::Blockparty(e));
+            let dist = payouts
+                .build_payouts(group_uuid, reward)
+                .await
+                .map_err(blockparty_err)?
+                .ok_or(SettleFailure::UnusableGroup)?;
+            payouts
+                .on_block_found(
+                    group_uuid,
+                    height,
+                    &pb.block_hash,
+                    reward,
+                    dist.pool_fee_sats,
+                    &dist.splits,
+                    Some(pb.found_at_ms),
+                )
+                .await
+                .map(|row| u64::from(row.is_some()))
+                .map_err(blockparty_err)
+        }
+        SettlementMode::Pplns => settlers
+            .pplns
             .ok_or(SettleFailure::NoEngine)?
-            .on_block_found(height, actual, weight_snapshot, payouts_fingerprint)
+            .on_block_found(
+                height,
+                actual,
+                pb.weight_snapshot.clone(),
+                pb.payouts_fingerprint,
+            )
             .await
             .map(|o| o.history_inserted)
             .map_err(|e| SettleFailure::Engine(SettleError::Pplns(e))),
@@ -352,8 +389,9 @@ pub(crate) enum SettleFailure {
     /// This process has no engine for the block's mode.
     #[error("no engine wired for this block's mode")]
     NoEngine,
-    /// A Group-Solo block whose group id does not parse.
-    #[error("unusable Group-Solo group id")]
+    /// A group-mode block whose group id does not parse, or a Blockparty
+    /// whose group no longer exists.
+    #[error("unusable group id")]
     UnusableGroup,
     #[error(transparent)]
     Engine(SettleError),
@@ -372,13 +410,15 @@ impl SettleFailure {
     }
 }
 
-/// The two engines' errors, so one loop can treat them alike.
+/// The engines' errors, so one loop can treat them alike.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SettleError {
     #[error(transparent)]
     Pplns(bp_pplns_engine::engine::EngineError),
     #[error(transparent)]
     GroupSolo(bp_group_solo_engine::engine::EngineError),
+    #[error(transparent)]
+    Blockparty(bp_blockparty_engine::BlockpartyServiceError),
 }
 
 impl SettleError {
@@ -386,6 +426,9 @@ impl SettleError {
         match self {
             SettleError::Pplns(e) => e.is_terminal(),
             SettleError::GroupSolo(e) => e.is_terminal(),
+            // The payout half only reads and inserts rows: a database error,
+            // which the next tick may not repeat.
+            SettleError::Blockparty(_) => false,
         }
     }
 }
@@ -791,8 +834,11 @@ mod declared_block_booking_regtest {
             super::reconcile(
                 &self.node.bitcoin_rpc().expect("regtest BitcoinRpc"),
                 &self.redis,
-                Some(&self.pplns),
-                Some(&self.group_solo),
+                &super::Settlers {
+                    pplns: Some(&self.pplns),
+                    group_solo: Some(&self.group_solo),
+                    blockparty: None,
+                },
                 DEPTH,
                 None,
                 &mut last_unbookable,
@@ -1098,6 +1144,7 @@ mod declared_block_booking_regtest {
                 payouts_fingerprint: Some(c.fingerprint),
                 group: Some(crate::pending_blocks::PendingGroup {
                     group_id: "not-a-uuid".to_string(),
+                    kind: crate::pending_blocks::GroupKind::GroupSolo,
                 }),
             },
         )
@@ -1531,8 +1578,11 @@ mod declared_block_booking_regtest {
             super::reconcile(
                 &self.node.bitcoin_rpc().expect("regtest BitcoinRpc"),
                 &self.redis,
-                Some(&self.pplns),
-                Some(&self.group_solo),
+                &super::Settlers {
+                    pplns: Some(&self.pplns),
+                    group_solo: Some(&self.group_solo),
+                    blockparty: None,
+                },
                 DEPTH,
                 None,
                 &mut last_unbookable,
@@ -1802,5 +1852,133 @@ mod declared_block_booking_regtest {
         c.assert_no_ledger_rows().await;
 
         c.teardown().await;
+    }
+}
+
+#[cfg(test)]
+mod blockparty_settlement {
+    use std::collections::HashMap;
+
+    use bp_blockparty_engine::{BlockpartyPayoutConfig, BlockpartyPayouts};
+    use bp_coinbase_snapshot::ActualCoinbase;
+    use bp_common::{AddressId, Sats};
+
+    use super::{settle_block, SettleFailure, Settlers};
+    use crate::pending_blocks::{GroupKind, PendingBlock, PendingGroup};
+
+    const REWARD: u64 = 312_500_000;
+    const FOUND_AT_MS: i64 = 1_700_000_000_123;
+
+    /// A parked Blockparty block settles through the shared watcher path: one
+    /// history row with the roster's split, keyed and timestamped by the
+    /// parked blob, and nothing more on replay. A process without the
+    /// Blockparty payouts leaves it parked (negative control).
+    #[tokio::test]
+    async fn a_parked_blockparty_block_books_once_from_its_blob() {
+        let Some(pg) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let admin = bp_test_support::deterministic_p2wpkh_regtest([0xB1; 32]);
+        let member = bp_test_support::deterministic_p2wpkh_regtest([0xB2; 32]);
+        let fee = bp_test_support::deterministic_p2wpkh_regtest([0xB3; 32]);
+        bp_test_support::cleanup_blockparty_rows(&pg, &[&admin, &member]).await;
+
+        let group_id = uuid::Uuid::new_v4();
+        let admin_id = AddressId::new(admin.clone()).unwrap();
+        bp_db::insert_blockparty_group(
+            &pg,
+            group_id,
+            &format!("bp-settle-{group_id}"),
+            &admin_id,
+            "hash",
+            "active",
+            1,
+        )
+        .await
+        .expect("insert group");
+        for (addr, bp, role) in [(&admin, 6_000, "admin"), (&member, 4_000, "member")] {
+            let id = AddressId::new(addr.clone()).unwrap();
+            bp_db::insert_blockparty_member(&pg, group_id, &id, "", bp, role, Some(1), 1)
+                .await
+                .expect("insert member");
+        }
+
+        let payouts = BlockpartyPayouts::new(
+            pg.clone(),
+            BlockpartyPayoutConfig {
+                fee_address: Some(AddressId::new(fee).unwrap()),
+                fee_percent: 2.0,
+                min_payout_sats: Sats(5_000),
+            },
+        );
+        let actual = ActualCoinbase {
+            paid_by_address: HashMap::new(),
+            pool_paid_sats: 0,
+            total_value_sats: REWARD,
+        };
+        let pb = PendingBlock {
+            block_hash: format!("{:064x}", group_id.as_u128()),
+            found_at_ms: FOUND_AT_MS,
+            block_height: 900_000,
+            weight_snapshot: None,
+            actual_coinbase: Some(actual.clone()),
+            payouts_fingerprint: None,
+            group: Some(PendingGroup {
+                group_id: group_id.to_string(),
+                kind: GroupKind::Blockparty,
+            }),
+        };
+
+        let without = Settlers {
+            pplns: None,
+            group_solo: None,
+            blockparty: None,
+        };
+        let refused = settle_block(&without, &pb, &actual).await;
+        assert!(
+            matches!(refused, Err(SettleFailure::NoEngine)),
+            "{refused:?}"
+        );
+
+        let with = Settlers {
+            pplns: None,
+            group_solo: None,
+            blockparty: Some(&payouts),
+        };
+        assert_eq!(settle_block(&with, &pb, &actual).await.expect("settle"), 1);
+
+        let rows = bp_db::list_blockparty_block_history(&pg, group_id)
+            .await
+            .expect("history");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.block_hash, pb.block_hash);
+        assert_eq!(
+            row.found_at, FOUND_AT_MS,
+            "found_at comes from the parked blob"
+        );
+        assert_eq!(row.coinbase_value_sats, Sats(REWARD as i64));
+        // 2 % base fee, then 60/40 of the miners' cut.
+        let cut = REWARD as i64 - REWARD as i64 * 2 / 100;
+        let paid: HashMap<&str, i64> = row
+            .splits
+            .0
+            .iter()
+            .map(|s| (s.address.as_str(), s.sats))
+            .collect();
+        assert_eq!(paid[admin.as_str()], cut * 6_000 / 10_000);
+        assert_eq!(paid[member.as_str()], cut * 4_000 / 10_000);
+        assert_eq!(
+            row.pool_fee_sats.0 + paid.values().sum::<i64>(),
+            REWARD as i64
+        );
+
+        assert_eq!(
+            settle_block(&with, &pb, &actual).await.expect("replay"),
+            0,
+            "a replay must not insert a second row"
+        );
+
+        bp_test_support::cleanup_blockparty_rows(&pg, &[&admin, &member]).await;
     }
 }

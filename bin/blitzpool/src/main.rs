@@ -528,9 +528,8 @@ async fn main() -> ExitCode {
         None
     };
 
-    // Applies parked PPLNS/Group-Solo blocks at `confirmation_depth` and
-    // discards them on orphan, so a reorg never drifts the ledger. Blockparty
-    // recomputes from the DB, so it needs no confirmation.
+    // Applies parked blocks of every booking mode at `confirmation_depth` and
+    // discards them on orphan, so a reorg never books a dropped block.
 
     let block_confirmation = if is_accounting {
         let depth = cfg
@@ -544,6 +543,7 @@ async fn main() -> ExitCode {
             handles.redis.clone(),
             engines.pplns.clone(),
             Some(engines.group_solo.clone()),
+            engines.blockparty_payouts.clone(),
             depth,
             Some(settle_signal.clone()),
         ))

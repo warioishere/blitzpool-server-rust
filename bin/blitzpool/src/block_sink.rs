@@ -29,7 +29,9 @@ use tracing::{error, info, warn};
 use crate::block_confirmation::{settle_block, SettleFailure};
 use crate::boot::FoundationHandles;
 use crate::engines::{BlitzpoolModeGate, EngineHandles};
-use crate::pending_blocks::{put_pending_block, PendingBlock, PendingGroup, SettlementMode};
+use crate::pending_blocks::{
+    put_pending_block, GroupKind, PendingBlock, PendingGroup, SettlementMode,
+};
 
 /// The Core→Satellite block-found event: the front submits and records the
 /// block, the payout Satellite applies the ledger from this. Its wire form is
@@ -67,7 +69,7 @@ pub(crate) struct BlockFoundEvent {
     pub pplns_payouts_fingerprint: Option<[u8; 32]>,
     /// What the found block's coinbase actually paid, decoded on the Core;
     /// settlement books `claim − paid` from it. `None` (undecodable, or
-    /// [`Booking::RecordOnly`]) makes PPLNS and Group-Solo book nothing.
+    /// [`Booking::RecordOnly`]) makes every mode book nothing.
     #[serde(default)]
     pub actual_coinbase: Option<ActualCoinbase>,
 }
@@ -86,9 +88,8 @@ impl BlockFoundEvent {
 /// (`blocks_entity` row + notification).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Booking {
-    /// `reward_sats` is what the coinbase claims. PPLNS and Group-Solo only
-    /// log it, they settle from the block's own coinbase; Blockparty builds
-    /// its history row from it.
+    /// `reward_sats` is what the coinbase claims. Settlement only logs it and
+    /// books from the block's own coinbase.
     Book { reward_sats: u64 },
     /// For a block whose distribution was never bookable, or whose pool-built
     /// SV2 custom-job coinbase did not decode.
@@ -573,10 +574,10 @@ impl BlockFoundApplier {
         }
     }
 
-    /// PPLNS and Group-Solo: park the settlement inputs until
-    /// `confirmation_depth` so an orphan never books, else apply immediately.
-    /// Parking inputs, not results, lets several blocks pend at once. Never
-    /// substitute another `weight_snapshot`: that books what the chain didn't pay.
+    /// Park the settlement inputs until `confirmation_depth` so an orphan
+    /// never books, else apply immediately. Parking inputs, not results, lets
+    /// several blocks pend at once. Never substitute another
+    /// `weight_snapshot`: that books what the chain didn't pay.
     #[allow(clippy::too_many_arguments)]
     async fn gate_or_apply(
         &self,
@@ -601,83 +602,72 @@ impl BlockFoundApplier {
             );
             return;
         };
+        // The confirmation watcher's key and the idempotent history-row key.
+        let Some(block_hash) = block_hash_hex else {
+            error!(
+                address = address_str,
+                height, mode, "block-found: event carries no block hash — NOT booked"
+            );
+            return;
+        };
+        let pending = PendingBlock {
+            block_hash: block_hash.to_string(),
+            found_at_ms: chrono::Utc::now().timestamp_millis(),
+            block_height: height,
+            weight_snapshot,
+            actual_coinbase: Some(actual.clone()),
+            payouts_fingerprint,
+            group,
+        };
 
-        if let (Some(redis), Some(block_hash)) = (self.redis.as_ref(), block_hash_hex) {
-            let pending = PendingBlock {
-                block_hash: block_hash.to_string(),
-                found_at_ms: chrono::Utc::now().timestamp_millis(),
-                block_height: height,
-                weight_snapshot: weight_snapshot.clone(),
-                actual_coinbase: Some(actual.clone()),
-                payouts_fingerprint,
-                group: group.clone(),
-            };
-            let mut conn = redis.clone();
-            match put_pending_block(&mut conn, &pending).await {
-                Ok(()) => {
-                    info!(
-                        address = address_str,
-                        height,
-                        block_hash,
-                        mode,
-                        "block-found: distribution frozen, awaiting confirmations before apply"
-                    );
-                    return;
+        match self.redis.as_ref() {
+            Some(redis) => {
+                let mut conn = redis.clone();
+                match put_pending_block(&mut conn, &pending).await {
+                    Ok(()) => {
+                        info!(
+                            address = address_str,
+                            height,
+                            block_hash,
+                            mode,
+                            "block-found: distribution frozen, awaiting confirmations before apply"
+                        );
+                        return;
+                    }
+                    Err(err) => warn!(
+                        %err, address = address_str, height, mode,
+                        "block-found: pending-store write failed; applying immediately as fallback"
+                    ),
                 }
-                Err(err) => warn!(
-                    %err, address = address_str, height, mode,
-                    "block-found: pending-store write failed; applying immediately as fallback"
-                ),
             }
-        } else if self.redis.is_none() {
-            warn!(
+            None => warn!(
                 address = address_str,
                 height,
                 mode,
                 "block-found: confirmation-gating unavailable (no Redis); applying immediately"
-            );
-        } else {
-            warn!(address = address_str, height, mode,
-                "block-found: confirmation-gating unavailable (no block hash); applying immediately");
+            ),
         }
 
-        self.apply_now(
-            address_str,
-            height,
-            reward,
-            weight_snapshot,
-            actual,
-            payouts_fingerprint,
-            group,
-        )
-        .await;
+        self.apply_now(address_str, reward, &pending, actual).await;
     }
 
     /// Fallback of [`Self::gate_or_apply`]; the same settlement the
-    /// confirmation watcher runs.
-    #[allow(clippy::too_many_arguments)]
+    /// confirmation watcher runs, on the same blob it would have parked.
     async fn apply_now(
         &self,
         address_str: &str,
-        height: i32,
         reward: u64,
-        weight_snapshot: Option<bp_pplns_engine::window::snapshot::StoredWeightSnapshot>,
+        pending: &PendingBlock,
         actual: &bp_coinbase_snapshot::ActualCoinbase,
-        payouts_fingerprint: Option<[u8; 32]>,
-        group: Option<PendingGroup>,
     ) {
-        let mode = SettlementMode::of(group.as_ref());
-        let label = mode.label();
-        let applied = settle_block(
-            self.pplns.as_ref(),
-            self.group_solo.as_ref(),
-            mode,
-            height,
-            actual,
-            weight_snapshot,
-            payouts_fingerprint,
-        )
-        .await;
+        let height = pending.block_height;
+        let label = pending.mode().label();
+        let settlers = crate::block_confirmation::Settlers {
+            pplns: self.pplns.as_ref(),
+            group_solo: self.group_solo.as_ref(),
+            blockparty: self.blockparty.as_ref(),
+        };
+        let applied = settle_block(&settlers, pending, actual).await;
         match applied {
             Ok(history_inserted) => {
                 self.settle_distributions().await;
@@ -698,9 +688,14 @@ impl BlockFoundApplier {
             ),
             Err(SettleFailure::UnusableGroup) => warn!(
                 address = address_str,
-                group_id = group.as_ref().map(|g| g.group_id.as_str()).unwrap_or("-"),
+                group_id = pending
+                    .group
+                    .as_ref()
+                    .map(|g| g.group_id.as_str())
+                    .unwrap_or("-"),
                 height,
-                "block-found: Group-Solo group id or finder unusable — NOT booked"
+                mode = label,
+                "block-found: group id unusable or group gone — NOT booked"
             ),
             Err(SettleFailure::Engine(err)) => warn!(
                 %err, address = address_str, height,
@@ -771,112 +766,41 @@ impl BlockFoundApplier {
                 Booking::Book {
                     reward_sats: reward,
                 },
-            ) => {
-                let svc = match self.blockparty.as_ref() {
-                    Some(s) => s,
-                    None => {
-                        warn!(
-                            address = address_str,
-                            height,
-                            "block-found: Blockparty mode but service handle not wired — skipping history-row write"
-                        );
-                        return;
-                    }
-                };
-                let block_hash = match block_hash_hex.as_deref() {
-                    Some(h) => h,
-                    None => {
-                        warn!(
-                            address = address_str,
-                            height,
-                            "block-found: Blockparty needs a block hash for idempotent history-row write — skipping"
-                        );
-                        return;
-                    }
-                };
-                let group_id_str = match event.group_id.as_deref() {
-                    Some(g) => g,
-                    None => {
-                        warn!(
-                            address = address_str,
-                            height,
-                            "block-found: Blockparty mode published WITHOUT a group_id — skipping"
-                        );
-                        return;
-                    }
-                };
-                let group_uuid = match uuid::Uuid::parse_str(group_id_str) {
-                    Ok(u) => u,
-                    Err(err) => {
+            ) => match (event.group_id.as_deref(), self.blockparty.as_ref()) {
+                (Some(group_id_str), Some(_payouts)) => {
+                    if let Err(err) = uuid::Uuid::parse_str(group_id_str) {
                         warn!(
                             %err,
                             address = address_str,
                             group_id = group_id_str,
-                            "block-found: Blockparty group_id is not a valid UUID — skipping"
+                            "block-found: Blockparty group_id is not a valid UUID — skipping history-row write"
                         );
                         return;
                     }
-                };
-                let reward_sats = bp_common::Sats(reward as i64);
-                // Recomputed from the live engine, which also shaped the
-                // coinbase at template broadcast.
-                let dist = match svc.build_payouts(group_uuid, reward_sats).await {
-                    Ok(Some(d)) => d,
-                    Ok(None) => {
-                        warn!(
-                            address = address_str,
-                            group_id = group_id_str,
-                            height,
-                            "block-found: Blockparty group_id not found in DB — skipping history-row write"
-                        );
-                        return;
-                    }
-                    Err(err) => {
-                        warn!(
-                            %err,
-                            address = address_str,
-                            group_id = group_id_str,
-                            height,
-                            "block-found: Blockparty distribution build failed — skipping history-row write"
-                        );
-                        return;
-                    }
-                };
-                match svc
-                    .on_block_found(
-                        group_uuid,
+                    self.gate_or_apply(
+                        address_str,
                         height,
-                        block_hash,
-                        reward_sats,
-                        dist.pool_fee_sats,
-                        &dist.splits,
+                        reward,
+                        block_hash_hex.as_deref(),
                         None,
+                        event.actual_coinbase.as_ref(),
+                        None,
+                        Some(PendingGroup {
+                            group_id: group_id_str.to_string(),
+                            kind: GroupKind::Blockparty,
+                        }),
                     )
-                    .await
-                {
-                    Ok(Some(row)) => info!(
-                        address = address_str,
-                        group_id = group_id_str,
-                        height,
-                        reward_sats = reward,
-                        row_id = row.id,
-                        "block-found: Blockparty history row inserted"
-                    ),
-                    Ok(None) => info!(
-                        address = address_str,
-                        group_id = group_id_str,
-                        height,
-                        "block-found: Blockparty replay (idempotent, history row already present)"
-                    ),
-                    Err(err) => warn!(
-                        %err,
-                        address = address_str,
-                        group_id = group_id_str,
-                        height,
-                        "block-found: Blockparty on_block_found failed"
-                    ),
+                    .await;
                 }
-            }
+                (None, _) => warn!(
+                    address = address_str,
+                    height, "block-found: Blockparty mode published WITHOUT a group_id — skipping"
+                ),
+                (Some(_), None) => warn!(
+                    address = address_str,
+                    height, "block-found: Blockparty mode but payouts not configured — skipping history-row write"
+                ),
+            },
             (
                 MiningMode::GroupSolo,
                 Booking::Book {
@@ -911,6 +835,7 @@ impl BlockFoundApplier {
                                     Some(fingerprint),
                                     Some(PendingGroup {
                                         group_id: group_id_str.to_string(),
+                                        kind: GroupKind::GroupSolo,
                                     }),
                                 )
                                 .await;

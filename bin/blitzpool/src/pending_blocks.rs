@@ -15,12 +15,25 @@ pub(crate) const PENDING_KEY: &str = "pool:pending_blocks";
 /// deleted, so its frozen distribution survives for the operator.
 pub(crate) const UNBOOKABLE_KEY: &str = "pool:unbookable_blocks";
 
-/// Which group a Group-Solo block belongs to. Absent for PPLNS, whose
+/// Which group a group-mode block belongs to. Absent for PPLNS, whose
 /// accounting is pool-wide.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PendingGroup {
     /// Group UUID string.
     pub group_id: String,
+    /// Defaults to Group-Solo, so a blob parked without the field still
+    /// settles as the only group mode that existed then.
+    #[serde(default)]
+    pub kind: GroupKind,
+}
+
+/// The modes keyed by a group, as stored in a parked blob.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum GroupKind {
+    #[default]
+    GroupSolo,
+    Blockparty,
 }
 
 /// One frozen, not-yet-applied block-found.
@@ -43,7 +56,7 @@ pub(crate) struct PendingBlock {
     /// The weights fingerprint the winning job carried.
     #[serde(default)]
     pub payouts_fingerprint: Option<[u8; 32]>,
-    /// `Some` → Group-Solo, `None` → PPLNS. Branch on
+    /// `None` → PPLNS, else the group's [`GroupKind`]. Branch on
     /// [`PendingBlock::mode`], not on this field.
     #[serde(default)]
     pub group: Option<PendingGroup>,
@@ -55,13 +68,17 @@ pub(crate) struct PendingBlock {
 pub(crate) enum SettlementMode<'a> {
     Pplns,
     GroupSolo(&'a PendingGroup),
+    Blockparty(&'a PendingGroup),
 }
 
 impl<'a> SettlementMode<'a> {
     pub(crate) fn of(group: Option<&'a PendingGroup>) -> Self {
         match group {
-            Some(g) => Self::GroupSolo(g),
             None => Self::Pplns,
+            Some(g) => match g.kind {
+                GroupKind::GroupSolo => Self::GroupSolo(g),
+                GroupKind::Blockparty => Self::Blockparty(g),
+            },
         }
     }
 
@@ -69,6 +86,7 @@ impl<'a> SettlementMode<'a> {
         match self {
             Self::Pplns => "pplns",
             Self::GroupSolo(_) => "group-solo",
+            Self::Blockparty(_) => "blockparty",
         }
     }
 }
@@ -163,6 +181,7 @@ mod tests {
             payouts_fingerprint: Some([7u8; 32]),
             group: Some(PendingGroup {
                 group_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                kind: GroupKind::Blockparty,
             }),
         };
         let json = serde_json::to_string(&pb).unwrap();
@@ -172,6 +191,7 @@ mod tests {
         assert_eq!(back.payouts_fingerprint, Some([7u8; 32]));
         let group = back.group.as_ref().expect("group context survives");
         assert_eq!(group.group_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert!(matches!(back.mode(), SettlementMode::Blockparty(_)));
     }
 
     /// A Group-Solo blob parked with a finder and a weight snapshot still

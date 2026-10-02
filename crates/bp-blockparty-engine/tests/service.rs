@@ -825,6 +825,68 @@ async fn ready_transition_sizes_coinbase_reservation_to_roster() {
     cleanup(&pool, name, admin).await;
 }
 
+/// Ready already routes shares into the party coinbase, and a block is booked
+/// by recomputing the split from the roster, so the roster must be frozen from
+/// Ready on. The same edit succeeds while confirming (negative control).
+#[tokio::test]
+async fn a_ready_party_refuses_every_roster_edit() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let name = "bp-test-ready-frozen";
+    let admin = "bc1qadminfrozen";
+    let bob = "bc1qbobfrozen";
+    let carol = "bc1qcarolfrozen";
+    cleanup(&pool, name, admin).await;
+    for a in [bob, carol] {
+        let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+            .bind(a)
+            .execute(&pool)
+            .await;
+    }
+
+    let svc = svc(&pool).await;
+    let create = svc.create_group(name, admin, 5_000).await.expect("create");
+    let gid = create.group.id;
+    let token = Some(create.admin_token.as_str());
+    svc.add_member(gid, bob, 5_000, token)
+        .await
+        .expect("add_member");
+    svc.update_splits(gid, &[(addr(bob), 5_000)], token)
+        .await
+        .expect("precondition: confirming is editable");
+
+    svc.mark_member_confirmed(gid, &addr(bob))
+        .await
+        .expect("mark_confirmed");
+    let g = svc.get_group(gid).await.unwrap().unwrap();
+    assert_eq!(
+        g.status, "ready",
+        "precondition: the party must be routable"
+    );
+
+    let splits = svc.update_splits(gid, &[(addr(bob), 5_000)], token).await;
+    assert!(
+        matches!(splits, Err(BlockpartyServiceError::NotEditable)),
+        "{splits:?}"
+    );
+    let add = svc.add_member(gid, carol, 1_000, token).await;
+    assert!(
+        matches!(add, Err(BlockpartyServiceError::NotEditable)),
+        "{add:?}"
+    );
+    let remove = svc.remove_member(gid, bob, token).await;
+    assert!(
+        matches!(remove, Err(BlockpartyServiceError::NotEditable)),
+        "{remove:?}"
+    );
+    let g = svc.get_group(gid).await.unwrap().unwrap();
+    assert_eq!(g.status, "ready");
+    assert_eq!(svc.list_members(gid).await.unwrap().len(), 2);
+
+    cleanup(&pool, name, admin).await;
+}
+
 #[tokio::test]
 async fn update_splits_confirms_admin_and_resets_non_admin() {
     let Some(pool) = connect_or_skip().await else {
@@ -833,38 +895,45 @@ async fn update_splits_confirms_admin_and_resets_non_admin() {
     let name = "bp-test-splits-10";
     let admin = "bc1qadminsplits10";
     let bob = "bc1qbobsplits10";
+    // Unconfirmed, so the party stays editable while bob is confirmed.
+    let carol = "bc1qcarolsplits10";
     cleanup(&pool, name, admin).await;
-    let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
-        .bind(bob)
-        .execute(&pool)
-        .await;
+    for a in [bob, carol] {
+        let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+            .bind(a)
+            .execute(&pool)
+            .await;
+    }
 
     let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
-    svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
-        .await
-        .expect("add_member");
-
-    // Confirm bob → READY (admin is confirmed at creation).
-    svc.mark_member_confirmed(create.group.id, &addr(bob))
+    let gid = create.group.id;
+    let token = Some(create.admin_token.as_str());
+    for (m, pct) in [(bob, 3_000), (carol, 2_000)] {
+        svc.add_member(gid, m, pct, token)
+            .await
+            .expect("add_member");
+    }
+    svc.mark_member_confirmed(gid, &addr(bob))
         .await
         .expect("mark_confirmed");
-    let g = svc.get_group(create.group.id).await.unwrap().unwrap();
-    assert_eq!(
-        g.status, "ready",
-        "precondition: group READY before splits edit"
+    let bob_before = bp_db::list_blockparty_members_for_group(&pool, gid)
+        .await
+        .expect("list members")
+        .into_iter()
+        .find(|m| m.address.as_str() == bob)
+        .unwrap();
+    assert!(
+        bob_before.confirmed_at.is_some(),
+        "precondition: bob must be confirmed before the edit"
     );
 
-    // Edit splits: swap percentages.
-    svc.update_splits(
-        create.group.id,
-        &[(addr(admin), 6_000), (addr(bob), 4_000)],
-        Some(&create.admin_token),
-    )
-    .await
-    .expect("update_splits");
+    // Edit splits: move percent from bob to the admin.
+    svc.update_splits(gid, &[(addr(admin), 6_000), (addr(bob), 2_000)], token)
+        .await
+        .expect("update_splits");
 
-    let members = bp_db::list_blockparty_members_for_group(&pool, create.group.id)
+    let members = bp_db::list_blockparty_members_for_group(&pool, gid)
         .await
         .expect("list members");
     let admin_row = members
@@ -881,22 +950,19 @@ async fn update_splits_confirms_admin_and_resets_non_admin() {
         bob_row.confirmed_at.is_none(),
         "non-admin must lose confirmedAt after splits edit"
     );
+    let g = svc.get_group(gid).await.unwrap().unwrap();
+    assert_eq!(g.status, "confirming");
 
-    // Group must be CONFIRMING until bob re-confirms.
-    let g = svc.get_group(create.group.id).await.unwrap().unwrap();
-    assert_eq!(
-        g.status, "confirming",
-        "splits edit resets group to CONFIRMING"
-    );
-
-    // Re-confirm bob → READY again.
-    svc.mark_member_confirmed(create.group.id, &addr(bob))
-        .await
-        .expect("re-confirm bob");
-    let g = svc.get_group(create.group.id).await.unwrap().unwrap();
+    // Everyone re-confirms → READY.
+    for m in [bob, carol] {
+        svc.mark_member_confirmed(gid, &addr(m))
+            .await
+            .expect("re-confirm");
+    }
+    let g = svc.get_group(gid).await.unwrap().unwrap();
     assert_eq!(
         g.status, "ready",
-        "group re-enters READY once all members re-confirm"
+        "group enters READY once all members confirm the new splits"
     );
 
     cleanup(&pool, name, admin).await;

@@ -40,9 +40,11 @@ impl BlockpartyStatus {
         matches!(self, Self::Draft | Self::Confirming)
     }
 
-    /// The admin may change members or splits.
+    /// The admin may change members or splits. Never while routable: a block
+    /// is booked by recomputing the split from the roster, which matches the
+    /// coinbase only because the roster cannot change once jobs pay it.
     pub const fn is_editable(self) -> bool {
-        matches!(self, Self::Draft | Self::Confirming | Self::Ready)
+        matches!(self, Self::Draft | Self::Confirming)
     }
 }
 
@@ -100,12 +102,21 @@ mod tests {
     }
 
     #[test]
-    fn editable_excludes_active_and_dissolved() {
+    fn editable_excludes_every_routable_status() {
         assert!(BlockpartyStatus::Draft.is_editable());
         assert!(BlockpartyStatus::Confirming.is_editable());
-        assert!(BlockpartyStatus::Ready.is_editable());
+        assert!(!BlockpartyStatus::Ready.is_editable());
         assert!(!BlockpartyStatus::Active.is_editable());
         assert!(!BlockpartyStatus::Dissolved.is_editable());
+        for s in [
+            BlockpartyStatus::Draft,
+            BlockpartyStatus::Confirming,
+            BlockpartyStatus::Ready,
+            BlockpartyStatus::Active,
+            BlockpartyStatus::Dissolved,
+        ] {
+            assert!(!(s.is_routable() && s.is_editable()), "{s} is both");
+        }
     }
 
     #[test]

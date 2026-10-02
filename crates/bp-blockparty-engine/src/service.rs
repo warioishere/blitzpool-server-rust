@@ -955,8 +955,9 @@ struct RecomputeOutcome {
     admin_address: AddressId,
 }
 
-/// Confirming becomes ready when all members are confirmed, ready falls back
-/// otherwise; other statuses are untouched (`None`). Runs in the caller's TX
+/// Confirming becomes ready once all members are confirmed; other statuses are
+/// untouched (`None`). Ready never falls back: nothing can unconfirm a member
+/// of a party past Confirming, which is not editable. Runs in the caller's TX
 /// so the status always matches the roster it was read from, and the confirm
 /// paths stay atomic with their member write.
 async fn recompute_status_in_tx(
@@ -971,10 +972,7 @@ async fn recompute_status_in_tx(
         .status
         .parse::<BlockpartyStatus>()
         .map_err(|_| BlockpartyServiceError::InvalidState)?;
-    if !matches!(
-        current,
-        BlockpartyStatus::Confirming | BlockpartyStatus::Ready
-    ) {
+    if current != BlockpartyStatus::Confirming {
         return Ok(None);
     }
 
