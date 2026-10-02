@@ -229,7 +229,7 @@ ring = "0.17"
 rustls-pki-types = "1"
 
 # Base64 + base64url encoding for VAPID `k=` header + general use.
-base64 = "0.22"
+base64 = "0.23"
 
 # Test fixtures + scratch dirs
 tempfile = "3"
