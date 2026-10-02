@@ -319,9 +319,12 @@ pub mod redis_db {
     /// here, and don't add a write to either without moving them apart.
     pub const SESSION_PERSISTENCE: u16 = 15 * RANGE;
 
-    /// The last slice of the 544-DB test container: the next binary needs
-    /// `bp-test-redis` recreated with a larger `--databases`.
     pub const API: u16 = 16 * RANGE;
+
+    /// A second range for the `blitzpool` binary, whose first one is full.
+    /// The last slice of the 576-DB test container: the next one needs
+    /// `bp-test-redis` recreated with a larger `--databases`.
+    pub const BLITZPOOL_BIN_2: u16 = 17 * RANGE;
 }
 
 /// CI's Valkey service has only 16 databases and cannot be given

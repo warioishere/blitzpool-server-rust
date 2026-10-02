@@ -265,7 +265,6 @@ mod tests {
     use super::*;
     use redis::AsyncCommands;
 
-    const REDIS_URL: &str = "redis://127.0.0.1:16379";
     const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
     const RETENTION_MS: i64 = 48 * 3600 * 1000;
 
@@ -282,15 +281,6 @@ mod tests {
         assert!(!is_per_job_snapshot("groupsolo:g1:by-address"));
     }
 
-    async fn redis_or_skip(db: u8) -> Option<ConnectionManager> {
-        let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
-        let client = redis::Client::open(format!("{base}/{db}")).ok()?;
-        tokio::time::timeout(Duration::from_secs(2), ConnectionManager::new(client))
-            .await
-            .ok()?
-            .ok()
-    }
-
     async fn pg_or_skip() -> Option<PgPool> {
         let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| PG_URL.to_string());
         let db = tokio::time::timeout(Duration::from_secs(2), bp_db::Db::connect(&url))
@@ -303,7 +293,13 @@ mod tests {
     /// Backup, wipe, restore returns every key byte-for-byte; skips and `--scope` hold.
     #[tokio::test]
     async fn backup_then_restore_roundtrip_restores_exact_state() {
-        let Some(mut redis) = redis_or_skip(9).await else {
+        // Index 0 of the second range: the first one is full.
+        let Some(mut redis) = bp_test_support::connect_redis_in_range_or_skip(
+            bp_test_support::redis_db::BLITZPOOL_BIN_2,
+            0,
+        )
+        .await
+        else {
             eprintln!("redis unreachable — skipping redis-state-backup roundtrip");
             return;
         };
@@ -311,9 +307,6 @@ mod tests {
             eprintln!("pg unreachable — skipping redis-state-backup roundtrip");
             return;
         };
-
-        // Clean slate in the isolated test DB.
-        let _: () = redis::cmd("FLUSHDB").query_async(&mut redis).await.unwrap();
 
         // PPLNS aggregate (hash) + total (string), a Group-Solo round (zset +
         // by-address hash), and a transient rebuild temp that MUST be skipped.
