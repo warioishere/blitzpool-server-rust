@@ -28,13 +28,15 @@ pub(crate) struct SharedGroupService {
     pub(crate) service: Arc<GroupService>,
 }
 
-/// A failed cache rebuild is fatal: Stratum and API need it at first share.
+/// The address cache is warmed only where it is read (`warm_cache`: the front's
+/// group lookup and the API's group endpoints); a failed warm-up is fatal there.
 /// The member ceiling uses the same [`max_coinbase_outputs`] the
 /// coinbase-capacity endpoint reports, so the UI and the join refusal agree.
 pub(crate) async fn spawn(
     foundation: &FoundationHandles,
     production_hooks: &ProductionHooks,
     group_solo: &GroupSoloEngine,
+    warm_cache: bool,
 ) -> Result<SharedGroupService, GroupServiceSpawnError> {
     let cfg = group_solo.config();
     let coinbase_max_members = max_coinbase_outputs(cfg.coinbase_weight_budget);
@@ -49,8 +51,10 @@ pub(crate) async fn spawn(
         KICK_INACTIVITY_DAYS,
         coinbase_max_members,
     ));
-    info!("group-service: rebuilding address cache");
-    service.rebuild_cache().await?;
-    info!("group-service: address cache warm");
+    if warm_cache {
+        info!("group-service: rebuilding address cache");
+        service.rebuild_cache().await?;
+        info!("group-service: address cache warm");
+    }
     Ok(SharedGroupService { service })
 }

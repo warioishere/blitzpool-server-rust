@@ -390,25 +390,35 @@ async fn main() -> ExitCode {
         )
     });
 
-    let group_service =
-        match group_service::spawn(&handles, &production_hooks, &engines.group_solo).await {
-            Ok(g) => g,
-            Err(err) => {
-                tracing::error!(%err, "group-service spawn failed");
-                eprintln!("blitzpool: {err}");
-                print_group_service_error_help(&err);
-                return ExitCode::from(7);
-            }
-        };
-
-    let blockparty = match blockparty_service::spawn(&cfg, &handles, &group_service).await {
-        Ok(bp) => bp,
+    // Only the front (routing) and the API (group endpoints) read the group
+    // and Blockparty caches; the other roles skip the boot warm-up.
+    let reads_caches = is_front || is_api;
+    let group_service = match group_service::spawn(
+        &handles,
+        &production_hooks,
+        &engines.group_solo,
+        reads_caches,
+    )
+    .await
+    {
+        Ok(g) => g,
         Err(err) => {
-            tracing::error!(%err, "blockparty spawn failed");
+            tracing::error!(%err, "group-service spawn failed");
             eprintln!("blitzpool: {err}");
-            return ExitCode::from(11);
+            print_group_service_error_help(&err);
+            return ExitCode::from(7);
         }
     };
+
+    let blockparty =
+        match blockparty_service::spawn(&cfg, &handles, &group_service, reads_caches).await {
+            Ok(bp) => bp,
+            Err(err) => {
+                tracing::error!(%err, "blockparty spawn failed");
+                eprintln!("blitzpool: {err}");
+                return ExitCode::from(11);
+            }
+        };
     if let Some(ref bp) = blockparty {
         // Before stratum::spawn, so its payout resolver gets the Blockparty
         // arm and the pending-fee guard.

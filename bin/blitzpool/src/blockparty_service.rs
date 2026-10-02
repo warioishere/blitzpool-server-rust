@@ -59,11 +59,13 @@ pub(crate) struct SharedBlockparty {
 }
 
 /// Construct the production Blockparty handles when the feature is
-/// configured. `None` cleanly disables every Blockparty code path.
+/// configured. `None` cleanly disables every Blockparty code path. The
+/// routing cache is warmed only where it is read (`warm_cache`: front, API).
 pub(crate) async fn spawn(
     cfg: &AppConfig,
     foundation: &FoundationHandles,
     group_service: &SharedGroupService,
+    warm_cache: bool,
 ) -> Result<Option<SharedBlockparty>, BlockpartySpawnError> {
     let Some(bp_cfg) = cfg.blockparty.as_ref() else {
         info!("blockparty: feature disabled (no `[blockparty]` config block)");
@@ -104,9 +106,11 @@ pub(crate) async fn spawn(
         BlockpartyService::new(foundation.db.pool().clone(), hooks, pplns_cache, svc_config)
             .with_coinbase_reservation(reservation),
     );
-    info!("blockparty: rebuilding routing cache");
-    concrete.rebuild_cache().await?;
-    info!("blockparty: routing cache warm");
+    if warm_cache {
+        info!("blockparty: rebuilding routing cache");
+        concrete.rebuild_cache().await?;
+        info!("blockparty: routing cache warm");
+    }
     // Stash the routing cache as a membership reader for the
     // GroupService bidirectional collision check.
     let membership_reader: Arc<dyn bp_group_mgmt_engine::BlockpartyMembershipReader> =
