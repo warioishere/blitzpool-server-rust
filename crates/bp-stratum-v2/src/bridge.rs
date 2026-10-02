@@ -361,7 +361,7 @@ impl JdpDeclaredJobRegistry {
     /// Register a Coinbase-only allocate token. Sweeps expired entries on the
     /// way in, affordable because allocations are rate-limited.
     pub fn register_allocation(&mut self, token: Token, entry: AllocatedTokenRef, now_ms: u64) {
-        self.allocations.retain(|_, a| a.expires_at_ms > now_ms);
+        self.allocations.retain(|_, a| a.expires_at_ms >= now_ms);
         self.allocations.insert(token, entry);
     }
 
@@ -375,7 +375,7 @@ impl JdpDeclaredJobRegistry {
     pub fn allocation_ref(&self, token: &Token, now_ms: u64) -> Option<&AllocatedTokenRef> {
         self.allocations
             .get(token)
-            .filter(|a| a.expires_at_ms > now_ms)
+            .filter(|a| a.expires_at_ms >= now_ms)
     }
 
     // ── Payout distributions (ext 0x0003 push model) ────────────────
@@ -717,6 +717,33 @@ mod tests {
                 distribution_id: 11
             }),
             "the handler's ext 0x0003/Negotiation gate needs to see the TLV in order to reject it"
+        );
+    }
+
+    /// The expiry millisecond is still active here, as in
+    /// `crate::tokens::AllocatedToken::is_expired`; one after it is not.
+    #[test]
+    fn an_allocation_is_live_through_its_expiry_millisecond() {
+        let mut reg = JdpDeclaredJobRegistry::new();
+        let t = token(5);
+        let entry = AllocatedTokenRef {
+            expires_at_ms: 100,
+            ..allocated_ref(AllocationKind::JudgedByDistribution)
+        };
+        reg.register_allocation(t, entry, 0);
+        assert!(
+            reg.allocation_ref(&t, 100).is_some(),
+            "the boundary ms is still active"
+        );
+        assert!(reg.allocation_ref(&t, 101).is_none());
+        reg.register_allocation(
+            token(6),
+            allocated_ref(AllocationKind::JudgedByDistribution),
+            100,
+        );
+        assert!(
+            reg.allocation_ref(&t, 100).is_some(),
+            "a sweep at the boundary keeps it"
         );
     }
 
