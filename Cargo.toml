@@ -111,7 +111,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 axum = "0.7"
 
 # Typed config file (bp-config / bin/blitzpool).
-toml = "0.8"
+toml = "1.1"
 
 # CLI argument parsing for the binary.
 clap = { version = "4", features = ["derive"] }
