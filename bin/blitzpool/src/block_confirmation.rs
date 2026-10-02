@@ -8,7 +8,6 @@
 use std::time::Duration;
 
 use bp_bitcoin::{BitcoinRpc, RpcError};
-use bp_common::AddressId;
 use bp_group_solo_engine::engine::GroupSoloEngine;
 use bp_pplns_engine::engine::PplnsEngine;
 use bp_template_distribution::{TdpHandle, TemplateUpdate};
@@ -328,21 +327,12 @@ pub(crate) async fn settle_block(
     match mode {
         SettlementMode::GroupSolo(group) => {
             let engine = group_solo.ok_or(SettleFailure::NoEngine)?;
-            let (Ok(group_uuid), Ok(finder)) = (
-                uuid::Uuid::parse_str(&group.group_id),
-                AddressId::new(group.finder.clone()),
-            ) else {
+            let Ok(group_uuid) = uuid::Uuid::parse_str(&group.group_id) else {
                 return Err(SettleFailure::UnusableGroup);
             };
+            // Books from the coinbase alone; the snapshot inputs are PPLNS's.
             engine
-                .on_block_found(
-                    group_uuid,
-                    height,
-                    actual,
-                    &finder,
-                    weight_snapshot,
-                    payouts_fingerprint,
-                )
+                .on_block_found(group_uuid, height, actual)
                 .await
                 .map(|o| o.history_inserted)
                 .map_err(|e| SettleFailure::Engine(SettleError::GroupSolo(e)))
@@ -362,8 +352,8 @@ pub(crate) enum SettleFailure {
     /// This process has no engine for the block's mode.
     #[error("no engine wired for this block's mode")]
     NoEngine,
-    /// A Group-Solo block whose group id or finder does not parse.
-    #[error("unusable Group-Solo group id or finder")]
+    /// A Group-Solo block whose group id does not parse.
+    #[error("unusable Group-Solo group id")]
     UnusableGroup,
     #[error(transparent)]
     Engine(SettleError),
@@ -1108,7 +1098,6 @@ mod declared_block_booking_regtest {
                 payouts_fingerprint: Some(c.fingerprint),
                 group: Some(crate::pending_blocks::PendingGroup {
                     group_id: "not-a-uuid".to_string(),
-                    finder: c.miners[0].clone(),
                 }),
             },
         )
@@ -1511,6 +1500,16 @@ mod declared_block_booking_regtest {
             actual: Option<bp_coinbase_snapshot::ActualCoinbase>,
             block_hash: &str,
         ) -> bool {
+            self.book_paying(actual, block_hash, self.fingerprint).await
+        }
+
+        /// [`Self::book`] under a chosen payout fingerprint.
+        async fn book_paying(
+            &self,
+            actual: Option<bp_coinbase_snapshot::ActualCoinbase>,
+            block_hash: &str,
+            fingerprint: [u8; 32],
+        ) -> bool {
             self.sink()
                 .book_declared_block_found(
                     crate::block_sink::FoundBlockRecord {
@@ -1521,7 +1520,7 @@ mod declared_block_booking_regtest {
                         block_data: self.block_hex.clone(),
                     },
                     self.actual.total_value_sats,
-                    self.fingerprint,
+                    fingerprint,
                     actual,
                 )
                 .await
@@ -1617,12 +1616,51 @@ mod declared_block_booking_regtest {
     }
 
     /// The chain's own coinbase decides the Group-Solo booking too — not the
-    /// list the pool intended to pay.
+    /// list the pool intended to pay. Only a coinbase the pool built is booked:
+    /// the same block under a zeroed fingerprint parks nothing and leaves the
+    /// round standing, then books once the real fingerprint arrives.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_declared_group_block_books_exactly_what_its_coinbase_paid() {
         let Some(c) = GroupChain::setup(DB_GROUP_BOOKS_THE_COINBASE).await else {
             return;
         };
+
+        let round_before = c
+            .group_solo
+            .reader()
+            .round_stats(c.group_id)
+            .await
+            .expect("round stats")
+            .total_shares;
+        assert!(
+            round_before > 0.0,
+            "precondition: the seeded round holds shares"
+        );
+        assert!(
+            c.book_paying(Some(c.actual.clone()), &c.block_hash, [0u8; 32])
+                .await
+        );
+        let mut conn = c.redis.clone();
+        assert_eq!(
+            crate::pending_blocks::count_pending_at(&mut conn, crate::pending_blocks::PENDING_KEY)
+                .await
+                .expect("pending count"),
+            0,
+            "a coinbase the pool did not build must not be parked for booking"
+        );
+        c.reconcile_once().await;
+        assert!(c.history_rows().await.is_empty(), "nothing booked");
+        let round_after = c
+            .group_solo
+            .reader()
+            .round_stats(c.group_id)
+            .await
+            .expect("round stats")
+            .total_shares;
+        assert_eq!(
+            round_after, round_before,
+            "the round must not be reset for a block nobody booked"
+        );
 
         assert!(
             c.book(Some(c.actual.clone()), &c.block_hash).await,
@@ -1691,8 +1729,8 @@ mod declared_block_booking_regtest {
     }
 
     /// Replay safety: a second apply never adds, removes or moves a booked row.
-    /// Pins the outcome, not the mechanism (the consumed weight snapshot), with
-    /// a different coinbase so an overwrite would be visible.
+    /// Pins the outcome, not the mechanism, with a different coinbase so an
+    /// overwrite would be visible.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_second_apply_of_the_same_group_block_cannot_overwrite_it() {
         let Some(c) = GroupChain::setup(DB_GROUP_NO_OVERWRITE).await else {

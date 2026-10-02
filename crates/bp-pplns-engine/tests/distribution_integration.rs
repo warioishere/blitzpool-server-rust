@@ -524,7 +524,7 @@ async fn the_bootstrap_build_pays_the_asking_miner() {
     assert_eq!(paid.iter().map(|(_, s)| *s).sum::<u64>(), T, "Σ == T");
 
     // Bookable: the snapshot landed under its own fingerprint.
-    assert!(result.snapshot_written);
+    assert!(result.bookable);
     let window = build_window(&h).await;
     assert!(window
         .read_weight_snapshot_for(&result.payouts_fingerprint())
@@ -640,7 +640,7 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
         .expect("a rejected snapshot write must not fail the distribution build");
 
     assert!(
-        !result.snapshot_written,
+        !result.bookable,
         "the read-only user must have rejected the snapshot write — without \
          that this test never exercises its subject"
     );
@@ -758,7 +758,7 @@ async fn an_unreadable_ledger_degrades_to_a_score_only_distribution() {
         );
     }
     assert!(
-        degraded.snapshot_written,
+        degraded.bookable,
         "the degraded distribution is bookable like any other"
     );
 

@@ -328,7 +328,7 @@ impl GroupServiceHooks for ProductionGroupServiceHooks {
     async fn on_group_dissolved(&self, group_id: Uuid) {
         let group_id_str = group_id.to_string();
 
-        // Redis: wipe all round state including last-accepted-share-at + snapshots.
+        // Redis: wipe all round state including last-accepted-share-at.
         match self.group_solo.round().reset_full(&group_id_str).await {
             Ok(()) => {
                 info!(%group_id, "group-hooks: on_group_dissolved redis reset_full ok");
@@ -341,23 +341,6 @@ impl GroupServiceHooks for ProductionGroupServiceHooks {
                 );
             }
         }
-        // Redis: delete every snapshot of this group.
-        // Other wipes spare the per-job keys because they back live jobs;
-        // a dissolved group can book no block, so they go too.
-        let mut snap_conn = self.group_solo.round().connection_for_snapshot();
-        if let Err(err) = bp_group_solo_engine::round::snapshot::delete_everything_for_group(
-            &mut snap_conn,
-            &group_id_str,
-        )
-        .await
-        {
-            warn!(
-                %err,
-                %group_id,
-                "group-hooks: on_group_dissolved delete_all_snapshots failed (best-effort)"
-            );
-        }
-
         // PG: delete all block history rows for this group.
         match delete_pplns_group_block_history_for_group(self.db.pool(), group_id).await {
             Ok(n) => {

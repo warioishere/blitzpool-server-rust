@@ -54,8 +54,8 @@ impl ProductionPayoutResolver {
     }
 
     /// Resolution core for SV1 and SV2. The flag says whether a block found on
-    /// this list could be booked (for snapshot modes: the list came from the
-    /// engine AND its snapshot landed); one call yields both, so they agree.
+    /// this list could be booked (for PPLNS: the list came from the engine AND
+    /// its snapshot landed); one call yields both, so they agree.
     async fn resolve_internal(
         &self,
         miner_address: &str,
@@ -105,9 +105,8 @@ impl ProductionPayoutResolver {
 
 /// A PPLNS or Group-Solo build as this template's coinbase list, plus whether a
 /// block found on it can be booked. Evaluated with ext 0x0003/Payout Computation
-/// at this template's revenue, the same formula a JDC runs with its own. A build
-/// without its snapshot still stands (failing would hand this miner the whole
-/// block), but names a missing key, so the block is not bookable.
+/// at this template's revenue, the same formula a JDC runs with its own. An
+/// unbookable build still stands: failing would hand this miner the whole block.
 fn lower_built(
     scope: &'static str,
     group_id: Option<Uuid>,
@@ -115,14 +114,14 @@ fn lower_built(
     miner_address: &str,
     reward_sats: u64,
 ) -> (ResolvedPayouts, bool) {
-    if !built.snapshot_written {
+    if !built.bookable {
         warn!(
             scope,
             ?group_id,
             miner_address,
             reward_sats,
-            "distribution built but its snapshot did not land — the coinbase stands, \
-             a block found on it cannot be booked automatically"
+            "distribution built but not bookable — the coinbase stands, a block found on \
+             it cannot be booked automatically"
         );
     }
     match built.distribution.payout_entries_at(reward_sats) {
@@ -137,7 +136,7 @@ fn lower_built(
                     .collect(),
                 payouts_fingerprint: built.payouts_fingerprint(),
             },
-            built.snapshot_written,
+            built.bookable,
         ),
         Err(err) => {
             error!(
@@ -191,13 +190,13 @@ async fn blockparty_payouts(
 }
 
 /// Can a block on this mode be booked without resolving a distribution snapshot?
-/// Solo books no ledger row and Blockparty recomputes its splits, so yes. PPLNS
-/// and Group-Solo book from the snapshot this exact list was stored under, and a
-/// fallback list names one that was never written.
+/// Solo books no ledger row, Blockparty recomputes its splits and Group-Solo
+/// books from the coinbase alone, so yes. PPLNS settles from the snapshot this
+/// exact list was stored under, and a fallback list names one never written.
 fn books_without_a_snapshot(mode: MiningMode) -> bool {
     match mode {
-        MiningMode::Solo | MiningMode::Blockparty => true,
-        MiningMode::Pplns | MiningMode::GroupSolo => false,
+        MiningMode::Solo | MiningMode::Blockparty | MiningMode::GroupSolo => true,
+        MiningMode::Pplns => false,
     }
 }
 
@@ -545,7 +544,7 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
         self.lower_weight_distribution(
             &result.distribution,
             Some(result.payouts_fingerprint()),
-            result.snapshot_written,
+            result.bookable,
         )
     }
 
@@ -600,7 +599,7 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
                     Ok(result) => self.lower_weight_distribution(
                         &result.distribution,
                         Some(result.payouts_fingerprint()),
-                        result.snapshot_written,
+                        result.bookable,
                     ),
                     Err(err) => {
                         warn!(%err, miner = miner_address.as_str(),
@@ -722,8 +721,8 @@ mod tests {
 
     const TEST_REWARD: u64 = 5_000_000_000;
 
-    /// Solo and Blockparty are always bookable; the snapshot modes are not.
-    /// The flag gates the whole block-found emission, not just a snapshot lookup.
+    /// Only PPLNS needs a snapshot to book. The flag gates the whole
+    /// block-found emission, not just a snapshot lookup.
     #[test]
     fn the_modes_that_resolve_no_snapshot_can_always_be_booked() {
         assert!(
@@ -734,8 +733,11 @@ mod tests {
             books_without_a_snapshot(MiningMode::Blockparty),
             "blockparty recomputes its splits and keys on the block hash"
         );
+        assert!(
+            books_without_a_snapshot(MiningMode::GroupSolo),
+            "group-solo books what the coinbase paid and keeps no ledger"
+        );
         assert!(!books_without_a_snapshot(MiningMode::Pplns));
-        assert!(!books_without_a_snapshot(MiningMode::GroupSolo));
     }
 
     /// Pins the full mode → JDP distribution map, every mode named.
@@ -1023,10 +1025,10 @@ mod tests {
             "precondition: pool output plus both miners"
         );
 
-        for snapshot_written in [true, false] {
+        for promised in [true, false] {
             let built = BuiltDistribution {
                 distribution: distribution.clone(),
-                snapshot_written,
+                bookable: promised,
             };
             let (resolved, bookable) = lower_built("PPLNS", None, &built, "m", reward);
             let got: Vec<(String, u64)> = resolved
@@ -1039,7 +1041,7 @@ mod tests {
                 "the coinbase stands with or without the snapshot"
             );
             assert_eq!(resolved.payouts_fingerprint, distribution.fingerprint);
-            assert_eq!(bookable, snapshot_written);
+            assert_eq!(bookable, promised);
         }
     }
 

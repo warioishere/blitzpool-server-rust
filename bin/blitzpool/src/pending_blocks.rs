@@ -21,8 +21,6 @@ pub(crate) const UNBOOKABLE_KEY: &str = "pool:unbookable_blocks";
 pub(crate) struct PendingGroup {
     /// Group UUID string.
     pub group_id: String,
-    /// Finder (winning miner) address.
-    pub finder: String,
 }
 
 /// One frozen, not-yet-applied block-found.
@@ -35,7 +33,7 @@ pub(crate) struct PendingBlock {
     pub found_at_ms: i64,
     /// Block height (chain tip + 1 at find time).
     pub block_height: i32,
-    /// The distribution's settlement inputs.
+    /// The distribution's settlement inputs; PPLNS only.
     #[serde(default)]
     pub weight_snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
     /// What the block's coinbase actually paid — settlement's ground
@@ -165,7 +163,6 @@ mod tests {
             payouts_fingerprint: Some([7u8; 32]),
             group: Some(PendingGroup {
                 group_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
-                finder: "bcrt1qfinder".to_string(),
             }),
         };
         let json = serde_json::to_string(&pb).unwrap();
@@ -174,7 +171,20 @@ mod tests {
         assert_eq!(back.block_height, 840_000);
         assert_eq!(back.payouts_fingerprint, Some([7u8; 32]));
         let group = back.group.as_ref().expect("group context survives");
-        assert_eq!(group.finder, "bcrt1qfinder");
+        assert_eq!(group.group_id, "550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    /// A Group-Solo blob parked with a finder and a weight snapshot still
+    /// parses and settles as Group-Solo: parked blocks carry no TTL.
+    #[test]
+    fn a_group_solo_blob_with_finder_and_snapshot_still_parses() {
+        let json = r#"{"block_hash":"ab","found_at_ms":1,"block_height":2,
+            "weight_snapshot":{"entries":[],"score_total":0,"weight_p":1,"fee_ppm":15000,
+              "fee_address":"bc1qfee","reference_revenue_sats":312500000},
+            "group":{"group_id":"550e8400-e29b-41d4-a716-446655440000","finder":"bcrt1qf"}}"#;
+        let back: PendingBlock = serde_json::from_str(json).unwrap();
+        assert!(matches!(back.mode(), SettlementMode::GroupSolo(g)
+            if g.group_id == "550e8400-e29b-41d4-a716-446655440000"));
     }
 
     /// A PPLNS blob without group or optional fields still parses.

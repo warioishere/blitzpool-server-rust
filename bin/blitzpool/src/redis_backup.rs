@@ -25,11 +25,11 @@ const SCOPES: &[(&str, &str)] = &[("pplns", "pplns:*"), ("groupsolo", "groupsolo
 /// `RENAME`; never worth backing up (and confusing on restore).
 const SKIP_SUFFIX: &str = ":by-address:rebuild";
 
-/// Per-job coinbase-distribution snapshots, skipped as neither restorable
-/// nor few: each belongs to one in-memory job, so after a Redis loss nothing
+/// Per-job PPLNS distribution snapshots, skipped as neither restorable nor
+/// few: each belongs to one in-memory job, so after a Redis loss nothing
 /// looks a restored one up.
 fn is_per_job_snapshot(key: &str) -> bool {
-    key.starts_with("pplns:snapshot:") || key.contains(":jobsnapshot:")
+    key.starts_with("pplns:snapshot:")
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -274,18 +274,12 @@ mod tests {
     fn per_job_snapshots_are_classified_apart_from_restorable_state() {
         let fp = "ab".repeat(32);
         assert!(is_per_job_snapshot(&format!("pplns:snapshot:{fp}")));
-        assert!(is_per_job_snapshot(&format!(
-            "groupsolo:g1:jobsnapshot:{fp}"
-        )));
 
         assert!(!is_per_job_snapshot("pplns:window:by-address"));
         assert!(!is_per_job_snapshot("pplns:window:total"));
         assert!(!is_per_job_snapshot("pplns:buckets"));
         assert!(!is_per_job_snapshot("groupsolo:g1:shares"));
         assert!(!is_per_job_snapshot("groupsolo:g1:by-address"));
-        // The per-finder Group-Solo snapshot is one row per member, not per
-        // job, small, and stays in the backup.
-        assert!(!is_per_job_snapshot("groupsolo:g1:snapshot:bc1qfoo"));
     }
 
     async fn redis_or_skip(db: u8) -> Option<ConnectionManager> {
@@ -344,17 +338,9 @@ mod tests {
             .hset("pplns:window:by-address:rebuild", "x", "1")
             .await
             .unwrap();
-        // Per-job coinbase snapshots, which the backup must leave alone.
+        // A per-job coinbase snapshot, which the backup must leave alone.
         let _: () = redis
             .hset(format!("pplns:snapshot:{}", "ab".repeat(32)), "reward", "1")
-            .await
-            .unwrap();
-        let _: () = redis
-            .hset(
-                format!("groupsolo:test-g:jobsnapshot:{}", "cd".repeat(32)),
-                "reward",
-                "1",
-            )
             .await
             .unwrap();
 
@@ -363,7 +349,7 @@ mod tests {
             .expect("backup");
         assert_eq!(
             n, 4,
-            "4 keys backed up (rebuild temp + both per-job snapshots skipped)"
+            "4 keys backed up (rebuild temp + per-job snapshot skipped)"
         );
 
         let captured = bp_db::latest_redis_backup_captured_at(&pool)

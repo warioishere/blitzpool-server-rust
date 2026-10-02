@@ -336,7 +336,7 @@ async fn a_block_settles_from_its_parked_blob_after_the_snapshot_key_is_gone() {
     let result = h.engine.build_distribution(REWARD).await.expect("built");
     let fp = result.payouts_fingerprint();
     assert!(
-        result.snapshot_written,
+        result.bookable,
         "precondition: the build persisted its snapshot"
     );
     let actual = actual_paying_exactly(&result, REWARD);

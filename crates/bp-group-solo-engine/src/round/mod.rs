@@ -5,8 +5,6 @@
 //! time-bucketed sliding window trimmed by age that never block-resets.
 //! Both reset paths keep `applied` (see [`key_applied`]) so an un-ACKed batch is not reapplied.
 
-pub mod snapshot;
-
 use std::collections::HashMap;
 
 use bp_group_mgmt::group::PayoutMode;
@@ -665,12 +663,6 @@ impl GroupRoundStore {
     }
 
     // ── Member operations (admin-triggered) ────────────────────────
-
-    /// A `ConnectionManager` clone for snapshot writes/reads (multiplexed,
-    /// cheap to clone).
-    pub fn connection_for_snapshot(&self) -> ConnectionManager {
-        self.conn.clone()
-    }
 
     /// Remove the address's contribution (kick flow) and return the removed
     /// diff-1 amount. The caller passes the mode because this store has no

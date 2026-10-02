@@ -47,20 +47,6 @@ pub enum EngineError {
     Reset(#[from] ResetError),
     #[error("distribution: {0}")]
     Distribution(Arc<DistributionError>),
-    #[error("snapshot missing for group {group_id} finder {finder_address} block {block_height}")]
-    SnapshotMissing {
-        group_id: Uuid,
-        finder_address: String,
-        block_height: i32,
-    },
-    #[error(
-        "no snapshot for group {group_id} finder {finder_address} under the winning job's payout \
-         list — the block needs an operator reprocess"
-    )]
-    SnapshotMissingForPayouts {
-        group_id: Uuid,
-        finder_address: String,
-    },
     #[error(
         "group {group_id} block {block_height} coinbase pays {actual_reward} sats, less than \
          the {subsidy} sat subsidy the block was entitled to — it forfeited money, so nothing \
@@ -82,10 +68,7 @@ impl EngineError {
     /// is not lost: the operator reprocess books it from its own coinbase.
     pub fn is_terminal(&self) -> bool {
         match self {
-            EngineError::Config(_)
-            | EngineError::SnapshotMissing { .. }
-            | EngineError::SnapshotMissingForPayouts { .. }
-            | EngineError::RevenueBelowSubsidy { .. } => true,
+            EngineError::Config(_) | EngineError::RevenueBelowSubsidy { .. } => true,
             // Infrastructure, and the per-group in-flight guard — all
             // of these clear on their own.
             EngineError::Redis(_)
@@ -514,43 +497,15 @@ impl GroupSoloEngine {
             .map_err(EngineError::Distribution)
     }
 
-    /// Look up the weight snapshot stored under the winning job's
-    /// `weights_fingerprint`. Never rebuilds: one share after job issue moves
-    /// the round, and a rebuild would book a split the coinbase did not pay.
-    /// Missing → typed error, so an operator books the block rather than it being booked wrong.
-    pub async fn weight_snapshot_for_block_found(
-        &self,
-        group_id: Uuid,
-        finder_address: &AddressId,
-        weights_fingerprint: &[u8; 32],
-    ) -> Result<bp_coinbase_snapshot::StoredWeightSnapshot, EngineError> {
-        let mut conn = self.inner.round.connection_for_snapshot();
-        let group_key = group_id.to_string();
-        bp_coinbase_snapshot::resolve_snapshot_for_block_found(
-            &mut conn,
-            |fp| crate::round::snapshot::key_for_fingerprint(&group_key, fp),
-            weights_fingerprint,
-            "group-solo",
-        )
-        .await?
-        .ok_or_else(|| EngineError::SnapshotMissingForPayouts {
-            group_id,
-            finder_address: finder_address.as_str().to_string(),
-        })
-    }
-
     /// Book a found block from its OWN coinbase, then move the round on. No
     /// settlement: withheld value goes to the pool ([`bp_pplns::WithheldValue::ToPool`]),
-    /// so what the coinbase paid is the whole truth and `snapshot` only feeds
-    /// sanity checks. Idempotent via the `(groupId, blockHeight, address)` UNIQUE key.
+    /// so what the coinbase paid is the whole truth. Idempotent via the
+    /// `(groupId, blockHeight, address)` UNIQUE key.
     pub async fn on_block_found(
         &self,
         group_id: Uuid,
         block_height: i32,
         actual: &bp_coinbase_snapshot::ActualCoinbase,
-        finder_address: &AddressId,
-        snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
-        weights_fingerprint: Option<[u8; 32]>,
     ) -> Result<ApplyDistributionResult, EngineError> {
         {
             let mut in_flight = self.inner.block_found_in_progress.lock().await;
@@ -560,14 +515,7 @@ impl GroupSoloEngine {
             in_flight.insert(group_id);
         }
         let result = self
-            .on_block_found_inner(
-                group_id,
-                block_height,
-                actual,
-                finder_address,
-                snapshot,
-                weights_fingerprint,
-            )
+            .on_block_found_inner(group_id, block_height, actual)
             .await;
         self.inner
             .block_found_in_progress
@@ -582,36 +530,8 @@ impl GroupSoloEngine {
         group_id: Uuid,
         block_height: i32,
         actual: &bp_coinbase_snapshot::ActualCoinbase,
-        finder_address: &AddressId,
-        snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
-        weights_fingerprint: Option<[u8; 32]>,
     ) -> Result<ApplyDistributionResult, EngineError> {
         let group_key = group_id.to_string();
-
-        // 1. Snapshot source: event-carried, else the fingerprint key.
-        let snapshot = match snapshot {
-            Some(s) => s,
-            None => {
-                let read = match weights_fingerprint.filter(|fp| fp != &[0u8; 32]) {
-                    Some(fp) => {
-                        let mut conn = self.inner.round.connection_for_snapshot();
-                        bp_coinbase_snapshot::resolve_snapshot_for_block_found(
-                            &mut conn,
-                            |fp| crate::round::snapshot::key_for_fingerprint(&group_key, fp),
-                            &fp,
-                            "group-solo",
-                        )
-                        .await?
-                    }
-                    None => None,
-                };
-                read.ok_or(EngineError::SnapshotMissing {
-                    group_id,
-                    finder_address: finder_address.as_str().to_string(),
-                    block_height,
-                })?
-            }
-        };
 
         // The one hard gate: a coinbase that pays less than its own
         // subsidy destroyed money it was entitled to, which no healthy
@@ -656,16 +576,10 @@ impl GroupSoloEngine {
         let total_shares_in_round: f64 = round_by_addr.values().sum();
         let total_shares_i64 = total_shares_in_round.round() as i64;
 
-        let audit_rows = history_rows_from_coinbase(
-            group_id,
-            &snapshot,
-            actual,
-            &round_by_addr,
-            total_shares_i64,
-        );
+        let audit_rows =
+            history_rows_from_coinbase(group_id, actual, &round_by_addr, total_shares_i64);
 
-        // 3. Write the history, 4. move the round on, 5. drop the
-        //    snapshots this block consumed, 6. drop the build cache.
+        // 3. Write the history, 4. move the round on, 5. drop the build cache.
         let outcome = apply_distribution(
             &self.inner.pool,
             group_id,
@@ -692,8 +606,6 @@ impl GroupSoloEngine {
             }
         }
 
-        // The snapshot is not consumed: jobs built from its distribution may
-        // still be mined, and it expires by TTL, as PPLNS does.
         self.inner.distribution_builder.invalidate_all();
 
         info!(
@@ -706,13 +618,11 @@ impl GroupSoloEngine {
     }
 }
 
-/// One history row per address the coinbase paid; amounts come only from
-/// `actual`. The snapshot supplies just the fee address and the member list
-/// for flagging strays. An unpaid member gets no row: under
+/// One history row per address the coinbase paid besides the pool output,
+/// amounts only from `actual`. An unpaid member gets no row: under
 /// [`bp_pplns::WithheldValue::ToPool`] they are owed nothing.
 fn history_rows_from_coinbase(
     group_id: Uuid,
-    snapshot: &bp_coinbase_snapshot::StoredWeightSnapshot,
     actual: &bp_coinbase_snapshot::ActualCoinbase,
     round_by_addr: &HashMap<String, f64>,
     total_shares_in_round: i64,
@@ -720,8 +630,7 @@ fn history_rows_from_coinbase(
     let mut rows: Vec<AuditRow> = Vec::new();
 
     for (addr_str, paid) in &actual.paid_by_address {
-        if *paid == 0 || *addr_str == snapshot.fee_address {
-            // The pool output (fee plus withheld value) is not a member payout.
+        if *paid == 0 {
             continue;
         }
         let Ok(address) = AddressId::new(addr_str.clone()) else {
@@ -733,16 +642,6 @@ fn history_rows_from_coinbase(
             );
             continue;
         };
-        if !snapshot.entries.iter().any(|e| &e.address == addr_str) {
-            // Positional validation rules this out; the chain paid it, so
-            // record it anyway, loudly.
-            warn!(
-                %group_id,
-                address = %addr_str,
-                paid,
-                "group-solo history: coinbase paid an address outside the distribution"
-            );
-        }
         rows.push(AuditRow {
             address,
             paid_sats: Sats(*paid as i64),
@@ -895,16 +794,31 @@ mod tests {
         assert!(s.contains(&g.to_string()));
     }
 
+    /// Every paid output besides the pool's becomes a row, the fee address
+    /// mining as a member included; a 0-sat entry does not.
     #[test]
-    fn snapshot_missing_carries_finder() {
-        let g = Uuid::new_v4();
-        let e = EngineError::SnapshotMissing {
-            group_id: g,
-            finder_address: "bc1qfinder".to_string(),
-            block_height: 9999,
+    fn history_rows_transcribe_every_paid_output_besides_the_pool() {
+        const MEMBER: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        const FEE_AS_MEMBER: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
+        const UNPAID: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+        let actual = bp_coinbase_snapshot::ActualCoinbase {
+            paid_by_address: HashMap::from([
+                (MEMBER.to_string(), 200_000_000),
+                (FEE_AS_MEMBER.to_string(), 100_000_000),
+                (UNPAID.to_string(), 0),
+            ]),
+            pool_paid_sats: 12_500_000,
+            total_value_sats: 312_500_000,
         };
-        let s = format!("{e}");
-        assert!(s.contains("bc1qfinder"));
-        assert!(s.contains("9999"));
+        let rows = history_rows_from_coinbase(Uuid::nil(), &actual, &HashMap::new(), 0);
+        let paid: Vec<(&str, i64)> = rows
+            .iter()
+            .map(|r| (r.address.as_str(), r.paid_sats.0))
+            .collect();
+        assert_eq!(
+            paid,
+            vec![(FEE_AS_MEMBER, 100_000_000), (MEMBER, 200_000_000)],
+            "the pool output is not in `paid_by_address`; everything else paid is a row"
+        );
     }
 }

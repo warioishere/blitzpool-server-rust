@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Persistence and ledger primitives shared by the PPLNS and Group-Solo
-//! payout engines. One copy keeps the snapshot wire format (stable across
-//! deploys) and the DB row-type strings identical for both; each engine keeps
-//! only its key scheme.
+//! Build and ledger primitives shared by the PPLNS and Group-Solo payout
+//! engines, so the weight build, the decoded coinbase and the DB row-type
+//! strings stay identical for both. The settlement snapshot (wire format stable
+//! across deploys) is PPLNS's alone: Group-Solo books from the coinbase.
 
 pub mod actual;
 pub mod budget;
@@ -18,7 +18,7 @@ use tracing::warn;
 
 pub use actual::ActualCoinbase;
 pub use budget::{read_coinbase_budget, write_coinbase_budget, PPLNS_COINBASE_BUDGET_KEY};
-pub use build::{build_and_snapshot, BuildRequest, BuiltDistribution};
+pub use build::{build_and_snapshot, sanitize_and_build, BuildRequest, BuiltDistribution};
 pub use ledger::{ApplyDistributionResult, LedgerError, PayoutRowType};
 pub use snapshot::{
     delete_snapshot, read_weight_snapshot, read_weight_snapshot_with_retry,

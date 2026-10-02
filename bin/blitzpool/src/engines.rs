@@ -252,12 +252,11 @@ fn to_group_solo_engine_config(cfg: &AppConfig) -> Result<GroupSoloEngineConfig,
         coinbase_weight_budget: cfg.group_fees.coinbase_weight_budget,
         subsidy_halving_interval: subsidy_halving_interval(cfg.network),
         // One floor shared with PPLNS. Not `unwrap_or_default()`: `Sats(0)`
-        // fails validation, and `..default()` below skips an explicit field.
+        // fails validation.
         min_payout_sats: cfg.pplns.as_ref().map_or_else(
             || GroupSoloEngineConfig::default().min_payout_sats,
             |p| Sats(p.min_payout_sats),
         ),
-        ..GroupSoloEngineConfig::default()
     };
     let validated = base.try_new()?;
     Ok(validated)

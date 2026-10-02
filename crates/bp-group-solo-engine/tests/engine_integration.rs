@@ -6,7 +6,6 @@
 //! End-to-end integration tests for `GroupSoloEngine` against
 //! docker-Redis + docker-PG.
 
-use bp_coinbase_snapshot::StoredWeightSnapshot;
 use bp_common::AddressId;
 use bp_group_solo_engine::config::GroupSoloEngineConfig;
 use bp_group_solo_engine::engine::{EngineError, GroupSoloEngine};
@@ -17,8 +16,7 @@ use uuid::Uuid;
 const REDIS_URL: &str = "redis://127.0.0.1:16379";
 const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
 
-/// Pool-output recipient; the weight model needs one, and it must differ
-/// from every miner address because a fee address is never a member row.
+/// Pool-output recipient; the weight model needs one.
 const FEE_ADDR: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
 
 struct Harness {
@@ -270,14 +268,7 @@ async fn on_block_found_applies_distribution_and_resets_round() {
     let actual = actual_paying_exactly(&result, 312_500_000);
     let outcome = h
         .engine
-        .on_block_found(
-            h.group_id,
-            block_height,
-            &actual,
-            &finder,
-            None,
-            Some(result.payouts_fingerprint()),
-        )
+        .on_block_found(h.group_id, block_height, &actual)
         .await
         .expect("ok");
     assert!(outcome.history_inserted >= 1);
@@ -335,9 +326,6 @@ async fn a_richer_block_leaves_nobody_owing() {
             h.group_id,
             9_995_401,
             &actual_paying_exactly(&result, T_ACTUAL),
-            &finder,
-            None,
-            Some(result.payouts_fingerprint()),
         )
         .await
         .expect("apply");
@@ -391,82 +379,11 @@ async fn count_group_balance_rows(pool: &PgPool, group_id: Uuid) -> i64 {
         .expect("count balances")
 }
 
-// ── Test 3b — snapshot-carried apply survives a Redis snapshot overwrite ──
+// ── Test 3b — the block books the job's coinbase, never a rebuild ──
+// A rebuild sees a round that moved since job issue; the history must still
+// transcribe what the winning job's coinbase paid.
 #[tokio::test]
-async fn snapshot_carried_apply_survives_redis_overwrite() {
-    let h = match spawn_or_skip(11, None).await {
-        Some(h) => h,
-        None => return,
-    };
-    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
-    let reward = 312_500_000;
-
-    h.engine
-        .record_share(None, h.group_id, finder.as_str(), 100.0, 1_700_000_000_001)
-        .await
-        .unwrap();
-
-    let job = h
-        .engine
-        .build_distribution(h.group_id, reward, &finder)
-        .await
-        .expect("job-time build ok");
-
-    let frozen = h
-        .engine
-        .weight_snapshot_for_block_found(h.group_id, &finder, &job.payouts_fingerprint())
-        .await
-        .expect("freeze snapshot ok");
-    assert_eq!(frozen.reference_revenue_sats, reward);
-
-    // Template churn overwrites the per-(group, finder) key with a moved round.
-    h.engine
-        .record_share(None, h.group_id, finder.as_str(), 50.0, 1_700_000_000_002)
-        .await
-        .unwrap();
-    h.engine
-        .build_distribution(h.group_id, reward + 999_999, &finder)
-        .await
-        .expect("churn rebuild ok");
-
-    let block_height = 9_995_010;
-    let actual = actual_paying_exactly(&job, reward);
-    let outcome = h
-        .engine
-        .on_block_found(
-            h.group_id,
-            block_height,
-            &actual,
-            &finder,
-            Some(frozen),
-            Some(job.payouts_fingerprint()),
-        )
-        .await
-        .expect("snapshot-carried apply must succeed despite the Redis overwrite");
-    assert!(outcome.history_inserted >= 1);
-
-    let count: (i64,) = sqlx::query_as(
-        r#"SELECT count(*) FROM pplns_group_block_history
-           WHERE "groupId" = $1 AND "blockHeight" = $2"#,
-    )
-    .bind(h.group_id)
-    .bind(block_height)
-    .fetch_one(&h.pool)
-    .await
-    .unwrap();
-    assert!(count.0 >= 1);
-
-    let stats = h.engine.reader().round_stats(h.group_id).await.expect("ok");
-    assert_eq!(stats.total_shares, 0.0, "round wiped on block-found");
-
-    drop_harness(h).await;
-}
-
-// ── Test 3b2 — block-found resolves the job's distribution, never a rebuild ──
-// A rebuild sees a round that moved since job issue, so the coinbase would
-// pay one split and the history book another.
-#[tokio::test]
-async fn block_found_resolves_the_job_time_distribution_not_a_rebuild() {
+async fn block_found_books_the_job_coinbase_after_the_round_moved() {
     let h = match spawn_or_skip(13, None).await {
         Some(h) => h,
         None => return,
@@ -489,127 +406,64 @@ async fn block_found_resolves_the_job_time_distribution_not_a_rebuild() {
         .await
         .expect("job-time build ok");
 
-    // One share lands between job issue and block-found — B overtakes A.
+    // One share lands between job issue and block-found: B overtakes A.
     h.engine
         .record_share(None, h.group_id, b.as_str(), 900.0, 3)
         .await
         .unwrap();
-
-    // Precondition: the round really moved.
     let rebuilt = h
         .engine
         .build_distribution(h.group_id, reward, &a)
         .await
         .expect("rebuild ok");
+    let paid = actual_paying_exactly(&job, reward);
+    let rebuilt_pays = actual_paying_exactly(&rebuilt, reward);
     assert_ne!(
-        rebuilt.payouts_fingerprint(),
-        job.payouts_fingerprint(),
-        "the share must have moved the round, else this test proves nothing"
+        paid.paid_by_address, rebuilt_pays.paid_by_address,
+        "the share must have moved the split, else this test proves nothing"
     );
 
-    let snap = h
-        .engine
-        .weight_snapshot_for_block_found(h.group_id, &a, &job.payouts_fingerprint())
+    let height = 9_995_010;
+    h.engine
+        .on_block_found(h.group_id, height, &paid)
         .await
-        .expect("the job's own distribution must resolve");
-    assert_eq!(
-        snap,
-        StoredWeightSnapshot::from_distribution(&job.distribution),
-        "block-found must book the settlement inputs the winning job's coinbase was built from"
-    );
+        .expect("apply");
+    let history = read_block_history(&h.pool, h.group_id, height).await;
+    let expected: std::collections::HashMap<String, i64> = paid
+        .paid_by_address
+        .iter()
+        .map(|(addr, sats)| (addr.clone(), *sats as i64))
+        .collect();
+    assert_eq!(history, expected, "history transcribes the job's coinbase");
+
+    let stats = h.engine.reader().round_stats(h.group_id).await.expect("ok");
+    assert_eq!(stats.total_shares, 0.0, "round wiped on block-found");
 
     drop_harness(h).await;
 }
 
-// ── Test 3b2b — an unknown payout list resolves to nothing ───────────
-// Any substitute would be a split the coinbase did not pay; a wrong booking
-// cannot be undone, a missing one can.
+// ── Test 3b4 — a redelivered apply books nothing ──────────────────
 #[tokio::test]
-async fn an_unknown_payout_list_resolves_to_nothing() {
-    let h = match spawn_or_skip(16, None).await {
-        Some(h) => h,
-        None => return,
-    };
-    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
-    let reward = 312_500_000;
-
-    h.engine
-        .record_share(None, h.group_id, finder.as_str(), 100.0, 1)
-        .await
-        .unwrap();
-    // A real distribution exists — but not under this fingerprint.
-    h.engine
-        .build_distribution(h.group_id, reward, &finder)
-        .await
-        .expect("build ok");
-
-    let err = h
-        .engine
-        .weight_snapshot_for_block_found(h.group_id, &finder, &[0x11u8; 32])
-        .await
-        .expect_err("an unknown payout list must not resolve to some other distribution");
-    assert!(
-        matches!(err, EngineError::SnapshotMissingForPayouts { .. }),
-        "expected SnapshotMissingForPayouts, got {err:?}"
-    );
-
-    drop_harness(h).await;
-}
-
-// ── Test 3b4 — an apply leaves every payout-list snapshot in place ──
-// Each member mines its own job; a second block found before the next
-// rebuild must still resolve its distribution.
-#[tokio::test]
-async fn a_redelivered_apply_books_nothing_and_snapshots_outlive_their_blocks() {
+async fn a_redelivered_apply_books_nothing() {
     let h = match spawn_or_skip(17, None).await {
         Some(h) => h,
         None => return,
     };
     let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
-    let other = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
     let reward = 312_500_000;
 
-    // Two members, or every build is 100 % to one address and never moves.
     h.engine
         .record_share(None, h.group_id, finder.as_str(), 100.0, 1)
-        .await
-        .unwrap();
-    h.engine
-        .record_share(None, h.group_id, other.as_str(), 100.0, 2)
         .await
         .unwrap();
     let booked = h
         .engine
         .build_distribution(h.group_id, reward, &finder)
         .await
-        .expect("build A");
-
-    h.engine
-        .record_share(None, h.group_id, other.as_str(), 900.0, 3)
-        .await
-        .unwrap();
-    let still_live = h
-        .engine
-        .build_distribution(h.group_id, reward, &finder)
-        .await
-        .expect("build B");
-    assert_ne!(
-        booked.payouts_fingerprint(),
-        still_live.payouts_fingerprint(),
-        "the two jobs must carry different payout lists, else this proves nothing"
-    );
+        .expect("build");
 
     let actual = actual_paying_exactly(&booked, reward);
-    let apply = || {
-        h.engine.on_block_found(
-            h.group_id,
-            9_995_021,
-            &actual,
-            &finder,
-            None,
-            Some(booked.payouts_fingerprint()),
-        )
-    };
+    let apply = || h.engine.on_block_found(h.group_id, 9_995_021, &actual);
     let first = apply().await.expect("apply ok");
     assert!(
         first.history_inserted >= 1,
@@ -619,15 +473,6 @@ async fn a_redelivered_apply_books_nothing_and_snapshots_outlive_their_blocks() 
         .await
         .expect("a redelivery is a no-op, not an error");
     assert_eq!(again.history_inserted, 0, "a redelivery must write nothing");
-
-    h.engine
-        .weight_snapshot_for_block_found(h.group_id, &finder, &booked.payouts_fingerprint())
-        .await
-        .expect("the booked job's distribution expires by TTL, not by the apply");
-    h.engine
-        .weight_snapshot_for_block_found(h.group_id, &finder, &still_live.payouts_fingerprint())
-        .await
-        .expect("a live job's distribution must survive another block's apply");
 
     drop_harness(h).await;
 }
@@ -660,9 +505,6 @@ async fn on_block_found_keeps_round_when_reset_flag_false() {
             h.group_id,
             9_997_001,
             &actual_paying_exactly(&dist, 312_500_000),
-            &finder,
-            None,
-            Some(dist.payouts_fingerprint()),
         )
         .await
         .expect("ok");
@@ -707,22 +549,10 @@ async fn duplicate_block_found_does_not_double_the_history() {
         .build_distribution(h.group_id, reward, &finder)
         .await
         .expect("job-time build ok");
-    let snap = h
-        .engine
-        .weight_snapshot_for_block_found(h.group_id, &finder, &job.payouts_fingerprint())
-        .await
-        .expect("snapshot");
     let actual = actual_paying_exactly(&job, reward);
 
     h.engine
-        .on_block_found(
-            h.group_id,
-            height,
-            &actual,
-            &finder,
-            Some(snap.clone()),
-            Some(job.payouts_fingerprint()),
-        )
+        .on_block_found(h.group_id, height, &actual)
         .await
         .expect("apply 1");
     let after_first = read_block_history(&h.pool, h.group_id, height).await;
@@ -730,14 +560,7 @@ async fn duplicate_block_found_does_not_double_the_history() {
     assert!(after_first[finder.as_str()] > 0);
 
     h.engine
-        .on_block_found(
-            h.group_id,
-            height,
-            &actual,
-            &finder,
-            Some(snap),
-            Some(job.payouts_fingerprint()),
-        )
+        .on_block_found(h.group_id, height, &actual)
         .await
         .expect("apply 2 (replay) must not error");
     let after_replay = read_block_history(&h.pool, h.group_id, height).await;
@@ -781,44 +604,31 @@ async fn on_block_found_re_entrancy_guard_per_group() {
         .build_distribution(h.group_id, 312_500_000, &finder)
         .await
         .expect("ok");
-    let fp = dist.payouts_fingerprint();
     let actual = actual_paying_exactly(&dist, 312_500_000);
 
     let engine1 = h.engine.clone();
     let engine2 = h.engine.clone();
     let gid = h.group_id;
-    let finder1 = finder.clone();
-    let finder2 = finder.clone();
     let actual1 = actual.clone();
     let actual2 = actual;
-    let task1 = tokio::spawn(async move {
-        engine1
-            .on_block_found(gid, 9_995_002, &actual1, &finder1, None, Some(fp))
-            .await
-    });
-    let task2 = tokio::spawn(async move {
-        engine2
-            .on_block_found(gid, 9_995_002, &actual2, &finder2, None, Some(fp))
-            .await
-    });
+    let task1 = tokio::spawn(async move { engine1.on_block_found(gid, 9_995_002, &actual1).await });
+    let task2 = tokio::spawn(async move { engine2.on_block_found(gid, 9_995_002, &actual2).await });
 
     let (r1, r2) = tokio::join!(task1, task2);
     let r1 = r1.unwrap();
     let r2 = r2.unwrap();
-    let succeeded = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
-    let in_flight = [&r1, &r2]
-        .iter()
-        .filter(|r| matches!(r, Err(EngineError::BlockFoundInProgress { .. })))
-        .count();
-    // The loser is either blocked in-flight or finds the snapshot consumed.
-    assert_eq!(succeeded, 1, "exactly one call succeeds");
-    let other_handled = in_flight == 1
-        || matches!(&r1, Err(EngineError::SnapshotMissing { .. }))
-        || matches!(&r2, Err(EngineError::SnapshotMissing { .. }));
-    assert!(
-        other_handled,
-        "second call is either re-entrancy-blocked or sees a cleared snapshot"
-    );
+    // The loser is either blocked in-flight or, arriving after the winner,
+    // a no-op redelivery; either way the block is booked once.
+    let mut inserted = 0;
+    for r in [&r1, &r2] {
+        match r {
+            Ok(outcome) => inserted += outcome.history_inserted,
+            Err(EngineError::BlockFoundInProgress { .. }) => {}
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+    assert!(r1.is_ok() || r2.is_ok(), "one call must book the block");
+    assert_eq!(inserted, 1, "one member, booked exactly once");
 
     drop_harness(h).await;
 }
@@ -937,9 +747,6 @@ async fn on_block_found_with_finder_bonus_merges_duplicate_outputs() {
             h.group_id,
             block_height,
             &actual_paying_exactly(&result, reward),
-            &finder,
-            None,
-            Some(result.payouts_fingerprint()),
         )
         .await
         .expect("on_block_found ok");
@@ -1489,9 +1296,6 @@ async fn a_group_block_far_off_the_reference_is_still_booked() {
             h.group_id,
             height,
             &actual_paying_exactly(&result, T_ACTUAL),
-            &finder,
-            None,
-            Some(result.payouts_fingerprint()),
         )
         .await
         .expect("a block off the reference revenue must still book");
@@ -1545,9 +1349,6 @@ async fn a_group_coinbase_below_the_block_subsidy_is_refused() {
             h.group_id,
             height,
             &actual_paying_exactly(&result, subsidy - 1),
-            &finder,
-            None,
-            Some(result.payouts_fingerprint()),
         )
         .await
         .expect_err("a coinbase below the subsidy must not book");

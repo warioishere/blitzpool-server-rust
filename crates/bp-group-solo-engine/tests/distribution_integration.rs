@@ -187,19 +187,7 @@ async fn build_with_shares_returns_payouts_and_writes_snapshot() {
             .unwrap_or(0)
     };
     assert!(score_of(&addr_a) > score_of(&addr_b));
-
-    // Readable under the fingerprint, the key a booking resolves.
-    let mut conn = h.round.connection_for_snapshot();
-    let snap = bp_group_solo_engine::round::snapshot::read_weight_snapshot_for(
-        &mut conn,
-        &h.group_id.to_string(),
-        &result.payouts_fingerprint(),
-    )
-    .await
-    .expect("snapshot read ok")
-    .expect("snapshot persisted");
-    assert_eq!(snap.reference_revenue_sats, 312_500_000);
-    assert_eq!(snap.entries.len(), result.distribution.entries.len());
+    assert!(result.bookable, "a Group-Solo build is always bookable");
 
     cleanup_group(&h.pool, h.group_id).await;
 }
@@ -435,7 +423,7 @@ async fn an_empty_round_pays_the_finder_not_the_whole_block_to_the_pool() {
 
     // A bootstrap distribution is bookable like any other.
     assert!(
-        result.snapshot_written,
+        result.bookable,
         "a bootstrap block must be bookable like any other"
     );
 

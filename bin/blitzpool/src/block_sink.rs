@@ -55,10 +55,9 @@ pub(crate) struct BlockFoundEvent {
     /// Derived on the Core right after submit: the chain may have advanced by
     /// the time a Satellite consumes the event.
     pub height: i32,
-    /// Settlement inputs of the winning job's distribution, resolved at the
-    /// block-found instant for every snapshot-backed mode: the Redis keys they
-    /// come from are overwritten or expire before the apply side runs. The
-    /// wire name is format, the field serves every mode.
+    /// PPLNS settlement inputs of the winning job's distribution, resolved at
+    /// the block-found instant: the Redis keys they come from are overwritten
+    /// or expire before the apply side runs. The wire name is format only.
     #[serde(default, rename = "groupsolo_weight_snapshot")]
     pub weight_snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
     /// Identity of the payout list the winning job's coinbase pays, so what is
@@ -429,9 +428,7 @@ impl TdpBlockSubmissionSink {
             warn!(%err, address = %address, height, "block-found: blocks_entity insert failed");
         }
 
-        // A zeroed fingerprint means the pool did not build this coinbase
-        // (`SetCustomMiningJob`): there is no pool distribution to find.
-        let job_payouts_fingerprint = pplns_payouts_fingerprint.filter(|fp| fp != &[0u8; 32]);
+        let job_payouts_fingerprint = pool_built(pplns_payouts_fingerprint);
         let weight_snapshot = self
             .resolve_weight_snapshot(resolved, &address, job_payouts_fingerprint, height)
             .await;
@@ -476,10 +473,11 @@ impl TdpBlockSubmissionSink {
         true
     }
 
-    /// Resolve the settlement inputs at the block-found instant: the snapshot
-    /// key is alive now, usually not later, and is their only store. Every mode
-    /// is decided by the exhaustive `match`. Each `None` path logs which case it
-    /// was, because a JD-client coinbase must not be reprocessed, a miss must.
+    /// Resolve PPLNS's settlement inputs at the block-found instant: the
+    /// snapshot key is alive now, usually not later, and is their only store.
+    /// Every mode is decided by the exhaustive `match`. Each `None` path logs
+    /// which case it was, because a JD-client coinbase must not be reprocessed,
+    /// a miss must.
     async fn resolve_weight_snapshot(
         &self,
         mode: MiningModeResult,
@@ -502,9 +500,12 @@ impl TdpBlockSubmissionSink {
             }
         };
         match mode {
-            // Solo writes no ledger; Blockparty recomputes its fixed shares
-            // from the DB. Neither has a snapshot to carry.
-            MiningModeResult::Solo | MiningModeResult::Blockparty(_) => None,
+            // Solo writes no ledger, Blockparty recomputes its fixed shares
+            // from the DB, Group-Solo books from the coinbase alone. None of
+            // them has a snapshot to carry.
+            MiningModeResult::Solo
+            | MiningModeResult::Blockparty(_)
+            | MiningModeResult::GroupSolo(_) => None,
             MiningModeResult::Pplns => {
                 let engine = self.applier.pplns.as_ref().or_else(|| {
                     warn!(
@@ -532,45 +533,15 @@ impl TdpBlockSubmissionSink {
                     }
                 }
             }
-            MiningModeResult::GroupSolo(group_uuid) => {
-                let engine = self.applier.group_solo.as_ref().or_else(|| {
-                    warn!(
-                        address,
-                        height, "block-found: Group-Solo mode but the engine is not configured"
-                    );
-                    None
-                })?;
-                let fingerprint = fingerprint()?;
-                let Ok(finder) = AddressId::new(address.to_string()) else {
-                    warn!(
-                        address,
-                        %group_uuid,
-                        height,
-                        "block-found: Group-Solo finder address failed to parse"
-                    );
-                    return None;
-                };
-                match engine
-                    .weight_snapshot_for_block_found(group_uuid, &finder, &fingerprint)
-                    .await
-                {
-                    Ok(snap) => Some(snap),
-                    Err(err) => {
-                        error!(
-                            %err,
-                            address,
-                            %group_uuid,
-                            height,
-                            fingerprint = %hex::encode(fingerprint),
-                            "block-found: Group-Solo distribution lookup failed — the block is \
-                             NOT booked and must be reprocessed from its own coinbase"
-                        );
-                        None
-                    }
-                }
-            }
         }
     }
+}
+
+/// The payout list a found block's coinbase pays, or `None` when the pool did
+/// not build that coinbase: a zeroed fingerprint marks a `SetCustomMiningJob`,
+/// which has no pool distribution behind it.
+fn pool_built(fingerprint: Option<[u8; 32]>) -> Option<[u8; 32]> {
+    fingerprint.filter(|fp| fp != &[0u8; 32])
 }
 
 impl BlockFoundApplier {
@@ -746,17 +717,14 @@ impl BlockFoundApplier {
         let block_hash_hex = event.block_hash.clone();
         let height = event.height;
 
-        let address = match AddressId::new(address_str.to_string()) {
-            Ok(a) => a,
-            Err(err) => {
-                warn!(
-                    %err,
-                    address = address_str,
-                    "block-found apply: invalid AddressId shape — skipping"
-                );
-                return;
-            }
-        };
+        if let Err(err) = AddressId::new(address_str.to_string()) {
+            warn!(
+                %err,
+                address = address_str,
+                "block-found apply: invalid AddressId shape — skipping"
+            );
+            return;
+        }
 
         match (event.mode, event.booking()) {
             (MiningMode::Solo, _) => {
@@ -928,34 +896,34 @@ impl BlockFoundApplier {
                             );
                             return;
                         }
-                        // Without the distribution the coinbase pays there is
-                        // nothing safe to book: every substitute claims
-                        // payments the chain did not make.
-                        if event.weight_snapshot.is_some() {
-                            self.gate_or_apply(
-                                address_str,
-                                height,
-                                reward,
-                                block_hash_hex.as_deref(),
-                                event.weight_snapshot.clone(),
-                                event.actual_coinbase.as_ref(),
-                                event.pplns_payouts_fingerprint,
-                                Some(PendingGroup {
-                                    group_id: group_id_str.to_string(),
-                                    finder: address.as_str().to_string(),
-                                }),
-                            )
-                            .await;
-                        } else {
+                        // Only a coinbase the pool built pays the group's
+                        // distribution; booking any other would reset the
+                        // round for a block that may not have paid the group.
+                        match pool_built(event.pplns_payouts_fingerprint) {
+                            Some(fingerprint) => {
+                                self.gate_or_apply(
+                                    address_str,
+                                    height,
+                                    reward,
+                                    block_hash_hex.as_deref(),
+                                    None,
+                                    event.actual_coinbase.as_ref(),
+                                    Some(fingerprint),
+                                    Some(PendingGroup {
+                                        group_id: group_id_str.to_string(),
+                                    }),
+                                )
+                                .await;
+                            }
                             // Falls through to the notification: a block nobody
-                            // can book is the one the operator must hear about.
-                            error!(
+                            // books is the one the operator must hear about.
+                            None => error!(
                                 address = address_str,
                                 group_id = group_id_str,
                                 height,
-                                "block-found: Group-Solo event carried no distribution — NOT \
-                                 booked, needs an operator reprocess"
-                            );
+                                "block-found: Group-Solo block on a coinbase the pool did not \
+                                 build — NOT booked and the round NOT reset"
+                            ),
                         }
                     }
                     (None, _) => warn!(
@@ -1178,7 +1146,7 @@ impl Sv2BlockSubmissionSink for TdpBlockSubmissionSink {
                 worker,
                 session_id_hex,
                 submission_diff = accept.submission_difficulty.as_f64(),
-                bookable = fingerprint != [0u8; 32],
+                bookable = pool_built(Some(fingerprint)).is_some(),
                 "sv2 block-found on a custom job the JDP path will not claim: the JDC \
                  propagates it through its own node, the pool records it here (no template_id \
                  to submit with)"
@@ -1496,17 +1464,13 @@ mod tests {
             reward_sats: Some(312_500_000),
             block_hash: Some("00000000deadbeef".to_string()),
             block_data: "ab".repeat(80),
-            mode: MiningMode::GroupSolo,
-            group_id: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            mode: MiningMode::Pplns,
+            group_id: None,
             height: 870_123,
         };
         let json = serde_json::to_string(&event).expect("serialize");
         let back: BlockFoundEvent = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.mode, MiningMode::GroupSolo);
-        assert_eq!(
-            back.group_id.as_deref(),
-            Some("550e8400-e29b-41d4-a716-446655440000")
-        );
+        assert_eq!(back.mode, MiningMode::Pplns);
         assert_eq!(back.height, 870_123);
         assert_eq!(back.reward_sats, Some(312_500_000));
         assert_eq!(back.address, event.address);

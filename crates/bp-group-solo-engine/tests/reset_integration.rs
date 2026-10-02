@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use bp_cron_utils::TestClock;
 use bp_group_solo_engine::reset::{GroupResetRunner, ResetError, RESET_DEBOUNCE_MS};
-use bp_group_solo_engine::round::{snapshot, GroupRoundStore};
+use bp_group_solo_engine::round::GroupRoundStore;
 use redis::{aio::ConnectionManager, Client};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use uuid::Uuid;
@@ -158,28 +158,10 @@ async fn reset_scheduled_wipes_redis_pg_state_and_stamps() {
 
     let round = GroupRoundStore::new(conn);
     let group_key = group_id.to_string();
-    // Pre-state: shares + the snapshot of a job still being mined.
     round
         .record_share(None, &group_key, "test_reset_a", 100.0, 1)
         .await
         .unwrap();
-    let job_key = snapshot::key_for_fingerprint(&group_key, &[0x5au8; 32]);
-    let mut snap_conn = round.connection_for_snapshot();
-    bp_coinbase_snapshot::snapshot::write_weight_snapshot(
-        &mut snap_conn,
-        &job_key,
-        &bp_coinbase_snapshot::StoredWeightSnapshot {
-            entries: vec![],
-            score_total: 0,
-            weight_p: 1,
-            fee_ppm: 15_000,
-            fee_address: "bc1qfee".to_string(),
-            reference_revenue_sats: 312_500_000,
-        },
-        60,
-    )
-    .await
-    .unwrap();
 
     let clock = clock_at_ms(1_700_000_000_000);
     let runner = GroupResetRunner::new(pool.clone(), round.clone(), clock);
@@ -188,14 +170,6 @@ async fn reset_scheduled_wipes_redis_pg_state_and_stamps() {
 
     // Redis state wiped.
     assert!(round.read_by_address(&group_key).await.unwrap().is_empty());
-    // A job built before the reset can still find a block; its snapshot stays.
-    let mut snap_conn = round.connection_for_snapshot();
-    assert!(
-        bp_coinbase_snapshot::snapshot::read_weight_snapshot(&mut snap_conn, &job_key)
-            .await
-            .unwrap()
-            .is_some()
-    );
 
     // lastRoundResetAt stamped to clock's now_ms.
     let last: (Option<i64>,) =

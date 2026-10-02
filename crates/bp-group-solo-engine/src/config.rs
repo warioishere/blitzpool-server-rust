@@ -32,9 +32,6 @@ pub struct GroupSoloEngineConfig {
     /// stream so no `bitcoin.conf` knob needs to match.
     pub coinbase_weight_budget: u32,
 
-    /// Per-(group, finder) snapshot TTL in seconds.
-    pub snapshot_ttl_secs: u32,
-
     /// Blocks between subsidy halvings, the input to the settlement gate's
     /// floor. Derived from the network at boot, not an operator knob: regtest
     /// halves every 150 blocks, and the mainnet value would make later regtest
@@ -49,7 +46,6 @@ impl Default for GroupSoloEngineConfig {
             fee_percent: 0.0,
             min_payout_sats: Sats(DEFAULT_MIN_PAYOUT_SATS as i64),
             coinbase_weight_budget: DEFAULT_COINBASE_WEIGHT_BUDGET,
-            snapshot_ttl_secs: 3_600,
             subsidy_halving_interval: bp_share::SUBSIDY_HALVING_INTERVAL,
         }
     }
@@ -65,11 +61,6 @@ impl GroupSoloEngineConfig {
             self.min_payout_sats.0,
             self.coinbase_weight_budget,
         )?;
-        if self.snapshot_ttl_secs == 0 {
-            return Err(ConfigError::ZeroUnsignedField {
-                field: "snapshot_ttl_secs",
-            });
-        }
         Ok(self)
     }
 }
@@ -80,8 +71,6 @@ pub enum ConfigError {
     /// payout engine; see [`FeePayoutBudgetError`].
     #[error(transparent)]
     FeePayoutBudget(#[from] FeePayoutBudgetError),
-    #[error("{field} must be > 0, got 0")]
-    ZeroUnsignedField { field: &'static str },
 }
 
 #[cfg(test)]
@@ -199,20 +188,6 @@ mod tests {
             cfg.try_new().unwrap_err(),
             ConfigError::FeePayoutBudget(FeePayoutBudgetError::WeightBudgetTooLow { .. })
         ));
-    }
-
-    #[test]
-    fn zero_snapshot_ttl_rejects() {
-        let cfg = GroupSoloEngineConfig {
-            snapshot_ttl_secs: 0,
-            ..valid()
-        };
-        assert_eq!(
-            cfg.try_new().unwrap_err(),
-            ConfigError::ZeroUnsignedField {
-                field: "snapshot_ttl_secs",
-            }
-        );
     }
 
     #[test]

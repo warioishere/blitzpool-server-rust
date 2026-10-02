@@ -208,16 +208,9 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
         bp_coinbase_snapshot::ActualCoinbase::from_coinbase(&coinbase_tx, Network::Regtest);
     assert_eq!(actual.total_value_sats, reward_sats);
     let outcome = engine
-        .on_block_found(
-            group_id,
-            after as i32,
-            &actual,
-            &finder,
-            None,
-            Some(fingerprint),
-        )
+        .on_block_found(group_id, after as i32, &actual)
         .await
-        .expect("the mined job's own distribution must settle from the accepted coinbase");
+        .expect("the accepted coinbase must book");
     assert!(outcome.history_inserted >= 1, "audit rows written");
 
     // ── The history must match the coinbase the chain accepted ───

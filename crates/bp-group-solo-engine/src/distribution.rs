@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `DistributionBuilder`: the Group-Solo side of the shared build-and-snapshot
-//! path, built with [`WithheldValue::ToPool`] and no ledger read, since
-//! Group-Solo owes nothing between blocks. Builds are cached per
-//! `(group, reward, finder)` because each session is its own prospective finder.
+//! `DistributionBuilder`: the Group-Solo side of the shared weight build, with
+//! [`WithheldValue::ToPool`], no ledger read and no snapshot, since Group-Solo
+//! owes nothing between blocks and books a found block from its coinbase alone.
+//! Builds are cached per `(group, reward, finder)` because each session is its
+//! own prospective finder.
 
 pub use bp_coinbase_snapshot::BuiltDistribution;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bp_coinbase_snapshot::{build_and_snapshot, share_map_from_redis_hash, BuildRequest};
+use bp_coinbase_snapshot::{sanitize_and_build, share_map_from_redis_hash, BuildRequest};
 use bp_common::{AddressId, Sats};
 use bp_db::{find_group, DbError};
 use bp_inflight_cache::InflightResultCache;
@@ -56,7 +57,6 @@ pub struct DistributionConfig {
     pub fee_percent: f64,
     pub min_payout_sats: Sats,
     pub coinbase_weight_budget: u32,
-    pub snapshot_ttl_secs: u32,
 }
 
 impl DistributionConfig {
@@ -66,7 +66,6 @@ impl DistributionConfig {
             fee_percent: cfg.fee_percent,
             min_payout_sats: cfg.min_payout_sats,
             coinbase_weight_budget: cfg.coinbase_weight_budget,
-            snapshot_ttl_secs: cfg.snapshot_ttl_secs,
         }
     }
 }
@@ -165,35 +164,31 @@ async fn compute_distribution(
         .fee_address
         .as_ref()
         .ok_or(DistributionError::NoFeeAddress)?;
-    let group_key = group_id.to_string();
-    let mut conn_fp = round.connection_for_snapshot();
-    let built = build_and_snapshot(
-        BuildRequest {
-            address_shares,
-            balances: HashMap::new(),
-            fee_address,
-            fee_percent: config.fee_percent,
-            min_payout_sats: config.min_payout_sats,
-            coinbase_weight_budget: config.coinbase_weight_budget,
-            finder_bonus_ppm,
-            finder_address: Some(finder_address),
-            // An empty round is routine (every reset DELs the hash); builds
-            // are per-finder, so a bootstrap distribution never reaches
-            // another member.
-            bootstrap_claimant: Some(finder_address),
-            reference_revenue_sats: block_reward_sats,
-            // A member the coinbase cannot pay forfeits to the pool output,
-            // so nothing carries to the next block and no ledger is needed.
-            withheld_value: WithheldValue::ToPool,
-            scope: "group-solo",
-        },
-        &mut conn_fp,
-        |fp| crate::round::snapshot::key_for_fingerprint(&group_key, fp),
-        config.snapshot_ttl_secs,
-    )
-    .await?;
+    let distribution = sanitize_and_build(BuildRequest {
+        address_shares,
+        balances: HashMap::new(),
+        fee_address,
+        fee_percent: config.fee_percent,
+        min_payout_sats: config.min_payout_sats,
+        coinbase_weight_budget: config.coinbase_weight_budget,
+        finder_bonus_ppm,
+        finder_address: Some(finder_address),
+        // An empty round is routine (every reset DELs the hash); builds
+        // are per-finder, so a bootstrap distribution never reaches
+        // another member.
+        bootstrap_claimant: Some(finder_address),
+        reference_revenue_sats: block_reward_sats,
+        // A member the coinbase cannot pay forfeits to the pool output,
+        // so nothing carries to the next block and no ledger is needed.
+        withheld_value: WithheldValue::ToPool,
+        scope: "group-solo",
+    })?;
 
-    Ok(built)
+    // Booking needs only the coinbase, so every build is bookable.
+    Ok(BuiltDistribution {
+        distribution,
+        bookable: true,
+    })
 }
 
 #[cfg(test)]
@@ -206,7 +201,6 @@ mod tests {
             fee_address: Some(AddressId::new("bc1qfee0000000000000000000000000").unwrap()),
             fee_percent: 1.5,
             coinbase_weight_budget: 60_000,
-            snapshot_ttl_secs: 1800,
             ..crate::config::GroupSoloEngineConfig::default()
         };
         let dist_cfg = DistributionConfig::from_engine_config(&engine_cfg);
@@ -216,6 +210,5 @@ mod tests {
         );
         assert!((dist_cfg.fee_percent - 1.5).abs() < 1e-9);
         assert_eq!(dist_cfg.coinbase_weight_budget, 60_000);
-        assert_eq!(dist_cfg.snapshot_ttl_secs, 1800);
     }
 }

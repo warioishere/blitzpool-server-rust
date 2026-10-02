@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! The one build-and-persist path both payout engines run: drop unusable
-//! addresses, project onto weights, persist the settlement inputs under the
-//! fingerprint. One copy keeps the modes from drifting; share sourcing,
-//! caching and post-build steps stay per engine.
+//! The one weight build both payout engines run: drop unusable addresses and
+//! project onto weights ([`sanitize_and_build`]). PPLNS also persists the
+//! settlement inputs under the fingerprint ([`build_and_snapshot`]); Group-Solo
+//! books from the coinbase alone and needs none. One copy keeps the modes from
+//! drifting; share sourcing, caching and post-build steps stay per engine.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -50,19 +51,19 @@ pub struct BuildRequest<'a> {
     pub scope: &'static str,
 }
 
-/// A built distribution plus whether its snapshot actually landed.
+/// A built distribution plus whether a block found on it can be booked.
 #[derive(Clone, Debug)]
 pub struct BuiltDistribution {
     pub distribution: WeightDistribution,
-    /// `false` → the distribution still becomes a coinbase, but a block
-    /// found on it cannot be booked automatically. Never promise a
-    /// booking on `false`.
-    pub snapshot_written: bool,
+    /// `false` → the distribution still becomes a coinbase, but a block found
+    /// on it cannot be booked automatically: its snapshot did not land, and the
+    /// mode settles from it. Never promise a booking on `false`.
+    pub bookable: bool,
 }
 
 impl BuiltDistribution {
-    /// The snapshot key ([`bp_share::weights_fingerprint_from_parts`]); a
-    /// found block carries it back so settlement reads exactly these inputs.
+    /// The payout list's identity ([`bp_share::weights_fingerprint_from_parts`])
+    /// and, for a snapshot-backed build, its snapshot key.
     pub fn payouts_fingerprint(&self) -> [u8; 32] {
         self.distribution.fingerprint
     }
@@ -85,11 +86,11 @@ pub async fn build_and_snapshot(
     // snapshot serves every job built from this distribution, JDC jobs included.
     let snapshot = StoredWeightSnapshot::from_distribution(&distribution);
     let key = snapshot_key(&distribution.fingerprint);
-    let snapshot_written = write_with_retry(conn, &key, &snapshot, ttl_secs, scope).await;
+    let bookable = write_with_retry(conn, &key, &snapshot, ttl_secs, scope).await;
 
     Ok(BuiltDistribution {
         distribution,
-        snapshot_written,
+        bookable,
     })
 }
 
