@@ -536,6 +536,48 @@ async fn the_bootstrap_build_pays_the_asking_miner() {
     cleanup(&h.pool, &h.address_prefix).await;
 }
 
+/// MONEY: a share that lands after an empty-window build must reach the very
+/// next build. On the front nothing invalidates this builder when a share
+/// lands (the window is written by another process), so cached empty inputs
+/// would keep bootstrapping every miner to the whole block.
+#[tokio::test]
+async fn a_share_after_an_empty_window_reaches_the_next_build() {
+    let h = match connect_or_skip(16, "test_dist_late_").await {
+        Some(h) => h,
+        None => return,
+    };
+    const ADDR: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    const T: u64 = 312_500_000;
+    cleanup_addresses(&h.pool, &[ADDR]).await;
+
+    assert!(
+        h.builder.build(T).await.is_err(),
+        "precondition: the window is empty"
+    );
+
+    // Written by a second store, as the payout process does; the builder
+    // is not told.
+    let window = build_window(&h).await;
+    seed_share(&window, ADDR, 50.0, 1).await;
+
+    let result = h
+        .builder
+        .build(T)
+        .await
+        .expect("the share in the window must end the empty-window answer");
+    assert!(
+        result
+            .distribution
+            .entries
+            .iter()
+            .any(|e| e.address.as_str() == ADDR && e.score_weight > 0),
+        "the miner with the window's only share must hold score weight"
+    );
+
+    cleanup_addresses(&h.pool, &[ADDR]).await;
+    cleanup(&h.pool, &h.address_prefix).await;
+}
+
 // ── Helper: a sibling WindowStore on the harness's Redis DB ─────────
 
 async fn build_window(h: &Harness) -> WindowStore {
@@ -567,6 +609,7 @@ fn redis_db_for_prefix(prefix: &str) -> u8 {
         "test_dist_nopg_" => 5,
         "test_dist_nowin_" => 7,
         "test_dist_boot_" => 4,
+        "test_dist_late_" => 16,
         other => panic!("unknown test prefix: {other}"),
     }
 }

@@ -430,6 +430,55 @@ async fn an_empty_round_pays_the_finder_not_the_whole_block_to_the_pool() {
     cleanup_group(&h.pool, h.group_id).await;
 }
 
+// ── Test 7b — the bootstrap does not outlive the empty round ────────
+
+/// MONEY: a share that lands in the round after a bootstrap build must reach
+/// the very next build. On the front nothing invalidates this cache when a
+/// share lands (the round is written by another process), so a cached
+/// bootstrap would keep paying the asking finder the whole block.
+#[tokio::test]
+async fn a_share_after_a_bootstrap_reaches_the_next_build() {
+    let h = match spawn_or_skip(8, None).await {
+        Some(h) => h,
+        None => return,
+    };
+    let finder = AddressId::new(FINDER_A).unwrap();
+    let other = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
+    const T: u64 = 312_500_000;
+
+    let first = h.builder.build(h.group_id, T, &finder).await.expect("ok");
+    assert_eq!(
+        first
+            .distribution
+            .entries
+            .iter()
+            .map(|e| &e.address)
+            .collect::<Vec<_>>(),
+        vec![&finder],
+        "precondition: an empty round bootstraps to the asking finder"
+    );
+
+    // Written straight to the round, as the payout process does; the
+    // builder is not told.
+    h.round
+        .record_share(None, &h.group_id.to_string(), other.as_str(), 50.0, 1)
+        .await
+        .unwrap();
+
+    let next = h.builder.build(h.group_id, T, &finder).await.expect("ok");
+    assert!(
+        next.distribution.entries.iter().any(|e| e.address == other),
+        "the member with the round's only share must be paid, got {:?}",
+        next.distribution
+            .entries
+            .iter()
+            .map(|e| e.address.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    cleanup_group(&h.pool, h.group_id).await;
+}
+
 // ── Test 8 — different rewards run independently ───────────────────
 
 #[tokio::test]

@@ -4,7 +4,8 @@
 //! [`WithheldValue::ToPool`], no ledger read and no snapshot, since Group-Solo
 //! owes nothing between blocks and books a found block from its coinbase alone.
 //! Builds are cached per `(group, reward, finder)` because each session is its
-//! own prospective finder.
+//! own prospective finder. An empty round is never cached: its bootstrap is
+//! rebuilt per call, so the first share reaches the next job.
 
 pub use bp_coinbase_snapshot::BuiltDistribution;
 use std::collections::HashMap;
@@ -115,12 +116,44 @@ impl DistributionBuilder {
         let round = self.round.clone();
         let config = self.config.clone();
         let finder = finder_address.clone();
-        self.cache
+        let cached = self
+            .cache
             .get_or_compute(key, move || async move {
-                compute_distribution(&pool, &round, &config, group_id, block_reward_sats, &finder)
-                    .await
+                compute_distribution(
+                    &pool,
+                    &round,
+                    &config,
+                    group_id,
+                    block_reward_sats,
+                    &finder,
+                    false,
+                )
+                .await
             })
-            .await
+            .await;
+        match cached {
+            // Failures are not cached, so this round is read again next call.
+            Err(err)
+                if matches!(
+                    *err,
+                    DistributionError::WeightBuild(WeightBuildError::NoScoredMiners)
+                ) =>
+            {
+                compute_distribution(
+                    &self.pool,
+                    &self.round,
+                    &self.config,
+                    group_id,
+                    block_reward_sats,
+                    finder_address,
+                    true,
+                )
+                .await
+                .map(Arc::new)
+                .map_err(Arc::new)
+            }
+            other => other,
+        }
     }
 
     pub fn invalidate_all(&self) {
@@ -137,6 +170,7 @@ async fn compute_distribution(
     group_id: Uuid,
     block_reward_sats: u64,
     finder_address: &AddressId,
+    bootstrap: bool,
 ) -> Result<BuiltDistribution, DistributionError> {
     // 1. Per-group config: the finder bonus lives in the DB row as a
     //    FRACTION of the miner cut (ppm), because a proportion is what §4
@@ -173,10 +207,11 @@ async fn compute_distribution(
         coinbase_weight_budget: config.coinbase_weight_budget,
         finder_bonus_ppm,
         finder_address: Some(finder_address),
-        // An empty round is routine (every reset DELs the hash); builds
-        // are per-finder, so a bootstrap distribution never reaches
-        // another member.
-        bootstrap_claimant: Some(finder_address),
+        // An empty round is routine (every reset DELs the hash). Only the
+        // uncached call bootstraps, and builds are per-finder, so a bootstrap
+        // distribution neither outlives the empty round nor reaches another
+        // member.
+        bootstrap_claimant: bootstrap.then_some(finder_address),
         reference_revenue_sats: block_reward_sats,
         // A member the coinbase cannot pay forfeits to the pool output,
         // so nothing carries to the next block and no ledger is needed.

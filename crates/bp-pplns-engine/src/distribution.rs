@@ -136,7 +136,8 @@ impl DistributionBuilder {
         let config = self.config.clone();
         let inputs_cache = self.inputs_cache.clone();
         let inputs_loads = self.inputs_loads.clone();
-        self.cache
+        let built = self
+            .cache
             .get_or_compute(reference_revenue_sats, || async move {
                 let inputs = inputs_cache
                     .get_or_compute((), || async move {
@@ -150,7 +151,18 @@ impl DistributionBuilder {
                 // `build_bootstrap` resolves it per miner.
                 build_from_inputs(&inputs, &window, &config, reference_revenue_sats, None).await
             })
-            .await
+            .await;
+        // An empty window must not outlive its first share: drop the inputs,
+        // so the bootstrap and the next build read the window again.
+        if let Err(err) = &built {
+            if matches!(
+                **err,
+                DistributionError::WeightBuild(WeightBuildError::NoScoredMiners)
+            ) {
+                self.inputs_cache.clear();
+            }
+        }
+        built
     }
 
     /// The empty-window answer for ONE miner, uncached because a distribution
