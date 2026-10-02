@@ -44,7 +44,7 @@ bp-share-hook = { workspace = true }
 bp-test-support = { workspace = true }
 bp-regtest-harness = { workspace = true }
 tokio = { workspace = true }
-criterion = "0.5"
+criterion = "0.8"
 
 [[bench]]
 name = "parse"
