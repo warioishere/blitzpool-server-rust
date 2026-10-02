@@ -63,7 +63,7 @@ impl WebPushAdapter {
     /// `vapid = None` keeps the adapter alive but disables JWT
     /// signing — every send goes via plain POST.
     pub fn new(vapid: Option<VapidConfig>) -> AdapterResult<Self> {
-        let client = Client::builder()
+        let client = bp_http::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| AdapterError::Config(format!("reqwest client build: {e}")))?;

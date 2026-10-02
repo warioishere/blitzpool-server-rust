@@ -58,7 +58,10 @@ pub fn spawn_network_difficulty_cron(
 ) -> watch::Sender<bool> {
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
-        let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
+        let client = match bp_http::client_builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+        {
             Ok(c) => c,
             Err(e) => {
                 warn!(target: "bp_notifications::cron::network_difficulty", error = %e, "client build failed");

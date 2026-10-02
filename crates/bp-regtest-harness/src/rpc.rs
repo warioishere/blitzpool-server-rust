@@ -41,7 +41,7 @@ pub(crate) struct RpcCaller {
 
 impl RpcCaller {
     pub(crate) fn new(base_url: String, cookie_path: std::path::PathBuf) -> Self {
-        let client = Client::builder()
+        let client = bp_http::client_builder()
             .timeout(Duration::from_secs(30))
             .build()
             .expect("reqwest client build cannot fail with these options");

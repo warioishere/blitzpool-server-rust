@@ -33,7 +33,7 @@ pub struct ReqwestGeoIpClient {
 
 impl ReqwestGeoIpClient {
     pub fn new(base_url: impl Into<String>, request_timeout: Duration) -> Result<Self, GeoIpError> {
-        let http = reqwest::Client::builder()
+        let http = bp_http::client_builder()
             .timeout(request_timeout)
             .build()
             .map_err(|e| GeoIpError::Http(format!("client build: {e}")))?;

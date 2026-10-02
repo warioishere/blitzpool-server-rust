@@ -33,6 +33,7 @@ members = [
     "crates/bp-api",
     "crates/bp-metrics",
     "crates/bp-geoip",
+    "crates/bp-http",
     "crates/bp-regtest-harness",
     "crates/bp-test-support",
     "bin/blitzpool",
@@ -105,7 +106,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Cache / outbound HTTP
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "aio", "connection-manager", "script", "streams"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# No bundled crypto provider: bp-http installs ring, which the rest of the tree
+# uses, instead of the aws-lc-rs build the `rustls` feature would add.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 # HTTP server
 axum = "0.7"
@@ -263,6 +267,7 @@ bp-stratum-v2 = { path = "crates/bp-stratum-v2" }
 bp-api = { path = "crates/bp-api" }
 bp-metrics = { path = "crates/bp-metrics" }
 bp-geoip = { path = "crates/bp-geoip" }
+bp-http = { path = "crates/bp-http" }
 bp-regtest-harness = { path = "crates/bp-regtest-harness" }
 bp-test-support = { path = "crates/bp-test-support" }
 

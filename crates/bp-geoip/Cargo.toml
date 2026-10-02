@@ -13,7 +13,8 @@ workspace = true
 [dependencies]
 tokio = { workspace = true }
 async-trait = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["query"] }
+bp-http = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }

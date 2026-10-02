@@ -19,4 +19,4 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
-reqwest = { workspace = true }
+bp-http = { workspace = true }

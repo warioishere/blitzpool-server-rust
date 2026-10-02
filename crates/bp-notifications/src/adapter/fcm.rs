@@ -64,7 +64,7 @@ pub struct FcmAdapter {
 
 impl FcmAdapter {
     pub fn new(config: FcmConfig) -> AdapterResult<Self> {
-        let client = Client::builder()
+        let client = bp_http::client_builder()
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|e| AdapterError::Config(format!("reqwest client build: {e}")))?;

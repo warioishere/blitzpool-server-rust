@@ -30,7 +30,8 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-reqwest = { workspace = true, features = ["stream"] }
+reqwest = { workspace = true, features = ["stream", "form"] }
+bp-http = { workspace = true }
 
 # SMTP transport for the email-notification adapter.
 lettre = { workspace = true }

@@ -42,7 +42,7 @@ pub fn spawn_telegram_listener(
 ) -> watch::Sender<bool> {
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
-        let client = match Client::builder()
+        let client = match bp_http::client_builder()
             // `timeout` must outlast the long-poll timeout or the poll is
             // cancelled prematurely; pad by 10 s.
             .timeout(Duration::from_secs(

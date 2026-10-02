@@ -55,7 +55,7 @@ pub fn spawn_ntfy_listener(
 ) -> watch::Sender<bool> {
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
-        let client = match Client::builder().build() {
+        let client = match bp_http::client_builder().build() {
             Ok(c) => c,
             Err(e) => {
                 warn!(target: "bp_notifications::listener::ntfy", error = %e, "client build failed");

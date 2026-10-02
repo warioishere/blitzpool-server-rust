@@ -29,7 +29,7 @@ impl NtfyAdapter {
         if config.server_url.trim().is_empty() {
             return Err(AdapterError::Config("NTFY_SERVER_URL is empty".to_string()));
         }
-        let client = Client::builder()
+        let client = bp_http::client_builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .map_err(|e| AdapterError::Config(format!("reqwest client build: {e}")))?;

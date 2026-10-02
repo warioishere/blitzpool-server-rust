@@ -53,7 +53,7 @@ impl TelegramAdapter {
                 "[notifications.telegram] bot_token is empty".to_string(),
             ));
         }
-        let client = Client::builder()
+        let client = bp_http::client_builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .map_err(|e| AdapterError::Config(format!("reqwest client build: {e}")))?;

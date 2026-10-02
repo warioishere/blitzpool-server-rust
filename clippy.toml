@@ -1,0 +1,7 @@
+# reqwest has no bundled TLS crypto provider here; building a client before
+# one is installed panics. bp_http::client_builder installs it.
+disallowed-methods = [
+    { path = "reqwest::Client::builder", reason = "use bp_http::client_builder" },
+    { path = "reqwest::Client::new", reason = "use bp_http::client_builder" },
+    { path = "reqwest::get", reason = "use bp_http::client_builder" },
+]

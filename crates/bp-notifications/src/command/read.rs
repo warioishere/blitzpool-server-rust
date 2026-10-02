@@ -30,7 +30,7 @@ const MEMPOOL_NEXT_ADJUST: &str = "https://mempool.space/api/v1/difficulty-adjus
 // ── HTTP client for the mempool.space-backed read commands (5 s timeout).
 
 fn default_http_client() -> Client {
-    Client::builder()
+    bp_http::client_builder()
         .timeout(Duration::from_secs(5))
         .build()
         .expect("default reqwest Client build")

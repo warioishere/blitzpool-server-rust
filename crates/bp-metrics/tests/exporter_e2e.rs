@@ -37,7 +37,11 @@ async fn spawn_emit_scrape_roundtrip() {
     set_parked_block_counts(2, 0);
 
     let url = format!("http://{}/metrics", handle.bind_addr);
-    let body = reqwest::get(&url)
+    let body = bp_http::client_builder()
+        .build()
+        .expect("client")
+        .get(&url)
+        .send()
         .await
         .expect("GET /metrics")
         .error_for_status()

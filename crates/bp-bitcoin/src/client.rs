@@ -29,7 +29,7 @@ impl BitcoinRpc {
     /// Performs no network I/O; connection and auth are first exercised by
     /// the first RPC call.
     pub fn new(config: BitcoinRpcConfig) -> Result<Self, RpcError> {
-        let mut builder = reqwest::Client::builder();
+        let mut builder = bp_http::client_builder();
         if let Some(timeout) = config.timeout {
             builder = builder.timeout(timeout);
         }
