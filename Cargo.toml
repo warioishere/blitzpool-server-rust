@@ -198,7 +198,7 @@ jd_server_sv2 = { git = "https://github.com/stratum-mining/sv2-apps.git", tag = 
 siphasher = "1"
 # async-channel: vom obigen Crate genutzte channel-Lib für die TDP-IO-Boundary.
 # Wir matchen die exakte Version damit Sender/Receiver kompatibel sind.
-async-channel = "1.5"
+async-channel = "2.5"
 
 # Date/time math (cron next-3am-UTC, abandoned-balance day calculation).
 # `clock` feature pulls in `Utc::now()`; we deliberately skip `serde` since
