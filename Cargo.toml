@@ -143,7 +143,7 @@ num-traits = "0.2"
 # CSPRNG byte fill — used for admin/invitation token generation in
 # bp-group-mgmt. Tiny wrapper around the OS RNG; no convenience layer,
 # which is fine for one-shot calls.
-getrandom = "0.2"
+getrandom = "0.4"
 
 # Constant-time equality check for hashed-token verification. Same crate
 # the rust-crypto ecosystem standardises on.
