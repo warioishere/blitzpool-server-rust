@@ -41,7 +41,7 @@ tower-http = { workspace = true }
 # already a transitive dep of `tower_governor` — pinning it here makes
 # `NoOpMiddleware` nameable in the rate_limit helper module.
 tower_governor = { version = "0.5", default-features = false, features = ["axum"] }
-governor = "0.8"
+governor = "0.10"
 
 # Postgres pool + UUIDs in JSON DTOs.
 sqlx = { workspace = true }
