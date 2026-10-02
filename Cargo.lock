@@ -526,7 +526,7 @@ dependencies = [
 
 [[package]]
 name = "blitzpool"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "bp-api"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "async-trait",
  "axum",
@@ -654,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "bp-bitcoin"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "bp-http",
  "bp-regtest-harness",
@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "bp-blockparty"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "bp-common",
  "serde",
@@ -676,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "bp-blockparty-engine"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -701,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "bp-client-live"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "bp-common",
  "bp-test-support",
@@ -712,7 +712,7 @@ dependencies = [
 
 [[package]]
 name = "bp-coinbase-snapshot"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "bitcoin",
  "bp-common",
@@ -730,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "bp-common"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "proptest",
  "serde",
@@ -742,7 +742,7 @@ dependencies = [
 
 [[package]]
 name = "bp-config"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -751,14 +751,14 @@ dependencies = [
 
 [[package]]
 name = "bp-cron-utils"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "chrono",
 ]
 
 [[package]]
 name = "bp-db"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "bp-blockparty",
  "bp-common",
@@ -771,7 +771,7 @@ dependencies = [
 
 [[package]]
 name = "bp-geoip"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "async-trait",
  "bp-http",
@@ -785,7 +785,7 @@ dependencies = [
 
 [[package]]
 name = "bp-group-mgmt"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "bp-common",
  "getrandom 0.2.17",
@@ -797,7 +797,7 @@ dependencies = [
 
 [[package]]
 name = "bp-group-mgmt-engine"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "async-trait",
  "bp-common",
@@ -814,7 +814,7 @@ dependencies = [
 
 [[package]]
 name = "bp-group-solo-engine"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -847,7 +847,7 @@ dependencies = [
 
 [[package]]
 name = "bp-http"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "reqwest",
  "rustls",
@@ -856,7 +856,7 @@ dependencies = [
 
 [[package]]
 name = "bp-inflight-cache"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "thiserror 2.0.21",
  "tokio",
@@ -864,11 +864,11 @@ dependencies = [
 
 [[package]]
 name = "bp-jobs-lifecycle"
-version = "2.3.8"
+version = "2.3.9"
 
 [[package]]
 name = "bp-metrics"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "bp-http",
  "metrics",
@@ -880,7 +880,7 @@ dependencies = [
 
 [[package]]
 name = "bp-mining-job"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "bitcoin",
  "bp-regtest-harness",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "bp-mining-mode"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "bp-common",
  "tokio",
@@ -905,7 +905,7 @@ dependencies = [
 
 [[package]]
 name = "bp-notifications"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -935,7 +935,7 @@ dependencies = [
 
 [[package]]
 name = "bp-pplns"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "bitcoin",
  "bp-common",
@@ -953,7 +953,7 @@ dependencies = [
 
 [[package]]
 name = "bp-pplns-engine"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -983,7 +983,7 @@ dependencies = [
 
 [[package]]
 name = "bp-regtest-harness"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "bp-bitcoin",
  "bp-http",
@@ -998,7 +998,7 @@ dependencies = [
 
 [[package]]
 name = "bp-session-persistence"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "async-trait",
  "bp-client-live",
@@ -1017,7 +1017,7 @@ dependencies = [
 
 [[package]]
 name = "bp-share"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "hex",
  "num-bigint",
@@ -1031,7 +1031,7 @@ dependencies = [
 
 [[package]]
 name = "bp-share-hook"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "async-trait",
  "bp-common",
@@ -1042,7 +1042,7 @@ dependencies = [
 
 [[package]]
 name = "bp-share-stats-sink"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "async-trait",
  "bp-common",
@@ -1058,7 +1058,7 @@ dependencies = [
 
 [[package]]
 name = "bp-share-stream"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "async-trait",
  "bp-share-hook",
@@ -1075,7 +1075,7 @@ dependencies = [
 
 [[package]]
 name = "bp-stats"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "bp-common",
  "parking_lot",
@@ -1084,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "bp-stratum-v1"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -1113,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "bp-stratum-v2"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -1146,7 +1146,7 @@ dependencies = [
 
 [[package]]
 name = "bp-template-distribution"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "async-channel",
  "bitcoin_core_sv2",
@@ -1161,7 +1161,7 @@ dependencies = [
 
 [[package]]
 name = "bp-test-support"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "bitcoin",
  "bp-mining-job",
@@ -1176,7 +1176,7 @@ dependencies = [
 
 [[package]]
 name = "bp-vardiff"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "bp-common",
 ]
