@@ -35,7 +35,7 @@ use crate::jdp::client::{
     JdpSessionState, SolutionHeader,
 };
 use crate::jdp::dynamic_outputs::CandidateBacking;
-use crate::jdp::tx_validation::{merge_provided_with_known, partition_against_template};
+use crate::jdp::tx_validation::DeclaredTxs;
 use crate::jdp_server_codec::{
     decode_jdp_inbound, encode_jdp_outbound, InboundJdpFrame, JdpWireFrame,
 };
@@ -145,16 +145,6 @@ pub trait JdpBlockSubmissionSink: Send + Sync {
     );
 }
 
-/// `position → raw_tx` flattened into declaration order.
-fn ordered_raw_txs(by_position: &std::collections::HashMap<u32, Vec<u8>>) -> Vec<Vec<u8>> {
-    let mut positions: Vec<&u32> = by_position.keys().collect();
-    positions.sort_unstable();
-    positions
-        .into_iter()
-        .filter_map(|p| by_position.get(p).cloned())
-        .collect()
-}
-
 /// Hands a declared job to a Bitcoin node for a verdict (SV2 JDP/Job
 /// Declarator Server). `None` in [`JdpServerHooks::job_validator`] trusts the JDC.
 #[async_trait]
@@ -175,7 +165,7 @@ pub struct DeclaredJobToValidate<'a> {
     /// Declaration order, wire byte order.
     pub wtxid_list: &'a [[u8; 32]],
     /// Raw txs the pool can supply; the node reports what it still misses.
-    pub known_raw_txs: &'a [Vec<u8>],
+    pub known_raw_txs: &'a [&'a [u8]],
     pub leg: DeclarationLeg,
 }
 
@@ -666,7 +656,7 @@ async fn dispatch_jdp_inbound(
             };
             let template_txs = hooks.template_tx_provider.snapshot().await;
             // Computed once for node and handler: it clones megabytes of raw txs.
-            let partition = partition_against_template(&input.wtxid_list, &template_txs);
+            let txs = DeclaredTxs::against_template(&input.wtxid_list, &template_txs);
             // SV2 JDP/Job Declarator Server: the node judges before anything is
             // registered, so a rejection needs no rollback.
             if let Some(validator) = hooks.job_validator.as_ref() {
@@ -674,7 +664,7 @@ async fn dispatch_jdp_inbound(
                     validator,
                     session_id,
                     &input,
-                    &ordered_raw_txs(&partition.known_raw_txs),
+                    &txs.known(),
                     DeclarationLeg::Declare,
                     "jdp: node rejected the declared job — not accepting it",
                 )
@@ -696,7 +686,7 @@ async fn dispatch_jdp_inbound(
                 state,
                 &input,
                 &declaring.miner_address,
-                partition,
+                txs,
                 DeclarationContext {
                     current_prev_hash,
                     distribution,
@@ -711,19 +701,15 @@ async fn dispatch_jdp_inbound(
             // `request_id` gets no merge and no node call; the handler refuses it.
             let completed = hooks.job_validator.as_ref().and_then(|validator| {
                 let pending = state.pending_declarations.get(input.request_id)?;
-                let merged = merge_provided_with_known(
-                    pending.pending.clone(),
-                    input.transaction_list.clone(),
-                )
-                .ok()?;
-                Some((validator, pending.input.clone(), ordered_raw_txs(&merged)))
+                let txs = pending.txs.completed_with(&input.transaction_list).ok()?;
+                Some((validator, &pending.input, txs))
             });
-            if let Some((validator, declared, known)) = completed {
+            if let Some((validator, declared, txs)) = completed {
                 if let Some(refusal) = node_refuses_declaration(
                     validator,
                     session_id,
-                    &declared,
-                    &known,
+                    declared,
+                    &txs,
                     DeclarationLeg::Completed,
                     "jdp: node rejected the completed declaration — not accepting it",
                 )
@@ -753,7 +739,7 @@ async fn dispatch_jdp_inbound(
             };
             handle_provide_missing_transactions_success(
                 state,
-                &input,
+                input,
                 DeclarationContext {
                     current_prev_hash,
                     distribution,
@@ -772,7 +758,7 @@ async fn node_refuses_declaration(
     validator: &Arc<dyn DeclaredJobValidator>,
     session_id: u32,
     declared: &crate::jdp::client::DeclareMiningJobInput,
-    known_raw_txs: &[Vec<u8>],
+    known_raw_txs: &[&[u8]],
     leg: DeclarationLeg,
     log_message: &'static str,
 ) -> Option<JdpHandlerOutcome> {
@@ -1825,8 +1811,7 @@ mod tests {
             version: 0,
             coinbase_tx_prefix: vec![],
             coinbase_tx_suffix: vec![],
-            wtxid_list: vec![],
-            raw_transactions: HashMap::new(),
+            raw_transactions: Vec::new(),
             prev_hash: [0xCC; 32],
             declared_at_ms: 500,
             booking: None,

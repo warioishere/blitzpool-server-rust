@@ -894,7 +894,7 @@ impl DeclaredJobValidator for ProductionJobValidator {
         let provided: Vec<stratum_core::binary_sv2::B016MOwned> = job
             .known_raw_txs
             .iter()
-            .filter_map(|tx| tx.clone().try_into().ok())
+            .filter_map(|tx| tx.to_vec().try_into().ok())
             .collect();
         let provide = stratum_core::binary_sv2::Seq064KOwned::new(provided)
             .ok()
@@ -1037,7 +1037,7 @@ mod jdp_validation_regtest {
         prefix: &'a [u8],
         suffix: &'a [u8],
         wtxid_list: &'a [[u8; 32]],
-        known_raw_txs: &'a [Vec<u8>],
+        known_raw_txs: &'a [&'a [u8]],
         leg: DeclarationLeg,
     ) -> DeclaredJobToValidate<'a> {
         DeclaredJobToValidate {
@@ -1205,7 +1205,7 @@ mod jdp_validation_regtest {
         let declared = super::coinbase_shapes::unrelated_transaction(1);
         let other = super::coinbase_shapes::unrelated_transaction(2);
         let wtxids = [declared.compute_wtxid().to_byte_array()];
-        let supply = |tx: &bitcoin::Transaction| vec![bitcoin::consensus::serialize(tx)];
+        let supply = |tx: &bitcoin::Transaction| bitcoin::consensus::serialize(tx);
 
         let mismatched = supply(&other);
         let verdict = validator
@@ -1213,7 +1213,7 @@ mod jdp_validation_regtest {
                 &prefix,
                 &suffix,
                 &wtxids,
-                &mismatched,
+                &[mismatched.as_slice()],
                 DeclarationLeg::Completed,
             ))
             .await;
@@ -1228,7 +1228,7 @@ mod jdp_validation_regtest {
                 &prefix,
                 &suffix,
                 &wtxids,
-                &matching,
+                &[matching.as_slice()],
                 DeclarationLeg::Completed,
             ))
             .await;

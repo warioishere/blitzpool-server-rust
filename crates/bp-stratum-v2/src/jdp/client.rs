@@ -5,7 +5,7 @@
 //! never close the socket; they emit [`JdpSessionEvent::Disconnect`] so the IO
 //! layer writes the pending `SetupConnection.Error` first.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use bitcoin::hex::DisplayHex;
 use bp_common::normalize_btc_address;
@@ -21,7 +21,7 @@ use crate::bridge::DistributionAcceptance;
 use super::declarations::{DeclaredJob, DeclaredJobStore};
 use super::dynamic_outputs::{declared_coinbase_tx, CandidateBacking, PayoutBooking};
 use super::payout_distribution::validate_coinbase_outputs_against_distribution;
-use super::tx_validation::{merge_provided_with_known, PartitionResult, PendingDeclaration};
+use super::tx_validation::DeclaredTxs;
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -296,7 +296,7 @@ impl PendingDeclarations {
     /// declaration it pushed out when the bound was already reached.
     fn insert(&mut self, pending: PendingState) -> Option<PendingState> {
         self.0
-            .retain(|held| held.pending.request_id != pending.pending.request_id);
+            .retain(|held| held.input.request_id != pending.input.request_id);
         let evicted = if self.0.len() >= MAX_PENDING_DECLARATIONS {
             self.0.pop_front()
         } else {
@@ -309,14 +309,14 @@ impl PendingDeclarations {
     pub fn get(&self, request_id: u32) -> Option<&PendingState> {
         self.0
             .iter()
-            .find(|held| held.pending.request_id == request_id)
+            .find(|held| held.input.request_id == request_id)
     }
 
     pub fn take(&mut self, request_id: u32) -> Option<PendingState> {
         let position = self
             .0
             .iter()
-            .position(|held| held.pending.request_id == request_id)?;
+            .position(|held| held.input.request_id == request_id)?;
         self.0.remove(position)
     }
 
@@ -330,7 +330,8 @@ impl PendingDeclarations {
 #[derive(Clone, Debug)]
 pub struct PendingState {
     pub input: DeclareMiningJobInput,
-    pub pending: PendingDeclaration,
+    /// Gaps at the positions asked for in `ProvideMissingTransactions`.
+    pub txs: DeclaredTxs,
     pub miner_address: AddressId,
     /// Pool tip when `DeclareMiningJob` arrived; a different tip at completion
     /// means `stale-chain-tip`.
@@ -564,39 +565,37 @@ pub fn declare_refused_by_session(
 }
 
 /// Handle `DeclareMiningJob` after the caller spent the token
-/// ([`crate::tokens::TokenStore::take_active`]) and partitioned the wtxids:
+/// ([`crate::tokens::TokenStore::take_active`]) and matched the wtxids
+/// against the template:
 /// accept now, or ask via `ProvideMissingTransactions` and stash a [`PendingState`].
 /// `declaring_miner` is the spent token's address, never the connection's.
 pub fn handle_declare_mining_job(
     state: &mut JdpSessionState,
     input: &DeclareMiningJobInput,
     declaring_miner: &AddressId,
-    partition: PartitionResult,
+    txs: DeclaredTxs,
     ctx: DeclarationContext,
 ) -> JdpHandlerOutcome {
     let miner_address = declaring_miner.clone();
 
-    if partition.fully_covered() {
-        return accept_declaration(state, input, partition.known_raw_txs, miner_address, ctx);
-    }
+    let txs = match txs.into_complete() {
+        Ok(raw) => return accept_declaration(state, input, raw, miner_address, ctx),
+        Err(gapped) => gapped,
+    };
 
     let outcome = JdpHandlerOutcome::with_frame(JdpOutboundFrame::ProvideMissingTransactions {
         request_id: input.request_id,
-        unknown_tx_position_list: partition.missing_positions.clone(),
+        unknown_tx_position_list: txs.missing_positions(),
     });
     let evicted = state.pending_declarations.insert(PendingState {
         input: input.clone(),
-        pending: PendingDeclaration {
-            request_id: input.request_id,
-            missing_positions: partition.missing_positions,
-            known_raw_txs: partition.known_raw_txs,
-        },
+        txs,
         miner_address,
         prev_hash_at_declare: ctx.current_prev_hash,
     });
     if let Some(dropped) = evicted {
         tracing::warn!(
-            dropped_request_id = dropped.pending.request_id,
+            dropped_request_id = dropped.input.request_id,
             request_id = input.request_id,
             "jdp: too many declarations waiting for ProvideMissingTransactions.Success — \
              the oldest is dropped and its request_id will never be answered"
@@ -608,11 +607,11 @@ pub fn handle_declare_mining_job(
 // ── Handler: ProvideMissingTransactions.Success ─────────────────────
 
 /// Handle `ProvideMissingTransactions.Success`: unknown `request_id` dropped,
-/// merge failure ([`merge_provided_with_known`]) → `missing-txs`, else accept
-/// under a freshly resolved [`DeclarationContext`].
+/// a list that does not fill the gaps ([`DeclaredTxs::complete_with`]) →
+/// `missing-txs`, else accept under a freshly resolved [`DeclarationContext`].
 pub fn handle_provide_missing_transactions_success(
     state: &mut JdpSessionState,
-    input: &ProvideMissingTransactionsSuccessInput,
+    input: ProvideMissingTransactionsSuccessInput,
     ctx: DeclarationContext,
 ) -> JdpHandlerOutcome {
     let Some(pending) = state.pending_declarations.take(input.request_id) else {
@@ -626,7 +625,7 @@ pub fn handle_provide_missing_transactions_success(
             b"chain tip advanced during the missing-transactions round-trip",
         );
     }
-    let merged = match merge_provided_with_known(pending.pending, input.transaction_list.clone()) {
+    let merged = match pending.txs.complete_with(input.transaction_list) {
         Ok(m) => m,
         Err(err) => {
             tracing::warn!(
@@ -651,7 +650,7 @@ pub fn handle_provide_missing_transactions_success(
 fn accept_declaration(
     state: &mut JdpSessionState,
     input: &DeclareMiningJobInput,
-    raw_transactions: HashMap<u32, Vec<u8>>,
+    raw_transactions: Vec<Vec<u8>>,
     miner_address: AddressId,
     ctx: DeclarationContext,
 ) -> JdpHandlerOutcome {
@@ -816,7 +815,6 @@ fn accept_declaration(
         version: input.version,
         coinbase_tx_prefix: input.coinbase_tx_prefix.clone(),
         coinbase_tx_suffix: input.coinbase_tx_suffix.clone(),
-        wtxid_list: input.wtxid_list.clone(),
         raw_transactions,
         prev_hash,
         declared_at_ms: ctx.now_ms,
@@ -890,21 +888,7 @@ pub fn handle_push_solution(
     };
     let coinbase_prefix = job.coinbase_tx_prefix.clone();
     let coinbase_suffix = job.coinbase_tx_suffix.clone();
-    let wtxid_count = job.wtxid_list.len();
-    let mut transactions: Vec<Vec<u8>> = Vec::with_capacity(wtxid_count);
-    for i in 0..wtxid_count {
-        match job.raw_transactions.get(&(i as u32)) {
-            Some(raw) => transactions.push(raw.clone()),
-            None => {
-                tracing::warn!(
-                    prev_hash = %input.header.prev_hash.as_hex(),
-                    position = i,
-                    "jdp: PushSolution dropped — declared job is missing raw tx data"
-                );
-                return JdpHandlerOutcome::default();
-            }
-        }
-    }
+    let transactions = job.raw_transactions.clone();
 
     let mut coinbase_raw =
         Vec::with_capacity(coinbase_prefix.len() + input.extranonce.len() + coinbase_suffix.len());
@@ -933,6 +917,7 @@ mod tests {
     use super::*;
     use crate::extensions::RequestExtensions;
     use crate::jdp::payout_distribution::{compute_payout_vector, WeightedOutput};
+    use std::collections::HashMap;
 
     // ── Fixtures ───────────────────────────────────────────────────
 
@@ -1102,7 +1087,7 @@ mod tests {
     }
 
     /// The IO layer's pre-handler steps: session gates, spending the token
-    /// ([`TokenStore::take_active`]), partition. Panics on a reused token.
+    /// ([`TokenStore::take_active`]), template match. Panics on a reused token.
     fn declared(
         s: &mut JdpSessionState,
         input: &DeclareMiningJobInput,
@@ -1116,9 +1101,8 @@ mod tests {
             .tokens
             .take_active(&input.mining_job_token, ctx.now_ms)
             .expect("a declaration must name a token the pool issued and has not spent");
-        let partition =
-            crate::jdp::tx_validation::partition_against_template(&input.wtxid_list, template_txs);
-        handle_declare_mining_job(s, input, &declaring.miner_address, partition, ctx)
+        let txs = DeclaredTxs::against_template(&input.wtxid_list, template_txs);
+        handle_declare_mining_job(s, input, &declaring.miner_address, txs, ctx)
     }
 
     /// Suffix carrying the ext 0x0003/Payout Computation recompute for `entry` at `t`.
@@ -2074,7 +2058,7 @@ mod tests {
     fn complete(s: &mut JdpSessionState, request_id: u32, now_ms: u64) -> Option<JdpOutboundFrame> {
         handle_provide_missing_transactions_success(
             s,
-            &ProvideMissingTransactionsSuccessInput {
+            ProvideMissingTransactionsSuccessInput {
                 request_id,
                 transaction_list: vec![vec![0xBB; 16]],
             },
@@ -2145,7 +2129,7 @@ mod tests {
             request_id: 5,
             transaction_list: vec![vec![0xFE; 16]],
         };
-        let out = handle_provide_missing_transactions_success(&mut s, &success, ctx(4_000));
+        let out = handle_provide_missing_transactions_success(&mut s, success, ctx(4_000));
         match &out.outbound[0] {
             JdpOutboundFrame::DeclareMiningJobSuccess { request_id, .. } => {
                 assert_eq!(*request_id, 5);
@@ -2175,7 +2159,7 @@ mod tests {
         // …but the round-trip completes under tip 0xCD.
         let out = handle_provide_missing_transactions_success(
             &mut s,
-            &success,
+            success,
             DeclarationContext {
                 current_prev_hash: Some([0xCD; 32]),
                 ..ctx(4_000)
@@ -2232,7 +2216,7 @@ mod tests {
         // …but superseded during the round-trip.
         let out = handle_provide_missing_transactions_success(
             &mut s,
-            &success,
+            success,
             DeclarationContext {
                 distribution: Some(DistributionAcceptance::Stale),
                 ..ctx(4_000)
@@ -2276,7 +2260,7 @@ mod tests {
         };
         let out = handle_provide_missing_transactions_success(
             &mut s,
-            &success,
+            success,
             DeclarationContext {
                 distribution: accepted(distribution_entry(7)),
                 ..ctx(4_000)
@@ -2311,7 +2295,7 @@ mod tests {
         };
         let out = handle_provide_missing_transactions_success(
             &mut s,
-            &success,
+            success,
             DeclarationContext {
                 current_prev_hash: None,
                 ..ctx(0)
@@ -2334,7 +2318,7 @@ mod tests {
             request_id: 6,
             transaction_list: vec![vec![0xFE; 16]],
         };
-        let out = handle_provide_missing_transactions_success(&mut s, &bad_success, ctx(4_000));
+        let out = handle_provide_missing_transactions_success(&mut s, bad_success, ctx(4_000));
         match out.outbound.first() {
             Some(JdpOutboundFrame::DeclareMiningJobError {
                 request_id,
@@ -2478,7 +2462,7 @@ mod tests {
     }
 
     #[test]
-    fn push_solution_missing_raw_tx_drops_silently() {
+    fn push_solution_on_a_still_pending_declaration_submits_nothing() {
         let mut s = fresh();
         let token = complete_setup_and_allocate(&mut s);
         let wtxid_a = [0x01; 32];

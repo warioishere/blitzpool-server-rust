@@ -29,10 +29,8 @@ pub struct DeclaredJob {
     pub coinbase_tx_prefix: Vec<u8>,
     /// Everything after the extranonce slot.
     pub coinbase_tx_suffix: Vec<u8>,
-    /// Merkle-leaf order, coinbase excluded.
-    pub wtxid_list: Vec<[u8; 32]>,
-    /// Witness-serialised, keyed by position in `wtxid_list`.
-    pub raw_transactions: HashMap<u32, Vec<u8>>,
+    /// Witness-serialised, in merkle-leaf order, coinbase excluded.
+    pub raw_transactions: Vec<Vec<u8>>,
     /// The pool's tip at declaration; every `SetCustomMiningJob` on this
     /// declaration is held to it.
     pub prev_hash: [u8; 32],
@@ -141,8 +139,7 @@ mod tests {
             version: 0x2000_0000,
             coinbase_tx_prefix: vec![0xAA; 8],
             coinbase_tx_suffix: vec![0xBB; 8],
-            wtxid_list: vec![[0u8; 32]; 3],
-            raw_transactions: HashMap::new(),
+            raw_transactions: Vec::new(),
             prev_hash,
             declared_at_ms: declared_at,
             booking: None,

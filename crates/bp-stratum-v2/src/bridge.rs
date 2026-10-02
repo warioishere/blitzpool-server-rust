@@ -528,7 +528,6 @@ impl JdpDeclaredJobRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap as Map;
 
     const ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
@@ -570,8 +569,7 @@ mod tests {
             version: 0x2000_0000,
             coinbase_tx_prefix: prefix,
             coinbase_tx_suffix: suffix,
-            wtxid_list: vec![],
-            raw_transactions: Map::new(),
+            raw_transactions: Vec::new(),
             prev_hash: [0xAB; 32],
             declared_at_ms: 1_000,
             booking: None,

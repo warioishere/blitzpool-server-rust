@@ -40,16 +40,15 @@ pub enum BindingViolation {
     ExtranonceSlotWidth,
 }
 
-/// `None` when the coinbase cannot be rebuilt or a declared transaction is
-/// missing: the caller must reject, never read it as "nothing to check".
+/// `None` when the coinbase or a declared transaction cannot be decoded: the
+/// caller must reject, never read it as "nothing to check".
 pub fn binding_from_declared_job(job: &DeclaredJob) -> Option<DeclaredJobBinding> {
     let declared = declared_coinbase_tx(&job.coinbase_tx_prefix, &job.coinbase_tx_suffix)?;
     let tx = &declared.tx;
 
-    let mut txids = Vec::with_capacity(1 + job.wtxid_list.len());
+    let mut txids = Vec::with_capacity(1 + job.raw_transactions.len());
     txids.push(tx.compute_txid().to_byte_array());
-    for position in 0..job.wtxid_list.len() as u32 {
-        let raw = job.raw_transactions.get(&position)?;
+    for raw in &job.raw_transactions {
         let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(raw).ok()?;
         txids.push(tx.compute_txid().to_byte_array());
     }
@@ -122,7 +121,6 @@ mod tests {
     use crate::jdp::declarations::DeclaredJob;
     use crate::tokens::Token;
     use bp_common::AddressId;
-    use std::collections::HashMap;
 
     const SCRIPT_SIG_PREFIX: [u8; 3] = [0x03, 0xC8, 0x00];
     const SLOT: usize = 8;
@@ -174,19 +172,15 @@ mod tests {
 
     fn declared_job(tx_count: usize) -> DeclaredJob {
         let (coinbase_tx_prefix, coinbase_tx_suffix) = coinbase_parts(&SCRIPT_SIG_PREFIX, &[0x00]);
-        let mut raw_transactions = HashMap::new();
-        let mut wtxid_list = Vec::new();
-        for position in 0..tx_count {
-            raw_transactions.insert(position as u32, a_transaction(0xA0 + position as u8));
-            wtxid_list.push([0xA0 + position as u8; 32]);
-        }
+        let raw_transactions = (0..tx_count)
+            .map(|position| a_transaction(0xA0 + position as u8))
+            .collect();
         DeclaredJob {
             new_token: Token([1u8; 16]),
             miner_address: AddressId::new("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080").unwrap(),
             version: 0x2000_0000,
             coinbase_tx_prefix,
             coinbase_tx_suffix,
-            wtxid_list,
             raw_transactions,
             prev_hash: [0xAB; 32],
             declared_at_ms: 1_000,
@@ -344,15 +338,11 @@ mod tests {
         assert!(binding_from_declared_job(&job).is_none());
     }
 
-    /// A branch over a SHORTER set would authorise a different block.
+    /// A branch that skipped it would authorise a different block.
     #[test]
-    fn a_missing_declared_transaction_projects_to_none() {
+    fn an_undecodable_declared_transaction_projects_to_none() {
         let mut job = declared_job(2);
-        job.raw_transactions.remove(&1);
-        assert!(binding_from_declared_job(&job).is_none());
-
-        let mut job = declared_job(2);
-        job.raw_transactions.insert(1, vec![0xFF, 0xFF]);
+        job.raw_transactions[1] = vec![0xFF, 0xFF];
         assert!(binding_from_declared_job(&job).is_none());
     }
 

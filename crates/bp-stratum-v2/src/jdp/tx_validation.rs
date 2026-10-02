@@ -6,58 +6,12 @@
 
 use std::collections::HashMap;
 
-// ── PartitionResult ─────────────────────────────────────────────────
+// ── DeclaredTxs ─────────────────────────────────────────────────────
 
-/// Both keyed by position in the declared `wtxid_list`.
+/// One slot per position in the declared `wtxid_list`: the raw tx when the
+/// template has it, `None` where it must be requested.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PartitionResult {
-    pub known_raw_txs: HashMap<u32, Vec<u8>>,
-    pub missing_positions: Vec<u32>,
-}
-
-impl PartitionResult {
-    pub fn fully_covered(&self) -> bool {
-        self.missing_positions.is_empty()
-    }
-}
-
-// ── partition_against_template ──────────────────────────────────────
-
-/// Split `wtxid_list` into positions the template covers and positions to
-/// request.
-pub fn partition_against_template(
-    wtxid_list: &[[u8; 32]],
-    template_txs: &HashMap<[u8; 32], Vec<u8>>,
-) -> PartitionResult {
-    let mut known = HashMap::with_capacity(wtxid_list.len());
-    let mut missing = Vec::new();
-    for (idx, wtxid) in wtxid_list.iter().enumerate() {
-        let position = idx as u32;
-        match template_txs.get(wtxid) {
-            Some(raw) => {
-                known.insert(position, raw.clone());
-            }
-            None => missing.push(position),
-        }
-    }
-    PartitionResult {
-        known_raw_txs: known,
-        missing_positions: missing,
-    }
-}
-
-// ── PendingDeclaration ──────────────────────────────────────────────
-
-/// A declaration waiting for `ProvideMissingTransactions.Success`. At most one
-/// per connection: a second `DeclareMiningJob` replaces it unanswered.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PendingDeclaration {
-    pub request_id: u32,
-    pub missing_positions: Vec<u32>,
-    pub known_raw_txs: HashMap<u32, Vec<u8>>,
-}
-
-// ── merge_provided_with_known ──────────────────────────────────────
+pub struct DeclaredTxs(Vec<Option<Vec<u8>>>);
 
 /// The provided list must match the request in count and order
 /// (SV2 JDP/ProvideMissingTransactions.Success); a shorter list would shift
@@ -68,22 +22,76 @@ pub enum MergeError {
     PositionCountMismatch { expected: usize, got: usize },
 }
 
-/// The complete `position → raw_tx` map.
-pub fn merge_provided_with_known(
-    pending: PendingDeclaration,
-    provided: Vec<Vec<u8>>,
-) -> Result<HashMap<u32, Vec<u8>>, MergeError> {
-    if provided.len() != pending.missing_positions.len() {
+impl DeclaredTxs {
+    pub fn against_template(
+        wtxid_list: &[[u8; 32]],
+        template_txs: &HashMap<[u8; 32], Vec<u8>>,
+    ) -> Self {
+        Self(
+            wtxid_list
+                .iter()
+                .map(|wtxid| template_txs.get(wtxid).cloned())
+                .collect(),
+        )
+    }
+
+    /// The positions to request, ascending.
+    pub fn missing_positions(&self) -> Vec<u32> {
+        (0u32..)
+            .zip(&self.0)
+            .filter_map(|(position, slot)| slot.is_none().then_some(position))
+            .collect()
+    }
+
+    /// The transactions the pool already has, in declaration order.
+    pub fn known(&self) -> Vec<&[u8]> {
+        self.0.iter().flatten().map(Vec::as_slice).collect()
+    }
+
+    /// Every transaction in declaration order, or `self` back when one is missing.
+    pub fn into_complete(self) -> Result<Vec<Vec<u8>>, Self> {
+        if self.0.iter().any(Option::is_none) {
+            return Err(self);
+        }
+        Ok(self.0.into_iter().flatten().collect())
+    }
+
+    /// The complete list with `provided` filling the gaps, without copying a tx.
+    pub fn completed_with<'a>(
+        &'a self,
+        provided: &'a [Vec<u8>],
+    ) -> Result<Vec<&'a [u8]>, MergeError> {
+        fill_gaps(
+            self.0.iter().map(Option::as_deref),
+            provided.iter().map(Vec::as_slice),
+        )
+    }
+
+    /// The complete list with `provided` filling the gaps.
+    pub fn complete_with(self, provided: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>, MergeError> {
+        fill_gaps(self.0, provided)
+    }
+}
+
+/// `provided` into the `None` slots, in order.
+fn fill_gaps<T>(
+    slots: impl IntoIterator<Item = Option<T>>,
+    provided: impl IntoIterator<Item = T, IntoIter: ExactSizeIterator>,
+) -> Result<Vec<T>, MergeError> {
+    let slots: Vec<Option<T>> = slots.into_iter().collect();
+    let mut provided = provided.into_iter();
+    let expected = slots.iter().filter(|slot| slot.is_none()).count();
+    if provided.len() != expected {
         return Err(MergeError::PositionCountMismatch {
-            expected: pending.missing_positions.len(),
+            expected,
             got: provided.len(),
         });
     }
-    let mut merged = pending.known_raw_txs;
-    for (position, raw_tx) in pending.missing_positions.into_iter().zip(provided) {
-        merged.insert(position, raw_tx);
-    }
-    Ok(merged)
+    Ok(slots
+        .into_iter()
+        .map(|slot| slot.or_else(|| provided.next()))
+        .collect::<Option<Vec<T>>>()
+        .expect("one provided tx per gap, counted above"))
 }
 
 #[cfg(test)]
@@ -94,111 +102,84 @@ mod tests {
         [byte; 32]
     }
 
-    // ── partition_against_template ─────────────────────────────────
+    // ── against_template ───────────────────────────────────────────
 
     #[test]
-    fn partition_template_empty_list_is_fully_covered() {
-        let result = partition_against_template(&[], &HashMap::new());
-        assert!(result.fully_covered());
-        assert!(result.known_raw_txs.is_empty());
-        assert!(result.missing_positions.is_empty());
+    fn an_empty_list_is_complete() {
+        let txs = DeclaredTxs::against_template(&[], &HashMap::new());
+        assert!(txs.missing_positions().is_empty());
+        assert_eq!(txs.into_complete(), Ok(vec![]));
     }
 
     #[test]
-    fn partition_template_all_known_yields_no_missing() {
+    fn a_list_the_template_covers_is_complete_in_order() {
         let mut template = HashMap::new();
         template.insert(wtxid(0x01), vec![0xAA]);
         template.insert(wtxid(0x02), vec![0xBB]);
-        let list = vec![wtxid(0x01), wtxid(0x02)];
-        let result = partition_against_template(&list, &template);
-        assert!(result.fully_covered());
-        assert_eq!(result.known_raw_txs.len(), 2);
-        assert_eq!(result.known_raw_txs.get(&0), Some(&vec![0xAA]));
-        assert_eq!(result.known_raw_txs.get(&1), Some(&vec![0xBB]));
+        let txs = DeclaredTxs::against_template(&[wtxid(0x02), wtxid(0x01)], &template);
+        assert!(txs.missing_positions().is_empty());
+        assert_eq!(txs.into_complete(), Ok(vec![vec![0xBB], vec![0xAA]]));
     }
 
     #[test]
-    fn partition_template_unknown_wtxids_become_missing_positions() {
-        let mut template = HashMap::new();
-        template.insert(wtxid(0x01), vec![0xAA]);
-        let list = vec![wtxid(0x01), wtxid(0x02), wtxid(0x03)];
-        let result = partition_against_template(&list, &template);
-        assert!(!result.fully_covered());
-        assert_eq!(result.missing_positions, vec![1, 2]);
-        assert_eq!(result.known_raw_txs.len(), 1);
-        assert_eq!(result.known_raw_txs.get(&0), Some(&vec![0xAA]));
-    }
-
-    #[test]
-    fn partition_template_preserves_position_order() {
+    fn unknown_wtxids_become_missing_positions() {
         let mut template = HashMap::new();
         template.insert(wtxid(0x02), vec![0xBB]);
-        let list = vec![wtxid(0x01), wtxid(0x02), wtxid(0x03), wtxid(0x04)];
-        let result = partition_against_template(&list, &template);
-        assert_eq!(result.missing_positions, vec![0, 2, 3]);
-        assert_eq!(result.known_raw_txs.get(&1), Some(&vec![0xBB]));
+        let list = [wtxid(0x01), wtxid(0x02), wtxid(0x03), wtxid(0x04)];
+        let txs = DeclaredTxs::against_template(&list, &template);
+        assert_eq!(txs.missing_positions(), vec![0, 2, 3]);
+        assert_eq!(txs.known(), vec![&[0xBB][..]]);
+        assert!(txs.into_complete().is_err());
     }
 
     #[test]
-    fn partition_template_handles_duplicate_wtxids() {
+    fn a_duplicate_wtxid_fills_both_positions() {
         let mut template = HashMap::new();
         template.insert(wtxid(0x01), vec![0xAA]);
-        let list = vec![wtxid(0x01), wtxid(0x01)];
-        let result = partition_against_template(&list, &template);
-        assert_eq!(result.known_raw_txs.len(), 2);
-        assert!(result.missing_positions.is_empty());
-        assert_eq!(result.known_raw_txs.get(&0), Some(&vec![0xAA]));
-        assert_eq!(result.known_raw_txs.get(&1), Some(&vec![0xAA]));
+        let txs = DeclaredTxs::against_template(&[wtxid(0x01), wtxid(0x01)], &template);
+        assert_eq!(txs.into_complete(), Ok(vec![vec![0xAA], vec![0xAA]]));
     }
 
-    // ── merge_provided_with_known ──────────────────────────────────
+    // ── completing ─────────────────────────────────────────────────
+
+    fn gapped() -> DeclaredTxs {
+        DeclaredTxs(vec![Some(vec![0xAA]), None, Some(vec![0xCC]), None])
+    }
 
     #[test]
-    fn merge_provided_folds_into_known_map() {
-        let mut known = HashMap::new();
-        known.insert(0u32, vec![0xAA]);
-        known.insert(2u32, vec![0xCC]);
-        let pending = PendingDeclaration {
-            request_id: 7,
-            missing_positions: vec![1, 3],
-            known_raw_txs: known,
-        };
+    fn provided_txs_fill_the_gaps_in_order() {
         let provided = vec![vec![0xBB], vec![0xDD]];
-        let merged = merge_provided_with_known(pending, provided).unwrap();
-        assert_eq!(merged.len(), 4);
-        assert_eq!(merged.get(&0), Some(&vec![0xAA]));
-        assert_eq!(merged.get(&1), Some(&vec![0xBB]));
-        assert_eq!(merged.get(&2), Some(&vec![0xCC]));
-        assert_eq!(merged.get(&3), Some(&vec![0xDD]));
+        let expected = vec![vec![0xAA], vec![0xBB], vec![0xCC], vec![0xDD]];
+        let txs = gapped();
+        let borrowed = txs.completed_with(&provided).unwrap();
+        assert_eq!(
+            borrowed,
+            expected.iter().map(Vec::as_slice).collect::<Vec<_>>()
+        );
+        assert_eq!(gapped().complete_with(provided).unwrap(), expected);
     }
 
     #[test]
-    fn merge_provided_length_mismatch_returns_error() {
-        let pending = PendingDeclaration {
-            request_id: 1,
-            missing_positions: vec![1, 2, 3],
-            known_raw_txs: HashMap::new(),
+    fn a_provided_list_of_the_wrong_length_is_refused() {
+        let err = MergeError::PositionCountMismatch {
+            expected: 2,
+            got: 3,
         };
-        let provided = vec![vec![0xAA], vec![0xBB]];
-        let err = merge_provided_with_known(pending, provided).unwrap_err();
+        let provided = vec![vec![0x01], vec![0x02], vec![0x03]];
+        assert_eq!(gapped().completed_with(&provided).unwrap_err(), err);
+        assert_eq!(gapped().complete_with(provided).unwrap_err(), err);
         assert_eq!(
-            err,
+            gapped().complete_with(vec![vec![0x01]]).unwrap_err(),
             MergeError::PositionCountMismatch {
-                expected: 3,
-                got: 2,
+                expected: 2,
+                got: 1,
             }
         );
     }
 
     #[test]
-    fn merge_provided_zero_positions_is_a_noop() {
-        let pending = PendingDeclaration {
-            request_id: 1,
-            missing_positions: vec![],
-            known_raw_txs: HashMap::from([(0u32, vec![0xAA])]),
-        };
-        let merged = merge_provided_with_known(pending, vec![]).unwrap();
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged.get(&0), Some(&vec![0xAA]));
+    fn nothing_provided_completes_a_gapless_list() {
+        let txs = DeclaredTxs(vec![Some(vec![0xAA])]);
+        assert_eq!(txs.complete_with(vec![]).unwrap(), vec![vec![0xAA]]);
     }
 }

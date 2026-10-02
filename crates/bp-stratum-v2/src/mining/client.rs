@@ -5166,7 +5166,6 @@ pub(crate) mod tests {
     }
     use crate::jdp::declarations::DeclaredJob as JdpDeclaredJob;
     use crate::tokens::Token;
-    use std::collections::HashMap as Map;
 
     /// The scriptSig prefix every fixture below declares and mines (BIP-34 height push).
     const FIXTURE_SCRIPT_SIG_PREFIX: [u8; 3] = [0x03, 0xC8, 0x00];
@@ -5174,12 +5173,10 @@ pub(crate) mod tests {
     /// `full_extranonce_size()`, which the binding compares it to.
     const FIXTURE_DECLARED_SLOT: usize = 12;
 
-    /// Two decodable transactions as `(wtxid_list, raw_transactions)`. The
-    /// wtxids are opaque tags; the merkle branch comes from the raw bytes.
-    fn fixture_declared_txs() -> (Vec<[u8; 32]>, Map<u32, Vec<u8>>) {
-        let mut raw = Map::new();
-        let mut wtxids = Vec::new();
-        for (position, tag) in [0xA1u8, 0xB2].into_iter().enumerate() {
+    /// Two decodable transactions; the merkle branch comes from their bytes.
+    fn fixture_declared_txs() -> Vec<Vec<u8>> {
+        let mut raw = Vec::new();
+        for tag in [0xA1u8, 0xB2] {
             let tx = bitcoin::Transaction {
                 version: bitcoin::transaction::Version(2),
                 lock_time: bitcoin::absolute::LockTime::ZERO,
@@ -5200,10 +5197,9 @@ pub(crate) mod tests {
                     script_pubkey: bitcoin::ScriptBuf::new(),
                 }],
             };
-            raw.insert(position as u32, bitcoin::consensus::serialize(&tx));
-            wtxids.push([tag; 32]);
+            raw.push(bitcoin::consensus::serialize(&tx));
         }
-        (wtxids, raw)
+        raw
     }
 
     /// The declared coinbase split around the extranonce slot, assembled as the handler does.
@@ -5278,7 +5274,7 @@ pub(crate) mod tests {
     ) -> RegisteredDeclaredJob {
         let (coinbase_tx_prefix, coinbase_tx_suffix) =
             fixture_declared_coinbase_parts(script_sig_prefix, outputs_blob);
-        let (wtxid_list, raw_transactions) = fixture_declared_txs();
+        let raw_transactions = fixture_declared_txs();
         RegisteredDeclaredJob {
             declared_job: JdpDeclaredJob {
                 new_token: token,
@@ -5286,7 +5282,6 @@ pub(crate) mod tests {
                 version: 0x2000_0000,
                 coinbase_tx_prefix,
                 coinbase_tx_suffix,
-                wtxid_list,
                 raw_transactions,
                 prev_hash: [0xAB; 32],
                 declared_at_ms: 1_000,
@@ -7346,7 +7341,7 @@ pub(crate) mod tests {
         // + 4 index + 1 scriptSig len.
         let raw = bitcoin::consensus::serialize(&tx);
         let index = 4 + 2 + 1 + 32 + 4 + 1 + script_sig_head.len();
-        let (wtxid_list, raw_transactions) = fixture_declared_txs();
+        let raw_transactions = fixture_declared_txs();
         let token = Token([1u8; 16]);
         let entry = RegisteredDeclaredJob {
             declared_job: JdpDeclaredJob {
@@ -7355,7 +7350,6 @@ pub(crate) mod tests {
                 version: 0x2000_0000,
                 coinbase_tx_prefix: raw[..index].to_vec(),
                 coinbase_tx_suffix: raw[index + FIXTURE_DECLARED_SLOT..].to_vec(),
-                wtxid_list,
                 raw_transactions,
                 prev_hash: [0xAB; 32],
                 declared_at_ms: 1_000,
