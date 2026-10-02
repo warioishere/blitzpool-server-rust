@@ -5,6 +5,7 @@
 //! `/api/pplns/invitations/*`; the UI fetches those exact prefixes.
 
 mod controllers;
+pub mod core_start;
 pub mod email_hooks;
 pub mod error;
 pub mod middleware;

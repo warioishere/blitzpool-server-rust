@@ -58,8 +58,8 @@ pub struct AppState {
     /// Whether the email-send pipeline is enabled. When `false`,
     /// /email/register short-circuits with `email-disabled`.
     pub email_enabled: bool,
-    /// Pool start time — `/api/info` returns this as the `uptime` field
-    /// (ISO-8601 timestamp, set once at startup).
+    /// This process's start time: `/api/health` uptime, and the `/api/info`
+    /// uptime only when the front's start time is missing from Redis.
     pub start_time: DateTime<Utc>,
     /// Bitcoin network the pool is mining against. Drives address
     /// parsing inside the per-address block-template handler.

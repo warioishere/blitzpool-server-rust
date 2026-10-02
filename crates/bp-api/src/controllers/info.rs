@@ -1209,8 +1209,24 @@ struct InfoResponse {
     block_data: Vec<FoundBlockEntry>,
     user_agents: Vec<UserAgentEntry>,
     high_scores: Vec<HighScoreEntry>,
-    /// Pool start time as an ISO-8601 string, not a duration.
+    /// Front start time as an ISO-8601 string, not a duration.
     uptime: String,
+}
+
+/// The front's boot time, so a satellite restart leaves the uptime alone.
+/// Falls back to this process's own start when the key or Redis is missing.
+async fn pool_started_at(state: &crate::state::AppState) -> chrono::DateTime<chrono::Utc> {
+    let Some(mut conn) = state.redis.clone() else {
+        return state.start_time;
+    };
+    match crate::core_start::read_core_started_at(&mut conn).await {
+        Ok(Some(at)) => at,
+        Ok(None) => state.start_time,
+        Err(err) => {
+            tracing::warn!(%err, "/api/info: core start time unreadable; reporting API start");
+            state.start_time
+        }
+    }
 }
 
 async fn info(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
@@ -1264,8 +1280,8 @@ async fn info(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
                             best_difficulty_user_agent: s.best_difficulty_user_agent,
                         })
                         .collect(),
-                    uptime: s
-                        .start_time
+                    uptime: pool_started_at(&s)
+                        .await
                         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 })
             },
@@ -1390,6 +1406,35 @@ mod slot_json_tests {
 
 #[cfg(test)]
 mod tests {
+    /// The front's start wins over the API's own; without it, the API's.
+    #[tokio::test]
+    async fn info_uptime_is_the_front_start_and_falls_back_to_the_api_start() {
+        let Some(redis) =
+            bp_test_support::connect_redis_in_range_or_skip(bp_test_support::redis_db::API, 2)
+                .await
+        else {
+            return;
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1/unused")
+            .expect("lazy pool");
+        let mut state = crate::state::AppState::new(pool, "0.0.0");
+        let api_start = chrono::DateTime::from_timestamp_millis(1_790_000_500_000).unwrap();
+        let front_start = chrono::DateTime::from_timestamp_millis(1_790_000_000_000).unwrap();
+        state.start_time = api_start;
+
+        assert_eq!(pool_started_at(&state).await, api_start, "no Redis handle");
+
+        state.redis = Some(redis.clone());
+        assert_eq!(pool_started_at(&state).await, api_start, "key missing");
+
+        let mut conn = redis;
+        crate::core_start::write_core_started_at(&mut conn, front_start)
+            .await
+            .unwrap();
+        assert_eq!(pool_started_at(&state).await, front_start, "key set");
+    }
+
     /// `previewFinder` is omitted, not null, when unset.
     #[test]
     fn preview_finder_field_is_absent_unless_set() {

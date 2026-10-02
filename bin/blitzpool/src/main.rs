@@ -510,6 +510,16 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // `/api/info` reports this as the pool's uptime.
+    if stratum.is_some() {
+        let mut conn = handles.redis.clone();
+        if let Err(err) =
+            bp_api::core_start::write_core_started_at(&mut conn, chrono::Utc::now()).await
+        {
+            tracing::warn!(%err, "core start time not written; /api/info uptime keeps the old value");
+        }
+    }
+
     // Maintenance crons run on accounting, notification crons on notify.
     let crons = if is_accounting || is_notify {
         let crons = crons::spawn(
