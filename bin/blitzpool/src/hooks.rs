@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Production impls of the Noop-by-default hook traits of bp-api and the
-//! group-mgmt engine: verification, invitation and join-decision emails, and
+//! group-mgmt engine: verification and join-decision emails, and
 //! the Group-Solo last-active lookup plus kick / dissolve Redis cleanup.
 
 use std::sync::Arc;
@@ -41,7 +41,7 @@ use crate::engines::EngineHandles;
 /// with and without `[smtp]`.
 pub(crate) struct ProductionHooks {
     pub(crate) email_verification: Arc<dyn EmailVerificationHooks>,
-    pub(crate) invitation_email: Arc<SmtpInvitationEmailHooks>,
+    pub(crate) join_decision_email: Arc<SmtpJoinDecisionEmailHooks>,
     pub(crate) group_service: Arc<ProductionGroupServiceHooks>,
     /// FCM adapter for the crons. `None` without `[notifications.fcm]`; the
     /// network-difficulty cron then keeps its tracker row fresh without push.
@@ -81,7 +81,7 @@ pub(crate) async fn spawn(
     let pool_base_url = cfg.pool_base_url.clone();
     let email_verification: Arc<dyn EmailVerificationHooks> =
         Arc::new(SmtpEmailVerificationHooks::new(smtp.clone()));
-    let invitation_email = Arc::new(SmtpInvitationEmailHooks::new(smtp.clone()));
+    let join_decision_email = Arc::new(SmtpJoinDecisionEmailHooks::new(smtp.clone()));
     let group_service = Arc::new(ProductionGroupServiceHooks {
         db: foundation.db.clone(),
         group_solo: engines.group_solo.clone(),
@@ -96,7 +96,7 @@ pub(crate) async fn spawn(
     );
     Ok(ProductionHooks {
         email_verification,
-        invitation_email,
+        join_decision_email,
         group_service,
         fcm,
         web_push,
@@ -107,7 +107,7 @@ pub(crate) async fn spawn(
 
 fn build_smtp_adapter(cfg: &AppConfig) -> Result<Option<Arc<SmtpAdapter>>, HooksError> {
     let Some(smtp) = cfg.smtp.as_ref() else {
-        warn!("smtp: not configured — verification + invitation emails will silently no-op");
+        warn!("smtp: not configured — verification + join-decision emails will silently no-op");
         return Ok(None);
     };
     let notif_cfg = NotifSmtpConfig {
@@ -213,20 +213,20 @@ impl EmailVerificationHooks for SmtpEmailVerificationHooks {
 
 // ─── bp-group-mgmt-engine::EmailHooks impl ───────────────────────
 
-/// SMTP-backed invitation + join-decision email hook; like
+/// SMTP-backed join-decision email hook; like
 /// [`SmtpEmailVerificationHooks`], a quiet no-op without SMTP.
-pub(crate) struct SmtpInvitationEmailHooks {
+pub(crate) struct SmtpJoinDecisionEmailHooks {
     smtp: Option<Arc<SmtpAdapter>>,
 }
 
-impl SmtpInvitationEmailHooks {
+impl SmtpJoinDecisionEmailHooks {
     pub(crate) fn new(smtp: Option<Arc<SmtpAdapter>>) -> Self {
         Self { smtp }
     }
 }
 
 #[async_trait]
-impl EmailHooks for SmtpInvitationEmailHooks {
+impl EmailHooks for SmtpJoinDecisionEmailHooks {
     async fn send_join_decision(&self, ctx: JoinDecisionEmailContext) {
         let Some(smtp) = self.smtp.as_ref() else {
             return;

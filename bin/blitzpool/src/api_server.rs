@@ -88,7 +88,7 @@ fn build_app_state(
     let join_request_service = Arc::new(JoinRequestService::new(
         pool.clone(),
         group_service.clone(),
-        production_hooks.invitation_email.clone(),
+        production_hooks.join_decision_email.clone(),
         JoinRequestServiceConfig {
             pool_base_url: cfg.pool_base_url.clone(),
             ..JoinRequestServiceConfig::default()

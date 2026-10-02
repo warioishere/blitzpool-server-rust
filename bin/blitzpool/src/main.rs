@@ -1245,7 +1245,7 @@ fn log_hooks_summary(_h: &ProductionHooks) {
     // readiness, this line only marks the phase boundary.
     tracing::info!(
         email_verification_ready = true,
-        invitation_email_ready = true,
+        join_decision_email_ready = true,
         push_ready = true,
         group_service_ready = true,
         "production hooks summary"
