@@ -112,7 +112,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 # HTTP server
-axum = "0.7"
+axum = "0.8"
 
 # Typed config file (bp-config / bin/blitzpool).
 toml = "1"
