@@ -6,6 +6,7 @@
 use bitcoin::Network;
 use bp_common::MiningMode;
 use bp_jobs_lifecycle::LifecycleConfig;
+use std::time::Duration;
 
 use crate::error::StratumV1Error;
 
@@ -61,6 +62,9 @@ pub struct ServerConfig {
     /// Log submit-to-ack latency per share at INFO; set by the same
     /// `debug.submit_latency` switch as SV2.
     pub log_submit_latency: bool,
+    /// How long [`crate::server::StratumV1Server::shutdown`] waits for a
+    /// translator before detaching it.
+    pub shutdown_drain_timeout: Duration,
 }
 
 impl ServerConfig {
@@ -75,6 +79,7 @@ impl ServerConfig {
             protocol_debug: false,
             share_logs: false,
             log_submit_latency: false,
+            shutdown_drain_timeout: Duration::from_secs(5),
         }
     }
 
@@ -198,6 +203,8 @@ mod tests {
         assert_eq!(c.pool_identifier, "Public-Pool");
         assert_eq!(c.lifecycle, LifecycleConfig::DEFAULT);
         assert_eq!(c.difficulty_check_interval_ms, 60_000);
+        // Same drain bound as the SV2 server.
+        assert_eq!(c.shutdown_drain_timeout, Duration::from_secs(5));
     }
 
     #[test]

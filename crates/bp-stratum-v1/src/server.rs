@@ -285,7 +285,8 @@ impl StratumV1Server {
         ))
     }
 
-    /// Cancels translators and connections; idempotent.
+    /// Cancels translators and connections; idempotent. Waits for each
+    /// translator up to [`ServerConfig::shutdown_drain_timeout`].
     pub async fn shutdown(&self) {
         self.inner.cancel.cancel();
         let handles = std::mem::take(
@@ -295,9 +296,12 @@ impl StratumV1Server {
                 .lock()
                 .expect("translator_joins mutex poisoned"),
         );
+        let drain_timeout = self.inner.server_config.shutdown_drain_timeout;
         for h in handles {
-            if let Err(err) = h.await {
-                warn!("sv1 translator task panicked during shutdown: {err}");
+            match tokio::time::timeout(drain_timeout, h).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => warn!("sv1 translator task panicked during shutdown: {err}"),
+                Err(_) => warn!("sv1 translator didn't drain within {drain_timeout:?}, detaching"),
             }
         }
     }
@@ -1387,6 +1391,30 @@ mod tests {
     }
 
     // ── Smoke test: spawn + shutdown ─────────────────────────────────
+
+    /// A translator that never exits must not hold the shutdown.
+    #[tokio::test]
+    async fn shutdown_detaches_a_translator_that_does_not_drain() {
+        let (_updates_tx, updates_rx) = broadcast::channel(8);
+        let server = StratumV1Server::spawn(
+            server_cfg(),
+            updates_rx,
+            bp_template_distribution::TemplateSnapshot::default(),
+            Vec::new(),
+            ServerHooks::no_op(),
+            SharedExtranonce::new(),
+            Arc::new(MiningJobCache::new()),
+        );
+        server
+            .inner
+            .translator_joins
+            .lock()
+            .unwrap()
+            .push(tokio::spawn(std::future::pending::<()>()));
+        tokio::time::timeout(std::time::Duration::from_secs(10), server.shutdown())
+            .await
+            .expect("shutdown must give up on a translator after the drain timeout");
+    }
 
     #[tokio::test]
     async fn server_spawn_and_shutdown_is_clean() {
