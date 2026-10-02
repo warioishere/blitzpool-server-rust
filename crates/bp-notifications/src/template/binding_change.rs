@@ -52,7 +52,7 @@ Someone just tried to register a different email against your mining address:\n\
 {attempted}\n\
 </p>\n\
 <p style=\"margin:0 0 16px;font-size:14px;line-height:1.6;color:{text};\">\n  \
-The attempt was <strong style=\"color:{primary};\">refused</strong>. Your existing binding is still active and group invitations continue to come to this email address.\n\
+The attempt was <strong style=\"color:{primary};\">refused</strong>. Your existing binding is still active and group join decisions continue to come to this email address.\n\
 </p>\n\
 <p style=\"margin:0 0 16px;font-size:14px;line-height:1.6;color:{text};\">\n  \
 No action is required if this was you (e.g. you typed your address by mistake on a friend's device). If you don't recognise this, your address may be on a public block-finder list \u{2014} there is no exposure beyond this notification.\n\
@@ -80,7 +80,7 @@ fn render_text(ctx: &BindingChangeContext) -> String {
         "",
         &format!("Attempted new email: {}", ctx.attempted_email_masked),
         "",
-        "The attempt was REFUSED. Your existing binding is still active and group invitations continue to come to this email address.",
+        "The attempt was REFUSED. Your existing binding is still active and group join decisions continue to come to this email address.",
         "",
         "No action is required. If you don't recognise this, your address is likely on a public block-finder list — there is no exposure beyond this notification.",
     ]
