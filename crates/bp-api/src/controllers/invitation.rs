@@ -17,9 +17,9 @@ use crate::state::SharedState;
 
 pub(crate) fn routes() -> Router<SharedState> {
     Router::new()
-        .route("/api/pplns/invitations/open/:token", get(open_public))
+        .route("/api/pplns/invitations/open/{token}", get(open_public))
         .route(
-            "/api/pplns/invitations/open/:token/accept",
+            "/api/pplns/invitations/open/{token}/accept",
             post(accept_open).layer(rate_limit::per_minute_layer(10)),
         )
 }

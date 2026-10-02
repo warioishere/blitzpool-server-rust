@@ -112,7 +112,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 # HTTP server
-axum = "0.7"
+axum = "0.8"
 
 # Typed config file (bp-config / bin/blitzpool).
 toml = "1"
@@ -125,7 +125,7 @@ clap = { version = "4", features = ["derive"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace", "compression-br", "compression-gzip", "compression-deflate"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "compression-br", "compression-gzip", "compression-deflate"] }
 
 # Bitcoin
 bitcoin = "0.32"

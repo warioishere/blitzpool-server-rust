@@ -34,25 +34,25 @@ pub(crate) fn routes(state: SharedState) -> Router<SharedState> {
     // admin route must be added above the layer call.
     let admin_routes = Router::new()
         // ─── admin writers ───────────────────────────────────────
-        .route("/api/pplns/groups/:id/transfer", post(transfer))
-        .route("/api/pplns/groups/:id/settings", patch(update_settings))
-        .route("/api/pplns/groups/:id", delete(dissolve))
+        .route("/api/pplns/groups/{id}/transfer", post(transfer))
+        .route("/api/pplns/groups/{id}/settings", patch(update_settings))
+        .route("/api/pplns/groups/{id}", delete(dissolve))
         .route(
-            "/api/pplns/groups/:id/invitations/open",
+            "/api/pplns/groups/{id}/invitations/open",
             post(create_open_invite)
                 .layer(rate_limit::per_minute_layer(5))
                 .delete(revoke_open_invite),
         )
         .route(
-            "/api/pplns/groups/:id/members/:address",
+            "/api/pplns/groups/{id}/members/{address}",
             delete(remove_member),
         )
         .route(
-            "/api/pplns/groups/:id/join-requests/:req_id/approve",
+            "/api/pplns/groups/{id}/join-requests/{req_id}/approve",
             post(approve_join_request),
         )
         .route(
-            "/api/pplns/groups/:id/join-requests/:req_id/reject",
+            "/api/pplns/groups/{id}/join-requests/{req_id}/reject",
             post(reject_join_request),
         )
         .route_layer(axum::middleware::from_fn_with_state(state, require_admin));
@@ -64,46 +64,46 @@ pub(crate) fn routes(state: SharedState) -> Router<SharedState> {
             get(coinbase_capacity),
         )
         .route(
-            "/api/pplns/groups/join-requests/by-address/:address",
+            "/api/pplns/groups/join-requests/by-address/{address}",
             get(join_requests_by_address),
         )
-        .route("/api/pplns/groups/public/:id", get(public_one))
-        .route("/api/pplns/groups/by-address/:address", get(by_address))
-        .route("/api/pplns/groups/membership/:address", get(membership))
-        .route("/api/pplns/groups/:id/admin-check", get(admin_check))
-        .route("/api/pplns/groups/:id/hashrate", get(hashrate))
-        .route("/api/pplns/groups/:id/chart", get(group_chart))
-        .route("/api/pplns/groups/:id/accepted", get(group_accepted))
-        .route("/api/pplns/groups/:id/rejected", get(group_rejected))
+        .route("/api/pplns/groups/public/{id}", get(public_one))
+        .route("/api/pplns/groups/by-address/{address}", get(by_address))
+        .route("/api/pplns/groups/membership/{address}", get(membership))
+        .route("/api/pplns/groups/{id}/admin-check", get(admin_check))
+        .route("/api/pplns/groups/{id}/hashrate", get(hashrate))
+        .route("/api/pplns/groups/{id}/chart", get(group_chart))
+        .route("/api/pplns/groups/{id}/accepted", get(group_accepted))
+        .route("/api/pplns/groups/{id}/rejected", get(group_rejected))
         .route(
-            "/api/pplns/groups/:id/max-difficulty",
+            "/api/pplns/groups/{id}/max-difficulty",
             get(group_max_difficulty),
         )
-        .route("/api/pplns/groups/:id/distribution", get(distribution))
+        .route("/api/pplns/groups/{id}/distribution", get(distribution))
         .route(
-            "/api/pplns/groups/:id/window-timeline",
+            "/api/pplns/groups/{id}/window-timeline",
             get(window_timeline),
         )
         .route(
-            "/api/pplns/groups/:id/best-difficulty",
+            "/api/pplns/groups/{id}/best-difficulty",
             get(best_difficulty),
         )
-        .route("/api/pplns/groups/:id/history", get(history))
+        .route("/api/pplns/groups/{id}/history", get(history))
         .route(
-            "/api/pplns/groups/:id/invitations/open/active",
+            "/api/pplns/groups/{id}/invitations/open/active",
             get(open_invite_active),
         )
         .route(
-            "/api/pplns/groups/:id/join-requests",
+            "/api/pplns/groups/{id}/join-requests",
             get(list_join_requests),
         )
         .route("/api/pplns/groups", post(create))
         .route(
-            "/api/pplns/groups/public/:id/join-request",
+            "/api/pplns/groups/public/{id}/join-request",
             post(create_join_request).layer(rate_limit::per_minute_layer(10)),
         )
         // Last, so the more specific paths above win the route-match.
-        .route("/api/pplns/groups/:id", get(by_id));
+        .route("/api/pplns/groups/{id}", get(by_id));
 
     admin_routes.merge(public_routes)
 }

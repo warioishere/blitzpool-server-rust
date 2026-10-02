@@ -23,26 +23,26 @@ use crate::state::SharedState;
 
 pub(crate) fn routes() -> Router<SharedState> {
     Router::new()
-        .route("/api/client/:address", get(by_address))
-        .route("/api/client/:address/worker-shares", get(worker_shares))
-        .route("/api/client/:address/chart", get(chart))
-        .route("/api/client/:address/accepted", get(accepted))
-        .route("/api/client/:address/max-difficulty", get(max_difficulty))
-        .route("/api/client/:address/workers", get(workers))
-        .route("/api/client/:address/rejected", get(rejected))
-        .route("/api/client/:address/diff-scores", get(diff_scores))
+        .route("/api/client/{address}", get(by_address))
+        .route("/api/client/{address}/worker-shares", get(worker_shares))
+        .route("/api/client/{address}/chart", get(chart))
+        .route("/api/client/{address}/accepted", get(accepted))
+        .route("/api/client/{address}/max-difficulty", get(max_difficulty))
+        .route("/api/client/{address}/workers", get(workers))
+        .route("/api/client/{address}/rejected", get(rejected))
+        .route("/api/client/{address}/diff-scores", get(diff_scores))
         .route(
-            "/api/client/:address/best-difficulty/today",
+            "/api/client/{address}/best-difficulty/today",
             get(best_difficulty_today),
         )
-        .route("/api/client/:address/reset", post(reset_address))
-        .route("/api/client/:address/delete-stats", post(delete_stats))
-        .route("/api/client/:address/delete-all", post(delete_all))
+        .route("/api/client/{address}/reset", post(reset_address))
+        .route("/api/client/{address}/delete-stats", post(delete_stats))
+        .route("/api/client/{address}/delete-all", post(delete_all))
         // The triple-segment routes must come AFTER the specific
         // chart/accepted/workers/rejected paths so axum picks the
         // specific match first.
-        .route("/api/client/:address/:worker", get(by_worker))
-        .route("/api/client/:address/:worker/:session", get(by_session))
+        .route("/api/client/{address}/{worker}", get(by_worker))
+        .route("/api/client/{address}/{worker}/{session}", get(by_session))
 }
 
 // ─── time-range chart endpoints ──────────────────────────────────

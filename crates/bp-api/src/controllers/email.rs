@@ -30,8 +30,8 @@ pub(crate) fn routes() -> Router<SharedState> {
             "/api/email/register",
             post(register).layer(rate_limit::per_minute_layer(5)),
         )
-        .route("/api/email/verify/:token", get(verify))
-        .route("/api/email/by-address/:address", get(by_address))
+        .route("/api/email/verify/{token}", get(verify))
+        .route("/api/email/by-address/{address}", get(by_address))
 }
 
 // ─── POST /api/email/register ────────────────────────────────────

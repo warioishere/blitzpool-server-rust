@@ -41,8 +41,8 @@ pub(crate) fn routes() -> Router<SharedState> {
             "/api/address/ownership/verify",
             post(verify).layer(rate_limit::per_minute_layer(5)),
         )
-        .route("/api/address/ownership/:address", get(by_address))
-        .route("/api/address/verified/:address", get(verified_status))
+        .route("/api/address/ownership/{address}", get(by_address))
+        .route("/api/address/verified/{address}", get(verified_status))
 }
 
 // ─── POST /api/address/ownership/challenge ───────────────────────

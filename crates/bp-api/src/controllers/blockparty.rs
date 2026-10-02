@@ -244,21 +244,27 @@ pub(crate) fn routes() -> Router<SharedState> {
         // ── Reads ────────────────────────────────────────────────
         // NB: no public directory listing — blockparty is invite-only, so the
         // group id is not enumerable. Detail/by-address need the id up front.
-        .route("/api/blockparty/by-address/:address", get(by_address))
-        .route("/api/blockparty/:id", get(detail))
-        .route("/api/blockparty/:id/history", get(history))
-        .route("/api/blockparty/:id/admin-check", get(admin_check))
-        .route("/api/blockparty/:id/member-view/:address", get(member_view))
+        .route("/api/blockparty/by-address/{address}", get(by_address))
+        .route("/api/blockparty/{id}", get(detail))
+        .route("/api/blockparty/{id}/history", get(history))
+        .route("/api/blockparty/{id}/admin-check", get(admin_check))
+        .route(
+            "/api/blockparty/{id}/member-view/{address}",
+            get(member_view),
+        )
         // ── Admin lifecycle ──────────────────────────────────────
         .route("/api/blockparty", post(create))
-        .route("/api/blockparty/:id/splits", patch(update_splits))
+        .route("/api/blockparty/{id}/splits", patch(update_splits))
         .route(
-            "/api/blockparty/:id/request-confirmation",
+            "/api/blockparty/{id}/request-confirmation",
             post(request_confirmation),
         )
-        .route("/api/blockparty/:id/rental-hint", patch(update_rental_hint))
         .route(
-            "/api/blockparty/:id/join-link",
+            "/api/blockparty/{id}/rental-hint",
+            patch(update_rental_hint),
+        )
+        .route(
+            "/api/blockparty/{id}/join-link",
             get(active_join_link)
                 .post(create_join_link)
                 .delete(revoke_join_link),
@@ -267,23 +273,23 @@ pub(crate) fn routes() -> Router<SharedState> {
             // Public self-service join — throttled per client IP (matches the
             // group-solo open-invite accept). Covers both the POST join (DB
             // write + member-token mint) and the GET context (token probing).
-            "/api/blockparty/join/:token",
+            "/api/blockparty/join/{token}",
             get(get_join_context)
                 .post(join_via_link)
                 .layer(rate_limit::per_minute_layer(10)),
         )
         .route(
-            "/api/blockparty/:id/members/:address",
+            "/api/blockparty/{id}/members/{address}",
             delete(remove_member),
         )
         .route(
-            "/api/blockparty/:id/transition-confirming",
+            "/api/blockparty/{id}/transition-confirming",
             post(transition_confirming),
         )
-        .route("/api/blockparty/:id/dissolve", post(dissolve))
+        .route("/api/blockparty/{id}/dissolve", post(dissolve))
         // ── Member-token gated ───────────────────────────────────
         .route(
-            "/api/blockparty/:id/members/:address/reconfirm",
+            "/api/blockparty/{id}/members/{address}/reconfirm",
             post(reconfirm_member),
         )
 }

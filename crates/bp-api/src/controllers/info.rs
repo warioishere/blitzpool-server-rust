@@ -25,7 +25,7 @@ use crate::state::SharedState;
 pub(crate) fn routes() -> Router<SharedState> {
     Router::new()
         .route("/api/info", get(info))
-        .route("/api/info/chart/mode/:mode", get(chart_mode))
+        .route("/api/info/chart/mode/{mode}", get(chart_mode))
         .route("/api/info/version", get(version))
         .route("/api/info/core", get(core))
         .route("/api/info/peers", get(peers))
@@ -33,7 +33,7 @@ pub(crate) fn routes() -> Router<SharedState> {
         .route("/api/info/block-template", get(block_template))
         .route("/api/info/next-block-reward", get(next_block_reward))
         .route(
-            "/api/client/:address/block-template",
+            "/api/client/{address}/block-template",
             get(client_block_template),
         )
         .route("/api/info/chart", get(chart))

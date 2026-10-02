@@ -28,7 +28,7 @@ pub(crate) fn routes() -> Router<SharedState> {
         .route("/api/push/info", get(info))
         .route("/api/push/register", post(register))
         .route("/api/push/unregister", post(unregister))
-        .route("/api/push/status/:address", get(status))
+        .route("/api/push/status/{address}", get(status))
         .route("/api/push/configure", post(configure))
         .route("/api/push/fcm/register", post(register_fcm))
         .route("/api/push/fcm/unregister", post(unregister_fcm))

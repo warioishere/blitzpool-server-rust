@@ -18,14 +18,14 @@ use crate::state::{AppState, SharedState};
 pub(crate) fn routes() -> Router<SharedState> {
     Router::new()
         .route("/api/pplns", get(root))
-        .route("/api/pplns/mode/:address", get(mode))
+        .route("/api/pplns/mode/{address}", get(mode))
         .route("/api/pplns/status", get(status))
         .route("/api/pplns/fees", get(fees))
         .route("/api/pplns/distribution", get(distribution))
         .route("/api/pplns/ledger", get(ledger))
         .route("/api/pplns/chart", get(chart))
-        .route("/api/pplns/:address", get(address_summary))
-        .route("/api/pplns/:address/history", get(address_history))
+        .route("/api/pplns/{address}", get(address_summary))
+        .route("/api/pplns/{address}/history", get(address_history))
 }
 
 // ─── /api/pplns/chart ────────────────────────────────────────────

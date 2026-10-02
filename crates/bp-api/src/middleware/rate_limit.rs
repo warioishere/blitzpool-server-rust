@@ -19,8 +19,8 @@ use tower_governor::GovernorLayer;
 /// count-per-window.
 pub type LimitConfig = Arc<GovernorConfig<SmartIpKeyExtractor, NoOpMiddleware>>;
 
-/// Build an `n`-per-60s [`LimitConfig`]. Wrap in `GovernorLayer { config }`
-/// to layer onto a single axum route.
+/// Build an `n`-per-60s [`LimitConfig`]; [`per_minute_layer`] wraps it for a
+/// single axum route.
 pub fn per_minute(n: u32) -> LimitConfig {
     let period = Duration::from_secs(60)
         .checked_div(n)
@@ -35,10 +35,44 @@ pub fn per_minute(n: u32) -> LimitConfig {
     )
 }
 
-/// Convenience: build the layer in one call. Equivalent to
-/// `GovernorLayer { config: per_minute(n) }`.
-pub fn per_minute_layer(n: u32) -> GovernorLayer<SmartIpKeyExtractor, NoOpMiddleware> {
-    GovernorLayer {
-        config: per_minute(n),
+/// The [`per_minute`] limit as a layer for a single axum route.
+pub fn per_minute_layer(
+    n: u32,
+) -> GovernorLayer<SmartIpKeyExtractor, NoOpMiddleware, axum::body::Body> {
+    GovernorLayer::new(per_minute(n))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    async fn status(app: &Router, ip: &str) -> StatusCode {
+        let req = Request::builder()
+            .uri("/limited")
+            .header("x-forwarded-for", ip)
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap().status()
+    }
+
+    /// The burst is `n` per IP; the next request is refused with 429 while a
+    /// different IP still has its own bucket.
+    #[tokio::test]
+    async fn the_request_past_the_burst_is_refused_per_ip() {
+        let app = Router::new()
+            .route("/limited", get(|| async { "ok" }))
+            .layer(super::per_minute_layer(2));
+
+        assert_eq!(status(&app, "10.0.0.1").await, StatusCode::OK);
+        assert_eq!(status(&app, "10.0.0.1").await, StatusCode::OK);
+        assert_eq!(
+            status(&app, "10.0.0.1").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(status(&app, "10.0.0.2").await, StatusCode::OK);
     }
 }
