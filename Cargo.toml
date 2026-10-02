@@ -105,7 +105,7 @@ sqlx = { version = "0.8", default-features = false, features = [
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # Cache / outbound HTTP
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "aio", "connection-manager", "script", "streams"] }
+redis = { version = "1.7", default-features = false, features = ["tokio-comp", "aio", "connection-manager", "script", "streams"] }
 # No bundled crypto provider: bp-http installs ring, which the rest of the tree
 # uses, instead of the aws-lc-rs build the `rustls` feature would add.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
