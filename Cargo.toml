@@ -119,7 +119,7 @@ clap = { version = "4", features = ["derive"] }
 # Metrics — `metrics` facade + Prometheus exporter (text-format /metrics
 # endpoint with histogram-bucket support). Used by `bp-metrics`.
 metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "compression-br", "compression-gzip", "compression-deflate"] }
 
