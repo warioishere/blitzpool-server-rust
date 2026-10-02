@@ -147,6 +147,14 @@ pub(crate) async fn count_pending_at(
     conn.hlen(key).await
 }
 
+/// Hashes of every block still awaiting confirmation; unparsable fields
+/// included, since those are still parked too.
+pub(crate) async fn pending_block_hashes(
+    conn: &mut ConnectionManager,
+) -> Result<std::collections::HashSet<String>, RedisError> {
+    conn.hkeys(PENDING_KEY).await
+}
+
 /// Load every block in the pending store. A field whose JSON fails to parse
 /// (corrupt / schema-drifted) is skipped, its hash returned in the second
 /// tuple element so the caller can prune it.
@@ -215,5 +223,41 @@ mod tests {
         assert!(back.group.is_none());
         assert!(back.weight_snapshot.is_none());
         assert!(back.actual_coinbase.is_none());
+    }
+
+    /// The reconcile check looks a block up by the hash the chain reports, so
+    /// the store must key each parked block by exactly that hash.
+    #[tokio::test]
+    async fn a_parked_block_is_listed_by_its_hash_until_removed() {
+        let Some(mut conn) = bp_test_support::connect_redis_in_range_or_skip(
+            bp_test_support::redis_db::BLITZPOOL_BIN_2,
+            1,
+        )
+        .await
+        else {
+            return;
+        };
+        let hash = "0000000000000000000201d3f0c2b6a2e7f1f0ad2b3c4d5e6f708192a3b4c5d6".to_string();
+        put_pending_block(
+            &mut conn,
+            &PendingBlock {
+                block_hash: hash.clone(),
+                found_at_ms: 1_790_000_000_000,
+                block_height: 900_000,
+                weight_snapshot: None,
+                actual_coinbase: None,
+                payouts_fingerprint: None,
+                group: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pending_block_hashes(&mut conn).await.unwrap(),
+            [hash.clone()].into()
+        );
+
+        remove_pending_block(&mut conn, &hash).await.unwrap();
+        assert!(pending_block_hashes(&mut conn).await.unwrap().is_empty());
     }
 }

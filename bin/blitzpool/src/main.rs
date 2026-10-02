@@ -604,6 +604,7 @@ async fn main() -> ExitCode {
             Some(markers) => Some(crate::block_reconcile::spawn_reconcile_task(
                 handles.bitcoin_rpc.clone(),
                 handles.db.pool().clone(),
+                handles.redis.clone(),
                 markers,
                 engines.mode_gate.clone(),
                 crate::block_reconcile::DEFAULT_INTERVAL,

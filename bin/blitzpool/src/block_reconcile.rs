@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bp_bitcoin::BitcoinRpc;
+use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -159,6 +160,7 @@ fn btc_to_sats(btc: f64) -> u64 {
 pub(crate) fn spawn_reconcile_task(
     rpc: BitcoinRpc,
     pool: PgPool,
+    mut redis: ConnectionManager,
     markers: PoolMarkers,
     modes: Arc<dyn ModeLedger>,
     interval: Duration,
@@ -178,11 +180,21 @@ pub(crate) fn spawn_reconcile_task(
         );
         loop {
             tick.tick().await;
+            // Without the parked set a block awaiting confirmation reads as
+            // unbooked, so a pass that cannot load it does not run.
+            let parked = match crate::pending_blocks::pending_block_hashes(&mut redis).await {
+                Ok(p) => p,
+                Err(err) => {
+                    warn!(%err, "block-reconcile: parked blocks unreadable; retry next tick");
+                    continue;
+                }
+            };
             match run_once(
                 &rpc,
                 &pool,
                 &markers,
                 modes.as_ref(),
+                &parked,
                 checked_through,
                 lookback,
             )
@@ -212,12 +224,15 @@ pub(crate) struct ReconcilePass {
 
 /// Walk the unchecked range, and report every pool block with no ledger
 /// record. Errors on a single block are logged and skipped — one unreadable
-/// block must not stop the rest of the range from being checked.
+/// block must not stop the rest of the range from being checked. A block in
+/// `parked` is still waiting for its confirmations, so it is not reported but
+/// walked again next pass, in case its booking then fails.
 pub(crate) async fn run_once(
     rpc: &BitcoinRpc,
     pool: &PgPool,
     markers: &PoolMarkers,
     modes: &dyn ModeLedger,
+    parked: &HashSet<String>,
     checked_through: Option<u64>,
     lookback: u64,
 ) -> Result<ReconcilePass, bp_bitcoin::RpcError> {
@@ -232,9 +247,19 @@ pub(crate) async fn run_once(
         });
     }
 
-    let mut first_error: Option<u64> = None;
+    let mut first_recheck: Option<u64> = None;
     for height in from_height..=tip {
         match inspect_block(rpc, pool, markers, modes, height).await {
+            Ok(Some(block))
+                if block.gap == Gap::RegisteredButUnbooked && parked.contains(&block.hash) =>
+            {
+                debug!(
+                    height,
+                    hash = %block.hash,
+                    "block-reconcile: block awaits confirmation; checked again next pass"
+                );
+                first_recheck.get_or_insert(height);
+            }
             Ok(Some(block)) => {
                 match block.gap {
                     Gap::NeverRegistered => error!(
@@ -257,13 +282,13 @@ pub(crate) async fn run_once(
             Ok(None) => {}
             Err(err) => {
                 warn!(%err, height, "block-reconcile: could not check block; will retry");
-                first_error.get_or_insert(height);
+                first_recheck.get_or_insert(height);
             }
         }
     }
     Ok(ReconcilePass {
         from_height,
-        checked_through: next_watermark(tip, first_error),
+        checked_through: next_watermark(tip, first_recheck),
         unbooked,
     })
 }
@@ -282,9 +307,10 @@ fn scan_start(checked_through: Option<u64>, tip: u64, lookback: u64) -> u64 {
 }
 
 /// How far this pass may claim to have checked: below the first height it
-/// could not read, so a transient RPC failure costs a retry, not the block.
-fn next_watermark(tip: u64, first_error: Option<u64>) -> u64 {
-    match first_error {
+/// could not read or that still awaits confirmation, so neither a transient
+/// RPC failure nor a booking still to come costs the block its check.
+fn next_watermark(tip: u64, first_recheck: Option<u64>) -> u64 {
+    match first_recheck {
         Some(h) => h.saturating_sub(1),
         None => tip,
     }
@@ -597,6 +623,7 @@ mod regtest {
             &pg,
             &markers,
             &ledger_mode,
+            &HashSet::new(),
             Some(before),
             DEFAULT_LOOKBACK,
         )
@@ -634,6 +661,7 @@ mod regtest {
             &pg,
             &markers,
             &ledger_mode,
+            &HashSet::new(),
             Some(before),
             DEFAULT_LOOKBACK,
         )
@@ -648,6 +676,35 @@ mod regtest {
             "registered but never booked must still be reported"
         );
 
+        // 2b. The same block, still parked for its confirmations: its booking
+        //     is yet to come, so it is not reported, and the pass stops short
+        //     of it so the next one looks again.
+        let mined_hash = rpc
+            .get_block_hash(mined)
+            .await
+            .expect("hash of the mined block");
+        let parked: HashSet<String> = [mined_hash].into();
+        let pass = run_once(
+            &rpc,
+            &pg,
+            &markers,
+            &ledger_mode,
+            &parked,
+            Some(before),
+            DEFAULT_LOOKBACK,
+        )
+        .await
+        .expect("pass 2b");
+        assert!(
+            !pass.unbooked.iter().any(|b| b.height == mined),
+            "a block awaiting confirmation is not unbooked"
+        );
+        assert!(
+            pass.checked_through < mined,
+            "a parked block must be walked again: checked through {}",
+            pass.checked_through
+        );
+
         // 3. A mode that keeps no ledger (Solo pays in the coinbase) has no
         //    payout row by design and must not be flagged.
         let pass = run_once(
@@ -655,6 +712,7 @@ mod regtest {
             &pg,
             &markers,
             &Modes(false),
+            &HashSet::new(),
             Some(before),
             DEFAULT_LOOKBACK,
         )
@@ -680,6 +738,7 @@ mod regtest {
             &pg,
             &markers,
             &ledger_mode,
+            &HashSet::new(),
             Some(before),
             DEFAULT_LOOKBACK,
         )
