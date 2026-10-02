@@ -1,0 +1,24 @@
+name: Audit
+
+# RustSec advisories against Cargo.lock. Its own workflow so the weekly run
+# catches an advisory published against code that has not changed.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Exceptions live in .cargo/audit.toml, each with its reason.
+      - run: cargo audit

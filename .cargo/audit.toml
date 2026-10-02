@@ -1,0 +1,7 @@
+[advisories]
+ignore = [
+    # rsa (Marvin timing attack, no fixed release): locked only through
+    # sqlx-mysql, which no crate enables, so `cargo tree -i rsa` is empty and
+    # nothing compiles it.
+    "RUSTSEC-2023-0071",
+]
