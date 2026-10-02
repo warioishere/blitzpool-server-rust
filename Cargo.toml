@@ -57,7 +57,7 @@ license = "AGPL-3.0-or-later"
 # clients). The TS port hit unbounded RSS growth on glibc and only
 # stabilised under jemalloc; we adopt the same allocator preemptively
 # so we don't re-discover the same fragmentation problem in production.
-tikv-jemallocator = "0.6"
+tikv-jemallocator = "0.7"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
