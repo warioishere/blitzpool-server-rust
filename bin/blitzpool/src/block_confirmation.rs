@@ -321,7 +321,7 @@ pub(crate) async fn settle_block(
     mode: SettlementMode<'_>,
     height: i32,
     actual: &bp_coinbase_snapshot::ActualCoinbase,
-    weight_snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
+    weight_snapshot: Option<bp_pplns_engine::window::snapshot::StoredWeightSnapshot>,
     payouts_fingerprint: Option<[u8; 32]>,
 ) -> Result<u64, SettleFailure> {
     match mode {

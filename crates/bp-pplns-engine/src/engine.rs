@@ -289,14 +289,9 @@ impl PplnsEngine {
         weights_fingerprint: &[u8; 32],
     ) -> Result<StoredWeightSnapshot, EngineError> {
         let mut conn = self.inner.window.connection_for_snapshot();
-        bp_coinbase_snapshot::resolve_snapshot_for_block_found(
-            &mut conn,
-            crate::window::snapshot_key_for,
-            weights_fingerprint,
-            "pplns",
-        )
-        .await?
-        .ok_or(EngineError::SnapshotMissingForPayouts)
+        crate::window::snapshot::resolve_snapshot_for_block_found(&mut conn, weights_fingerprint)
+            .await?
+            .ok_or(EngineError::SnapshotMissingForPayouts)
     }
 
     /// Settle `claim(T_actual) − paid` per address against the block's OWN coinbase.
@@ -567,7 +562,7 @@ impl PplnsEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bp_coinbase_snapshot::WeightSnapshotEntry;
+    use crate::window::snapshot::WeightSnapshotEntry;
 
     #[test]
     fn engine_error_carries_source_variants() {

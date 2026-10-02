@@ -35,7 +35,7 @@ pub(crate) struct PendingBlock {
     pub block_height: i32,
     /// The distribution's settlement inputs; PPLNS only.
     #[serde(default)]
-    pub weight_snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
+    pub weight_snapshot: Option<bp_pplns_engine::window::snapshot::StoredWeightSnapshot>,
     /// What the block's coinbase actually paid — settlement's ground
     /// truth. Without it there is nothing to settle against.
     #[serde(default)]

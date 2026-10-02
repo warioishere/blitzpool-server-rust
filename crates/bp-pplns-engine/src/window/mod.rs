@@ -466,7 +466,7 @@ impl WindowStore {
         })
     }
 
-    /// Redis handle for the shared build-and-snapshot path.
+    /// Redis handle for the snapshot write and the block-found read.
     pub fn connection_for_snapshot(&self) -> ConnectionManager {
         self.conn.clone()
     }

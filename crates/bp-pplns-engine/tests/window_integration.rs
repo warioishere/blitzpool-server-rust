@@ -235,7 +235,7 @@ async fn trim_window_drops_oldest_over_window_size() {
 
 #[tokio::test]
 async fn rewriting_a_snapshot_with_fewer_entries_leaves_no_stale_fields() {
-    use bp_coinbase_snapshot::{
+    use bp_pplns_engine::window::snapshot::{
         read_weight_snapshot, write_weight_snapshot, StoredWeightSnapshot, WeightSnapshotEntry,
     };
 

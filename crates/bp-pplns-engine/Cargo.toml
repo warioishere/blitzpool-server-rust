@@ -15,8 +15,8 @@ workspace = true
 bp-common = { workspace = true }
 bp-pplns = { workspace = true }
 bp-db = { workspace = true }
-# Shared snapshot persistence + ledger row-type primitives (also used
-# by bp-group-solo-engine — one source of truth for the wire formats).
+# Shared weight build + ledger row-type primitives (also used by
+# bp-group-solo-engine — one source of truth for both).
 bp-coinbase-snapshot = { workspace = true }
 # Protocol-agnostic accepted-share hook surface. The SV1 and SV2
 # Stratum servers project their native ShareAccept into the shared

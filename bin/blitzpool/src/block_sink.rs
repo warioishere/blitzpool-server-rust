@@ -59,7 +59,7 @@ pub(crate) struct BlockFoundEvent {
     /// the block-found instant: the Redis keys they come from are overwritten
     /// or expire before the apply side runs. The wire name is format only.
     #[serde(default, rename = "groupsolo_weight_snapshot")]
-    pub weight_snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
+    pub weight_snapshot: Option<bp_pplns_engine::window::snapshot::StoredWeightSnapshot>,
     /// Identity of the payout list the winning job's coinbase pays, so what is
     /// booked is what the coinbase paid. `None` when the pool did not build the
     /// coinbase. The `pplns_` name is wire format; the field serves every mode.
@@ -484,7 +484,7 @@ impl TdpBlockSubmissionSink {
         address: &str,
         payouts_fingerprint: Option<[u8; 32]>,
         height: i32,
-    ) -> Option<bp_coinbase_snapshot::StoredWeightSnapshot> {
+    ) -> Option<bp_pplns_engine::window::snapshot::StoredWeightSnapshot> {
         let fingerprint = || match payouts_fingerprint {
             Some(fp) => Some(fp),
             None => {
@@ -584,7 +584,7 @@ impl BlockFoundApplier {
         height: i32,
         reward: u64,
         block_hash_hex: Option<&str>,
-        weight_snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
+        weight_snapshot: Option<bp_pplns_engine::window::snapshot::StoredWeightSnapshot>,
         actual: Option<&bp_coinbase_snapshot::ActualCoinbase>,
         payouts_fingerprint: Option<[u8; 32]>,
         group: Option<PendingGroup>,
@@ -661,7 +661,7 @@ impl BlockFoundApplier {
         address_str: &str,
         height: i32,
         reward: u64,
-        weight_snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
+        weight_snapshot: Option<bp_pplns_engine::window::snapshot::StoredWeightSnapshot>,
         actual: &bp_coinbase_snapshot::ActualCoinbase,
         payouts_fingerprint: Option<[u8; 32]>,
         group: Option<PendingGroup>,
@@ -1439,8 +1439,8 @@ mod tests {
     /// Pins the JSON round-trip of the Core-stamped event fields.
     #[test]
     fn block_found_event_json_round_trips_with_stamped_fields() {
-        let weight_snapshot = bp_coinbase_snapshot::StoredWeightSnapshot {
-            entries: vec![bp_coinbase_snapshot::WeightSnapshotEntry {
+        let weight_snapshot = bp_pplns_engine::window::snapshot::StoredWeightSnapshot {
+            entries: vec![bp_pplns_engine::window::snapshot::WeightSnapshotEntry {
                 address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
                 score_weight: 1_000_000_000_000,
                 balance_sats: 0,

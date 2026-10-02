@@ -1,29 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! The one weight build both payout engines run: drop unusable addresses and
-//! project onto weights ([`sanitize_and_build`]). PPLNS also persists the
-//! settlement inputs under the fingerprint ([`build_and_snapshot`]); Group-Solo
-//! books from the coinbase alone and needs none. One copy keeps the modes from
-//! drifting; share sourcing, caching and post-build steps stay per engine.
+//! project onto weights ([`sanitize_and_build`]). One copy keeps the modes
+//! from drifting; share sourcing, caching, persistence and post-build steps
+//! stay per engine.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use bp_common::{AddressId, Sats};
 use bp_pplns::{
     build_weight_distribution, is_valid_payout_address, WeightBuildError, WeightDistribution,
     WeightDistributionInput, WithheldValue,
 };
-use redis::aio::ConnectionManager;
 use tracing::warn;
-
-use crate::snapshot::{write_weight_snapshot, StoredWeightSnapshot};
-
-/// Retries for a failed snapshot write before the job goes out without one;
-/// a block found on this job can only be booked from this key.
-const SNAPSHOT_WRITE_RETRIES: u32 = 2;
-/// Backoff between those attempts, multiplied by the attempt number.
-const SNAPSHOT_WRITE_BACKOFF: Duration = Duration::from_millis(40);
 
 /// Everything the weight model needs that the two modes disagree on.
 /// The share and balance maps come in by value because the sanitize pass
@@ -67,31 +56,6 @@ impl BuiltDistribution {
     pub fn payouts_fingerprint(&self) -> [u8; 32] {
         self.distribution.fingerprint
     }
-}
-
-/// Sanitize, build, persist. A failed snapshot write does not fail the build:
-/// it costs a manual reprocess if a block lands, a missing job costs every
-/// miner. `snapshot_key` is a closure since the fingerprint exists only after
-/// the build; [`crate::snapshot::resolve_snapshot_for_block_found`] reads it back.
-pub async fn build_and_snapshot(
-    req: BuildRequest<'_>,
-    conn: &mut ConnectionManager,
-    snapshot_key: impl FnOnce(&[u8; 32]) -> String,
-    ttl_secs: u32,
-) -> Result<BuiltDistribution, WeightBuildError> {
-    let scope = req.scope;
-    let distribution = sanitize_and_build(req)?;
-
-    // Settlement books `claim(T_actual) − paid` from the real coinbase, so one
-    // snapshot serves every job built from this distribution, JDC jobs included.
-    let snapshot = StoredWeightSnapshot::from_distribution(&distribution);
-    let key = snapshot_key(&distribution.fingerprint);
-    let bookable = write_with_retry(conn, &key, &snapshot, ttl_secs, scope).await;
-
-    Ok(BuiltDistribution {
-        distribution,
-        bookable,
-    })
 }
 
 /// Sanitize and build, applying the empty-source bootstrap. Pure, no I/O, so
@@ -161,37 +125,6 @@ pub fn sanitize_and_build(
         other => other?,
     };
     Ok(distribution)
-}
-
-async fn write_with_retry(
-    conn: &mut ConnectionManager,
-    key: &str,
-    snapshot: &StoredWeightSnapshot,
-    ttl_secs: u32,
-    scope: &str,
-) -> bool {
-    let mut attempt = 0;
-    loop {
-        match write_weight_snapshot(conn, key, snapshot, ttl_secs).await {
-            Ok(()) => return true,
-            Err(err) if attempt < SNAPSHOT_WRITE_RETRIES => {
-                warn!(%err, scope, attempt, "snapshot write failed — retrying");
-                attempt += 1;
-                tokio::time::sleep(SNAPSHOT_WRITE_BACKOFF * attempt).await;
-            }
-            Err(err) => {
-                warn!(
-                    %err,
-                    scope,
-                    key,
-                    "snapshot write failed after retries — the coinbase distribution stands, \
-                     but a block found on this job cannot be booked automatically and needs \
-                     operator reprocessing from the block's own coinbase"
-                );
-                return false;
-            }
-        }
-    }
 }
 
 #[cfg(test)]

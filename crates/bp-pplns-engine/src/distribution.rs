@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! PPLNS wrapper around the shared `bp_coinbase_snapshot::build_and_snapshot`:
-//! Redis window plus Postgres balances, snapshotted under
-//! `pplns:snapshot:<fingerprint>` so a found block settles against them. The
-//! window+ledger inputs are cached apart from the reward, so N rewards cost one read.
+//! PPLNS around the shared weight build: Redis window plus Postgres balances,
+//! snapshotted under `pplns:snapshot:<fingerprint>` so a found block settles
+//! against them. The window+ledger inputs are cached apart from the reward, so
+//! N rewards cost one read.
 
 pub use bp_coinbase_snapshot::BuiltDistribution;
 use std::collections::HashMap;
@@ -11,20 +11,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bp_coinbase_snapshot::{build_and_snapshot, BuildRequest};
+use bp_coinbase_snapshot::{sanitize_and_build, BuildRequest};
 use bp_common::{AddressId, Sats};
 use bp_db::{find_pplns_balances_with_open_balance, PplnsBalanceRow};
 use bp_pplns::WeightBuildError;
 use sqlx::PgPool;
 use thiserror::Error;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::autoscale::LiveBudget;
+use crate::window::snapshot::{write_weight_snapshot, StoredWeightSnapshot};
 use crate::window::{WindowError, WindowStore};
 use bp_coinbase_snapshot::share_map_from_redis_hash;
 use bp_inflight_cache::InflightResultCache;
 
 pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Retries for a failed snapshot write before the job goes out without one;
+/// a block found on this job can only be booked from this key.
+const SNAPSHOT_WRITE_RETRIES: u32 = 2;
+/// Backoff between those attempts, multiplied by the attempt number.
+const SNAPSHOT_WRITE_BACKOFF: Duration = Duration::from_millis(40);
 
 /// Errors surfaced by [`DistributionBuilder::build`]. `Default` exists so
 /// the in-flight cache can build a placeholder when the leader panics.
@@ -258,7 +265,6 @@ async fn build_from_inputs(
             scope: "pplns",
         },
         &mut conn,
-        crate::window::snapshot_key_for,
         config.snapshot_ttl_secs,
     )
     .await?;
@@ -276,6 +282,57 @@ fn open_balance_rows_to_balance_map(rows: &[PplnsBalanceRow]) -> HashMap<Address
         out.insert(row.address.clone(), row.balance_sats);
     }
     out
+}
+
+/// Build, then persist the settlement inputs under the fingerprint. A failed
+/// snapshot write does not fail the build: it costs a manual reprocess if a
+/// block lands, a missing job costs every miner.
+async fn build_and_snapshot(
+    req: BuildRequest<'_>,
+    conn: &mut redis::aio::ConnectionManager,
+    ttl_secs: u32,
+) -> Result<BuiltDistribution, WeightBuildError> {
+    let distribution = sanitize_and_build(req)?;
+
+    // Settlement books `claim(T_actual) − paid` from the real coinbase, so one
+    // snapshot serves every job built from this distribution, JDC jobs included.
+    let snapshot = StoredWeightSnapshot::from_distribution(&distribution);
+    let key = crate::window::snapshot_key_for(&distribution.fingerprint);
+    let bookable = write_with_retry(conn, &key, &snapshot, ttl_secs).await;
+
+    Ok(BuiltDistribution {
+        distribution,
+        bookable,
+    })
+}
+
+async fn write_with_retry(
+    conn: &mut redis::aio::ConnectionManager,
+    key: &str,
+    snapshot: &StoredWeightSnapshot,
+    ttl_secs: u32,
+) -> bool {
+    let mut attempt = 0;
+    loop {
+        match write_weight_snapshot(conn, key, snapshot, ttl_secs).await {
+            Ok(()) => return true,
+            Err(err) if attempt < SNAPSHOT_WRITE_RETRIES => {
+                warn!(%err, attempt, "pplns: snapshot write failed — retrying");
+                attempt += 1;
+                tokio::time::sleep(SNAPSHOT_WRITE_BACKOFF * attempt).await;
+            }
+            Err(err) => {
+                warn!(
+                    %err,
+                    key,
+                    "pplns: snapshot write failed after retries — the coinbase distribution \
+                     stands, but a block found on this job cannot be booked automatically and \
+                     needs operator reprocessing from the block's own coinbase"
+                );
+                return false;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

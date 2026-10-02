@@ -2,14 +2,12 @@
 
 //! Build and ledger primitives shared by the PPLNS and Group-Solo payout
 //! engines, so the weight build, the decoded coinbase and the DB row-type
-//! strings stay identical for both. The settlement snapshot (wire format stable
-//! across deploys) is PPLNS's alone: Group-Solo books from the coinbase.
+//! strings stay identical for both.
 
 pub mod actual;
 pub mod budget;
 pub mod build;
 pub mod ledger;
-pub mod snapshot;
 
 use std::collections::HashMap;
 
@@ -18,13 +16,8 @@ use tracing::warn;
 
 pub use actual::ActualCoinbase;
 pub use budget::{read_coinbase_budget, write_coinbase_budget, PPLNS_COINBASE_BUDGET_KEY};
-pub use build::{build_and_snapshot, sanitize_and_build, BuildRequest, BuiltDistribution};
+pub use build::{sanitize_and_build, BuildRequest, BuiltDistribution};
 pub use ledger::{ApplyDistributionResult, LedgerError, PayoutRowType};
-pub use snapshot::{
-    delete_snapshot, read_weight_snapshot, read_weight_snapshot_with_retry,
-    resolve_snapshot_for_block_found, write_weight_snapshot, StoredWeightSnapshot,
-    WeightSnapshotEntry,
-};
 
 /// Redis per-address share aggregate (`address → diff-1 sum`) into the
 /// validated distribution input. An invalid address is skipped with a warn

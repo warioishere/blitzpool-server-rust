@@ -12,24 +12,22 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-# Domain types shared by the coinbase distribution snapshot.
+# Domain types of the shared weight build.
 bp-common = { workspace = true }
 bp-pplns = { workspace = true }
-# The one shared extras/claim projection both the build and the
-# settlement read a weight snapshot through.
 bp-share = { workspace = true }
 bitcoin = { workspace = true }
 # DbError, wrapped by the shared LedgerError.
 bp-db = { workspace = true }
 
-# Serde derives so the snapshot can ride inside the block-found event.
+# Serde derives so the decoded coinbase can ride inside the block-found event.
 serde = { workspace = true }
-# Redis-backed snapshot persistence.
+# Redis-backed coinbase-budget persistence.
 redis = { workspace = true }
 # sqlx::Error variant on the shared LedgerError.
 sqlx = { workspace = true }
 
-# Backoff between snapshot-write retries.
+# Timeout on the coinbase-budget read.
 tokio = { workspace = true, features = ["time"] }
 
 # Observability + errors
@@ -39,7 +37,3 @@ thiserror = { workspace = true }
 [dev-dependencies]
 # Async test runtime for the Redis-backed budget persistence tests.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
-# Round-trips the pending-block JSON blob, to pin that a snapshot still
-# carrying the retired finder bonus is refused rather than silently
-# stripped of it.
-serde_json = { workspace = true }
