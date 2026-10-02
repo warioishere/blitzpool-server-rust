@@ -198,6 +198,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-channel"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "924ed96dd52d1b75e9c1a3e6275715fd320f5f9439fb5a4a11fa51f4221158d2"
+dependencies = [
+ "concurrent-queue",
+ "event-listener-strategy",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "async-compression"
 version = "0.4.50"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -468,7 +480,7 @@ name = "bitcoin_core_sv2"
 version = "0.6.0"
 source = "git+https://github.com/stratum-mining/sv2-apps.git?tag=v0.8.0#7f49074357e54da4f5b13acfcc29dc3cbb9e541f"
 dependencies = [
- "async-channel",
+ "async-channel 1.9.0",
  "bitcoin-capnp-types 0.1.2",
  "bitcoin-capnp-types 0.2.1",
  "stratum-core",
@@ -1148,7 +1160,7 @@ dependencies = [
 name = "bp-template-distribution"
 version = "2.3.9"
 dependencies = [
- "async-channel",
+ "async-channel 2.5.0",
  "bitcoin_core_sv2",
  "bp-regtest-harness",
  "bp-share",
@@ -2850,7 +2862,7 @@ name = "jd_server_sv2"
 version = "0.6.0"
 source = "git+https://github.com/stratum-mining/sv2-apps.git?tag=v0.8.0#7f49074357e54da4f5b13acfcc29dc3cbb9e541f"
 dependencies = [
- "async-channel",
+ "async-channel 1.9.0",
  "async-trait",
  "hotpath",
  "serde",
@@ -4803,7 +4815,7 @@ name = "stratum-apps"
 version = "0.8.0"
 source = "git+https://github.com/stratum-mining/sv2-apps.git?tag=v0.8.0#7f49074357e54da4f5b13acfcc29dc3cbb9e541f"
 dependencies = [
- "async-channel",
+ "async-channel 1.9.0",
  "bitcoin_core_sv2",
  "bs58 0.4.0",
  "config",
