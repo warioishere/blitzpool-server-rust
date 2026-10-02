@@ -57,7 +57,7 @@ license = "AGPL-3.0-or-later"
 # clients). The TS port hit unbounded RSS growth on glibc and only
 # stabilised under jemalloc; we adopt the same allocator preemptively
 # so we don't re-discover the same fragmentation problem in production.
-tikv-jemallocator = "0.6"
+tikv-jemallocator = "0.7"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -111,7 +111,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 axum = "0.7"
 
 # Typed config file (bp-config / bin/blitzpool).
-toml = "0.8"
+toml = "1"
 
 # CLI argument parsing for the binary.
 clap = { version = "4", features = ["derive"] }
@@ -119,7 +119,7 @@ clap = { version = "4", features = ["derive"] }
 # Metrics — `metrics` facade + Prometheus exporter (text-format /metrics
 # endpoint with histogram-bucket support). Used by `bp-metrics`.
 metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "compression-br", "compression-gzip", "compression-deflate"] }
 
@@ -133,7 +133,7 @@ bs58 = { version = "0.5", features = ["check"] }
 
 # Hashing + big integer arithmetic (pure math, no Bitcoin-crate dep needed)
 sha2 = { version = "0.10", features = ["asm"] }
-num-bigint = "0.4"
+num-bigint = "0.5"
 num-traits = "0.2"
 
 # CSPRNG byte fill — used for admin/invitation token generation in
