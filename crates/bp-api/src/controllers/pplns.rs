@@ -254,11 +254,13 @@ struct FeesResponse {
     fee_percent: f64,
     fee_address: Option<String>,
     coinbase_weight_budget: u32,
-    /// Shared `[group_fees]` lane percent (Group-Solo + Blockparty).
-    /// Falls back to the PPLNS `fee_percent` when no group fee is wired.
-    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
-    group_fee_percent: f64,
+    /// Group-Solo fee from `[group_solo]`; `null` while Group-Solo is off.
+    #[serde(serialize_with = "crate::time_range::ser_opt_f64_jsnum")]
+    group_fee_percent: Option<f64>,
     group_fee_address: Option<String>,
+    /// Blockparty fee from `[blockparty]`; `null` while Blockparty is off.
+    #[serde(serialize_with = "crate::time_range::ser_opt_f64_jsnum")]
+    blockparty_fee_percent: Option<f64>,
     dust_limit_sats: u64,
     min_payout_sats: i64,
     coinbase_base_weight: u32,
@@ -282,11 +284,7 @@ async fn fees(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
             TtlKind::PplnsFees,
             async move {
                 let engine = require_pplns(&s)?;
-                let group_solo = s
-                    .group_solo
-                    .as_ref()
-                    .ok_or(ApiError::Unavailable("group-solo not wired"))?
-                    .config();
+                let group_solo = s.group_solo.as_ref().map(|g| g.config());
                 let cfg = engine.reader().fee_config();
                 let raw_cfg = engine.config();
                 let coinbase_weight_budget =
@@ -301,14 +299,14 @@ async fn fees(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
                     fee_percent: cfg.fee_percent,
                     fee_address: cfg.fee_address,
                     coinbase_weight_budget,
-                    // The Group-Solo engine's own resolved lane
-                    // (`[group_fees]`, else `[pplns]`); Blockparty resolves
-                    // the same way.
-                    group_fee_percent: group_solo.fee_percent,
+                    group_fee_percent: group_solo.map(|g| g.fee_percent),
                     group_fee_address: group_solo
-                        .fee_address
-                        .as_ref()
+                        .and_then(|g| g.fee_address.as_ref())
                         .map(|a| a.as_str().to_string()),
+                    blockparty_fee_percent: s
+                        .blockparty
+                        .as_ref()
+                        .map(|b| b.payouts().fee_percent()),
                     dust_limit_sats: DUST_LIMIT_SATS,
                     min_payout_sats: cfg.min_payout_sats,
                     coinbase_base_weight: COINBASE_BASE_WEIGHT,

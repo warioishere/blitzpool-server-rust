@@ -45,6 +45,11 @@ impl BlockpartyPayouts {
         Self { pool, config }
     }
 
+    /// The pool fee every Blockparty coinbase pays, in percent.
+    pub fn fee_percent(&self) -> f64 {
+        self.config.fee_percent
+    }
+
     /// Coinbase distribution over the current roster; `Ok(None)` when the
     /// group does not exist.
     pub async fn build_payouts(
