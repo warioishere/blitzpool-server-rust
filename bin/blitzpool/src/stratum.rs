@@ -160,6 +160,12 @@ pub(crate) async fn spawn(
         settle.clone(),
     )?;
     let noise_config = stratum_v2::build_noise_config(cfg)?;
+    // SV2 miners and JD clients pin this key; this line is where an operator
+    // reads it.
+    info!(
+        authority_pubkey = %noise_config.authority_pub(),
+        "stratum-v2: authority public key"
+    );
     // Warm the customer-extranonce cache before the servers start serving, then
     // it self-refreshes off PG. Shared across every SV2 port.
     let custom_extranonce: Arc<dyn bp_stratum_v2::hooks::CustomExtranonceSource> =

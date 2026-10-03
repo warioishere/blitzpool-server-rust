@@ -347,6 +347,20 @@ mod tests {
         assert_ne!((*noise.authority_pub()).into_bytes(), [0u8; 32]);
     }
 
+    /// The logged public key is the base58check form SV2 miners and JD
+    /// clients are configured with; the pair is the SV2 reference dev key.
+    #[test]
+    fn the_authority_public_key_displays_as_miners_configure_it() {
+        let cfg = min_cfg_with_sv2(Some(
+            "65995eb19631f478a46ffa5cf1e545091efe950eaeac7482ffdc06eb6a89f697".to_string(),
+        ));
+        let noise = build_noise_config(&cfg).expect("must parse");
+        assert_eq!(
+            noise.authority_pub().to_string(),
+            "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
+        );
+    }
+
     #[test]
     fn build_noise_config_rejects_missing_privkey() {
         let cfg = min_cfg_with_sv2(None);
