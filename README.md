@@ -114,6 +114,19 @@ Routing priority on connect: **explicit PPLNS port → Blockparty admin address 
 
 ---
 
+## Getting started
+
+**[`DEPLOYMENT.md`](DEPLOYMENT.md)** sets up a working Solo pool with Docker
+Compose from [`simple-setup/`](simple-setup/README.md): the only prerequisite
+is Bitcoin Core 31 with its IPC socket, and the compose file can run that node
+for you. [`full-setup/`](full-setup/README.md) is the four-process layout for
+redeploying single processes. Start from
+[`blitzpool.example.toml`](blitzpool.example.toml) (Solo) and add sections from
+[`blitzpool.full.example.toml`](blitzpool.full.example.toml) to switch on PPLNS,
+Group-Solo or Blockparty.
+
+---
+
 ## Configuration
 
 Configuration is **TOML-first** (parsed by `bp-config`), grouped into sections — the most relevant:
@@ -122,10 +135,10 @@ Configuration is **TOML-first** (parsed by `bp-config`), grouped into sections �
 |---|---|
 | `[tdp].socket_path` | bitcoin-core IPC socket for the template streams |
 | `[pplns].coinbase_weight_budget` | PPLNS budget **floor** (default 50 000 WU); autoscaler grows from here |
-| `[coinbase_autoscale]` | `max_weight_budget` (ceiling), `up/down_threshold`, `step_factor`, debounce, cooldown |
-| `[group_fees].coinbase_weight_budget` | Group-Solo + Blockparty fixed budget (default 10 000 WU ≈ 50 members) |
-| `[group_fees].address` / `.percent` | Shared Group-Solo/Blockparty fee lane (falls back to `[pplns]` fee) |
-| `[solo].coinbase_weight_budget` / `[blockparty].coinbase_weight_budget` | Per-mode fixed alt-stream reservations |
+| `[pplns.coinbase_autoscale]` | `max_weight_budget` (ceiling), `up/down_threshold`, `step_factor`, debounce, cooldown |
+| `[pplns]` / `[group_solo]` / `[blockparty]` | Presence switches the mode on; absent means off. Solo is always on |
+| `[solo]` / `[pplns]` / `[group_solo]` / `[blockparty]` `.fee_address` + `.fee_percent` | Each mode's own pool fee (optional on Solo) |
+| `[solo]` / `[group_solo]` / `[blockparty]` `.coinbase_weight_budget` | Per-mode fixed alt-stream reservations (Group-Solo default 10 000 WU ≈ 50 members) |
 | `--roles` / `BLITZPOOL_ROLES` | Deployment topology override (front/api/payout/stats/notify) |
 
 Schema is applied via **sqlx migrations run at boot** (advisory-locked + idempotent, so every process in a split can run them safely). Postgres + Redis are required — there is no SQLite path. Upstream SV2-stack dependency pins and bump strategy live in [`UPSTREAM_DEPS.md`](UPSTREAM_DEPS.md).
@@ -149,13 +162,13 @@ cargo test --workspace           # unit + integration tests (~40% of the tree is
 cargo clippy --workspace         # lints
 ```
 
-Regtest-driven integration tests (TDP/IPC + RPC paths) spin up bitcoin-core via the in-tree `bp-regtest-harness`; the `bp-template-distribution` and `bp-job-declaration` test suites are the bitcoin-core compatibility canaries. A regtest deploy helper lives at `build_and_deploy_regtest.sh`, and the split-validation runbook at [`full-setup/REGTEST-SPLIT-VALIDATION.md`](full-setup/REGTEST-SPLIT-VALIDATION.md).
+Regtest-driven integration tests (TDP/IPC + RPC paths) spin up bitcoin-core via the in-tree `bp-regtest-harness`; the `bp-template-distribution` test suite is the bitcoin-core compatibility canary. The split-validation runbook lives at [`full-setup/REGTEST-SPLIT-VALIDATION.md`](full-setup/REGTEST-SPLIT-VALIDATION.md).
 
 ---
 
 ## Tech stack
 
-Rust workspace of **37 crates** (`bp-*` + the `blitzpool` binary). Async on **tokio**; HTTP on **axum**; DB on **sqlx** (Postgres); **Redis** for the share/cache/stream bus. SV2 protocol primitives from the SRI `stratum-core`; bitcoin-core IPC bridge from `sv2-apps` (`bitcoin_core_sv2`) — see [`UPSTREAM_DEPS.md`](UPSTREAM_DEPS.md).
+Rust workspace of **35 library crates** (`bp-*`) plus the `blitzpool` binary. Async on **tokio**; HTTP on **axum**; DB on **sqlx** (Postgres); **Redis** for the share/cache/stream bus. SV2 protocol primitives from the SRI `stratum-core`; bitcoin-core IPC bridge from `sv2-apps` (`bitcoin_core_sv2`) — see [`UPSTREAM_DEPS.md`](UPSTREAM_DEPS.md).
 
 ---
 

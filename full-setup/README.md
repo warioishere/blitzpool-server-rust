@@ -1,5 +1,11 @@
 # blitzpool-rust — docker-compose stack
 
+> **Setting up a new pool? Start with [`../simple-setup/`](../simple-setup/README.md)**
+> and [`../DEPLOYMENT.md`](../DEPLOYMENT.md): two pool processes, an optional
+> bundled node, nothing to prepare. This directory is the four-process
+> layout, for operators who redeploy the API, payout and notification
+> processes one at a time. Both run every payout mode.
+
 Single `docker-compose.yml`. Profiles select the bitcoin network (mainnet /
 testnet4 / regtest); one shared postgres + valkey back every network. The
 pool itself runs as **four processes** from one image + one shared config,
@@ -56,14 +62,17 @@ cd full-setup/
 # 1. Create + chown the persistent data dirs (idempotent, safe to re-run).
 ./prepare.sh
 
-# 2. Per network, edit the matching toml in ../.local/ (gitignored).
+# 2. Per network, create the matching toml in ../.local/ (gitignored) from
+#    ../blitzpool.example.toml:
 #    mainnet  → ../.local/blitzpool.toml
 #    testnet4 → ../.local/blitzpool-testnet4.toml
 #    regtest  → ../.local/blitzpool-regtest.toml
 #
-# A regtest example with sane defaults already lives at the path above.
-# Copy + adapt for testnet4 / mainnet as needed. Keep `roles` OUT of the
-# toml — BLITZPOOL_ROLES in the compose file decides each process's role.
+# The host names match the example (bitcoin, postgres, redis, and
+# [tdp] socket_path = "/ipc/node.sock"). RPC user and password are
+# bitcoin / bitcoin from docker/bitcoin/<network>/bitcoin.conf, Postgres
+# is postgres / postgres unless .env overrides it. Keep `roles` OUT of the toml —
+# BLITZPOOL_ROLES in the compose file decides each process's role.
 
 # 3. Bring up exactly one network (starts infra + the four pool processes).
 #    mainnet uses ../.local/blitzpool.toml by default:

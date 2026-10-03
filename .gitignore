@@ -49,3 +49,8 @@ CHECKLIST.md
 
 # Local agent instructions — never publish
 CLAUDE.md
+
+# ── simple-setup/ (DEPLOYMENT.md) ─────────────────────────────────────────
+# The operator's config and secrets; the examples are committed.
+simple-setup/blitzpool.toml
+simple-setup/.env

@@ -1,0 +1,149 @@
+# Blitzpool: two pool processes, Postgres and Valkey, and optionally a
+# Bitcoin Core 31 node. See DEPLOYMENT.md in the repo root.
+#
+#   cp ../blitzpool.example.toml blitzpool.toml   # then edit it
+#   docker compose --profile bitcoin up -d --build   # with the bundled node
+#   docker compose up -d --build                     # with your own node (needs .env)
+#
+# A .env next to this file is optional; .env.example lists what it can set.
+#
+# The pool always runs as two processes from one image and one config:
+#   front  holds the miners (Stratum V1/V2, block submit) and serves the API
+#   back   books payouts, writes statistics and sends notifications
+# They talk through Redis streams, so `back` can restart without dropping a
+# miner. They must not be merged into one process.
+
+name: blitzpool
+
+x-pool: &pool
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  image: blitzpool:latest
+  restart: unless-stopped
+  stop_grace_period: 30s
+  volumes:
+    - "./blitzpool.toml:/app/blitzpool.toml:ro"
+  # Lets the pool reach a node running on the Docker host as
+  # http://host.docker.internal.
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "3"
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  front:
+    <<: *pool
+    environment:
+      BLITZPOOL_ROLES: front,api
+      RUST_LOG: ${RUST_LOG:-info}
+    # Each miner is one socket; the Docker default of 1024 is too low.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "3333:3333"    # Solo
+      - "3339:3339"    # Solo, high difficulty
+      - "3334:3334"    # HTTP API
+      # With [pplns] enabled, also publish its ports:
+      # - "3340:3340"
+      # - "3349:3349"
+      # With [sv2] jdp_enabled, publish jdp_port:
+      # - "3335:3335"
+    volumes:
+      - "./blitzpool.toml:/app/blitzpool.toml:ro"
+      # The node's IPC socket directory. Default: the volume the bundled node
+      # writes to. Your own node: set BITCOIN_IPC_DIR in .env to the host
+      # directory that holds node.sock.
+      - "${BITCOIN_IPC_DIR:-bitcoin-ipc}:/ipc"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      bitcoin:
+        condition: service_started
+        required: false
+
+  back:
+    <<: *pool
+    environment:
+      BLITZPOOL_ROLES: payout,stats,notify
+      RUST_LOG: ${RUST_LOG:-info}
+
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    stop_grace_period: 30s
+    # No published port: only the pool containers on this compose network
+    # reach the database, which is why a default password is acceptable here.
+    # Publishing the port needs a real PG_PASSWORD (and the same value in
+    # blitzpool.toml) first.
+    environment:
+      POSTGRES_DB: blitzpool
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-postgres}
+    healthcheck:
+      test: ["CMD-SHELL", "cd / && pg_isready -U postgres -d blitzpool"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - "pg-data:/var/lib/postgresql"
+
+  redis:
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    stop_grace_period: 30s
+    # Append-only file: the pool keeps its payout windows and parked blocks
+    # here. volatile-lru evicts only keys with a TTL, so state without one
+    # (parked blocks awaiting confirmation) is never evicted.
+    command: >
+      valkey-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory ${REDIS_MAX_MEMORY:-1gb}
+      --maxmemory-policy volatile-lru
+    healthcheck:
+      test: ["CMD-SHELL", "cd / && valkey-cli ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - "redis-data:/data"
+
+  # Optional Bitcoin Core 31 node: `docker compose --profile bitcoin up`.
+  # Mainnet needs a full initial sync (days) before the pool can serve work.
+  bitcoin:
+    profiles: ["bitcoin"]
+    build:
+      context: ../full-setup/docker/bitcoin/mainnet
+    restart: unless-stopped
+    stop_grace_period: 60s
+    command:
+      - "-printtoconsole"
+      - "-datadir=/app/data"
+      - "-conf=/app/bitcoin.conf"
+      - "-chain=${BITCOIN_CHAIN:-main}"
+      - "-ipcbind=unix:/ipc/node.sock"
+    ports:
+      - "8333:8333"    # P2P (mainnet)
+    volumes:
+      - "./bitcoin.conf:/app/bitcoin.conf:ro"
+      - "bitcoin-data:/app/data"
+      - "bitcoin-ipc:/ipc"
+
+volumes:
+  pg-data:
+  redis-data:
+  bitcoin-data:
+  bitcoin-ipc:

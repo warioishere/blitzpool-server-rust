@@ -27,3 +27,7 @@ full-setup/blitzpool.toml
 full-setup/blitzpool-regtest.toml
 full-setup/blitzpool-testnet4.toml
 full-setup/.env
+
+# simple-setup/ stack: the operator's config and secrets stay out of the image.
+simple-setup/blitzpool.toml
+simple-setup/.env
