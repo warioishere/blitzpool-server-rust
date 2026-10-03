@@ -180,6 +180,11 @@ async fn create(
     State(state): State<SharedState>,
     Json(body): Json<CreateGroupBody>,
 ) -> Result<(StatusCode, Json<CreateGroupResponse>), ApiError> {
+    // A group created here would route its members to a mode this pool
+    // does not run.
+    if state.group_solo.is_none() {
+        return Err(ApiError::Unavailable("group-solo is disabled"));
+    }
     let svc = require_group_service(&state)?;
     // Immutable, so validated up front.
     let mode = match body.mode.as_deref() {
@@ -1907,6 +1912,32 @@ mod tests {
 
     fn parse_include_decided(s: Option<&str>) -> bool {
         s.map(|v| v == "1" || v == "true").unwrap_or(false)
+    }
+
+    /// Without `[group_solo]` no group can be created: its members would be
+    /// routed to a mode this pool does not run.
+    #[tokio::test]
+    async fn creating_a_group_is_refused_while_group_solo_is_disabled() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1/unused")
+            .expect("lazy pool");
+        let state: SharedState = std::sync::Arc::new(crate::state::AppState::new(pool, "0.0.0"));
+        assert!(
+            state.group_solo.is_none(),
+            "precondition: no Group-Solo engine"
+        );
+        let body = CreateGroupBody {
+            name: "g".into(),
+            creator_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".into(),
+            mode: None,
+        };
+        let Err(err) = create(State(state), Json(body)).await else {
+            panic!("a group was created while Group-Solo is disabled");
+        };
+        assert!(
+            matches!(err, ApiError::Unavailable("group-solo is disabled")),
+            "got {err:?}"
+        );
     }
 
     /// Every group-scoped cache key is dropped by a group mutation; a key

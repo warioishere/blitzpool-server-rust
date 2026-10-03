@@ -43,7 +43,7 @@ use crate::boot::FoundationHandles;
 
 pub(crate) struct EngineHandles {
     pub(crate) pplns: Option<PplnsEngine>,
-    pub(crate) group_solo: GroupSoloEngine,
+    pub(crate) group_solo: Option<GroupSoloEngine>,
     pub(crate) stats: ShareStatsEngineHandle,
     pub(crate) session_persistence: SessionPersistenceEngineHandle,
     pub(crate) mode_gate: Arc<BlitzpoolModeGate>,
@@ -68,6 +68,14 @@ pub(crate) enum EngineError {
     GroupSolo(#[from] bp_group_solo_engine::engine::EngineError),
     #[error("group-solo config invalid: {0}")]
     GroupSoloConfig(#[from] bp_group_solo_engine::config::ConfigError),
+    #[error(
+        "group-solo is disabled (no [group_solo] table in config) but {count} active \
+         group(s) exist; their members would mine as Solo. Add an empty [group_solo] \
+         table to keep them, or dissolve the groups first"
+    )]
+    GroupSoloDisabledWithActiveGroups { count: usize },
+    #[error("group-solo: active-group check failed: {0}")]
+    GroupSoloActiveGroups(#[from] bp_db::DbError),
     #[error("share-stats engine spawn failed: {0}")]
     Stats(#[from] bp_share_stats_sink::error::SinkError),
     #[error("session-persistence engine spawn failed: {0}")]
@@ -117,6 +125,7 @@ pub(crate) async fn spawn(
 
     info!(
         pplns_enabled = pplns.is_some(),
+        group_solo_enabled = group_solo.is_some(),
         read_only,
         roles = ?cfg.effective_roles(),
         "engines ready"
@@ -227,8 +236,20 @@ async fn spawn_group_solo(
     cfg: &AppConfig,
     handles: &FoundationHandles,
     core: bool,
-) -> Result<GroupSoloEngine, EngineError> {
-    let engine_cfg = to_group_solo_engine_config(cfg)?;
+) -> Result<Option<GroupSoloEngine>, EngineError> {
+    let Some(gs_cfg) = cfg.group_solo.as_ref() else {
+        // Switching the mode off must not silently turn existing groups'
+        // members into Solo miners.
+        let active = bp_db::list_active_pplns_groups(handles.db.pool()).await?;
+        if !active.is_empty() {
+            return Err(EngineError::GroupSoloDisabledWithActiveGroups {
+                count: active.len(),
+            });
+        }
+        info!("group-solo: disabled (no [group_solo] table in config)");
+        return Ok(None);
+    };
+    let engine_cfg = to_group_solo_engine_config(gs_cfg, cfg.network)?;
     info!(
         fee_percent = engine_cfg.fee_percent,
         core, "group-solo: spawning engine"
@@ -240,34 +261,34 @@ async fn spawn_group_solo(
     } else {
         GroupSoloEngine::spawn(engine_cfg, redis, pool).await?
     };
-    Ok(engine)
+    Ok(Some(engine))
 }
 
-fn to_group_solo_engine_config(cfg: &AppConfig) -> Result<GroupSoloEngineConfig, EngineError> {
-    let (fee_address, fee_percent) = crate::blockparty_service::resolve_group_fees(cfg)
-        .map_err(|(raw, err)| EngineError::InvalidAddress(raw, err))?;
+fn to_group_solo_engine_config(
+    cfg: &bp_config::GroupSoloConfig,
+    network: bp_config::Network,
+) -> Result<GroupSoloEngineConfig, EngineError> {
     let base = GroupSoloEngineConfig {
-        fee_address,
-        fee_percent,
+        fee_address: Some(mode_fee_address(&cfg.fee_address)?),
+        fee_percent: cfg.fee_percent,
         // Must equal the budget boot reserves on the Group-Solo TDP stream, or
         // the coinbase outgrows Core's reservation and the block is rejected.
-        coinbase_weight_budget: cfg.group_fees.coinbase_weight_budget,
-        subsidy_halving_interval: subsidy_halving_interval(cfg.network),
-        // One floor shared with PPLNS. Not `unwrap_or_default()`: `Sats(0)`
-        // fails validation.
-        min_payout_sats: cfg.pplns.as_ref().map_or_else(
-            || GroupSoloEngineConfig::default().min_payout_sats,
-            |p| Sats(p.min_payout_sats),
-        ),
+        coinbase_weight_budget: cfg.coinbase_weight_budget,
+        subsidy_halving_interval: subsidy_halving_interval(network),
+        min_payout_sats: Sats(cfg.min_payout_sats),
     };
     let validated = base.try_new()?;
     Ok(validated)
 }
 
+/// A mode section's required fee address.
+fn mode_fee_address(raw: &str) -> Result<AddressId, EngineError> {
+    AddressId::new(raw.trim().to_string())
+        .map_err(|e| EngineError::InvalidAddress(raw.to_string(), e))
+}
+
 // ─── Blockparty payouts ──────────────────────────────────────────
 
-/// Fees from the same resolver as Group-Solo, so one config knob applies to
-/// both.
 fn blockparty_payouts(
     cfg: &AppConfig,
     handles: &FoundationHandles,
@@ -276,13 +297,11 @@ fn blockparty_payouts(
         info!("blockparty: feature disabled (no `[blockparty]` config block)");
         return Ok(None);
     };
-    let (fee_address, fee_percent) = crate::blockparty_service::resolve_group_fees(cfg)
-        .map_err(|(raw, err)| EngineError::InvalidAddress(raw, err))?;
     Ok(Some(BlockpartyPayouts::new(
         handles.db.pool().clone(),
         BlockpartyPayoutConfig {
-            fee_address,
-            fee_percent,
+            fee_address: Some(mode_fee_address(&bp_cfg.fee_address)?),
+            fee_percent: bp_cfg.fee_percent,
             min_payout_sats: Sats(bp_cfg.min_payout_sats),
         },
     )))
@@ -525,7 +544,7 @@ pub(crate) struct AcceptedSinkSet {
 
 pub(crate) fn build_accepted_sinks(
     pplns: Option<&PplnsEngine>,
-    group_solo: &GroupSoloEngine,
+    group_solo: Option<&GroupSoloEngine>,
     stats: &ShareStatsEngineHandle,
     session_persistence: &SessionPersistenceEngineHandle,
     redis: redis::aio::ConnectionManager,
@@ -534,9 +553,9 @@ pub(crate) fn build_accepted_sinks(
     if let Some(p) = pplns {
         money.push(Arc::new(PplnsAcceptedShareSink::new(p.clone())));
     }
-    money.push(Arc::new(GroupSoloAcceptedShareSink::new(
-        group_solo.clone(),
-    )));
+    if let Some(g) = group_solo {
+        money.push(Arc::new(GroupSoloAcceptedShareSink::new(g.clone())));
+    }
 
     let aux: Vec<Arc<dyn SharedAcceptedShareSink>> = vec![
         Arc::new(ShareStatsAcceptedSink::new(stats.accumulators())),
@@ -568,13 +587,15 @@ fn build_producing_composite(
 }
 
 pub(crate) fn build_rejected_sinks(
-    group_solo: &GroupSoloEngine,
+    group_solo: Option<&GroupSoloEngine>,
     stats: &ShareStatsEngineHandle,
 ) -> Vec<Arc<dyn SharedRejectedShareSink>> {
-    vec![
-        Arc::new(GroupSoloRejectedShareSink::new(group_solo.clone())),
-        Arc::new(ShareStatsRejectedSink::new(stats.accumulators())),
-    ]
+    let mut sinks: Vec<Arc<dyn SharedRejectedShareSink>> =
+        vec![Arc::new(ShareStatsRejectedSink::new(stats.accumulators()))];
+    if let Some(g) = group_solo {
+        sinks.push(Arc::new(GroupSoloRejectedShareSink::new(g.clone())));
+    }
+    sinks
 }
 
 fn build_producing_rejected_composite(
@@ -680,30 +701,17 @@ mod tests {
         high_diff_target_shares_per_minute = 6
         difficulty_check_interval_ms = 60000
 
-        [group_fees]
-        address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
-        percent = 1.0
+        [group_solo]
+        fee_address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        fee_percent = 1.0
+        coinbase_weight_budget = 12000
+        min_payout_sats = 7000
     "#;
 
-    /// Pins that without `[pplns]` `min_payout_sats` is the engine default,
-    /// not the invalid `Sats(0)`.
+    /// Group-Solo takes every knob from `[group_solo]`, and a `[pplns]`
+    /// section with other values changes none of them.
     #[test]
-    fn a_pool_without_pplns_still_builds_its_group_solo_config() {
-        let cfg: bp_config::AppConfig =
-            toml::from_str(NO_PPLNS_CFG).expect("parse config without [pplns]");
-        assert!(cfg.pplns.is_none(), "the fixture must not define [pplns]");
-
-        let built = to_group_solo_engine_config(&cfg).expect("must build without [pplns]");
-        assert_eq!(
-            built.min_payout_sats,
-            GroupSoloEngineConfig::default().min_payout_sats,
-            "the engine default applies, not Sats(0)"
-        );
-    }
-
-    /// Pins that `[pplns]`'s `min_payout_sats` is shared with Group-Solo.
-    #[test]
-    fn pplns_min_payout_is_shared_with_group_solo() {
+    fn group_solo_takes_its_config_from_its_own_section() {
         let cfg: bp_config::AppConfig = toml::from_str(&format!(
             "{NO_PPLNS_CFG}\n\
              [pplns]\n\
@@ -711,16 +719,23 @@ mod tests {
              high_diff_port = 3349\n\
              start_difficulty = 5000\n\
              target_shares_per_minute = 12\n\
-             fee_address = \"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\"\n\
+             fee_address = \"bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq\"\n\
              fee_percent = 1.5\n\
              coinbase_weight_budget = 35000\n\
              min_difficulty = 500\n\
              min_payout_sats = 12345\n"
         ))
-        .expect("parse config with [pplns]");
+        .expect("parse config");
+        let gs = cfg.group_solo.as_ref().expect("fixture enables Group-Solo");
 
-        let built = to_group_solo_engine_config(&cfg).expect("build");
-        assert_eq!(built.min_payout_sats, Sats(12_345));
+        let built = to_group_solo_engine_config(gs, cfg.network).expect("build");
+        assert_eq!(
+            built.fee_address.as_ref().map(|a| a.as_str()),
+            Some("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4")
+        );
+        assert_eq!(built.fee_percent, 1.0);
+        assert_eq!(built.coinbase_weight_budget, 12_000);
+        assert_eq!(built.min_payout_sats, Sats(7_000));
     }
 
     // ── CompositeAcceptedShareSink: ArcSwap fan-out list ─────────────

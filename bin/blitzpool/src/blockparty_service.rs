@@ -104,40 +104,6 @@ pub(crate) async fn spawn(
     })
 }
 
-/// Resolve the shared Group-Solo + Blockparty fee: `[group_fees]` wins when
-/// set, otherwise the `[pplns]` fee applies, so a config with only a PPLNS
-/// fee needs no separate section. `Err((raw, parse_error))` on a bad address.
-pub(crate) fn resolve_group_fees(
-    cfg: &AppConfig,
-) -> Result<(Option<AddressId>, f64), (String, bp_common::InvalidAddressError)> {
-    let raw_address = cfg
-        .group_fees
-        .address
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .or_else(|| {
-            cfg.pplns
-                .as_ref()
-                .map(|p| p.fee_address.trim().to_owned())
-                .filter(|s| !s.is_empty())
-        });
-    let address = match raw_address {
-        Some(raw) => match AddressId::new(raw.clone()) {
-            Ok(a) => Some(a),
-            Err(e) => return Err((raw, e)),
-        },
-        None => None,
-    };
-    let percent = cfg
-        .group_fees
-        .percent
-        .or_else(|| cfg.pplns.as_ref().map(|p| p.fee_percent))
-        .unwrap_or(0.0);
-    Ok((address, percent))
-}
-
 /// Calls `on_share_accepted` for every Blockparty share: the first promotes
 /// READY → ACTIVE, later ones refresh `lastShareAt` (the dissolve-cooldown
 /// gate). Reads the producer-stamped `share.mode`, so it needs no mode gate.

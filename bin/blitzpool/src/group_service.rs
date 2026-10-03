@@ -7,7 +7,6 @@
 use std::sync::Arc;
 
 use bp_group_mgmt_engine::{GroupService, GroupServiceError};
-use bp_group_solo_engine::engine::GroupSoloEngine;
 use bp_pplns::max_coinbase_outputs;
 use thiserror::Error;
 use tracing::info;
@@ -35,12 +34,11 @@ pub(crate) struct SharedGroupService {
 pub(crate) async fn spawn(
     foundation: &FoundationHandles,
     production_hooks: &ProductionHooks,
-    group_solo: &GroupSoloEngine,
+    group_solo_coinbase_weight_budget: u32,
 ) -> Result<SharedGroupService, GroupServiceSpawnError> {
-    let cfg = group_solo.config();
-    let coinbase_max_members = max_coinbase_outputs(cfg.coinbase_weight_budget);
+    let coinbase_max_members = max_coinbase_outputs(group_solo_coinbase_weight_budget);
     info!(
-        coinbase_weight_budget = cfg.coinbase_weight_budget,
+        coinbase_weight_budget = group_solo_coinbase_weight_budget,
         coinbase_max_members,
         "group-service: group member ceiling derived from the group-solo coinbase budget"
     );

@@ -120,10 +120,7 @@ pub(crate) async fn spawn(
         engines.mode_gate.clone(),
         engines.pplns.clone(),
         engines.group_solo.clone(),
-        crate::payout_resolver::SoloFeeConfig {
-            dev_fee_address: cfg.solo.dev_fee_address.clone(),
-            dev_fee_percent: cfg.solo.dev_fee_percent.unwrap_or(0.0),
-        },
+        crate::payout_resolver::solo_fee_config(cfg),
         membership.blockparty_service(),
     ));
     let sv1_resolver: Arc<dyn bp_stratum_v1::PayoutResolver> = production_resolver.clone();

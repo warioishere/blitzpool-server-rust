@@ -87,7 +87,7 @@ fn build_app_state(
     ));
 
     let pplns_arc = engines.pplns.clone().map(Arc::new);
-    let group_solo_arc = Some(Arc::new(engines.group_solo.clone()));
+    let group_solo_arc = engines.group_solo.clone().map(Arc::new);
     let bitcoin_rpc_arc = Some(Arc::new(foundation.bitcoin_rpc.clone()));
     let tdp_clone = foundation.tdp.clone();
     let geoip_arc = foundation.geoip.clone();
@@ -117,12 +117,7 @@ fn build_app_state(
         start_time: chrono::Utc::now(),
         network: crate::boot::bitcoin_network(cfg.network),
         pool_identifier: cfg.pool_identifier.clone(),
-        // Same values the payout resolver is built with, so the preview
-        // and the real coinbase cannot disagree.
-        solo_fee: bp_mining_job::SoloFeeConfig {
-            dev_fee_address: cfg.solo.dev_fee_address.clone(),
-            dev_fee_percent: cfg.solo.dev_fee_percent.unwrap_or(0.0),
-        },
+        solo_fee: crate::payout_resolver::solo_fee_config(cfg),
         cache: ResponseCache::new(cfg.api.cache.clone()),
     };
     Arc::new(state)

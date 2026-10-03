@@ -1,423 +1,63 @@
-# Blitzpool — Rust port configuration template
+# Blitzpool: a working Solo pool.
 #
-# Copy this file to `.local/blitzpool.toml` (or anywhere outside the
-# repo) and fill in the values for your deployment. `.local/` is
-# gitignored, so secrets stay out of version control.
+# Copy to simple-setup/blitzpool.toml and change every value marked CHANGE-ME.
+# The host names (postgres, redis, bitcoin) match simple-setup/docker-compose.yml;
+# see DEPLOYMENT.md for running without Docker or with your own node.
 #
-# Run with:    cargo run -p blitzpool -- --config .local/blitzpool.toml
+# Solo only: every block pays the miner who found it (minus the optional dev
+# fee). PPLNS, Group-Solo and Blockparty are switched on by adding their
+# sections; blitzpool.full.example.toml shows all of them.
 #
-# Field semantics + defaults are documented in
-# `crates/bp-config/src/lib.rs`. Unknown keys cause a hard load error
-# — typos surface immediately instead of silently falling back to a
-# default.
+# Process roles are not set here: each process gets them from
+# BLITZPOOL_ROLES (the compose file does this) or --roles.
 
-network = "mainnet"               # mainnet | testnet | regtest
+# mainnet | testnet | testnet4 | regtest. Must match the node.
+network = "mainnet"
+# Written into every coinbase scriptSig.
 pool_identifier = "blitzpool"
 
-# Public UI base URL — required when SMTP is configured (used to
-# assemble invitation + email-verification links). No trailing slash.
-# pool_base_url = "https://blitzpool.example.com"
-
-# ───────────────────────────────────────────────────────────────
-# Bitcoin Core
-# ───────────────────────────────────────────────────────────────
-
+# JSON-RPC to Bitcoin Core: submitblock fallback, chain reads.
 [bitcoin_rpc]
-url = "http://127.0.0.1"
-user = "bitcoin"
-password = "REPLACE-ME"
-port = 8332
-timeout_ms = 10000
+url = "http://bitcoin"            # bundled node; your own node: http://host.docker.internal
+port = 8332                       # mainnet 8332, testnet4 48332, regtest 18443
+user = "blitzpool"                # rpcuser from bitcoin.conf
+password = "CHANGE-ME"            # rpcpassword from bitcoin.conf
 
-# ───────────────────────────────────────────────────────────────
-# Template-Distribution-Protocol (TDP) — bitcoin-core IPC socket
-# ───────────────────────────────────────────────────────────────
-# The Rust port uses TDP-direkt instead of `getblocktemplate` RPC
-# (memory `project-tdp-direct-architecture`). Configure the IPC
-# socket on the bitcoin-core side and point this at it.
-
+# Block templates come over Bitcoin Core 31's IPC socket (Template
+# Distribution Protocol). The node must run as `bitcoin-node` (not bitcoind)
+# with -ipcbind=unix:<path>; the compose file mounts that socket here.
 [tdp]
-socket_path = "/var/run/bitcoind/bp-tdp.sock"
-# fee_threshold_sats = 1000000
-# min_interval_secs = 1
-# broadcast_capacity = 16
-
-# ───────────────────────────────────────────────────────────────
-# Postgres
-# ───────────────────────────────────────────────────────────────
+socket_path = "/ipc/node.sock"
 
 [database]
-host = "127.0.0.1"
-port = 5432
+host = "postgres"
 user = "postgres"
-password = "REPLACE-ME"
+password = "postgres"             # = PG_PASSWORD in simple-setup/.env, if set there
 database = "blitzpool"
-ssl = false
-pool_size = 10
-acquire_timeout_ms = 60000
-idle_timeout_ms = 10000
-
-# ───────────────────────────────────────────────────────────────
-# Redis
-# ───────────────────────────────────────────────────────────────
 
 [redis]
-host = "127.0.0.1"
-port = 6379
-# password = "REPLACE-ME"
-db = 0
-
-# ───────────────────────────────────────────────────────────────
-# HTTP API (axum)
-# ───────────────────────────────────────────────────────────────
+host = "redis"
 
 [api]
 port = 3334
 
-# Per-endpoint response-cache TTLs (seconds). Defaults shown.
-# Set any value to 0 to disable caching for that endpoint family.
-[api.cache]
-site_info_secs              = 300   # /api/info
-pool_info_secs              = 600   # /api/pool
-core_info_secs              = 60    # /api/info/core
-peer_info_secs              = 60    # /api/info/peers
-chart_secs                  = 60    # /api/info/chart
-shares_secs                 = 60    # /api/info/shares
-workers_secs                = 60    # /api/info/workers
-accepted_secs               = 60    # /api/info/accepted
-rejected_secs               = 60    # /api/info/rejected
-client_block_template_secs  = 60    # /api/client/:address/block-template
-client_info_secs            = 60    # /api/client/:address
-client_chart_secs           = 60    # /api/client/:address/chart
-client_worker_shares_secs   = 60    # /api/client/:address/worker-shares
-client_workers_secs         = 60    # /api/client/:address/workers
-client_accepted_secs        = 60    # /api/client/:address/accepted
-client_rejected_secs        = 60    # /api/client/:address/rejected
-client_worker_group_secs    = 60    # /api/client/:address/:worker
-client_worker_session_secs  = 60    # /api/client/:address/:worker/:session
-
-# PPLNS endpoints
-pplns_root_secs             = 60    # /api/pplns
-pplns_mode_secs             = 60    # /api/pplns/mode/:address
-pplns_status_secs           = 60    # /api/pplns/status
-pplns_fees_secs             = 60    # /api/pplns/fees
-pplns_distribution_secs     = 60    # /api/pplns/distribution
-pplns_chart_secs            = 60    # /api/pplns/chart
-pplns_ledger_secs           = 30    # /api/pplns/ledger (sensitive — short TTL)
-pplns_address_secs          = 60    # /api/pplns/:address
-pplns_address_history_secs  = 60    # /api/pplns/:address/history
-
-# Group endpoints
-group_public_list_secs      = 60    # /api/pplns/groups/public
-group_detail_secs           = 60    # /api/pplns/groups/:id
-group_public_detail_secs    = 60    # /api/pplns/groups/public/:id
-group_hashrate_secs         = 60    # /api/pplns/groups/:id/hashrate
-group_chart_secs            = 60    # /api/pplns/groups/:id/chart
-group_accepted_secs         = 60    # /api/pplns/groups/:id/accepted
-group_rejected_secs         = 60    # /api/pplns/groups/:id/rejected
-group_distribution_secs     = 60    # /api/pplns/groups/:id/distribution
-group_best_difficulty_secs  = 60    # /api/pplns/groups/:id/best-difficulty
-group_history_secs          = 60    # /api/pplns/groups/:id/history
-group_invitations_secs      = 30    # /api/pplns/groups/:id/invitations(/open/active)
-group_join_requests_secs    = 30    # /api/pplns/groups/:id/join-requests + by-address
-
-max_entries                 = 10000 # LRU capacity (all endpoints combined)
-
-# ───────────────────────────────────────────────────────────────
-# Stratum V1 (solo + high-diff ports)
-# ───────────────────────────────────────────────────────────────
-
+# Both ports serve Stratum V1 and Stratum V2 on the same socket.
 [stratum]
 solo_port = 3333
 solo_start_difficulty = 5000
-solo_high_diff_port = 3339
+solo_high_diff_port = 3339         # for large rigs and rented hashrate
 high_diff_start_difficulty = 1000000
-# How long a retired job is kept for late shares (SV1 and SV2).
-job_retention_ms = 600000
 target_shares_per_minute = 15
 high_diff_target_shares_per_minute = 10
 difficulty_check_interval_ms = 240000
 
-# Vardiff silence easing.
-#
-# Vardiff's only sensor is the arriving share stream, and its rate
-# estimators historically ended their measurement window at the LAST
-# share. A session that went quiet was therefore evaluated against a
-# frozen window forever: the difficulty stayed pinned where the miner
-# could no longer reach it (throttled solar rigs, dropped hashboards,
-# power modes). With this on, the estimators end their window at *now* —
-# elapsed silence lowers the estimate, and the ordinary retarget walks
-# the difficulty down, one halving per doubling of the silence.
-#
-# Built-in bounds (not configurable): descent stops 16x below the rate
-# measured before the silence began (a rig that is GONE parks there
-# instead of sinking to the floor and flooding on return); the first
-# upward retarget after that is capped at 8x, and once a raise has
-# survived a full interval of fresh shares the cap lifts so a genuine
-# hashrate jump is not rationed. Rejected shares count as alive: a miner
-# in a duplicate/stale storm is hashing against a stale job, so its
-# difficulty is held, not eased.
-#
-# THE SAME SWITCH also enables a second, separate intervention: sessions
-# that have never landed a single share. Their difficulty rests purely on
-# a declared hashrate (or the port's start value), and until now nothing
-# could lower it — the classic estimators have no sensor before the first
-# share, so a miner assigned a target it cannot reach hung there
-# indefinitely. With this on, elapsed silence at a known difficulty bounds
-# the hashrate from above and the difficulty is walked down until the
-# session can be heard. What that adds, on top of the above:
-#
-#   - a session with no share yet descends at most 256x below the highest
-#     difficulty it has ever been assigned (a different, wider bound than
-#     the 16x above — it only has to get the miner from never to
-#     occasionally; the first share hands over to the normal estimator);
-#   - a below-target reject does NOT count as reaching the target, so a
-#     miner that submits but cannot clear the bar is still rescued;
-#   - the descent only runs for sessions that completed the handshake AND
-#     were sent a job, so a template outage does not walk everyone down;
-#   - on SV2, an `UpdateChannel` whose declared hashrate contradicts a long
-#     observed silence is capped to what the silence allows. A channel that
-#     has simply not mined yet is NOT affected — its first declaration is
-#     honoured in full.
-#
-# Off by default — switch it on deliberately (staging first) and watch
-# stratum_difficulty_adjustments_total for the retarget cadence.
-vardiff_silence_easing_enabled = false
-
-# ───────────────────────────────────────────────────────────────
-# Stratum V2 + JDP
-# ───────────────────────────────────────────────────────────────
-
+# Stratum V2 (Noise) identity. Required: the front refuses to start without it.
+# Generate with `openssl rand -hex 32` and keep it: SV2 miners pin the public
+# key derived from it, so a new key means reconfiguring every SV2 miner.
 [sv2]
-# 32-byte secp256k1 private key in hex. Pool identity for the Noise
-# NX handshake — miners pin the public key. Absent ⇒ random per
-# startup (staging only).
-# authority_privkey_hex = "REPLACE-ME-32-byte-hex"
-jdp_enabled = false
-# jdp_port = 3335
-#
-# Hand every declared job to bitcoin-core for a real verdict before
-# accepting it (SV2 JDP/Job Declarator Server). UNSET means declarations
-# are taken on the JD-client's word — the pool then validates nothing.
-# Upstream derives `<dir>/<network>/node.sock` from a data directory, so
-# the path here has to be one that derivation can produce; boot refuses
-# to start on a mismatch rather than validating nothing while the log
-# says otherwise.
-# jdp_validation_socket_path = "/var/lib/bitcoind/node.sock"
-#
-# Resubmit a JDC-found block through `submitblock` as the pool's half of
-# the anti-orphan redundancy. Default `true`. With `false` the JD-client
-# is the sole propagator; the block still travels, the pool just stops
-# contributing the second path.
-# jdp_orphan_submitblock = true
-#
-# Republish cadence in seconds for the ext 0x0003 payout distribution
-# (`SetPayoutDistribution`). Default 60. The publisher also fires
-# immediately on a settlement; this only bounds how stale a published
-# distribution may grow between blocks.
-# jdp_payout_distribution_interval_secs = 60
+authority_privkey_hex = "CHANGE-ME"
 
-# ───────────────────────────────────────────────────────────────
-# Protocol-level debug logging — all flags default `false` because
-# the traces are noisy under production load. Flip to `true` in
-# staging / regtest when diagnosing miner rejection rates or a Noise
-# handshake. NOTE: these gate *which* diagnostics are emitted; the
-# log LEVEL is still controlled by the RUST_LOG env var (a flag at
-# `true` only surfaces if its target is at `debug`, e.g.
-# RUST_LOG=info,bp_stratum_v2=debug). `submit_latency` logs at INFO.
-#   stratum_wire_logs  → SV1/SV2 protocol frame RX/TX dumps
-#   stratum_share_logs → per-share diff + accepted traces
-#                        (SV1 🎯/✅, SV2 🎯/📤 SubmitSharesExtended)
-#   noise_debug        → SV2 Noise handshake byte dumps
-#   submit_latency     → pool-internal submit→ack latency, SV1 + SV2 (INFO)
-# ───────────────────────────────────────────────────────────────
-
-[debug]
-stratum_wire_logs = false
-stratum_share_logs = false
-submit_latency = false
-
-# ───────────────────────────────────────────────────────────────
-# PPLNS mode (optional — leave the whole [pplns] table out to disable)
-# ───────────────────────────────────────────────────────────────
-
-# [pplns]
-# port = 3340
-# high_diff_port = 3349
-# start_difficulty = 5000
-# target_shares_per_minute = 12
-# fee_address = "bc1qYOUR-PPLNS-FEE-ADDRESS"
-# fee_percent = 1.5
-# coinbase_weight_budget = 35000
-# min_difficulty = 500
-# min_payout_sats = 5000
-# Shares per count-bucket for the sliding window (default 10000). The window
-# is stored as per-address buckets of this many shares instead of one entry
-# per share; bigger = less Redis memory + coarser trim, smaller = more memory
-# + finer. Do NOT raise this on a running pool: the bucket id comes from a
-# Redis counter that never resets, so a bigger divisor sends new shares to an
-# id that is already in use, they merge into that older bucket, and they are
-# aged out with it. Raise it only against an empty window (lowering it is
-# harmless).
-# bucket_shares = 10000
-# Daily 03:00 UTC abandoned-pair sweep on pplns_balance.
-# dust_sweep_enabled = true
-#
-# How long a miner may be silent before it counts as gone. ONE knob, TWO
-# effects — check both before changing it:
-#
-#   1. Ledger. A credit whose owner has been silent this long is written off
-#      against an open debit by the nightly sweep.
-#   2. PAYOUT WINDOW. Share buckets older than this are dropped, so a miner
-#      silent this long stops earning a share of the next block.
-#
-# The second one is a payout change, not housekeeping. Setting this to 14
-# does not just clear dust faster, it truncates every miner's PPLNS window to
-# a fortnight. The window's own size rule (window_factor x network difficulty)
-# is a separate, much larger bound; on a pool far below it this value is the
-# only thing that ever drops a bucket.
-# abandoned_balance_days = 90
-
-# Coinbase-budget autoscaler (optional). Leave the sub-table out and the
-# budget stays fixed at coinbase_weight_budget above. Add it and the budget
-# self-adjusts at runtime — no restart — as your payout count grows.
-#   floor   = coinbase_weight_budget (above)
-#   ceiling = max_weight_budget (below, REQUIRED)
-# It steps multiplicatively with hysteresis + debounce + cooldown so it
-# never flaps. The persisted live value (Redis) survives restarts.
-# [pplns.coinbase_autoscale]
-# max_weight_budget = 200000   # hard ceiling in WU (required)
-# enabled = true               # default true
-# up_threshold = 0.85          # step up at ≥85% of the trim threshold
-# down_threshold = 0.50        # step down at ≤50% (rare)
-# step_factor = 1.15           # ×1.15 up / ÷1.15 down
-# up_debounce = 3              # consecutive high samples before stepping up
-# down_debounce = 10           # consecutive low samples before stepping down
-# cooldown_secs = 300          # min seconds between two changes
-# sample_interval_secs = 30    # how often utilization is evaluated
-
-# ───────────────────────────────────────────────────────────────
-# Fee overview
-#
-#   Solo:              [solo]        dev_fee_address / dev_fee_percent
-#   PPLNS:             [pplns]       fee_address / fee_percent
-#   Group-Solo:        [group_fees]  address / percent  (falls back to [pplns])
-#   Blockparty:        [group_fees]  address / percent  (same lane as Group-Solo)
-#
-# All fee percentages are in percent of block reward (1.5 = 1.5 %).
-# Solo dev-fee is optional; all others are required when the mode is enabled.
-# ───────────────────────────────────────────────────────────────
-
-# ───────────────────────────────────────────────────────────────
-# Solo (dev-fee + coinbase weight reservation)
-# ───────────────────────────────────────────────────────────────
-
+# Optional pool fee on Solo blocks. Leave out for 100 % to the finder.
 [solo]
-# dev_fee_address = "bc1qYOUR-SOLO-FEE-ADDRESS"
-# dev_fee_percent = 1.5
-# Coinbase weight reservation (WU) for Solo blocks. Solo pays 1–2 outputs, so
-# this stays tiny — bitcoin-core then packs the rest of the block with fee txs
-# instead of reserving PPLNS-sized space. Default 4000 (core min-clamps to 2000).
-# coinbase_weight_budget = 4000
-
-# ───────────────────────────────────────────────────────────────
-# Shared Group-Solo + Blockparty fee lane (independent from PPLNS).
-# Both fields optional — fall back to `[pplns].fee_address` /
-# `[pplns].fee_percent` so existing PPLNS-only deployments keep
-# working without a config change. New operators should set both.
-# ───────────────────────────────────────────────────────────────
-
-# [group_fees]
-# address = "bc1qYOUR-GROUP-FEE-ADDRESS"
-# percent = 1.5
-# Coinbase weight reservation (WU) for the Group-Solo template stream (a small
-# fixed reservation against the same bitcoind, separate from the autoscaled
-# PPLNS default). Size it to your largest group: ~172 WU/member (Taproot) + one
-# fee output. Default 10000 (~50 members). This value is wired into both the TDP
-# reservation AND the engine's distribution trimmer, so blocks stay valid:
-# members beyond the budget are rolled into the pool fee. Under-sizing costs
-# fairness (trimmed members get 0 sats), not validity.
-# coinbase_weight_budget = 10000
-#
-# This value is ALSO the hard member cap: a group cannot grow past what the
-# budget can pay (`max_coinbase_outputs`), and a join beyond it is refused.
-# Group-Solo keeps no ledger — a member the coinbase cannot pay forfeits the
-# block and their share goes to the pool output — so the cap is what keeps
-# that from ever happening. 10000 WU ≈ 52 members; raise BOTH this and the
-# operator's own `maxMembers` to grow a group.
-
-# ───────────────────────────────────────────────────────────────
-# Blockparty mode (optional — leave the whole [blockparty] table out
-# to disable). Fee address/percent come from [group_fees] above
-# (shared with Group-Solo), NOT from this block.
-# ───────────────────────────────────────────────────────────────
-
-# [blockparty]
-# min_payout_sats = 5000
-# Coinbase weight reservation (WU) for the Blockparty template stream (small
-# fixed reservation, separate from the autoscaled PPLNS default). ~172 WU/member
-# (Taproot) + one fee output. Default 8000 (~40 members). VALIDITY-CRITICAL — a
-# party past this reservation produces a coinbase bitcoin-core will reject.
-# coinbase_weight_budget = 8000
-
-# ───────────────────────────────────────────────────────────────
-# Outbound notifications — each sub-table optional
-# ───────────────────────────────────────────────────────────────
-
-[notifications]
-
-# [notifications.telegram]
-# bot_token = "REPLACE-ME"
-
-# [notifications.ntfy]
-# server_url = "https://ntfy.example.com"
-# # access_token = "REPLACE-ME"
-# # topic_prefix = "blitzpool-"
-
-# [notifications.web_push]
-# vapid_public_key = "REPLACE-ME"
-# vapid_private_key = "REPLACE-ME"
-# vapid_subject = "mailto:admin@example.com"
-
-# [notifications.fcm]
-# service_account_path = ".local/firebase-service-account.json"
-
-# Debounce for miner online/offline notifications. Stratum reports every
-# connect and disconnect; sent verbatim that is one push pair per WiFi
-# hiccup, per rotating rental rig and per pool restart. Nothing is sent
-# on an event — it only schedules a re-check, and at that moment the
-# pool asks the Stratum fronts which devices they actually hold open.
-# So a device that returns inside the grace produces no message at all,
-# and a source with many rigs under one worker name is only reported
-# offline once its last rig is gone.
-#
-# Consequence worth knowing: a genuine outage is reported
-# `offline_grace_secs` late. The defaults below are also the built-in
-# values — the whole block can stay commented out.
-#
-# [notifications.device_status]
-# offline_grace_secs = 300     # must look gone this long before "offline"
-# online_dwell_secs = 90       # must look present this long before "back online"
-# coalesce_window_secs = 300   # min spacing between two messages for one address;
-#                              # transitions inside it leave together as one summary
-# recheck_interval_secs = 300  # how often a settled device is re-checked, so a
-#                              # wrong answer corrects itself instead of standing
-
-# ───────────────────────────────────────────────────────────────
-# SMTP (transactional email — invitations + verification)
-# ───────────────────────────────────────────────────────────────
-
-# [smtp]
-# host = "mail.example.com"
-# port = 587
-# secure = false                    # true ⇒ implicit TLS on 465
-# user = "noreply@example.com"
-# pass = "REPLACE-ME"
-# from = "Blitz Pool <noreply@example.com>"
-
-# Prometheus /metrics exporter. Default off — flip `enabled = true`
-# to bind the listener (default 0.0.0.0:9000). Exposes stream-consumer
-# lag, parked-block depths, vardiff adjustments and lost accepted shares.
-[metrics]
-enabled = false
-# bind = "0.0.0.0:9000"
+# fee_address = "bc1q..."
+# fee_percent = 1.0

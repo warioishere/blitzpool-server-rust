@@ -327,7 +327,7 @@ mod tests {
                 coinbase_autoscale: None,
             }),
             solo: Default::default(),
-            group_fees: Default::default(),
+            group_solo: None,
             blockparty: None,
             notifications: Default::default(),
             smtp: None,

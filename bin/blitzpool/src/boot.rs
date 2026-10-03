@@ -117,11 +117,12 @@ pub(crate) async fn boot(
         let tdp = spawn_tdp_stream(&cfg.tdp, default_constraints, StreamKind::Pplns.as_label())?;
         // Alt streams: small FIXED reservations against the same socket, one
         // per non-PPLNS mode, each sized so its mode's coinbase never
-        // overflows it. Blockparty only when `[blockparty]` is configured.
-        let mut alt_specs: Vec<(StreamKind, u32)> = vec![
-            (StreamKind::Solo, cfg.solo.coinbase_weight_budget),
-            (StreamKind::GroupSolo, cfg.group_fees.coinbase_weight_budget),
-        ];
+        // overflows it. Group-Solo and Blockparty only when configured.
+        let mut alt_specs: Vec<(StreamKind, u32)> =
+            vec![(StreamKind::Solo, cfg.solo.coinbase_weight_budget)];
+        if let Some(gs) = cfg.group_solo.as_ref() {
+            alt_specs.push((StreamKind::GroupSolo, gs.coinbase_weight_budget));
+        }
         if let Some(bp) = cfg.blockparty.as_ref() {
             alt_specs.push((StreamKind::Blockparty, bp.coinbase_weight_budget));
         }

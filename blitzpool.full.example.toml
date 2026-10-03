@@ -1,0 +1,157 @@
+# Blitzpool: every payout mode and integration, documented.
+#
+# Start from blitzpool.example.toml (Solo) and copy in the sections you want.
+# A section that is absent switches its feature off; every key without a
+# comment saying "optional" is required once its section is present.
+# Each payout mode carries all of its own settings, including its fee.
+# Values marked CHANGE-ME must be replaced.
+
+network = "mainnet"
+pool_identifier = "blitzpool"
+# Public URL of the web UI, no trailing slash. Needed for the links in
+# verification and invitation emails (Group-Solo, Blockparty).
+pool_base_url = "https://pool.example.com"
+
+[bitcoin_rpc]
+url = "http://bitcoin"
+port = 8332
+user = "blitzpool"
+password = "CHANGE-ME"
+# timeout_ms = 10000              # optional
+
+[tdp]
+socket_path = "/ipc/node.sock"
+# staleness_threshold_secs = 120  # optional: /api/health reports "stale" after this
+
+[database]
+host = "postgres"
+# port = 5432                     # optional
+user = "postgres"
+password = "CHANGE-ME"
+database = "blitzpool"
+# pool_size = 10                  # optional
+
+[redis]
+host = "redis"
+# port = 6379                     # optional
+# password = "..."                # optional
+
+[api]
+port = 3334
+
+# Optional: per-endpoint response-cache TTLs in seconds. Every key has a
+# default; set only the ones you want to change.
+# [api.cache]
+# site_info_secs = 300
+# pool_info_secs = 600
+
+[stratum]
+solo_port = 3333
+solo_start_difficulty = 5000
+solo_high_diff_port = 3339
+high_diff_start_difficulty = 1000000
+target_shares_per_minute = 15
+high_diff_target_shares_per_minute = 10
+difficulty_check_interval_ms = 240000
+# job_retention_ms = 600000              # optional
+# vardiff_silence_easing_enabled = false # optional
+
+[sv2]
+authority_privkey_hex = "CHANGE-ME"      # openssl rand -hex 32
+# Job Declaration Protocol: lets a miner build its own block template.
+# jdp_enabled = true
+# jdp_port = 3335
+# Validate declared jobs against the node. On mainnet the [tdp] socket path
+# works as is; other networks need the layout <dir>/<network>/node.sock.
+# jdp_validation_socket_path = "/ipc/node.sock"
+
+# ── Solo (always on) ─────────────────────────────────────────────────
+# Every block pays the miner who found it.
+[solo]
+# fee_address = "bc1q..."                # optional pool fee on Solo blocks
+# fee_percent = 1.0
+# coinbase_weight_budget = 4000          # optional
+
+# ── PPLNS ─────────────────────────────────────────────────────────────
+# Shared reward: every block is split by recent shares. Adds two ports;
+# publish them in simple-setup/docker-compose.yml too.
+[pplns]
+port = 3340
+high_diff_port = 3349
+start_difficulty = 5000
+target_shares_per_minute = 15
+min_difficulty = 1000
+fee_address = "CHANGE-ME"                # receives the pool fee in every PPLNS block
+fee_percent = 1.5
+# Coinbase space (weight units) reserved for payout outputs. More room pays
+# more miners per block and leaves less for transaction fees.
+coinbase_weight_budget = 50000
+# Payouts below this stay as balance until they grow; at least 546.
+min_payout_sats = 10000
+# confirmation_depth = 3                 # optional: blocks before a found block is booked
+# dust_sweep_enabled = true              # optional
+# abandoned_balance_days = 90            # optional
+
+# Optional: grow the coinbase budget automatically when miners would be
+# left out, up to max_weight_budget.
+# [pplns.coinbase_autoscale]
+# enabled = true
+# max_weight_budget = 200000
+
+# ── Group-Solo ───────────────────────────────────────────────────────
+# Miners form a group; a block found by any member is split among the
+# members by their shares in the current round. Members need a verified
+# email, so this needs [smtp] and pool_base_url. Per-group settings (round
+# reset, finder bonus, payout mode) are set per group through the API.
+[group_solo]
+fee_address = "CHANGE-ME"
+fee_percent = 1.5
+# coinbase_weight_budget = 10000         # optional: ~50 members
+# min_payout_sats = 5000                 # optional: smaller shares go to the fee output
+
+# ── Blockparty ───────────────────────────────────────────────────────
+# One admin hashes; every block pays fixed percentages to a confirmed list
+# of members. Members need a verified email, so this needs [smtp].
+[blockparty]
+fee_address = "CHANGE-ME"
+fee_percent = 1.5
+# min_payout_sats = 5000                 # optional: smaller splits go to the fee output
+# coinbase_weight_budget = 8000          # optional: ~40 members
+
+# ── Email (verification, invitations) ────────────────────────────────
+[smtp]
+host = "smtp.example.com"
+port = 587
+secure = false                           # true = TLS on 465, false = STARTTLS on 587
+user = "pool@example.com"
+pass = "CHANGE-ME"
+from = "Blitzpool <pool@example.com>"
+
+# ── Notifications (all optional) ─────────────────────────────────────
+# [notifications.telegram]
+# bot_token = "..."
+
+# [notifications.ntfy]
+# server_url = "https://ntfy.sh"
+# access_token = "..."
+# topic_prefix = "blitzpool-"
+
+# Web Push / UnifiedPush. VAPID keys are base64url, raw P-256.
+# [notifications.web_push]
+# vapid_public_key = "..."
+# vapid_private_key = "..."
+# vapid_subject = "mailto:admin@example.com"
+
+# Firebase Cloud Messaging (Android app).
+# [notifications.fcm]
+# service_account_path = "/app/keys/firebase-service-account.json"
+
+# Timing of the miner online/offline messages.
+# [notifications.device_status]
+# offline_grace_secs = 300
+# online_dwell_secs = 90
+
+# ── Prometheus metrics ───────────────────────────────────────────────
+[metrics]
+enabled = false
+# bind = "0.0.0.0:9000"

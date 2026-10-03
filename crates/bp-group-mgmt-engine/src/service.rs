@@ -63,7 +63,7 @@ pub struct GroupService {
     /// HARD member ceiling: how many payout outputs the Group-Solo coinbase
     /// can carry. Past it the blockspace cut silently drops members from the
     /// coinbase, so refusing the join is what lets Group-Solo run without a
-    /// ledger. Derived from the fixed `[group_fees].coinbase_weight_budget`.
+    /// ledger. Derived from `[group_solo].coinbase_weight_budget`.
     coinbase_max_members: u64,
     /// When set, `create_group` and `add_member_without_admin` refuse
     /// addresses already in a Blockparty. `OnceLock` so it attaches via

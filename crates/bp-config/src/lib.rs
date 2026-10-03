@@ -46,11 +46,8 @@ pub struct AppConfig {
     pub pplns: Option<PplnsConfig>,
     #[serde(default)]
     pub solo: SoloConfig,
-    /// Shared fee config for Group-Solo + Blockparty. Independent
-    /// from the PPLNS lane; falls back to `[pplns].fee_*` when
-    /// fields are absent.
     #[serde(default)]
-    pub group_fees: GroupFeesConfig,
+    pub group_solo: Option<GroupSoloConfig>,
     #[serde(default)]
     pub blockparty: Option<BlockpartyConfig>,
 
@@ -407,8 +404,9 @@ pub struct StratumConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sv2Config {
-    /// 32-byte secp256k1 authority private key in hex. Absent ⇒ a random key
-    /// per startup, so the pool identity cannot be pinned (not for prod).
+    /// 32-byte secp256k1 authority private key in hex (`openssl rand -hex 32`).
+    /// Required by the front: its Stratum and JDP servers refuse to start
+    /// without it. SV2 miners pin the public key derived from it.
     #[serde(default)]
     pub authority_privkey_hex: Option<String>,
     #[serde(default)]
@@ -602,12 +600,12 @@ impl CoinbaseAutoscaleConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SoloConfig {
-    /// Optional solo-mining dev-fee address. Empty/absent = no
-    /// dev-fee output (every sat goes to the share finder).
+    /// Optional pool fee on Solo blocks. Empty/absent = no fee output (every
+    /// sat goes to the finder).
     #[serde(default)]
-    pub dev_fee_address: Option<String>,
+    pub fee_address: Option<String>,
     #[serde(default)]
-    pub dev_fee_percent: Option<f64>,
+    pub fee_percent: Option<f64>,
     /// Coinbase weight reservation (WU) for the Solo template stream. Solo
     /// coinbases have 1–2 outputs, so a small value leaves the block to fee
     /// transactions. Sent to core over TDP; core clamps it to at least 2000 WU.
@@ -623,18 +621,50 @@ fn default_solo_coinbase_weight_budget() -> u32 {
 impl Default for SoloConfig {
     fn default() -> Self {
         Self {
-            dev_fee_address: None,
-            dev_fee_percent: None,
+            fee_address: None,
+            fee_percent: None,
             coinbase_weight_budget: default_solo_coinbase_weight_budget(),
         }
     }
 }
 
+/// Presence enables Group-Solo.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupSoloConfig {
+    /// Receives the pool fee in every Group-Solo block; must parse for
+    /// `network`.
+    pub fee_address: String,
+    pub fee_percent: f64,
+    /// Coinbase weight reservation (WU) for the Group-Solo stream, default fits
+    /// ~50 members. Drives both the TDP reservation and the engine's trimmer,
+    /// so blocks stay valid; under-sizing rolls trimmed members' payout into
+    /// the fee output, costing fairness rather than validity.
+    #[serde(default = "default_group_solo_coinbase_weight_budget")]
+    pub coinbase_weight_budget: u32,
+    /// Smallest member output; smaller shares go to the fee output.
+    #[serde(default = "default_group_solo_min_payout_sats")]
+    pub min_payout_sats: i64,
+}
+
+pub fn default_group_solo_coinbase_weight_budget() -> u32 {
+    // ~50 Taproot members + fee output + cushion.
+    10_000
+}
+
+fn default_group_solo_min_payout_sats() -> i64 {
+    5_000
+}
+
 /// Presence enables Blockparty; absence leaves every Blockparty surface on
-/// its Solo fallback. The fee lives in the shared `[group_fees]` section.
+/// its Solo fallback.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlockpartyConfig {
+    /// Receives the pool fee in every Blockparty block; must parse for
+    /// `network`.
+    pub fee_address: String,
+    pub fee_percent: f64,
     /// Minimum on-chain payout per member. Sub-min splits roll into
     /// the pool-fee output. Clamped at runtime to ≥ Bitcoin dust limit.
     #[serde(default = "default_blockparty_min_payout_sats")]
@@ -647,15 +677,6 @@ pub struct BlockpartyConfig {
     pub coinbase_weight_budget: u32,
 }
 
-impl Default for BlockpartyConfig {
-    fn default() -> Self {
-        Self {
-            min_payout_sats: default_blockparty_min_payout_sats(),
-            coinbase_weight_budget: default_blockparty_coinbase_weight_budget(),
-        }
-    }
-}
-
 fn default_blockparty_min_payout_sats() -> i64 {
     5_000
 }
@@ -663,38 +684,6 @@ fn default_blockparty_min_payout_sats() -> i64 {
 fn default_blockparty_coinbase_weight_budget() -> u32 {
     // ~40 Taproot members + fee output + cushion.
     8_000
-}
-
-/// Fee settings shared by Group-Solo and Blockparty; absent fields fall back
-/// to the `[pplns]` values at boot.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GroupFeesConfig {
-    #[serde(default)]
-    pub address: Option<String>,
-    #[serde(default)]
-    pub percent: Option<f64>,
-    /// Coinbase weight reservation (WU) for the Group-Solo stream, default fits
-    /// ~50 members. Drives both the TDP reservation and the engine's trimmer,
-    /// so blocks stay valid; under-sizing rolls trimmed members' payout into
-    /// the fee output, costing fairness rather than validity.
-    #[serde(default = "default_group_solo_coinbase_weight_budget")]
-    pub coinbase_weight_budget: u32,
-}
-
-impl Default for GroupFeesConfig {
-    fn default() -> Self {
-        Self {
-            address: None,
-            percent: None,
-            coinbase_weight_budget: default_group_solo_coinbase_weight_budget(),
-        }
-    }
-}
-
-fn default_group_solo_coinbase_weight_budget() -> u32 {
-    // ~50 Taproot members + fee output + cushion.
-    10_000
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -914,13 +903,28 @@ impl AppConfig {
 mod tests {
     use super::*;
 
-    /// `blitzpool.example.toml` parses against the current schema.
+    /// `blitzpool.example.toml` parses against the current schema and is
+    /// the Solo-only pool it says it is.
     #[test]
     fn example_toml_parses() {
         let bytes = include_str!("../../../blitzpool.example.toml");
         let cfg = AppConfig::from_toml_str(bytes).expect("blitzpool.example.toml parses");
         assert_eq!(cfg.network, Network::Mainnet);
         assert_eq!(cfg.pool_identifier, "blitzpool");
+        assert!(cfg.pplns.is_none() && cfg.group_solo.is_none() && cfg.blockparty.is_none());
+        assert!(
+            cfg.sv2.authority_privkey_hex.is_some(),
+            "the front needs it to start"
+        );
+    }
+
+    /// `blitzpool.full.example.toml` parses and switches every mode on.
+    #[test]
+    fn full_example_toml_parses() {
+        let bytes = include_str!("../../../blitzpool.full.example.toml");
+        let cfg = AppConfig::from_toml_str(bytes).expect("blitzpool.full.example.toml parses");
+        assert!(cfg.pplns.is_some() && cfg.group_solo.is_some() && cfg.blockparty.is_some());
+        assert!(cfg.smtp.is_some());
     }
 
     /// Minimal valid config body (top-level keys + required tables) for the
@@ -1067,19 +1071,19 @@ mod tests {
         assert!(toml::from_str::<SoloConfig>("dust_sweep_dormant_days = 30").is_err());
     }
 
+    const MODE_FEE: &str =
+        "fee_address = \"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\"\nfee_percent = 1.5\n";
+
     #[test]
     fn group_solo_coinbase_budget_defaults_and_parses() {
-        // Default applied when omitted (sized to ~50 members).
-        assert_eq!(GroupFeesConfig::default().coinbase_weight_budget, 10_000);
-        // Smaller than the 50 kWU PPLNS budget — the whole point of the stream.
-        assert!(GroupFeesConfig::default().coinbase_weight_budget < 50_000);
-        // Parses + overridable; other fields keep their defaults.
-        let c: GroupFeesConfig = toml::from_str("coinbase_weight_budget = 22000").expect("parses");
-        assert_eq!(c.coinbase_weight_budget, 22_000);
-        assert!(c.address.is_none());
-        // Omitted → default.
-        let d: GroupFeesConfig = toml::from_str("percent = 1.5").expect("parses");
+        // Default applied when omitted (sized to ~50 members), smaller than
+        // the 50 kWU PPLNS budget: the whole point of the stream.
+        let d: GroupSoloConfig = toml::from_str(MODE_FEE).expect("parses");
         assert_eq!(d.coinbase_weight_budget, 10_000);
+        assert_eq!(d.min_payout_sats, 5_000);
+        let c: GroupSoloConfig =
+            toml::from_str(&format!("{MODE_FEE}coinbase_weight_budget = 22000\n")).expect("parses");
+        assert_eq!(c.coinbase_weight_budget, 22_000);
     }
 
     #[test]
@@ -1104,25 +1108,54 @@ mod tests {
         assert_eq!(c.abandoned_balance_days, 45);
     }
 
-    /// Sweep keys on `[group_fees]` fail the load: Group-Solo has no ledger.
+    /// Sweep keys on `[group_solo]` fail the load: Group-Solo has no ledger.
     #[test]
-    fn group_fees_rejects_the_retired_sweep_keys() {
-        assert!(toml::from_str::<GroupFeesConfig>("dust_sweep_enabled = false").is_err());
-        assert!(toml::from_str::<GroupFeesConfig>("dormant_balance_days = 14").is_err());
+    fn group_solo_rejects_the_retired_sweep_keys() {
+        for key in ["dust_sweep_enabled = false", "dormant_balance_days = 14"] {
+            assert!(toml::from_str::<GroupSoloConfig>(&format!("{MODE_FEE}{key}\n")).is_err());
+        }
+    }
+
+    /// `[group_solo]` switches the mode: present is on, absent is off; once
+    /// present, its fee is required, with no fallback to another section.
+    #[test]
+    fn group_solo_is_on_only_with_its_table() {
+        let off = AppConfig::from_toml_str(MINIMAL_CFG).expect("parses");
+        assert!(off.group_solo.is_none());
+        let on = AppConfig::from_toml_str(&format!("{MINIMAL_CFG}\n[group_solo]\n{MODE_FEE}"))
+            .expect("parses");
+        assert!(on.group_solo.is_some());
+        assert!(
+            AppConfig::from_toml_str(&format!("{MINIMAL_CFG}\n[group_solo]\n")).is_err(),
+            "[group_solo] without its fee must fail the load"
+        );
+    }
+
+    /// `[group_fees]` and `dev_fee_*` are not config keys: a config carrying them
+    /// fails the load instead of silently dropping the fee.
+    #[test]
+    fn retired_fee_keys_fail_the_load() {
+        assert!(AppConfig::from_toml_str(&format!(
+            "{MINIMAL_CFG}\n[group_fees]\naddress = \"x\"\n"
+        ))
+        .is_err());
+        assert!(AppConfig::from_toml_str(&format!(
+            "{MINIMAL_CFG}\n[solo]\ndev_fee_percent = 1.0\n"
+        ))
+        .is_err());
     }
 
     #[test]
     fn blockparty_coinbase_budget_defaults_and_parses() {
         // Default applied when omitted (sized to ~40 members).
-        assert_eq!(BlockpartyConfig::default().coinbase_weight_budget, 8_000);
-        assert!(BlockpartyConfig::default().coinbase_weight_budget < 50_000);
-        // Parses + overridable alongside min_payout_sats.
-        let c: BlockpartyConfig = toml::from_str("coinbase_weight_budget = 16000").expect("parses");
-        assert_eq!(c.coinbase_weight_budget, 16_000);
-        assert_eq!(c.min_payout_sats, default_blockparty_min_payout_sats());
-        // Omitted → default.
-        let d: BlockpartyConfig = toml::from_str("min_payout_sats = 6000").expect("parses");
+        let d: BlockpartyConfig = toml::from_str(MODE_FEE).expect("parses");
         assert_eq!(d.coinbase_weight_budget, 8_000);
+        assert_eq!(d.min_payout_sats, default_blockparty_min_payout_sats());
+        let c: BlockpartyConfig =
+            toml::from_str(&format!("{MODE_FEE}coinbase_weight_budget = 16000\n")).expect("parses");
+        assert_eq!(c.coinbase_weight_budget, 16_000);
+        // The fee is required once Blockparty is on.
+        assert!(toml::from_str::<BlockpartyConfig>("").is_err());
     }
 
     #[test]

@@ -298,11 +298,11 @@ impl TdpBlockSubmissionSink {
     pub(crate) fn with_fanout(
         mut self,
         pplns: Option<PplnsEngine>,
-        group_solo: GroupSoloEngine,
+        group_solo: Option<GroupSoloEngine>,
         dispatcher: Option<Arc<NotificationDispatcher>>,
     ) -> Self {
         self.applier.pplns = pplns;
-        self.applier.group_solo = Some(group_solo);
+        self.applier.group_solo = group_solo;
         self.applier.dispatcher = dispatcher;
         self
     }

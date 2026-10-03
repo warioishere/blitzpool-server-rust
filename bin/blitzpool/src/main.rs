@@ -394,16 +394,25 @@ async fn main() -> ExitCode {
     // The group and Blockparty routing caches exist only where they are read:
     // the front's routing and the API's group endpoints.
     let membership = if is_front || is_api {
-        let group =
-            match group_service::spawn(&handles, &production_hooks, &engines.group_solo).await {
-                Ok(g) => g,
-                Err(err) => {
-                    tracing::error!(%err, "group-service spawn failed");
-                    eprintln!("blitzpool: {err}");
-                    print_group_service_error_help(&err);
-                    return ExitCode::from(7);
-                }
-            };
+        let group = match group_service::spawn(
+            &handles,
+            &production_hooks,
+            cfg.group_solo
+                .as_ref()
+                .map_or_else(bp_config::default_group_solo_coinbase_weight_budget, |g| {
+                    g.coinbase_weight_budget
+                }),
+        )
+        .await
+        {
+            Ok(g) => g,
+            Err(err) => {
+                tracing::error!(%err, "group-service spawn failed");
+                eprintln!("blitzpool: {err}");
+                print_group_service_error_help(&err);
+                return ExitCode::from(7);
+            }
+        };
         let blockparty = match engines.blockparty_payouts.as_ref() {
             Some(payouts) => {
                 match blockparty_service::spawn(&cfg, &handles, payouts, &group).await {
@@ -552,7 +561,7 @@ async fn main() -> ExitCode {
             handles.bitcoin_rpc.clone(),
             handles.redis.clone(),
             engines.pplns.clone(),
-            Some(engines.group_solo.clone()),
+            engines.group_solo.clone(),
             engines.blockparty_payouts.clone(),
             depth,
             Some(settle_signal.clone()),
@@ -593,12 +602,21 @@ async fn main() -> ExitCode {
     // Reports pool blocks on chain the ledger has no record of. Report only:
     // the chain does not carry the distribution behind a coinbase.
     let _block_reconcile = if cfg.has_role(Role::Payout) {
+        // Every mode's fee address, since each mode pays its own.
         let markers = crate::block_reconcile::PoolMarkers::new([
             cfg.pplns
                 .as_ref()
                 .map(|p| p.fee_address.clone())
                 .unwrap_or_default(),
-            cfg.solo.dev_fee_address.clone().unwrap_or_default(),
+            cfg.solo.fee_address.clone().unwrap_or_default(),
+            cfg.group_solo
+                .as_ref()
+                .map(|g| g.fee_address.clone())
+                .unwrap_or_default(),
+            cfg.blockparty
+                .as_ref()
+                .map(|b| b.fee_address.clone())
+                .unwrap_or_default(),
         ]);
         match markers {
             Some(markers) => Some(crate::block_reconcile::spawn_reconcile_task(
@@ -628,7 +646,7 @@ async fn main() -> ExitCode {
     let satellite_consumer = if consumes_streams {
         let sinks = engines::build_accepted_sinks(
             engines.pplns.as_ref(),
-            &engines.group_solo,
+            engines.group_solo.as_ref(),
             &engines.stats,
             &engines.session_persistence,
             handles.redis.clone(),
@@ -647,7 +665,7 @@ async fn main() -> ExitCode {
     let block_found_consumer = if consumes_streams {
         let applier = crate::block_sink::BlockFoundApplier::new(
             engines.pplns.clone(),
-            Some(engines.group_solo.clone()),
+            engines.group_solo.clone(),
             engines.blockparty_payouts.clone(),
             None,
             Some(handles.redis.clone()),
@@ -694,7 +712,7 @@ async fn main() -> ExitCode {
     };
 
     let rejected_consumer = if consumes_streams {
-        let sinks = engines::build_rejected_sinks(&engines.group_solo, &engines.stats);
+        let sinks = engines::build_rejected_sinks(engines.group_solo.as_ref(), &engines.stats);
         let rej_redis = handles.dedicated_redis(&cfg.redis, "rejected").await;
         Some(crate::rejected_consumer::spawn(rej_redis, sinks))
     } else {
@@ -803,10 +821,7 @@ async fn main() -> ExitCode {
                         engines.mode_gate.clone(),
                         engines.pplns.clone(),
                         engines.group_solo.clone(),
-                        crate::payout_resolver::SoloFeeConfig {
-                            dev_fee_address: cfg.solo.dev_fee_address.clone(),
-                            dev_fee_percent: cfg.solo.dev_fee_percent.unwrap_or(0.0),
-                        },
+                        crate::payout_resolver::solo_fee_config(&cfg),
                         membership
                             .as_ref()
                             .and_then(membership::Membership::blockparty_service),
@@ -913,7 +928,7 @@ async fn main() -> ExitCode {
 struct EngineShutdownHandles {
     stats: bp_share_stats_sink::ShareStatsEngineHandle,
     pplns: Option<bp_pplns_engine::engine::PplnsEngine>,
-    group_solo: bp_group_solo_engine::engine::GroupSoloEngine,
+    group_solo: Option<bp_group_solo_engine::engine::GroupSoloEngine>,
     session_persistence: bp_session_persistence::SessionPersistenceEngineHandle,
 }
 
@@ -1013,7 +1028,9 @@ async fn wait_for_shutdown(
     if let Some(p) = engine_shutdown.pplns.as_ref() {
         p.shutdown();
     }
-    engine_shutdown.group_solo.shutdown();
+    if let Some(g) = engine_shutdown.group_solo.as_ref() {
+        g.shutdown();
+    }
     engine_shutdown.stats.shutdown().await;
     listeners.shutdown().await;
     engine_shutdown.session_persistence.shutdown().await;
@@ -1150,7 +1167,7 @@ fn print_stratum_error_help(err: &StratumSpawnError) {
         StratumSpawnError::Sv1(stratum_v1::StratumV1SpawnError::ServerConfig(_)) => {
             eprintln!(
                 "hint: the server-wide SV1 config failed validation. \
-                 Check `[solo] dev_fee_address` + `dev_fee_percent` \
+                 Check `[solo] fee_address` + `fee_percent` \
                  (percent must be in [0, 100]; address must be \
                  non-empty when set)."
             );
@@ -1320,9 +1337,22 @@ fn print_engine_error_help(err: &EngineError) {
         }
         EngineError::GroupSolo(_) | EngineError::GroupSoloConfig(_) => {
             eprintln!(
-                "hint: check `[solo]` fields. Group-Solo reuses the solo \
-                 `dev_fee_*` knobs. `min_payout_sats` is shared with PPLNS \
-                 — both must satisfy ≥ 546 (Bitcoin Core relay dust limit)."
+                "hint: check `[group_solo]`: `fee_address` must be a valid \
+                 address for the configured `network`, `fee_percent` in \
+                 [0.0, 100.0], `min_payout_sats` ≥ 546. Remove `[group_solo]` \
+                 to run without Group-Solo."
+            );
+        }
+        EngineError::GroupSoloDisabledWithActiveGroups { .. } => {
+            eprintln!(
+                "hint: add an empty `[group_solo]` table to the config to keep \
+                 Group-Solo running for the existing groups."
+            );
+        }
+        EngineError::GroupSoloActiveGroups(_) => {
+            eprintln!(
+                "hint: the active-group check reads `pplns_group` from Postgres; \
+                 check the `[database]` connection."
             );
         }
         EngineError::Stats(_) => {

@@ -258,7 +258,8 @@ impl EmailHooks for SmtpJoinDecisionEmailHooks {
 
 pub(crate) struct ProductionGroupServiceHooks {
     db: Db,
-    group_solo: GroupSoloEngine,
+    /// `None` without `[group_solo]`: then no group holds round state.
+    group_solo: Option<GroupSoloEngine>,
 }
 
 #[async_trait]
@@ -267,9 +268,9 @@ impl GroupServiceHooks for ProductionGroupServiceHooks {
         // Redis is the only source (Group-Solo keeps no ledger row). `None`
         // makes the caller fall back to `joined_at`, so after a Redis loss a
         // long-standing member looks freshly joined.
+        let group_solo = self.group_solo.as_ref()?;
         let group_key = group_id.to_string();
-        match self
-            .group_solo
+        match group_solo
             .round()
             .read_last_accepted_share_at(&group_key, address.as_str())
             .await
@@ -297,8 +298,10 @@ impl GroupServiceHooks for ProductionGroupServiceHooks {
         // Redis: drop the address from the payout source of the group's
         // mode (PROP round or both window lanes), its reject counter, the
         // inactivity clock and, if it was theirs, the best share.
-        match self
-            .group_solo
+        let Some(group_solo) = self.group_solo.as_ref() else {
+            return;
+        };
+        match group_solo
             .forget_member(group_id, kicked_address.as_str())
             .await
         {
@@ -329,16 +332,18 @@ impl GroupServiceHooks for ProductionGroupServiceHooks {
         let group_id_str = group_id.to_string();
 
         // Redis: wipe all round state including last-accepted-share-at.
-        match self.group_solo.round().reset_full(&group_id_str).await {
-            Ok(()) => {
-                info!(%group_id, "group-hooks: on_group_dissolved redis reset_full ok");
-            }
-            Err(err) => {
-                warn!(
-                    %err,
-                    %group_id,
-                    "group-hooks: on_group_dissolved redis reset_full failed (best-effort)"
-                );
+        if let Some(group_solo) = self.group_solo.as_ref() {
+            match group_solo.round().reset_full(&group_id_str).await {
+                Ok(()) => {
+                    info!(%group_id, "group-hooks: on_group_dissolved redis reset_full ok");
+                }
+                Err(err) => {
+                    warn!(
+                        %err,
+                        %group_id,
+                        "group-hooks: on_group_dissolved redis reset_full failed (best-effort)"
+                    );
+                }
             }
         }
         // PG: delete all block history rows for this group.
@@ -358,7 +363,9 @@ impl GroupServiceHooks for ProductionGroupServiceHooks {
         // Re-arm this group's round-reset cron so a settings change takes
         // effect without a restart: the old per-group task is replaced by a
         // fresh one, or none if the preset was cleared or the group dissolved.
-        self.group_solo.reschedule_group(group);
+        if let Some(group_solo) = self.group_solo.as_ref() {
+            group_solo.reschedule_group(group);
+        }
     }
 }
 

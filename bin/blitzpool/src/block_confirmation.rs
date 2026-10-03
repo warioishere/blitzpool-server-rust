@@ -802,7 +802,11 @@ mod declared_block_booking_regtest {
                 self.pg.clone(),
             )
             .with_network(Network::Regtest)
-            .with_fanout(Some(self.pplns.clone()), self.group_solo.clone(), None)
+            .with_fanout(
+                Some(self.pplns.clone()),
+                Some(self.group_solo.clone()),
+                None,
+            )
             .with_redis(self.redis.clone())
         }
 
@@ -1538,7 +1542,11 @@ mod declared_block_booking_regtest {
                 self.pg.clone(),
             )
             .with_network(Network::Regtest)
-            .with_fanout(Some(self.pplns.clone()), self.group_solo.clone(), None)
+            .with_fanout(
+                Some(self.pplns.clone()),
+                Some(self.group_solo.clone()),
+                None,
+            )
             .with_redis(self.redis.clone())
         }
 

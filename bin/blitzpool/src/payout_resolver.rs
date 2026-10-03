@@ -15,6 +15,15 @@ use bp_group_solo_engine::engine::GroupSoloEngine;
 use bp_mining_mode::MiningModeResult;
 // Re-exported so the wiring keeps one import path for the solo split.
 pub(crate) use bp_mining_job::SoloFeeConfig;
+
+/// The Solo fee from `[solo]`, the one source for the Stratum, JDP and API
+/// resolvers so a preview and a real coinbase cannot disagree.
+pub(crate) fn solo_fee_config(cfg: &bp_config::AppConfig) -> SoloFeeConfig {
+    SoloFeeConfig {
+        dev_fee_address: cfg.solo.fee_address.clone(),
+        dev_fee_percent: cfg.solo.fee_percent.unwrap_or(0.0),
+    }
+}
 use bp_mining_job::{solo_payouts, PayoutEntry, ResolvedPayouts};
 use bp_pplns_engine::engine::PplnsEngine;
 use bp_stratum_v2::bridge::DistributionAccounting;
@@ -29,7 +38,7 @@ use crate::engines::BlitzpoolModeGate;
 pub(crate) struct ProductionPayoutResolver {
     mode_gate: Arc<BlitzpoolModeGate>,
     pplns: Option<PplnsEngine>,
-    group_solo: GroupSoloEngine,
+    group_solo: Option<GroupSoloEngine>,
     solo_fee: SoloFeeConfig,
     /// When `None`, the Blockparty arm serves no job and the pending-fee guard
     /// falls through to Solo.
@@ -40,7 +49,7 @@ impl ProductionPayoutResolver {
     pub(crate) fn new(
         mode_gate: Arc<BlitzpoolModeGate>,
         pplns: Option<PplnsEngine>,
-        group_solo: GroupSoloEngine,
+        group_solo: Option<GroupSoloEngine>,
         solo_fee: SoloFeeConfig,
         blockparty: Option<Arc<BlockpartyService>>,
     ) -> Self {
@@ -352,6 +361,14 @@ impl ProductionPayoutResolver {
         reward_sats: u64,
         group_id: Uuid,
     ) -> (ResolvedPayouts, bool) {
+        let Some(group_solo) = self.group_solo.as_ref() else {
+            error!(
+                miner_address,
+                %group_id,
+                "Group-Solo mode in gate but `[group_solo]` is absent from config; serving NO JOB"
+            );
+            return (ResolvedPayouts::none(), false);
+        };
         // The connecting miner is the finder for the group's finder bonus.
         let finder = match AddressId::new(miner_address.to_string()) {
             Ok(a) => a,
@@ -363,8 +380,7 @@ impl ProductionPayoutResolver {
                 return (ResolvedPayouts::none(), false);
             }
         };
-        match self
-            .group_solo
+        match group_solo
             .build_distribution(group_id, reward_sats, &finder)
             .await
         {
@@ -590,9 +606,10 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
                 let Some(MiningModeResult::GroupSolo(group_id)) = known else {
                     return TailoredDistribution::Unavailable;
                 };
-                match self
-                    .resolver
-                    .group_solo
+                let Some(group_solo) = self.resolver.group_solo.as_ref() else {
+                    return TailoredDistribution::Unavailable;
+                };
+                match group_solo
                     .build_distribution(group_id, t_ref, miner_address)
                     .await
                 {

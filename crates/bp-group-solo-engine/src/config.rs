@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `GroupSoloEngineConfig`: knobs that apply to all groups; per-group settings
-//! live in the `pplns_group` row. The fee knobs mirror `PplnsEngineConfig` but
-//! are separate values (`[group_fees]` vs `[pplns]`); only the fee address
-//! falls back to `[pplns].fee_address`.
+//! `GroupSoloEngineConfig`: knobs that apply to all groups, from
+//! `[group_solo]`; per-group settings live in the `pplns_group` row.
 
 use bp_common::{AddressId, Sats};
 use bp_pplns::{
