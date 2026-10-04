@@ -9,3 +9,8 @@ updates:
       # Minor and patch bumps in one PR, every major in its own.
       compatible:
         update-types: [minor, patch]
+    ignore:
+      # Its Sender/Receiver cross the bitcoin_core_sv2 boundary, so the major
+      # follows sv2-apps (see UPSTREAM_DEPS.md), not the newest release.
+      - dependency-name: async-channel
+        update-types: ["version-update:semver-major"]
