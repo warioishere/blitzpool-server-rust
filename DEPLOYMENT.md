@@ -165,9 +165,11 @@ docker compose --profile bitcoin up -d --build
 ```
 
 Point any SHA-256 miner (for example `minerd -a sha256d`) at
-`stratum+tcp://localhost:3333` with a `bcrt1…` address as username. Found
-blocks show up in `curl localhost:3334/api/info` and in the coinbase:
-`$CLI getblock "$($CLI getbestblockhash)" 2`.
+`stratum+tcp://localhost:3333` with a `bcrt1…` address as username. A found
+block's coinbase pays that address at once:
+`$CLI getblock "$($CLI getbestblockhash)" 2`. `curl localhost:3334/api/info`
+lists it too, but serves a cached answer for up to five minutes
+(`[api.cache] site_info_secs`, default 300).
 
 ## Enabling more payout modes
 
