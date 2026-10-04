@@ -404,7 +404,7 @@ pub struct StratumConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sv2Config {
-    /// 32-byte secp256k1 authority private key in hex (`openssl rand -hex 32`).
+    /// 32-byte secp256k1 authority private key in hex (`blitzpool --sv2-keygen`).
     /// Required by the front: its Stratum and JDP servers refuse to start
     /// without it. SV2 miners pin the public key derived from it.
     #[serde(default)]

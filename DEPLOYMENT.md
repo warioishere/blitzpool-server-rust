@@ -44,13 +44,26 @@ Protocol) and uses JSON-RPC only for one-off calls.
 git clone https://github.com/warioishere/blitzpool-server-rust.git
 cd blitzpool-server-rust/simple-setup
 cp ../blitzpool.example.toml blitzpool.toml
+docker compose build
+docker compose run --rm --no-deps front --sv2-keygen
+```
+
+The build compiles the pool and takes a while the first time. The last line
+prints a new Stratum V2 key:
+
+```
+[sv2]
+authority_privkey_hex = "…"
+
+# Public key for SV2 miners and JD clients:
+# 9…
 ```
 
 `blitzpool.toml` holds your secrets and is ignored by git. Set these values:
 
 | Where | What |
 |---|---|
-| `blitzpool.toml` `[sv2] authority_privkey_hex` | output of `openssl rand -hex 32`. Keep it: SV2 miners pin the public key derived from it |
+| `blitzpool.toml` `[sv2] authority_privkey_hex` | the line printed by `--sv2-keygen`. Keep it: SV2 miners pin the public key printed with it, so a new key means reconfiguring every SV2 miner |
 | `blitzpool.toml` `[bitcoin_rpc] password` | the node's `rpcpassword` (next step) |
 | `blitzpool.toml` `network` | `mainnet`, `testnet4` or `regtest`, matching the node |
 

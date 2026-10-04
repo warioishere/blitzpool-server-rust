@@ -52,8 +52,9 @@ high_diff_target_shares_per_minute = 10
 difficulty_check_interval_ms = 240000
 
 # Stratum V2 (Noise) identity. Required: the front refuses to start without it.
-# Generate with `openssl rand -hex 32` and keep it: SV2 miners pin the public
-# key derived from it, so a new key means reconfiguring every SV2 miner.
+# Generate with `docker compose run --rm --no-deps front --sv2-keygen` (or
+# `blitzpool --sv2-keygen`), which also prints the public key SV2 miners pin.
+# Keep it: a new key means reconfiguring every SV2 miner.
 [sv2]
 authority_privkey_hex = "CHANGE-ME"
 

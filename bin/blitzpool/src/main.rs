@@ -164,6 +164,11 @@ struct Cli {
     /// in the live Redis — keys not in the snapshot are left untouched.
     #[arg(long)]
     restore_force: bool,
+
+    /// Print a new `[sv2] authority_privkey_hex` and its public key, then
+    /// exit. Needs no config.
+    #[arg(long)]
+    sv2_keygen: bool,
 }
 
 #[tokio::main]
@@ -171,6 +176,9 @@ async fn main() -> ExitCode {
     init_tracing();
 
     let cli = Cli::parse();
+    if cli.sv2_keygen {
+        return print_sv2_keypair();
+    }
     tracing::info!(config = %cli.config.display(), "loading config");
 
     let mut cfg = match AppConfig::load(&cli.config) {
@@ -1176,7 +1184,7 @@ fn print_stratum_error_help(err: &StratumSpawnError) {
             eprintln!(
                 "hint: SV2 needs `[sv2] authority_privkey_hex` (32-byte \
                  secp256k1 secret key, hex-encoded). Generate one with \
-                 `openssl rand -hex 32`."
+                 `blitzpool --sv2-keygen`."
             );
         }
         StratumSpawnError::Sv2(_) => {
@@ -1322,6 +1330,26 @@ fn log_engines_summary(e: &EngineHandles) {
         session_persistence_ready = true,
         "engine handles summary"
     );
+}
+
+/// `--sv2-keygen`: the config line and the public key, on stdout only, so the
+/// output can be pasted or piped as is.
+#[allow(clippy::print_stdout)]
+fn print_sv2_keypair() -> ExitCode {
+    match crate::stratum_v2::generate_authority_key() {
+        Ok((secret_hex, public_key)) => {
+            println!("[sv2]");
+            println!("authority_privkey_hex = \"{secret_hex}\"");
+            println!();
+            println!("# Public key for SV2 miners and JD clients:");
+            println!("# {public_key}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("blitzpool: no randomness for the key: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Operator-friendly hint for [`EngineError`] variants — each maps

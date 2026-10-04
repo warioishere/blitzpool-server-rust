@@ -566,6 +566,7 @@ dependencies = [
  "bs58 0.5.1",
  "chrono",
  "clap",
+ "getrandom 0.2.17",
  "hex",
  "jd_server_sv2",
  "redis",

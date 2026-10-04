@@ -66,6 +66,25 @@ pub(crate) fn build_noise_config(cfg: &AppConfig) -> Result<NoiseConfig, Stratum
         .authority_privkey_hex
         .as_deref()
         .ok_or(StratumV2SpawnError::PrivkeyMissing)?;
+    noise_config_from_hex(hex_str)
+}
+
+/// A fresh authority key as `(authority_privkey_hex, public key)`, the public
+/// key in the form SV2 miners are configured with. Decoded through the same
+/// path the pool takes at start, so the pair is one the pool accepts.
+pub(crate) fn generate_authority_key() -> Result<(String, String), getrandom::Error> {
+    loop {
+        let mut secret = [0u8; 32];
+        getrandom::getrandom(&mut secret)?;
+        let hex_str = hex::encode(secret);
+        // Only a zero or out-of-range scalar fails; draw again.
+        if let Ok(noise) = noise_config_from_hex(&hex_str) {
+            return Ok((hex_str, noise.authority_pub().to_string()));
+        }
+    }
+}
+
+fn noise_config_from_hex(hex_str: &str) -> Result<NoiseConfig, StratumV2SpawnError> {
     if hex_str.len() != 64 {
         return Err(StratumV2SpawnError::PrivkeyHexLen(hex_str.len()));
     }
@@ -359,6 +378,18 @@ mod tests {
             noise.authority_pub().to_string(),
             "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
         );
+    }
+
+    /// `--sv2-keygen` prints a pair the pool accepts at start: the config it
+    /// yields resolves to the very public key printed next to it.
+    #[test]
+    fn a_generated_authority_key_is_one_the_pool_starts_with() {
+        let (secret_hex, public_key) = generate_authority_key().expect("randomness");
+        let cfg = min_cfg_with_sv2(Some(secret_hex.clone()));
+        let noise = build_noise_config(&cfg).expect("the pool accepts the generated key");
+        assert_eq!(noise.authority_pub().to_string(), public_key);
+        let (other, _) = generate_authority_key().expect("randomness");
+        assert_ne!(other, secret_hex, "every run draws a new key");
     }
 
     #[test]
