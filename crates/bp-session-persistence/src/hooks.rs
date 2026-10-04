@@ -13,7 +13,7 @@ use tokio::time::Instant;
 use tracing::warn;
 
 use crate::diff_stat_buffer::{DiffStatBuffer, DiffStatKeyRef};
-use crate::hashrate_sampler::HashrateSampler;
+use crate::hashrate_watchdog::HashrateWatchdog;
 use crate::row_debounce::RowDebounce;
 use crate::touch_buffer::{TouchBuffer, TouchKeyRef};
 
@@ -67,18 +67,18 @@ impl SharedSessionPersistence for SessionPersistenceHook {
 }
 
 /// Bumps the session's `client:live:*` hash (TTL, best/current difficulty,
-/// channel count) on every accepted share, buffered to one write per session
-/// per flush. `hash_rate` is owned by the `HashrateSampler` alone so two
-/// writers never fight over one field.
+/// vardiff's hashrate, channel count) on every accepted share, buffered to
+/// one write per session per flush, and tells the watchdog the session is
+/// still sending.
 #[derive(Clone)]
 pub struct ClientRowTouchSink {
     buffer: Arc<TouchBuffer>,
-    sampler: Arc<HashrateSampler>,
+    watchdog: Arc<HashrateWatchdog>,
 }
 
 impl ClientRowTouchSink {
-    pub(crate) fn new(buffer: Arc<TouchBuffer>, sampler: Arc<HashrateSampler>) -> Self {
-        Self { buffer, sampler }
+    pub(crate) fn new(buffer: Arc<TouchBuffer>, watchdog: Arc<HashrateWatchdog>) -> Self {
+        Self { buffer, watchdog }
     }
 }
 
@@ -102,13 +102,14 @@ impl SharedAcceptedShareSink for ClientRowTouchSink {
             key,
             share.submission_difficulty as f32,
             Some(share.effective_difficulty as f32),
+            share.hash_rate,
             share.channel_count as i32,
             // The front's accept time, not ours: a later stamp on a share that
             // arrives after the disconnect would make `kill_dead_clients`
             // revive a session that is already gone.
             share.ts_ms,
         );
-        self.sampler.record(key, share.effective_difficulty);
+        self.watchdog.record(key, Instant::now());
     }
 }
 

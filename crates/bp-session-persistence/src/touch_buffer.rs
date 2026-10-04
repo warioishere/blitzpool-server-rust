@@ -2,8 +2,8 @@
 
 //! Coalesces per-session share updates in a [`TouchBuffer`] and flushes them
 //! periodically into the `client:live:*` Redis hashes ([`crate::live_store`])
-//! instead of a write per share. `hash_rate` is not written here: it belongs
-//! to [`crate::hashrate_sampler`], and a second writer would clobber it.
+//! instead of a write per share. `hash_rate` is vardiff's session rate; once
+//! the shares stop, [`crate::hashrate_watchdog`] zeroes it.
 
 use std::sync::Mutex;
 
@@ -68,6 +68,7 @@ impl Equivalent<TouchKey> for TouchKeyRef<'_> {
 pub(crate) struct TouchEntry {
     pub share_diff: f32,
     pub current_diff: Option<f32>,
+    pub hash_rate: Option<f64>,
     pub channel_count: i32,
     pub updated_at_ms: i64,
 }
@@ -94,12 +95,14 @@ impl TouchBuffer {
 
     /// Insert or merge a sample: `share_diff` and `updated_at_ms` take the
     /// max (out-of-order shares must not roll the timestamp back), the
-    /// optionals overwrite only when `Some`.
+    /// optionals overwrite only when `Some`. A `hash_rate` of 0 is vardiff
+    /// before its first estimate and keeps the stored rate.
     pub(crate) fn record(
         &self,
         key: TouchKeyRef<'_>,
         share_diff: f32,
         current_diff: Option<f32>,
+        hash_rate: f64,
         channel_count: i32,
         updated_at_ms: i64,
     ) {
@@ -109,6 +112,7 @@ impl TouchBuffer {
             return;
         }
         let current_diff = current_diff.filter(|d| d.is_finite());
+        let hash_rate = Some(hash_rate).filter(|r| r.is_finite() && *r > 0.0);
         let mut guard = self.guard();
         if let Some(e) = guard.get_mut(&key) {
             if share_diff > e.share_diff {
@@ -116,6 +120,9 @@ impl TouchBuffer {
             }
             if current_diff.is_some() {
                 e.current_diff = current_diff;
+            }
+            if hash_rate.is_some() {
+                e.hash_rate = hash_rate;
             }
             // Latest wins: the freshest share reflects the current channel count.
             e.channel_count = channel_count;
@@ -128,6 +135,7 @@ impl TouchBuffer {
                 TouchEntry {
                     share_diff,
                     current_diff,
+                    hash_rate,
                     channel_count,
                     updated_at_ms,
                 },
@@ -154,6 +162,9 @@ impl TouchBuffer {
                     }
                     if e.current_diff.is_none() {
                         e.current_diff = v.current_diff;
+                    }
+                    if e.hash_rate.is_none() {
+                        e.hash_rate = v.hash_rate;
                     }
                     if v.updated_at_ms > e.updated_at_ms {
                         e.updated_at_ms = v.updated_at_ms;
@@ -250,15 +261,20 @@ mod tests {
             client_name: "wkr".into(),
             session_id: "sess".into(),
         };
-        buf.record(kref(&key), 100.0, Some(8.0), 1, 1000);
-        buf.record(kref(&key), 50.0, Some(16.0), 1, 2000);
-        buf.record(kref(&key), 200.0, None, 3, 1500);
+        buf.record(kref(&key), 100.0, Some(8.0), 1.0e12, 1, 1000);
+        buf.record(kref(&key), 50.0, Some(16.0), 2.0e12, 1, 2000);
+        buf.record(kref(&key), 200.0, None, 0.0, 3, 1500);
 
         let snap = buf.drain();
         assert_eq!(snap.len(), 1);
         let entry = snap.get(&key).unwrap();
         assert_eq!(entry.share_diff, 200.0, "running max");
         assert_eq!(entry.current_diff, Some(16.0), "latest non-None");
+        assert_eq!(
+            entry.hash_rate,
+            Some(2.0e12),
+            "latest positive rate; vardiff's 0 does not clobber it"
+        );
         assert_eq!(entry.channel_count, 3, "latest sample wins");
         assert_eq!(
             entry.updated_at_ms, 2000,
@@ -281,12 +297,13 @@ mod tests {
             TouchEntry {
                 share_diff: 100.0,
                 current_diff: Some(8.0),
+                hash_rate: Some(1.0e12),
                 channel_count: 1,
                 updated_at_ms: 1000,
             },
         );
         // Meanwhile a new share landed.
-        buf.record(kref(&key), 50.0, Some(16.0), 1, 2000);
+        buf.record(kref(&key), 50.0, Some(16.0), 2.0e12, 1, 2000);
         // DB failed → rebuffer the snapshot.
         buf.rebuffer(snap);
 
@@ -298,6 +315,7 @@ mod tests {
             Some(16.0),
             "live write keeps its value (rebuffer doesn't clobber non-None with older value)"
         );
+        assert_eq!(entry.hash_rate, Some(2.0e12), "same for the live rate");
         assert_eq!(entry.updated_at_ms, 2000);
     }
 
@@ -309,7 +327,7 @@ mod tests {
             client_name: "c".into(),
             session_id: "s".into(),
         };
-        buf.record(kref(&key), 1.0, None, 1, 1);
+        buf.record(kref(&key), 1.0, None, 0.0, 1, 1);
         assert_eq!(buf.len(), 1);
         let snap = buf.drain();
         assert_eq!(snap.len(), 1);
@@ -325,18 +343,19 @@ mod tests {
             client_name: "wkr".into(),
             session_id: "sess".into(),
         };
-        b.record(kref(&k), f32::INFINITY, None, 1, 1);
-        b.record(kref(&k), f32::NAN, None, 1, 1);
+        b.record(kref(&k), f32::INFINITY, None, 0.0, 1, 1);
+        b.record(kref(&k), f32::NAN, None, 0.0, 1, 1);
         assert_eq!(b.len(), 0, "an unusable share_diff creates no entry");
 
-        // A finite share with a non-finite vardiff target keeps the
-        // entry but drops the unusable field.
-        b.record(kref(&k), 5.0, Some(f32::INFINITY), 1, 1);
+        // A finite share with a non-finite vardiff target and rate keeps
+        // the entry but drops the unusable fields.
+        b.record(kref(&k), 5.0, Some(f32::INFINITY), f64::NAN, 1, 1);
         assert_eq!(b.len(), 1);
         let snap = b.drain();
         let e = snap.values().next().expect("entry");
         assert_eq!(e.share_diff, 5.0);
         assert_eq!(e.current_diff, None, "non-finite current_diff is dropped");
+        assert_eq!(e.hash_rate, None, "non-finite hash_rate is dropped");
     }
 
     #[test]
@@ -348,11 +367,11 @@ mod tests {
             session_id: sid,
         };
         // The second share must find the first's entry via the borrowed ref.
-        buf.record(r("abc123"), 42.0, Some(8.0), 1, 1000);
-        buf.record(r("abc123"), 99.0, None, 1, 2000);
+        buf.record(r("abc123"), 42.0, Some(8.0), 0.0, 1, 1000);
+        buf.record(r("abc123"), 99.0, None, 0.0, 1, 2000);
         assert_eq!(buf.len(), 1, "same identity must coalesce, not duplicate");
         // A different session_id must be a distinct entry (no false hit).
-        buf.record(r("zzz999"), 1.0, None, 1, 3000);
+        buf.record(r("zzz999"), 1.0, None, 0.0, 1, 3000);
         assert_eq!(buf.len(), 2, "distinct identity is a separate entry");
 
         // Retrievable by the owned key: both hash and compare identically.

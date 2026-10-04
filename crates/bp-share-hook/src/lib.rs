@@ -36,8 +36,8 @@ pub struct SharedAcceptedShare<'a> {
     /// bitcoin-core is the authoritative validator.
     pub is_block_candidate: bool,
 
-    /// Vardiff's session hashrate snapshot (H/s). Not the live `hash_rate`,
-    /// which the session-persistence sampler owns.
+    /// Vardiff's session hashrate (H/s), shown as the live `hash_rate`; 0
+    /// before vardiff's first estimate.
     pub hash_rate: f64,
 
     /// Channels on this session's connection; `> 1` when a rental proxy

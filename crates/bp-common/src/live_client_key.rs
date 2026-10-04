@@ -13,7 +13,7 @@ pub const CLIENT_LIVE_PREFIX: &str = "client:live:";
 pub const KEY_SEP: char = '\u{1f}';
 
 /// Hash field: live hashrate in H/s. May be the ONLY field present: the
-/// sampler's write can recreate an expired key with just this field.
+/// watchdog's write can recreate an expired key with just this field.
 pub const F_HASH_RATE: &str = "hash_rate";
 /// Hash field: latest vardiff target observed on an accepted share.
 pub const F_CURRENT_DIFFICULTY: &str = "current_difficulty";

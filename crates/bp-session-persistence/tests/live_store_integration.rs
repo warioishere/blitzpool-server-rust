@@ -3,7 +3,7 @@
 #![allow(clippy::print_stderr)]
 
 //! Integration tests for the `client:live:*` live store: touch refreshes
-//! liveness, the sampler never does, and a Redis outage never hangs a flush.
+//! liveness, the hashrate watchdog never does, and a Redis outage never hangs a flush.
 //! Needs `bp-test-pg` (15433) and `bp-test-redis` (16379); every test skips
 //! when a service is unreachable, so watch the passed-count.
 
@@ -354,7 +354,7 @@ async fn best_difficulty_is_monotone_across_flushes() {
     cleanup(&pool, prefix).await;
 }
 
-/// The sampler's write does not extend a session's TTL.
+/// The touch writes vardiff's rate; the watchdog's zero does not extend the TTL.
 #[tokio::test]
 async fn hashrate_write_does_not_refresh_liveness() {
     let Some(pool) = pg_or_skip().await else {
@@ -376,38 +376,63 @@ async fn hashrate_write_does_not_refresh_liveness() {
     hook.register_session("sessL003", &address, "rig1", None)
         .await;
     handle.flush_births_now().await;
+    sink.record_accepted(SharedAcceptedShare {
+        hash_rate: 5.0e12,
+        ..share(&address, "rig1", "sessL003", 100.0, 512.0, 1)
+    })
+    .await;
+    handle.flush_touches_now().await;
+    assert!(ttl(&mut redis, &key).await > 10, "touch set the full TTL");
+    assert_eq!(
+        hgetall(&mut redis, &key)
+            .await
+            .get(F_HASH_RATE)
+            .map(String::as_str),
+        Some("5000000000000"),
+        "the touch wrote the share's vardiff rate"
+    );
+
+    // A share with vardiff's 0 keeps the stored rate.
     sink.record_accepted(share(&address, "rig1", "sessL003", 100.0, 512.0, 1))
         .await;
     handle.flush_touches_now().await;
-    assert!(ttl(&mut redis, &key).await > 10, "touch set the full TTL");
+    assert_eq!(
+        hgetall(&mut redis, &key)
+            .await
+            .get(F_HASH_RATE)
+            .map(String::as_str),
+        Some("5000000000000"),
+        "vardiff's 0 before its first estimate keeps the stored rate"
+    );
 
-    // Shrink the TTL, then let the sampler write its hashrate.
+    // Shrink the TTL, then let the watchdog zero the rate.
     let _: i64 = redis::cmd("EXPIRE")
         .arg(&key)
         .arg(10i64)
         .query_async(&mut redis)
         .await
         .expect("EXPIRE");
-    handle.sample_hashrate_now(60.0).await;
+    handle.zero_silent_hashrates_now(Duration::ZERO).await;
 
-    let hash = hgetall(&mut redis, &key).await;
-    let rate: f64 = hash
-        .get(F_HASH_RATE)
-        .expect("hash_rate written")
-        .parse()
-        .expect("hash_rate numeric");
-    assert!(rate > 0.0, "sampler wrote a positive rate, got {rate}");
+    assert_eq!(
+        hgetall(&mut redis, &key)
+            .await
+            .get(F_HASH_RATE)
+            .map(String::as_str),
+        Some("0"),
+        "the watchdog zeroed the silent session"
+    );
     let t = ttl(&mut redis, &key).await;
     assert!(
         (1..=10).contains(&t),
-        "sampler must not extend liveness — TTL was ≤10, now {t}"
+        "the watchdog must not extend liveness — TTL was ≤10, now {t}"
     );
 
     handle.shutdown().await;
     cleanup(&pool, prefix).await;
 }
 
-/// A sampler HSET that creates the key still sets a TTL; the hash holds only `hash_rate`.
+/// A watchdog HSET that creates the key still sets a TTL; the hash holds only `hash_rate`.
 #[tokio::test]
 async fn hashrate_write_on_fresh_key_sets_ttl() {
     let Some(pool) = pg_or_skip().await else {
@@ -425,23 +450,23 @@ async fn hashrate_write_on_fresh_key_sets_ttl() {
     let address = format!("{prefix}dave");
     let key = client_live_key(&address, "rig1", "sessL004");
 
-    // Feed the sampler but do NOT flush touches — the key must not exist.
+    // Feed the watchdog but do NOT flush touches — the key must not exist.
     sink.record_accepted(share(&address, "rig1", "sessL004", 100.0, 512.0, 1))
         .await;
     assert_eq!(ttl(&mut redis, &key).await, -2, "key must not exist yet");
 
-    handle.sample_hashrate_now(60.0).await;
+    handle.zero_silent_hashrates_now(Duration::ZERO).await;
 
     let hash = hgetall(&mut redis, &key).await;
-    assert!(hash.contains_key(F_HASH_RATE), "sampler created the key");
+    assert!(hash.contains_key(F_HASH_RATE), "watchdog created the key");
     assert!(
         !hash.contains_key(F_CURRENT_DIFFICULTY),
-        "sampler-created hash is partial by design"
+        "watchdog-created hash is partial by design"
     );
     let t = ttl(&mut redis, &key).await;
     assert!(
         t > 0,
-        "a sampler-created key without TTL is immortal under volatile-lru, got {t}"
+        "a watchdog-created key without TTL is immortal under volatile-lru, got {t}"
     );
 
     handle.shutdown().await;
@@ -567,6 +592,7 @@ async fn live_reader_agrees_with_the_writer() {
     let addr_a = bp_common::AddressId::new(format!("{prefix}a")).unwrap();
     let addr_b = bp_common::AddressId::new(format!("{prefix}b")).unwrap();
     let addr_idle = bp_common::AddressId::new(format!("{prefix}idle")).unwrap();
+    let per_session = 600.0 * 4_294_967_296.0 / 60.0;
 
     for (addr, sess) in [
         (&addr_a, "sessL006"),
@@ -575,15 +601,15 @@ async fn live_reader_agrees_with_the_writer() {
     ] {
         hook.register_session(sess, addr.as_str(), "rig1", None)
             .await;
-        sink.record_accepted(share(addr.as_str(), "rig1", sess, 100.0, 600.0, 1))
-            .await;
+        sink.record_accepted(SharedAcceptedShare {
+            hash_rate: per_session,
+            ..share(addr.as_str(), "rig1", sess, 100.0, 600.0, 1)
+        })
+        .await;
     }
     handle.flush_births_now().await;
     handle.flush_touches_now().await;
-    handle.sample_hashrate_now(60.0).await;
 
-    // Each session wrote rate = 600 * 2^32 / 60.
-    let per_session = 600.0 * 4_294_967_296.0 / 60.0;
     let a_sum = bp_client_live::hashrate_for_addresses(Some(&redis), std::slice::from_ref(&addr_a))
         .await
         .expect("read addr_a");
@@ -650,10 +676,12 @@ async fn composed_reader_returns_the_writers_fields_in_position() {
     let sink = handle.client_row_touch_sink();
     let address = format!("{prefix}fred");
 
-    sink.record_accepted(share(&address, "rig1", "sessL009", 100.5, 64.0, 2))
-        .await;
+    sink.record_accepted(SharedAcceptedShare {
+        hash_rate: 5.0e12,
+        ..share(&address, "rig1", "sessL009", 100.5, 64.0, 2)
+    })
+    .await;
     handle.flush_touches_now().await;
-    handle.sample_hashrate_now(60.0).await;
 
     let live = bp_client_live::live_fields_for_sessions(
         Some(&redis),
@@ -669,7 +697,7 @@ async fn composed_reader_returns_the_writers_fields_in_position() {
     assert!((lf.best_difficulty - 100.5).abs() < 0.01);
     assert_eq!(lf.current_difficulty, Some(64.0));
     assert_eq!(lf.channel_count, Some(2));
-    assert!(lf.hash_rate > 0.0, "sampler wrote a rate");
+    assert_eq!(lf.hash_rate, 5.0e12, "the share's vardiff rate");
     assert!(lf.updated_at_ms.is_some());
     assert_eq!(live[1], None, "unknown session stays None in position");
 

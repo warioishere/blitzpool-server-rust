@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Redis writer for the per-session `client:live:*` hashes. Only the touch
-//! flush refreshes the TTL (it is the liveness signal); the sampler's fade
+//! flush refreshes the TTL (it is the liveness signal); the watchdog's zero
 //! writes must not. HSET and EXPIRE run in one Lua script because under
 //! `volatile-lru` a key without a TTL is immortal and un-evictable.
 
@@ -20,14 +20,14 @@ use crate::touch_buffer::{TouchEntry, TouchKey};
 /// Keys per script invocation, bounding one EVAL's server blocking time.
 const CHUNK: usize = 400;
 
-/// Touch write. `ARGV[1]` = TTL seconds, then a stride of 4 per key:
+/// Touch write. `ARGV[1]` = TTL seconds, then a stride of 5 per key:
 /// best difficulty (max-merged with the stored one, so a later flush cannot
-/// regress it), current difficulty ("" keeps the stored value), channel
-/// count, last-seen epoch-ms.
+/// regress it), current difficulty and hashrate ("" keeps the stored value),
+/// channel count, last-seen epoch-ms.
 const TOUCH_LIVE_LUA: &str = r#"
 local ttl = tonumber(ARGV[1])
 for i = 1, #KEYS do
-    local base = 1 + (i - 1) * 4
+    local base = 1 + (i - 1) * 5
     local key = KEYS[i]
     -- No `or 0` fallback here on purpose: `tonumber` only yields nil
     -- for a string that is not a number at all ("abc", ""), and every
@@ -43,17 +43,20 @@ for i = 1, #KEYS do
     end
     redis.call('HSET', key,
         'best_difficulty', tostring(best),
-        'channel_count', ARGV[base + 3],
-        'updated_at_ms', ARGV[base + 4])
+        'channel_count', ARGV[base + 4],
+        'updated_at_ms', ARGV[base + 5])
     if ARGV[base + 2] ~= '' then
         redis.call('HSET', key, 'current_difficulty', ARGV[base + 2])
+    end
+    if ARGV[base + 3] ~= '' then
+        redis.call('HSET', key, 'hash_rate', ARGV[base + 3])
     end
     redis.call('EXPIRE', key, ttl)
 end
 return #KEYS
 "#;
 
-/// Sampler write. `ARGV[1]` = TTL seconds, then one hashrate per key.
+/// Watchdog write. `ARGV[1]` = TTL seconds, then one hashrate per key.
 /// The conditional EXPIRE is the immortal-key guard only: it fires when
 /// this HSET created the key (TTL == -1), never to refresh a live one.
 const HASHRATE_LIVE_LUA: &str = r#"
@@ -74,18 +77,19 @@ struct Batch {
     args: Vec<String>,
 }
 
-/// Chunked touch batches, stride 4 (see [`TOUCH_LIVE_LUA`]).
+/// Chunked touch batches, stride 5 (see [`TOUCH_LIVE_LUA`]).
 fn build_touch_batches(snapshot: &HashMap<TouchKey, TouchEntry>) -> Vec<Batch> {
     let entries: Vec<(&TouchKey, &TouchEntry)> = snapshot.iter().collect();
     entries
         .chunks(CHUNK)
         .map(|chunk| {
             let mut keys = Vec::with_capacity(chunk.len());
-            let mut args = Vec::with_capacity(chunk.len() * 4);
+            let mut args = Vec::with_capacity(chunk.len() * 5);
             for (k, v) in chunk {
                 keys.push(client_live_key(&k.address, &k.client_name, &k.session_id));
                 args.push(v.share_diff.to_string());
                 args.push(v.current_diff.map(|d| d.to_string()).unwrap_or_default());
+                args.push(v.hash_rate.map(|r| r.to_string()).unwrap_or_default());
                 args.push(v.channel_count.to_string());
                 args.push(v.updated_at_ms.to_string());
             }
@@ -94,7 +98,7 @@ fn build_touch_batches(snapshot: &HashMap<TouchKey, TouchEntry>) -> Vec<Batch> {
         .collect()
 }
 
-/// Chunked sampler batches, stride 1 (see [`HASHRATE_LIVE_LUA`]).
+/// Chunked watchdog batches, stride 1 (see [`HASHRATE_LIVE_LUA`]).
 fn build_hashrate_batches(writes: &[(TouchKey, f64)]) -> Vec<Batch> {
     writes
         .chunks(CHUNK)
@@ -157,7 +161,7 @@ impl LiveSessionStore {
             .await
     }
 
-    /// Mirror one sampler pass into the live hashes. Same all-chunks
+    /// Mirror one watchdog pass into the live hashes. Same all-chunks
     /// rule as [`Self::write_touch_batch`].
     pub(crate) async fn write_hashrate_batch(
         &self,
@@ -205,6 +209,7 @@ mod tests {
         TouchEntry {
             share_diff: 100.5,
             current_diff: Some(64.0),
+            hash_rate: Some(5.0e12),
             channel_count: 2,
             updated_at_ms: 1_700_000_000_000,
         }
@@ -216,6 +221,7 @@ mod tests {
         for field in [
             F_BEST_DIFFICULTY,
             F_CURRENT_DIFFICULTY,
+            F_HASH_RATE,
             F_CHANNEL_COUNT,
             F_UPDATED_AT_MS,
         ] {
@@ -228,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn touch_batch_layout_is_stride_four_per_key() {
+    fn touch_batch_layout_is_stride_five_per_key() {
         let mut snap = HashMap::new();
         snap.insert(key(1), entry());
         let batches = build_touch_batches(&snap);
@@ -236,8 +242,8 @@ mod tests {
         assert_eq!(batches[0].keys.len(), 1);
         assert_eq!(
             batches[0].args,
-            vec!["100.5", "64", "2", "1700000000000"],
-            "stride must be best, current, channels, updated_at"
+            vec!["100.5", "64", "5000000000000", "2", "1700000000000"],
+            "stride must be best, current, hashrate, channels, updated_at"
         );
     }
 
@@ -248,11 +254,13 @@ mod tests {
             key(1),
             TouchEntry {
                 current_diff: None,
+                hash_rate: None,
                 ..entry()
             },
         );
         let batches = build_touch_batches(&snap);
         assert_eq!(batches[0].args[1], "", "None sentinel is the empty string");
+        assert_eq!(batches[0].args[2], "", "None sentinel is the empty string");
     }
 
     /// A failing first chunk does not stop the second from being written.
@@ -303,7 +311,7 @@ mod tests {
         let batches = build_touch_batches(&snap);
         assert_eq!(batches.len(), 2, "CHUNK+1 entries need a second invocation");
         assert_eq!(batches[0].keys.len() + batches[1].keys.len(), CHUNK + 1);
-        assert_eq!(batches[0].args.len(), batches[0].keys.len() * 4);
+        assert_eq!(batches[0].args.len(), batches[0].keys.len() * 5);
 
         let writes: Vec<(TouchKey, f64)> = (0..CHUNK + 1).map(|n| (key(n), 1.0)).collect();
         let batches = build_hashrate_batches(&writes);

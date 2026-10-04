@@ -236,7 +236,7 @@ pub async fn live_keys_exist<S: SessionKey>(
 pub struct LiveFields {
     pub hash_rate: f64,
     pub current_difficulty: Option<f64>,
-    /// `None` on a sampler-created partial hash — render as 1 channel.
+    /// `None` on a watchdog-created partial hash — render as 1 channel.
     pub channel_count: Option<i32>,
     pub best_difficulty: f64,
     /// Epoch-ms of the freshest accepted share.
@@ -389,7 +389,7 @@ mod tests {
 
     #[test]
     fn live_fields_parse_tolerates_partial_hashes() {
-        // Sampler-created hash: only hash_rate.
+        // Watchdog-created hash: only hash_rate.
         let lf = parse_live_fields(vec![("hash_rate".into(), "1234.5".into())]).unwrap();
         assert_eq!(lf.hash_rate, 1234.5);
         assert_eq!(

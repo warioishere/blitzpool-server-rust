@@ -11,8 +11,8 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 /// Expected hashes per unit of difficulty-1 work (`2^32`). `Σdifficulty ×
-/// this / seconds` is a hashrate in H/s — the one conversion vardiff, the
-/// live hashrate sampler and the API charts all use.
+/// this / seconds` is a hashrate in H/s — the one conversion vardiff and the
+/// API charts both use.
 pub const HASHES_PER_DIFFICULTY_1: f64 = 4_294_967_296.0;
 
 /// Bitcoin Core's default P2PKH dust limit; smaller outputs are non-standard.
