@@ -75,7 +75,7 @@ pub(crate) fn build_noise_config(cfg: &AppConfig) -> Result<NoiseConfig, Stratum
 pub(crate) fn generate_authority_key() -> Result<(String, String), getrandom::Error> {
     loop {
         let mut secret = [0u8; 32];
-        getrandom::getrandom(&mut secret)?;
+        getrandom::fill(&mut secret)?;
         let hex_str = hex::encode(secret);
         // Only a zero or out-of-range scalar fails; draw again.
         if let Ok(noise) = noise_config_from_hex(&hex_str) {

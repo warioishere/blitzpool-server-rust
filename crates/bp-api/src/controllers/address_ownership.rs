@@ -317,7 +317,7 @@ fn ownership_error(code: &'static str, status: StatusCode) -> ApiError {
 
 pub(crate) fn random_nonce() -> String {
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).expect("OS CSPRNG");
+    getrandom::fill(&mut bytes).expect("OS CSPRNG");
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 

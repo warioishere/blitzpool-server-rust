@@ -144,7 +144,7 @@ fn parse_session_id(hex_id: &str) -> [u8; 4] {
 /// the RNG fails: a fixed id is better than dropping the connection.
 pub(crate) fn random_session_id_hex() -> String {
     let mut bytes = [0u8; 4];
-    getrandom::getrandom(&mut bytes).unwrap_or_default();
+    getrandom::fill(&mut bytes).unwrap_or_default();
     let n = u32::from_be_bytes(bytes);
     format!("{:08x}", n)
 }

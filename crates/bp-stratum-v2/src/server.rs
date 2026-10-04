@@ -325,7 +325,7 @@ impl StratumV2MiningServer {
     /// `client_entity.sessionId` carry the same 8-char hex string.
     fn alloc_session_id(&self) -> u32 {
         let mut bytes = [0u8; 4];
-        getrandom::getrandom(&mut bytes).unwrap_or_default();
+        getrandom::fill(&mut bytes).unwrap_or_default();
         u32::from_be_bytes(bytes)
     }
 }

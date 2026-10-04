@@ -31,7 +31,7 @@ impl AdminToken {
     /// The caller persists only the hash and shows the plaintext once.
     pub fn generate() -> Result<Self, TokenError> {
         let mut bytes = [0u8; 24];
-        getrandom::getrandom(&mut bytes).map_err(|e| TokenError::Csprng(e.to_string()))?;
+        getrandom::fill(&mut bytes).map_err(|e| TokenError::Csprng(e.to_string()))?;
         Ok(Self(format!("GRP-{}", hex::encode(bytes))))
     }
 
@@ -54,7 +54,7 @@ impl AdminToken {
 impl InvitationToken {
     pub fn generate() -> Result<Self, TokenError> {
         let mut bytes = [0u8; 32];
-        getrandom::getrandom(&mut bytes).map_err(|e| TokenError::Csprng(e.to_string()))?;
+        getrandom::fill(&mut bytes).map_err(|e| TokenError::Csprng(e.to_string()))?;
         Ok(Self(hex::encode(bytes)))
     }
 

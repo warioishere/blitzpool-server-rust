@@ -257,7 +257,7 @@ fn challenge_message(address: &str, nonce: &str, now: i64, expires_at: i64) -> S
 
 fn random_token() -> String {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).expect("OS CSPRNG");
+    getrandom::fill(&mut bytes).expect("OS CSPRNG");
     hex::encode(bytes)
 }
 

@@ -183,7 +183,7 @@ impl TokenStore {
         if let Some(ref mut rng) = self.rng {
             rng(&mut bytes[TOKEN_COUNTER_LEN..]).map_err(TokenAllocError::EntropyFailed)?;
         } else {
-            getrandom::getrandom(&mut bytes[TOKEN_COUNTER_LEN..])
+            getrandom::fill(&mut bytes[TOKEN_COUNTER_LEN..])
                 .map_err(|e| TokenAllocError::EntropyFailed(e.to_string()))?;
         }
         Ok(Token(bytes))

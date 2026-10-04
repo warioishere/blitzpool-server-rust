@@ -232,6 +232,6 @@ fn generate_token() -> String {
     // URL-safe, fits in the 64-char `pplns_email_verification.token`
     // column with margin.
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).expect("OS CSPRNG");
+    getrandom::fill(&mut bytes).expect("OS CSPRNG");
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
