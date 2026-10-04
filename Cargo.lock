@@ -610,7 +610,7 @@ version = "2.3.9"
 dependencies = [
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bip322",
  "bitcoin",
  "bp-bitcoin",
@@ -909,7 +909,7 @@ name = "bp-notifications"
 version = "2.3.9"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bp-client-live",
  "bp-common",
  "bp-cron-utils",
