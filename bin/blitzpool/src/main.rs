@@ -1486,8 +1486,11 @@ fn print_config_error_help(err: &ConfigError) {
         }
         ConfigError::Parse { .. } => {
             eprintln!(
-                "hint: unknown-field errors come from a typo in the TOML \
-                 key. Compare your file against `blitzpool.example.toml`."
+                "hint: the excerpt above marks where the file stops matching \
+                 the schema: a misspelled or retired key, a required key that \
+                 is missing, or a value of the wrong type. \
+                 `blitzpool.full.example.toml` lists every section and key; \
+                 after an upgrade, the release notes list the renamed keys."
             );
         }
     }
