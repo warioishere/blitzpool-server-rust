@@ -87,7 +87,7 @@ serde_json = { version = "1", features = ["raw_value"] }
 simd-json = { version = "0.17", default-features = false, features = ["serde_impl", "swar-number-parsing"] }
 bytes = "1"
 hex = "0.4"
-faster-hex = { version = "0.10", default-features = false, features = ["std"] }
+faster-hex = { version = "1.0", default-features = false, features = ["std"] }
 smallvec = { version = "1", features = ["union", "const_generics"] }
 parking_lot = "0.12"
 # Zero-alloc composite-key lookups (Equivalent trait) on the share hot path.
