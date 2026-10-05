@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bp_common::AddressId;
+use bp_db::pg_text;
 use bp_share_hook::{
     RejectedReason, SharedAcceptedShare, SharedAcceptedShareSink, SharedRejectedShare,
     SharedRejectedShareSink,
@@ -45,9 +46,10 @@ impl SharedAcceptedShareSink for ShareStatsAcceptedSink {
             Ok(a) => a,
             Err(_) => return, // pre-authorize-rejected shapes can't be keyed
         };
+        let worker = pg_text(share.worker);
         let key = ClientStatisticsKey {
             address: address_id.clone(),
-            client_name: share.worker.to_string(),
+            client_name: worker.to_string(),
             session_id: share.session_id.to_string(),
             slot,
         };
@@ -61,14 +63,15 @@ impl SharedAcceptedShareSink for ShareStatsAcceptedSink {
         );
         // Best difficulty tracks the solved difficulty, which can exceed the
         // credited one.
+        let user_agent = share.user_agent.map(pg_text);
         self.accumulators.best_difficulty.add(
             &address_id,
             share.submission_difficulty,
-            share.user_agent,
+            user_agent.as_deref(),
         );
         self.accumulators
             .share_totals
-            .add(address_id, share.worker.to_string(), diff);
+            .add(address_id, worker.into_owned(), diff);
     }
 }
 
@@ -103,6 +106,7 @@ impl SharedRejectedShareSink for ShareStatsRejectedSink {
         let (Some(addr), Some(worker)) = (share.address, share.worker) else {
             return;
         };
+        let worker = pg_text(worker);
         let address_id = match AddressId::new(addr.to_string()) {
             Ok(a) => a,
             Err(_) => return,

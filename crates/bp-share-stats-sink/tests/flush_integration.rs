@@ -10,7 +10,9 @@
 use std::sync::Arc;
 
 use bp_common::{AddressId, MiningMode};
+use bp_share_hook::{SharedAcceptedShare, SharedAcceptedShareSink};
 use bp_share_stats_sink::flush::{flush_once, Accumulators, FlushScope, Flusher};
+use bp_share_stats_sink::ShareStatsAcceptedSink;
 use bp_stats::{
     ClientStatisticsKey, ClientStatisticsRecord, FlushHealth, FlushHealthMonitor, RejectedReason,
     TimeSlot,
@@ -516,4 +518,83 @@ async fn a_failed_flush_hands_everything_back_for_the_next_one() {
     assert_eq!(shares, 10.0);
     assert_eq!(accepted, 10.0);
     assert_eq!((total, best), (10.0, 64.0));
+}
+
+/// A worker name with a NUL byte, which Postgres text rejects, neither
+/// fails the flush nor holds back anyone else's rows.
+#[tokio::test]
+async fn a_nul_byte_in_a_worker_name_does_not_block_the_flush() {
+    let _guard = FLUSH_TEST_LOCK.lock().await;
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let slot = TimeSlot::from_millis(32_503_680_800_000);
+    let prefix = "test_flush_nul_";
+    cleanup(&pool, slot.as_millis(), prefix).await;
+    let alice = format!("{prefix}alice");
+    let bob = format!("{prefix}bob");
+
+    let accs = Arc::new(Accumulators::default());
+    let sink = ShareStatsAcceptedSink::new(accs.clone());
+    for (address, worker, ua) in [
+        (alice.as_str(), "rig\0x", "bitaxe\0"),
+        (bob.as_str(), "rig", "bitaxe"),
+    ] {
+        sink.record_accepted(SharedAcceptedShare {
+            address,
+            worker,
+            session_id: "s1",
+            effective_difficulty: 10.0,
+            submission_difficulty: 64.0,
+            user_agent: Some(ua),
+            is_block_candidate: false,
+            hash_rate: 0.0,
+            channel_count: 1,
+            ts_ms: 0,
+            share_id: "",
+            mode: bp_common::MiningMode::Solo,
+            group_id: None,
+        })
+        .await;
+    }
+    // Only the client rows are under test; keep the pool rows out of the real slot.
+    accs.pool_shares.take();
+    accs.pool_mode_hashrate.take();
+
+    let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
+    flush_once(&pool, &accs, &health, FlushScope::All).await;
+
+    let workers: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT address, "clientName" FROM worker_shares_entity
+           WHERE address LIKE $1 ORDER BY address"#,
+    )
+    .bind(format!("{prefix}%"))
+    .fetch_all(&pool)
+    .await
+    .expect("read workers");
+    let clients: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM client_statistics_entity WHERE address LIKE $1"#,
+    )
+    .bind(format!("{prefix}%"))
+    .fetch_one(&pool)
+    .await
+    .expect("read clients");
+    let ua: Option<String> = sqlx::query_scalar(
+        r#"SELECT "bestDifficultyUserAgent" FROM address_settings_entity WHERE address = $1"#,
+    )
+    .bind(&alice)
+    .fetch_one(&pool)
+    .await
+    .expect("read ua");
+    cleanup(&pool, slot.as_millis(), prefix).await;
+
+    assert_eq!(
+        workers,
+        vec![
+            (alice.clone(), "rig\u{FFFD}x".to_string()),
+            (bob.clone(), "rig".to_string()),
+        ]
+    );
+    assert_eq!(clients, 2, "both client rows written");
+    assert_eq!(ua.as_deref(), Some("bitaxe\u{FFFD}"));
 }

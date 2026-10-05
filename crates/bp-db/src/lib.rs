@@ -19,8 +19,10 @@ mod pool_stats;
 mod pplns;
 mod redis_backup;
 mod stats_writes;
+mod text;
 
 pub use pool::{with_boot_policy, Db, DbConfig, DbError};
+pub use text::pg_text;
 
 pub use redis_backup::{
     fetch_redis_backup, insert_redis_backup, latest_redis_backup_captured_at,

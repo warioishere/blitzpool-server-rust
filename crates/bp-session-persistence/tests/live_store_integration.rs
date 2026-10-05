@@ -710,3 +710,45 @@ async fn a_failed_best_write_still_refreshes_the_live_hash() {
         "the live hash is written although the best write failed: {hash:?}"
     );
 }
+
+/// A session whose worker name carries a NUL byte, which Postgres text
+/// rejects, does not hold back the other sessions' bests.
+#[tokio::test]
+async fn a_nul_byte_in_one_worker_name_does_not_block_the_other_bests() {
+    let Some(pool) = pg_or_skip().await else {
+        return;
+    };
+    let Some(redis) = connect_redis_in_range_or_skip(redis_db::SESSION_PERSISTENCE, 11).await
+    else {
+        return;
+    };
+    let prefix = "test_lv_nul_";
+    cleanup(&pool, prefix).await;
+
+    let handle = spawn_engine(&pool, redis).await;
+    let healthy = format!("{prefix}alice");
+    handle
+        .session_persistence_hook()
+        .register_session("sessL030", &healthy, "rig1", None)
+        .await;
+    handle.flush_births_now().await;
+
+    let sink = handle.client_row_touch_sink();
+    sink.record_accepted(share(&healthy, "rig1", "sessL030", 700.0, 512.0, 1))
+        .await;
+    sink.record_accepted(share(
+        &format!("{prefix}bob"),
+        "rig\0x",
+        "sessL031",
+        900.0,
+        512.0,
+        1,
+    ))
+    .await;
+    handle.flush_touches_now().await;
+
+    assert_eq!(row_best(&pool, "sessL030").await, 700.0);
+
+    handle.shutdown().await;
+    cleanup(&pool, prefix).await;
+}

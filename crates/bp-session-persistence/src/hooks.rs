@@ -81,9 +81,12 @@ impl ClientRowTouchSink {
 #[async_trait]
 impl SharedAcceptedShareSink for ClientRowTouchSink {
     async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
+        // The worker keys the row's best write too, which Postgres rejects
+        // with a NUL in it.
+        let worker = bp_db::pg_text(share.worker);
         let key = TouchKeyRef {
             address: share.address,
-            client_name: share.worker,
+            client_name: &worker,
             session_id: share.session_id,
         };
         // `effective_difficulty` is the session's current vardiff target.
