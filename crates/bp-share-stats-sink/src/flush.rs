@@ -72,12 +72,10 @@ pub async fn flush_once(
     flush_pool_shares(pool, accs, health).await;
     flush_pool_mode_hashrate(pool, accs, health).await;
     flush_pool_rejected(pool, accs, health).await;
-    // The rejected-diff fan-out rides the worker_totals upsert, keeping
-    // `worker_shares_entity` writes serial (no row-lock contention).
-    let worker_rejected_fanout = flush_client_statistics(pool, accs, health, batch_size).await;
+    flush_client_statistics(pool, accs, health, batch_size).await;
     flush_client_rejected(pool, accs, health).await;
     flush_address_settings(pool, accs, health).await;
-    flush_worker_totals(pool, accs, health, &worker_rejected_fanout).await;
+    flush_worker_totals(pool, accs, health).await;
 }
 
 async fn flush_pool_shares(
@@ -175,18 +173,16 @@ async fn flush_pool_rejected(
     }
 }
 
-/// Returns the rejected difficulty per `(address, clientName)` from the
-/// confirmed rows, for [`flush_worker_totals`] to add to `rejectedShares`.
 async fn flush_client_statistics(
     pool: &PgPool,
     accs: &Accumulators,
     health: &Arc<std::sync::Mutex<FlushHealthMonitor<Flusher>>>,
     batch_size: usize,
-) -> HashMap<(String, String), f64> {
+) {
     let snapshot = accs.client_statistics.drain();
     if snapshot.is_empty() {
         record_success(health, Flusher::ClientStatistics);
-        return HashMap::new();
+        return;
     }
     let rows: Vec<ClientStatsUpsert> = snapshot
         .iter()
@@ -229,19 +225,7 @@ async fn flush_client_statistics(
             }
         }
     }
-    let mut worker_rejected: HashMap<(String, String), f64> = HashMap::new();
     if !confirmed_keys.is_empty() {
-        // Confirmed slice only, so unwritten data never reaches worker_shares.
-        for key in &confirmed_keys {
-            if let Some(rec) = snapshot.get(*key) {
-                let total = rec.rejected_diff_total();
-                if total > 0.0 {
-                    *worker_rejected
-                        .entry((key.address.as_str().to_string(), key.client_name.clone()))
-                        .or_insert(0.0) += total;
-                }
-            }
-        }
         let partial: bp_stats::ClientStatisticsSnapshot = confirmed_keys
             .iter()
             .map(|k| ((*k).clone(), snapshot.get(*k).cloned().unwrap_or_default()))
@@ -253,7 +237,6 @@ async fn flush_client_statistics(
     } else {
         record_success(health, Flusher::ClientStatistics);
     }
-    worker_rejected
 }
 
 async fn flush_client_rejected(
@@ -343,14 +326,16 @@ async fn flush_address_settings(
     }
 }
 
+/// Accepted and rejected deltas per worker in one upsert; both buffers are
+/// confirmed only on success.
 async fn flush_worker_totals(
     pool: &PgPool,
     accs: &Accumulators,
     health: &Arc<std::sync::Mutex<FlushHealthMonitor<Flusher>>>,
-    rejected_fanout: &HashMap<(String, String), f64>,
 ) {
     let snapshot = accs.share_totals.drain_workers();
-    if snapshot.is_empty() && rejected_fanout.is_empty() {
+    let rejected = accs.share_totals.drain_workers_rejected();
+    if snapshot.is_empty() && rejected.is_empty() {
         record_success(health, Flusher::WorkerTotals);
         return;
     }
@@ -359,14 +344,14 @@ async fn flush_worker_totals(
     for (key, delta) in &snapshot {
         merged
             .entry((key.address.as_str().to_string(), key.client_name.clone()))
-            .and_modify(|(s, _)| *s += *delta)
-            .or_insert((*delta, 0.0));
+            .or_default()
+            .0 += *delta;
     }
-    for (key, rejected) in rejected_fanout {
+    for (key, delta) in &rejected {
         merged
-            .entry(key.clone())
-            .and_modify(|(_, r)| *r += *rejected)
-            .or_insert((0.0, *rejected));
+            .entry((key.address.as_str().to_string(), key.client_name.clone()))
+            .or_default()
+            .1 += *delta;
     }
 
     let rows: Vec<WorkerSharesUpsert> = merged
@@ -383,6 +368,7 @@ async fn flush_worker_totals(
     match bulk_upsert_worker_shares_entity(pool, &rows).await {
         Ok(_) => {
             accs.share_totals.confirm_workers(&snapshot);
+            accs.share_totals.confirm_workers_rejected(&rejected);
             record_success(health, Flusher::WorkerTotals);
         }
         Err(e) => {

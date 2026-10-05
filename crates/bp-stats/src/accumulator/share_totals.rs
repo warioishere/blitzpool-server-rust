@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Lifetime share totals per address and per worker, in two buffers because
-//! they flush to different tables.
+//! Lifetime share totals per address and per worker, plus the rejected
+//! difficulty per worker. The address total flushes to its own table.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -23,6 +23,7 @@ pub type AddressTotalsSnapshot = HashMap<AddressId, f64>;
 pub struct ShareTotalsAccumulator {
     address: Mutex<NumberDeltaBuffer<AddressId>>,
     worker: Mutex<NumberDeltaBuffer<WorkerKey>>,
+    worker_rejected: Mutex<NumberDeltaBuffer<WorkerKey>>,
 }
 
 impl Default for ShareTotalsAccumulator {
@@ -36,6 +37,7 @@ impl ShareTotalsAccumulator {
         Self {
             address: Mutex::new(NumberDeltaBuffer::new()),
             worker: Mutex::new(NumberDeltaBuffer::new()),
+            worker_rejected: Mutex::new(NumberDeltaBuffer::new()),
         }
     }
 
@@ -60,6 +62,11 @@ impl ShareTotalsAccumulator {
         );
     }
 
+    /// Rejected difficulty of one share, added to the worker's lifetime total.
+    pub fn add_worker_rejected(&self, key: WorkerKey, diff: f64) {
+        self.worker_rejected.lock().add(key, diff);
+    }
+
     // ─── Coordinator drain / confirm ────────────────────────────────
 
     pub fn drain_addresses(&self) -> AddressTotalsSnapshot {
@@ -76,6 +83,14 @@ impl ShareTotalsAccumulator {
 
     pub fn confirm_workers(&self, snapshot: &WorkerTotalsSnapshot) {
         self.worker.lock().confirm(snapshot);
+    }
+
+    pub fn drain_workers_rejected(&self) -> WorkerTotalsSnapshot {
+        self.worker_rejected.lock().drain()
+    }
+
+    pub fn confirm_workers_rejected(&self, snapshot: &WorkerTotalsSnapshot) {
+        self.worker_rejected.lock().confirm(snapshot);
     }
 }
 

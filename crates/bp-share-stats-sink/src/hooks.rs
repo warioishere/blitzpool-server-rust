@@ -13,7 +13,7 @@ use bp_share_hook::{
     SharedRejectedShareSink,
 };
 use bp_stats::{
-    ClientRejectedKey, ClientStatisticsKey, ClientStatisticsRecord, TimeSlot,
+    ClientRejectedKey, ClientStatisticsKey, ClientStatisticsRecord, TimeSlot, WorkerKey,
     MAX_REASONABLE_DIFFICULTY,
 };
 
@@ -117,6 +117,14 @@ impl SharedRejectedShareSink for ShareStatsRejectedSink {
                 reason,
             },
             1.0,
+            difficulty,
+        );
+
+        self.accumulators.share_totals.add_worker_rejected(
+            WorkerKey {
+                address: address_id.clone(),
+                client_name: worker.to_string(),
+            },
             difficulty,
         );
 

@@ -4,16 +4,18 @@
 #![allow(clippy::needless_return)]
 
 //! Statistics-coordinator edge cases: batch splitting, special characters in
-//! `clientName`, and the per-worker rejected-diff fan-out into
+//! `clientName`, and the per-worker rejected difficulty in
 //! `worker_shares_entity`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use bp_common::AddressId;
+use bp_share_hook::{RejectedReason, SharedRejectedShare, SharedRejectedShareSink};
 use bp_share_stats_sink::config::StatsSinkConfig;
 use bp_share_stats_sink::engine::ShareStatsEngine;
 use bp_share_stats_sink::flush::{flush_once, Accumulators};
+use bp_share_stats_sink::ShareStatsRejectedSink;
 use bp_stats::{ClientStatisticsKey, ClientStatisticsRecord, FlushHealthMonitor, TimeSlot};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use tokio::sync::Mutex;
@@ -181,10 +183,39 @@ async fn client_name_with_special_chars_roundtrips_through_unnest() {
     cleanup(&pool, prefix).await;
 }
 
-// ── rejected fan-out per worker ──────────────────────────────────────
+// ── rejected difficulty per worker ───────────────────────────────────
+
+/// Empties the pool-wide accumulators: the sink books every reject into the
+/// current real slot, and only the worker row is under test here.
+fn drop_pool_rows(accs: &Accumulators) {
+    let pool = accs.pool_shares.drain();
+    accs.pool_shares.confirm(&pool);
+    let rejected = accs.pool_rejected.drain();
+    accs.pool_rejected.confirm(&rejected);
+}
+
+/// One reject from `session` through the sink, as the stream consumer feeds it.
+async fn reject(
+    accs: &Arc<Accumulators>,
+    address: &str,
+    session: &str,
+    reason: RejectedReason,
+    diff: f64,
+) {
+    ShareStatsRejectedSink::new(accs.clone())
+        .record_rejected(SharedRejectedShare {
+            address: Some(address),
+            worker: Some("wkr"),
+            session_id: session,
+            reason,
+            difficulty: diff,
+            group_id: None,
+        })
+        .await;
+}
 
 #[tokio::test]
-async fn rejected_diff_fanout_per_worker_aggregates_across_sessions() {
+async fn rejected_diff_per_worker_aggregates_across_sessions() {
     let _guard = SPEC_PORT_LOCK.lock().await;
     let Some(pool) = connect_or_skip().await else {
         return;
@@ -192,64 +223,36 @@ async fn rejected_diff_fanout_per_worker_aggregates_across_sessions() {
     let prefix = "test_spec_fanout_";
     cleanup(&pool, prefix).await;
 
-    // Same (address, clientName), 3 different sessions, with rejected
-    // diffs split across the 3 reason buckets. The post-flush fan-out
-    // must sum to (jnf + dup + low) across all 3 sessions and land in
-    // worker_shares_entity.rejectedShares as one combined delta.
-    let slot = TimeSlot::from_millis(32_503_680_300_000);
+    // One worker on three sessions, one reject reason each: the worker row
+    // carries the sum as one delta.
     let accs = Arc::new(Accumulators::default());
     let address = format!("{prefix}alice");
-    let client_name = "wkr".to_string();
-
-    let mk = |_session: &str, jnf: f64, dup: f64, low: f64| ClientStatisticsRecord {
-        rejected_count: 1.0,
-        rejected_job_not_found_diff1: jnf,
-        rejected_duplicate_share_diff1: dup,
-        rejected_low_difficulty_share_diff1: low,
-        ..Default::default()
-    };
-
-    for (session, jnf, dup, low) in [
-        ("sA", 10.0, 0.0, 0.0),
-        ("sB", 0.0, 20.0, 0.0),
-        ("sC", 0.0, 0.0, 30.0),
-    ] {
-        accs.client_statistics.add(
-            ClientStatisticsKey {
-                address: addr(&address),
-                client_name: client_name.clone(),
-                session_id: session.to_string(),
-                slot,
-            },
-            &mk(session, jnf, dup, low),
-        );
-    }
+    reject(&accs, &address, "sA", RejectedReason::JobNotFound, 10.0).await;
+    reject(&accs, &address, "sB", RejectedReason::DuplicateShare, 20.0).await;
+    reject(&accs, &address, "sC", RejectedReason::LowDifficulty, 30.0).await;
+    drop_pool_rows(&accs);
 
     let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
     flush_once(&pool, &accs, &health, 1000).await;
 
     let rejected: f64 = sqlx::query_scalar(
         r#"SELECT "rejectedShares" FROM worker_shares_entity
-           WHERE address = $1 AND "clientName" = $2"#,
+           WHERE address = $1 AND "clientName" = 'wkr'"#,
     )
     .bind(&address)
-    .bind(&client_name)
     .fetch_one(&pool)
     .await
     .expect("read");
     assert!(
         (rejected - 60.0).abs() < 0.01,
-        "rejected fan-out = 10 + 20 + 30 = 60: got {rejected}"
+        "rejected = 10 + 20 + 30 = 60: got {rejected}"
     );
 
     cleanup(&pool, prefix).await;
 }
 
-// ── all-zero fan-out is a no-op for worker_shares ────────────────────
-
 #[tokio::test]
-async fn rejected_fanout_skips_zero_rejected_diffs() {
-    // Zero rejected diffs and no accepted totals create no worker_shares row.
+async fn a_zero_difficulty_reject_writes_no_worker_row() {
     let _guard = SPEC_PORT_LOCK.lock().await;
     let Some(pool) = connect_or_skip().await else {
         return;
@@ -257,40 +260,23 @@ async fn rejected_fanout_skips_zero_rejected_diffs() {
     let prefix = "test_spec_zero_fanout_";
     cleanup(&pool, prefix).await;
 
-    let slot = TimeSlot::from_millis(32_503_680_400_000);
     let accs = Arc::new(Accumulators::default());
-    accs.client_statistics.add(
-        ClientStatisticsKey {
-            address: addr(&format!("{prefix}alice")),
-            client_name: "w".to_string(),
-            session_id: "s".to_string(),
-            slot,
-        },
-        &ClientStatisticsRecord {
-            shares: 10.0,
-            accepted_count: 1.0,
-            ..Default::default()
-        },
-    );
+    let address = format!("{prefix}alice");
+    reject(&accs, &address, "s", RejectedReason::Stale, 0.0).await;
+    drop_pool_rows(&accs);
 
     let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
     flush_once(&pool, &accs, &health, 1000).await;
 
     let row = sqlx::query_scalar::<_, Option<f64>>(
         r#"SELECT "rejectedShares" FROM worker_shares_entity
-           WHERE address = $1 AND "clientName" = $2"#,
+           WHERE address = $1 AND "clientName" = 'wkr'"#,
     )
-    .bind(format!("{prefix}alice"))
-    .bind("w")
+    .bind(&address)
     .fetch_optional(&pool)
     .await
     .expect("read");
-
-    // share_totals was never fed and the fan-out is empty: no write at all.
-    assert!(
-        row.is_none(),
-        "no worker_shares row expected with empty share_totals + zero rejected fan-out"
-    );
+    assert!(row.is_none(), "a zero-difficulty reject writes nothing");
 
     cleanup(&pool, prefix).await;
 }

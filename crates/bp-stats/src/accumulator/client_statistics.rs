@@ -48,18 +48,6 @@ pub struct ClientStatisticsRecord {
     pub max_difficulty: f64,
 }
 
-impl ClientStatisticsRecord {
-    /// Sum of every `*_diff1` field, written to the worker row. A new reason
-    /// MUST be added here too, or the worker total silently under-reports.
-    pub fn rejected_diff_total(&self) -> f64 {
-        self.rejected_job_not_found_diff1
-            + self.rejected_duplicate_share_diff1
-            + self.rejected_low_difficulty_share_diff1
-            + self.rejected_version_rolling_diff1
-            + self.rejected_stale_diff1
-    }
-}
-
 impl BufferRecord for ClientStatisticsRecord {
     fn is_zero(&self) -> bool {
         self.shares == 0.0
@@ -239,7 +227,6 @@ mod tests {
         assert_eq!(r.rejected_count, 1.0);
         assert_eq!(r.rejected_job_not_found_count, 1.0);
         assert_eq!(r.rejected_job_not_found_diff1, 7.0);
-        assert_eq!(r.rejected_diff_total(), 7.0);
     }
 
     #[test]
@@ -262,16 +249,5 @@ mod tests {
         acc.confirm(&snap);
         let residual = acc.drain();
         assert_eq!(residual.get(&k).map(|r| r.shares), Some(20.0));
-    }
-
-    #[test]
-    fn rejected_diff_total_is_sum_of_three_diff1_fields() {
-        let r = ClientStatisticsRecord {
-            rejected_job_not_found_diff1: 100.0,
-            rejected_duplicate_share_diff1: 50.0,
-            rejected_low_difficulty_share_diff1: 25.0,
-            ..Default::default()
-        };
-        assert_eq!(r.rejected_diff_total(), 175.0);
     }
 }

@@ -484,8 +484,7 @@ where
 
 /// One-shot seed of `worker_shares_entity` from `client_statistics_entity`;
 /// ON CONFLICT DO NOTHING makes a concurrent second seed harmless. Every
-/// `rejected*Diff1` column must be summed here, as in
-/// `bp_stats::ClientStatisticsRecord::rejected_diff_total`.
+/// `rejected*Diff1` column must be summed here.
 pub async fn seed_worker_shares_from_client_statistics<'e, E>(executor: E) -> Result<u64, DbError>
 where
     E: sqlx::PgExecutor<'e>,
