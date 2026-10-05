@@ -41,11 +41,19 @@ pub(crate) const STALE_CLIENT_CUTOFF: Duration = Duration::from_secs(5 * 60);
 
 /// Per-cron startup offsets, small primes so ticks of different crons
 /// rarely collide. Keep them distinct within each period family
-/// (60 s, 60 min, 24 h) so two crons of one family never align.
+/// (60 s, 60 min, 24 h) so two crons of one family never align. They count
+/// from process start, except `STATS_SINK_FLUSH`, which counts from each
+/// full wall-clock minute.
 pub(crate) mod offsets {
     use std::time::Duration;
     pub(crate) const KILL_DEAD: Duration = Duration::from_secs(0);
     pub(crate) const STATS_SINK_FLUSH: Duration = Duration::from_secs(17);
+    // An ended client slot reaches Postgres this long after its end; charts
+    // show it from the visibility buffer on, so a later write reads empty.
+    const _: () = assert!(
+        (STATS_SINK_FLUSH.as_millis() as i64) < bp_stats::CHART_VISIBILITY_BUFFER_MS,
+        "STATS_SINK_FLUSH must stay inside the chart visibility buffer"
+    );
     pub(crate) const OLD_STATS_CLEANUP: Duration = Duration::from_secs(7);
     pub(crate) const NETWORK_DIFFICULTY: Duration = Duration::from_secs(23);
     pub(crate) const HOURLY_STATS: Duration = Duration::from_secs(31);

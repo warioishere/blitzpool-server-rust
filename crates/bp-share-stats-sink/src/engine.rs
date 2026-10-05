@@ -149,12 +149,4 @@ mod tests {
             Duration::from_secs(47)
         );
     }
-
-    #[test]
-    fn an_ended_slot_is_written_inside_the_chart_visibility_buffer() {
-        let slot_end = bp_stats::TimeSlot::current().as_millis();
-        let wait = until_next_tick(slot_end, MIN, OFFSET);
-        let buffer = Duration::from_millis(bp_stats::CHART_VISIBILITY_BUFFER_MS as u64);
-        assert!(wait < buffer, "{wait:?}");
-    }
 }
