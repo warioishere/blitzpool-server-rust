@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Pool-wide share statistics: in-memory accumulators flushed every 60 s as
-//! bulk upserts into seven PG tables.
+//! bulk upserts into six PG tables.
 //! Mode-blind: every accepted and rejected share lands here, whatever the
 //! payout mode.
 

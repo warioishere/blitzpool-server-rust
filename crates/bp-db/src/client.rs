@@ -240,35 +240,6 @@ where
         .collect())
 }
 
-/// `client_rejected_statistics_entity` rows for one address from `since_ms`.
-pub async fn find_client_rejected_statistics_since_for_address(
-    pool: &PgPool,
-    address: &AddressId,
-    since_ms: i64,
-) -> Result<Vec<ClientRejectedStatisticsRow>, DbError> {
-    sqlx::query_as!(
-        ClientRejectedStatisticsRow,
-        r#"SELECT
-            "deletedAt" AS "deleted_at?",
-            "createdAt" AS "created_at!",
-            "updatedAt" AS "updated_at!",
-            id AS "id!",
-            address AS "address!: AddressId",
-            "time" AS "time!",
-            reason AS "reason!",
-            count AS "count!",
-            shares AS "shares!"
-           FROM client_rejected_statistics_entity
-           WHERE "deletedAt" IS NULL AND address = $1 AND "time" >= $2
-           ORDER BY "time" ASC"#,
-        address.as_str(),
-        since_ms,
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(DbError::from)
-}
-
 #[derive(Clone, Debug, FromRow)]
 pub struct ClientStatisticsRow {
     #[sqlx(rename = "deletedAt")]
@@ -352,22 +323,6 @@ pub async fn bulk_upsert_client_difficulty_statistics(
     .await
     .map_err(DbError::from)?;
     Ok(result.rows_affected())
-}
-
-#[derive(Clone, Debug, FromRow)]
-pub struct ClientRejectedStatisticsRow {
-    #[sqlx(rename = "deletedAt")]
-    pub deleted_at: Option<i64>,
-    #[sqlx(rename = "createdAt")]
-    pub created_at: i64,
-    #[sqlx(rename = "updatedAt")]
-    pub updated_at: i64,
-    pub id: i32,
-    pub address: AddressId,
-    pub time: i64,
-    pub reason: String,
-    pub count: f32,
-    pub shares: f32,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -768,21 +723,6 @@ where
     E: sqlx::PgExecutor<'e>,
 {
     let r = sqlx::query(r#"DELETE FROM client_statistics_entity WHERE "time" < $1"#)
-        .bind(cutoff_ms)
-        .execute(executor)
-        .await
-        .map_err(DbError::from)?;
-    Ok(r.rows_affected())
-}
-
-pub async fn delete_old_client_rejected_statistics<'e, E>(
-    executor: E,
-    cutoff_ms: i64,
-) -> Result<u64, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    let r = sqlx::query(r#"DELETE FROM client_rejected_statistics_entity WHERE "time" < $1"#)
         .bind(cutoff_ms)
         .execute(executor)
         .await

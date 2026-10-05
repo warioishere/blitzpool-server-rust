@@ -13,11 +13,11 @@ pub mod slot;
 
 pub use accumulator::{
     share_max, AddressTotalsSnapshot, BestDifficultyAccumulator, BestDifficultyEntry,
-    BestDifficultySnapshot, ClientRejectedAccumulator, ClientRejectedKey, ClientRejectedSnapshot,
-    ClientStatisticsAccumulator, ClientStatisticsKey, ClientStatisticsRecord,
-    ClientStatisticsSnapshot, PoolModeHashrateAccumulator, PoolModeHashrateSnapshot,
-    PoolRejectedAccumulator, PoolRejectedSnapshot, PoolSharesAccumulator, PoolSharesRecord,
-    PoolSharesSnapshot, RejectedReason, ShareTotalsAccumulator, WorkerKey, WorkerTotalsSnapshot,
+    BestDifficultySnapshot, ClientStatisticsAccumulator, ClientStatisticsKey,
+    ClientStatisticsRecord, ClientStatisticsSnapshot, PoolModeHashrateAccumulator,
+    PoolModeHashrateSnapshot, PoolRejectedAccumulator, PoolRejectedSnapshot, PoolSharesAccumulator,
+    PoolSharesRecord, PoolSharesSnapshot, RejectedReason, ShareTotalsAccumulator, WorkerKey,
+    WorkerTotalsSnapshot,
 };
 pub use buffer::{BufferRecord, NestedDeltaBuffer, NumberDeltaBuffer, RecordDeltaBuffer};
 pub use constants::{

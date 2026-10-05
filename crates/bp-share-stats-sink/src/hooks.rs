@@ -13,8 +13,7 @@ use bp_share_hook::{
     SharedRejectedShareSink,
 };
 use bp_stats::{
-    ClientRejectedKey, ClientStatisticsKey, ClientStatisticsRecord, TimeSlot, WorkerKey,
-    MAX_REASONABLE_DIFFICULTY,
+    ClientStatisticsKey, ClientStatisticsRecord, TimeSlot, WorkerKey, MAX_REASONABLE_DIFFICULTY,
 };
 
 use crate::flush::Accumulators;
@@ -109,16 +108,6 @@ impl SharedRejectedShareSink for ShareStatsRejectedSink {
             Ok(a) => a,
             Err(_) => return,
         };
-
-        self.accumulators.client_rejected.add(
-            ClientRejectedKey {
-                address: address_id.clone(),
-                slot,
-                reason,
-            },
-            1.0,
-            difficulty,
-        );
 
         self.accumulators.share_totals.add_worker_rejected(
             WorkerKey {

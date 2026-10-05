@@ -314,7 +314,6 @@ async fn engine_handles_repeated_empty_ticks_without_error() {
         bp_share_stats_sink::flush::Flusher::PoolModeHashrate,
         bp_share_stats_sink::flush::Flusher::PoolRejected,
         bp_share_stats_sink::flush::Flusher::ClientStatistics,
-        bp_share_stats_sink::flush::Flusher::ClientRejected,
         bp_share_stats_sink::flush::Flusher::AddressSettings,
         bp_share_stats_sink::flush::Flusher::WorkerTotals,
     ] {

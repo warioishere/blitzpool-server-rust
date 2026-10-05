@@ -1709,7 +1709,9 @@ fn jr_to_api_error(e: bp_group_mgmt_engine::JoinRequestServiceError) -> ApiError
 //
 // Over the group's current members, on the per-address slot grid.
 
-use crate::controllers::info::{rejected_by_reason_slots, RejectSlotsResponse};
+use crate::controllers::info::{
+    client_reject_samples, rejected_by_reason_slots, RejectSlotsResponse,
+};
 use crate::time_range::{
     accepted_slot_data, chart_slot_boundaries, max_difficulty_slot_data, ChartPoint, Range,
     SlotDataResponse,
@@ -1842,14 +1844,12 @@ async fn group_rejected(
             let mut rows = Vec::new();
             for a in &addrs {
                 rows.extend(
-                    bp_db::find_client_rejected_statistics_since_for_address(&s.pool, a, since)
-                        .await?,
+                    bp_db::find_client_statistics_since_for_address(&s.pool, a, since).await?,
                 );
             }
             Ok(rejected_by_reason_slots(
                 &chart_slot_boundaries(since),
-                rows.iter()
-                    .map(|r| (r.time, (r.reason.as_str(), r.count as f64, r.shares as f64))),
+                rows.iter().flat_map(client_reject_samples),
             ))
         })
         .await?;

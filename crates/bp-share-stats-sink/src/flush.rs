@@ -8,17 +8,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bp_db::{
-    bulk_upsert_address_settings, bulk_upsert_client_rejected_statistics_entity,
-    bulk_upsert_client_statistics_entity, bulk_upsert_pool_mode_hashrate,
-    bulk_upsert_pool_rejected_statistics, bulk_upsert_pool_share_statistics,
-    bulk_upsert_worker_shares_entity, AddressSettingsUpsert, ClientRejectedStatsUpsert,
+    bulk_upsert_address_settings, bulk_upsert_client_statistics_entity,
+    bulk_upsert_pool_mode_hashrate, bulk_upsert_pool_rejected_statistics,
+    bulk_upsert_pool_share_statistics, bulk_upsert_worker_shares_entity, AddressSettingsUpsert,
     ClientStatsUpsert, PoolModeHashrateUpsert, PoolRejectedStatsUpsert, PoolShareStatsUpsert,
     WorkerSharesUpsert,
 };
 use bp_stats::{
-    BestDifficultyAccumulator, ClientRejectedAccumulator, ClientStatisticsAccumulator,
-    FlushHealthMonitor, PoolModeHashrateAccumulator, PoolRejectedAccumulator,
-    PoolSharesAccumulator, ShareTotalsAccumulator,
+    BestDifficultyAccumulator, ClientStatisticsAccumulator, FlushHealthMonitor,
+    PoolModeHashrateAccumulator, PoolRejectedAccumulator, PoolSharesAccumulator,
+    ShareTotalsAccumulator,
 };
 use sqlx::PgPool;
 use tracing::warn;
@@ -31,7 +30,6 @@ pub enum Flusher {
     PoolModeHashrate,
     PoolRejected,
     ClientStatistics,
-    ClientRejected,
     AddressSettings,
     WorkerTotals,
 }
@@ -42,7 +40,6 @@ pub struct Accumulators {
     pub pool_mode_hashrate: PoolModeHashrateAccumulator,
     pub pool_rejected: PoolRejectedAccumulator,
     pub client_statistics: ClientStatisticsAccumulator,
-    pub client_rejected: ClientRejectedAccumulator,
     pub share_totals: ShareTotalsAccumulator,
     pub best_difficulty: BestDifficultyAccumulator,
 }
@@ -54,7 +51,6 @@ impl Default for Accumulators {
             pool_mode_hashrate: PoolModeHashrateAccumulator::new(),
             pool_rejected: PoolRejectedAccumulator::new(),
             client_statistics: ClientStatisticsAccumulator::new(),
-            client_rejected: ClientRejectedAccumulator::new(),
             share_totals: ShareTotalsAccumulator::new(),
             best_difficulty: BestDifficultyAccumulator::new(),
         }
@@ -73,7 +69,6 @@ pub async fn flush_once(
     flush_pool_mode_hashrate(pool, accs, health).await;
     flush_pool_rejected(pool, accs, health).await;
     flush_client_statistics(pool, accs, health, batch_size).await;
-    flush_client_rejected(pool, accs, health).await;
     flush_address_settings(pool, accs, health).await;
     flush_worker_totals(pool, accs, health).await;
 }
@@ -236,38 +231,6 @@ async fn flush_client_statistics(
         record_failure(health, Flusher::ClientStatistics);
     } else {
         record_success(health, Flusher::ClientStatistics);
-    }
-}
-
-async fn flush_client_rejected(
-    pool: &PgPool,
-    accs: &Accumulators,
-    health: &Arc<std::sync::Mutex<FlushHealthMonitor<Flusher>>>,
-) {
-    let snapshot = accs.client_rejected.drain();
-    if snapshot.is_empty() {
-        record_success(health, Flusher::ClientRejected);
-        return;
-    }
-    let rows: Vec<ClientRejectedStatsUpsert> = snapshot
-        .iter()
-        .map(|(key, rec)| ClientRejectedStatsUpsert {
-            address: key.address.as_str().to_string(),
-            time_ms: key.slot.as_millis(),
-            reason: key.reason.as_str().to_string(),
-            count: rec.count as f32,
-            shares: rec.shares as f32,
-        })
-        .collect();
-    match bulk_upsert_client_rejected_statistics_entity(pool, &rows).await {
-        Ok(_) => {
-            accs.client_rejected.confirm(&snapshot);
-            record_success(health, Flusher::ClientRejected);
-        }
-        Err(e) => {
-            warn!(error = %e, "client_rejected_statistics flush failed");
-            record_failure(health, Flusher::ClientRejected);
-        }
     }
 }
 

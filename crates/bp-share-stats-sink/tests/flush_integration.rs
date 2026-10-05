@@ -12,8 +12,8 @@ use std::sync::Arc;
 use bp_common::{AddressId, MiningMode};
 use bp_share_stats_sink::flush::{flush_once, Accumulators, Flusher};
 use bp_stats::{
-    ClientRejectedKey, ClientStatisticsKey, ClientStatisticsRecord, FlushHealth,
-    FlushHealthMonitor, RejectedReason, TimeSlot,
+    ClientStatisticsKey, ClientStatisticsRecord, FlushHealth, FlushHealthMonitor, RejectedReason,
+    TimeSlot,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use tokio::sync::Mutex;
@@ -64,10 +64,6 @@ async fn cleanup(pool: &PgPool, slot_time_ms: i64, addr_prefix: &str) {
         .execute(pool)
         .await;
     let _ = sqlx::query(r#"DELETE FROM client_statistics_entity WHERE address LIKE $1"#)
-        .bind(format!("{addr_prefix}%"))
-        .execute(pool)
-        .await;
-    let _ = sqlx::query(r#"DELETE FROM client_rejected_statistics_entity WHERE address LIKE $1"#)
         .bind(format!("{addr_prefix}%"))
         .execute(pool)
         .await;
@@ -128,15 +124,6 @@ async fn flush_once_drains_all_seven_tables_to_pg() {
             max_difficulty: 4096.0,
             ..Default::default()
         },
-    );
-    accs.client_rejected.add(
-        ClientRejectedKey {
-            address: addr(&format!("{prefix}alice")),
-            slot,
-            reason: RejectedReason::LowDifficulty,
-        },
-        1.0,
-        1.0,
     );
     accs.share_totals
         .add(addr(&format!("{prefix}alice")), "worker1".to_string(), 10.0);
@@ -204,19 +191,6 @@ async fn flush_once_drains_all_seven_tables_to_pg() {
     .expect("count cs rows");
     assert!(cs >= 1);
 
-    // Client-rejected.
-    let cr_count: f32 = sqlx::query_scalar(
-        r#"SELECT count FROM client_rejected_statistics_entity
-           WHERE address = $1 AND "time" = $2 AND reason = $3"#,
-    )
-    .bind(format!("{prefix}alice"))
-    .bind(slot.as_millis())
-    .bind("LowDifficultyShare")
-    .fetch_one(&pool)
-    .await
-    .expect("client_rejected row");
-    assert!((cr_count - 1.0).abs() < 0.01);
-
     // Address settings — incremented from 100.0 to 110.0.
     let addr_shares: f64 =
         sqlx::query_scalar(r#"SELECT shares FROM address_settings_entity WHERE address = $1"#)
@@ -245,7 +219,6 @@ async fn flush_once_drains_all_seven_tables_to_pg() {
             Flusher::PoolModeHashrate,
             Flusher::PoolRejected,
             Flusher::ClientStatistics,
-            Flusher::ClientRejected,
             Flusher::AddressSettings,
             Flusher::WorkerTotals,
         ] {

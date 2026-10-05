@@ -37,7 +37,4 @@ impl ReaderView {
     pub fn pending_client_statistics(&self) -> usize {
         self.accumulators.client_statistics.len()
     }
-    pub fn pending_client_rejected(&self) -> usize {
-        self.accumulators.client_rejected.len()
-    }
 }

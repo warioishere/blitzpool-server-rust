@@ -56,7 +56,6 @@ async fn cleanup(pool: &PgPool, slot_time_ms: i64, prefix: &str) {
     }
     for sql in [
         r#"DELETE FROM client_statistics_entity WHERE address LIKE $1"#,
-        r#"DELETE FROM client_rejected_statistics_entity WHERE address LIKE $1"#,
         r#"DELETE FROM worker_shares_entity WHERE address LIKE $1"#,
         r#"DELETE FROM address_settings_entity WHERE address LIKE $1"#,
     ] {

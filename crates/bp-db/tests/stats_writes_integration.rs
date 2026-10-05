@@ -7,13 +7,12 @@
 //! each test runs inside a rolled-back transaction.
 
 use bp_db::{
-    bulk_upsert_address_settings, bulk_upsert_client_rejected_statistics_entity,
-    bulk_upsert_client_statistics_entity, bulk_upsert_pool_mode_hashrate,
-    bulk_upsert_pool_rejected_statistics, bulk_upsert_pool_share_statistics,
-    bulk_upsert_worker_shares_entity, count_worker_shares, find_max_difficulty_since_for_addresses,
-    seed_worker_shares_from_client_statistics, AddressSettingsUpsert, ClientRejectedStatsUpsert,
-    ClientStatsUpsert, PoolModeHashrateUpsert, PoolRejectedStatsUpsert, PoolShareStatsUpsert,
-    WorkerSharesUpsert,
+    bulk_upsert_address_settings, bulk_upsert_client_statistics_entity,
+    bulk_upsert_pool_mode_hashrate, bulk_upsert_pool_rejected_statistics,
+    bulk_upsert_pool_share_statistics, bulk_upsert_worker_shares_entity, count_worker_shares,
+    find_max_difficulty_since_for_addresses, seed_worker_shares_from_client_statistics,
+    AddressSettingsUpsert, ClientStatsUpsert, PoolModeHashrateUpsert, PoolRejectedStatsUpsert,
+    PoolShareStatsUpsert, WorkerSharesUpsert,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 
@@ -422,48 +421,6 @@ async fn client_stats_distinct_keys_stay_independent() {
     .await
     .expect("count");
     assert_eq!(cnt, 2);
-
-    tx.rollback().await.expect("rollback");
-}
-
-// ── client_rejected_statistics ───────────────────────────────────────
-
-#[tokio::test]
-async fn client_rejected_stats_dual_field_increment() {
-    let Some(pool) = connect_or_skip().await else {
-        return;
-    };
-    let mut tx = pool.begin().await.expect("begin tx");
-    let slot = unique_slot(6);
-
-    let rows = vec![ClientRejectedStatsUpsert {
-        address: "test_crs_a".to_string(),
-        time_ms: slot,
-        reason: "low-difficulty".to_string(),
-        count: 2.0,
-        shares: 0.5,
-    }];
-    bulk_upsert_client_rejected_statistics_entity(&mut *tx, &rows)
-        .await
-        .expect("first");
-    bulk_upsert_client_rejected_statistics_entity(&mut *tx, &rows)
-        .await
-        .expect("second");
-
-    let row = sqlx::query(
-        r#"SELECT count, shares FROM client_rejected_statistics_entity
-           WHERE address = $1 AND "time" = $2 AND reason = $3"#,
-    )
-    .bind("test_crs_a")
-    .bind(slot)
-    .bind("low-difficulty")
-    .fetch_one(&mut *tx)
-    .await
-    .expect("read");
-    let count: f32 = row.get("count");
-    let shares: f32 = row.get("shares");
-    assert!((count - 4.0).abs() < 0.01);
-    assert!((shares - 1.0).abs() < 0.01);
 
     tx.rollback().await.expect("rollback");
 }

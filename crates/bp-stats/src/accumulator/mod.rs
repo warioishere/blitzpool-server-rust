@@ -5,7 +5,6 @@
 //! fail, so out-of-range or non-finite inputs are dropped silently.
 
 mod best_difficulty;
-mod client_rejected;
 mod client_statistics;
 mod pool_mode_hashrate;
 mod pool_rejected;
@@ -13,7 +12,6 @@ mod pool_shares;
 mod share_totals;
 
 pub use best_difficulty::{BestDifficultyAccumulator, BestDifficultyEntry, BestDifficultySnapshot};
-pub use client_rejected::{ClientRejectedAccumulator, ClientRejectedKey, ClientRejectedSnapshot};
 pub use client_statistics::{
     ClientStatisticsAccumulator, ClientStatisticsKey, ClientStatisticsRecord,
     ClientStatisticsSnapshot,

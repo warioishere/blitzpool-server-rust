@@ -47,7 +47,9 @@ pub(crate) fn routes() -> Router<SharedState> {
 
 // ─── time-range chart endpoints ──────────────────────────────────
 
-use crate::controllers::info::{rejected_by_reason_slots, RejectSlotsResponse};
+use crate::controllers::info::{
+    client_reject_samples, rejected_by_reason_slots, RejectSlotsResponse,
+};
 use crate::time_range::{
     accepted_slot_data, chart_slot_boundaries, fold_into_slots, max_difficulty_slot_data,
     sum_into_slots, ChartPoint, Range, SlotDataResponse,
@@ -225,12 +227,10 @@ async fn rejected(
                 let now = bp_common::now_ms();
                 let since = now - range.window_ms();
                 let rows =
-                    bp_db::find_client_rejected_statistics_since_for_address(&s.pool, &addr, since)
-                        .await?;
+                    bp_db::find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
                 Ok(rejected_by_reason_slots(
                     &chart_slot_boundaries(since),
-                    rows.iter()
-                        .map(|r| (r.time, (r.reason.as_str(), r.count as f64, r.shares as f64))),
+                    rows.iter().flat_map(client_reject_samples),
                 ))
             },
         )

@@ -47,7 +47,7 @@ async fn rejected_share_with_address_fans_into_four_accumulators() {
         pr.values().next().unwrap()[&RejectedReason::LowDifficulty],
         25.0
     );
-    assert_eq!(accs.client_rejected.drain().len(), 1);
+    assert_eq!(accs.share_totals.drain_workers_rejected().len(), 1);
     assert_eq!(accs.client_statistics.drain().len(), 1);
 }
 
@@ -64,7 +64,7 @@ async fn rejected_share_without_address_skips_per_address_buckets() {
         10.0
     );
     assert_eq!(accs.pool_rejected.drain().len(), 1);
-    assert_eq!(accs.client_rejected.drain().len(), 0);
+    assert_eq!(accs.share_totals.drain_workers_rejected().len(), 0);
     assert_eq!(accs.client_statistics.drain().len(), 0);
     assert_eq!(accs.share_totals.drain_addresses().len(), 0);
 }
@@ -87,7 +87,7 @@ async fn rejected_share_with_invalid_address_short_circuits() {
         5.0
     );
     assert_eq!(accs.pool_rejected.drain().len(), 1);
-    assert_eq!(accs.client_rejected.drain().len(), 0);
+    assert_eq!(accs.share_totals.drain_workers_rejected().len(), 0);
 }
 
 #[tokio::test]
@@ -107,7 +107,7 @@ async fn rejected_share_non_finite_difficulty_is_silently_discarded() {
 
     assert_eq!(accs.pool_shares.drain().len(), 0);
     assert_eq!(accs.pool_rejected.drain().len(), 0);
-    assert_eq!(accs.client_rejected.drain().len(), 0);
+    assert_eq!(accs.share_totals.drain_workers_rejected().len(), 0);
 }
 
 #[tokio::test]

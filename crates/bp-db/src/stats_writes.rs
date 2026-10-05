@@ -293,58 +293,6 @@ where
     Ok(result.rows_affected())
 }
 
-/// One row in a `client_rejected_statistics_entity` bulk-upsert.
-/// `count` is the share count (integer-valued real); `shares` is the
-/// diff sum.
-#[derive(Clone, Debug)]
-pub struct ClientRejectedStatsUpsert {
-    pub address: String,
-    pub time_ms: i64,
-    pub reason: String,
-    pub count: f32,
-    pub shares: f32,
-}
-
-pub async fn bulk_upsert_client_rejected_statistics_entity<'e, E>(
-    executor: E,
-    rows: &[ClientRejectedStatsUpsert],
-) -> Result<u64, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    if rows.is_empty() {
-        return Ok(0);
-    }
-    let addresses: Vec<String> = rows.iter().map(|r| r.address.clone()).collect();
-    let times: Vec<i64> = rows.iter().map(|r| r.time_ms).collect();
-    let reasons: Vec<String> = rows.iter().map(|r| r.reason.clone()).collect();
-    let counts: Vec<f32> = rows.iter().map(|r| r.count).collect();
-    let share_sums: Vec<f32> = rows.iter().map(|r| r.shares).collect();
-
-    let result = sqlx::query!(
-        r#"INSERT INTO client_rejected_statistics_entity
-             (address, "time", reason, count, shares, "updatedAt")
-           SELECT
-             u.a, u.t, u.r, u.c, u.s,
-             (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
-           FROM UNNEST($1::varchar[], $2::bigint[], $3::varchar[], $4::real[], $5::real[])
-             AS u(a, t, r, c, s)
-           ON CONFLICT (address, "time", reason) DO UPDATE
-           SET count      = client_rejected_statistics_entity.count  + EXCLUDED.count,
-               shares     = client_rejected_statistics_entity.shares + EXCLUDED.shares,
-               "updatedAt" = EXCLUDED."updatedAt""#,
-        &addresses,
-        &times,
-        &reasons,
-        &counts,
-        &share_sums,
-    )
-    .execute(executor)
-    .await
-    .map_err(DbError::from)?;
-    Ok(result.rows_affected())
-}
-
 // ── 2. Lifetime totals ──────────────────────────────────────────────
 
 /// One row in an `address_settings_entity` bulk-upsert. `delta_shares` is

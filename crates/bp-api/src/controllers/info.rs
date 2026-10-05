@@ -1058,6 +1058,48 @@ pub(crate) struct RejectSlotsResponse {
     slot_data: Vec<RejectedSlot>,
 }
 
+/// One `(time, (reason, count, diff1))` sample per reject reason of a
+/// `client_statistics_entity` row, the input [`rejected_by_reason_slots`]
+/// takes. The `match` makes a new `RejectedReason` a compile error here.
+pub(crate) fn client_reject_samples(
+    r: &bp_db::ClientStatisticsRow,
+) -> impl Iterator<Item = (i64, (&'static str, f64, f64))> + '_ {
+    use bp_stats::RejectedReason as R;
+    [
+        R::JobNotFound,
+        R::DuplicateShare,
+        R::LowDifficulty,
+        R::VersionRollingNotAllowed,
+        R::Stale,
+    ]
+    .into_iter()
+    .map(move |reason| {
+        let (count, diff1) = match reason {
+            R::JobNotFound => (
+                r.rejected_job_not_found_count,
+                r.rejected_job_not_found_diff1,
+            ),
+            R::DuplicateShare => (
+                r.rejected_duplicate_share_count,
+                r.rejected_duplicate_share_diff1,
+            ),
+            R::LowDifficulty => (
+                r.rejected_low_difficulty_share_count,
+                r.rejected_low_difficulty_share_diff1,
+            ),
+            R::VersionRollingNotAllowed => (
+                r.rejected_version_rolling_count,
+                r.rejected_version_rolling_diff1,
+            ),
+            R::Stale => (r.rejected_stale_count, r.rejected_stale_diff1),
+        };
+        (
+            r.time,
+            (reason.as_str(), f64::from(count), f64::from(diff1)),
+        )
+    })
+}
+
 pub(crate) fn rejected_by_reason_slots<'a>(
     boundaries: &[i64],
     samples: impl IntoIterator<Item = (i64, (&'a str, f64, f64))>,
@@ -1408,6 +1450,74 @@ mod slot_json_tests {
         assert_eq!(
             json(&rejected_slots(&BOUNDARIES, samples)),
             r#"{"slotData":[{"time":"2023-11-14T22:20:00.000Z","counts":{"DuplicateShare":0,"JobNotFound":3,"LowDifficultyShare":0.10000000149011612,"NotSubscribed":0,"OtherUnknown":3,"Stale":0,"UnauthorizedWorker":0,"VersionRollingNotAllowed":0}},{"time":"2023-11-14T22:30:00.000Z","counts":{"DuplicateShare":0,"JobNotFound":0,"LowDifficultyShare":0,"NotSubscribed":0,"OtherUnknown":0,"Stale":4,"UnauthorizedWorker":0,"VersionRollingNotAllowed":0}},{"time":"2023-11-14T22:40:00.000Z","counts":{"DuplicateShare":0,"JobNotFound":0,"LowDifficultyShare":0,"NotSubscribed":0,"OtherUnknown":0,"Stale":0,"UnauthorizedWorker":0,"VersionRollingNotAllowed":0}}]}"#
+        );
+    }
+
+    /// A client row with every reject column at zero except the given ones.
+    fn client_row(time: i64, worker: &str) -> bp_db::ClientStatisticsRow {
+        bp_db::ClientStatisticsRow {
+            deleted_at: None,
+            created_at: 0,
+            updated_at: 0,
+            id: 0,
+            address: bp_common::AddressId::new("bc1qalice".to_string()).unwrap(),
+            client_name: worker.to_string(),
+            session_id: "s".to_string(),
+            time,
+            shares: 0.0,
+            accepted_count: 0,
+            rejected_count: 0,
+            rejected_job_not_found_count: 0,
+            rejected_job_not_found_diff1: 0.0,
+            rejected_duplicate_share_count: 0,
+            rejected_duplicate_share_diff1: 0.0,
+            rejected_low_difficulty_share_count: 0,
+            rejected_low_difficulty_share_diff1: 0.0,
+            rejected_version_rolling_count: 0,
+            rejected_version_rolling_diff1: 0.0,
+            rejected_stale_count: 0,
+            rejected_stale_diff1: 0.0,
+            max_difficulty: 0.0,
+        }
+    }
+
+    /// The per-reason columns of `client_statistics_entity`, summed over
+    /// workers, give the JSON the per-address reject rows gave: the one
+    /// table the rejected charts read now carries the same numbers.
+    #[test]
+    fn client_reject_columns_match_the_per_reason_rows() {
+        let mut a = client_row(T0, "w1");
+        a.rejected_job_not_found_count = 2;
+        a.rejected_job_not_found_diff1 = 1.5;
+        a.rejected_stale_count = 1;
+        a.rejected_stale_diff1 = 0.25;
+        let mut b = client_row(T0, "w2");
+        b.rejected_job_not_found_count = 1;
+        b.rejected_job_not_found_diff1 = 0.5;
+        b.rejected_version_rolling_count = 3;
+        b.rejected_version_rolling_diff1 = 6.0;
+        let mut c = client_row(T0 + S + 7, "w1");
+        c.rejected_duplicate_share_count = 4;
+        c.rejected_duplicate_share_diff1 = 2.0;
+        c.rejected_low_difficulty_share_count = 5;
+        c.rejected_low_difficulty_share_diff1 = 1.25;
+        // Accepted-only row: contributes nothing.
+        let d = client_row(T0 + S, "w3");
+        let rows = [a, b, c, d];
+
+        let per_reason_rows = vec![
+            (T0, ("JobNotFound", 3.0, 2.0)),
+            (T0, ("Stale", 1.0, 0.25)),
+            (T0, ("VersionRollingNotAllowed", 3.0, 6.0)),
+            (T0 + S + 7, ("DuplicateShare", 4.0, 2.0)),
+            (T0 + S + 7, ("LowDifficultyShare", 5.0, 1.25)),
+        ];
+        assert_eq!(
+            json(&rejected_by_reason_slots(
+                &BOUNDARIES,
+                rows.iter().flat_map(client_reject_samples)
+            )),
+            json(&rejected_by_reason_slots(&BOUNDARIES, per_reason_rows)),
         );
     }
 }
