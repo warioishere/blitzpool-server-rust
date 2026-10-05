@@ -8,12 +8,9 @@
 //! `worker_shares_entity`.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use bp_common::AddressId;
 use bp_share_hook::{RejectedReason, SharedRejectedShare, SharedRejectedShareSink};
-use bp_share_stats_sink::config::StatsSinkConfig;
-use bp_share_stats_sink::engine::ShareStatsEngine;
 use bp_share_stats_sink::flush::{flush_once, Accumulators, FlushScope};
 use bp_share_stats_sink::ShareStatsRejectedSink;
 use bp_stats::{ClientStatisticsKey, ClientStatisticsRecord, FlushHealthMonitor, TimeSlot};
@@ -279,49 +276,4 @@ async fn a_zero_difficulty_reject_writes_no_worker_row() {
     assert!(row.is_none(), "a zero-difficulty reject writes nothing");
 
     cleanup(&pool, prefix).await;
-}
-
-// ── engine spawn with seed_on_spawn = false survives multiple ticks ──
-
-#[tokio::test]
-async fn engine_handles_repeated_empty_ticks_without_error() {
-    // Back-to-back ticks with empty accumulators stay healthy.
-    let _guard = SPEC_PORT_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
-        return;
-    };
-
-    let handle = ShareStatsEngine::spawn(
-        StatsSinkConfig {
-            flush_interval: Duration::from_millis(50),
-            client_stats_batch_size: 1000,
-            seed_on_spawn: false,
-            tick_offset: Duration::ZERO,
-        },
-        pool,
-    )
-    .await
-    .expect("spawn");
-
-    // Wait for ≥ 3 ticks.
-    tokio::time::sleep(Duration::from_millis(220)).await;
-
-    // Reader still reports healthy across all 7 flushers.
-    let reader = handle.reader();
-    for f in [
-        bp_share_stats_sink::flush::Flusher::PoolShares,
-        bp_share_stats_sink::flush::Flusher::PoolModeHashrate,
-        bp_share_stats_sink::flush::Flusher::PoolRejected,
-        bp_share_stats_sink::flush::Flusher::ClientStatistics,
-        bp_share_stats_sink::flush::Flusher::AddressSettings,
-        bp_share_stats_sink::flush::Flusher::WorkerTotals,
-    ] {
-        assert_eq!(
-            reader.consecutive_failures(f),
-            0,
-            "flusher {f:?} should be healthy after empty ticks"
-        );
-    }
-
-    handle.shutdown().await;
 }

@@ -135,7 +135,7 @@ pub use pplns::{
 pub use stats_writes::{
     bulk_upsert_address_settings, bulk_upsert_client_statistics_entity,
     bulk_upsert_pool_mode_hashrate, bulk_upsert_pool_rejected_statistics,
-    bulk_upsert_pool_share_statistics, bulk_upsert_worker_shares_entity, count_worker_shares,
-    seed_worker_shares_from_client_statistics, AddressSettingsUpsert, ClientStatsUpsert,
-    PoolModeHashrateUpsert, PoolRejectedStatsUpsert, PoolShareStatsUpsert, WorkerSharesUpsert,
+    bulk_upsert_pool_share_statistics, bulk_upsert_worker_shares_entity, AddressSettingsUpsert,
+    ClientStatsUpsert, PoolModeHashrateUpsert, PoolRejectedStatsUpsert, PoolShareStatsUpsert,
+    WorkerSharesUpsert,
 };

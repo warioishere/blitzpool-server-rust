@@ -159,8 +159,9 @@ impl SessionPersistenceEngineHandle {
             .await
     }
 
-    /// Hook that touches the session's `client:live:*` hash on every
-    /// accepted share, buffered until the next touch flush.
+    /// Hook that records every accepted share for the session's best (onto
+    /// its row) and its `client:live:*` hash, buffered until the next touch
+    /// flush.
     pub fn client_row_touch_sink(&self) -> ClientRowTouchSink {
         ClientRowTouchSink::new(self.touch_buffer.clone())
     }

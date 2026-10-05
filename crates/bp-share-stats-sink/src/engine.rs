@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Top-level coordinator: spawn background flush task, expose
-//! [`ReaderView`] for the API surface, propagate shutdown.
+//! Top-level coordinator: spawn the background flush task, hand the
+//! accumulators to the share hooks, propagate shutdown.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,18 +13,14 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, instrument, warn};
 
 use crate::config::StatsSinkConfig;
-use crate::error::SinkError;
 use crate::flush::{flush_once, Accumulators, FlushScope, Flusher};
-use crate::reader::ReaderView;
-use crate::seed::seed_if_empty;
 
-/// Accumulators are written by the share hooks from many tasks, the health
-/// monitor only by the flush task; both sit behind `Arc` for `ReaderView`.
+/// Accumulators are written by the share hooks from many tasks and drained
+/// by the flush task.
 pub struct ShareStatsEngine {
     config: StatsSinkConfig,
     pool: PgPool,
     accumulators: Arc<Accumulators>,
-    health: Arc<std::sync::Mutex<FlushHealthMonitor<Flusher>>>,
 }
 
 impl ShareStatsEngine {
@@ -35,32 +31,13 @@ impl ShareStatsEngine {
             config,
             pool,
             accumulators: Arc::new(Accumulators::default()),
-            health: Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default())),
         }
     }
 
-    /// Builds the engine, runs `seed_if_empty` when `config.seed_on_spawn`,
-    /// and spawns the flush task.
+    /// Builds the engine and spawns the flush task.
     #[instrument(skip(pool), fields(flush_interval = ?config.flush_interval), name = "stats_sink.spawn")]
-    pub async fn spawn(
-        config: StatsSinkConfig,
-        pool: PgPool,
-    ) -> Result<ShareStatsEngineHandle, SinkError> {
-        let engine = Self::new(config, pool);
-        if engine.config.seed_on_spawn {
-            if let Some(rows) = seed_if_empty(&engine.pool).await? {
-                debug!(rows, "stats_sink: seed_if_empty bootstrapped worker_shares");
-            }
-        }
-        Ok(engine.spawn_internal())
-    }
-
-    /// Cheap-to-clone read-only handle.
-    pub fn reader(&self) -> ReaderView {
-        ReaderView {
-            accumulators: self.accumulators.clone(),
-            health: self.health.clone(),
-        }
+    pub fn spawn(config: StatsSinkConfig, pool: PgPool) -> ShareStatsEngineHandle {
+        Self::new(config, pool).spawn_internal()
     }
 
     /// Hook impls clone this `Arc` into the share path.
@@ -70,16 +47,17 @@ impl ShareStatsEngine {
 
     fn spawn_internal(self) -> ShareStatsEngineHandle {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let pool = self.pool.clone();
-        let accs = self.accumulators.clone();
-        let health = self.health.clone();
-        let reader = self.reader();
-        let cfg = self.config.clone();
-
-        let join = tokio::spawn(run_flush_loop(pool, accs, health, cfg, shutdown_rx));
+        let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
+        let join = tokio::spawn(run_flush_loop(
+            self.pool,
+            self.accumulators.clone(),
+            health,
+            self.config,
+            shutdown_rx,
+        ));
 
         ShareStatsEngineHandle {
-            reader,
+            accumulators: self.accumulators,
             shutdown_tx: Some(shutdown_tx),
             join: Some(join),
         }
@@ -89,18 +67,14 @@ impl ShareStatsEngine {
 /// [`Self::shutdown`] waits for the final drain; dropping the handle only
 /// detaches the task, which then drains on its own.
 pub struct ShareStatsEngineHandle {
-    reader: ReaderView,
+    accumulators: Arc<Accumulators>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join: Option<JoinHandle<()>>,
 }
 
 impl ShareStatsEngineHandle {
-    pub fn reader(&self) -> ReaderView {
-        self.reader.clone()
-    }
-
     pub fn accumulators(&self) -> Arc<Accumulators> {
-        self.reader.accumulators.clone()
+        self.accumulators.clone()
     }
 
     /// Returns once the flush task has drained residuals and exited.

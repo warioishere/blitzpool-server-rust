@@ -76,8 +76,6 @@ pub(crate) enum EngineError {
     GroupSoloDisabledWithActiveGroups { count: usize },
     #[error("group-solo: active-group check failed: {0}")]
     GroupSoloActiveGroups(#[from] bp_db::DbError),
-    #[error("share-stats engine spawn failed: {0}")]
-    Stats(#[from] bp_share_stats_sink::error::SinkError),
     #[error("session-persistence engine spawn failed: {0}")]
     SessionPersistence(#[from] bp_session_persistence::error::SessionPersistenceError),
     #[error("invalid bitcoin address {0:?}: {1}")]
@@ -108,7 +106,7 @@ pub(crate) async fn spawn(
     let mode_gate = Arc::new(BlitzpoolModeGate::new());
     let pplns = spawn_pplns(cfg, handles, read_only).await?;
     let group_solo = spawn_group_solo(cfg, handles, read_only).await?;
-    let stats = spawn_stats(handles).await?;
+    let stats = spawn_stats(handles);
     let session_persistence = spawn_session_persistence(handles).await?;
     let blockparty_payouts = blockparty_payouts(cfg, handles)?;
 
@@ -309,7 +307,7 @@ fn blockparty_payouts(
 
 // ─── ShareStats engine ───────────────────────────────────────────
 
-async fn spawn_stats(handles: &FoundationHandles) -> Result<ShareStatsEngineHandle, EngineError> {
+fn spawn_stats(handles: &FoundationHandles) -> ShareStatsEngineHandle {
     let cfg = StatsSinkConfig {
         // Spreads the 60 s loops across the minute.
         tick_offset: crate::crons::offsets::STATS_SINK_FLUSH,
@@ -317,12 +315,10 @@ async fn spawn_stats(handles: &FoundationHandles) -> Result<ShareStatsEngineHand
     };
     info!(
         flush_interval = ?cfg.flush_interval,
-        seed_on_spawn = cfg.seed_on_spawn,
         tick_offset = ?cfg.tick_offset,
         "share-stats: spawning engine"
     );
-    let handle = ShareStatsEngine::spawn(cfg, handles.db.pool().clone()).await?;
-    Ok(handle)
+    ShareStatsEngine::spawn(cfg, handles.db.pool().clone())
 }
 
 // ─── Session-persistence engine ──────────────────────────────────

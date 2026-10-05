@@ -587,6 +587,7 @@ async fn invalidate_address_cache(state: &SharedState, addr: &AddressId) {
         "CLIENT_WORKER_SHARES_",
         "CLIENT_WORKERS_",
         "CLIENT_ACCEPTED_",
+        "CLIENT_MAX_DIFFICULTY_",
         "CLIENT_REJECTED_",
         "CLIENT_DIFF_SCORES_",
         "CLIENT_WORKER_GROUP_",

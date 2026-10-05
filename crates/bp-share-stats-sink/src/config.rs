@@ -12,8 +12,6 @@ pub struct StatsSinkConfig {
     /// Max rows per `client_statistics_entity` bulk upsert; larger drains
     /// are split across several calls.
     pub client_stats_batch_size: usize,
-    /// Run `seed_if_empty` on [`crate::engine::ShareStatsEngine::spawn`].
-    pub seed_on_spawn: bool,
     /// How far past each wall-clock period the tick fires, so this flush
     /// does not coincide with the other 60 s loops. An ended slot reaches
     /// Postgres this long after its end, which must stay inside
@@ -26,7 +24,6 @@ impl Default for StatsSinkConfig {
         Self {
             flush_interval: Duration::from_secs(60),
             client_stats_batch_size: 1000,
-            seed_on_spawn: true,
             tick_offset: Duration::ZERO,
         }
     }

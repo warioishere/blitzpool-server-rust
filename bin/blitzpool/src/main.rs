@@ -1383,14 +1383,6 @@ fn print_engine_error_help(err: &EngineError) {
                  check the `[database]` connection."
             );
         }
-        EngineError::Stats(_) => {
-            eprintln!(
-                "hint: the share-stats engine couldn't bootstrap. Likely \
-                 cause: the `seed_if_empty` migration hit a PG row-level \
-                 constraint. Inspect the DB tracing output above the \
-                 error line for the failing query."
-            );
-        }
         EngineError::SessionPersistence(_) => {
             eprintln!(
                 "hint: session-persistence config rejected — the flush/sample \

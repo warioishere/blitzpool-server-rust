@@ -98,17 +98,12 @@ async fn engine_spawn_tick_flushes_to_pg_then_shutdown_drains() {
     let prefix = "test_engine_e2e_";
     cleanup(&pool, slot.as_millis(), prefix).await;
 
-    // The seed touches the whole table and would collide with parallel
-    // tests; `seed_integration` covers it.
     let cfg = StatsSinkConfig {
         flush_interval: Duration::from_millis(80),
         client_stats_batch_size: 1000,
-        seed_on_spawn: false,
         tick_offset: Duration::ZERO,
     };
-    let handle = ShareStatsEngine::spawn(cfg, pool.clone())
-        .await
-        .expect("spawn engine");
+    let handle = ShareStatsEngine::spawn(cfg, pool.clone());
 
     // Same path the share hooks take.
     let accs = handle.accumulators();
@@ -166,32 +161,6 @@ async fn engine_spawn_tick_flushes_to_pg_then_shutdown_drains() {
 }
 
 #[tokio::test]
-async fn engine_reader_exposes_pending_residuals_before_flush() {
-    let _guard = ENGINE_TEST_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
-        return;
-    };
-
-    let cfg = StatsSinkConfig {
-        flush_interval: Duration::from_secs(3600), // never tick in this test
-        client_stats_batch_size: 1000,
-        seed_on_spawn: false,
-        tick_offset: Duration::ZERO,
-    };
-    let engine = ShareStatsEngine::new(cfg, pool);
-    let reader = engine.reader();
-    let accs = engine.accumulators();
-
-    assert_eq!(reader.pending_pool_shares(), 0);
-    accs.pool_shares
-        .add_accepted(TimeSlot::from_millis(32_503_680_011_001), 25.0, 25.0);
-    assert_eq!(reader.pending_pool_shares(), 1);
-    // Clones share the backing state.
-    let reader_clone = reader.clone();
-    assert_eq!(reader_clone.pending_pool_shares(), 1);
-}
-
-#[tokio::test]
 async fn engine_handle_shutdown_is_idempotent_against_dropped_handle() {
     // Dropping the handle without an explicit shutdown must not panic.
     let _guard = ENGINE_TEST_LOCK.lock().await;
@@ -203,13 +172,10 @@ async fn engine_handle_shutdown_is_idempotent_against_dropped_handle() {
             StatsSinkConfig {
                 flush_interval: Duration::from_millis(100),
                 client_stats_batch_size: 1000,
-                seed_on_spawn: false,
                 tick_offset: Duration::ZERO,
             },
             pool,
-        )
-        .await
-        .expect("spawn");
+        );
         // Dropping detaches the task; it drains and exits on its own.
     }
     // Let the detached task run; tokio would log a panic there.

@@ -9,10 +9,9 @@
 use bp_db::{
     bulk_upsert_address_settings, bulk_upsert_client_statistics_entity,
     bulk_upsert_pool_mode_hashrate, bulk_upsert_pool_rejected_statistics,
-    bulk_upsert_pool_share_statistics, bulk_upsert_worker_shares_entity, count_worker_shares,
-    find_max_difficulty_since_for_addresses, seed_worker_shares_from_client_statistics,
-    AddressSettingsUpsert, ClientStatsUpsert, PoolModeHashrateUpsert, PoolRejectedStatsUpsert,
-    PoolShareStatsUpsert, WorkerSharesUpsert,
+    bulk_upsert_pool_share_statistics, bulk_upsert_worker_shares_entity,
+    find_max_difficulty_since_for_addresses, AddressSettingsUpsert, ClientStatsUpsert,
+    PoolModeHashrateUpsert, PoolRejectedStatsUpsert, PoolShareStatsUpsert, WorkerSharesUpsert,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 
@@ -828,109 +827,6 @@ async fn worker_shares_composite_pk_upsert_increments() {
     let rejected: f64 = row.get("rejectedShares");
     assert!((shares - 200.0).abs() < 0.01);
     assert!((rejected - 3.0).abs() < 0.01);
-
-    tx.rollback().await.expect("rollback");
-}
-
-// ── seed bootstrap ───────────────────────────────────────────────────
-
-#[tokio::test]
-async fn count_worker_shares_returns_zero_after_truncate_in_tx() {
-    let Some(pool) = connect_or_skip().await else {
-        return;
-    };
-    let mut tx = pool.begin().await.expect("begin tx");
-    sqlx::query("TRUNCATE worker_shares_entity")
-        .execute(&mut *tx)
-        .await
-        .expect("truncate");
-    let n = count_worker_shares(&mut *tx).await.expect("count");
-    assert_eq!(n, 0);
-    tx.rollback().await.expect("rollback");
-}
-
-#[tokio::test]
-async fn seed_aggregates_client_statistics_into_worker_shares() {
-    let Some(pool) = connect_or_skip().await else {
-        return;
-    };
-    let mut tx = pool.begin().await.expect("begin tx");
-    sqlx::query("TRUNCATE worker_shares_entity")
-        .execute(&mut *tx)
-        .await
-        .expect("truncate ws");
-    sqlx::query("TRUNCATE client_statistics_entity")
-        .execute(&mut *tx)
-        .await
-        .expect("truncate cs");
-
-    let slot = unique_slot(7);
-    // Two slots for the same (addr, clientName); seed should sum.
-    let stats = vec![
-        ClientStatsUpsert {
-            address: "test_seed_alice".to_string(),
-            client_name: "w1".to_string(),
-            session_id: "s1".to_string(),
-            time_ms: slot,
-            shares: 30.0,
-            accepted_count: 1,
-            rejected_count: 0,
-            rejected_job_not_found_count: 0,
-            rejected_job_not_found_diff1: 0.0,
-            rejected_duplicate_share_count: 0,
-            rejected_duplicate_share_diff1: 0.0,
-            rejected_low_difficulty_share_count: 1,
-            rejected_low_difficulty_share_diff1: 0.5,
-            rejected_version_rolling_count: 0,
-            rejected_version_rolling_diff1: 0.0,
-            rejected_stale_count: 0,
-            rejected_stale_diff1: 0.0,
-            max_difficulty: 0.0,
-        },
-        ClientStatsUpsert {
-            address: "test_seed_alice".to_string(),
-            client_name: "w1".to_string(),
-            session_id: "s2".to_string(),
-            time_ms: slot + 1,
-            shares: 70.0,
-            accepted_count: 2,
-            rejected_count: 0,
-            rejected_job_not_found_count: 0,
-            rejected_job_not_found_diff1: 0.0,
-            rejected_duplicate_share_count: 0,
-            rejected_duplicate_share_diff1: 0.0,
-            rejected_low_difficulty_share_count: 1,
-            rejected_low_difficulty_share_diff1: 0.75,
-            rejected_version_rolling_count: 0,
-            rejected_version_rolling_diff1: 0.0,
-            rejected_stale_count: 0,
-            rejected_stale_diff1: 0.0,
-            max_difficulty: 0.0,
-        },
-    ];
-    bulk_upsert_client_statistics_entity(&mut *tx, &stats)
-        .await
-        .expect("seed cs rows");
-
-    let inserted = seed_worker_shares_from_client_statistics(&mut *tx)
-        .await
-        .expect("seed");
-    assert_eq!(inserted, 1, "one aggregated row");
-
-    let row = sqlx::query(
-        r#"SELECT shares, "rejectedShares" FROM worker_shares_entity
-           WHERE address = $1 AND "clientName" = $2"#,
-    )
-    .bind("test_seed_alice")
-    .bind("w1")
-    .fetch_one(&mut *tx)
-    .await
-    .expect("read seeded");
-    let shares: f64 = row.get("shares");
-    let rejected: f64 = row.get("rejectedShares");
-    assert!((shares - 100.0).abs() < 0.01, "sum of 30+70: {shares}");
-    // Sum of low-diff diff1: 0.5 + 0.75 = 1.25 (jnf+dup were zero).
-    assert!((rejected - 1.25).abs() < 0.01, "rejected sum: {rejected}");
 
     tx.rollback().await.expect("rollback");
 }

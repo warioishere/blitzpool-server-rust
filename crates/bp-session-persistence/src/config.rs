@@ -9,7 +9,8 @@ use crate::error::SessionPersistenceError;
 /// Constructed once at `bin/blitzpool` startup, immutable thereafter.
 #[derive(Clone, Debug)]
 pub struct SessionPersistenceConfig {
-    /// Flush interval for the touch updates into the `client:live:*` hashes.
+    /// Flush interval for the touch updates: the session's best onto its
+    /// row, the rest into the `client:live:*` hashes.
     pub touch_flush_interval: Duration,
     /// How long a session must survive before its `client_entity` row is
     /// written. Must stay well below the device-status gate's `online_dwell`,
