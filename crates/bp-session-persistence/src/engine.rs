@@ -17,7 +17,6 @@ use redis::aio::ConnectionManager;
 
 use crate::config::SessionPersistenceConfig;
 use crate::error::SessionPersistenceError;
-use crate::hashrate_watchdog::{run_watchdog_loop, HashrateWatchdog};
 use crate::hooks::{ClientRowTouchSink, SessionPersistenceHook};
 use crate::live_store::LiveSessionStore;
 use crate::row_debounce::{run_birth_loop, RowDebounce};
@@ -27,7 +26,6 @@ pub struct SessionPersistenceEngine {
     pool: PgPool,
     config: SessionPersistenceConfig,
     touch_buffer: Arc<TouchBuffer>,
-    hashrate_watchdog: Arc<HashrateWatchdog>,
     row_debounce: Arc<RowDebounce>,
     live_store: Option<Arc<LiveSessionStore>>,
 }
@@ -52,7 +50,6 @@ impl SessionPersistenceEngine {
             pool,
             config,
             touch_buffer: Arc::new(TouchBuffer::default()),
-            hashrate_watchdog: Arc::new(HashrateWatchdog::default()),
             row_debounce: Arc::new(RowDebounce::default()),
             live_store,
         })
@@ -73,7 +70,6 @@ impl SessionPersistenceEngine {
         SessionPersistenceEngineHandle {
             pool: self.pool,
             touch_buffer: self.touch_buffer,
-            hashrate_watchdog: self.hashrate_watchdog,
             row_debounce: self.row_debounce,
             row_debounce_age: self.config.row_debounce,
             live_store: self.live_store,
@@ -100,24 +96,15 @@ impl SessionPersistenceEngine {
             touch_rx,
         ));
 
-        let (watchdog_tx, watchdog_rx) = oneshot::channel();
-        let watchdog_join = tokio::spawn(run_watchdog_loop(
-            self.hashrate_watchdog.clone(),
-            self.live_store.clone(),
-            self.config.hashrate_watchdog_interval,
-            watchdog_rx,
-        ));
-
         SessionPersistenceEngineHandle {
             pool: self.pool,
             touch_buffer: self.touch_buffer,
-            hashrate_watchdog: self.hashrate_watchdog,
             row_debounce: self.row_debounce,
             row_debounce_age: self.config.row_debounce,
             live_store: self.live_store,
             shutdown: Arc::new(std::sync::Mutex::new(ShutdownState {
-                txs: vec![birth_tx, touch_tx, watchdog_tx],
-                joins: vec![birth_join, touch_join, watchdog_join],
+                txs: vec![birth_tx, touch_tx],
+                joins: vec![birth_join, touch_join],
             })),
         }
     }
@@ -137,7 +124,6 @@ struct ShutdownState {
 pub struct SessionPersistenceEngineHandle {
     pool: PgPool,
     touch_buffer: Arc<TouchBuffer>,
-    hashrate_watchdog: Arc<HashrateWatchdog>,
     row_debounce: Arc<RowDebounce>,
     row_debounce_age: Duration,
     live_store: Option<Arc<LiveSessionStore>>,
@@ -173,22 +159,10 @@ impl SessionPersistenceEngineHandle {
             .await
     }
 
-    /// One watchdog pass that treats `silence` as the cutoff (a tick uses
-    /// two minutes); `Duration::ZERO` zeroes every watched session.
-    pub async fn zero_silent_hashrates_now(&self, silence: Duration) {
-        crate::hashrate_watchdog::zero_silent(
-            &self.hashrate_watchdog,
-            tokio::time::Instant::now(),
-            silence,
-            self.live_store.as_deref(),
-        )
-        .await
-    }
-
     /// Hook that touches the session's `client:live:*` hash on every
     /// accepted share, buffered until the next touch flush.
     pub fn client_row_touch_sink(&self) -> ClientRowTouchSink {
-        ClientRowTouchSink::new(self.touch_buffer.clone(), self.hashrate_watchdog.clone())
+        ClientRowTouchSink::new(self.touch_buffer.clone())
     }
 
     /// Signal every loop and join them; idempotent across handle clones.

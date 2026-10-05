@@ -12,7 +12,6 @@ use sqlx::PgPool;
 use tokio::time::Instant;
 use tracing::warn;
 
-use crate::hashrate_watchdog::HashrateWatchdog;
 use crate::row_debounce::RowDebounce;
 use crate::touch_buffer::{TouchBuffer, TouchKeyRef};
 
@@ -67,17 +66,15 @@ impl SharedSessionPersistence for SessionPersistenceHook {
 
 /// Buffers every accepted share for the session's best (onto its row) and its
 /// `client:live:*` hash (TTL, current difficulty, vardiff's hashrate, channel
-/// count), one write per session per flush, and tells the watchdog the
-/// session is still sending.
+/// count, freshest share), one write per session per flush.
 #[derive(Clone)]
 pub struct ClientRowTouchSink {
     buffer: Arc<TouchBuffer>,
-    watchdog: Arc<HashrateWatchdog>,
 }
 
 impl ClientRowTouchSink {
-    pub(crate) fn new(buffer: Arc<TouchBuffer>, watchdog: Arc<HashrateWatchdog>) -> Self {
-        Self { buffer, watchdog }
+    pub(crate) fn new(buffer: Arc<TouchBuffer>) -> Self {
+        Self { buffer }
     }
 }
 
@@ -101,6 +98,5 @@ impl SharedAcceptedShareSink for ClientRowTouchSink {
             // revive a session that is already gone.
             share.ts_ms,
         );
-        self.watchdog.record(key, Instant::now());
     }
 }

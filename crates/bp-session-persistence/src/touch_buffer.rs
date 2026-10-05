@@ -3,8 +3,8 @@
 //! Coalesces per-session share updates in a [`TouchBuffer`] and flushes them
 //! periodically: the session's best onto its Postgres row, the rest into the
 //! `client:live:*` Redis hashes ([`crate::live_store`]), instead of a write
-//! per share. `hash_rate` is vardiff's session rate; once
-//! the shares stop, [`crate::hashrate_watchdog`] zeroes it.
+//! per share. `hash_rate` is vardiff's session rate; once the shares stop,
+//! readers zero it from `updated_at_ms`.
 
 use std::sync::Mutex;
 

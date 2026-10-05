@@ -11,8 +11,6 @@ use crate::error::SessionPersistenceError;
 pub struct SessionPersistenceConfig {
     /// Flush interval for the touch updates into the `client:live:*` hashes.
     pub touch_flush_interval: Duration,
-    /// How often the watchdog looks for sessions that stopped sending shares.
-    pub hashrate_watchdog_interval: Duration,
     /// How long a session must survive before its `client_entity` row is
     /// written. Must stay well below the device-status gate's `online_dwell`,
     /// which treats a device without a row as absent. `ZERO` is legal.
@@ -28,7 +26,6 @@ impl Default for SessionPersistenceConfig {
     fn default() -> Self {
         Self {
             touch_flush_interval: Duration::from_secs(30),
-            hashrate_watchdog_interval: Duration::from_secs(60),
             row_debounce: Duration::from_secs(15),
             row_flush_interval: Duration::from_secs(5),
             live_ttl: Duration::from_secs(5 * 60),
@@ -41,11 +38,6 @@ impl SessionPersistenceConfig {
         if self.touch_flush_interval.is_zero() {
             return Err(SessionPersistenceError::Config(
                 "touch_flush_interval must be > 0".to_string(),
-            ));
-        }
-        if self.hashrate_watchdog_interval.is_zero() {
-            return Err(SessionPersistenceError::Config(
-                "hashrate_watchdog_interval must be > 0".to_string(),
             ));
         }
         // `row_debounce` may be zero: it is an age threshold, not a timer.
@@ -77,15 +69,6 @@ mod tests {
     fn zero_flush_interval_rejected() {
         let cfg = SessionPersistenceConfig {
             touch_flush_interval: Duration::ZERO,
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn zero_hashrate_watchdog_interval_rejected() {
-        let cfg = SessionPersistenceConfig {
-            hashrate_watchdog_interval: Duration::ZERO,
             ..Default::default()
         };
         assert!(cfg.validate().is_err());

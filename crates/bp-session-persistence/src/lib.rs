@@ -7,7 +7,6 @@
 pub mod config;
 pub mod engine;
 pub mod error;
-mod hashrate_watchdog;
 pub mod hooks;
 mod live_store;
 mod row_debounce;

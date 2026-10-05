@@ -2,8 +2,8 @@
 
 #![allow(clippy::print_stderr)]
 
-//! Integration tests for the `client:live:*` live store: touch refreshes
-//! liveness, the hashrate watchdog never does, and a Redis outage never hangs a flush.
+//! Integration tests for the `client:live:*` live store: touch writes the
+//! live fields and refreshes the TTL, and a Redis outage never hangs a flush.
 //! Needs `bp-test-pg` (15433) and `bp-test-redis` (16379); every test skips
 //! when a service is unreachable, so watch the passed-count.
 
@@ -384,9 +384,9 @@ async fn a_session_keeps_its_best_when_its_live_key_expires() {
     cleanup(&pool, prefix).await;
 }
 
-/// The touch writes vardiff's rate; the watchdog's zero does not extend the TTL.
+/// The touch writes vardiff's rate, and vardiff's 0 keeps the stored one.
 #[tokio::test]
-async fn hashrate_write_does_not_refresh_liveness() {
+async fn touch_writes_vardiffs_rate_and_a_zero_keeps_it() {
     let Some(pool) = pg_or_skip().await else {
         return;
     };
@@ -433,70 +433,6 @@ async fn hashrate_write_does_not_refresh_liveness() {
             .map(String::as_str),
         Some("5000000000000"),
         "vardiff's 0 before its first estimate keeps the stored rate"
-    );
-
-    // Shrink the TTL, then let the watchdog zero the rate.
-    let _: i64 = redis::cmd("EXPIRE")
-        .arg(&key)
-        .arg(10i64)
-        .query_async(&mut redis)
-        .await
-        .expect("EXPIRE");
-    handle.zero_silent_hashrates_now(Duration::ZERO).await;
-
-    assert_eq!(
-        hgetall(&mut redis, &key)
-            .await
-            .get(F_HASH_RATE)
-            .map(String::as_str),
-        Some("0"),
-        "the watchdog zeroed the silent session"
-    );
-    let t = ttl(&mut redis, &key).await;
-    assert!(
-        (1..=10).contains(&t),
-        "the watchdog must not extend liveness — TTL was ≤10, now {t}"
-    );
-
-    handle.shutdown().await;
-    cleanup(&pool, prefix).await;
-}
-
-/// A watchdog HSET that creates the key still sets a TTL; the hash holds only `hash_rate`.
-#[tokio::test]
-async fn hashrate_write_on_fresh_key_sets_ttl() {
-    let Some(pool) = pg_or_skip().await else {
-        return;
-    };
-    let Some(mut redis) = connect_redis_in_range_or_skip(redis_db::SESSION_PERSISTENCE, 3).await
-    else {
-        return;
-    };
-    let prefix = "test_lv_fresh_";
-    cleanup(&pool, prefix).await;
-
-    let handle = spawn_engine(&pool, redis.clone()).await;
-    let sink = handle.client_row_touch_sink();
-    let address = format!("{prefix}dave");
-    let key = client_live_key(&address, "rig1", "sessL004");
-
-    // Feed the watchdog but do NOT flush touches — the key must not exist.
-    sink.record_accepted(share(&address, "rig1", "sessL004", 100.0, 512.0, 1))
-        .await;
-    assert_eq!(ttl(&mut redis, &key).await, -2, "key must not exist yet");
-
-    handle.zero_silent_hashrates_now(Duration::ZERO).await;
-
-    let hash = hgetall(&mut redis, &key).await;
-    assert!(hash.contains_key(F_HASH_RATE), "watchdog created the key");
-    assert!(
-        !hash.contains_key(F_CURRENT_DIFFICULTY),
-        "watchdog-created hash is partial by design"
-    );
-    let t = ttl(&mut redis, &key).await;
-    assert!(
-        t > 0,
-        "a watchdog-created key without TTL is immortal under volatile-lru, got {t}"
     );
 
     handle.shutdown().await;
