@@ -17,7 +17,7 @@ use bp_db::{
 use bp_stats::{
     BestDifficultyAccumulator, ClientStatisticsAccumulator, FlushHealthMonitor,
     PoolModeHashrateAccumulator, PoolRejectedAccumulator, PoolSharesAccumulator,
-    ShareTotalsAccumulator,
+    ShareTotalsAccumulator, TimeSlot,
 };
 use sqlx::PgPool;
 use tracing::warn;
@@ -57,6 +57,17 @@ impl Default for Accumulators {
     }
 }
 
+/// Which `client_statistics_entity` slots a flush writes. Every chart hides
+/// the slot in progress, so a tick writes each slot once, after it ended;
+/// the shutdown drain writes the open slot too, and the next process adds
+/// onto that row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushScope {
+    /// Only slots ending at or before this one's start.
+    Before(TimeSlot),
+    All,
+}
+
 /// One coordinator tick, sequenced per flusher so a failed table stays
 /// unconfirmed while the others proceed.
 pub async fn flush_once(
@@ -64,11 +75,12 @@ pub async fn flush_once(
     accs: &Accumulators,
     health: &Arc<std::sync::Mutex<FlushHealthMonitor<Flusher>>>,
     batch_size: usize,
+    scope: FlushScope,
 ) {
     flush_pool_shares(pool, accs, health).await;
     flush_pool_mode_hashrate(pool, accs, health).await;
     flush_pool_rejected(pool, accs, health).await;
-    flush_client_statistics(pool, accs, health, batch_size).await;
+    flush_client_statistics(pool, accs, health, batch_size, scope).await;
     flush_address_settings(pool, accs, health).await;
     flush_worker_totals(pool, accs, health).await;
 }
@@ -173,8 +185,12 @@ async fn flush_client_statistics(
     accs: &Accumulators,
     health: &Arc<std::sync::Mutex<FlushHealthMonitor<Flusher>>>,
     batch_size: usize,
+    scope: FlushScope,
 ) {
-    let snapshot = accs.client_statistics.drain();
+    let mut snapshot = accs.client_statistics.drain();
+    if let FlushScope::Before(current) = scope {
+        snapshot.retain(|key, _| key.slot < current);
+    }
     if snapshot.is_empty() {
         record_success(health, Flusher::ClientStatistics);
         return;

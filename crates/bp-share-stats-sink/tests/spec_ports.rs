@@ -14,7 +14,7 @@ use bp_common::AddressId;
 use bp_share_hook::{RejectedReason, SharedRejectedShare, SharedRejectedShareSink};
 use bp_share_stats_sink::config::StatsSinkConfig;
 use bp_share_stats_sink::engine::ShareStatsEngine;
-use bp_share_stats_sink::flush::{flush_once, Accumulators};
+use bp_share_stats_sink::flush::{flush_once, Accumulators, FlushScope};
 use bp_share_stats_sink::ShareStatsRejectedSink;
 use bp_stats::{ClientStatisticsKey, ClientStatisticsRecord, FlushHealthMonitor, TimeSlot};
 use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -94,7 +94,7 @@ async fn client_statistics_1500_rows_split_across_batches() {
     }
 
     let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs, &health, 1000).await;
+    flush_once(&pool, &accs, &health, 1000, FlushScope::All).await;
 
     let count: i64 = sqlx::query_scalar(
         r#"SELECT COUNT(*) FROM client_statistics_entity WHERE address LIKE $1"#,
@@ -156,7 +156,7 @@ async fn client_name_with_special_chars_roundtrips_through_unnest() {
     }
 
     let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs, &health, 1000).await;
+    flush_once(&pool, &accs, &health, 1000, FlushScope::All).await;
 
     // Each stress-named row landed both in client_statistics and in
     // worker_shares_entity with the same byte-identical clientName.
@@ -233,7 +233,7 @@ async fn rejected_diff_per_worker_aggregates_across_sessions() {
     drop_pool_rows(&accs);
 
     let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs, &health, 1000).await;
+    flush_once(&pool, &accs, &health, 1000, FlushScope::All).await;
 
     let rejected: f64 = sqlx::query_scalar(
         r#"SELECT "rejectedShares" FROM worker_shares_entity
@@ -266,7 +266,7 @@ async fn a_zero_difficulty_reject_writes_no_worker_row() {
     drop_pool_rows(&accs);
 
     let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs, &health, 1000).await;
+    flush_once(&pool, &accs, &health, 1000, FlushScope::All).await;
 
     let row = sqlx::query_scalar::<_, Option<f64>>(
         r#"SELECT "rejectedShares" FROM worker_shares_entity
@@ -295,9 +295,8 @@ async fn engine_handles_repeated_empty_ticks_without_error() {
         StatsSinkConfig {
             flush_interval: Duration::from_millis(50),
             client_stats_batch_size: 1000,
-            slot_aligned_flush: false,
             seed_on_spawn: false,
-            startup_offset: Duration::ZERO,
+            tick_offset: Duration::ZERO,
         },
         pool,
     )

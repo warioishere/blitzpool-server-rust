@@ -312,13 +312,13 @@ fn blockparty_payouts(
 async fn spawn_stats(handles: &FoundationHandles) -> Result<ShareStatsEngineHandle, EngineError> {
     let cfg = StatsSinkConfig {
         // Spreads the 60 s loops across the minute.
-        startup_offset: crate::crons::offsets::STATS_SINK_FLUSH,
+        tick_offset: crate::crons::offsets::STATS_SINK_FLUSH,
         ..StatsSinkConfig::default()
     };
     info!(
         flush_interval = ?cfg.flush_interval,
         seed_on_spawn = cfg.seed_on_spawn,
-        startup_offset = ?cfg.startup_offset,
+        tick_offset = ?cfg.tick_offset,
         "share-stats: spawning engine"
     );
     let handle = ShareStatsEngine::spawn(cfg, handles.db.pool().clone()).await?;

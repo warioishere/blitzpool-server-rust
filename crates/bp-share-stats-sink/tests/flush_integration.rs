@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use bp_common::{AddressId, MiningMode};
-use bp_share_stats_sink::flush::{flush_once, Accumulators, Flusher};
+use bp_share_stats_sink::flush::{flush_once, Accumulators, FlushScope, Flusher};
 use bp_stats::{
     ClientStatisticsKey, ClientStatisticsRecord, FlushHealth, FlushHealthMonitor, RejectedReason,
     TimeSlot,
@@ -129,7 +129,7 @@ async fn flush_once_drains_all_seven_tables_to_pg() {
         .add(addr(&format!("{prefix}alice")), "worker1".to_string(), 10.0);
 
     let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs, &health, 1000).await;
+    flush_once(&pool, &accs, &health, 1000, FlushScope::All).await;
 
     // Pool-shares row exists with the right values.
     let row = sqlx::query(
@@ -254,7 +254,7 @@ async fn flush_once_folds_best_difficulty_via_greatest() {
         .add(&addr(&address), 623_932_928.0, Some("octaxe")); // window max
     accs.best_difficulty
         .add(&addr(&address), 40.0, Some("worker")); // lower — ignored
-    flush_once(&pool, &accs, &health, 1000).await;
+    flush_once(&pool, &accs, &health, 1000, FlushScope::All).await;
 
     let (best, ua): (f64, Option<String>) = {
         let row = sqlx::query(
@@ -278,7 +278,7 @@ async fn flush_once_folds_best_difficulty_via_greatest() {
     accs2
         .best_difficulty
         .add(&addr(&address), 1_000.0, Some("bitaxe"));
-    flush_once(&pool, &accs2, &health, 1000).await;
+    flush_once(&pool, &accs2, &health, 1000, FlushScope::All).await;
     let best_after: f64 = sqlx::query_scalar(
         r#"SELECT "bestDifficulty" FROM address_settings_entity WHERE address = $1"#,
     )
@@ -305,7 +305,7 @@ async fn empty_accumulators_no_op_all_flushers() {
     };
     let accs = Arc::new(Accumulators::default());
     let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs, &health, 1000).await;
+    flush_once(&pool, &accs, &health, 1000, FlushScope::All).await;
 
     // Nothing crashed; nothing in PG, all healthy.
     let h = health.lock().expect("health lock");
@@ -328,12 +328,12 @@ async fn replay_idempotency_double_flush_doubles_counts() {
     let accs1 = Arc::new(Accumulators::default());
     accs1.pool_shares.add_accepted(slot, 5.0, 5.0);
     let health1 = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs1, &health1, 1000).await;
+    flush_once(&pool, &accs1, &health1, 1000, FlushScope::All).await;
 
     let accs2 = Arc::new(Accumulators::default());
     accs2.pool_shares.add_accepted(slot, 5.0, 5.0);
     let health2 = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs2, &health2, 1000).await;
+    flush_once(&pool, &accs2, &health2, 1000, FlushScope::All).await;
 
     let accepted: f32 = sqlx::query_scalar(
         r#"SELECT accepted FROM pool_share_statistics_entity WHERE "time" = $1"#,
@@ -364,7 +364,7 @@ async fn health_monitor_tracks_success_after_single_clean_flush() {
     let accs = Arc::new(Accumulators::default());
     accs.pool_shares.add_accepted(slot, 1.0, 1.0);
     let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs, &health, 1000).await;
+    flush_once(&pool, &accs, &health, 1000, FlushScope::All).await;
 
     {
         let mut h = health.lock().expect("health");
@@ -373,4 +373,77 @@ async fn health_monitor_tracks_success_after_single_clean_flush() {
     }
 
     cleanup(&pool, slot.as_millis(), prefix).await;
+}
+
+/// A tick writes a client slot only once it ended, the shutdown drain
+/// writes the open one too, and the next process adds onto that row.
+#[tokio::test]
+async fn client_slots_reach_pg_once_ended_and_the_drain_writes_the_rest() {
+    let _guard = FLUSH_TEST_LOCK.lock().await;
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let ended = TimeSlot::from_millis(32_503_680_600_000);
+    let open = ended.next();
+    let prefix = "test_flush_scope_";
+    cleanup(&pool, ended.as_millis(), prefix).await;
+    let key = |slot| ClientStatisticsKey {
+        address: addr(&format!("{prefix}alice")),
+        client_name: "rig".to_string(),
+        session_id: "s1".to_string(),
+        slot,
+    };
+    let shares = |s: f64| ClientStatisticsRecord {
+        shares: s,
+        accepted_count: 1.0,
+        ..Default::default()
+    };
+    let read = |slot: TimeSlot| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, f32>(
+                r#"SELECT shares FROM client_statistics_entity
+                   WHERE address = $1 AND "time" = $2"#,
+            )
+            .bind(format!("{prefix}alice"))
+            .bind(slot.as_millis())
+            .fetch_optional(&pool)
+            .await
+            .expect("read")
+        }
+    };
+    let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
+
+    let accs = Arc::new(Accumulators::default());
+    accs.client_statistics.add(key(ended), &shares(10.0));
+    accs.client_statistics.add(key(open), &shares(3.0));
+    flush_once(&pool, &accs, &health, 1000, FlushScope::Before(open)).await;
+    assert_eq!(read(ended).await, Some(10.0), "the ended slot is written");
+    assert_eq!(read(open).await, None, "the open slot waits for its end");
+
+    // A second tick in the same slot writes nothing new.
+    flush_once(&pool, &accs, &health, 1000, FlushScope::Before(open)).await;
+    assert_eq!(read(ended).await, Some(10.0), "written once, not twice");
+
+    flush_once(&pool, &accs, &health, 1000, FlushScope::All).await;
+    assert_eq!(read(open).await, Some(3.0), "the shutdown drain writes it");
+
+    // The next process books the rest of the open slot onto the same row.
+    let accs2 = Arc::new(Accumulators::default());
+    accs2.client_statistics.add(key(open), &shares(4.0));
+    flush_once(
+        &pool,
+        &accs2,
+        &health,
+        1000,
+        FlushScope::Before(open.next()),
+    )
+    .await;
+    assert_eq!(
+        read(open).await,
+        Some(7.0),
+        "the restart adds, not overwrites"
+    );
+
+    cleanup(&pool, ended.as_millis(), prefix).await;
 }

@@ -103,9 +103,8 @@ async fn engine_spawn_tick_flushes_to_pg_then_shutdown_drains() {
     let cfg = StatsSinkConfig {
         flush_interval: Duration::from_millis(80),
         client_stats_batch_size: 1000,
-        slot_aligned_flush: false,
         seed_on_spawn: false,
-        startup_offset: Duration::ZERO,
+        tick_offset: Duration::ZERO,
     };
     let handle = ShareStatsEngine::spawn(cfg, pool.clone())
         .await
@@ -176,9 +175,8 @@ async fn engine_reader_exposes_pending_residuals_before_flush() {
     let cfg = StatsSinkConfig {
         flush_interval: Duration::from_secs(3600), // never tick in this test
         client_stats_batch_size: 1000,
-        slot_aligned_flush: false,
         seed_on_spawn: false,
-        startup_offset: Duration::ZERO,
+        tick_offset: Duration::ZERO,
     };
     let engine = ShareStatsEngine::new(cfg, pool);
     let reader = engine.reader();
@@ -205,9 +203,8 @@ async fn engine_handle_shutdown_is_idempotent_against_dropped_handle() {
             StatsSinkConfig {
                 flush_interval: Duration::from_millis(100),
                 client_stats_batch_size: 1000,
-                slot_aligned_flush: false,
                 seed_on_spawn: false,
-                startup_offset: Duration::ZERO,
+                tick_offset: Duration::ZERO,
             },
             pool,
         )

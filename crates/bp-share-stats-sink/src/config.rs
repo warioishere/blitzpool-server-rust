@@ -7,18 +7,18 @@ use std::time::Duration;
 /// Constructed once at `bin/blitzpool` startup, immutable thereafter.
 #[derive(Clone, Debug)]
 pub struct StatsSinkConfig {
+    /// Period of the flush tick, aligned to the wall clock.
     pub flush_interval: Duration,
     /// Max rows per `client_statistics_entity` bulk upsert; larger drains
     /// are split across several calls.
     pub client_stats_batch_size: usize,
-    /// Flush immediately when the 10-minute slot ends instead of waiting
-    /// for the next tick.
-    pub slot_aligned_flush: bool,
     /// Run `seed_if_empty` on [`crate::engine::ShareStatsEngine::spawn`].
     pub seed_on_spawn: bool,
-    /// Delays the first tick so the flush does not coincide with the other
-    /// 60 s loops and their PG load.
-    pub startup_offset: Duration,
+    /// How far past each wall-clock period the tick fires, so this flush
+    /// does not coincide with the other 60 s loops. An ended slot reaches
+    /// Postgres this long after its end, which must stay inside
+    /// `bp_stats::CHART_VISIBILITY_BUFFER` or charts show it empty.
+    pub tick_offset: Duration,
 }
 
 impl Default for StatsSinkConfig {
@@ -26,9 +26,8 @@ impl Default for StatsSinkConfig {
         Self {
             flush_interval: Duration::from_secs(60),
             client_stats_batch_size: 1000,
-            slot_aligned_flush: true,
             seed_on_spawn: true,
-            startup_offset: Duration::ZERO,
+            tick_offset: Duration::ZERO,
         }
     }
 }
