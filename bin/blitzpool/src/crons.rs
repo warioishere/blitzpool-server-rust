@@ -34,11 +34,10 @@ use crate::live_sessions::RedisLiveSessions;
 /// Tick of the `kill_dead_clients` poller.
 const KILL_DEAD_TICK: Duration = Duration::from_secs(60);
 
-/// Staleness cutoff for the `kill_dead_clients` sweep: sessions whose
-/// `updatedAt` is older than this become sweep candidates. Also the TTL of
-/// the `client:live:*` hashes (see `engines::spawn_session_persistence`),
-/// so the two clocks agree.
-pub(crate) const STALE_CLIENT_TTL: Duration = Duration::from_secs(5 * 60);
+/// Staleness cutoff for the `kill_dead_clients` sweep: a session whose row
+/// birth is older than this is a candidate, and one whose freshest share
+/// (the `client:live:*` hash's `updated_at_ms`) is older too is swept.
+pub(crate) const STALE_CLIENT_CUTOFF: Duration = Duration::from_secs(5 * 60);
 
 /// Per-cron startup offsets, small primes so ticks of different crons
 /// rarely collide. Keep them distinct within each period family
@@ -330,7 +329,7 @@ fn spawn_kill_dead_clients_loop(
                 }
                 _ = ticker.tick() => {
                     let cutoff_ms =
-                        Utc::now().timestamp_millis() - STALE_CLIENT_TTL.as_millis() as i64;
+                        Utc::now().timestamp_millis() - STALE_CLIENT_CUTOFF.as_millis() as i64;
                     match sweep_dead_sessions_once(&pool, &redis, cutoff_ms, &mut strikes).await {
                         Ok(o) if o.is_quiet() => {}
                         Ok(o) => info!(
@@ -379,10 +378,11 @@ impl SweepOutcome {
     }
 }
 
-/// One reconcile pass: a session a front holds is alive; otherwise only a live
-/// key missing on TWO passes sweeps, since the keyspace is empty after a Redis
-/// restart. A row whose live hash postdates its soft-delete is revived. Any
-/// error aborts the pass: "cannot ask" and "no key" must never collapse.
+/// One reconcile pass: a session a front holds is alive; otherwise only a
+/// session without a share since the cutoff on TWO passes sweeps, since the
+/// keyspace is empty after a Redis restart. A row whose live hash postdates
+/// its soft-delete is revived. Any error aborts the pass: "cannot ask" and
+/// "no key" must never collapse.
 async fn sweep_dead_sessions_once(
     pool: &PgPool,
     redis: &redis::aio::ConnectionManager,
@@ -414,9 +414,16 @@ async fn sweep_kill_half(
         .sessions()
         .await
         .map_err(|e| format!("front live set: {e}"))?;
-    let alive = bp_client_live::live_keys_exist(Some(redis), &candidates)
+    // The key outlives the session (its TTL only cleans up); a share
+    // newer than the cutoff is the evidence.
+    let alive = bp_client_live::live_fields_for_sessions(Some(redis), &candidates)
         .await
-        .map_err(|e| format!("live-key check: {e}"))?;
+        .map_err(|e| format!("live-key check: {e}"))?
+        .into_iter()
+        .map(|lf| {
+            lf.and_then(|lf| lf.updated_at_ms)
+                .is_some_and(|ts| ts >= cutoff_ms)
+        });
 
     let mut missing_now = StrikeSet::with_capacity(candidates.len());
     let mut addresses = Vec::new();
@@ -513,7 +520,7 @@ const STATS_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 /// Cutoff for soft-deleted clients before hard-delete. Nothing reads them
 /// longer (the device-status seed looks back 1 h, "known device" lives in
 /// Redis), and keeping them scatters live rows that every bulk writer re-logs.
-const CLIENT_HARD_DELETE_RETENTION: Duration = Duration::from_secs(2 * 60 * 60);
+pub(crate) const CLIENT_HARD_DELETE_RETENTION: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// Hourly cron: purge stats older than `STATS_RETENTION`, hard-delete
 /// clients soft-deleted longer than [`CLIENT_HARD_DELETE_RETENTION`], and
@@ -748,6 +755,47 @@ mod sweep_tests {
             "live-keyed session survives"
         );
         assert!(!active(&pool, "swpB0001").await, "keyless session is swept");
+
+        cleanup(&pool, addr).await;
+    }
+
+    /// A live hash whose freshest share is older than the cutoff counts as
+    /// missing: the key outlives the session, its timestamp is the verdict.
+    #[tokio::test]
+    async fn a_live_key_without_a_recent_share_sweeps_on_the_second_pass() {
+        let _guard = SWEEP_LOCK.lock().await;
+        let Some(pool) = connect_pg_or_skip().await else {
+            return;
+        };
+        // Shares DB_TWO_STRIKE: SWEEP_LOCK serializes these tests and the
+        // connect flushes the database.
+        let Some(mut redis) =
+            connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, DB_TWO_STRIKE).await
+        else {
+            return;
+        };
+        let addr = "test_sweep_stale_addr";
+        cleanup(&pool, addr).await;
+        seed_aged(&pool, addr, "swpS0001").await;
+        seed_aged(&pool, addr, "swpS0002").await;
+        // Both keys exist; only the second saw a share after the cutoff.
+        put_live_key(&mut redis, addr, "swpS0001", 1_000).await;
+        put_live_key(&mut redis, addr, "swpS0002", 3_000).await;
+
+        let mut strikes = StrikeSet::new();
+        let first = sweep_dead_sessions_once(&pool, &redis, 2_000, &mut strikes)
+            .await
+            .expect("first pass");
+        assert_eq!(first.swept, 0, "one observation must not sweep anything");
+        let second = sweep_dead_sessions_once(&pool, &redis, 2_000, &mut strikes)
+            .await
+            .expect("second pass");
+        assert_eq!(second.swept, 1);
+        assert!(
+            !active(&pool, "swpS0001").await,
+            "a stale key does not keep a session"
+        );
+        assert!(active(&pool, "swpS0002").await, "a fresh share does");
 
         cleanup(&pool, addr).await;
     }

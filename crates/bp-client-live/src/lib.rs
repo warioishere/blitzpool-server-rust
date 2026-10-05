@@ -201,28 +201,6 @@ pub async fn delete_address_live_keys(
     Ok(deleted)
 }
 
-/// Pipelined `EXISTS`, positionally aligned. The liveness sweep must SKIP
-/// on an error, never sweep: "cannot ask Redis" is not "no key".
-pub async fn live_keys_exist<S: SessionKey>(
-    redis: Option<&ConnectionManager>,
-    sessions: &[S],
-) -> Result<Vec<bool>, LiveReadError> {
-    if sessions.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut conn = redis.ok_or(LiveReadError::NotConfigured)?.clone();
-    let mut out = Vec::with_capacity(sessions.len());
-    for chunk in sessions.chunks(FETCH_CHUNK) {
-        let mut pipe = redis::pipe();
-        for s in chunk {
-            pipe.cmd("EXISTS").arg(live_key::key_of(s));
-        }
-        let flags: Vec<bool> = bounded(pipe.query_async(&mut conn)).await?;
-        out.extend(flags);
-    }
-    Ok(out)
-}
-
 /// The live half of one session. Missing fields default to 0 / `None`; a
 /// wholly missing hash is `None` from [`live_fields_for_sessions`].
 #[derive(Clone, Debug, Default, PartialEq)]

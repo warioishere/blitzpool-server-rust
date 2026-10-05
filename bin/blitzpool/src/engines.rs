@@ -331,10 +331,10 @@ async fn spawn_session_persistence(
     handles: &FoundationHandles,
 ) -> Result<SessionPersistenceEngineHandle, EngineError> {
     let cfg = SessionPersistenceConfig {
-        // Same duration as the sweep's staleness cutoff, but this TTL runs
-        // from the last touch flush, the cutoff from the row's birth: the
-        // key is the liveness signal, the age only a birth grace.
-        live_ttl: crate::crons::STALE_CLIENT_TTL,
+        // The key lives as long as its row can: a paused miner keeps its
+        // difficulty, channels and last share on display. Liveness comes
+        // from the hash's `updated_at_ms`, not from the key's existence.
+        live_ttl: crate::crons::CLIENT_HARD_DELETE_RETENTION,
         ..SessionPersistenceConfig::default()
     };
     info!(

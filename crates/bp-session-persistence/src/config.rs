@@ -17,8 +17,9 @@ pub struct SessionPersistenceConfig {
     pub row_debounce: Duration,
     /// Flush interval for the batched row births.
     pub row_flush_interval: Duration,
-    /// TTL of the `client:live:*` hashes, wired to the dead-session sweep's
-    /// staleness cutoff so both clocks agree. Only the touch flush refreshes it.
+    /// TTL of the `client:live:*` hashes. Cleanup only: readers judge a
+    /// session by the hash's `updated_at_ms`, so the key may outlive it.
+    /// Only the touch flush refreshes it.
     pub live_ttl: Duration,
 }
 
@@ -28,7 +29,7 @@ impl Default for SessionPersistenceConfig {
             touch_flush_interval: Duration::from_secs(30),
             row_debounce: Duration::from_secs(15),
             row_flush_interval: Duration::from_secs(5),
-            live_ttl: Duration::from_secs(5 * 60),
+            live_ttl: Duration::from_secs(2 * 60 * 60),
         }
     }
 }

@@ -167,9 +167,10 @@ async fn touch_flush_dual_writes_hash_and_ttl() {
     assert!(updated > 0, "updated_at_ms is a share timestamp");
 
     let t = ttl(&mut redis, &key).await;
+    let configured = SessionPersistenceConfig::default().live_ttl.as_secs() as i64;
     assert!(
-        t > 0 && t <= 300,
-        "touch write must set the liveness TTL, got {t}"
+        t > 0 && t <= configured,
+        "touch write must set the configured TTL ({configured} s), got {t}"
     );
 
     handle.shutdown().await;
