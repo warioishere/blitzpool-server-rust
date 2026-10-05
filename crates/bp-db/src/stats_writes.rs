@@ -140,8 +140,8 @@ where
     Ok(result.rows_affected())
 }
 
-/// One row in a `client_statistics_entity` bulk-upsert — the big
-/// 9-field-per-key bucket. Counts are `i32`; diff fields are `f32`.
+/// One row in a `client_statistics_entity` bulk-upsert. Counts are `i32`;
+/// diff fields are `f32`.
 #[derive(Clone, Debug)]
 pub struct ClientStatsUpsert {
     pub address: String,
@@ -149,8 +149,6 @@ pub struct ClientStatsUpsert {
     pub session_id: String,
     pub time_ms: i64,
     pub shares: f32,
-    pub accepted_count: i32,
-    pub rejected_count: i32,
     pub rejected_job_not_found_count: i32,
     pub rejected_job_not_found_diff1: f32,
     pub rejected_duplicate_share_count: i32,
@@ -165,9 +163,9 @@ pub struct ClientStatsUpsert {
 }
 
 /// Bulk-upsert client-statistics rows. UNIQUE (address, clientName,
-/// sessionId, "time") drives ON CONFLICT; numeric fields accumulate.
-/// The caller batches in chunks of at most 1000 rows to stay well under
-/// the PG parameter limit.
+/// sessionId, "time") drives ON CONFLICT; numeric fields accumulate, the
+/// slot maximum through `GREATEST`. The columns travel as arrays, so the
+/// row count adds no bind parameters.
 pub async fn bulk_upsert_client_statistics_entity<'e, E>(
     executor: E,
     rows: &[ClientStatsUpsert],
@@ -183,8 +181,6 @@ where
     let session_ids: Vec<String> = rows.iter().map(|r| r.session_id.clone()).collect();
     let times: Vec<i64> = rows.iter().map(|r| r.time_ms).collect();
     let shares: Vec<f32> = rows.iter().map(|r| r.shares).collect();
-    let accepted: Vec<i32> = rows.iter().map(|r| r.accepted_count).collect();
-    let rejected: Vec<i32> = rows.iter().map(|r| r.rejected_count).collect();
     let r_jnf_count: Vec<i32> = rows
         .iter()
         .map(|r| r.rejected_job_not_found_count)
@@ -224,7 +220,6 @@ where
     let result = sqlx::query!(
         r#"INSERT INTO client_statistics_entity
              (address, "clientName", "sessionId", "time", shares,
-              "acceptedCount", "rejectedCount",
               "rejectedJobNotFoundCount",      "rejectedJobNotFoundDiff1",
               "rejectedDuplicateShareCount",   "rejectedDuplicateShareDiff1",
               "rejectedLowDifficultyShareCount","rejectedLowDifficultyShareDiff1",
@@ -234,7 +229,6 @@ where
               "updatedAt")
            SELECT
              u.addr, u.cname, u.sid, u.t, u.sh,
-             u.ac,  u.rc,
              u.rjc, u.rjd,
              u.rdc, u.rdd,
              u.rlc, u.rld,
@@ -244,18 +238,15 @@ where
              (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
            FROM UNNEST(
              $1::varchar[], $2::varchar[], $3::varchar[], $4::bigint[], $5::real[],
-             $6::int[], $7::int[],
+             $6::int[], $7::real[],
              $8::int[], $9::real[],
              $10::int[], $11::real[],
              $12::int[], $13::real[],
              $14::int[], $15::real[],
-             $16::int[], $17::real[],
-             $18::real[]
-           ) AS u(addr, cname, sid, t, sh, ac, rc, rjc, rjd, rdc, rdd, rlc, rld, rvc, rvd, rsc, rsd, mx)
+             $16::real[]
+           ) AS u(addr, cname, sid, t, sh, rjc, rjd, rdc, rdd, rlc, rld, rvc, rvd, rsc, rsd, mx)
            ON CONFLICT (address, "clientName", "sessionId", "time") DO UPDATE
            SET shares                              = client_statistics_entity.shares                              + EXCLUDED.shares,
-               "acceptedCount"                     = client_statistics_entity."acceptedCount"                     + EXCLUDED."acceptedCount",
-               "rejectedCount"                     = client_statistics_entity."rejectedCount"                     + EXCLUDED."rejectedCount",
                "rejectedJobNotFoundCount"          = client_statistics_entity."rejectedJobNotFoundCount"          + EXCLUDED."rejectedJobNotFoundCount",
                "rejectedJobNotFoundDiff1"          = client_statistics_entity."rejectedJobNotFoundDiff1"          + EXCLUDED."rejectedJobNotFoundDiff1",
                "rejectedDuplicateShareCount"       = client_statistics_entity."rejectedDuplicateShareCount"       + EXCLUDED."rejectedDuplicateShareCount",
@@ -273,8 +264,6 @@ where
         &session_ids,
         &times,
         &shares,
-        &accepted,
-        &rejected,
         &r_jnf_count,
         &r_jnf_diff,
         &r_dup_count,

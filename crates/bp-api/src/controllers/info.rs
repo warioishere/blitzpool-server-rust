@@ -1460,8 +1460,6 @@ mod slot_json_tests {
             session_id: "s".to_string(),
             time,
             shares: 0.0,
-            accepted_count: 0,
-            rejected_count: 0,
             rejected_job_not_found_count: 0,
             rejected_job_not_found_diff1: 0.0,
             rejected_duplicate_share_count: 0,

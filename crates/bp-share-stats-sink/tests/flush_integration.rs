@@ -120,7 +120,6 @@ async fn flush_once_drains_all_seven_tables_to_pg() {
         },
         &ClientStatisticsRecord {
             shares: 10.0,
-            accepted_count: 1.0,
             max_difficulty: 4096.0,
             ..Default::default()
         },
@@ -395,7 +394,6 @@ async fn client_slots_reach_pg_once_ended_and_the_drain_writes_the_rest() {
     };
     let shares = |s: f64| ClientStatisticsRecord {
         shares: s,
-        accepted_count: 1.0,
         ..Default::default()
     };
     let read = |slot: TimeSlot| {

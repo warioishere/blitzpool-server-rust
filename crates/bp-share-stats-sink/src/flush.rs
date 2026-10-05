@@ -196,8 +196,6 @@ async fn flush_client_statistics(
             session_id: key.session_id.clone(),
             time_ms: key.slot.as_millis(),
             shares: rec.shares as f32,
-            accepted_count: rec.accepted_count as i32,
-            rejected_count: rec.rejected_count as i32,
             rejected_job_not_found_count: rec.rejected_job_not_found_count as i32,
             rejected_job_not_found_diff1: rec.rejected_job_not_found_diff1 as f32,
             rejected_duplicate_share_count: rec.rejected_duplicate_share_count as i32,

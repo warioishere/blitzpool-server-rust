@@ -565,13 +565,12 @@ async fn worker_chart_breaks_rejects_down_by_every_reason() {
     sqlx::query(
         r#"INSERT INTO client_statistics_entity
              (address, "clientName", "sessionId", "time", shares,
-              "acceptedCount", "rejectedCount",
               "rejectedJobNotFoundCount",       "rejectedJobNotFoundDiff1",
               "rejectedDuplicateShareCount",    "rejectedDuplicateShareDiff1",
               "rejectedLowDifficultyShareCount","rejectedLowDifficultyShareDiff1",
               "rejectedVersionRollingCount",    "rejectedVersionRollingDiff1",
               "rejectedStaleCount",             "rejectedStaleDiff1")
-           VALUES ($1,$2,$3,$4, 10, 1, 15, 1,0.5, 2,0.25, 3,0.125, 4,0.0625, 5,0.03125)"#,
+           VALUES ($1,$2,$3,$4, 10, 1,0.5, 2,0.25, 3,0.125, 4,0.0625, 5,0.03125)"#,
     )
     .bind(addr)
     .bind(worker)
@@ -627,7 +626,7 @@ async fn worker_chart_breaks_rejects_down_by_every_reason() {
         + n("rejectedLowDifficultyShare")
         + n("rejectedVersionRolling")
         + n("rejectedStale");
-    assert_eq!(sum, 15.0, "breakdown must sum to rejectedCount, got {sum}");
+    assert_eq!(sum, 15.0, "the breakdown covers all 15 rejects, got {sum}");
     // Diff-1 weights ride along per reason and must not be cross-wired.
     assert_eq!(n("rejectedVersionRollingDiff1"), 0.0625);
     assert_eq!(n("rejectedStaleDiff1"), 0.03125);

@@ -130,5 +130,8 @@ async fn rejected_share_classifies_jnf_dup_low_into_separate_diff1_fields() {
     assert_eq!(rec.rejected_job_not_found_diff1, 7.0);
     assert_eq!(rec.rejected_duplicate_share_diff1, 13.0);
     assert_eq!(rec.rejected_low_difficulty_share_diff1, 29.0);
-    assert_eq!(rec.rejected_count, 3.0);
+    let counts = rec.rejected_job_not_found_count
+        + rec.rejected_duplicate_share_count
+        + rec.rejected_low_difficulty_share_count;
+    assert_eq!(counts, 3.0, "one count per reject, each under its reason");
 }

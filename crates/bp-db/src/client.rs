@@ -191,8 +191,6 @@ pub async fn find_client_statistics_since_for_address(
             "sessionId" AS "session_id!",
             "time" AS "time!",
             shares AS "shares!",
-            "acceptedCount" AS "accepted_count!",
-            "rejectedCount" AS "rejected_count!",
             "rejectedJobNotFoundCount" AS "rejected_job_not_found_count!",
             "rejectedJobNotFoundDiff1" AS "rejected_job_not_found_diff1!",
             "rejectedDuplicateShareCount" AS "rejected_duplicate_share_count!",
@@ -259,10 +257,6 @@ pub struct ClientStatisticsRow {
     pub session_id: String,
     pub time: i64,
     pub shares: f32,
-    #[sqlx(rename = "acceptedCount")]
-    pub accepted_count: i32,
-    #[sqlx(rename = "rejectedCount")]
-    pub rejected_count: i32,
     #[sqlx(rename = "rejectedJobNotFoundCount")]
     pub rejected_job_not_found_count: i32,
     #[sqlx(rename = "rejectedJobNotFoundDiff1")]

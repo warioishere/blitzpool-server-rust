@@ -118,7 +118,6 @@ async fn engine_spawn_tick_flushes_to_pg_then_shutdown_drains() {
         },
         &ClientStatisticsRecord {
             shares: 50.0,
-            accepted_count: 1.0,
             ..Default::default()
         },
     );

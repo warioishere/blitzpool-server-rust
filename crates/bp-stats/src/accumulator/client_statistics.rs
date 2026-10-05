@@ -26,8 +26,6 @@ pub struct ClientStatisticsKey {
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct ClientStatisticsRecord {
     pub shares: f64,
-    pub accepted_count: f64,
-    pub rejected_count: f64,
     pub rejected_job_not_found_count: f64,
     pub rejected_job_not_found_diff1: f64,
     pub rejected_duplicate_share_count: f64,
@@ -50,8 +48,6 @@ pub struct ClientStatisticsRecord {
 impl BufferRecord for ClientStatisticsRecord {
     fn is_zero(&self) -> bool {
         self.shares == 0.0
-            && self.accepted_count == 0.0
-            && self.rejected_count == 0.0
             && self.rejected_job_not_found_count == 0.0
             && self.rejected_job_not_found_diff1 == 0.0
             && self.rejected_duplicate_share_count == 0.0
@@ -67,8 +63,6 @@ impl BufferRecord for ClientStatisticsRecord {
 
     fn add_assign(&mut self, rhs: &Self) {
         self.shares += rhs.shares;
-        self.accepted_count += rhs.accepted_count;
-        self.rejected_count += rhs.rejected_count;
         self.rejected_job_not_found_count += rhs.rejected_job_not_found_count;
         self.rejected_job_not_found_diff1 += rhs.rejected_job_not_found_diff1;
         self.rejected_duplicate_share_count += rhs.rejected_duplicate_share_count;
@@ -150,14 +144,12 @@ mod tests {
     fn accepted_record(diff: f64) -> ClientStatisticsRecord {
         ClientStatisticsRecord {
             shares: diff,
-            accepted_count: 1.0,
             ..Default::default()
         }
     }
 
     fn rejected_jnf_record(diff: f64) -> ClientStatisticsRecord {
         ClientStatisticsRecord {
-            rejected_count: 1.0,
             rejected_job_not_found_count: 1.0,
             rejected_job_not_found_diff1: diff,
             ..Default::default()
@@ -202,8 +194,6 @@ mod tests {
         let snap = acc.take();
         let r = snap.get(&k).expect("merged bucket");
         assert_eq!(r.shares, 150.0);
-        assert_eq!(r.accepted_count, 2.0);
-        assert_eq!(r.rejected_count, 1.0);
         assert_eq!(r.rejected_job_not_found_count, 1.0);
         assert_eq!(r.rejected_job_not_found_diff1, 7.0);
     }

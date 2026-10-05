@@ -220,7 +220,7 @@ async fn pool_rejected_stats_composite_key_increment() {
     tx.rollback().await.expect("rollback");
 }
 
-// ── client_statistics_entity (15 cols, batchable) ────────────────────
+// ── client_statistics_entity ─────────────────────────────────────────
 
 #[tokio::test]
 async fn client_stats_insert_then_increment_every_field() {
@@ -230,22 +230,13 @@ async fn client_stats_insert_then_increment_every_field() {
     let mut tx = pool.begin().await.expect("begin tx");
     let slot = unique_slot(4);
 
-    let mk = |shares: f32,
-              accepted: i32,
-              rejected: i32,
-              jnf: i32,
-              dup: i32,
-              low: i32,
-              vr: i32,
-              stale: i32| {
+    let mk = |shares: f32, jnf: i32, dup: i32, low: i32, vr: i32, stale: i32| {
         ClientStatsUpsert {
             address: "test_cs_alice".to_string(),
             client_name: "w1".to_string(),
             session_id: "sess0001".to_string(),
             time_ms: slot,
             shares,
-            accepted_count: accepted,
-            rejected_count: rejected,
             rejected_job_not_found_count: jnf,
             rejected_job_not_found_diff1: jnf as f32 * 0.5,
             rejected_duplicate_share_count: dup,
@@ -263,18 +254,19 @@ async fn client_stats_insert_then_increment_every_field() {
         }
     };
 
-    bulk_upsert_client_statistics_entity(&mut *tx, &[mk(100.0, 5, 3, 1, 1, 1, 2, 4)])
+    bulk_upsert_client_statistics_entity(&mut *tx, &[mk(100.0, 1, 1, 1, 2, 4)])
         .await
         .expect("first");
     // Second call: every numeric field accumulates.
-    bulk_upsert_client_statistics_entity(&mut *tx, &[mk(50.0, 2, 0, 0, 0, 0, 3, 6)])
+    bulk_upsert_client_statistics_entity(&mut *tx, &[mk(50.0, 1, 2, 3, 3, 6)])
         .await
         .expect("second");
 
     let row = sqlx::query(
-        r#"SELECT shares, "acceptedCount", "rejectedCount",
-                  "rejectedJobNotFoundCount", "rejectedDuplicateShareCount",
-                  "rejectedLowDifficultyShareCount",
+        r#"SELECT shares,
+                  "rejectedJobNotFoundCount", "rejectedJobNotFoundDiff1",
+                  "rejectedDuplicateShareCount", "rejectedDuplicateShareDiff1",
+                  "rejectedLowDifficultyShareCount", "rejectedLowDifficultyShareDiff1",
                   "rejectedVersionRollingCount", "rejectedVersionRollingDiff1",
                   "rejectedStaleCount", "rejectedStaleDiff1", "maxDifficulty"
            FROM client_statistics_entity
@@ -289,21 +281,25 @@ async fn client_stats_insert_then_increment_every_field() {
     .expect("read");
 
     let shares: f32 = row.get("shares");
-    let accepted: i32 = row.get("acceptedCount");
-    let rejected: i32 = row.get("rejectedCount");
     let jnf: i32 = row.get("rejectedJobNotFoundCount");
+    let jnf_diff: f32 = row.get("rejectedJobNotFoundDiff1");
     let dup: i32 = row.get("rejectedDuplicateShareCount");
+    let dup_diff: f32 = row.get("rejectedDuplicateShareDiff1");
     let low: i32 = row.get("rejectedLowDifficultyShareCount");
+    let low_diff: f32 = row.get("rejectedLowDifficultyShareDiff1");
     let vr: i32 = row.get("rejectedVersionRollingCount");
     let vr_diff: f32 = row.get("rejectedVersionRollingDiff1");
     let stale: i32 = row.get("rejectedStaleCount");
     let stale_diff: f32 = row.get("rejectedStaleDiff1");
     assert!((shares - 150.0).abs() < 0.01);
-    assert_eq!(accepted, 7);
-    assert_eq!(rejected, 3);
-    assert_eq!(jnf, 1);
-    assert_eq!(dup, 1);
-    assert_eq!(low, 1);
+    // Each pair at its own count and multiplier, so a swapped bind or a
+    // wrong `$n` index lands on another pair's value.
+    assert_eq!(jnf, 2);
+    assert!((jnf_diff - 1.0).abs() < 0.001, "got {jnf_diff}");
+    assert_eq!(dup, 3);
+    assert!((dup_diff - 0.75).abs() < 0.001, "got {dup_diff}");
+    assert_eq!(low, 4);
+    assert!((low_diff - 0.4).abs() < 0.001, "got {low_diff}");
     // 2 + 3, at a multiplier no other pair uses — a swapped bind would land
     // on one of the others' values instead.
     assert_eq!(vr, 5);
@@ -337,8 +333,6 @@ async fn max_difficulty_for_addresses_is_the_members_maximum_per_slot() {
         session_id: "sess0001".to_string(),
         time_ms,
         shares: 1.0,
-        accepted_count: 1,
-        rejected_count: 0,
         rejected_job_not_found_count: 0,
         rejected_job_not_found_diff1: 0.0,
         rejected_duplicate_share_count: 0,
@@ -390,8 +384,6 @@ async fn client_stats_distinct_keys_stay_independent() {
         session_id: "sessA".to_string(),
         time_ms: slot,
         shares: 10.0,
-        accepted_count: 1,
-        rejected_count: 0,
         rejected_job_not_found_count: 0,
         rejected_job_not_found_diff1: 0.0,
         rejected_duplicate_share_count: 0,

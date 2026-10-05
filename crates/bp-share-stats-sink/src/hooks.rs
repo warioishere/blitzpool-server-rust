@@ -55,7 +55,6 @@ impl SharedAcceptedShareSink for ShareStatsAcceptedSink {
             key,
             &ClientStatisticsRecord {
                 shares: diff,
-                accepted_count: 1.0,
                 max_difficulty: bp_stats::share_max(share.submission_difficulty),
                 ..Default::default()
             },
@@ -123,12 +122,9 @@ impl SharedRejectedShareSink for ShareStatsRejectedSink {
             session_id: share.session_id.to_string(),
             slot,
         };
-        let mut delta = ClientStatisticsRecord {
-            rejected_count: 1.0,
-            ..Default::default()
-        };
-        // One column pair per reason, no folds, so the counters sum to
-        // `rejected_count`; a new `RejectedReason` variant needs its own pair.
+        let mut delta = ClientStatisticsRecord::default();
+        // One column pair per reason, no folds; a new `RejectedReason`
+        // variant needs its own pair.
         match reason {
             RejectedReason::JobNotFound => {
                 delta.rejected_job_not_found_count = 1.0;

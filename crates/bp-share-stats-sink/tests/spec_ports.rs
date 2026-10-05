@@ -84,7 +84,6 @@ async fn client_statistics_1500_rows_land_in_one_statement() {
             },
             &ClientStatisticsRecord {
                 shares: 1.0,
-                accepted_count: 1.0,
                 ..Default::default()
             },
         );
@@ -136,7 +135,6 @@ async fn client_name_with_special_chars_roundtrips_through_unnest() {
             },
             &ClientStatisticsRecord {
                 shares: 1.0,
-                accepted_count: 1.0,
                 ..Default::default()
             },
         );
