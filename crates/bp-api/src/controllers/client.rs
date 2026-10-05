@@ -662,22 +662,6 @@ async fn purge_address_stats(pool: &sqlx::PgPool, addr: &AddressId) -> Result<()
     .execute(pool)
     .await
     .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
-    // Nothing writes the next two tables; the deletes clear what they still
-    // hold for this address until a migration drops them.
-    sqlx::query!(
-        r#"DELETE FROM client_rejected_statistics_entity WHERE address = $1"#,
-        addr.as_str()
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
-    sqlx::query!(
-        r#"DELETE FROM client_difficulty_statistics_entity WHERE address = $1"#,
-        addr.as_str()
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
     sqlx::query!(
         r#"DELETE FROM worker_shares_entity WHERE address = $1"#,
         addr.as_str()
