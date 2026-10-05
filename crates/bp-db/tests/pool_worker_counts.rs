@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Pins `find_pool_worker_counts_since`: distinct counts per slot over the
-//! non-soft-deleted rows at or after `since`.
+//! Pins `find_pool_worker_counts_since` (distinct counts per slot over the
+//! rows at or after `since`) and the row order of the multi-address reader.
 
 use bp_db::{find_pool_worker_counts_since, PoolWorkerCounts};
 use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -33,11 +33,10 @@ async fn connect_or_skip() -> Option<PgPool> {
     }
 }
 
-/// Distinct addresses and workers per slot, from active in-window rows only:
-/// two sessions of one worker count once, a soft-deleted or earlier row not
-/// at all.
+/// Distinct addresses and workers per slot, from in-window rows only: two
+/// sessions of one worker count once, an earlier row not at all.
 #[tokio::test]
-async fn worker_counts_are_distinct_and_skip_deleted_and_old_rows() {
+async fn worker_counts_are_distinct_and_skip_old_rows() {
     let Some(pool) = connect_or_skip().await else {
         return;
     };
@@ -47,28 +46,25 @@ async fn worker_counts_are_distinct_and_skip_deleted_and_old_rows() {
     let since: i64 = 9_000_000_000_000_000;
     let next = since + 600_000;
 
-    // (address, worker, session, time, deleted?)
-    let seed: &[(&str, &str, &str, i64, Option<i64>)] = &[
-        ("bp_pwr_X", "w1", "s1", since, None),
-        ("bp_pwr_X", "w1", "s2", since, None), // same worker, second session
-        ("bp_pwr_X", "w2", "s3", since, None),
-        ("bp_pwr_Y", "w1", "s4", since, None),
-        ("bp_pwr_Y", "w1", "s5", next, None),
-        ("bp_pwr_OLD", "w1", "s6", since - 1, None), // before since
-        ("bp_pwr_DEL", "w1", "s7", since, Some(since)), // soft-deleted
+    // (address, worker, session, time)
+    let seed: &[(&str, &str, &str, i64)] = &[
+        ("bp_pwr_X", "w1", "s1", since),
+        ("bp_pwr_X", "w1", "s2", since), // same worker, second session
+        ("bp_pwr_X", "w2", "s3", since),
+        ("bp_pwr_Y", "w1", "s4", since),
+        ("bp_pwr_Y", "w1", "s5", next),
+        ("bp_pwr_OLD", "w1", "s6", since - 1), // before since
     ];
-    for (addr, worker, session, time, deleted) in seed {
+    for (addr, worker, session, time) in seed {
         sqlx::query(
             r#"INSERT INTO client_statistics_entity
-                 (address, "clientName", "sessionId", "time", shares, "deletedAt")
-               VALUES ($1, $2, $3, $4, $5, $6)"#,
+                 (address, "clientName", "sessionId", "time", shares)
+               VALUES ($1, $2, $3, $4, 1)"#,
         )
         .bind(addr)
         .bind(worker)
         .bind(session)
         .bind(time)
-        .bind(1.0_f32)
-        .bind(deleted)
         .execute(&mut *tx)
         .await
         .expect("seed insert");
@@ -95,4 +91,73 @@ async fn worker_counts_are_distinct_and_skip_deleted_and_old_rows() {
     );
 
     // tx dropped → rolls back, no DB pollution.
+}
+
+/// The multi-address reader returns address by address in the order given,
+/// each by time, so sums over it add in the order one read per address did.
+#[tokio::test]
+async fn client_statistics_come_address_by_address_in_the_given_order() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let since: i64 = 9_100_000_000_000_000;
+    let (a, b) = ("bp_csr_alice", "bp_csr_bob");
+    let cleanup = || async {
+        let _ = sqlx::query("DELETE FROM client_statistics_entity WHERE address IN ($1, $2)")
+            .bind(a)
+            .bind(b)
+            .execute(&pool)
+            .await;
+    };
+    cleanup().await;
+    for (addr, time) in [
+        (a, since + 600_000),
+        (b, since),
+        (a, since),
+        (b, since + 600_000),
+    ] {
+        sqlx::query(
+            r#"INSERT INTO client_statistics_entity
+                 (address, "clientName", "sessionId", "time", shares)
+               VALUES ($1, 'w', 's1', $2, 1)"#,
+        )
+        .bind(addr)
+        .bind(time)
+        .execute(&pool)
+        .await
+        .expect("seed");
+    }
+
+    let order = |addresses: Vec<&'static str>| {
+        let pool = pool.clone();
+        async move {
+            let ids: Vec<bp_common::AddressId> = addresses
+                .iter()
+                .map(|s| bp_common::AddressId::new(s.to_string()).unwrap())
+                .collect();
+            bp_db::find_client_statistics_since_for_addresses(&pool, &ids, since)
+                .await
+                .expect("read")
+                .into_iter()
+                .map(|r| (r.address.as_str().to_string(), r.time))
+                .collect::<Vec<_>>()
+        }
+    };
+    let b_then_a = order(vec![b, a]).await;
+    let a_only = order(vec![a]).await;
+    cleanup().await;
+
+    assert_eq!(
+        b_then_a,
+        vec![
+            (b.to_string(), since),
+            (b.to_string(), since + 600_000),
+            (a.to_string(), since),
+            (a.to_string(), since + 600_000),
+        ]
+    );
+    assert_eq!(
+        a_only,
+        vec![(a.to_string(), since), (a.to_string(), since + 600_000)]
+    );
 }

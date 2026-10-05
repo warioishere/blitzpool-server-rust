@@ -164,7 +164,7 @@ where
                   COUNT(DISTINCT address) AS "addresses!",
                   COUNT(DISTINCT (address, "clientName")) AS "workers!"
              FROM client_statistics_entity
-            WHERE "deletedAt" IS NULL AND "time" >= $1
+            WHERE "time" >= $1
             GROUP BY "time""#,
         since_ms,
     )
@@ -173,19 +173,18 @@ where
     .map_err(DbError::from)
 }
 
-/// One address's `client_statistics_entity` rows from `since_ms` on, by time.
-pub async fn find_client_statistics_since_for_address(
+/// The `client_statistics_entity` rows of `addresses` from `since_ms` on, in
+/// one query: address by address in the order given, each by time, so a sum
+/// over them adds in the same order as one read per address would.
+pub async fn find_client_statistics_since_for_addresses(
     pool: &PgPool,
-    address: &AddressId,
+    addresses: &[AddressId],
     since_ms: i64,
 ) -> Result<Vec<ClientStatisticsRow>, DbError> {
+    let addresses: Vec<String> = addresses.iter().map(|a| a.as_str().to_string()).collect();
     sqlx::query_as!(
         ClientStatisticsRow,
         r#"SELECT
-            "deletedAt" AS "deleted_at?",
-            "createdAt" AS "created_at!",
-            "updatedAt" AS "updated_at!",
-            id AS "id!",
             address AS "address!: AddressId",
             "clientName" AS "client_name!",
             "sessionId" AS "session_id!",
@@ -203,9 +202,9 @@ pub async fn find_client_statistics_since_for_address(
             "rejectedStaleDiff1" AS "rejected_stale_diff1!",
             "maxDifficulty" AS "max_difficulty!"
            FROM client_statistics_entity
-           WHERE "deletedAt" IS NULL AND address = $1 AND "time" >= $2
-           ORDER BY "time" ASC"#,
-        address.as_str(),
+           WHERE address = ANY($1) AND "time" >= $2
+           ORDER BY array_position($1, address::text), "time""#,
+        &addresses,
         since_ms,
     )
     .fetch_all(pool)
@@ -227,7 +226,7 @@ where
     let rows = sqlx::query!(
         r#"SELECT "time" AS "time!", MAX("maxDifficulty") AS "max_difficulty!"
            FROM client_statistics_entity
-           WHERE "deletedAt" IS NULL AND address = ANY($1) AND "time" >= $2
+           WHERE address = ANY($1) AND "time" >= $2
            GROUP BY "time""#,
         &addresses,
         since_ms,
@@ -243,13 +242,6 @@ where
 
 #[derive(Clone, Debug, FromRow)]
 pub struct ClientStatisticsRow {
-    #[sqlx(rename = "deletedAt")]
-    pub deleted_at: Option<i64>,
-    #[sqlx(rename = "createdAt")]
-    pub created_at: i64,
-    #[sqlx(rename = "updatedAt")]
-    pub updated_at: i64,
-    pub id: i32,
     pub address: AddressId,
     #[sqlx(rename = "clientName")]
     pub client_name: String,

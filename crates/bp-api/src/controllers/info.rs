@@ -1443,10 +1443,6 @@ mod slot_json_tests {
     /// A client row with every reject column at zero except the given ones.
     fn client_row(time: i64, worker: &str) -> bp_db::ClientStatisticsRow {
         bp_db::ClientStatisticsRow {
-            deleted_at: None,
-            created_at: 0,
-            updated_at: 0,
-            id: 0,
             address: bp_common::AddressId::new("bc1qalice".to_string()).unwrap(),
             client_name: worker.to_string(),
             session_id: "s".to_string(),

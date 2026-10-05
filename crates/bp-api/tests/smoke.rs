@@ -484,7 +484,7 @@ async fn push_status_for_unknown_address_returns_empty_shape() {
         .await
         .expect("oneshot");
     assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+    let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(json["subscriptionCount"], 0);
     assert!(json["subscriptions"].is_array());
@@ -647,7 +647,7 @@ async fn get_json(pool: PgPool, uri: &str) -> (StatusCode, serde_json::Value) {
         .await
         .expect("oneshot");
     let status = resp.status();
-    let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+    let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
     let json = serde_json::from_slice(&bytes)
         .unwrap_or_else(|e| panic!("non-JSON body for {uri} ({e}): {bytes:?}"));
     (status, json)
@@ -904,4 +904,71 @@ async fn worker_shares_lists_connected_workers_with_a_row_in_name_order() {
             {"workerName": "rig_b", "totalShares": 250, "totalRejected": 3},
         ])
     );
+}
+
+/// `/max-difficulty` per address: the highest share of each visible slot
+/// over all its sessions, every other slot 0.
+#[tokio::test]
+async fn client_max_difficulty_takes_the_best_session_per_slot() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    // Own address: no sibling test in this binary touches it.
+    let addr = "bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h";
+    let last = bp_stats::slot::chart_visibility_cutoff_slot()
+        .previous()
+        .as_millis();
+    let earlier = last - bp_stats::SLOT_DURATION_MS;
+    let rows: [(&str, i64, f32); 4] = [
+        ("mxs00001", earlier, 300.0),
+        ("mxs00002", earlier, 4_096.5),
+        ("mxs00001", last, 77.25),
+        ("mxs00002", last, 12.0),
+    ];
+    let cleanup = || async {
+        let _ = sqlx::query("DELETE FROM client_statistics_entity WHERE address = $1")
+            .bind(addr)
+            .execute(&pool)
+            .await;
+    };
+    cleanup().await;
+    for (session, slot_end, max) in rows {
+        sqlx::query(
+            r#"INSERT INTO client_statistics_entity
+                 (address, "clientName", "sessionId", "time", shares, "maxDifficulty")
+               VALUES ($1, 'rig', $2, $3, 1, $4)"#,
+        )
+        .bind(addr)
+        .bind(session)
+        .bind(slot_end)
+        .bind(max)
+        .execute(&pool)
+        .await
+        .expect("seed client stats");
+    }
+    let (status, body) =
+        get_json(pool.clone(), &format!("/api/client/{addr}/max-difficulty")).await;
+    cleanup().await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let slots = body["slotData"].as_array().expect("slotData");
+    let at = |t: i64| -> f64 {
+        let label = chrono::DateTime::from_timestamp_millis(t)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        slots
+            .iter()
+            .find(|e| e["time"] == label)
+            .unwrap_or_else(|| panic!("no slot {label}"))["counts"]["maxDifficulty"]
+            .as_f64()
+            .expect("number")
+    };
+    assert_eq!(at(earlier), 4_096.5);
+    assert_eq!(at(last), 77.25);
+    let nonzero = slots
+        .iter()
+        .filter(|e| e["counts"]["maxDifficulty"].as_f64() != Some(0.0))
+        .count();
+    assert_eq!(nonzero, 2, "every other slot reads 0");
 }

@@ -63,7 +63,7 @@ pub use client::{
     bulk_upsert_clients, delete_client_for_session, delete_old_client_statistics,
     delete_old_clients, delete_old_pool_mode_hashrate, delete_old_pool_rejected_statistics,
     device_first_seen, device_watch_seed, find_active_session_keys,
-    find_active_sessions_for_addresses, find_client, find_client_statistics_since_for_address,
+    find_active_sessions_for_addresses, find_client, find_client_statistics_since_for_addresses,
     find_clients_by_address, find_max_difficulty_since_for_addresses,
     find_pool_worker_counts_since, find_recently_deleted_sessions, find_stale_active_sessions,
     find_worker_shares_for_address, raise_client_best_difficulties, revive_sessions,

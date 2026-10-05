@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            \"time\" AS \"time!\",\n            accepted AS \"accepted!\",\n            rejected AS \"rejected!\",\n            \"maxDifficulty\" AS \"max_difficulty!\"\n           FROM pool_share_statistics_entity\n           WHERE \"time\" >= $1\n           ORDER BY \"time\" ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "time!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "accepted!",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 2,
+        "name": "rejected!",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 3,
+        "name": "max_difficulty!",
+        "type_info": "Float4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "80050b498937a11e505c37206a82cdc7cad5eb4d47c6da3639293c58f5627eed"
+}

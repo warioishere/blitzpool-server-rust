@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            \"time\" AS \"time!\",\n            reason AS \"reason!\",\n            count AS \"count!\"\n           FROM pool_rejected_statistics_entity\n           WHERE \"time\" >= $1\n           ORDER BY \"time\" ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "time!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "reason!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "count!",
+        "type_info": "Float4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0a2f0f001292b2343850071a6df187047383c55401e46357a7c67fad283f2413"
+}

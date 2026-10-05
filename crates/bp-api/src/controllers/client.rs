@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use bp_common::AddressId;
 use bp_db::{
-    find_address_settings, find_client, find_client_statistics_since_for_address,
+    find_address_settings, find_client, find_client_statistics_since_for_addresses,
     find_clients_by_address, find_worker_shares_for_address,
     reset_address_settings_best_difficulty, WorkerSharesRow,
 };
@@ -81,8 +81,12 @@ async fn chart(
         .get_or_fetch::<Vec<ChartPoint>, _, ApiError>(key, TtlKind::ClientChart, async move {
             let now = bp_common::now_ms();
             let since = now - range.window_ms();
-            let rows =
-                bp_db::find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
+            let rows = bp_db::find_client_statistics_since_for_addresses(
+                &s.pool,
+                std::slice::from_ref(&addr),
+                since,
+            )
+            .await?;
             Ok(chart_points(
                 &chart_slot_boundaries(since),
                 rows.iter().map(|r| (r.time, r.shares as f64)),
@@ -120,8 +124,12 @@ async fn accepted(
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::ClientAccepted, async move {
             let now = bp_common::now_ms();
             let since = now - range.window_ms();
-            let rows =
-                bp_db::find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
+            let rows = bp_db::find_client_statistics_since_for_addresses(
+                &s.pool,
+                std::slice::from_ref(&addr),
+                since,
+            )
+            .await?;
             // Diff-1-weighted accepted shares (sum of share difficulty), not
             // the raw count: it tracks work, so the chart stays flat when
             // vardiff trades share size for share rate. (The rejected
@@ -150,11 +158,15 @@ async fn max_difficulty(
         .cache
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::ClientAccepted, async move {
             let since = bp_common::now_ms() - range.window_ms();
-            let rows =
-                bp_db::find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
+            let rows = bp_db::find_max_difficulty_since_for_addresses(
+                &s.pool,
+                std::slice::from_ref(&addr),
+                since,
+            )
+            .await?;
             Ok(max_difficulty_slot_data(
                 &chart_slot_boundaries(since),
-                rows.iter().map(|r| (r.time, r.max_difficulty as f64)),
+                rows.into_iter().map(|(t, max)| (t, max as f64)),
             ))
         })
         .await?;
@@ -175,8 +187,12 @@ async fn workers(
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::ClientWorkers, async move {
             let now = bp_common::now_ms();
             let since = now - range.window_ms();
-            let rows =
-                bp_db::find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
+            let rows = bp_db::find_client_statistics_since_for_addresses(
+                &s.pool,
+                std::slice::from_ref(&addr),
+                since,
+            )
+            .await?;
             Ok(worker_slots(
                 &chart_slot_boundaries(since),
                 rows.iter()
@@ -226,8 +242,12 @@ async fn rejected(
             async move {
                 let now = bp_common::now_ms();
                 let since = now - range.window_ms();
-                let rows =
-                    bp_db::find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
+                let rows = bp_db::find_client_statistics_since_for_addresses(
+                    &s.pool,
+                    std::slice::from_ref(&addr),
+                    since,
+                )
+                .await?;
                 Ok(rejected_by_reason_slots(
                     &chart_slot_boundaries(since),
                     rows.iter().flat_map(client_reject_samples),
@@ -468,7 +488,12 @@ async fn by_worker(
             let now = bp_common::now_ms();
             let since = now - range.window_ms();
             let cutoff = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
-            let rows = find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
+            let rows = find_client_statistics_since_for_addresses(
+                &s.pool,
+                std::slice::from_ref(&addr),
+                since,
+            )
+            .await?;
             let mut grouped: BTreeMap<i64, WorkerChartEntry> = BTreeMap::new();
             for r in rows
                 .iter()
@@ -543,7 +568,12 @@ async fn by_session(
                 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
                 let since = now - DAY_MS;
                 let cutoff = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
-                let rows = find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
+                let rows = find_client_statistics_since_for_addresses(
+                    &s.pool,
+                    std::slice::from_ref(&addr),
+                    since,
+                )
+                .await?;
                 let mut grouped: BTreeMap<i64, f64> = BTreeMap::new();
                 for r in rows.iter().filter(|r| {
                     r.client_name == worker && r.session_id == session && r.time < cutoff

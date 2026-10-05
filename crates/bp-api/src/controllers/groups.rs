@@ -1756,12 +1756,10 @@ async fn group_chart(
             // Sparse: only slots that received shares get a point.
             let mut slot_shares: std::collections::BTreeMap<i64, f64> =
                 std::collections::BTreeMap::new();
-            for a in &addrs {
-                let rows =
-                    bp_db::find_client_statistics_since_for_address(&s.pool, a, since).await?;
-                for r in rows.iter().filter(|r| r.time < cutoff) {
-                    *slot_shares.entry(r.time).or_insert(0.0) += r.shares as f64;
-                }
+            let rows =
+                bp_db::find_client_statistics_since_for_addresses(&s.pool, &addrs, since).await?;
+            for r in rows.iter().filter(|r| r.time < cutoff) {
+                *slot_shares.entry(r.time).or_insert(0.0) += r.shares as f64;
             }
             Ok(slot_shares
                 .into_iter()
@@ -1789,12 +1787,8 @@ async fn group_accepted(
             let now = bp_common::now_ms();
             let since = now - range.window_ms();
             let addrs = collect_group_member_addresses(&s, id).await?;
-            let mut rows = Vec::new();
-            for a in &addrs {
-                rows.extend(
-                    bp_db::find_client_statistics_since_for_address(&s.pool, a, since).await?,
-                );
-            }
+            let rows =
+                bp_db::find_client_statistics_since_for_addresses(&s.pool, &addrs, since).await?;
             // Difficulty-weighted like the per-client endpoint, so it stays
             // flat at constant hashrate.
             Ok(accepted_slot_data(
@@ -1844,12 +1838,8 @@ async fn group_rejected(
             let now = bp_common::now_ms();
             let since = now - range.window_ms();
             let addrs = collect_group_member_addresses(&s, id).await?;
-            let mut rows = Vec::new();
-            for a in &addrs {
-                rows.extend(
-                    bp_db::find_client_statistics_since_for_address(&s.pool, a, since).await?,
-                );
-            }
+            let rows =
+                bp_db::find_client_statistics_since_for_addresses(&s.pool, &addrs, since).await?;
             Ok(rejected_by_reason_slots(
                 &chart_slot_boundaries(since),
                 rows.iter().flat_map(client_reject_samples),

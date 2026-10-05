@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT \"time\" AS \"time!\",\n                  COUNT(DISTINCT address) AS \"addresses!\",\n                  COUNT(DISTINCT (address, \"clientName\")) AS \"workers!\"\n             FROM client_statistics_entity\n            WHERE \"deletedAt\" IS NULL AND \"time\" >= $1\n            GROUP BY \"time\"",
+  "query": "SELECT \"time\" AS \"time!\",\n                  COUNT(DISTINCT address) AS \"addresses!\",\n                  COUNT(DISTINCT (address, \"clientName\")) AS \"workers!\"\n             FROM client_statistics_entity\n            WHERE \"time\" >= $1\n            GROUP BY \"time\"",
   "describe": {
     "columns": [
       {
@@ -30,5 +30,5 @@
       null
     ]
   },
-  "hash": "92ad58226c2acc1cc19f6b90f3aaa04d7dfaac3274c46e49a7f16689676c0372"
+  "hash": "be14e6432d790db9c061051d0ff88df002de3c37458b4aefaf70643be56472d4"
 }
