@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Per-session VarDiff engine and race-window clamp, shared by SV1 and SV2.
-//! With silence easing, estimates end at *now* so a quiet session's
-//! difficulty decays instead of freezing where the miner cannot reach it; a
-//! session with no share at all descends on a Poisson upper bound.
+//!
+//! One estimator drives every retarget. Arrivals are counted against the
+//! window's *exposure* `S = ∫dt/D(t)`, the share count a miner producing one
+//! difficulty unit per second would have reached, so `r = arrivals / S` is
+//! the rate in difficulty per second whatever difficulties the window spans.
+//! The window always ends at *now*, so silence lowers the estimate by itself.
+//! A window with fewer than [`VARDIFF_MIN_SHARES`] arrivals cannot measure a
+//! rate, only bound it from above, and therefore only ever lowers the
+//! difficulty. An assignment acted on a measured window starts a new one; a
+//! thinner window carries over. A window's first arrival opens it and carries
+//! no weight, dropping the silence before it.
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,55 +20,49 @@ use bp_common::HASHES_PER_DIFFICULTY_1;
 
 // ── Constants ────────────────────────────────────────────────────────
 
-/// Maximum number of submissions kept in the retarget sample cache.
-pub const VARDIFF_CACHE_SIZE: usize = 30;
-
-/// Sliding window for the submission cache. Older entries are dropped on
-/// the next `update_hash_rate`.
-pub const VARDIFF_CACHE_WINDOW_MS: u64 = 300_000;
-
 /// Default vardiff floor when the caller passes a non-finite / non-positive
 /// `min_difficulty`.
 pub const VARDIFF_DEFAULT_MIN_DIFFICULTY: f64 = 0.00001;
 
-/// Hashrate-slot length (10 minutes).
+/// Display-hashrate slot length (10 minutes).
 pub const VARDIFF_SLOT_DURATION_MS: u64 = 600_000;
-
-/// Minimum samples before the full cache-rate retarget math is allowed to
-/// fire. Below the threshold, the engine waits during warmup, then — past the
-/// warmup window — retargets from the measured hashrate (the under-sampled
-/// path in [`VarDiffEngine::suggested_difficulty`]).
-pub const VARDIFF_SAMPLE_THRESHOLD: usize = 5;
-
-/// Initial warmup period during which under-sampled sessions are NOT
-/// retargeted (return `None`). After this, an under-sampled session retargets
-/// from its measured hashrate (once it has one) instead of waiting for a full
-/// sample window.
-pub const VARDIFF_WARMUP_MS: u64 = 60_000;
 
 /// Default `target_shares_per_minute` fallback for misconfigured ports.
 pub const VARDIFF_DEFAULT_TARGET_SHARES_PER_MIN: f64 = 6.0;
 
-/// Silence easing: floor of the descent below the pre-silence rate. A session
-/// that is gone rather than slow parks here instead of sinking to
-/// `min_difficulty`, bounding its share flood on return to 16× target rate.
-pub const VARDIFF_SILENCE_MAX_DESCENT_FACTOR: f64 = 16.0;
+/// Shortest window a retarget is decided on. It is measured in time, not in
+/// shares, so neither two shares a millisecond apart nor a flood packing
+/// thousands into one millisecond can collapse it.
+pub const VARDIFF_MIN_WINDOW_MS: u64 = 60_000;
 
-/// Silence easing: cap on a single upward retarget, so a burst-inflated
-/// estimate (a JDC flushing optimistic-mining shares) gets a second interval
-/// before it is trusted.
+/// Arrivals a window needs before its rate counts as measured. Below this the
+/// window only bounds the rate from above.
+pub const VARDIFF_MIN_SHARES: u32 = 4;
+
+/// Length of one window bucket. The window holds the current bucket and the
+/// one before it, so a steady session decides on the last 5 to 10 minutes.
+pub const VARDIFF_BUCKET_MS: u64 = 300_000;
+
+/// Confidence constant `k = ln(1/α)` of the upper bound (3.0 is α = 5 %).
+/// Zero arrivals over exposure `S` have probability `e^(-r·S)`, so
+/// `r ≤ k / S`; with `n` arrivals the bound is taken as `(n + k) / S`,
+/// within one power-of-two rung of the exact Poisson limit for `n < 4`.
+pub const VARDIFF_CONFIDENCE_K: f64 = 3.0;
+
+/// Cap on a single upward retarget, so a burst-inflated window (a JDC
+/// flushing optimistic-mining shares) is measured once more before it is
+/// trusted.
 pub const VARDIFF_MAX_UP_STEP_FACTOR: f64 = 8.0;
 
-/// No-share descent: confidence constant `k = ln(1/α)` (3.0 is α = 5 %).
-/// Zero shares while difficulty follows `D(t)` has probability
-/// `e^-((H/2^32)·S)` with `S = ∫dt/D(t)`, so `H ≤ k · 2^32 / S`. Not a tuning
-/// knob: α = 1 % differs by less than one power-of-two rung.
-pub const VARDIFF_NO_SHARE_CONFIDENCE_K: f64 = 3.0;
+/// Descent floor below the last difficulty the session sustained with a
+/// measured window. A session that is gone rather than slow parks here,
+/// bounding its share flood on return to 16× target rate.
+pub const VARDIFF_SILENCE_MAX_DESCENT_FACTOR: f64 = 16.0;
 
-/// No-share descent: floor below the opening difficulty. It only has to get
-/// the miner from *never* to *occasionally*, since one accepted share hands
-/// over to the under-sampled bootstrap; looser costs a bigger flood when an
-/// idle session returns at full power.
+/// Descent floor below the highest difficulty ever assigned, for a session
+/// that has never sustained one. It only has to get the miner from *never*
+/// to *occasionally*; looser costs a bigger flood when an idle session
+/// returns at full power.
 pub const VARDIFF_NO_SHARE_MAX_DESCENT_FACTOR: f64 = 256.0;
 
 // ── Clock ────────────────────────────────────────────────────────────
@@ -72,8 +73,8 @@ pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
 }
 
-/// Wall clock. The engine only uses differences, so a backwards step at most
-/// stalls a retarget window, never panics.
+/// Wall clock. The engine only uses differences; a backwards step drops the
+/// retarget window (see [`VarDiffEngine::note_difficulty_assigned`]).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemClock;
 
@@ -168,75 +169,87 @@ pub fn effective_job_difficulty(
 
 // ── VarDiffEngine ────────────────────────────────────────────────────
 
+/// One stretch of the retarget window.
 #[derive(Clone, Copy, Debug)]
-struct Submission {
-    time_ms: u64,
-    difficulty: f64,
+struct Bucket {
+    start_ms: u64,
+    /// Arrivals, each weighted by its credited difficulty over the one in
+    /// force, so a share validated at an older, lower difficulty counts for
+    /// the work it carries.
+    arrivals: f64,
+    /// Unweighted arrival count including the window's opening arrival, for
+    /// the [`VARDIFF_MIN_SHARES`] test.
+    shares: u32,
+    /// Closed exposure in seconds per difficulty unit.
+    exposure: f64,
 }
 
-/// Per-session VarDiff state machine + hashrate accumulator. Clamped
-/// (stale-diff) shares MUST stay out of the retarget cache, which they would
-/// make oscillate, but count toward the displayed hashrate, which must
-/// reflect real work.
+impl Bucket {
+    fn empty(start_ms: u64) -> Self {
+        Self {
+            start_ms,
+            arrivals: 0.0,
+            shares: 0,
+            exposure: 0.0,
+        }
+    }
+}
+
+/// The whole window as of one instant.
+#[derive(Clone, Copy, Debug)]
+struct Window {
+    span_ms: u64,
+    arrivals: f64,
+    shares: u32,
+    exposure: f64,
+}
+
+/// Per-session VarDiff state machine plus the display-hashrate accumulator.
+/// The display hashrate never feeds a retarget.
 pub struct VarDiffEngine<C: Clock> {
     clock: C,
 
     // Config
-    target_submission_per_second: f64,
+    target_share_interval_s: f64,
     min_difficulty: f64,
 
-    // Cache state
-    submission_cache_start_ms: u64,
-    submission_cache: VecDeque<Submission>,
+    // Retarget window. `difficulty` is the one in force since
+    // `segment_start_ms`; the open segment's exposure is added at read time.
+    difficulty: f64,
+    segment_start_ms: u64,
+    previous: Option<Bucket>,
+    current: Bucket,
 
-    // Lifetime credited difficulty: the long-window rate for the
-    // under-sampled bootstrap, the one signal an ultra-sparse miner gives.
-    // Grows unbounded but is only read as a ratio.
-    lifetime_difficulty_sum: f64,
+    // Descent anchors: the difficulty the last measured window was gathered
+    // at, and the highest one ever assigned.
+    sustained: Option<f64>,
+    highest_assigned: f64,
+    // What the window dropped at the last assignment measured, `None` if it
+    // was too thin to measure. The up-step cap lifts only when it agrees.
+    previous_measurement: Option<f64>,
+    accepted_any: bool,
 
-    // Hashrate state
+    // Display hashrate, by 10-minute slot.
     hash_rate: f64,
-    // Observation span (ms) behind the last `hash_rate` computation.
-    // Lets the silence-eased read extend the same window to *now* instead
-    // of re-deriving it: decayed = work / (window + silence tail).
-    hash_rate_window_ms: u64,
     current_slot: Option<u64>,
     previous_slot_time_ms: u64,
     current_slot_time_ms: u64,
     previous_shares: f64,
     shares: f64,
-
-    // Silence easing (opt-in; see the module doc). `last_submission_ms`
-    // is the liveness sensor, stamped by every accepted AND rejected share:
-    // a rejecting miner is alive, just unlucky or stale.
-    silence_easing: bool,
-    last_submission_ms: Option<u64>,
-
-    // No-share descent: `S = ∫dt/D(t)` over closed segments; the open one is
-    // added at read time against the stored difficulty, not the caller's, so
-    // a missed `note_difficulty_assigned` descends too little, never too much.
-    no_share_accum_s_per_diff: f64,
-    no_share_segment_start_ms: u64,
-    no_share_segment_difficulty: f64,
-    // Difficulty the session opened with — the anchor the descent floor is
-    // expressed against. 0.0 until the first assignment is known.
-    opening_difficulty: f64,
-    // Whether the last assignment raised the difficulty. Lets the up-step
-    // cap charge a proving interval ONCE instead of once per 8×.
-    last_assignment_was_a_raise: bool,
-    // Denominator anchor for the under-sampled bootstrap. Starts at
-    // `submission_cache_start_ms` and may only move while
-    // `lifetime_difficulty_sum == 0`, so numerator and denominator always
-    // span the same stretch of time. See `note_difficulty_assigned`.
-    bootstrap_epoch_ms: u64,
 }
 
 impl<C: Clock> VarDiffEngine<C> {
-    /// Construct with a clock + per-port config. `target_shares_per_minute`
-    /// ≤ 0 falls back to [`VARDIFF_DEFAULT_TARGET_SHARES_PER_MIN`]; a
-    /// non-finite / non-positive `min_difficulty` falls back to
-    /// [`VARDIFF_DEFAULT_MIN_DIFFICULTY`].
-    pub fn new(clock: C, target_shares_per_minute: f64, min_difficulty: f64) -> Self {
+    /// Construct with a clock, per-port config and the difficulty the session
+    /// opens with. `target_shares_per_minute` ≤ 0 falls back to
+    /// [`VARDIFF_DEFAULT_TARGET_SHARES_PER_MIN`]; a non-finite / non-positive
+    /// `min_difficulty` falls back to [`VARDIFF_DEFAULT_MIN_DIFFICULTY`], and
+    /// such an `initial_difficulty` to the floor.
+    pub fn new(
+        clock: C,
+        target_shares_per_minute: f64,
+        min_difficulty: f64,
+        initial_difficulty: f64,
+    ) -> Self {
         let target = if target_shares_per_minute > 0.0 && target_shares_per_minute.is_finite() {
             target_shares_per_minute
         } else {
@@ -247,416 +260,243 @@ impl<C: Clock> VarDiffEngine<C> {
         } else {
             VARDIFF_DEFAULT_MIN_DIFFICULTY
         };
+        let difficulty = if initial_difficulty.is_finite() && initial_difficulty > 0.0 {
+            initial_difficulty
+        } else {
+            min_difficulty
+        };
         let now = clock.now_ms();
         Self {
             clock,
-            target_submission_per_second: 60.0 / target,
+            target_share_interval_s: 60.0 / target,
             min_difficulty,
-            submission_cache_start_ms: now,
-            submission_cache: VecDeque::with_capacity(VARDIFF_CACHE_SIZE + 1),
-            lifetime_difficulty_sum: 0.0,
+            difficulty,
+            segment_start_ms: now,
+            previous: None,
+            current: Bucket::empty(now),
+            sustained: None,
+            highest_assigned: difficulty,
+            previous_measurement: None,
+            accepted_any: false,
             hash_rate: 0.0,
-            hash_rate_window_ms: 0,
             current_slot: None,
             previous_slot_time_ms: 0,
             current_slot_time_ms: 0,
             previous_shares: 0.0,
             shares: 0.0,
-            silence_easing: false,
-            last_submission_ms: None,
-            no_share_accum_s_per_diff: 0.0,
-            no_share_segment_start_ms: now,
-            no_share_segment_difficulty: 0.0,
-            opening_difficulty: 0.0,
-            last_assignment_was_a_raise: false,
-            bootstrap_epoch_ms: now,
         }
     }
 
-    /// Enable/disable silence easing and the no-share descent (off by default).
-    /// Callers must then report every assignment and rejected share too.
-    pub fn with_silence_easing(mut self, enabled: bool) -> Self {
-        self.silence_easing = enabled;
-        self
-    }
-
-    /// Seed the difficulty the session opens with. Required for the
-    /// no-share descent: without it the engine knows the miner is quiet but
-    /// not what it is quiet *at*.
-    pub fn with_initial_difficulty(mut self, difficulty: f64) -> Self {
-        if difficulty.is_finite() && difficulty > 0.0 {
-            self.opening_difficulty = difficulty;
-            self.no_share_segment_difficulty = difficulty;
-        }
-        self
-    }
-
-    /// Report a difficulty assignment by ANY route. Closes the no-share
-    /// segment at the difficulty that was in force for it. Before the first
-    /// share it also moves the bootstrap anchor, so time spent too high to
-    /// produce shares does not drag the first estimate far below the truth.
+    /// Report a difficulty assignment by ANY route. A window that holds a
+    /// measurement is spent once acted on, and dropping it is what lets the
+    /// up-step cap bound a burst; what it measured is kept for the cap. A
+    /// thinner window carries over: its evidence is all there is, and exposure
+    /// already weighs it at the difficulty it was gathered at.
+    ///
+    /// Every entry point first drops the window if the clock stepped back
+    /// past it, since arrivals would otherwise pile up against exposure that
+    /// cannot grow until the clock catches up.
     pub fn note_difficulty_assigned(&mut self, difficulty: f64) {
-        if !self.silence_easing {
+        if !(difficulty.is_finite() && difficulty > 0.0) {
             return;
         }
         let now = self.clock.now_ms();
-        self.close_no_share_segment(now);
-        if difficulty.is_finite() && difficulty > 0.0 {
-            self.last_assignment_was_a_raise = self.no_share_segment_difficulty > 0.0
-                && difficulty > self.no_share_segment_difficulty;
-            self.no_share_segment_difficulty = difficulty;
-            // Anchor the descent floor to the HIGHEST difficulty carried; a
-            // lowering must not move it, or the floor would ratchet down with
-            // every descent step.
-            self.opening_difficulty = self.opening_difficulty.max(difficulty);
+        self.drop_window_if_clock_stepped_back(now);
+        self.close_segment(now);
+        let window = self.window(now);
+        // Only a window long enough to decide on counts as a measurement.
+        self.previous_measurement = (window.shares >= VARDIFF_MIN_SHARES
+            && window.span_ms >= VARDIFF_MIN_WINDOW_MS)
+            .then(|| window.arrivals / window.exposure * self.target_share_interval_s);
+        if window.shares >= VARDIFF_MIN_SHARES {
+            self.previous = None;
+            self.current = Bucket::empty(now);
         }
-        if self.lifetime_difficulty_sum == 0.0 {
-            self.bootstrap_epoch_ms = now;
-        }
+        self.difficulty = difficulty;
+        self.highest_assigned = self.highest_assigned.max(difficulty);
     }
 
-    /// Fold the open segment into `S` and restart it at `now`. A segment
-    /// with no known difficulty carries no evidence and is dropped.
-    fn close_no_share_segment(&mut self, now: u64) {
-        let span_ms = now.saturating_sub(self.no_share_segment_start_ms);
-        if self.no_share_segment_difficulty > 0.0 && span_ms > 0 {
-            self.no_share_accum_s_per_diff +=
-                (span_ms as f64 / 1000.0) / self.no_share_segment_difficulty;
-        }
-        self.no_share_segment_start_ms = now;
+    /// Record an accepted share at its credited (post-clamp) difficulty.
+    pub fn note_share_accepted(&mut self, credited_difficulty: f64) {
+        let now = self.clock.now_ms();
+        self.accepted_any = true;
+        self.record_arrival(now, credited_difficulty);
+        self.record_display(now, credited_difficulty);
     }
 
-    /// Floor a no-share estimate at
-    /// [`VARDIFF_NO_SHARE_MAX_DESCENT_FACTOR`] below the highest difficulty
-    /// this session has ever been assigned. A LOWER bound, so the
-    /// power-of-two round-up that follows cannot violate it.
-    fn descent_floor(&self, raw: f64) -> f64 {
-        if self.opening_difficulty > 0.0 {
-            raw.max(self.opening_difficulty / VARDIFF_NO_SHARE_MAX_DESCENT_FACTOR)
-        } else {
-            raw
-        }
+    /// A share refused as stale, before it was hashed, after the duplicate
+    /// check: the miner sent it as meeting the target on a job it was given,
+    /// so it is an arrival at the difficulty in force, credited nowhere. An
+    /// unknown-job share must NOT come here, since SV2 rejects it before any
+    /// duplicate check and a resent one would inflate the rate; nor a
+    /// duplicate or a below-target reject.
+    pub fn note_stale_share(&mut self) {
+        let now = self.clock.now_ms();
+        self.record_arrival(now, self.difficulty);
     }
 
-    /// `S` including the still-open segment, as of `now`.
-    fn no_share_inverse_difficulty_time(&self, now: u64) -> f64 {
-        let span_ms = now.saturating_sub(self.no_share_segment_start_ms);
-        if self.no_share_segment_difficulty > 0.0 && span_ms > 0 {
-            self.no_share_accum_s_per_diff
-                + (span_ms as f64 / 1000.0) / self.no_share_segment_difficulty
-        } else {
-            self.no_share_accum_s_per_diff
-        }
-    }
-
-    /// Liveness heartbeat for rejected shares: a rejecting miner is hashing,
-    /// so easing must not walk its difficulty down. Leaves the no-share
-    /// evidence alone, since a reject does not prove the target was reached;
-    /// use [`Self::note_target_reached`] for that.
-    pub fn note_submission(&mut self) {
-        if self.silence_easing {
-            self.last_submission_ms = Some(self.clock.now_ms());
-        }
-    }
-
-    /// A reject whose work still met the target (duplicate, stale, unknown
-    /// job): stamps liveness AND spends the no-share evidence. A below-target
-    /// reject must NOT come here, or `S` is pinned to the gap between two
-    /// rejects and the difficulty never falls.
-    pub fn note_target_reached(&mut self) {
-        if self.silence_easing {
-            let now = self.clock.now_ms();
-            self.last_submission_ms = Some(now);
-            self.no_share_accum_s_per_diff = 0.0;
-            self.no_share_segment_start_ms = now;
-        }
-    }
-
-    /// Milliseconds since the last submission of any kind; 0 before the first,
-    /// since there is no rate yet to decay.
-    fn true_silence_tail_ms(&self) -> u64 {
-        match self.last_submission_ms {
-            Some(t) => self.clock.now_ms().saturating_sub(t),
-            None => 0,
-        }
-    }
-
-    /// Latest computed hashrate in hashes/second. Initially `0.0`; rises
-    /// as shares accumulate within the current 10-minute slot.
+    /// Latest display hashrate in hashes/second; `0.0` until two shares
+    /// landed in one slot.
     pub fn hash_rate(&self) -> f64 {
         self.hash_rate
     }
 
-    /// Whether this session has ever had a share ACCEPTED.
-    pub fn has_accepted_share(&self) -> bool {
-        self.lifetime_difficulty_sum > 0.0
+    /// Arrivals in the retarget window, for tests and diagnostics.
+    pub fn window_shares(&self) -> u32 {
+        self.previous.map_or(0, |b| b.shares) + self.current.shares
     }
 
-    /// Highest difficulty the accumulated silence is consistent with, or
-    /// `None` without such evidence. Lets a caller weigh a declared hashrate
-    /// against observation: "no share yet" alone is normal for a fresh proxy
-    /// channel; a long silence that rules the number out is not.
+    /// Highest difficulty the window's evidence is consistent with, or `None`
+    /// once a share was accepted or the window is too short or already
+    /// measured. Lets a caller weigh a declared hashrate against observation:
+    /// "no share yet" alone is normal for a fresh proxy channel; a long
+    /// silence that rules the number out is not.
     pub fn silence_implied_max_difficulty(&self) -> Option<f64> {
-        if !self.silence_easing || self.has_accepted_share() {
+        if self.accepted_any {
             return None;
         }
-        let now = self.clock.now_ms();
-        if now.saturating_sub(self.submission_cache_start_ms) <= VARDIFF_WARMUP_MS {
+        let window = self.window(self.clock.now_ms());
+        if window.span_ms < VARDIFF_MIN_WINDOW_MS || window.shares >= VARDIFF_MIN_SHARES {
             return None;
         }
-        let s = self.no_share_inverse_difficulty_time(now);
-        if !s.is_finite() || s <= 0.0 {
-            return None;
-        }
-        let raw = VARDIFF_NO_SHARE_CONFIDENCE_K * self.target_submission_per_second / s;
-        if !raw.is_finite() {
-            return None;
-        }
-        Some(self.descent_floor(raw))
-    }
-
-    /// Submission cache size, for tests and diagnostics.
-    pub fn cache_len(&self) -> usize {
-        self.submission_cache.len()
-    }
-
-    /// Current-slot `shares` accumulator, for tests.
-    pub fn current_shares(&self) -> f64 {
-        self.shares
-    }
-
-    /// Record an accepted share at its credited (post-clamp) difficulty.
-    /// `is_current_diff` MUST be `false` when the clamp credited the old
-    /// difficulty, keeping it out of the retarget cache.
-    pub fn update_hash_rate(&mut self, target_difficulty: f64, is_current_diff: bool) {
-        let now = self.clock.now_ms();
-        let slot = slot_for(now);
-
-        // An accepted share proves liveness and reaching the target, so it
-        // also spends the no-share evidence.
-        if self.silence_easing {
-            self.last_submission_ms = Some(now);
-            self.no_share_accum_s_per_diff = 0.0;
-            self.no_share_segment_start_ms = now;
-        }
-
-        // Clamped shares count too: they are real work.
-        self.lifetime_difficulty_sum += target_difficulty;
-
-        if is_current_diff {
-            self.update_submission_cache(now, target_difficulty);
-        }
-
-        match self.current_slot {
-            None => {
-                self.previous_slot_time_ms = now;
-                self.current_slot_time_ms = now;
-                self.current_slot = Some(slot);
-                self.shares = target_difficulty;
-            }
-            Some(s) if s != slot => {
-                self.previous_shares = self.shares;
-                self.previous_slot_time_ms = self.current_slot_time_ms;
-                self.current_slot_time_ms = now;
-                self.current_slot = Some(slot);
-                self.shares = target_difficulty;
-                // Recompute across the gap, so the first share after a silence
-                // does not quote the pre-silence rate and ratchet an eased
-                // session straight back up.
-                if self.silence_easing {
-                    let elapsed_ms = now.saturating_sub(self.previous_slot_time_ms);
-                    let work = self.previous_shares + self.shares;
-                    if elapsed_ms > 0 && work > 0.0 {
-                        self.hash_rate = slot_hashrate(work, elapsed_ms);
-                        self.hash_rate_window_ms = elapsed_ms;
-                    }
-                }
-            }
-            Some(_) => {
-                self.shares += target_difficulty;
-                if self.shares > 0.0 {
-                    let elapsed_ms = now.saturating_sub(self.previous_slot_time_ms);
-                    if elapsed_ms > 0 {
-                        self.hash_rate =
-                            slot_hashrate(self.previous_shares + self.shares, elapsed_ms);
-                        self.hash_rate_window_ms = elapsed_ms;
-                    }
-                }
-            }
-        }
-    }
-
-    fn update_submission_cache(&mut self, now: u64, difficulty: f64) {
-        while let Some(front) = self.submission_cache.front() {
-            if now.saturating_sub(front.time_ms) > VARDIFF_CACHE_WINDOW_MS {
-                self.submission_cache.pop_front();
-            } else {
-                break;
-            }
-        }
-        if self.submission_cache.len() >= VARDIFF_CACHE_SIZE {
-            self.submission_cache.pop_front();
-        }
-        self.submission_cache.push_back(Submission {
-            time_ms: now,
-            difficulty,
-        });
+        self.upper_bound_difficulty(&window)
     }
 
     /// Next difficulty for the session, or `None` for no retarget. A result is
-    /// a power of two, at least `min_difficulty`, never NaN or infinite.
+    /// a power of two or `min_difficulty`, never NaN or infinite.
     pub fn suggested_difficulty(&self, client_difficulty: f64) -> Option<f64> {
-        if self.submission_cache.len() < VARDIFF_SAMPLE_THRESHOLD {
-            // Under-sampled: hold during warmup, then retarget from the
-            // MEASURED rate. It does not depend on `client_difficulty`, so it
-            // converges in one step and repeated calls cannot compound.
-            let now = self.clock.now_ms();
-            if now.saturating_sub(self.submission_cache_start_ms) <= VARDIFF_WARMUP_MS {
-                return None;
-            }
-            // Prefer the slot hashrate (needs ≥2 shares in one slot); else
-            // lifetime diff-work over elapsed time, where the time to the first
-            // share itself encodes the hashrate.
-            let rate = if self.hash_rate > 0.0 {
-                if self.silence_easing {
-                    // `hash_rate` is only recomputed when a share arrives, so
-                    // after a silence it still quotes the pre-slowdown rate.
-                    // The decayed read extends its window to *now*.
-                    self.silence_decayed_slot_rate()
-                } else {
-                    self.hash_rate
-                }
-            } else if self.lifetime_difficulty_sum > 0.0 {
-                let elapsed_ms = now.saturating_sub(self.bootstrap_epoch_ms);
-                // This branch has no up-step cap, so a window of milliseconds
-                // after a moved epoch would turn one share into a huge raise.
-                // The first share freezes the epoch, so this waits at most once.
-                if elapsed_ms <= VARDIFF_WARMUP_MS {
-                    return None;
-                }
-                let elapsed_s = elapsed_ms as f64 / 1000.0;
-                self.lifetime_difficulty_sum * HASHES_PER_DIFFICULTY_1 / elapsed_s
-            } else if self.silence_easing {
-                // No accepted share ever: the waiting is the measurement. The
-                // bound only drops below the current difficulty after ~k
-                // expected share gaps, so it calibrates to the port's rate.
-                return self.no_share_descent(now, client_difficulty);
-            } else {
-                return None;
-            };
-            // NO up-step cap: this path converges in one step, so a cap would
-            // only stretch a fast miner's legitimate jump over intervals of flooding.
-            let target = rate * self.target_submission_per_second / HASHES_PER_DIFFICULTY_1;
-            if !target.is_finite() {
-                return None;
-            }
-            return self.nearest_difficulty_step(target);
-        }
-
-        let sum: f64 = self.submission_cache.iter().map(|s| s.difficulty).sum();
-        let first_t = self.submission_cache.front().expect("≥ threshold").time_ms;
-        let last_t = self.submission_cache.back().expect("≥ threshold").time_ms;
-        let closed_ms = last_t.saturating_sub(first_t);
-        // Silence easing ends the window at *now*, so a quiet stretch lowers
-        // the estimate along 1/T. A window whose shares share one millisecond
-        // (a flushed JDC burst) has no rate to floor against, so it stays 0
-        // and the guard below holds.
-        let total_ms = if self.silence_easing && closed_ms > 0 {
-            closed_ms.saturating_add(self.true_silence_tail_ms())
-        } else {
-            closed_ms
-        };
-        let diff_seconds = total_ms as f64 / 1000.0;
-        if diff_seconds <= 0.0 {
+        let window = self.window(self.clock.now_ms());
+        if window.span_ms < VARDIFF_MIN_WINDOW_MS {
             return None;
         }
-
-        let mut difficulty_per_second = sum / diff_seconds;
-        // Bounded descent, anchored to the closed (pre-silence) window so it
-        // cannot go stale when the difficulty changes through another route.
-        if self.silence_easing {
-            debug_assert!(closed_ms > 0, "eased with a zero-span window");
-            let pre_silence_rate = sum / (closed_ms as f64 / 1000.0);
-            difficulty_per_second = floor_descent(difficulty_per_second, pre_silence_rate);
+        if window.shares < VARDIFF_MIN_SHARES {
+            // Too few arrivals to measure; the bound can only argue for less.
+            let candidate = self.nearest_difficulty_step(self.upper_bound_difficulty(&window)?)?;
+            return (candidate < client_difficulty).then_some(candidate);
         }
-        let target_difficulty = self.cap_up_step(
-            difficulty_per_second * self.target_submission_per_second,
-            client_difficulty,
-        );
-        if !difficulty_per_second.is_finite() || !target_difficulty.is_finite() {
+        let measured = window.arrivals / window.exposure * self.target_share_interval_s;
+        let target = self.cap_up_step(measured.max(self.descent_floor()), client_difficulty);
+        if !target.is_finite() {
             return None;
         }
-
         // 2× deadband.
-        if client_difficulty * 2.0 < target_difficulty
-            || client_difficulty / 2.0 > target_difficulty
-        {
-            return self.nearest_difficulty_step(target_difficulty);
+        if client_difficulty * 2.0 < target || client_difficulty / 2.0 > target {
+            return self.nearest_difficulty_step(target);
         }
         None
     }
 
-    /// No-share descent `D = k·τ/S` (see [`VARDIFF_NO_SHARE_CONFIDENCE_K`]),
-    /// a geometric descent independent of the check interval. Invariant:
-    /// **zero arrivals never justify raising a difficulty**, so anything but
-    /// a strict decrease is dropped.
-    fn no_share_descent(&self, now: u64, client_difficulty: f64) -> Option<f64> {
-        let s = self.no_share_inverse_difficulty_time(now);
-        if !s.is_finite() || s <= 0.0 {
-            // Unknown what difficulty the session is quiet AT: hold.
-            return None;
+    fn record_arrival(&mut self, now: u64, credited_difficulty: f64) {
+        self.drop_window_if_clock_stepped_back(now);
+        if self.window_shares() == 0 {
+            // The first arrival opens a fresh window and carries no weight:
+            // its work was done before the window began, and dropping the
+            // silence before it keeps a miner that only just started from
+            // being measured against time it may not have been mining.
+            self.previous = None;
+            self.current = Bucket::empty(now);
+            self.current.shares = 1;
+            self.segment_start_ms = now;
+            return;
         }
-        let raw = VARDIFF_NO_SHARE_CONFIDENCE_K * self.target_submission_per_second / s;
-        if !raw.is_finite() {
-            return None;
+        self.current.arrivals += credited_difficulty / self.difficulty;
+        self.current.shares += 1;
+        if now.saturating_sub(self.current.start_ms) >= VARDIFF_BUCKET_MS {
+            // The arrival closes the bucket it was mined in. A bucket too thin
+            // to measure on its own absorbs the one before it instead of
+            // replacing it, so a miner slower than one share per bucket still
+            // gathers a measurement.
+            self.close_segment(now);
+            let closed = self.current;
+            self.previous = Some(match self.previous {
+                Some(older) if closed.shares < VARDIFF_MIN_SHARES => Bucket {
+                    start_ms: older.start_ms,
+                    arrivals: older.arrivals + closed.arrivals,
+                    shares: older.shares + closed.shares,
+                    exposure: older.exposure + closed.exposure,
+                },
+                _ => closed,
+            });
+            self.current = Bucket::empty(now);
         }
-        let candidate = self.nearest_difficulty_step(self.descent_floor(raw))?;
-        if candidate < client_difficulty {
-            Some(candidate)
-        } else {
-            None
+        if self.window_shares() >= VARDIFF_MIN_SHARES {
+            self.sustained = Some(self.difficulty);
         }
     }
 
-    /// Slot hashrate with its window extended to *now*, floored like the
-    /// windowed path.
-    fn silence_decayed_slot_rate(&self) -> f64 {
-        // No deadband on this path, so ordinary Poisson gaps would flap a
-        // healthy session; decay only once the tail exceeds both the window
-        // and five target gaps.
-        let tail_ms = self.true_silence_tail_ms();
-        let gap_ms = (self.target_submission_per_second * 1000.0) as u64;
-        let threshold_ms = self
-            .hash_rate_window_ms
-            .max(gap_ms.saturating_mul(VARDIFF_SAMPLE_THRESHOLD as u64));
-        if tail_ms <= threshold_ms {
-            return self.hash_rate;
+    fn drop_window_if_clock_stepped_back(&mut self, now: u64) {
+        if now < self.segment_start_ms {
+            self.previous = None;
+            self.current = Bucket::empty(now);
+            self.segment_start_ms = now;
         }
-        let total_ms = self.hash_rate_window_ms.saturating_add(tail_ms);
-        let decayed = slot_hashrate(self.previous_shares + self.shares, total_ms);
-        floor_descent(decayed, self.hash_rate)
+    }
+
+    /// Fold the open segment's exposure into the current bucket and restart
+    /// it at `now`.
+    fn close_segment(&mut self, now: u64) {
+        self.current.exposure += self.open_exposure(now);
+        self.segment_start_ms = now;
+    }
+
+    fn open_exposure(&self, now: u64) -> f64 {
+        (now.saturating_sub(self.segment_start_ms) as f64 / 1000.0) / self.difficulty
+    }
+
+    fn window(&self, now: u64) -> Window {
+        let current = Window {
+            span_ms: now.saturating_sub(self.current.start_ms),
+            arrivals: self.current.arrivals,
+            shares: self.current.shares,
+            exposure: self.current.exposure + self.open_exposure(now),
+        };
+        match self.previous {
+            None => current,
+            Some(previous) => Window {
+                span_ms: now.saturating_sub(previous.start_ms),
+                arrivals: previous.arrivals + current.arrivals,
+                shares: previous.shares + current.shares,
+                exposure: previous.exposure + current.exposure,
+            },
+        }
+    }
+
+    /// The upper-bound difficulty `(n + k) / S · τ` (see
+    /// [`VARDIFF_CONFIDENCE_K`]), floored by [`Self::descent_floor`]; `None`
+    /// if it overflows.
+    fn upper_bound_difficulty(&self, window: &Window) -> Option<f64> {
+        let raw = (window.arrivals + VARDIFF_CONFIDENCE_K) / window.exposure
+            * self.target_share_interval_s;
+        raw.is_finite().then(|| raw.max(self.descent_floor()))
+    }
+
+    /// Lowest difficulty a descent may reach. A LOWER bound, so the
+    /// power-of-two round-up that follows cannot violate it.
+    fn descent_floor(&self) -> f64 {
+        match self.sustained {
+            Some(sustained) => sustained / VARDIFF_SILENCE_MAX_DESCENT_FACTOR,
+            None => self.highest_assigned / VARDIFF_NO_SHARE_MAX_DESCENT_FACTOR,
+        }
     }
 
     /// Cap an upward retarget at [`VARDIFF_MAX_UP_STEP_FACTOR`] × current,
     /// snapped down to a power of two because the rounding that follows goes
-    /// UP.
+    /// UP. The cap lifts when the window dropped at the last assignment
+    /// measured past it too: two windows in a row agreeing is a proven jump
+    /// (a proxy attaching a farm), not a burst, and must not be rationed at
+    /// 8× per interval.
     fn cap_up_step(&self, target: f64, client_difficulty: f64) -> f64 {
-        if !self.silence_easing {
-            return target;
-        }
-        // First raise only: the cap buys ONE proving interval, it must not
-        // ration a genuine large jump (a proxy attaching a farm) at 8× each.
-        if self.last_assignment_was_a_raise {
-            return target;
-        }
         let cap = client_difficulty * VARDIFF_MAX_UP_STEP_FACTOR;
-        if cap.is_finite() && cap > 0.0 {
-            // Largest rung not exceeding the cap; `nearest_difficulty_step`
-            // leaves an exact power of two alone, so the result stays capped.
-            let capped_rung = 2_f64.powf(cap.log2().floor());
-            target.min(capped_rung)
-        } else {
+        if !(cap.is_finite() && cap > 0.0) {
+            return target;
+        }
+        // Largest rung not exceeding the cap; `nearest_difficulty_step` leaves
+        // an exact power of two alone, so the result stays capped.
+        let capped_rung = 2_f64.powf(cap.log2().floor());
+        if self.previous_measurement.is_some_and(|m| m >= capped_rung) {
             target
+        } else {
+            target.min(capped_rung)
         }
     }
 
@@ -669,6 +509,39 @@ impl<C: Clock> VarDiffEngine<C> {
             return Some(self.min_difficulty);
         }
         Some(round_up_to_power_of_two(val))
+    }
+
+    fn record_display(&mut self, now: u64, credited_difficulty: f64) {
+        let slot = slot_for(now);
+        match self.current_slot {
+            None => {
+                self.previous_slot_time_ms = now;
+                self.current_slot_time_ms = now;
+                self.current_slot = Some(slot);
+                self.shares = credited_difficulty;
+            }
+            Some(s) if s != slot => {
+                self.previous_shares = self.shares;
+                self.previous_slot_time_ms = self.current_slot_time_ms;
+                self.current_slot_time_ms = now;
+                self.current_slot = Some(slot);
+                self.shares = credited_difficulty;
+                // Recompute across the gap, so the first share after a silence
+                // does not quote the pre-silence rate.
+                let elapsed_ms = now.saturating_sub(self.previous_slot_time_ms);
+                let work = self.previous_shares + self.shares;
+                if elapsed_ms > 0 && work > 0.0 {
+                    self.hash_rate = slot_hashrate(work, elapsed_ms);
+                }
+            }
+            Some(_) => {
+                self.shares += credited_difficulty;
+                let elapsed_ms = now.saturating_sub(self.previous_slot_time_ms);
+                if self.shares > 0.0 && elapsed_ms > 0 {
+                    self.hash_rate = slot_hashrate(self.previous_shares + self.shares, elapsed_ms);
+                }
+            }
+        }
     }
 }
 
@@ -683,12 +556,6 @@ fn slot_hashrate(work: f64, span_ms: u64) -> f64 {
         return 0.0;
     }
     work * HASHES_PER_DIFFICULTY_1 / (span_ms as f64 / 1000.0)
-}
-
-/// Never let `value` fall more than [`VARDIFF_SILENCE_MAX_DESCENT_FACTOR`]
-/// below the pre-silence `base`.
-fn floor_descent(value: f64, base: f64) -> f64 {
-    value.max(base / VARDIFF_SILENCE_MAX_DESCENT_FACTOR)
 }
 
 #[cfg(test)]
@@ -743,584 +610,15 @@ mod tests {
         );
     }
 
-    // ── nearest_difficulty_step ────────────────────────────────────────
+    // ── helpers ──────────────────────────────────────────────────────────
 
-    fn engine_with_clock(clock: TestClock, target: f64, min: f64) -> VarDiffEngine<TestClock> {
-        VarDiffEngine::new(clock, target, min)
+    /// A 6 shares/min engine (target gap 10 s) opening at `initial`.
+    fn engine(clock: &TestClock, initial: f64) -> VarDiffEngine<&TestClock> {
+        VarDiffEngine::new(clock, 6.0, 0.00001, initial)
     }
 
-    /// Pins: every rung is a power of two, rounded up.
-    #[test]
-    fn nearest_step_returns_only_powers_of_two() {
-        let e = engine_with_clock(TestClock::new(0), 6.0, 0.00001);
-        assert_eq!(e.nearest_difficulty_step(1024.0), Some(1024.0));
-        assert_eq!(e.nearest_difficulty_step(2048.0), Some(2048.0));
-        // No 1.5x rung, and always UP.
-        assert_eq!(e.nearest_difficulty_step(1536.0), Some(2048.0));
-        assert_eq!(e.nearest_difficulty_step(1100.0), Some(2048.0));
-        assert_eq!(e.nearest_difficulty_step(2000.0), Some(2048.0));
-
-        // Every rung is a power of two, and never below what was asked for.
-        for probe in [3.0, 100.0, 950.3, 2887.8, 5000.0, 1e6] {
-            let step = e.nearest_difficulty_step(probe).expect("a rung");
-            assert_eq!(
-                step,
-                2_f64.powf(step.log2().round()),
-                "step {step} for {probe} is not a power of two"
-            );
-            assert!(step >= probe, "step {step} is below the requested {probe}");
-            assert!(step < probe * 2.0, "step {step} overshoots {probe}");
-        }
-    }
-
-    #[test]
-    fn nearest_step_zero_returns_none() {
-        let e = engine_with_clock(TestClock::new(0), 6.0, 0.00001);
-        assert_eq!(e.nearest_difficulty_step(0.0), None);
-    }
-
-    #[test]
-    fn nearest_step_below_min_returns_min() {
-        let e = engine_with_clock(TestClock::new(0), 6.0, 500.0);
-        assert_eq!(e.nearest_difficulty_step(0.1), Some(500.0));
-        assert_eq!(e.nearest_difficulty_step(499.9), Some(500.0));
-    }
-
-    // ── construction validates target + min ───────────────────────────
-
-    #[test]
-    fn invalid_target_shares_per_minute_falls_back_to_default() {
-        // Default 6 shares/min → target_submission_per_second = 60/6 = 10.
-        let e1 = VarDiffEngine::new(TestClock::new(0), 0.0, 0.00001);
-        assert_eq!(e1.target_submission_per_second, 10.0);
-        let e2 = VarDiffEngine::new(TestClock::new(0), -5.0, 0.00001);
-        assert_eq!(e2.target_submission_per_second, 10.0);
-        let e3 = VarDiffEngine::new(TestClock::new(0), f64::NAN, 0.00001);
-        assert_eq!(e3.target_submission_per_second, 10.0);
-    }
-
-    #[test]
-    fn invalid_min_difficulty_falls_back_to_default() {
-        let e1 = VarDiffEngine::new(TestClock::new(0), 6.0, 0.0);
-        assert_eq!(e1.min_difficulty, VARDIFF_DEFAULT_MIN_DIFFICULTY);
-        let e2 = VarDiffEngine::new(TestClock::new(0), 6.0, f64::NAN);
-        assert_eq!(e2.min_difficulty, VARDIFF_DEFAULT_MIN_DIFFICULTY);
-        let e3 = VarDiffEngine::new(TestClock::new(0), 6.0, -1.0);
-        assert_eq!(e3.min_difficulty, VARDIFF_DEFAULT_MIN_DIFFICULTY);
-    }
-
-    #[test]
-    fn valid_min_difficulty_is_honored() {
-        let e = VarDiffEngine::new(TestClock::new(0), 6.0, 500.0);
-        assert_eq!(e.min_difficulty, 500.0);
-    }
-
-    // ── submission cache gating ───────────────────────────────────────
-
-    #[test]
-    fn current_diff_shares_enter_the_submission_cache() {
-        let mut e = VarDiffEngine::new(TestClock::new(1_000), 6.0, 0.00001);
-        e.update_hash_rate(1024.0, true);
-        assert_eq!(e.cache_len(), 1);
-    }
-
-    #[test]
-    fn stale_diff_shares_are_excluded_from_the_submission_cache() {
-        let mut e = VarDiffEngine::new(TestClock::new(1_000), 6.0, 0.00001);
-        e.update_hash_rate(256.0, false);
-        e.update_hash_rate(256.0, false);
-        e.update_hash_rate(256.0, false);
-        assert_eq!(e.cache_len(), 0);
-    }
-
-    #[test]
-    fn stale_diff_shares_still_update_live_hashrate_share_sum() {
-        let mut e = VarDiffEngine::new(TestClock::new(1_000), 6.0, 0.00001);
-        e.update_hash_rate(1024.0, true);
-        let cache_before = e.cache_len();
-        e.update_hash_rate(256.0, false);
-        e.update_hash_rate(256.0, false);
-        assert_eq!(e.cache_len(), cache_before, "no cache pollution");
-        assert!(
-            e.current_shares() > 1024.0,
-            "hashrate share-sum must advance with stale-diff shares; got {}",
-            e.current_shares()
-        );
-    }
-
-    // ── submission cache capacity + sliding window ────────────────────
-
-    #[test]
-    fn cache_evicts_oldest_when_capacity_reached() {
-        let clock = TestClock::new(1_000);
-        let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001);
-        // Push CACHE_SIZE + 5 entries, each 1s apart so the time window
-        // doesn't drop any first.
-        for _ in 0..(VARDIFF_CACHE_SIZE + 5) {
-            e.update_hash_rate(1.0, true);
-            clock.advance_ms(1_000);
-        }
-        assert_eq!(e.cache_len(), VARDIFF_CACHE_SIZE);
-    }
-
-    #[test]
-    fn cache_drops_entries_older_than_window() {
-        let clock = TestClock::new(1_000);
-        let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001);
-        // Three early shares.
-        for _ in 0..3 {
-            e.update_hash_rate(1.0, true);
-            clock.advance_ms(1_000);
-        }
-        // Jump past the cache window (300s), then add one.
-        clock.advance_ms(VARDIFF_CACHE_WINDOW_MS + 60_000);
-        e.update_hash_rate(1.0, true);
-        // Only the most recent entry remains; the three early ones were
-        // dropped by the sliding-window check (their age > 300s).
-        assert_eq!(e.cache_len(), 1);
-    }
-
-    // ── suggested_difficulty: warmup + fallback formula ───────────────
-
-    #[test]
-    fn under_sampled_within_warmup_returns_none() {
-        let clock = TestClock::new(1_000);
-        let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001);
-        // 3 samples (< 5), still within warmup.
-        for _ in 0..3 {
-            e.update_hash_rate(1024.0, true);
-            clock.advance_ms(5_000);
-        }
-        assert!(e.suggested_difficulty(16384.0).is_none());
-    }
-
-    #[test]
-    fn under_sampled_past_warmup_with_no_share_at_all_waits() {
-        let clock = TestClock::new(0);
-        let e = VarDiffEngine::new(&clock, 6.0, 0.00001);
-        // Easing off and zero accepted shares: nothing to estimate from, hold.
-        clock.advance_ms(VARDIFF_WARMUP_MS + 1_000);
-        assert!(e.suggested_difficulty(16384.0).is_none());
-    }
-
-    #[test]
-    fn under_sampled_single_share_bootstraps_down_from_lifetime_rate() {
-        // A miner that lands exactly ONE share never establishes a slot
-        // hashrate (needs 2-in-a-slot). The bootstrap estimates the rate from
-        // cumulative accepted difficulty over elapsed time (the
-        // time-to-first-share encodes the hashrate), so it retargets DOWN.
-        let clock = TestClock::new(0);
-        let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001); // tsps = 10
-        e.update_hash_rate(1024.0, true); // one share, diff 1024, at t=0
-                                          // No 2nd share → slot hashrate stays 0 → bootstrap path.
-        assert_eq!(e.hash_rate(), 0.0);
-        clock.advance_ms(80_000); // elapsed 80s (> warmup 60s)
-                                  // target = lifetime_sum * tsps / elapsed_s = 1024 * 10 / 80 = 128.
-        let expected = 128.0;
-        // Client-independent, so repeated per-share calls cannot compound.
-        for client in [16384.0, 1024.0, 1.0, 0.001] {
-            assert_eq!(
-                e.suggested_difficulty(client),
-                Some(expected),
-                "single-share bootstrap must track the lifetime rate, not client={client}"
-            );
-        }
-    }
-
-    #[test]
-    fn bootstrap_retarget_converges_and_does_not_runaway_to_floor() {
-        // A steady ultra-sparse miner (one share per 700s, always in a distinct
-        // 10-min slot so the slot hashrate never engages → pure bootstrap path).
-        // Its per-share target must CONVERGE to the rate-derived equilibrium, not
-        // keep shrinking toward the floor call-over-call.
-        let clock = TestClock::new(0);
-        let min_diff = 0.00001;
-        let mut e = VarDiffEngine::new(&clock, 6.0, min_diff); // tsps = 10
-        let mut post_share_targets = Vec::new();
-        for _ in 0..8 {
-            e.update_hash_rate(700.0, true);
-            clock.advance_ms(700_000); // 700s → distinct slot each time
-            assert_eq!(e.hash_rate(), 0.0, "must stay on the bootstrap path");
-            if let Some(t) = e.suggested_difficulty(16384.0) {
-                post_share_targets.push(t);
-            }
-        }
-        // Equilibrium: lifetime_sum/elapsed → 700/700 = 1 diff/s → target = 10.
-        // Every post-share target sits near that, far above the floor, and the
-        // last two are within a small factor (converged, not geometrically
-        // decaying).
-        let last = *post_share_targets.last().unwrap();
-        let prev = post_share_targets[post_share_targets.len() - 2];
-        assert!(
-            last > min_diff * 100.0,
-            "must not sink to the floor: {last}"
-        );
-        assert!(
-            (last / prev).abs() < 2.0 && (prev / last).abs() < 2.0,
-            "successive targets must converge, not compound down: {prev} → {last}"
-        );
-    }
-
-    #[test]
-    fn under_sampled_past_warmup_retargets_from_measured_hashrate_not_current_diff() {
-        // The under-sampled path retargets from the measured hashrate,
-        // independent of the current diff, so it converges in one step and
-        // repeated calls cannot compound toward the floor.
-        let clock = TestClock::new(0);
-        let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001); // target/min => tsps = 10
-                                                              // 2 shares at diff 1000, 20s apart → hashrate = 2000 * 2^32 / 20s.
-                                                              // target = hashrate * tsps / 2^32 = (2000/20) * 10 = 1000 → step 1024.
-        e.update_hash_rate(1000.0, true);
-        clock.advance_ms(20_000);
-        e.update_hash_rate(1000.0, true);
-        // Still under-sampled (2 < 5 cache entries); jump past warmup.
-        assert!(e.cache_len() < VARDIFF_SAMPLE_THRESHOLD);
-        clock.advance_ms(VARDIFF_WARMUP_MS);
-
-        let expected = 1024.0;
-        // The result is derived from the measured rate, NOT the current diff:
-        // wildly different `client_difficulty` inputs all yield the SAME target
-        // — so calling it repeatedly (the per-share inline retarget) can never
-        // ratchet the diff down step by step.
-        for client in [16384.0, 1000.0, 1.0, 0.001] {
-            assert_eq!(
-                e.suggested_difficulty(client),
-                Some(expected),
-                "under-sampled retarget must track the hashrate, not client_difficulty={client}"
-            );
-        }
-    }
-
-    // ── suggested_difficulty: 2× clamp ────────────────────────────────
-
-    fn populate_cache(
-        e: &mut VarDiffEngine<&TestClock>,
-        clock: &TestClock,
-        count: usize,
-        diff: f64,
-    ) {
-        for _ in 0..count {
-            e.update_hash_rate(diff, true);
-            clock.advance_ms(2_000);
-        }
-    }
-
-    #[test]
-    fn suggested_diff_is_none_when_observed_rate_inside_two_x_clamp() {
-        let clock = TestClock::new(1_000);
-        let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001);
-        // 30 samples at diff=1024 over 60s → diff_per_sec = 30*1024/60 ≈ 512.
-        // target_submission_per_second = 60/6 = 10s.
-        // target = 512 * 10 = 5120. clientDiff*2=10240 > 5120 > clientDiff/2=2560 → no retarget.
-        populate_cache(&mut e, &clock, 30, 1024.0);
-        let suggested = e.suggested_difficulty(5120.0);
-        // Inside the 2× window → None.
-        assert!(
-            suggested.is_none() || (suggested.unwrap() - 5120.0).abs() < 1e-6,
-            "expected None (inside clamp) or exact 5120 step, got {:?}",
-            suggested
-        );
-    }
-
-    #[test]
-    fn suggested_diff_returns_step_when_far_below_target() {
-        // Run rate of 30 * 0.1 / 60s = 0.05/sec; target = 0.05*10 = 0.5.
-        // clientDifficulty = 16384 — clientDifficulty/2 = 8192 ≫ 0.5 → retarget.
-        let clock = TestClock::new(1_000);
-        let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001);
-        populate_cache(&mut e, &clock, 30, 0.1);
-        let suggested = e.suggested_difficulty(16384.0).expect("must retarget");
-        // Raw target 0.5..1.0 rounds UP to 1.0.
-        assert_eq!(suggested, 1.0);
-        assert!(suggested < 16384.0 / 2.0);
-    }
-
-    #[test]
-    fn suggested_diff_respects_configured_floor() {
-        // Same low rate but a 500.0 floor → suggestion clamps to 500.0.
-        let clock = TestClock::new(1_000);
-        let mut e = VarDiffEngine::new(&clock, 6.0, 500.0);
-        populate_cache(&mut e, &clock, 30, 0.1);
-        let suggested = e.suggested_difficulty(16384.0).expect("must retarget");
-        assert!(suggested >= 500.0, "got {}", suggested);
-        assert_eq!(suggested, 500.0);
-    }
-
-    #[test]
-    fn suggested_diff_without_floor_can_drop_below_one() {
-        // Without a configured floor the suggestion drops far below the 500
-        // floor the sibling test sets — that is the property under test. (It
-        // lands on 1.0 rather than 0.5 because the ladder rounds up.)
-        let clock = TestClock::new(1_000);
-        let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001);
-        populate_cache(&mut e, &clock, 30, 0.1);
-        let suggested = e.suggested_difficulty(16384.0).expect("must retarget");
-        assert!(suggested < 500.0, "got {}", suggested);
-    }
-
-    #[test]
-    fn suggested_diff_zero_floor_falls_back_to_default() {
-        // A floor of 0 falls back to the built-in default.
-        let clock = TestClock::new(1_000);
-        let mut e = VarDiffEngine::new(&clock, 6.0, 0.0);
-        populate_cache(&mut e, &clock, 30, 0.1);
-        let suggested = e.suggested_difficulty(16384.0).expect("must retarget");
-        assert!(suggested < 500.0, "got {}", suggested);
-    }
-
-    #[test]
-    fn suggested_diff_nan_floor_falls_back_to_default() {
-        // A non-finite floor is rejected and the built-in default is used.
-        let clock = TestClock::new(1_000);
-        let mut e = VarDiffEngine::new(&clock, 6.0, f64::NAN);
-        populate_cache(&mut e, &clock, 30, 0.1);
-        let suggested = e.suggested_difficulty(16384.0).expect("must retarget");
-        assert!(suggested < 500.0, "got {}", suggested);
-    }
-
-    // ── hashrate accumulation ─────────────────────────────────────────
-
-    #[test]
-    fn hash_rate_is_zero_before_any_share() {
-        let e: VarDiffEngine<TestClock> = VarDiffEngine::new(TestClock::new(0), 6.0, 0.00001);
-        assert_eq!(e.hash_rate(), 0.0);
-    }
-
-    #[test]
-    fn first_share_initializes_slot_but_keeps_hash_rate_zero() {
-        // The first share sets `shares` but the hashrate computation only
-        // kicks in on the SAME-SLOT accumulation branch, so hash_rate stays
-        // 0 until the second share arrives.
-        let clock = TestClock::new(1_000);
-        let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001);
-        e.update_hash_rate(1024.0, true);
-        assert_eq!(e.hash_rate(), 0.0);
-        assert_eq!(e.current_shares(), 1024.0);
-    }
-
-    #[test]
-    fn second_same_slot_share_computes_hashrate() {
-        let clock = TestClock::new(1_000);
-        let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001);
-        e.update_hash_rate(1024.0, true);
-        clock.advance_ms(1_000); // 1s later, same 10-min slot
-        e.update_hash_rate(2048.0, true);
-        // shares = 3072, prev = 0, elapsed = 1s.
-        // hashrate = 3072 * 2^32 / 1 ≈ 1.32e13.
-        let expected = 3072.0 * HASHES_PER_DIFFICULTY_1 / 1.0;
-        assert!(
-            (e.hash_rate() - expected).abs() < 1.0,
-            "expected ≈ {}, got {}",
-            expected,
-            e.hash_rate()
-        );
-    }
-
-    #[test]
-    fn crossing_slot_boundary_rotates_share_buckets() {
-        let clock = TestClock::new(0);
-        let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001);
-        // Two shares in slot A.
-        e.update_hash_rate(1024.0, true);
-        clock.advance_ms(1_000);
-        e.update_hash_rate(2048.0, true);
-        assert_eq!(e.current_shares(), 3072.0);
-
-        // Jump across a slot boundary (10 min).
-        clock.advance_ms(VARDIFF_SLOT_DURATION_MS);
-        e.update_hash_rate(512.0, true);
-        // prev_shares = 3072 (from slot A), shares = 512 (slot B fresh).
-        assert_eq!(e.current_shares(), 512.0);
-    }
-
-    // ── silence easing ────────────────────────────────────────────────
-    //
-    // Shared setup: 30 shares at 1024, 10 s apart, sits inside the 2×
-    // deadband, so anything a test observes afterwards is the silence path.
-
-    fn eased_engine(clock: &TestClock) -> VarDiffEngine<&TestClock> {
-        VarDiffEngine::new(clock, 6.0, 0.00001).with_silence_easing(true)
-    }
-
-    fn fill_equilibrium(e: &mut VarDiffEngine<&TestClock>, clock: &TestClock) {
-        for _ in 0..30 {
-            e.update_hash_rate(1024.0, true);
-            clock.advance_ms(10_000);
-        }
-    }
-
-    #[test]
-    fn easing_off_holds_through_any_silence() {
-        // Default: with the switch off, an hour of total silence changes
-        // nothing.
-        let clock = TestClock::new(1_000);
-        let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001);
-        fill_equilibrium(&mut e, &clock);
-        clock.advance_ms(3_600_000);
-        assert_eq!(e.suggested_difficulty(1024.0), None);
-    }
-
-    #[test]
-    fn silence_descends_monotonically_and_parks_at_the_bound() {
-        // Healthy session goes fully silent. The estimate decays along
-        // 1/T; the deadband turns that into paced ~2× steps; the descent
-        // parks within [floor, 2×floor] of the 16× bound and stays.
-        let clock = TestClock::new(1_000);
-        let mut e = eased_engine(&clock);
-        fill_equilibrium(&mut e, &clock);
-
-        let mut client = 1024.0;
-        let mut proposals = Vec::new();
-        for i in 0..240 {
-            clock.advance_ms(60_000);
-            if let Some(next) = e.suggested_difficulty(client) {
-                // Trigger boundary: the first proposal needs the total
-                // window to double — i.e. > ~310 s of tail on the 290 s
-                // closed span. Ordinary Poisson gaps never get close.
-                assert!(i >= 5, "eased before the deadband allows it (check #{i})");
-                assert!(next < client, "descent must be monotone: {client} → {next}");
-                proposals.push(next);
-                client = next;
-            }
-        }
-        // Bound: pre-silence rate / 16 → target 66.2 → step 64. The
-        // deadband may park the session up to one step above it.
-        assert!(
-            (64.0..=128.0).contains(&client),
-            "must park within a step of the 16× bound, got {client}"
-        );
-        assert!(!proposals.is_empty(), "silence must have eased at all");
-        // Parked means parked: another hour of silence proposes nothing.
-        for _ in 0..60 {
-            clock.advance_ms(60_000);
-            assert_eq!(e.suggested_difficulty(client), None, "must stay parked");
-        }
-    }
-
-    #[test]
-    fn poisson_jitter_steady_state_is_unperturbed() {
-        // THE safety property: a healthy miner with realistic (jittered)
-        // share arrivals must see identical decisions with easing on and
-        // off — including checks landing mid-gap and after unlucky long
-        // gaps. Deterministic LCG, no wall clock.
-        let clock = TestClock::new(0);
-        let mut on = eased_engine(&clock);
-        let mut off = VarDiffEngine::new(&clock, 6.0, 0.00001);
-        let client = 1024.0;
-
-        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut t_ms: u64 = 0;
-        for i in 0..300u32 {
-            seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let r = (seed >> 33) % 1000;
-            // 2–18 s gaps around the 10 s mean, with a heavy 45 s tail
-            // sprinkled in — the Poisson outliers a naive trigger would
-            // mistake for silence.
-            let gap_ms = if i % 37 == 0 { 45_000 } else { 2_000 + r * 16 };
-            t_ms += gap_ms;
-            clock.set_ms(t_ms);
-            on.update_hash_rate(1024.0, true);
-            off.update_hash_rate(1024.0, true);
-            assert_eq!(
-                on.suggested_difficulty(client),
-                off.suggested_difficulty(client),
-                "post-share decision diverged at share #{i}"
-            );
-            // Mid-gap check (timer tick between shares).
-            clock.set_ms(t_ms + gap_ms / 2);
-            assert_eq!(
-                on.suggested_difficulty(client),
-                off.suggested_difficulty(client),
-                "mid-gap decision diverged after share #{i}"
-            );
-            clock.set_ms(t_ms);
-        }
-    }
-
-    #[test]
-    fn reject_storm_holds_the_difficulty() {
-        // A miner whose shares are all rejected is hashing, not silent: the
-        // difficulty holds, and silence counts from the last reject.
-        let clock = TestClock::new(1_000);
-        let mut e = eased_engine(&clock);
-        fill_equilibrium(&mut e, &clock);
-
-        // 30 minutes of pure reject traffic: every 10 s a rejected share.
-        for i in 0..180 {
-            clock.advance_ms(10_000);
-            e.note_submission();
-            if i % 6 == 0 {
-                assert_eq!(
-                    e.suggested_difficulty(1024.0),
-                    None,
-                    "a rejecting miner must never be eased (t+{}s)",
-                    (i + 1) * 10
-                );
-            }
-        }
-        // Rejects stop → the silence clock starts at the LAST reject.
-        let mut first_some_after_s = None;
-        for i in 1..=15 {
-            clock.advance_ms(60_000);
-            if let Some(d) = e.suggested_difficulty(1024.0) {
-                assert!(d < 1024.0);
-                first_some_after_s = Some(i * 60);
-                break;
-            }
-        }
-        let after = first_some_after_s.expect("easing must resume after the storm ends");
-        assert!(
-            after > 300,
-            "descent must wait a full deadband past the last reject, resumed after {after}s"
-        );
-    }
-
-    #[test]
-    fn descent_bound_is_rate_based_not_anchor_based() {
-        // A difficulty raised through a non-share route mid-silence cannot
-        // deepen the descent: the bound derives from the pre-silence rate.
-        let clock = TestClock::new(1_000);
-        let mut e = eased_engine(&clock);
-        fill_equilibrium(&mut e, &clock);
-        clock.advance_ms(48 * 3_600_000); // two days of silence
-
-        // Floored estimate: (30720/290)/16 → target 66.2, rounded up to 128.
-        assert_eq!(e.suggested_difficulty(65_536.0), Some(128.0));
-        // And from 100, the floored target (66.2) sits inside the
-        // deadband — no proposal, no creep below the bound.
-        assert_eq!(e.suggested_difficulty(100.0), None);
-    }
-
-    #[test]
-    fn under_sampled_slot_rate_decays_with_silence() {
-        // The slot hashrate is only recomputed on a share, so after a
-        // silence it still quotes the pre-slowdown rate. The eased read
-        // extends its window to now and floors at frozen/16.
-        let clock = TestClock::new(0);
-        let mut on = eased_engine(&clock);
-        let mut off = VarDiffEngine::new(&clock, 6.0, 0.00001);
-        for e in [&mut on, &mut off] {
-            e.update_hash_rate(1000.0, true);
-        }
-        clock.advance_ms(20_000);
-        for e in [&mut on, &mut off] {
-            e.update_hash_rate(1000.0, true);
-        }
-        // 2 shares, 20 s apart, same slot → frozen rate 100 d/s.
-        clock.advance_ms(3_600_000);
-        // Decayed: 2000/(20+3600) = 0.55 d/s, floored at 100/16 = 6.25
-        // → target 62.5 → step 64. Frozen (off): target 1000 → step 1024.
-        assert_eq!(on.suggested_difficulty(64.0), Some(64.0));
-        assert_eq!(off.suggested_difficulty(64.0), Some(1024.0));
-    }
-
-    // ── No-share descent ────────────────────────────────────────────
-
-    /// One closed-loop vardiff cycle: tick, ask, APPLY and report the
-    /// proposal, so accumulator bugs show up.
-    fn no_share_cycle(
+    /// One closed-loop cycle: tick, ask, APPLY and report the proposal.
+    fn cycle(
         e: &mut VarDiffEngine<&TestClock>,
         clock: &TestClock,
         tick_ms: u64,
@@ -1337,38 +635,448 @@ mod tests {
         }
     }
 
-    /// A session that advertises 10× its real hashrate and lands no share:
-    /// with easing on it reaches a difficulty it can hit within a handful
-    /// of cycles; with easing off nothing is proposed.
-    #[test]
-    fn a_declining_miner_is_rescued_before_its_first_share() {
-        // Advertised 10×: the pool assigns 100_000 where the miner can only
-        // sustain 10_000. No share is ever accepted, so `update_hash_rate`
-        // is never called.
-        let assigned = 100_000.0;
-        let reachable = 10_000.0;
+    /// 30 shares at 1024, 10 s apart: an on-target session at 1024.
+    fn fill_equilibrium(e: &mut VarDiffEngine<&TestClock>, clock: &TestClock) {
+        for _ in 0..30 {
+            clock.advance_ms(10_000);
+            e.note_share_accepted(1024.0);
+        }
+    }
 
-        // Easing off: hold.
-        let clock = TestClock::new(1_000);
-        let mut off = VarDiffEngine::new(&clock, 6.0, 0.00001).with_initial_difficulty(assigned);
-        let mut diff = assigned;
-        for _ in 0..15 {
-            assert!(
-                !no_share_cycle(&mut off, &clock, 60_000, &mut diff),
-                "easing off must propose nothing before the first share"
+    /// Deterministic miner of `rate` difficulty/s for `duration_ms`, at the
+    /// difficulty in force, at most `max_per_s` shares per second, with a
+    /// vardiff check every `tick_ms` whose proposal is applied. Returns every
+    /// difficulty assigned.
+    fn mine_closed_loop(
+        e: &mut VarDiffEngine<&TestClock>,
+        clock: &TestClock,
+        diff: &mut f64,
+        rate: f64,
+        max_per_s: f64,
+        duration_ms: u64,
+        tick_ms: u64,
+    ) -> Vec<f64> {
+        let mut assigned = Vec::new();
+        let mut owed = 0.0;
+        let end = clock.now_ms() + duration_ms;
+        while clock.now_ms() < end {
+            clock.advance_ms(1_000);
+            owed += (rate / *diff).min(max_per_s);
+            while owed >= 1.0 {
+                e.note_share_accepted(*diff);
+                owed -= 1.0;
+            }
+            if clock.now_ms().is_multiple_of(tick_ms) {
+                if let Some(next) = e.suggested_difficulty(*diff) {
+                    *diff = next;
+                    e.note_difficulty_assigned(next);
+                    assigned.push(next);
+                }
+            }
+        }
+        assigned
+    }
+
+    // ── nearest_difficulty_step ────────────────────────────────────────
+
+    /// Pins: every rung is a power of two, rounded up.
+    #[test]
+    fn nearest_step_returns_only_powers_of_two() {
+        let clock = TestClock::new(0);
+        let e = engine(&clock, 1.0);
+        assert_eq!(e.nearest_difficulty_step(1024.0), Some(1024.0));
+        assert_eq!(e.nearest_difficulty_step(2048.0), Some(2048.0));
+        // No 1.5x rung, and always UP.
+        assert_eq!(e.nearest_difficulty_step(1536.0), Some(2048.0));
+        assert_eq!(e.nearest_difficulty_step(1100.0), Some(2048.0));
+        assert_eq!(e.nearest_difficulty_step(2000.0), Some(2048.0));
+
+        for probe in [3.0, 100.0, 950.3, 2887.8, 5000.0, 1e6] {
+            let step = e.nearest_difficulty_step(probe).expect("a rung");
+            assert_eq!(
+                step,
+                2_f64.powf(step.log2().round()),
+                "step {step} for {probe} is not a power of two"
+            );
+            assert!(step >= probe, "step {step} is below the requested {probe}");
+            assert!(step < probe * 2.0, "step {step} overshoots {probe}");
+        }
+    }
+
+    #[test]
+    fn nearest_step_zero_returns_none() {
+        let clock = TestClock::new(0);
+        assert_eq!(engine(&clock, 1.0).nearest_difficulty_step(0.0), None);
+    }
+
+    #[test]
+    fn nearest_step_below_min_returns_min() {
+        let clock = TestClock::new(0);
+        let e = VarDiffEngine::new(&clock, 6.0, 500.0, 1024.0);
+        assert_eq!(e.nearest_difficulty_step(0.1), Some(500.0));
+        assert_eq!(e.nearest_difficulty_step(499.9), Some(500.0));
+    }
+
+    // ── construction validates its inputs ─────────────────────────────
+
+    #[test]
+    fn invalid_target_shares_per_minute_falls_back_to_default() {
+        // Default 6 shares/min → a 10 s target gap.
+        for bad in [0.0, -5.0, f64::NAN] {
+            let e = VarDiffEngine::new(TestClock::new(0), bad, 0.00001, 1.0);
+            assert_eq!(e.target_share_interval_s, 10.0, "target {bad}");
+        }
+    }
+
+    #[test]
+    fn invalid_min_difficulty_falls_back_to_default() {
+        for bad in [0.0, f64::NAN, -1.0] {
+            let e = VarDiffEngine::new(TestClock::new(0), 6.0, bad, 1.0);
+            assert_eq!(
+                e.min_difficulty, VARDIFF_DEFAULT_MIN_DIFFICULTY,
+                "min {bad}"
             );
         }
-        assert_eq!(diff, assigned, "off must not move the difficulty at all");
+        let e = VarDiffEngine::new(TestClock::new(0), 6.0, 500.0, 1024.0);
+        assert_eq!(e.min_difficulty, 500.0);
+    }
 
-        // Easing on: the difficulty walks down to something the miner can
-        // actually hit, and does it monotonically.
+    #[test]
+    fn invalid_initial_difficulty_falls_back_to_the_floor() {
+        for bad in [0.0, f64::NAN, -1.0, f64::INFINITY] {
+            let e = VarDiffEngine::new(TestClock::new(0), 6.0, 500.0, bad);
+            assert_eq!(e.difficulty, 500.0, "initial {bad}");
+        }
+    }
+
+    // ── display hashrate ──────────────────────────────────────────────
+
+    #[test]
+    fn hash_rate_is_zero_before_any_share() {
+        let clock = TestClock::new(0);
+        assert_eq!(engine(&clock, 1024.0).hash_rate(), 0.0);
+    }
+
+    #[test]
+    fn first_share_initializes_slot_but_keeps_hash_rate_zero() {
         let clock = TestClock::new(1_000);
-        let mut on = eased_engine(&clock).with_initial_difficulty(assigned);
+        let mut e = engine(&clock, 1024.0);
+        e.note_share_accepted(1024.0);
+        assert_eq!(e.hash_rate(), 0.0);
+        assert_eq!(e.shares, 1024.0);
+    }
+
+    #[test]
+    fn second_same_slot_share_computes_hashrate() {
+        let clock = TestClock::new(1_000);
+        let mut e = engine(&clock, 1024.0);
+        e.note_share_accepted(1024.0);
+        clock.advance_ms(1_000); // same 10-min slot
+        e.note_share_accepted(2048.0);
+        let expected = 3072.0 * HASHES_PER_DIFFICULTY_1 / 1.0;
+        assert!(
+            (e.hash_rate() - expected).abs() < 1.0,
+            "expected ≈ {expected}, got {}",
+            e.hash_rate()
+        );
+    }
+
+    #[test]
+    fn crossing_slot_boundary_rotates_share_buckets() {
+        let clock = TestClock::new(0);
+        let mut e = engine(&clock, 1024.0);
+        e.note_share_accepted(1024.0);
+        clock.advance_ms(1_000);
+        e.note_share_accepted(2048.0);
+        assert_eq!(e.shares, 3072.0);
+        clock.advance_ms(VARDIFF_SLOT_DURATION_MS);
+        e.note_share_accepted(512.0);
+        assert_eq!(e.previous_shares, 3072.0);
+        assert_eq!(e.shares, 512.0);
+    }
+
+    /// The first share after a silent slot recomputes over the gap instead
+    /// of quoting the pre-silence rate.
+    #[test]
+    fn the_first_share_after_a_silent_slot_recomputes_the_display_rate() {
+        let clock = TestClock::new(0);
+        let mut e = engine(&clock, 1024.0);
+        e.note_share_accepted(1024.0);
+        clock.advance_ms(1_000);
+        e.note_share_accepted(2048.0);
+        let busy = e.hash_rate();
+        clock.advance_ms(3_600_000);
+        e.note_share_accepted(512.0);
+        let expected = 3584.0 * HASHES_PER_DIFFICULTY_1 / 3601.0;
+        assert!(
+            (e.hash_rate() - expected).abs() < 1.0,
+            "expected ≈ {expected}, got {} (busy rate was {busy})",
+            e.hash_rate()
+        );
+    }
+
+    // ── the window ────────────────────────────────────────────────────
+
+    /// Nothing is decided on less than a minute of evidence.
+    #[test]
+    fn no_retarget_inside_the_minimum_window() {
+        let clock = TestClock::new(0);
+        let mut e = engine(&clock, 1.0);
+        // One share per second at difficulty 1: ten times the target rate.
+        e.note_share_accepted(1.0); // opens the window at t = 0
+        for _ in 0..59 {
+            clock.advance_ms(1_000);
+            e.note_share_accepted(1.0);
+        }
+        assert_eq!(e.suggested_difficulty(1.0), None, "59 s is not a window");
+        clock.advance_ms(1_000);
+        e.note_share_accepted(1.0);
+        assert!(
+            e.suggested_difficulty(1.0).is_some_and(|d| d > 1.0),
+            "60 s of 10× the target rate must raise"
+        );
+    }
+
+    /// Pins the measurement on an on-target session: it holds.
+    #[test]
+    fn an_on_target_session_holds() {
+        let clock = TestClock::new(0);
+        let mut e = engine(&clock, 1024.0);
+        fill_equilibrium(&mut e, &clock);
+        assert_eq!(e.suggested_difficulty(1024.0), None);
+    }
+
+    /// Two shares close together cannot raise the difficulty, however close:
+    /// two arrivals are below [`VARDIFF_MIN_SHARES`], so they only bound the
+    /// rate from above.
+    #[test]
+    fn two_close_shares_cannot_raise_the_difficulty() {
+        for gap_ms in [1u64, 200, 500, 5_000, 30_000] {
+            let clock = TestClock::new(0);
+            let mut e = engine(&clock, 1024.0);
+            clock.advance_ms(61_000);
+            e.note_share_accepted(1024.0);
+            clock.advance_ms(gap_ms);
+            e.note_share_accepted(1024.0);
+            for wait_ms in [0u64, 1_000, 60_000] {
+                clock.advance_ms(wait_ms);
+                let proposed = e.suggested_difficulty(1024.0);
+                assert!(
+                    proposed.is_none_or(|p| p < 1024.0),
+                    "gap {gap_ms} ms, +{wait_ms} ms: proposed {proposed:?} from 1024"
+                );
+            }
+        }
+    }
+
+    /// A flood packing dozens of shares into each millisecond still has a
+    /// span: the window is measured in time, not in shares.
+    #[test]
+    fn a_flood_in_millisecond_clumps_still_retargets() {
+        let clock = TestClock::new(0);
+        let mut e = engine(&clock, 1.0);
+        for _ in 0..=61 {
+            for _ in 0..40 {
+                e.note_share_accepted(1.0); // 40 shares in the same millisecond
+            }
+            clock.advance_ms(1_000);
+        }
+        // 2440 credited arrivals over ~61 s at difficulty 1 → target ≈ 400,
+        // capped on the first raise at 8×.
+        assert_eq!(e.suggested_difficulty(1.0), Some(8.0));
+        e.note_difficulty_assigned(8.0);
+        for _ in 0..=61 {
+            for _ in 0..40 {
+                e.note_share_accepted(8.0);
+            }
+            clock.advance_ms(1_000);
+        }
+        // The proving interval is spent: the measured 3200 goes through.
+        assert_eq!(e.suggested_difficulty(8.0), Some(4096.0));
+    }
+
+    /// A 1 PH/s channel that opened at difficulty 1 reaches its equilibrium
+    /// rung, without overshooting it, while the pool can only process a
+    /// fraction of its share flood.
+    #[test]
+    fn a_petahash_channel_opened_at_difficulty_one_converges() {
+        let clock = TestClock::new(0);
+        let mut e = engine(&clock, 1.0);
+        let mut diff = 1.0;
+        let rate = 1e15 / HASHES_PER_DIFFICULTY_1;
+        let equilibrium = rate * 10.0; // ≈ 2.33e6
+        let assigned = mine_closed_loop(&mut e, &clock, &mut diff, rate, 2_000.0, 480_000, 60_000);
+        assert!(
+            assigned.iter().all(|d| *d <= 2.0 * equilibrium),
+            "overshot the equilibrium {equilibrium}: {assigned:?}"
+        );
+        assert!(
+            (equilibrium / 2.0..=2.0 * equilibrium).contains(&diff),
+            "did not converge within 8 minutes: {assigned:?}"
+        );
+    }
+
+    /// A window with fewer than [`VARDIFF_MIN_SHARES`] arrivals is too thin
+    /// for a point estimate: one share in its first minute reads an on-target
+    /// miner as six times too slow. It may only lower to its upper bound.
+    #[test]
+    fn a_thin_window_cannot_drive_a_descent_below_its_upper_bound() {
+        let clock = TestClock::new(0);
+        let mut e = engine(&clock, 1024.0);
+        clock.advance_ms(5_000);
+        e.note_share_accepted(1024.0); // opens the window
+        clock.advance_ms(30_000);
+        e.note_share_accepted(1024.0); // an unlucky first minute: one more
+        clock.advance_ms(30_000);
+        assert_eq!(
+            e.suggested_difficulty(1024.0),
+            None,
+            "one arrival in a minute must not lower an on-target 1024 session"
+        );
+    }
+
+    /// The window holds the last 5 to 10 minutes, not the whole session, so
+    /// a session that ran for hours still answers a real slowdown promptly.
+    #[test]
+    fn a_long_running_session_follows_a_slowdown_promptly() {
+        let clock = TestClock::new(0);
+        let mut e = engine(&clock, 1024.0);
+        let mut diff = 1024.0;
+        let steady = mine_closed_loop(&mut e, &clock, &mut diff, 102.4, 1e9, 3 * 3_600_000, 60_000);
+        assert!(
+            steady.is_empty(),
+            "precondition: three steady hours hold: {steady:?}"
+        );
+        // The rig drops to a quarter of its rate for good.
+        let after = mine_closed_loop(&mut e, &clock, &mut diff, 25.6, 1e9, 20 * 60_000, 60_000);
+        assert!(
+            diff <= 512.0,
+            "still at {diff} 20 minutes into a 4× slowdown: {after:?}"
+        );
+    }
+
+    // ── scenarios the engine must survive ─────────────────────────────
+
+    /// The wall clock steps back an hour under a steady session. Arrivals
+    /// must not pile up against exposure frozen until the clock catches up:
+    /// the session stays within a rung of its equilibrium throughout.
+    #[test]
+    fn a_backwards_clock_step_cannot_raise_a_steady_session() {
+        let clock = TestClock::new(10_000_000);
+        let mut e = engine(&clock, 1024.0);
+        let mut diff = 1024.0;
+        let steady = mine_closed_loop(&mut e, &clock, &mut diff, 102.4, 1e9, 1_800_000, 60_000);
+        assert!(
+            steady.is_empty(),
+            "precondition: on target holds: {steady:?}"
+        );
+        clock.set_ms(clock.now_ms() - 3_600_000);
+        let after = mine_closed_loop(&mut e, &clock, &mut diff, 102.4, 1e9, 7_200_000, 60_000);
+        assert!(
+            after.iter().all(|d| *d <= 2048.0) && (512.0..=2048.0).contains(&diff),
+            "a clock step moved an on-target 1024 session: {after:?}"
+        );
+    }
+
+    /// A rig that keeps only 1/3000 of its rate shares so rarely at the
+    /// 16× floor that no single bucket holds a measurement. The window keeps
+    /// gathering until it does, so the session reaches its new equilibrium
+    /// instead of parking at the floor.
+    #[test]
+    fn a_three_thousandfold_slowdown_reaches_the_new_equilibrium() {
+        let clock = TestClock::new(0);
+        let mut e = engine(&clock, 1_048_576.0);
+        let mut diff = 1_048_576.0;
+        let full = 104_857.6;
+        let steady = mine_closed_loop(&mut e, &clock, &mut diff, full, 1e9, 3_600_000, 60_000);
+        assert!(
+            steady.is_empty(),
+            "precondition: on target holds: {steady:?}"
+        );
+        let equilibrium = 1_048_576.0 / 3000.0; // ≈ 350
+        let after = mine_closed_loop(
+            &mut e,
+            &clock,
+            &mut diff,
+            full / 3000.0,
+            1e9,
+            6 * 3_600_000,
+            60_000,
+        );
+        assert!(
+            (equilibrium / 2.0..=2.0 * equilibrium).contains(&diff),
+            "parked at {diff} six hours into the slowdown, equilibrium {equilibrium}: {after:?}"
+        );
+        assert!(
+            after.windows(2).all(|w| w[1] <= w[0]),
+            "a slowdown must only ever lower: {after:?}"
+        );
+    }
+
+    /// A raise from outside (`UpdateChannel`, `mining.suggest_difficulty`) is
+    /// no measurement, so it does not lift the up-step cap: a flush right
+    /// after it is capped like any other.
+    #[test]
+    fn an_external_raise_does_not_lift_the_cap_for_a_burst() {
+        let clock = TestClock::new(0);
+        let mut e = engine(&clock, 2.0);
+        let mut diff = 2.0;
+        // True rate 0.4 difficulty/s: equilibrium 4. Measured at 2 first.
+        let _ = mine_closed_loop(&mut e, &clock, &mut diff, 0.4, 1e9, 600_000, 60_000);
+        e.note_difficulty_assigned(4.0); // the external raise
+        diff = 4.0;
+        clock.advance_ms(5_000);
+        for _ in 0..300 {
+            e.note_share_accepted(4.0); // the flush, in one millisecond
+        }
+        let assigned = mine_closed_loop(&mut e, &clock, &mut diff, 0.4, 1e9, 1_800_000, 60_000);
+        assert!(
+            assigned.iter().all(|d| *d <= 32.0),
+            "a flush after an external raise went past 8×: {assigned:?}"
+        );
+    }
+
+    /// A burst followed within the same millisecond by an external raise
+    /// leaves a window with shares but no span: no measurement, so it cannot
+    /// lift the cap for the next burst.
+    #[test]
+    fn a_window_without_span_is_no_measurement_for_the_cap() {
+        let clock = TestClock::new(0);
+        let mut e = engine(&clock, 4.0);
+        clock.advance_ms(10_000);
+        for _ in 0..300 {
+            e.note_share_accepted(4.0);
+        }
+        e.note_difficulty_assigned(8.0); // e.g. UpdateChannel, same millisecond
+        clock.advance_ms(1_000);
+        for _ in 0..300 {
+            e.note_share_accepted(8.0); // a second flush
+        }
+        clock.advance_ms(60_000);
+        let proposed = e
+            .suggested_difficulty(8.0)
+            .expect("a flushed window must raise");
+        assert!(
+            proposed <= 64.0,
+            "the second flush went past 8×: {proposed}"
+        );
+    }
+
+    // ── the upper bound ───────────────────────────────────────────────
+
+    /// A session that advertises 10× its real hashrate and lands no share
+    /// reaches a difficulty it can hit within a handful of cycles.
+    #[test]
+    fn a_declining_miner_is_rescued_before_its_first_share() {
+        let assigned = 100_000.0;
+        let reachable = 10_000.0;
+        let clock = TestClock::new(1_000);
+        let mut e = engine(&clock, assigned);
         let mut diff = assigned;
         let mut cycles_to_reachable = None;
         for i in 0..15 {
             let before = diff;
-            no_share_cycle(&mut on, &clock, 60_000, &mut diff);
+            cycle(&mut e, &clock, 60_000, &mut diff);
             assert!(diff <= before, "descent must be monotone (cycle {i})");
             if cycles_to_reachable.is_none() && diff <= reachable {
                 cycles_to_reachable = Some(i + 1);
@@ -1378,52 +1086,45 @@ mod tests {
         assert!(cycles <= 5, "took {cycles} cycles to become reachable");
     }
 
-    /// The property a fixed per-cycle divisor cannot have: whether a quiet
-    /// minute is evidence depends on how many shares that minute was
-    /// supposed to carry.
+    /// Whether a quiet minute is evidence depends on how many shares that
+    /// minute was supposed to carry.
     #[test]
     fn quiet_is_judged_against_the_expected_share_rate() {
         // 0.6 shares/min → a 100 s mean gap. 90 s of quiet is ordinary.
         let clock = TestClock::new(1_000);
-        let mut sparse = VarDiffEngine::new(&clock, 0.6, 0.00001)
-            .with_silence_easing(true)
-            .with_initial_difficulty(4096.0);
+        let mut sparse = VarDiffEngine::new(&clock, 0.6, 0.00001, 4096.0);
         let mut diff = 4096.0;
         assert!(
-            !no_share_cycle(&mut sparse, &clock, 90_000, &mut diff),
+            !cycle(&mut sparse, &clock, 90_000, &mut diff),
             "90 s without a share on a 0.6/min port is normal spacing, not evidence"
         );
 
         // 15 shares/min → a 4 s mean gap. The same 90 s is ~22 missed gaps.
         let clock = TestClock::new(1_000);
-        let mut dense = VarDiffEngine::new(&clock, 15.0, 0.00001)
-            .with_silence_easing(true)
-            .with_initial_difficulty(4096.0);
+        let mut dense = VarDiffEngine::new(&clock, 15.0, 0.00001, 4096.0);
         let mut diff = 4096.0;
         assert!(
-            no_share_cycle(&mut dense, &clock, 90_000, &mut diff),
+            cycle(&mut dense, &clock, 90_000, &mut diff),
             "90 s without a share on a 15/min port is overwhelming evidence"
         );
         assert!(diff < 4096.0);
     }
 
-    /// Evidence accumulates across ticks, so the descent does not depend on
-    /// `difficulty_check_interval_ms`.
+    /// Exposure accumulates across ticks and assignments, so the descent
+    /// does not depend on the check interval.
     #[test]
     fn descent_does_not_depend_on_the_check_interval() {
         let mut results = Vec::new();
         for (tick_ms, ticks) in [(30_000u64, 24u32), (60_000, 12), (240_000, 3)] {
             let clock = TestClock::new(1_000);
-            let mut e = eased_engine(&clock).with_initial_difficulty(1_048_576.0);
+            let mut e = engine(&clock, 1_048_576.0);
             let mut diff = 1_048_576.0;
             for _ in 0..ticks {
-                no_share_cycle(&mut e, &clock, tick_ms, &mut diff);
+                cycle(&mut e, &clock, tick_ms, &mut diff);
             }
             results.push((tick_ms, diff));
         }
-        // Same 12 minutes of silence, three cadences, same rung. (Coarse
-        // ticks can only lag by the granularity of the last step, so allow
-        // one rung of slack — but not more.)
+        // Same 12 minutes of silence, three cadences: within one rung.
         let reference = results[0].1;
         for (tick_ms, got) in &results {
             assert!(
@@ -1433,36 +1134,27 @@ mod tests {
         }
     }
 
-    /// A raw estimate that rounds back up onto the rung already in force
-    /// must propose nothing — and the descent must NOT stall there, because
-    /// `S` keeps growing and a later cycle crosses.
+    /// A bound that rounds back onto the rung in force proposes nothing, and
+    /// the descent does not stall there, because exposure keeps growing.
     #[test]
-    fn a_proposal_that_rounds_onto_the_current_rung_waits_and_then_crosses() {
+    fn a_bound_that_rounds_onto_the_current_rung_waits_and_then_crosses() {
         let clock = TestClock::new(1_000);
-        let mut e = eased_engine(&clock).with_initial_difficulty(65_536.0);
+        let mut e = engine(&clock, 65_536.0);
         let mut diff = 65_536.0;
-
-        // First opportunity past warmup: enough evidence to cross a rung.
-        assert!(no_share_cycle(&mut e, &clock, 61_000, &mut diff));
+        assert!(cycle(&mut e, &clock, 61_000, &mut diff));
         let after_first = diff;
         assert!(after_first < 65_536.0);
 
-        // Now poll FASTER than evidence accrues. One rung costs k·τ = 30 s
-        // of silence at 6 shares/min, so a 10 s tick cannot justify one and
-        // the raw estimate rounds straight back onto the rung in force.
+        // Poll faster than evidence accrues.
         assert!(
-            !no_share_cycle(&mut e, &clock, 10_000, &mut diff),
+            !cycle(&mut e, &clock, 10_000, &mut diff),
             "a sub-rung proposal must not be emitted"
         );
-        assert_eq!(
-            diff, after_first,
-            "a no-op tick must not move the difficulty"
-        );
+        assert_eq!(diff, after_first);
 
-        // And it must not be stuck there: the accumulator keeps growing.
         let mut moved = false;
         for _ in 0..10 {
-            if no_share_cycle(&mut e, &clock, 10_000, &mut diff) {
+            if cycle(&mut e, &clock, 10_000, &mut diff) {
                 moved = true;
                 break;
             }
@@ -1471,12 +1163,12 @@ mod tests {
         assert!(diff < after_first);
     }
 
-    /// Zero arrivals are evidence of *less* hashrate. They can never argue
-    /// for more, at any current difficulty, however long the wait.
+    /// Zero arrivals are evidence of *less* hashrate, at any current
+    /// difficulty, however long the wait.
     #[test]
-    fn the_descent_never_proposes_an_increase() {
+    fn the_bound_never_proposes_an_increase() {
         let clock = TestClock::new(1_000);
-        let e = eased_engine(&clock).with_initial_difficulty(1024.0);
+        let e = engine(&clock, 1024.0);
         clock.advance_ms(61_000);
         for elapsed in [0u64, 1_000, 60_000, 600_000, 86_400_000] {
             clock.advance_ms(elapsed);
@@ -1491,31 +1183,25 @@ mod tests {
         }
     }
 
-    /// The descent parks at the opening difficulty / 256 and then holds.
-    /// A session that is not weak but simply idle must not be walked down
-    /// to `min_difficulty` and flood on return.
+    /// A session that never sustained a difficulty parks at the highest one
+    /// assigned / 256 and holds, instead of sinking to `min_difficulty` and
+    /// flooding on return.
     #[test]
     fn descent_parks_at_the_no_share_bound() {
         let clock = TestClock::new(1_000);
         let opening = 1_048_576.0;
-        let mut e = eased_engine(&clock).with_initial_difficulty(opening);
+        let mut e = engine(&clock, opening);
         let mut diff = opening;
         for _ in 0..200 {
-            no_share_cycle(&mut e, &clock, 60_000, &mut diff);
+            cycle(&mut e, &clock, 60_000, &mut diff);
         }
-        let floor = opening / VARDIFF_NO_SHARE_MAX_DESCENT_FACTOR;
-        assert!(
-            diff >= floor,
-            "parked at {diff}, below the {VARDIFF_NO_SHARE_MAX_DESCENT_FACTOR}x bound {floor}"
-        );
-        // The bound is a LOWER bound, so rounding up cannot break it — the
-        // parked value is the first rung at or above the floor.
-        assert_eq!(diff, 4096.0);
+        // The floor is a LOWER bound: the first rung at or above it.
+        assert_eq!(diff, opening / VARDIFF_NO_SHARE_MAX_DESCENT_FACTOR);
         clock.advance_ms(86_400_000);
         assert_eq!(
             e.suggested_difficulty(diff),
             None,
-            "parked descent must stop proposing"
+            "parked must stay parked"
         );
     }
 
@@ -1523,12 +1209,11 @@ mod tests {
     #[test]
     fn descent_respects_the_configured_floor() {
         let clock = TestClock::new(1_000);
-        let mut e = VarDiffEngine::new(&clock, 6.0, 500.0)
-            .with_silence_easing(true)
-            .with_initial_difficulty(1_048_576.0);
-        let mut diff = 1_048_576.0;
+        let mut e = VarDiffEngine::new(&clock, 6.0, 500.0, 1_048_576.0);
+        e.note_difficulty_assigned(65_536.0);
+        let mut diff = 65_536.0;
         for _ in 0..200 {
-            no_share_cycle(&mut e, &clock, 60_000, &mut diff);
+            cycle(&mut e, &clock, 60_000, &mut diff);
         }
         assert!(
             diff >= 500.0,
@@ -1536,470 +1221,325 @@ mod tests {
         );
     }
 
-    /// Pins: rejects that cleared the target spend the evidence and hold the
-    /// session.
-    #[test]
-    fn rejects_that_reached_the_target_hold_the_descent() {
-        let clock = TestClock::new(1_000);
-        let mut e = eased_engine(&clock).with_initial_difficulty(65_536.0);
-        let mut diff = 65_536.0;
-        clock.advance_ms(61_000); // past warmup
-        for i in 0..60 {
-            clock.advance_ms(20_000);
-            e.note_target_reached(); // duplicate/stale: the work was good
-            assert_eq!(
-                e.suggested_difficulty(diff),
-                None,
-                "a miner proving it reaches the target must not be eased (cycle {i})"
-            );
-        }
-        assert_eq!(diff, 65_536.0);
-
-        // Once the rejects stop, evidence accrues from the last one.
-        for _ in 0..10 {
-            no_share_cycle(&mut e, &clock, 60_000, &mut diff);
-        }
-        assert!(diff < 65_536.0, "descent must resume after the storm ends");
-    }
-
-    /// The bootstrap divides accumulated work by elapsed time; time spent at
-    /// an unreachable difficulty holds no observable work, so it must not
-    /// sit in the denominator and make the first share after a descent read
-    /// far slower than the miner is.
-    #[test]
-    fn the_first_share_after_a_descent_is_not_diluted_by_the_silence() {
-        let clock = TestClock::new(1_000);
-        let mut e = eased_engine(&clock).with_initial_difficulty(100_000.0);
-        let mut diff = 100_000.0;
-        for _ in 0..4 {
-            no_share_cycle(&mut e, &clock, 60_000, &mut diff);
-        }
-        assert!(diff < 100_000.0, "precondition: the descent moved");
-
-        // The miner now lands shares at the reached difficulty, on time.
-        let gap_ms = 10_000; // the 6/min target gap
-        for _ in 0..4 {
-            clock.advance_ms(gap_ms);
-            e.update_hash_rate(diff, true);
-        }
-        clock.advance_ms(gap_ms);
-        let proposed = e
-            .suggested_difficulty(diff)
-            .expect("bootstrap must speak once a share exists");
-
-        // On target, so the estimate must sit AT the difficulty being mined.
-        assert!(
-            proposed >= diff / 2.0,
-            "diluted: proposed {proposed} from a session mining {diff} on target"
-        );
-    }
-
-    /// Both halves of the switch on one engine: the descent rescues the
-    /// session before its first share, the windowed easing takes over
-    /// afterwards, and neither corrupts the other.
-    #[test]
-    fn descent_hands_over_to_silence_easing() {
-        let clock = TestClock::new(1_000);
-        let mut e = eased_engine(&clock).with_initial_difficulty(100_000.0);
-        let mut diff = 100_000.0;
-
-        // Half one: no share ever, difficulty walks down.
-        for _ in 0..5 {
-            no_share_cycle(&mut e, &clock, 60_000, &mut diff);
-        }
-        let rescued = diff;
-        assert!(rescued < 100_000.0);
-
-        // The miner wakes up and mines a full window at that difficulty.
-        for _ in 0..30 {
-            clock.advance_ms(10_000);
-            e.update_hash_rate(rescued, true);
-        }
-
-        // Half two: it goes quiet again. The windowed estimator — not the
-        // descent, which is out of the picture once a share exists — walks
-        // it down and parks at the pre-silence bound.
-        let mut post = rescued;
-        for _ in 0..240 {
-            no_share_cycle(&mut e, &clock, 60_000, &mut post);
-        }
-        assert!(
-            post < rescued,
-            "silence easing must still work after a descent"
-        );
-        assert!(
-            post >= rescued / VARDIFF_SILENCE_MAX_DESCENT_FACTOR / 2.0,
-            "descent bound leaked into the eased path: {post} from {rescued}"
-        );
-    }
-
-    /// The up-step cap charges a proving interval once, not per 8×: a
-    /// genuine 128× rate jump reaches equilibrium within two intervals.
-    #[test]
-    fn a_proven_raise_is_not_rationed_at_eight_times_per_interval() {
-        let clock = TestClock::new(0);
-        let mut e = eased_engine(&clock).with_initial_difficulty(512.0);
-        let mut diff = 512.0;
-        // Equilibrium at 512, then the real rate jumps 128×.
-        for _ in 0..30 {
-            e.update_hash_rate(512.0, true);
-            clock.advance_ms(10_000);
-        }
-        // Fixed hashrate from here on: 128x the rate that made 512 the
-        // equilibrium, i.e. 512 difficulty every 78 ms.
-        let rate_per_s = 512.0 / 0.078;
-        let equilibrium = 512.0 * 128.0;
-        let mut steps = 0;
-        for _ in 0..30 {
-            // One check interval's worth of shares AT the difficulty
-            // currently in force — the interval between them stretches as
-            // the difficulty rises, which is the whole point.
-            let gap_ms = f64::max((diff / rate_per_s) * 1000.0, 1.0) as u64;
-            for _ in 0..30 {
-                e.update_hash_rate(diff, true);
-                clock.advance_ms(gap_ms);
-            }
-            match e.suggested_difficulty(diff) {
-                Some(next) if next > diff => {
-                    diff = next;
-                    e.note_difficulty_assigned(next);
-                    steps += 1;
-                }
-                _ => break,
-            }
-        }
-        assert!(
-            diff >= equilibrium / 2.0,
-            "never reached equilibrium: parked at {diff}, wanted ~{equilibrium}"
-        );
-        assert!(
-            steps <= 2,
-            "took {steps} intervals to follow a proven raise (reached {diff})"
-        );
-    }
-
-    /// The descent floor tracks the highest difficulty the session has ever
-    /// carried, so a later raise keeps the 256× bound relative to the
-    /// difficulty in force.
+    /// The no-share floor tracks the highest difficulty ever assigned, so a
+    /// later raise keeps it relative to the difficulty in force, and a
+    /// lowering does not drag it down.
     #[test]
     fn the_descent_floor_follows_a_later_raise() {
         let clock = TestClock::new(1_000);
-        let mut e = eased_engine(&clock).with_initial_difficulty(16_384.0);
+        let mut e = engine(&clock, 16_384.0);
         e.note_difficulty_assigned(500_000.0); // e.g. mining.suggest_difficulty
         let mut diff = 500_000.0;
         for _ in 0..400 {
-            no_share_cycle(&mut e, &clock, 60_000, &mut diff);
+            cycle(&mut e, &clock, 60_000, &mut diff);
         }
         let floor = 500_000.0 / VARDIFF_NO_SHARE_MAX_DESCENT_FACTOR;
+        assert!(diff >= floor, "parked at {diff}, below the bound {floor}");
         assert!(
-            diff >= floor,
-            "parked at {diff}, below the bound {floor} measured against the live difficulty"
-        );
-        // And a lowering must NOT drag the floor down with it, or the bound
-        // ratchets away with every descent step and stops bounding.
-        assert!(
-            diff >= 1024.0,
-            "floor ratcheted down during the descent: {diff}"
+            diff <= floor * 2.0,
+            "parked at {diff}, a rung above {floor}"
         );
     }
 
-    /// A bootstrap anchor moved shortly before the first share leaves a
-    /// window of milliseconds; the branch has no up-step cap, so it must
-    /// hold until that window spans a warmup rather than propose a raise.
-    #[test]
-    fn a_freshly_moved_bootstrap_anchor_cannot_manufacture_a_raise() {
-        for gap_ms in [1u64, 200, 500, 5_000, 59_000] {
-            let clock = TestClock::new(0);
-            let mut e = eased_engine(&clock).with_initial_difficulty(1024.0);
-            clock.advance_ms(600_000); // long silence, no share
-            e.note_difficulty_assigned(1024.0); // anchor moves to now
-            clock.advance_ms(gap_ms);
-            e.update_hash_rate(1024.0, true); // the FIRST accepted share
-            let proposed = e.suggested_difficulty(1024.0);
-            assert!(
-                proposed.is_none_or(|p| p <= 1024.0),
-                "gap {gap_ms} ms produced {proposed:?} from a session at 1024 — \
-                 a raise conjured out of a short measurement window"
-            );
-        }
-    }
-
-    /// A below-target reject shows the miner cannot clear the bar, which is
-    /// what the descent corrects, so it must not spend the evidence; a
-    /// reject that did clear the bar must.
-    #[test]
-    fn below_target_rejects_do_not_spend_the_descent_evidence() {
-        let clock = TestClock::new(1_000);
-        let mut e = eased_engine(&clock).with_initial_difficulty(65_536.0);
-        let mut diff = 65_536.0;
-        clock.advance_ms(61_000);
-        // A miner hashing steadily but never clearing the assigned target:
-        // liveness only, no proof it reached the difficulty.
-        for _ in 0..10 {
-            clock.advance_ms(20_000);
-            e.note_submission();
-        }
-        assert!(
-            no_share_cycle(&mut e, &clock, 1, &mut diff),
-            "a session that only produces below-target rejects must still descend"
-        );
-        assert!(diff < 65_536.0);
-
-        // A reject that DID clear the bar (duplicate, stale, unknown job)
-        // still spends it — that miner has proven it can reach the target.
-        let clock = TestClock::new(1_000);
-        let mut e2 = eased_engine(&clock).with_initial_difficulty(65_536.0);
-        let mut diff2 = 65_536.0;
-        clock.advance_ms(61_000);
-        for _ in 0..10 {
-            clock.advance_ms(20_000);
-            e2.note_target_reached();
-        }
-        assert!(
-            !no_share_cycle(&mut e2, &clock, 1, &mut diff2),
-            "a session proving it reaches the target must be held"
-        );
-        assert_eq!(diff2, 65_536.0);
-    }
-
-    /// Pins: once a share is accepted, a later assignment does not move the
-    /// bootstrap anchor.
-    #[test]
-    fn the_bootstrap_anchor_freezes_once_a_share_is_accepted() {
-        let clock = TestClock::new(0);
-        let mut e = eased_engine(&clock).with_initial_difficulty(1024.0);
-        e.update_hash_rate(1024.0, true); // one share at t=0
-        clock.advance_ms(80_000);
-        // Anchored at engine start: 1024 * 10 / 80 = 128.
-        let before = e.suggested_difficulty(16_384.0);
-        assert_eq!(before, Some(128.0), "precondition");
-
-        // A later assignment must not move the anchor any more.
-        e.note_difficulty_assigned(4096.0);
-        assert_eq!(
-            e.suggested_difficulty(16_384.0),
-            before,
-            "anchor moved after a share: the same work is now divided by a \
-             shorter span and the miner reads as faster than it is"
-        );
-    }
-
-    /// Pins: a missed lowering descends too little, never too much. A missed
-    /// RAISE would descend too much, so every raising path must call the hook.
+    /// A missed lowering descends too little, never too much: exposure is
+    /// computed at the difficulty the engine believes in.
     #[test]
     fn a_missed_assignment_hook_errs_toward_descending_too_little() {
-        // Missed LOWERING: engine still believes 1024, caller is at 64.
         let clock = TestClock::new(0);
-        let stale_high = eased_engine(&clock).with_initial_difficulty(1024.0);
-        // Truthful reference: the engine was told about the same lowering.
+        let stale_high = engine(&clock, 1024.0);
         let clock2 = TestClock::new(0);
-        let mut truthful = eased_engine(&clock2).with_initial_difficulty(1024.0);
+        let mut truthful = engine(&clock2, 1024.0);
         truthful.note_difficulty_assigned(64.0);
 
         clock.advance_ms(300_000);
         clock2.advance_ms(300_000);
-        let missed = stale_high.suggested_difficulty(64.0);
-        let told = truthful.suggested_difficulty(64.0);
-        match (missed, told) {
-            (Some(m), Some(t)) => assert!(
-                m >= t,
-                "a missed lowering must descend LESS, not more: {m} vs {t}"
-            ),
-            (None, _) => {} // held entirely — even more conservative
+        match (
+            stale_high.suggested_difficulty(64.0),
+            truthful.suggested_difficulty(64.0),
+        ) {
+            (Some(m), Some(t)) => assert!(m >= t, "missed: {m}, told: {t}"),
+            (None, _) => {}
             (Some(m), None) => panic!("missed hook proposed {m} where the truth held"),
         }
     }
 
-    /// The engine must be told what the session is quiet AT. Without a
-    /// seeded difficulty it has nothing to bound and holds — the
-    /// conservative failure mode for a missed wiring site.
+    /// The bound a caller weighs a declared hashrate against survives every
+    /// descent step. A translator re-sends its claim on a timer, and evidence
+    /// lost at each step would let that re-send undo the descent each time.
     #[test]
-    fn descent_holds_when_no_initial_difficulty_was_seeded() {
-        let clock = TestClock::new(1_000);
-        let e = eased_engine(&clock); // no with_initial_difficulty
-        clock.advance_ms(600_000);
-        assert_eq!(e.suggested_difficulty(100_000.0), None);
+    fn silence_evidence_survives_each_descent_step() {
+        let clock = TestClock::new(0);
+        let mut e = engine(&clock, 1_048_576.0);
+        assert_eq!(
+            e.silence_implied_max_difficulty(),
+            None,
+            "no evidence at t = 0"
+        );
+        let mut diff = 1_048_576.0;
+        let mut last_ceiling = f64::INFINITY;
+        let mut steps = 0;
+        for _ in 0..12 {
+            clock.advance_ms(60_000);
+            let ceiling = e
+                .silence_implied_max_difficulty()
+                .expect("a minute of silence and more is evidence");
+            assert!(
+                ceiling <= last_ceiling,
+                "evidence shrank: {last_ceiling} → {ceiling}"
+            );
+            if let Some(next) = e.suggested_difficulty(diff) {
+                diff = next;
+                e.note_difficulty_assigned(next);
+                steps += 1;
+                let after = e
+                    .silence_implied_max_difficulty()
+                    .expect("an assignment must not erase the silence evidence");
+                assert!(
+                    after <= diff,
+                    "right after the step to {diff} the evidence allows {after}"
+                );
+            }
+            last_ceiling = ceiling;
+        }
+        assert!(
+            steps >= 3,
+            "precondition: the descent moved ({steps} steps)"
+        );
+
+        // An accepted share ends the question for good.
+        e.note_share_accepted(diff);
+        assert_eq!(e.silence_implied_max_difficulty(), None);
     }
 
-    /// The cap must survive the ladder: rounding happens AFTER the cap, so a
-    /// raw cap of 384 (`client_difficulty = 48`) would round up to 512,
-    /// past the 8× bound.
+    // ── silence after a measured window ──────────────────────────────
+
+    /// A measured session goes fully silent: it descends monotonically,
+    /// not before the deadband allows it, parks within a rung of the 16×
+    /// bound below the difficulty it sustained, and stays there.
+    #[test]
+    fn silence_descends_monotonically_and_parks_at_the_bound() {
+        let clock = TestClock::new(1_000);
+        let mut e = engine(&clock, 1024.0);
+        fill_equilibrium(&mut e, &clock);
+
+        let mut diff = 1024.0;
+        let mut first_step = None;
+        for i in 0..240 {
+            let before = diff;
+            if cycle(&mut e, &clock, 60_000, &mut diff) {
+                first_step.get_or_insert(i);
+                assert!(diff < before, "descent must be monotone: {before} → {diff}");
+            }
+        }
+        // The measured rate halves once the window doubles: ~300 s of silence
+        // on top of the ~290 s it was measured over.
+        assert!(
+            first_step.is_some_and(|i| i >= 4),
+            "eased before the deadband allows it: first step at check {first_step:?}"
+        );
+        let floor = 1024.0 / VARDIFF_SILENCE_MAX_DESCENT_FACTOR;
+        assert!(
+            (floor..=2.0 * floor).contains(&diff),
+            "must park within a rung of {floor}, got {diff}"
+        );
+        for _ in 0..60 {
+            clock.advance_ms(60_000);
+            assert_eq!(e.suggested_difficulty(diff), None, "must stay parked");
+        }
+    }
+
+    /// Stale and unknown-job shares are arrivals: a session whose shares all
+    /// come back stale at its usual cadence holds. Without them the same
+    /// silence descends.
+    #[test]
+    fn stale_shares_hold_a_silent_session() {
+        let clock = TestClock::new(1_000);
+        let mut e = engine(&clock, 1024.0);
+        fill_equilibrium(&mut e, &clock);
+        let mut diff = 1024.0;
+        for i in 0..180 {
+            clock.advance_ms(10_000);
+            e.note_stale_share();
+            if i % 6 == 5 {
+                assert!(
+                    !cycle(&mut e, &clock, 0, &mut diff),
+                    "a session sending stale shares at its cadence must hold (t+{}s), went to {diff}",
+                    (i + 1) * 10
+                );
+            }
+        }
+
+        // Control: the same 30 minutes in silence descend.
+        let clock = TestClock::new(1_000);
+        let mut e = engine(&clock, 1024.0);
+        fill_equilibrium(&mut e, &clock);
+        let mut diff = 1024.0;
+        for _ in 0..30 {
+            cycle(&mut e, &clock, 60_000, &mut diff);
+        }
+        assert!(diff < 1024.0, "control: silence must descend");
+    }
+
+    /// The window without a share is dropped by the first arrival, so a
+    /// miner that starts late is not measured against the silence before.
+    #[test]
+    fn the_first_share_after_a_descent_is_not_diluted_by_the_silence() {
+        let clock = TestClock::new(1_000);
+        let mut e = engine(&clock, 1_048_576.0);
+        let mut diff = 1_048_576.0;
+        for _ in 0..60 {
+            cycle(&mut e, &clock, 60_000, &mut diff);
+        }
+        assert_eq!(diff, 4096.0, "precondition: parked at the no-share bound");
+
+        // A miner attaches that sustains 4096 on target: one share per 10 s.
+        for _ in 0..7 {
+            clock.advance_ms(10_000);
+            e.note_share_accepted(4096.0);
+        }
+        assert_eq!(
+            e.suggested_difficulty(4096.0),
+            None,
+            "an on-target miner must hold, not be read as slower than it is"
+        );
+    }
+
+    // ── the up-step cap ───────────────────────────────────────────────
+
+    /// A JDC flushing optimistic-mining shares lands a burst. The first raise
+    /// is capped at 8×; the assignment spends the burst, so it cannot drive a
+    /// second, uncapped raise, and the session comes back to its rate.
+    #[test]
+    fn a_burst_is_capped_once_and_cannot_ratchet_on() {
+        let clock = TestClock::new(0);
+        let mut e = engine(&clock, 4.0);
+        let mut diff = 4.0;
+        clock.advance_ms(10_000);
+        for _ in 0..300 {
+            e.note_share_accepted(4.0); // the flush, in one millisecond
+        }
+        // True rate 0.4 difficulty/s: equilibrium 4.
+        let assigned = mine_closed_loop(&mut e, &clock, &mut diff, 0.4, 1e9, 1_800_000, 60_000);
+        assert_eq!(
+            assigned.first(),
+            Some(&32.0),
+            "first raise capped at 8×: {assigned:?}"
+        );
+        assert!(
+            assigned.iter().all(|d| *d <= 32.0),
+            "the burst drove a second raise: {assigned:?}"
+        );
+        assert!(diff <= 8.0, "did not come back to its rate: {assigned:?}");
+    }
+
+    /// The cap survives the ladder: a raw cap of 384 (`client = 48`) would
+    /// round up to 512, past 8×.
     #[test]
     fn up_step_cap_survives_the_power_of_two_ladder() {
-        let clock = TestClock::new(1_000);
-        let mut on = eased_engine(&clock);
-        for _ in 0..30 {
-            on.update_hash_rate(4.0, true);
-            clock.advance_ms(100);
+        let clock = TestClock::new(0);
+        let mut e = engine(&clock, 48.0);
+        e.note_share_accepted(4.0);
+        for _ in 0..61 {
+            clock.advance_ms(1_000);
+            for _ in 0..10 {
+                e.note_share_accepted(48.0);
+            }
         }
-        let proposed = on
+        let proposed = e
             .suggested_difficulty(48.0)
-            .expect("burst window must propose a retarget");
+            .expect("a 100× window must raise");
         assert!(
             proposed <= 48.0 * VARDIFF_MAX_UP_STEP_FACTOR,
-            "{proposed} exceeds the {VARDIFF_MAX_UP_STEP_FACTOR}x cap over 48"
+            "{proposed} exceeds 8× 48"
         );
         assert_eq!(
             proposed,
             2_f64.powf(proposed.log2().round()),
-            "{proposed} must still be a power of two"
+            "not a power of two"
         );
     }
 
+    /// The cap charges a proving interval once, not per 8×: a genuine 128×
+    /// rate jump reaches equilibrium within two raises.
     #[test]
-    fn up_step_cap_bounds_burst_inflated_windows() {
-        // A bundled window (a JDC flushing optimistic-mining shares) implies
-        // an absurd rate; the cap limits the jump to 8×.
-        let clock = TestClock::new(1_000);
-        let mut on = eased_engine(&clock);
-        let mut off = VarDiffEngine::new(&clock, 6.0, 0.00001);
-        for _ in 0..30 {
-            on.update_hash_rate(4.0, true);
-            off.update_hash_rate(4.0, true);
-            clock.advance_ms(100);
-        }
-        // closed span 2.9 s, sum 120 → 41.4 d/s → target 414.
-        assert_eq!(on.suggested_difficulty(4.0), Some(32.0), "capped at 8×4");
-        // Uncapped, the raw 414 rounds up to the next rung.
-        assert_eq!(off.suggested_difficulty(4.0), Some(512.0), "uncapped leap");
+    fn a_proven_raise_is_not_rationed_at_eight_times_per_interval() {
+        let clock = TestClock::new(0);
+        let mut e = engine(&clock, 512.0);
+        let mut diff = 512.0;
+        let rate = 512.0 / 10.0 * 128.0;
+        let assigned = mine_closed_loop(&mut e, &clock, &mut diff, rate, 1e9, 600_000, 60_000);
+        let equilibrium = 512.0 * 128.0;
+        assert!(
+            diff >= equilibrium / 2.0 && diff <= equilibrium * 2.0,
+            "parked at {diff}, wanted ~{equilibrium}: {assigned:?}"
+        );
+        let raises_to_reach = assigned
+            .iter()
+            .position(|d| *d >= equilibrium / 2.0)
+            .map(|i| i + 1);
+        assert!(
+            raises_to_reach.is_some_and(|n| n <= 2),
+            "took more than two raises to follow a proven jump: {assigned:?}"
+        );
     }
 
+    // ── steady state ──────────────────────────────────────────────────
+
+    /// A healthy miner with jittered arrivals (uniform 2–18 s gaps plus a 45 s
+    /// outlier now and then), checked after every share and mid-gap, is never
+    /// retargeted. Deterministic LCG. Exponential gaps do retarget an
+    /// on-target session now and then; this pins the low-variance case.
+    #[test]
+    fn jittered_steady_state_is_unperturbed() {
+        let clock = TestClock::new(0);
+        let mut e = engine(&clock, 1024.0);
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut t_ms: u64 = 0;
+        for i in 0..300u32 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let r = (seed >> 33) % 1000;
+            // The 45 s outliers are the tail a naive trigger mistakes for
+            // silence.
+            let gap_ms = if i % 37 == 0 { 45_000 } else { 2_000 + r * 16 };
+            t_ms += gap_ms;
+            clock.set_ms(t_ms);
+            e.note_share_accepted(1024.0);
+            assert_eq!(e.suggested_difficulty(1024.0), None, "after share #{i}");
+            clock.set_ms(t_ms + gap_ms / 2);
+            assert_eq!(
+                e.suggested_difficulty(1024.0),
+                None,
+                "mid-gap after share #{i}"
+            );
+            clock.set_ms(t_ms);
+        }
+    }
+
+    /// A session eased down after a silence resumes at 1/10 of its rate: it
+    /// never snaps back to the pre-silence difficulty and settles near the
+    /// throttled equilibrium.
     #[test]
     fn recovery_converges_without_a_sawtooth() {
-        // A session eased down after a silence resumes at 1/10 rate: it may
-        // wobble once, must never snap back to the pre-silence difficulty,
-        // and must settle near the throttled equilibrium.
         let clock = TestClock::new(1_000);
-        let mut e = eased_engine(&clock);
+        let mut e = engine(&clock, 1024.0);
         fill_equilibrium(&mut e, &clock);
-        let pre_silence = 1024.0;
-
-        // Silence until parked.
-        let mut client = pre_silence;
+        let mut diff = 1024.0;
         for _ in 0..120 {
-            clock.advance_ms(60_000);
-            if let Some(next) = e.suggested_difficulty(client) {
-                client = next;
-            }
+            cycle(&mut e, &clock, 60_000, &mut diff);
         }
-        assert!((64.0..=128.0).contains(&client), "parked, got {client}");
+        assert!((64.0..=128.0).contains(&diff), "parked, got {diff}");
 
-        // The rig returns at 1/10 of its original rate (10.24 diff/s).
-        // Closed loop: shares arrive at the CURRENT difficulty's cadence,
-        // every proposal is applied, inline check after each share.
-        let throttled_rate = 10.24; // difficulty per second
-        let mut proposals = Vec::new();
-        for _ in 0..40 {
-            let gap_ms = ((client / throttled_rate) * 1000.0) as u64;
-            clock.advance_ms(gap_ms.max(1));
-            e.update_hash_rate(client, true);
-            if let Some(next) = e.suggested_difficulty(client) {
-                assert!(
-                    next <= client * VARDIFF_MAX_UP_STEP_FACTOR,
-                    "up-step cap violated: {client} → {next}"
-                );
-                assert!(
-                    next < pre_silence,
-                    "must never snap back to the pre-silence difficulty: {next}"
-                );
-                proposals.push(next);
-                client = next;
-            }
-        }
-        // Equilibrium ≈ 102 (deadband: 48..192); at most ONE excursion
-        // above 256 in the whole recovery.
+        // Back at 10.24 difficulty/s: equilibrium ≈ 102.
+        let assigned = mine_closed_loop(&mut e, &clock, &mut diff, 10.24, 1e9, 3_600_000, 60_000);
         assert!(
-            (48.0..=192.0).contains(&client),
-            "must settle near the throttled equilibrium, got {client}"
-        );
-        let excursions = proposals.iter().filter(|p| **p > 256.0).count();
-        assert!(
-            excursions <= 1,
-            "more than one recovery excursion: {proposals:?}"
-        );
-    }
-
-    // ── silence easing edge cases ─────────────────────────────────────
-
-    #[test]
-    fn zero_span_window_holds_instead_of_sinking() {
-        // A full window whose shares all carry one millisecond
-        // (closed_ms == 0) has no measurable rate and no pre-silence rate
-        // to floor against, so easing holds the difficulty.
-        let clock = TestClock::new(1_000);
-        let mut e = eased_engine(&clock);
-        for _ in 0..30 {
-            e.update_hash_rate(1024.0, true); // no clock advance → all one ms
-        }
-        assert_eq!(e.cache_len(), VARDIFF_CACHE_SIZE);
-        // Two days of silence: still held.
-        clock.advance_ms(48 * 3_600_000);
-        assert_eq!(
-            e.suggested_difficulty(1024.0),
-            None,
-            "a zero-span window must hold, not sink to the floor"
-        );
-        // And once a later share gives the window a real span, easing works
-        // again normally.
-        clock.advance_ms(10_000);
-        e.update_hash_rate(1024.0, true);
-        clock.advance_ms(400_000);
-        assert!(
-            e.suggested_difficulty(1024.0).is_some_and(|d| d < 1024.0),
-            "easing must resume once the window has a real span"
-        );
-    }
-
-    #[test]
-    fn bootstrap_convergence_is_not_capped_by_easing() {
-        // The up-step cap does not guard the under-sampled bootstrap, so a
-        // fast miner starting far too low jumps to equilibrium in one step
-        // and on/off agree there.
-        let clock = TestClock::new(0);
-        let mut on = eased_engine(&clock);
-        let mut off = VarDiffEngine::new(&clock, 6.0, 0.00001);
-        // Pass warmup FIRST, so both shares are recent and no silence decay
-        // applies; 100 ms apart at diff 1 implies a target far above 1.
-        clock.advance_ms(VARDIFF_WARMUP_MS + 1_000);
-        for e in [&mut on, &mut off] {
-            e.update_hash_rate(1.0, true);
-        }
-        clock.advance_ms(100);
-        for e in [&mut on, &mut off] {
-            e.update_hash_rate(1.0, true);
-        }
-        assert!(
-            on.cache_len() < VARDIFF_SAMPLE_THRESHOLD,
-            "under-sampled path"
-        );
-        // Check at the instant of the last share: tail is 0, so no decay —
-        // this isolates the cap from the silence decay.
-        let up_on = on.suggested_difficulty(1.0).expect("must retarget up");
-        let up_off = off.suggested_difficulty(1.0).expect("must retarget up");
-        assert_eq!(
-            up_on, up_off,
-            "bootstrap convergence must be identical on/off (not capped)"
+            assigned.iter().all(|d| *d < 1024.0),
+            "snapped back to the pre-silence difficulty: {assigned:?}"
         );
         assert!(
-            up_on > 1.0 * VARDIFF_MAX_UP_STEP_FACTOR,
-            "must jump past the 8x cap in one step, got {up_on}"
-        );
-    }
-
-    #[test]
-    fn note_submission_is_inert_when_easing_off() {
-        // With easing off, note_submission neither reads the clock nor arms
-        // the silence sensor, so it cannot influence the default path.
-        let clock = TestClock::new(1_000);
-        let mut off = VarDiffEngine::new(&clock, 6.0, 0.00001);
-        populate_cache(&mut off, &clock, 30, 1024.0);
-        clock.advance_ms(3_600_000);
-        let before = off.suggested_difficulty(1024.0);
-        off.note_submission(); // must be a no-op when easing is off
-        let after = off.suggested_difficulty(1024.0);
-        assert_eq!(
-            before, after,
-            "note_submission must not perturb the easing-off path"
+            (48.0..=256.0).contains(&diff),
+            "must settle near the throttled equilibrium, got {diff}: {assigned:?}"
         );
     }
 }

@@ -44,7 +44,7 @@ pub struct ChannelState {
     /// the clamp check loses no precision.
     pub declared_max_target: [u8; 32],
 
-    /// The `nominal_hash_rate` this channel last declared. Silence-easing uses
+    /// The `nominal_hash_rate` this channel last declared. `UpdateChannel` uses
     /// it to tell a NEW declaration (e.g. a proxy whose workers just attached)
     /// from the same value re-sent on a timer, where observed silence rules.
     pub last_declared_hash_rate: Option<f32>,

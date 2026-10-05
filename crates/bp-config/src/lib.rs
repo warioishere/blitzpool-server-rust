@@ -393,12 +393,6 @@ pub struct StratumConfig {
     pub target_shares_per_minute: u32,
     pub high_diff_target_shares_per_minute: u32,
     pub difficulty_check_interval_ms: u64,
-    /// Let vardiff walk a silent session's difficulty down to what its silence
-    /// still supports, instead of pinning it at an unreachable target.
-    /// Bounded (16x down, 8x up), paused while rejects still arrive. Off by
-    /// default.
-    #[serde(default)]
-    pub vardiff_silence_easing_enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

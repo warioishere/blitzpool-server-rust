@@ -98,11 +98,8 @@ impl<C: Clock> SessionState<C> {
             clock,
             port_config.target_shares_per_minute,
             port_config.minimum_difficulty,
-        )
-        .with_silence_easing(server_config.vardiff_silence_easing)
-        // The engine needs to know what the session is quiet AT before its
-        // first share, and on SV1 that is purely the configured start.
-        .with_initial_difficulty(initial);
+            initial,
+        );
 
         Self {
             version_rolling_mask: VERSION_ROLLING_MASK,
@@ -477,11 +474,6 @@ pub(crate) fn handle_submit<C: Clock>(
         return out;
     }
 
-    // Liveness heartbeat before any early return, so rejected shares count
-    // as alive too; after the guards, because an unauthorized or
-    // unsubscribed peer is not a miner.
-    state.vardiff.note_submission();
-
     // Built inline so `state.share_cache` can be borrowed `&mut` alongside.
     let extranonce1 = state.extranonce1;
     let session_ctx = SessionContext {
@@ -503,26 +495,26 @@ pub(crate) fn handle_submit<C: Clock>(
     match validation {
         ShareValidation::Accepted(accept) => {
             out.push_frame(write_submit_success(&id));
-            let is_current = accept.effective_difficulty == state.session_difficulty;
             state
                 .vardiff
-                .update_hash_rate(accept.effective_difficulty, is_current);
+                .note_share_accepted(accept.effective_difficulty);
             state.hash_rate = state.vardiff.hash_rate();
             out.push_event(SessionEvent::ShareAccepted(accept));
         }
         ShareValidation::Rejected(reject) => {
-            // A duplicate, stale or unknown-job share cleared the target and
-            // merely arrived wrong. `LowDifficulty` is what silence-easing must
-            // act on, and `VersionRollingNotAllowed` is decided before the
-            // header is hashed, so neither proves the target was reached.
-            let demonstrates_target = match reject.reason {
-                RejectReason::DuplicateShare | RejectReason::JobNotFound | RejectReason::Stale => {
-                    true
-                }
-                RejectReason::LowDifficulty | RejectReason::VersionRollingNotAllowed => false,
+            // Only a stale share counts as an arrival (see
+            // `VarDiffEngine::note_stale_share`): an unknown job, a duplicate
+            // and a below-target or malformed share say nothing about the rate,
+            // and SV2 treats them the same way.
+            let counts_as_arrival = match reject.reason {
+                RejectReason::Stale => true,
+                RejectReason::JobNotFound
+                | RejectReason::DuplicateShare
+                | RejectReason::LowDifficulty
+                | RejectReason::VersionRollingNotAllowed => false,
             };
-            if demonstrates_target {
-                state.vardiff.note_target_reached();
+            if counts_as_arrival {
+                state.vardiff.note_stale_share();
             }
             out.push_frame(write_error(&id, reject.wire_code, reject.wire_message));
             out.push_event(SessionEvent::ShareRejected {
@@ -1286,48 +1278,53 @@ mod tests {
         assert_eq!(state.last_difficulty_check_ms, 1_000);
     }
 
-    // ── silence easing wiring ────────────────────────────────────────
-    // These prove the operator switch reaches the wire. `eased_session` sits
-    // at equilibrium (30 shares at 16384, 10 s apart), so any retarget
-    // observed comes from the silence path.
+    // ── silence on the wire ──────────────────────────────────────────
+    // `measured_session` sits at equilibrium (30 shares at 16384, 10 s
+    // apart), so any retarget observed comes from what follows.
 
-    fn eased_session(
-        easing: bool,
+    fn measured_session(
         clock: &Arc<TestClock>,
     ) -> (SessionState<Arc<TestClock>>, ServerConfig, PortConfig) {
-        let mut sc = server_config();
-        sc.vardiff_silence_easing = easing;
+        let sc = server_config();
         let port = solo_port(16384.0);
         let mut state = SessionState::new(clock.clone(), &sc, &port, "abcd1234".to_string());
         state.stratum_initialized = true;
         for _ in 0..30 {
-            state.vardiff.update_hash_rate(16384.0, true);
+            state.vardiff.note_share_accepted(16384.0);
             clock.advance_ms(10_000);
         }
         (state, sc, port)
     }
 
-    /// A session that never reaches its port's start difficulty is eased
-    /// down on the wire.
-    #[test]
-    fn a_session_with_no_share_ever_is_eased_down_on_the_wire() {
-        let clock = Arc::new(TestClock::new(0));
-        let mut sc = server_config();
-        sc.vardiff_silence_easing = true;
-        let port = solo_port(1_000_000.0); // a high-diff port
-        let mut state = SessionState::new(clock.clone(), &sc, &port, "abcd1234".to_string());
-        state.stratum_initialized = true;
-        clock.advance_ms(61_000);
-        let out = apply_vardiff_check(
-            &mut state,
-            &sc,
-            &port,
+    fn vardiff_check_now(
+        state: &mut SessionState<Arc<TestClock>>,
+        sc: &ServerConfig,
+        port: &PortConfig,
+        clock: &Arc<TestClock>,
+    ) -> HandlerOutcome {
+        apply_vardiff_check(
+            state,
+            sc,
+            port,
             &empty_registry(),
             &MiningJobCache::new(),
             Some(&mineable_template()),
             &ResolvedPayouts::unsnapshotted(vec![]),
             clock.now_ms(),
-        );
+        )
+    }
+
+    /// A session that never reaches its port's start difficulty is walked
+    /// down on the wire.
+    #[test]
+    fn a_session_with_no_share_ever_is_eased_down_on_the_wire() {
+        let clock = Arc::new(TestClock::new(0));
+        let sc = server_config();
+        let port = solo_port(1_000_000.0); // a high-diff port
+        let mut state = SessionState::new(clock.clone(), &sc, &port, "abcd1234".to_string());
+        state.stratum_initialized = true;
+        clock.advance_ms(61_000);
+        let out = vardiff_check_now(&mut state, &sc, &port, &clock);
         let frame = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert!(
             frame.contains("mining.set_difficulty"),
@@ -1341,110 +1338,119 @@ mod tests {
     }
 
     #[test]
-    fn a_session_with_no_share_ever_holds_when_the_switch_is_off() {
+    fn silence_eases_a_quiet_session_on_the_wire() {
         let clock = Arc::new(TestClock::new(0));
-        let sc = server_config(); // easing off
-        let port = solo_port(1_000_000.0);
-        let mut state = SessionState::new(clock.clone(), &sc, &port, "abcd1234".to_string());
-        state.stratum_initialized = true;
-        for _ in 0..15 {
-            clock.advance_ms(60_000);
-            let out = apply_vardiff_check(
-                &mut state,
-                &sc,
-                &port,
-                &empty_registry(),
-                &MiningJobCache::new(),
-                None,
-                &ResolvedPayouts::unsnapshotted(vec![]),
-                clock.now_ms(),
-            );
-            assert!(out.outbound_frames.is_empty());
-        }
-        assert_eq!(state.session_difficulty, 1_000_000.0);
-    }
-
-    #[test]
-    fn silence_easing_stays_off_by_default() {
-        let clock = Arc::new(TestClock::new(0));
-        let (mut state, sc, port) = eased_session(false, &clock); // easing off
-        clock.advance_ms(3_600_000); // an hour of total silence
-        let out = apply_vardiff_check(
-            &mut state,
-            &sc,
-            &port,
-            &empty_registry(),
-            &MiningJobCache::new(),
-            Some(&mineable_template()),
-            &ResolvedPayouts::unsnapshotted(vec![]),
-            clock.now_ms(),
-        );
-        assert!(
-            out.outbound_frames.is_empty(),
-            "default config must hold through any silence"
-        );
-        assert_eq!(state.session_difficulty, 16384.0);
-    }
-
-    #[test]
-    fn silence_easing_config_reaches_the_wire() {
-        let clock = Arc::new(TestClock::new(0));
-        let (mut state, sc, port) = eased_session(true, &clock);
-        // 400 s of silence: target ≈ 7124, below half of 16384, rounds UP
-        // on the power-of-two ladder to 8192.
+        let (mut state, sc, port) = measured_session(&clock);
+        // 400 s of silence: 29 arrivals over 700 s → target ≈ 6787, below
+        // half of 16384, rounds UP on the power-of-two ladder to 8192.
         clock.advance_ms(400_000);
-        let out = apply_vardiff_check(
-            &mut state,
-            &sc,
-            &port,
-            &empty_registry(),
-            &MiningJobCache::new(),
-            Some(&mineable_template()),
-            &ResolvedPayouts::unsnapshotted(vec![]),
-            clock.now_ms(),
-        );
+        let out = vardiff_check_now(&mut state, &sc, &port, &clock);
         let frame = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert!(
             frame.contains("mining.set_difficulty"),
             "expected a set_difficulty frame, got {frame}"
         );
-        assert_eq!(state.session_difficulty, 8192.0, "one eased step down");
+        assert_eq!(state.session_difficulty, 8192.0, "one step down");
         assert!(out
             .events
             .iter()
             .any(|e| matches!(e, SessionEvent::DifficultyChanged)));
     }
 
+    /// Stale rejects at the session's usual cadence are arrivals, so the same
+    /// 400 s that ease a silent session hold this one.
     #[test]
-    fn a_rejected_share_holds_the_easing_back() {
-        // Pins: a validation reject restarts the silence clock, so the check
-        // that would have eased holds.
+    fn stale_rejects_at_the_usual_cadence_hold_the_session() {
         let clock = Arc::new(TestClock::new(0));
-        let (mut state, sc, port) = eased_session(true, &clock);
-        state.stratum_initialized = true;
+        let (mut state, sc, port) = measured_session(&clock);
         state.authorization = Some(authorize_req(REGTEST_ADDR));
-        clock.advance_ms(390_000);
         let reg = empty_registry();
-        let out = handle_submit(&mut state, &reg, submit_req("1"), clock.now_ms());
-        let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
-        assert!(s.contains("error"), "expected a reject frame, got {s}");
-        clock.advance_ms(10_000);
-        // t+400 s eases without the reject (see the wire test).
-        let out = apply_vardiff_check(
+        let _ = apply_new_template(
             &mut state,
             &sc,
             &port,
-            &empty_registry(),
+            &reg,
             &MiningJobCache::new(),
-            Some(&mineable_template()),
-            &ResolvedPayouts::unsnapshotted(vec![]),
+            &Arc::new(template_for_regtest()),
+            &solo_payouts_fixture(REGTEST_ADDR),
+            false,
             clock.now_ms(),
         );
+        let job_id = format!("{:x}", reg.peek_next_job_id() - 1);
+        reg.cleanup(true, clock.now_ms()); // the job retires: a new block
+        let nonces: Vec<String> = (0..40u32).map(|i| format!("{i:08x}")).collect();
+        for nonce in &nonces {
+            clock.advance_ms(10_000);
+            let request = SubmitRequest {
+                nonce_hex: nonce,
+                ..submit_req(&job_id)
+            };
+            let out = handle_submit(&mut state, &reg, request, clock.now_ms());
+            let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
+            assert!(s.contains("\"stale\""), "expected a stale reject, got {s}");
+        }
+        let out = vardiff_check_now(&mut state, &sc, &port, &clock);
         assert!(
             out.outbound_frames.is_empty(),
-            "a rejecting miner must be held, not eased"
+            "a session sending stale shares at its cadence must hold"
         );
         assert_eq!(state.session_difficulty, 16384.0);
+    }
+
+    /// An unknown-job share is no arrival: forty of them at the usual cadence
+    /// do not hold a silent session up.
+    #[test]
+    fn unknown_job_rejects_do_not_count_as_arrivals() {
+        let clock = Arc::new(TestClock::new(0));
+        let (mut state, sc, port) = measured_session(&clock);
+        state.authorization = Some(authorize_req(REGTEST_ADDR));
+        let reg = empty_registry();
+        let job_ids: Vec<String> = (0..40).map(|i| format!("{i:x}")).collect();
+        for job_id in &job_ids {
+            clock.advance_ms(10_000);
+            let out = handle_submit(&mut state, &reg, submit_req(job_id), clock.now_ms());
+            let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
+            assert!(
+                s.contains("Job not found"),
+                "expected an unknown-job reject, got {s}"
+            );
+        }
+        let _ = vardiff_check_now(&mut state, &sc, &port, &clock);
+        assert!(
+            state.session_difficulty < 16384.0,
+            "unknown-job rejects held the session at {}",
+            state.session_difficulty
+        );
+    }
+
+    /// A duplicate repeats an arrival already counted: resending one at the
+    /// usual cadence must not hold a silent session up.
+    #[test]
+    fn duplicate_rejects_do_not_count_as_arrivals() {
+        let clock = Arc::new(TestClock::new(0));
+        let (mut state, sc, port) = measured_session(&clock);
+        state.authorization = Some(authorize_req(REGTEST_ADDR));
+        let reg = empty_registry();
+        for i in 0..40 {
+            clock.advance_ms(10_000);
+            let out = handle_submit(&mut state, &reg, submit_req("1"), clock.now_ms());
+            let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
+            let expected = if i == 0 {
+                "Job not found"
+            } else {
+                "Duplicate share"
+            };
+            assert!(
+                s.contains(expected),
+                "submit #{i}: expected {expected}, got {s}"
+            );
+        }
+        let _ = vardiff_check_now(&mut state, &sc, &port, &clock);
+        assert!(
+            state.session_difficulty < 16384.0,
+            "duplicates held the session at {}",
+            state.session_difficulty
+        );
     }
 
     // ── apply_new_template ────────────────────────────────────────────

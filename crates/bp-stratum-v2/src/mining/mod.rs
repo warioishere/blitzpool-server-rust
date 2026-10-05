@@ -10,4 +10,3 @@ pub mod groups;
 pub mod jobs;
 pub mod submit;
 pub mod translator;
-pub mod vardiff;

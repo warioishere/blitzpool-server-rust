@@ -54,7 +54,6 @@ target_shares_per_minute = 15
 high_diff_target_shares_per_minute = 10
 difficulty_check_interval_ms = 240000
 # job_retention_ms = 600000              # optional
-# vardiff_silence_easing_enabled = false # optional
 
 [sv2]
 authority_privkey_hex = "CHANGE-ME"      # blitzpool --sv2-keygen
