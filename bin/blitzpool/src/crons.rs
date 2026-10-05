@@ -517,9 +517,11 @@ const WEEKLY_TICK: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// 90-day inactivity threshold: subscriptions whose `lastNotificationAt`
 /// (or `createdAt` when never notified) is older than this are hard-deleted.
 const STALE_PUSH_SUBSCRIPTION_TTL: Duration = Duration::from_secs(90 * 24 * 60 * 60);
-/// Cutoff for `client_statistics_entity`, the per-session detail table; a
-/// client chart asked for a longer `range` shows these 14 days.
-const STATS_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+/// Cutoff for `client_statistics_entity`, the per-session detail table. The
+/// longest period read from it is the difficulty scoreboard's calendar
+/// month (diff-scores, up to 31 days), plus a day for the scoreboard's time
+/// zone.
+const STATS_RETENTION: Duration = Duration::from_secs(32 * 24 * 60 * 60);
 /// Cutoff for the pool-wide breakdowns (`pool_mode_hashrate`,
 /// `pool_rejected_statistics_entity`): the longest chart range, `range=1m`.
 /// `pool_share_statistics_entity` keeps everything, because the share

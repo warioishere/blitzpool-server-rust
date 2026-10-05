@@ -1040,3 +1040,24 @@ async fn delete_stats_zeroes_the_address_total_with_the_workers() {
     assert_eq!(shares, 0.0, "the address total starts over with them");
     assert_eq!(all_time, 4096.0, "the public record is never lowered");
 }
+
+/// `diff-scores?range=30d` reaches back past a 31-day calendar month plus a
+/// time-zone offset, so the scoreboard's month starts inside the window.
+#[tokio::test]
+async fn diff_scores_month_window_covers_a_31_day_month() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let addr = "bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h";
+    let (status, body) = get_json(pool, &format!("/api/client/{addr}/diff-scores?range=30d")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first = body["slotData"][0]["time"].as_str().expect("first bucket");
+    let first_ms = chrono::DateTime::parse_from_rfc3339(first)
+        .expect("iso time")
+        .timestamp_millis();
+    let hour: i64 = 60 * 60 * 1000;
+    assert!(
+        first_ms <= bp_common::now_ms() - 31 * 24 * hour - 14 * hour,
+        "first bucket {first} must lie before a 31-day month in any zone"
+    );
+}

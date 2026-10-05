@@ -809,9 +809,12 @@ async fn diff_scores(
     let bytes = state
         .cache
         .get_or_fetch_secs::<DiffScoresResponse, _, ApiError>(key, ttl_secs, async move {
+            // "30d" serves the scoreboard's calendar month, which reaches back
+            // up to 31 days from the 1st in its own time zone: 32 days cover
+            // that, the same span `client_statistics_entity` is kept for.
             let hours: i64 = match range_label.as_str() {
                 "7d" => 24 * 7,
-                "30d" => 24 * 30,
+                "30d" => 24 * 32,
                 _ => 24,
             };
             let now = bp_common::now_ms();
