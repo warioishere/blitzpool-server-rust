@@ -17,7 +17,9 @@ pub struct SharedAcceptedShare<'a> {
     /// Miner-authorized payout address; never empty once a share is accepted.
     pub address: &'a str,
 
-    /// Worker name from `address.workername`; empty if none was supplied.
+    /// Worker name from `address.workername`, the same name the session row
+    /// carries. Never empty: without one, SV1 authorizes as "worker" and SV2
+    /// opens the channel as "default".
     pub worker: &'a str,
 
     pub session_id: &'a str,

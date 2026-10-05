@@ -2516,6 +2516,22 @@ pub(crate) mod tests {
         assert!(s.address.is_some());
     }
 
+    /// No worker, or an empty one, opens as "default": the session row and
+    /// every share carry that name, so the stats sinks never see "".
+    #[test]
+    fn a_channel_without_a_worker_name_opens_as_default() {
+        for identity in [REGTEST_ADDR.to_string(), format!("{REGTEST_ADDR}.")] {
+            let mut s = fresh_session();
+            handle_setup_connection(&mut s, &good_setup());
+            handle_open_standard_mining_channel(
+                &mut s,
+                &open_std(7, &identity),
+                vec![0x01, 0x02, 0x03, 0x04],
+            );
+            assert_eq!(s.worker_name, "default", "{identity}");
+        }
+    }
+
     /// A declared `nominal_hash_rate` is bounded only by `min_difficulty`; 0 gets the port start.
     #[test]
     fn open_standard_honours_a_declaration_and_falls_back_without_one() {

@@ -85,16 +85,9 @@ impl ClientRowTouchSink {
 #[async_trait]
 impl SharedAcceptedShareSink for ClientRowTouchSink {
     async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
-        // An SV2 user_identity without `.<name>` gives an empty worker; the
-        // session row was registered as "default", so this keeps the PK match.
-        let worker = if share.worker.is_empty() {
-            "default"
-        } else {
-            share.worker
-        };
         let key = TouchKeyRef {
             address: share.address,
-            client_name: worker,
+            client_name: share.worker,
             session_id: share.session_id,
         };
         // `effective_difficulty` is the session's current vardiff target.
@@ -139,16 +132,10 @@ impl SharedAcceptedShareSink for ClientDifficultyStatisticsSink {
         }
         // The hour the share was accepted in, not the hour it was consumed in.
         let slot = (share.ts_ms / DIFF_STAT_SLOT_MS) * DIFF_STAT_SLOT_MS;
-        // Same "default" PK convention as the client-row touch sink.
-        let worker = if share.worker.is_empty() {
-            "default"
-        } else {
-            share.worker
-        };
         self.buffer.record(
             DiffStatKeyRef {
                 address: share.address,
-                worker,
+                worker: share.worker,
                 slot_ms: slot,
             },
             candidate as f32,

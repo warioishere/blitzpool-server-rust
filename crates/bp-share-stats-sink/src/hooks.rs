@@ -74,8 +74,8 @@ impl SharedAcceptedShareSink for ShareStatsAcceptedSink {
     }
 }
 
-/// A reject before authorize has no address: it bumps only the pool-wide
-/// counters.
+/// A reject before authorize has neither address nor worker: it bumps only
+/// the pool-wide counters.
 pub struct ShareStatsRejectedSink {
     accumulators: Arc<Accumulators>,
 }
@@ -102,7 +102,7 @@ impl SharedRejectedShareSink for ShareStatsRejectedSink {
             .pool_rejected
             .add(slot, reason, difficulty);
 
-        let Some(addr) = share.address else {
+        let (Some(addr), Some(worker)) = (share.address, share.worker) else {
             return;
         };
         let address_id = match AddressId::new(addr.to_string()) {
@@ -122,7 +122,7 @@ impl SharedRejectedShareSink for ShareStatsRejectedSink {
 
         let key = ClientStatisticsKey {
             address: address_id.clone(),
-            client_name: share.worker.unwrap_or("").to_string(),
+            client_name: worker.to_string(),
             session_id: share.session_id.to_string(),
             slot,
         };
