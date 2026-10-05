@@ -667,3 +667,46 @@ async fn composed_reader_returns_the_writers_fields_in_position() {
     handle.shutdown().await;
     cleanup(&pool, prefix).await;
 }
+
+/// A failing Postgres best write does not hold back the live hash: the
+/// Redis half is written regardless, or the whole pool would read silent.
+#[tokio::test]
+async fn a_failed_best_write_still_refreshes_the_live_hash() {
+    let Some(mut redis) = connect_redis_in_range_or_skip(redis_db::SESSION_PERSISTENCE, 3).await
+    else {
+        return;
+    };
+    // A closed pool fails every statement.
+    let dead = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_lazy(DEFAULT_PG_URL)
+        .expect("lazy pool");
+    dead.close().await;
+    let handle = SessionPersistenceEngine::new(
+        SessionPersistenceConfig::default(),
+        dead,
+        Some(redis.clone()),
+    )
+    .expect("engine")
+    .into_handle();
+    let key = client_live_key("test_lv_pgdown_addr", "rig1", "sessL020");
+
+    handle
+        .client_row_touch_sink()
+        .record_accepted(share(
+            "test_lv_pgdown_addr",
+            "rig1",
+            "sessL020",
+            100.0,
+            512.0,
+            1,
+        ))
+        .await;
+    handle.flush_touches_now().await;
+
+    let hash = hgetall(&mut redis, &key).await;
+    assert!(
+        hash.contains_key(F_UPDATED_AT_MS),
+        "the live hash is written although the best write failed: {hash:?}"
+    );
+}

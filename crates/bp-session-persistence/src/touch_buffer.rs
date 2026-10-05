@@ -184,10 +184,12 @@ impl TouchBuffer {
     }
 }
 
-/// One flush pass; hands back a failed write and returns sessions written.
-/// Both writes are idempotent, so a retry after a half-failed pass is safe.
-/// Without a live store the live half is dropped, not handed back, or the
-/// buffer would grow without bound.
+/// One flush pass: the bests onto the rows and the live fields into Redis,
+/// each attempted whatever the other did, so a Postgres outage cannot stall
+/// the live hashes. Both writes are idempotent, so a snapshot handed back
+/// after either failed is safe to write again. Returns the sessions whose
+/// live hash was written. Without a live store the live half is dropped,
+/// not handed back, or the buffer would grow without bound.
 pub(crate) async fn flush_once(
     buffer: &TouchBuffer,
     pool: &PgPool,
@@ -198,36 +200,38 @@ pub(crate) async fn flush_once(
         return 0;
     }
     let n = snapshot.len();
-    if let Err(e) = raise_bests(pool, &snapshot).await {
-        warn!(
-            error = %e,
-            buffered = n,
-            "session best write failed; kept for retry"
-        );
-        buffer.restore(snapshot);
-        return 0;
-    }
-    let Some(store) = live else {
-        warn!(
-            dropped = n,
-            "no live store configured; session touch samples dropped"
-        );
-        return 0;
-    };
-    match store.write_touch_batch(&snapshot).await {
-        Ok(()) => {
-            debug!(buffered = n, "client touch buffer flushed to live hashes");
-            n as u64
-        }
+    let bests_written = match raise_bests(pool, &snapshot).await {
+        Ok(_) => true,
         Err(e) => {
-            warn!(
-                error = %e,
-                buffered = n,
-                "live-session touch write failed; kept for retry"
-            );
-            buffer.restore(snapshot);
-            0
+            warn!(error = %e, buffered = n, "session best write failed; kept for retry");
+            false
         }
+    };
+    let live_written = match live {
+        None => {
+            warn!(
+                dropped = n,
+                "no live store configured; session touch samples dropped"
+            );
+            None
+        }
+        Some(store) => match store.write_touch_batch(&snapshot).await {
+            Ok(()) => {
+                debug!(buffered = n, "client touch buffer flushed to live hashes");
+                Some(true)
+            }
+            Err(e) => {
+                warn!(error = %e, buffered = n, "live-session touch write failed; kept for retry");
+                Some(false)
+            }
+        },
+    };
+    if !bests_written || live_written == Some(false) {
+        buffer.restore(snapshot);
+    }
+    match live_written {
+        Some(true) => n as u64,
+        _ => 0,
     }
 }
 
