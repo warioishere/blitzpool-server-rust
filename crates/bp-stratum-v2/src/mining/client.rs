@@ -463,9 +463,6 @@ pub struct MiningSessionState<C: Clock> {
     pub target_shares_per_minute: f64,
     /// Cadence of the connection's vardiff tick in milliseconds.
     pub vardiff_interval_ms: u64,
-    /// Whether vardiff may walk a quiet channel's difficulty down (see
-    /// [`bp_vardiff`]'s module doc, "Silence easing").
-    pub vardiff_silence_easing: bool,
     /// Job lifecycle handed to every channel this connection opens.
     pub job_lifecycle: LifecycleConfig,
     /// Clock reading of the last vardiff evaluation, timer or inline; see
@@ -492,8 +489,6 @@ pub struct PortConfig {
     pub target_shares_per_minute: f64,
     /// Cadence of the vardiff check loop in milliseconds.
     pub vardiff_interval_ms: u64,
-    /// Whether vardiff may walk a quiet channel's difficulty down.
-    pub vardiff_silence_easing: bool,
     /// Job lifecycle every channel opened on this port ages its jobs under.
     pub job_lifecycle: LifecycleConfig,
 }
@@ -527,7 +522,6 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             ),
             target_shares_per_minute: port.target_shares_per_minute,
             vardiff_interval_ms: port.vardiff_interval_ms,
-            vardiff_silence_easing: port.vardiff_silence_easing,
             job_lifecycle: port.job_lifecycle,
             last_difficulty_check_ms: 0,
             share_logs: false,
@@ -557,9 +551,6 @@ impl<C: Clock + Clone> MiningSessionState<C> {
         self.last_difficulty_check_ms = self.clock.now_ms();
     }
 
-    /// A fresh vardiff engine for a newly opened channel. It is seeded with the
-    /// opening difficulty because that is all a share-less channel's silence
-    /// can be measured against.
     /// Register an opened channel with its vardiff engine; the first one
     /// becomes the primary channel.
     fn add_channel(&mut self, channel_id: u32, channel: ChannelState, difficulty: Difficulty) {
@@ -571,14 +562,15 @@ impl<C: Clock + Clone> MiningSessionState<C> {
         }
     }
 
+    /// A fresh vardiff engine for a newly opened channel, opening at the
+    /// difficulty the channel was assigned.
     fn new_channel_vardiff(&self, assigned_difficulty: Difficulty) -> VarDiffEngine<C> {
         VarDiffEngine::new(
             self.clock.clone(),
             self.target_shares_per_minute,
             self.min_difficulty.as_f64(),
+            assigned_difficulty.as_f64(),
         )
-        .with_silence_easing(self.vardiff_silence_easing)
-        .with_initial_difficulty(assigned_difficulty.as_f64())
     }
 }
 
@@ -949,14 +941,13 @@ fn resolve_open_context<C: Clock>(
 
 /// Vardiff grace: validate against the LOWER of the job's send-time difficulty
 /// and the channel's current one, so shares in flight across a retarget in
-/// EITHER direction are not lost. Crediting still uses the achieved difficulty.
+/// EITHER direction are not lost. Crediting uses the same lower difficulty.
 fn graced_validation_difficulty(job_frozen: Difficulty, session: Difficulty) -> Difficulty {
     Difficulty(job_frozen.as_f64().min(session.as_f64()))
 }
 
-/// Feed the channel's vardiff with a validated share. Every accepted share
-/// counts as current, even on an older-difficulty job, or the samples starve
-/// after each retarget (Standard jobs keep their send-time difficulty).
+/// Feed the channel's vardiff with a validated share. An accepted share counts
+/// at its credited difficulty, an older job's lower one included.
 fn feed_vardiff<C: Clock>(
     state: &mut MiningSessionState<C>,
     channel_id: u32,
@@ -967,20 +958,22 @@ fn feed_vardiff<C: Clock>(
     };
     match validation {
         ShareValidation::Accepted(accept) => {
-            engine.update_hash_rate(accept.effective_difficulty.as_f64(), true);
+            engine.note_share_accepted(accept.effective_difficulty.as_f64());
         }
         ShareValidation::Rejected(reject) => {
-            // Only a reject whose work met the target spends the silence
-            // evidence. `DifficultyTooLow` is the over-assignment the descent
-            // corrects; `BadExtranonceSize` is refused before anything is hashed.
-            let demonstrates_target = match reject.reason {
+            // Only a stale share counts as an arrival (see
+            // `VarDiffEngine::note_stale_share`): an unknown job, a duplicate
+            // and a below-target or malformed share say nothing about the rate,
+            // and SV1 treats them the same way.
+            let counts_as_arrival = match reject.reason {
+                RejectReason::StaleShare => true,
                 RejectReason::InvalidJobId
-                | RejectReason::StaleShare
-                | RejectReason::DuplicateShare => true,
-                RejectReason::DifficultyTooLow | RejectReason::BadExtranonceSize => false,
+                | RejectReason::DuplicateShare
+                | RejectReason::DifficultyTooLow
+                | RejectReason::BadExtranonceSize => false,
             };
-            if demonstrates_target {
-                engine.note_target_reached();
+            if counts_as_arrival {
+                engine.note_stale_share();
             }
         }
     }
@@ -1011,15 +1004,6 @@ fn submit_channel(
     Ok(channel)
 }
 
-/// Stamp the channel's vardiff liveness heartbeat for any submission, whatever
-/// its outcome. Every submit path must call it before any early-return reject,
-/// so a reject burst from a hashing miner is never misread as silence.
-fn stamp_submission_heartbeat<C: Clock>(state: &mut MiningSessionState<C>, channel_id: u32) {
-    if let Some(engine) = state.vardiff.get_mut(&channel_id) {
-        engine.note_submission();
-    }
-}
-
 /// Handle `SubmitSharesStandard` via [`validate_submit_standard`]. Validation
 /// uses the [`StandardTemplateSnapshot`] stored at send time, not the current
 /// template, so shares for retired jobs hash against what the miner mined under.
@@ -1028,7 +1012,6 @@ pub fn handle_submit_shares_standard<C: Clock>(
     submission: &SubmitSharesStandardInput,
     now_ms: u64,
 ) -> HandlerOutcome {
-    stamp_submission_heartbeat(state, submission.channel_id);
     let channel = match submit_channel(
         &mut state.channels,
         submission.channel_id,
@@ -1090,7 +1073,6 @@ pub fn handle_submit_shares_extended<C: Clock>(
         .negotiated_extensions
         .contains(&crate::extensions::SV2_EXTENSION_TYPE_WORKER_ID);
     let share_logs = state.share_logs;
-    stamp_submission_heartbeat(state, submission.channel_id);
     let channel = match submit_channel(
         &mut state.channels,
         submission.channel_id,
@@ -1200,18 +1182,12 @@ pub fn handle_update_channel<C: Clock>(
 ) -> HandlerOutcome {
     let target_shares_per_minute = state.target_shares_per_minute;
     let min_difficulty = state.min_difficulty;
-    let silence_easing = state.vardiff_silence_easing;
-
     // What the accumulated silence rules out; `None` for a fresh channel, so a
     // proxy's first real declaration passes untouched.
-    let silence_ceiling = if silence_easing {
-        state
-            .vardiff
-            .get(&input.channel_id)
-            .and_then(|e| e.silence_implied_max_difficulty())
-    } else {
-        None
-    };
+    let silence_ceiling = state
+        .vardiff
+        .get(&input.channel_id)
+        .and_then(|e| e.silence_implied_max_difficulty());
 
     let Some(channel) = state.channels.get_mut(&input.channel_id) else {
         return HandlerOutcome::with_frame(OutboundFrame::UpdateChannelError {
@@ -2289,23 +2265,12 @@ pub(crate) mod tests {
             initial_difficulty: Difficulty(1024.0),
             target_shares_per_minute: 6.0,
             vardiff_interval_ms: 60_000,
-            vardiff_silence_easing: false,
             job_lifecycle: LifecycleConfig::DEFAULT,
         }
     }
 
     fn fresh_session() -> MiningSessionState<Arc<TestClock>> {
         MiningSessionState::new(Arc::new(TestClock::new(0)), 1, port_cfg())
-    }
-
-    /// The silence-easing switch flows from PortConfig into session state.
-    #[test]
-    fn silence_easing_flag_flows_from_port_config() {
-        let mut cfg = port_cfg();
-        cfg.vardiff_silence_easing = true;
-        let s = MiningSessionState::new(Arc::new(TestClock::new(0)), 1, cfg);
-        assert!(s.vardiff_silence_easing);
-        assert!(!fresh_session().vardiff_silence_easing, "default off");
     }
 
     fn good_setup() -> SetupConnectionInput {
@@ -3081,9 +3046,9 @@ pub(crate) mod tests {
                 .record_send_for_test(7, easy, [0xDD; 32], snapshot(), 0);
         }
         assert_eq!(
-            s.vardiff[&channel_id].cache_len(),
+            s.vardiff[&channel_id].window_shares(),
             0,
-            "cache empty before any share"
+            "window empty before any share"
         );
         let sub = SubmitSharesStandardInput {
             channel_id,
@@ -3096,11 +3061,10 @@ pub(crate) mod tests {
         let out = handle_submit_shares_standard(&mut s, &sub, 0);
         assert!(matches!(out.events[0], SessionEvent::ShareAccepted { .. }));
         assert_eq!(
-            s.vardiff[&channel_id].cache_len(),
+            s.vardiff[&channel_id].window_shares(),
             1,
-            "accepted Standard share must feed the vardiff submission cache \
-             even when its frozen job difficulty differs from the session \
-             target — otherwise vardiff starves and drifts to the floor"
+            "accepted Standard share must feed the vardiff window even when \
+             its frozen job difficulty differs from the session target"
         );
     }
 
@@ -3503,14 +3467,14 @@ pub(crate) mod tests {
         let channel_id = s.primary_channel.unwrap();
         let initial = s.channels[&channel_id].session_difficulty.as_f64();
 
-        // 1 share/s against a target of 1 per 10 s.
+        // 1 share/s against a target of 1 per 10 s, over a full window.
         let tick_ms = 1_000_u64;
-        for _ in 0..10 {
+        for _ in 0..70 {
             clock.advance_ms(tick_ms);
             s.vardiff
                 .get_mut(&channel_id)
                 .unwrap()
-                .update_hash_rate(initial, true);
+                .note_share_accepted(initial);
         }
         clock.advance_ms(tick_ms);
 
@@ -3568,12 +3532,12 @@ pub(crate) mod tests {
 
         // Drive ONLY the fast channel well above the target rate.
         let tick_ms = 1_000_u64;
-        for _ in 0..10 {
+        for _ in 0..70 {
             clock.advance_ms(tick_ms);
             s.vardiff
                 .get_mut(&fast)
                 .unwrap()
-                .update_hash_rate(initial, true);
+                .note_share_accepted(initial);
         }
         clock.advance_ms(tick_ms);
 
@@ -3782,13 +3746,9 @@ pub(crate) mod tests {
         s
     }
 
-    /// An eased session whose channel has a full equilibrium share window.
-    fn eased_session_with_full_window(
-        clock: &Arc<TestClock>,
-    ) -> MiningSessionState<Arc<TestClock>> {
-        let mut cfg = port_cfg();
-        cfg.vardiff_silence_easing = true;
-        let mut s = MiningSessionState::new(clock.clone(), 1, cfg);
+    /// A session whose channel has a full equilibrium share window.
+    fn session_with_full_window(clock: &Arc<TestClock>) -> MiningSessionState<Arc<TestClock>> {
+        let mut s = MiningSessionState::new(clock.clone(), 1, port_cfg());
         handle_setup_connection(&mut s, &good_setup());
         let _ = handle_open_standard_mining_channel(
             &mut s,
@@ -3800,10 +3760,7 @@ pub(crate) mod tests {
         // window for the 6/min target.
         for _ in 0..30 {
             clock.advance_ms(10_000);
-            s.vardiff
-                .get_mut(&cid)
-                .unwrap()
-                .update_hash_rate(1024.0, true);
+            s.vardiff.get_mut(&cid).unwrap().note_share_accepted(1024.0);
         }
         s
     }
@@ -3812,7 +3769,7 @@ pub(crate) mod tests {
     fn silence_eases_a_quiet_standard_channel_control() {
         // Control: with no submission, 400 s of silence DOES ease down.
         let clock = Arc::new(TestClock::new(0));
-        let mut s = eased_session_with_full_window(&clock);
+        let mut s = session_with_full_window(&clock);
         clock.advance_ms(400_000);
         let out = apply_vardiff_check(&mut s);
         assert!(
@@ -3823,19 +3780,60 @@ pub(crate) mod tests {
         );
     }
 
-    /// An invalid-job reject still stamps the liveness heartbeat, so the channel holds.
+    /// Stale rejects at the channel's usual cadence are arrivals, so the same
+    /// 400 s that ease a silent channel (see the control above) hold this one.
     #[test]
-    fn invalid_job_reject_stamps_heartbeat_and_holds() {
+    fn stale_rejects_at_the_usual_cadence_hold_the_channel() {
         let clock = Arc::new(TestClock::new(0));
-        let mut s = eased_session_with_full_window(&clock);
+        let mut s = session_with_full_window(&clock);
         let cid = s.primary_channel.unwrap();
+        {
+            let ch = s.channels.get_mut(&cid).unwrap();
+            ch.standard_jobs
+                .record_send_for_test(7, Difficulty(1024.0), [0xDD; 32], snapshot(), 0);
+            ch.standard_jobs.retire(clock.now_ms());
+        }
+        for seq in 0..40u32 {
+            clock.advance_ms(10_000);
+            let sub = SubmitSharesStandardInput {
+                channel_id: cid,
+                sequence_number: seq,
+                job_id: 7,
+                nonce: seq,
+                version: 0x2000_0000,
+                ntime: 0x6500_0001,
+            };
+            let out = handle_submit_shares_standard(&mut s, &sub, clock.now_ms());
+            assert!(
+                matches!(
+                    &out.outbound[0],
+                    OutboundFrame::SubmitSharesError { error_code, .. }
+                        if error_code == "stale-share"
+                ),
+                "precondition: submit #{seq} must be a stale reject"
+            );
+        }
+        let out = apply_vardiff_check(&mut s);
+        assert!(
+            !out.outbound
+                .iter()
+                .any(|f| matches!(f, OutboundFrame::SetTarget { .. })),
+            "stale rejects at the usual cadence must hold the channel"
+        );
+    }
 
-        clock.advance_ms(390_000);
-        // No job was ever sent, so job_id 7 takes the InvalidJobId early return.
+    /// An invalid-job share is no arrival on either handler: it is refused
+    /// before any duplicate check, so a resent one would inflate the rate.
+    #[test]
+    fn invalid_job_rejects_do_not_count_as_arrivals() {
+        let clock = Arc::new(TestClock::new(0));
+        let mut s = session_with_full_window(&clock);
+        let cid = s.primary_channel.unwrap();
+        let before = s.vardiff[&cid].window_shares();
         let sub = SubmitSharesStandardInput {
             channel_id: cid,
             sequence_number: 1,
-            job_id: 7,
+            job_id: 7, // never sent
             nonce: 0x1234_5678,
             version: 0x2000_0000,
             ntime: 0x6500_0001,
@@ -3843,31 +3841,50 @@ pub(crate) mod tests {
         let out = handle_submit_shares_standard(&mut s, &sub, clock.now_ms());
         assert!(
             matches!(
-                out.outbound.first(),
-                Some(OutboundFrame::SubmitSharesError { .. })
+                &out.outbound[0],
+                OutboundFrame::SubmitSharesError { error_code, .. }
+                    if error_code == ERR_INVALID_JOB_ID
             ),
             "precondition: the submit must be an invalid-job reject"
         );
-        // 400 s total but only 10 s since the submit: must hold (the control eases).
-        clock.advance_ms(10_000);
-        let out = apply_vardiff_check(&mut s);
-        assert!(
-            !out.outbound
-                .iter()
-                .any(|f| matches!(f, OutboundFrame::SetTarget { .. })),
-            "an invalid-job reject must stamp the heartbeat and hold, not ease"
+        assert_eq!(s.vardiff[&cid].window_shares(), before, "Standard");
+
+        let mut s = MiningSessionState::new(clock.clone(), 1, port_cfg());
+        handle_setup_connection(&mut s, &good_setup());
+        let _ = handle_open_extended_mining_channel(
+            &mut s,
+            &open_ext(1, &format!("{}.w", REGTEST_ADDR)),
+            vec![0; 4],
         );
+        let cid = s.primary_channel.unwrap();
+        let sub = SubmitSharesExtendedInput {
+            channel_id: cid,
+            sequence_number: 1,
+            job_id: 99,
+            nonce: 0x1234_5678,
+            version: 0x2000_0000,
+            ntime: 0x6500_0001,
+            extranonce: ExtranonceBytes::from_slice(&[0x11; 4]),
+            tlvs: Vec::new(),
+        };
+        let out = handle_submit_shares_extended(&mut s, &sub, clock.now_ms());
+        assert!(
+            matches!(
+                &out.outbound[0],
+                OutboundFrame::SubmitSharesError { error_code, .. }
+                    if error_code == ERR_INVALID_JOB_ID
+            ),
+            "precondition: the submit must be an invalid-job reject"
+        );
+        assert_eq!(s.vardiff[&cid].window_shares(), 0, "Extended");
     }
 
-    /// A bad-extranonce-size reject is decided before anything is hashed, so
-    /// it stamps liveness but proves nothing about the target, as SV1's
-    /// pre-hash reject.
+    /// A bad-extranonce-size reject is malformed work, so it is no arrival and
+    /// leaves the silence evidence alone.
     #[test]
     fn a_bad_extranonce_size_reject_leaves_the_silence_evidence() {
         let clock = Arc::new(TestClock::new(0));
-        let mut cfg = port_cfg();
-        cfg.vardiff_silence_easing = true;
-        let mut s = MiningSessionState::new(clock.clone(), 1, cfg);
+        let mut s = MiningSessionState::new(clock.clone(), 1, port_cfg());
         handle_setup_connection(&mut s, &good_setup());
         let _ = handle_open_extended_mining_channel(
             &mut s,
@@ -3933,14 +3950,9 @@ pub(crate) mod tests {
 
     // ── no-share descent ──────────────────────────────────────────
 
-    /// An eased session whose channel has never submitted anything (opens at 1024).
-    fn unproven_session(
-        clock: &Arc<TestClock>,
-        easing: bool,
-    ) -> MiningSessionState<Arc<TestClock>> {
-        let mut cfg = port_cfg();
-        cfg.vardiff_silence_easing = easing;
-        let mut s = MiningSessionState::new(clock.clone(), 1, cfg);
+    /// A session whose channel has never submitted anything (opens at 1024).
+    fn unproven_session(clock: &Arc<TestClock>) -> MiningSessionState<Arc<TestClock>> {
+        let mut s = MiningSessionState::new(clock.clone(), 1, port_cfg());
         handle_setup_connection(&mut s, &good_setup());
         let _ = handle_open_standard_mining_channel(
             &mut s,
@@ -3953,11 +3965,11 @@ pub(crate) mod tests {
     #[test]
     fn a_channel_with_no_share_ever_is_eased_down_on_the_wire() {
         let clock = Arc::new(TestClock::new(0));
-        let mut s = unproven_session(&clock, true);
+        let mut s = unproven_session(&clock);
         let cid = s.primary_channel.unwrap();
         assert_eq!(s.channels[&cid].session_difficulty, Difficulty(1024.0));
 
-        clock.advance_ms(61_000); // past warmup, ~6 missed share gaps
+        clock.advance_ms(61_000); // a full window, ~6 missed share gaps
         let out = apply_vardiff_check(&mut s);
         assert!(
             out.outbound
@@ -3972,27 +3984,11 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn a_channel_with_no_share_ever_holds_when_the_switch_is_off() {
-        let clock = Arc::new(TestClock::new(0));
-        let mut s = unproven_session(&clock, false);
-        let cid = s.primary_channel.unwrap();
-        for _ in 0..15 {
-            clock.advance_ms(60_000);
-            let out = apply_vardiff_check(&mut s);
-            assert!(
-                out.outbound.is_empty(),
-                "default-off must be byte-identical to the pre-descent behaviour"
-            );
-        }
-        assert_eq!(s.channels[&cid].session_difficulty, Difficulty(1024.0));
-    }
-
     /// A repeated `UpdateChannel` claim cannot undo the descent; a new, lower one is honoured.
     #[test]
     fn update_channel_cannot_raise_a_silent_channel_back_up_on_repeat() {
         let clock = Arc::new(TestClock::new(0));
-        let mut s = unproven_session(&clock, true);
+        let mut s = unproven_session(&clock);
         let cid = s.primary_channel.unwrap();
         let claim = UpdateChannelInput {
             channel_id: cid,
@@ -4023,7 +4019,7 @@ pub(crate) mod tests {
     #[test]
     fn update_channel_may_still_lower_an_unproven_channel() {
         let clock = Arc::new(TestClock::new(0));
-        let mut s = unproven_session(&clock, true);
+        let mut s = unproven_session(&clock);
         let cid = s.primary_channel.unwrap();
         clock.advance_ms(61_000);
         let _ = apply_vardiff_check(&mut s);
@@ -4048,7 +4044,7 @@ pub(crate) mod tests {
     #[test]
     fn update_channel_max_target_still_overrides_the_guard() {
         let clock = Arc::new(TestClock::new(0));
-        let mut s = unproven_session(&clock, true);
+        let mut s = unproven_session(&clock);
         let cid = s.primary_channel.unwrap();
         clock.advance_ms(61_000);
         let _ = apply_vardiff_check(&mut s);
@@ -4072,12 +4068,9 @@ pub(crate) mod tests {
     #[test]
     fn update_channel_raises_freely_once_a_share_was_accepted() {
         let clock = Arc::new(TestClock::new(0));
-        let mut s = unproven_session(&clock, true);
+        let mut s = unproven_session(&clock);
         let cid = s.primary_channel.unwrap();
-        s.vardiff
-            .get_mut(&cid)
-            .unwrap()
-            .update_hash_rate(1024.0, true);
+        s.vardiff.get_mut(&cid).unwrap().note_share_accepted(1024.0);
 
         let out = handle_update_channel(
             &mut s,
@@ -4100,7 +4093,7 @@ pub(crate) mod tests {
         // A NEW declaration is honoured at every silence duration.
         for quiet_s in [10u64, 61, 120, 300, 600, 3_600] {
             let clock = Arc::new(TestClock::new(0));
-            let mut s = unproven_session(&clock, true);
+            let mut s = unproven_session(&clock);
             let cid = s.primary_channel.unwrap();
             clock.advance_ms(quiet_s * 1_000);
             let before = s.channels[&cid].session_difficulty;
@@ -4122,7 +4115,7 @@ pub(crate) mod tests {
 
         // The same claim re-sent on a timer cannot hold the difficulty up.
         let clock = Arc::new(TestClock::new(0));
-        let mut s = unproven_session(&clock, true);
+        let mut s = unproven_session(&clock);
         let cid = s.primary_channel.unwrap();
         let claim = UpdateChannelInput {
             channel_id: cid,
@@ -4151,7 +4144,7 @@ pub(crate) mod tests {
     #[test]
     fn update_channel_honours_a_fresh_channels_first_real_declaration() {
         let clock = Arc::new(TestClock::new(0));
-        let mut s = unproven_session(&clock, true);
+        let mut s = unproven_session(&clock);
         let cid = s.primary_channel.unwrap();
         assert_eq!(s.channels[&cid].session_difficulty, Difficulty(1024.0));
 
@@ -4183,7 +4176,6 @@ pub(crate) mod tests {
         for min_diff in [0.00001, 0.3, 1.0, 500.0, 3000.0, 5000.0] {
             let clock = Arc::new(TestClock::new(0));
             let mut cfg = port_cfg();
-            cfg.vardiff_silence_easing = true;
             cfg.min_difficulty = Difficulty(min_diff);
             let mut s = MiningSessionState::new(clock.clone(), 1, cfg);
             handle_setup_connection(&mut s, &good_setup());

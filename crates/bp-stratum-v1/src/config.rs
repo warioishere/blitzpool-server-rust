@@ -50,10 +50,6 @@ pub struct ServerConfig {
     pub lifecycle: LifecycleConfig,
     /// How often each connection re-evaluates its vardiff target.
     pub difficulty_check_interval_ms: u64,
-    /// Let vardiff treat silence as evidence and walk a quiet session down
-    /// (see [`bp_vardiff`]). Off by default because it changes retargeting
-    /// for every session.
-    pub vardiff_silence_easing: bool,
     /// Log every inbound and outbound frame at DEBUG. Heavy, staging only.
     pub protocol_debug: bool,
     /// Per-share difficulty traces at DEBUG, without the frame firehose of
@@ -75,7 +71,6 @@ impl ServerConfig {
             pool_identifier: DEFAULT_POOL_IDENTIFIER.to_string(),
             lifecycle: LifecycleConfig::DEFAULT,
             difficulty_check_interval_ms: DEFAULT_DIFFICULTY_CHECK_INTERVAL_MS,
-            vardiff_silence_easing: false,
             protocol_debug: false,
             share_logs: false,
             log_submit_latency: false,
