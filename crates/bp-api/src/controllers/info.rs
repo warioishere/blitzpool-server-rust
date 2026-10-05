@@ -824,7 +824,7 @@ use crate::time_range::{
 };
 use axum::extract::Query;
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -922,35 +922,37 @@ async fn workers(
         .cache
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::Workers, async move {
             let since = bp_common::now_ms() - range.window_ms();
-            let rows = bp_db::find_pool_worker_rows_since(&s.pool, since).await?;
+            let counts = bp_db::find_pool_worker_counts_since(&s.pool, since).await?;
             Ok(worker_slots(
                 &chart_slot_boundaries(since),
-                rows.iter()
-                    .map(|r| (r.time, (r.address.as_str(), r.client_name.as_str()))),
+                counts
+                    .into_iter()
+                    .map(|c| (c.time, (c.addresses, c.workers))),
             ))
         })
         .await?;
     Ok(JsonBytes(bytes))
 }
 
-/// `(time, (address, worker))` samples → distinct addresses + workers per slot.
-fn worker_slots<'a>(
+/// `(slot end, (addresses, workers))` counts → one bucket per slot. A row's
+/// time is a slot end, so each lands on its own boundary and nothing is
+/// counted twice.
+fn worker_slots(
     boundaries: &[i64],
-    samples: impl IntoIterator<Item = (i64, (&'a str, &'a str))>,
+    counts: impl IntoIterator<Item = (i64, (i64, i64))>,
 ) -> SlotDataResponse {
-    type Seen = (HashSet<String>, HashSet<(String, String)>);
     let slots = fold_into_slots(
         boundaries,
-        samples,
-        |(addresses, workers): &mut Seen, (address, worker)| {
-            addresses.insert(address.to_string());
-            workers.insert((address.to_string(), worker.to_string()));
+        counts,
+        |(addresses, workers): &mut (i64, i64), (a, w)| {
+            *addresses += a;
+            *workers += w;
         },
     );
     SlotDataResponse::from_slots(slots, |(addresses, workers)| {
         BTreeMap::from([
-            ("addresses".to_string(), addresses.len() as f64),
-            ("workers".to_string(), workers.len() as f64),
+            ("addresses".to_string(), addresses as f64),
+            ("workers".to_string(), workers as f64),
         ])
     })
 }
@@ -1422,16 +1424,9 @@ mod slot_json_tests {
     /// `/api/info/workers` — distinct addresses and (address, worker) pairs.
     #[test]
     fn workers_json_is_unchanged() {
-        let samples = vec![
-            (T0, ("a1", "w1")),
-            (T0, ("a1", "w2")),
-            (T0, ("a2", "w1")),
-            (T0, ("a1", "w1")),
-            (T0 + S + 9, ("a3", "w1")),
-            (T0 + 3 * S, ("a9", "w9")),
-        ];
+        let counts = vec![(T0, (2, 3)), (T0 + S, (1, 1)), (T0 + 3 * S, (1, 1))];
         assert_eq!(
-            json(&worker_slots(&BOUNDARIES, samples)),
+            json(&worker_slots(&BOUNDARIES, counts)),
             r#"{"slotData":[{"time":"2023-11-14T22:20:00.000Z","counts":{"addresses":2,"workers":3}},{"time":"2023-11-14T22:30:00.000Z","counts":{"addresses":1,"workers":1}},{"time":"2023-11-14T22:40:00.000Z","counts":{"addresses":0,"workers":0}}]}"#
         );
     }

@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Pins the row set of `find_pool_worker_rows_since`: exactly the
+//! Pins `find_pool_worker_counts_since`: distinct counts per slot over the
 //! non-soft-deleted rows at or after `since`.
 
-use std::collections::HashSet;
-
-use bp_db::find_pool_worker_rows_since;
+use bp_db::{find_pool_worker_counts_since, PoolWorkerCounts};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
 const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
@@ -35,23 +33,29 @@ async fn connect_or_skip() -> Option<PgPool> {
     }
 }
 
+/// Distinct addresses and workers per slot, from active in-window rows only:
+/// two sessions of one worker count once, a soft-deleted or earlier row not
+/// at all.
 #[tokio::test]
-async fn skinny_reader_returns_active_rows_in_window() {
+async fn worker_counts_are_distinct_and_skip_deleted_and_old_rows() {
     let Some(pool) = connect_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
 
-    let base: i64 = 32_503_680_000_000; // far-future slot, no real-data collision
-    let since = base;
+    // Past every other fixture, so `time >= since` sees only these rows.
+    let since: i64 = 9_000_000_000_000_000;
+    let next = since + 600_000;
 
     // (address, worker, session, time, deleted?)
     let seed: &[(&str, &str, &str, i64, Option<i64>)] = &[
-        ("bp_pwr_X", "w1", "s1", base, None),           // in window
-        ("bp_pwr_X", "w2", "s1", base + 600_000, None), // in window, later slot
-        ("bp_pwr_Y", "w1", "s1", base, None),           // in window
-        ("bp_pwr_OLD", "w1", "s1", base - 1, None),     // before since → excluded
-        ("bp_pwr_DEL", "w1", "s1", base, Some(base)),   // soft-deleted → excluded
+        ("bp_pwr_X", "w1", "s1", since, None),
+        ("bp_pwr_X", "w1", "s2", since, None), // same worker, second session
+        ("bp_pwr_X", "w2", "s3", since, None),
+        ("bp_pwr_Y", "w1", "s4", since, None),
+        ("bp_pwr_Y", "w1", "s5", next, None),
+        ("bp_pwr_OLD", "w1", "s6", since - 1, None), // before since
+        ("bp_pwr_DEL", "w1", "s7", since, Some(since)), // soft-deleted
     ];
     for (addr, worker, session, time, deleted) in seed {
         sqlx::query(
@@ -70,24 +74,24 @@ async fn skinny_reader_returns_active_rows_in_window() {
         .expect("seed insert");
     }
 
-    let got: HashSet<(String, String, i64)> = find_pool_worker_rows_since(&mut *tx, since)
+    let mut got = find_pool_worker_counts_since(&mut *tx, since)
         .await
-        .expect("skinny reader")
-        .into_iter()
-        // Pre-existing rows in the shared DB must not leak in.
-        .filter(|r| r.address.starts_with("bp_pwr_"))
-        .map(|r| (r.address, r.client_name, r.time))
-        .collect();
-
-    let expected: HashSet<(String, String, i64)> = HashSet::from([
-        ("bp_pwr_X".into(), "w1".into(), base),
-        ("bp_pwr_X".into(), "w2".into(), base + 600_000),
-        ("bp_pwr_Y".into(), "w1".into(), base),
-    ]);
-
+        .expect("counts");
+    got.sort_by_key(|c| c.time);
     assert_eq!(
-        got, expected,
-        "skinny reader must return active in-window rows only (no OLD, no DEL)"
+        got,
+        vec![
+            PoolWorkerCounts {
+                time: since,
+                addresses: 2,
+                workers: 3,
+            },
+            PoolWorkerCounts {
+                time: next,
+                addresses: 1,
+                workers: 1,
+            },
+        ]
     );
 
     // tx dropped → rolls back, no DB pollution.

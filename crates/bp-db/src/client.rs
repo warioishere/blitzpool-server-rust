@@ -141,28 +141,31 @@ pub async fn find_active_sessions_for_addresses(
 // ── Time-range readers ───────────────────────────────────────────────
 // Raw rows only: bucketing is endpoint-specific, so the API layer does it.
 
-/// Minimal projection for counting distinct workers per slot; unordered
-/// because the caller buckets into a map, so PG skips a sort.
-#[derive(Clone, Debug, FromRow)]
-pub struct PoolWorkerRow {
+/// Distinct miners of one slot: addresses, and `(address, worker)` pairs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolWorkerCounts {
     pub time: i64,
-    pub address: String,
-    #[sqlx(rename = "clientName")]
-    pub client_name: String,
+    pub addresses: i64,
+    pub workers: i64,
 }
 
-pub async fn find_pool_worker_rows_since<'e, E>(
+/// Distinct addresses and workers per slot from `since_ms` on, counted in
+/// Postgres so one row per slot crosses the wire instead of one per session.
+pub async fn find_pool_worker_counts_since<'e, E>(
     executor: E,
     since_ms: i64,
-) -> Result<Vec<PoolWorkerRow>, DbError>
+) -> Result<Vec<PoolWorkerCounts>, DbError>
 where
     E: sqlx::PgExecutor<'e>,
 {
     sqlx::query_as!(
-        PoolWorkerRow,
-        r#"SELECT "time" AS "time!", address AS "address!", "clientName" AS "client_name!"
+        PoolWorkerCounts,
+        r#"SELECT "time" AS "time!",
+                  COUNT(DISTINCT address) AS "addresses!",
+                  COUNT(DISTINCT (address, "clientName")) AS "workers!"
              FROM client_statistics_entity
-            WHERE "deletedAt" IS NULL AND "time" >= $1"#,
+            WHERE "deletedAt" IS NULL AND "time" >= $1
+            GROUP BY "time""#,
         since_ms,
     )
     .fetch_all(executor)
