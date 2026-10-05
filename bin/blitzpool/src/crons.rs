@@ -356,7 +356,7 @@ fn spawn_kill_dead_clients_loop(
     })
 }
 
-/// Session triples whose live key was missing on the previous tick.
+/// Session triples without a recent share on the previous tick.
 /// Bounded by the candidate count, replaced wholesale every pass.
 type StrikeSet = std::collections::HashSet<(String, String, String)>;
 
@@ -408,8 +408,8 @@ async fn sweep_kill_half(
         return Ok(0);
     }
     // `Err` is "cannot ask" and aborts the pass; `None` is "no front
-    // publishes sessions" (e.g. Redis just restarted) and leaves the key
-    // verdict below in charge.
+    // publishes sessions" (e.g. Redis just restarted) and leaves the
+    // last-share verdict below in charge.
     let held = RedisLiveSessions::new(redis.clone())
         .sessions()
         .await
@@ -724,8 +724,8 @@ mod sweep_tests {
     }
 
     /// Two-strike rule: pass 1 sweeps nothing, and on pass 2 only the
-    /// keyless session dies; the live-keyed one survives however old its
-    /// birth row is.
+    /// session without a live hash dies; the one with a recent share
+    /// survives however old its birth row is.
     #[tokio::test]
     async fn a_missing_key_sweeps_only_on_the_second_pass() {
         let _guard = SWEEP_LOCK.lock().await;
@@ -893,9 +893,9 @@ mod sweep_tests {
         cleanup(&pool, addr).await;
     }
 
-    /// The front's word outranks the key: a held session without a live
-    /// key survives both passes, an unheld keyless one is swept on pass 2,
-    /// and an unheld one with a live key survives on the key alone.
+    /// The front's word outranks the live hash: a held session without one
+    /// survives both passes, an unheld one without one is swept on pass 2,
+    /// and an unheld one with a recent share survives on that alone.
     #[tokio::test]
     async fn a_session_a_front_still_holds_is_never_swept() {
         let _guard = SWEEP_LOCK.lock().await;
@@ -932,7 +932,7 @@ mod sweep_tests {
         );
         assert!(
             active(&pool, "frtC0001").await,
-            "a live key still counts where the front says nothing"
+            "a recent share still counts where the front says nothing"
         );
 
         cleanup(&pool, addr).await;

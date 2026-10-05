@@ -275,8 +275,8 @@ pub(crate) async fn run_flush_loop(
             }
         }
     }
-    // The shutdown drain is the last TTL refresh those sessions get;
-    // afterwards they age out on the TTL like any silent session.
+    // The shutdown drain is the last write those sessions get; afterwards
+    // they read silent like any session without shares.
     let drained = flush_once(&buffer, &pool, live.as_deref()).await;
     debug!(final_drained = drained, "client touch flush loop exited");
 }
@@ -361,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_empties_buffer() {
+    fn take_empties_buffer() {
         let buf = TouchBuffer::default();
         let key = TouchKey {
             address: "a".into(),

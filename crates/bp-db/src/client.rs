@@ -478,8 +478,8 @@ where
 
 /// Candidates (not verdicts) of the dead-session sweep: `updatedAt` is not
 /// touched per share, so age alone does not mean silent. The cron soft-deletes
-/// via [`soft_delete_sessions`] only those whose live hash is gone; the cutoff
-/// is the birth grace period.
+/// via [`soft_delete_sessions`] only those without a recent share in their
+/// live hash; the cutoff is the birth grace period.
 pub async fn find_stale_active_sessions<'e, E>(
     executor: E,
     cutoff_ms: i64,

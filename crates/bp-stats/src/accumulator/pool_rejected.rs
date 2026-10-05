@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Per-slot per-reason pool-wide rejected counts (number of shares, not
-//! diff sum).
+//! Per-slot per-reason pool-wide rejected difficulty (the difficulty sum,
+//! not the number of shares).
 
 use parking_lot::Mutex;
 use std::collections::HashMap;

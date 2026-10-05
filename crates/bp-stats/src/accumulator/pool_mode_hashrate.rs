@@ -66,7 +66,7 @@ mod tests {
     }
 
     #[test]
-    fn add_and_drain_groups_by_slot_then_mode() {
+    fn add_and_take_groups_by_slot_then_mode() {
         let acc = PoolModeHashrateAccumulator::new();
         acc.add(slot(1_000), MiningMode::Solo, 100.0);
         acc.add(slot(1_000), MiningMode::Pplns, 50.0);

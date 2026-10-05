@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! In-process statistics buffers: the share path folds each share in with
-//! `add_*`, and the service layer flushes them to PG with `drain_*` and
-//! `confirm_*`. Pure logic with no I/O, so the hot path never waits on a
+//! `add_*`, and the flush takes what is due and restores it if the write
+//! fails. Pure logic with no I/O, so the hot path never waits on a
 //! database.
 
 pub mod accumulator;

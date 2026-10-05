@@ -3,7 +3,7 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! `flush_once` against PG, one drain → upsert → confirm tick at a time.
+//! `flush_once` against PG, one take → upsert → restore-on-failure tick at a time.
 //! `flush_once` takes a `PgPool`, not a transaction, so tests isolate via a
 //! suite-wide mutex and prefix-based cleanup instead of rollback.
 
@@ -81,7 +81,7 @@ fn addr(s: &str) -> AddressId {
 }
 
 #[tokio::test]
-async fn flush_once_drains_all_seven_tables_to_pg() {
+async fn flush_once_writes_all_six_tables_to_pg() {
     let _guard = FLUSH_TEST_LOCK.lock().await;
     let Some(pool) = connect_or_skip().await else {
         return;
@@ -286,8 +286,8 @@ async fn replay_idempotency_double_flush_doubles_counts() {
     let prefix = "test_flush_replay_";
     cleanup(&pool, slot.as_millis(), prefix).await;
 
-    // Flushes INCREMENT, so re-flushing an unconfirmed snapshot (PG
-    // committed, confirm lost) double-counts it.
+    // Flushes INCREMENT: the same delta written twice counts twice, which
+    // is what lets a second process finish a slot the first one started.
     let accs1 = Arc::new(Accumulators::default());
     accs1.pool_shares.add_accepted(slot, 5.0, 5.0);
     flush_once(&pool, &accs1, FlushScope::All).await;

@@ -623,7 +623,7 @@ async fn reset_address(
 }
 
 /// Helper used by both delete-stats and delete-all to wipe every
-/// per-address row across the four statistics tables + the worker
+/// per-address row across the statistics tables + the worker
 /// totals plus reset the address-level best-difficulty hints.
 async fn purge_address_stats(pool: &sqlx::PgPool, addr: &AddressId) -> Result<(), ApiError> {
     sqlx::query!(

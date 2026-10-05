@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! UNNEST bulk upserts for the share-stats sink. Every write is
-//! increment-semantic (`col + EXCLUDED.col` on conflict), so a flush that
-//! landed in PG but was never confirmed can be re-sent on the next tick and
-//! the totals stay eventually consistent with the accumulator.
+//! UNNEST bulk upserts for the share-stats sink. Every write adds onto the
+//! stored row (`col + EXCLUDED.col` on conflict, maxima via `GREATEST`), so a
+//! second process can finish a slot the first one started. Sending the same
+//! delta twice counts it twice.
 
 use crate::pool::DbError;
 
@@ -100,8 +100,8 @@ where
     Ok(result.rows_affected())
 }
 
-/// One row in a `pool_rejected_statistics_entity` bulk-upsert. `count`
-/// is the rejected-share count (integer-valued real) for `(slot, reason)`.
+/// One row in a `pool_rejected_statistics_entity` bulk-upsert. `count` is
+/// the difficulty sum of the slot's rejects for `reason`, not their number.
 #[derive(Clone, Debug)]
 pub struct PoolRejectedStatsUpsert {
     pub time_ms: i64,

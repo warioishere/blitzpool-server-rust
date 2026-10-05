@@ -103,8 +103,9 @@ impl LiveSessionStore {
     }
 
     /// Mirror one touch-flush snapshot. Every chunk is attempted even after a
-    /// failure, or the sessions behind it would miss their TTL refresh and be
-    /// swept while still hashing; the first error is returned at the end.
+    /// failure, or the sessions behind it would lose their last share time
+    /// and read silent while still hashing; the first error is returned at
+    /// the end.
     pub(crate) async fn write_touch_batch(
         &self,
         snapshot: &HashMap<TouchKey, TouchEntry>,

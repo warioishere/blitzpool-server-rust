@@ -108,7 +108,7 @@ mod tests {
     }
 
     #[test]
-    fn add_then_drain_returns_summed_diff() {
+    fn add_then_take_returns_summed_diff() {
         let acc = PoolSharesAccumulator::new();
         acc.add_accepted(slot(1_000), 100.0, 100.0);
         acc.add_accepted(slot(1_000), 50.0, 50.0);
