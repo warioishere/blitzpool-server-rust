@@ -11,12 +11,9 @@ use std::sync::Arc;
 
 use bp_common::{AddressId, MiningMode};
 use bp_share_hook::{SharedAcceptedShare, SharedAcceptedShareSink};
-use bp_share_stats_sink::flush::{flush_once, Accumulators, FlushScope, Flusher};
+use bp_share_stats_sink::flush::{flush_once, Accumulators, FlushScope};
 use bp_share_stats_sink::ShareStatsAcceptedSink;
-use bp_stats::{
-    ClientStatisticsKey, ClientStatisticsRecord, FlushHealth, FlushHealthMonitor, RejectedReason,
-    TimeSlot,
-};
+use bp_stats::{ClientStatisticsKey, ClientStatisticsRecord, RejectedReason, TimeSlot};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use tokio::sync::Mutex;
 
@@ -128,9 +125,7 @@ async fn flush_once_drains_all_seven_tables_to_pg() {
     );
     accs.share_totals
         .add(addr(&format!("{prefix}alice")), "worker1".to_string(), 10.0);
-
-    let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs, &health, FlushScope::All).await;
+    flush_once(&pool, &accs, FlushScope::All).await;
 
     // Pool-shares row exists with the right values.
     let row = sqlx::query(
@@ -212,21 +207,6 @@ async fn flush_once_drains_all_seven_tables_to_pg() {
     .expect("worker_shares row");
     assert!((worker_shares - 10.0).abs() < 0.01);
 
-    // All flushers report Healthy (success) after one clean tick.
-    {
-        let h = health.lock().expect("health lock");
-        for flusher in [
-            Flusher::PoolShares,
-            Flusher::PoolModeHashrate,
-            Flusher::PoolRejected,
-            Flusher::ClientStatistics,
-            Flusher::AddressSettings,
-            Flusher::WorkerTotals,
-        ] {
-            assert_eq!(h.consecutive_failures(&flusher), 0, "flusher: {flusher:?}");
-        }
-    }
-
     cleanup(&pool, slot.as_millis(), prefix).await;
 }
 
@@ -245,8 +225,6 @@ async fn flush_once_folds_best_difficulty_via_greatest() {
         .execute(&pool)
         .await;
 
-    let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-
     // No row yet: the flush inserts it at the window max.
     let accs = Arc::new(Accumulators::default());
     accs.best_difficulty
@@ -255,7 +233,7 @@ async fn flush_once_folds_best_difficulty_via_greatest() {
         .add(&addr(&address), 623_932_928.0, Some("octaxe")); // window max
     accs.best_difficulty
         .add(&addr(&address), 40.0, Some("worker")); // lower — ignored
-    flush_once(&pool, &accs, &health, FlushScope::All).await;
+    flush_once(&pool, &accs, FlushScope::All).await;
 
     let (best, ua): (f64, Option<String>) = {
         let row = sqlx::query(
@@ -279,7 +257,7 @@ async fn flush_once_folds_best_difficulty_via_greatest() {
     accs2
         .best_difficulty
         .add(&addr(&address), 1_000.0, Some("bitaxe"));
-    flush_once(&pool, &accs2, &health, FlushScope::All).await;
+    flush_once(&pool, &accs2, FlushScope::All).await;
     let best_after: f64 = sqlx::query_scalar(
         r#"SELECT "bestDifficulty" FROM address_settings_entity WHERE address = $1"#,
     )
@@ -299,22 +277,6 @@ async fn flush_once_folds_best_difficulty_via_greatest() {
 }
 
 #[tokio::test]
-async fn empty_accumulators_no_op_all_flushers() {
-    let _guard = FLUSH_TEST_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
-        return;
-    };
-    let accs = Arc::new(Accumulators::default());
-    let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs, &health, FlushScope::All).await;
-
-    // Nothing crashed; nothing in PG, all healthy.
-    let h = health.lock().expect("health lock");
-    assert_eq!(h.consecutive_failures(&Flusher::PoolShares), 0);
-    assert_eq!(h.consecutive_failures(&Flusher::WorkerTotals), 0);
-}
-
-#[tokio::test]
 async fn replay_idempotency_double_flush_doubles_counts() {
     let _guard = FLUSH_TEST_LOCK.lock().await;
     let Some(pool) = connect_or_skip().await else {
@@ -328,13 +290,11 @@ async fn replay_idempotency_double_flush_doubles_counts() {
     // committed, confirm lost) double-counts it.
     let accs1 = Arc::new(Accumulators::default());
     accs1.pool_shares.add_accepted(slot, 5.0, 5.0);
-    let health1 = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs1, &health1, FlushScope::All).await;
+    flush_once(&pool, &accs1, FlushScope::All).await;
 
     let accs2 = Arc::new(Accumulators::default());
     accs2.pool_shares.add_accepted(slot, 5.0, 5.0);
-    let health2 = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs2, &health2, FlushScope::All).await;
+    flush_once(&pool, &accs2, FlushScope::All).await;
 
     let accepted: f32 = sqlx::query_scalar(
         r#"SELECT accepted FROM pool_share_statistics_entity WHERE "time" = $1"#,
@@ -347,31 +307,6 @@ async fn replay_idempotency_double_flush_doubles_counts() {
         (accepted - 10.0).abs() < 0.01,
         "expected 10 from 2×5: {accepted}"
     );
-
-    cleanup(&pool, slot.as_millis(), prefix).await;
-}
-
-#[tokio::test]
-async fn health_monitor_tracks_success_after_single_clean_flush() {
-    // One clean flush leaves the health monitor un-degraded.
-    let _guard = FLUSH_TEST_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
-        return;
-    };
-    let slot = TimeSlot::from_millis(32_503_680_002_345);
-    let prefix = "test_flush_health_";
-    cleanup(&pool, slot.as_millis(), prefix).await;
-
-    let accs = Arc::new(Accumulators::default());
-    accs.pool_shares.add_accepted(slot, 1.0, 1.0);
-    let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs, &health, FlushScope::All).await;
-
-    {
-        let mut h = health.lock().expect("health");
-        let outcome = h.record_failure(Flusher::PoolShares);
-        assert!(matches!(outcome, FlushHealth::Healthy { .. }));
-    }
 
     cleanup(&pool, slot.as_millis(), prefix).await;
 }
@@ -412,26 +347,25 @@ async fn client_slots_reach_pg_once_ended_and_the_drain_writes_the_rest() {
             .expect("read")
         }
     };
-    let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
 
     let accs = Arc::new(Accumulators::default());
     accs.client_statistics.add(key(ended), &shares(10.0));
     accs.client_statistics.add(key(open), &shares(3.0));
-    flush_once(&pool, &accs, &health, FlushScope::Before(open)).await;
+    flush_once(&pool, &accs, FlushScope::Before(open)).await;
     assert_eq!(read(ended).await, Some(10.0), "the ended slot is written");
     assert_eq!(read(open).await, None, "the open slot waits for its end");
 
     // A second tick in the same slot writes nothing new.
-    flush_once(&pool, &accs, &health, FlushScope::Before(open)).await;
+    flush_once(&pool, &accs, FlushScope::Before(open)).await;
     assert_eq!(read(ended).await, Some(10.0), "written once, not twice");
 
-    flush_once(&pool, &accs, &health, FlushScope::All).await;
+    flush_once(&pool, &accs, FlushScope::All).await;
     assert_eq!(read(open).await, Some(3.0), "the shutdown drain writes it");
 
     // The next process books the rest of the open slot onto the same row.
     let accs2 = Arc::new(Accumulators::default());
     accs2.client_statistics.add(key(open), &shares(4.0));
-    flush_once(&pool, &accs2, &health, FlushScope::Before(open.next())).await;
+    flush_once(&pool, &accs2, FlushScope::Before(open.next())).await;
     assert_eq!(
         read(open).await,
         Some(7.0),
@@ -479,18 +413,19 @@ async fn a_failed_flush_hands_everything_back_for_the_next_one() {
         .connect_lazy(DEFAULT_URL)
         .expect("lazy pool");
     dead.close().await;
-    let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&dead, &accs, &health, FlushScope::All).await;
+    flush_once(&dead, &accs, FlushScope::All).await;
     assert_eq!(
-        health
-            .lock()
-            .expect("health")
-            .consecutive_failures(&Flusher::ClientStatistics),
+        accs.client_statistics.len(),
         1,
-        "the write failed"
+        "handed back after the failed write"
+    );
+    assert_eq!(
+        accs.pool_shares.len(),
+        1,
+        "handed back after the failed write"
     );
 
-    flush_once(&pool, &accs, &health, FlushScope::All).await;
+    flush_once(&pool, &accs, FlushScope::All).await;
     let shares: f32 = sqlx::query_scalar(
         r#"SELECT shares FROM client_statistics_entity WHERE address = $1 AND "time" = $2"#,
     )
@@ -560,9 +495,7 @@ async fn a_nul_byte_in_a_worker_name_does_not_block_the_flush() {
     // Only the client rows are under test; keep the pool rows out of the real slot.
     accs.pool_shares.take();
     accs.pool_mode_hashrate.take();
-
-    let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs, &health, FlushScope::All).await;
+    flush_once(&pool, &accs, FlushScope::All).await;
 
     let workers: Vec<(String, String)> = sqlx::query_as(
         r#"SELECT address, "clientName" FROM worker_shares_entity

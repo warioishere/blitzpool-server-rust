@@ -6,14 +6,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bp_stats::{FlushHealthMonitor, TimeSlot};
+use bp_stats::TimeSlot;
 use sqlx::PgPool;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, instrument, warn};
 
 use crate::config::StatsSinkConfig;
-use crate::flush::{flush_once, Accumulators, FlushScope, Flusher};
+use crate::flush::{flush_once, Accumulators, FlushScope};
 
 /// Accumulators are written by the share hooks from many tasks and drained
 /// by the flush task.
@@ -47,11 +47,9 @@ impl ShareStatsEngine {
 
     fn spawn_internal(self) -> ShareStatsEngineHandle {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
         let join = tokio::spawn(run_flush_loop(
             self.pool,
             self.accumulators.clone(),
-            health,
             self.config,
             shutdown_rx,
         ));
@@ -94,7 +92,6 @@ impl ShareStatsEngineHandle {
 async fn run_flush_loop(
     pool: PgPool,
     accs: Arc<Accumulators>,
-    health: Arc<std::sync::Mutex<FlushHealthMonitor<Flusher>>>,
     cfg: StatsSinkConfig,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
@@ -104,7 +101,7 @@ async fn run_flush_loop(
         tokio::select! {
             _ = tokio::time::sleep(wait) => {
                 let scope = FlushScope::Before(TimeSlot::current());
-                flush_once(&pool, &accs, &health, scope).await;
+                flush_once(&pool, &accs, scope).await;
             }
             _ = &mut shutdown_rx => {
                 debug!("stats_sink received shutdown");
@@ -114,7 +111,7 @@ async fn run_flush_loop(
     }
 
     info!("stats_sink final drain");
-    flush_once(&pool, &accs, &health, FlushScope::All).await;
+    flush_once(&pool, &accs, FlushScope::All).await;
 }
 
 /// Time until the next tick: `offset` past each wall-clock multiple of

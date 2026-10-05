@@ -17,7 +17,3 @@ pub const CHART_VISIBILITY_BUFFER: Duration = Duration::from_millis(60_000);
 /// Ceiling on a single share's difficulty. Anything above is implausible for a
 /// real miner (a corrupted frame or a probe) and is dropped by the accumulator.
 pub const MAX_REASONABLE_DIFFICULTY: f64 = 1.0e15;
-
-/// Consecutive flush failures before the health monitor warns once: one slow
-/// query does not spam the log, a real outage shows before memory grows.
-pub const FLUSH_FAILURE_WARN_THRESHOLD: u32 = 3;

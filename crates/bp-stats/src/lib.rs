@@ -8,7 +8,6 @@
 pub mod accumulator;
 pub mod buffer;
 pub mod constants;
-pub mod health;
 pub mod slot;
 
 pub use accumulator::{
@@ -21,8 +20,7 @@ pub use accumulator::{
 };
 pub use buffer::{BufferRecord, NestedDeltaBuffer, NumberDeltaBuffer, RecordDeltaBuffer};
 pub use constants::{
-    CHART_VISIBILITY_BUFFER, CHART_VISIBILITY_BUFFER_MS, FLUSH_FAILURE_WARN_THRESHOLD,
-    MAX_REASONABLE_DIFFICULTY, SLOT_DURATION_MS,
+    CHART_VISIBILITY_BUFFER, CHART_VISIBILITY_BUFFER_MS, MAX_REASONABLE_DIFFICULTY,
+    SLOT_DURATION_MS,
 };
-pub use health::{FlushHealth, FlushHealthMonitor};
 pub use slot::{chart_visibility_cutoff_slot, TimeSlot};

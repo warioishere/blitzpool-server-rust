@@ -13,7 +13,7 @@ use bp_common::AddressId;
 use bp_share_hook::{RejectedReason, SharedRejectedShare, SharedRejectedShareSink};
 use bp_share_stats_sink::flush::{flush_once, Accumulators, FlushScope};
 use bp_share_stats_sink::ShareStatsRejectedSink;
-use bp_stats::{ClientStatisticsKey, ClientStatisticsRecord, FlushHealthMonitor, TimeSlot};
+use bp_stats::{ClientStatisticsKey, ClientStatisticsRecord, TimeSlot};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use tokio::sync::Mutex;
 
@@ -88,9 +88,7 @@ async fn client_statistics_1500_rows_land_in_one_statement() {
             },
         );
     }
-
-    let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs, &health, FlushScope::All).await;
+    flush_once(&pool, &accs, FlushScope::All).await;
 
     let count: i64 = sqlx::query_scalar(
         r#"SELECT COUNT(*) FROM client_statistics_entity WHERE address LIKE $1"#,
@@ -146,9 +144,7 @@ async fn client_name_with_special_chars_roundtrips_through_unnest() {
             1.0,
         );
     }
-
-    let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs, &health, FlushScope::All).await;
+    flush_once(&pool, &accs, FlushScope::All).await;
 
     // Each stress-named row landed both in client_statistics and in
     // worker_shares_entity with the same byte-identical clientName.
@@ -221,9 +217,7 @@ async fn rejected_diff_per_worker_aggregates_across_sessions() {
     reject(&accs, &address, "sB", RejectedReason::DuplicateShare, 20.0).await;
     reject(&accs, &address, "sC", RejectedReason::LowDifficulty, 30.0).await;
     drop_pool_rows(&accs);
-
-    let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs, &health, FlushScope::All).await;
+    flush_once(&pool, &accs, FlushScope::All).await;
 
     let rejected: f64 = sqlx::query_scalar(
         r#"SELECT "rejectedShares" FROM worker_shares_entity
@@ -254,9 +248,7 @@ async fn a_zero_difficulty_reject_writes_no_worker_row() {
     let address = format!("{prefix}alice");
     reject(&accs, &address, "s", RejectedReason::Stale, 0.0).await;
     drop_pool_rows(&accs);
-
-    let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs, &health, FlushScope::All).await;
+    flush_once(&pool, &accs, FlushScope::All).await;
 
     let row = sqlx::query_scalar::<_, Option<f64>>(
         r#"SELECT "rejectedShares" FROM worker_shares_entity
