@@ -652,8 +652,8 @@ async fn reset_address(
 }
 
 /// Helper used by both delete-stats and delete-all to wipe every
-/// per-address row across the statistics tables + the worker
-/// totals plus reset the address-level best-difficulty hints.
+/// per-address row across the statistics tables + the worker totals, zero
+/// the address total with them, and reset the address-level best.
 async fn purge_address_stats(pool: &sqlx::PgPool, addr: &AddressId) -> Result<(), ApiError> {
     sqlx::query!(
         r#"DELETE FROM client_statistics_entity WHERE address = $1"#,
@@ -680,6 +680,15 @@ async fn purge_address_stats(pool: &sqlx::PgPool, addr: &AddressId) -> Result<()
     .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
     sqlx::query!(
         r#"DELETE FROM worker_shares_entity WHERE address = $1"#,
+        addr.as_str()
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
+    // The address total and the worker totals count the same shares; zeroed
+    // together, both start over from the same point.
+    sqlx::query!(
+        r#"UPDATE address_settings_entity SET shares = 0 WHERE address = $1"#,
         addr.as_str()
     )
     .execute(pool)
@@ -724,8 +733,7 @@ async fn delete_all(
     // What stays is the leaderboard record, which carries no address.
     sqlx::query!(
         r#"UPDATE address_settings_entity
-           SET shares = 0,
-               "miscCoinbaseScriptData" = NULL,
+           SET "miscCoinbaseScriptData" = NULL,
                "updatedAt" = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
            WHERE address = $1"#,
         addr.as_str()

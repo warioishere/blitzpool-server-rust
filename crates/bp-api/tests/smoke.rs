@@ -972,3 +972,71 @@ async fn client_max_difficulty_takes_the_best_session_per_slot() {
         .count();
     assert_eq!(nonzero, 2, "every other slot reads 0");
 }
+
+/// delete-stats zeroes the address total together with the worker totals,
+/// so both count from the same start afterwards; the public record stays.
+#[tokio::test]
+async fn delete_stats_zeroes_the_address_total_with_the_workers() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    // Own address: no sibling test in this binary touches it.
+    let addr = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
+    let cleanup = || async {
+        for table in ["address_settings_entity", "worker_shares_entity"] {
+            let _ = sqlx::query(&format!("DELETE FROM {table} WHERE address = $1"))
+                .bind(addr)
+                .execute(&pool)
+                .await;
+        }
+    };
+    cleanup().await;
+    sqlx::query(
+        r#"INSERT INTO address_settings_entity
+             (address, shares, "bestDifficulty", "allTimeBestDifficulty")
+           VALUES ($1, 500, 64, 4096)"#,
+    )
+    .bind(addr)
+    .execute(&pool)
+    .await
+    .expect("seed address");
+    sqlx::query(
+        r#"INSERT INTO worker_shares_entity (address, "clientName", shares, "rejectedShares")
+           VALUES ($1, 'rig', 500, 0)"#,
+    )
+    .bind(addr)
+    .execute(&pool)
+    .await
+    .expect("seed worker");
+
+    let resp = build_router(minimal_state(pool.clone()))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/client/{addr}/delete-stats"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("oneshot");
+    let status = resp.status();
+    let (shares, all_time): (f64, f64) = sqlx::query_as(
+        r#"SELECT shares, "allTimeBestDifficulty" FROM address_settings_entity WHERE address = $1"#,
+    )
+    .bind(addr)
+    .fetch_one(&pool)
+    .await
+    .expect("address row stays");
+    let workers: i64 =
+        sqlx::query_scalar(r#"SELECT COUNT(*) FROM worker_shares_entity WHERE address = $1"#)
+            .bind(addr)
+            .fetch_one(&pool)
+            .await
+            .expect("count workers");
+    cleanup().await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(workers, 0, "worker totals are gone");
+    assert_eq!(shares, 0.0, "the address total starts over with them");
+    assert_eq!(all_time, 4096.0, "the public record is never lowered");
+}
