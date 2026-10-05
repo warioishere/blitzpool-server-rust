@@ -10,8 +10,9 @@ use bp_db::{
     bulk_upsert_address_settings, bulk_upsert_client_statistics_entity,
     bulk_upsert_pool_mode_hashrate, bulk_upsert_pool_rejected_statistics,
     bulk_upsert_pool_share_statistics, bulk_upsert_worker_shares_entity,
-    find_max_difficulty_since_for_addresses, AddressSettingsUpsert, ClientStatsUpsert,
-    PoolModeHashrateUpsert, PoolRejectedStatsUpsert, PoolShareStatsUpsert, WorkerSharesUpsert,
+    delete_old_pool_rejected_statistics, find_max_difficulty_since_for_addresses,
+    AddressSettingsUpsert, ClientStatsUpsert, PoolModeHashrateUpsert, PoolRejectedStatsUpsert,
+    PoolShareStatsUpsert, WorkerSharesUpsert,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 
@@ -819,6 +820,49 @@ async fn worker_shares_composite_pk_upsert_increments() {
     let rejected: f64 = row.get("rejectedShares");
     assert!((shares - 200.0).abs() < 0.01);
     assert!((rejected - 3.0).abs() < 0.01);
+
+    tx.rollback().await.expect("rollback");
+}
+
+/// The retention delete removes rows strictly older than the cutoff.
+#[tokio::test]
+async fn pool_rejected_retention_keeps_the_cutoff_slot() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let mut tx = pool.begin().await.expect("begin tx");
+    let cutoff = unique_slot(9);
+    bulk_upsert_pool_rejected_statistics(
+        &mut *tx,
+        &[
+            PoolRejectedStatsUpsert {
+                time_ms: cutoff - 1,
+                reason: "Stale".to_string(),
+                count: 1.0,
+            },
+            PoolRejectedStatsUpsert {
+                time_ms: cutoff,
+                reason: "Stale".to_string(),
+                count: 2.0,
+            },
+        ],
+    )
+    .await
+    .expect("seed");
+
+    delete_old_pool_rejected_statistics(&mut *tx, cutoff)
+        .await
+        .expect("delete");
+    let left: Vec<i64> = sqlx::query_scalar(
+        r#"SELECT "time" FROM pool_rejected_statistics_entity
+           WHERE "time" IN ($1, $2) ORDER BY "time""#,
+    )
+    .bind(cutoff - 1)
+    .bind(cutoff)
+    .fetch_all(&mut *tx)
+    .await
+    .expect("read");
+    assert_eq!(left, vec![cutoff]);
 
     tx.rollback().await.expect("rollback");
 }

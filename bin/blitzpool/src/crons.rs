@@ -509,15 +509,20 @@ const WEEKLY_TICK: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// 90-day inactivity threshold: subscriptions whose `lastNotificationAt`
 /// (or `createdAt` when never notified) is older than this are hard-deleted.
 const STALE_PUSH_SUBSCRIPTION_TTL: Duration = Duration::from_secs(90 * 24 * 60 * 60);
-/// 14-day cutoff for the per-(address, worker, session, slot) detail
-/// tables — UI charts only render 1d/3d/7d windows.
+/// Cutoff for `client_statistics_entity`, the per-session detail table; a
+/// client chart asked for a longer `range` shows these 14 days.
 const STATS_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+/// Cutoff for the pool-wide breakdowns (`pool_mode_hashrate`,
+/// `pool_rejected_statistics_entity`): the longest chart range, `range=1m`.
+/// `pool_share_statistics_entity` keeps everything, because the share
+/// total since the last block reaches back as far as that block.
+const POOL_BREAKDOWN_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// Cutoff for soft-deleted clients before hard-delete. Nothing reads them
 /// longer (the device-status seed looks back 1 h, "known device" lives in
 /// Redis), and keeping them scatters live rows that every bulk writer re-logs.
 pub(crate) const CLIENT_HARD_DELETE_RETENTION: Duration = Duration::from_secs(2 * 60 * 60);
 
-/// Hourly cron: purge stats older than `STATS_RETENTION`, hard-delete
+/// Hourly cron: purge stats past their retention, hard-delete
 /// clients soft-deleted longer than [`CLIENT_HARD_DELETE_RETENTION`], and
 /// drop expired email verifications.
 pub(crate) fn spawn_old_stats_cleanup(pool: PgPool, cancel: CancellationToken) -> JoinHandle<()> {
@@ -533,11 +538,13 @@ pub(crate) fn spawn_old_stats_cleanup(pool: PgPool, cancel: CancellationToken) -
                 _ = ticker.tick() => {
                     let now = Utc::now().timestamp_millis();
                     let stats_cutoff = now - STATS_RETENTION.as_millis() as i64;
+                    let pool_cutoff = now - POOL_BREAKDOWN_RETENTION.as_millis() as i64;
                     let client_cutoff = now - CLIENT_HARD_DELETE_RETENTION.as_millis() as i64;
 
-                    let mut totals: [(&str, u64); 4] = [
+                    let mut totals: [(&str, u64); 5] = [
                         ("client_statistics", 0),
                         ("pool_mode_hashrate", 0),
+                        ("pool_rejected_statistics", 0),
                         ("client_entity_hard_delete", 0),
                         ("email_verification_purge", 0),
                     ];
@@ -545,16 +552,20 @@ pub(crate) fn spawn_old_stats_cleanup(pool: PgPool, cancel: CancellationToken) -
                         Ok(n) => totals[0].1 = n,
                         Err(err) => warn!(%err, "delete_old_client_statistics"),
                     }
-                    match bp_db::delete_old_pool_mode_hashrate(&pool, stats_cutoff).await {
+                    match bp_db::delete_old_pool_mode_hashrate(&pool, pool_cutoff).await {
                         Ok(n) => totals[1].1 = n,
                         Err(err) => warn!(%err, "delete_old_pool_mode_hashrate"),
                     }
-                    match bp_db::delete_old_clients(&pool, client_cutoff).await {
+                    match bp_db::delete_old_pool_rejected_statistics(&pool, pool_cutoff).await {
                         Ok(n) => totals[2].1 = n,
+                        Err(err) => warn!(%err, "delete_old_pool_rejected_statistics"),
+                    }
+                    match bp_db::delete_old_clients(&pool, client_cutoff).await {
+                        Ok(n) => totals[3].1 = n,
                         Err(err) => warn!(%err, "delete_old_clients"),
                     }
                     match bp_db::delete_expired_email_verifications(&pool, now).await {
-                        Ok(n) => totals[3].1 = n,
+                        Ok(n) => totals[4].1 = n,
                         Err(err) => warn!(%err, "delete_expired_email_verifications"),
                     }
                     let total: u64 = totals.iter().map(|(_, n)| *n).sum();
@@ -562,9 +573,11 @@ pub(crate) fn spawn_old_stats_cleanup(pool: PgPool, cancel: CancellationToken) -
                         info!(
                             client_statistics = totals[0].1,
                             pool_mode_hashrate = totals[1].1,
-                            client_entity_hard_delete = totals[2].1,
-                            email_verification_purge = totals[3].1,
+                            pool_rejected_statistics = totals[2].1,
+                            client_entity_hard_delete = totals[3].1,
+                            email_verification_purge = totals[4].1,
                             stats_cutoff,
+                            pool_cutoff,
                             client_cutoff,
                             "crons.old_stats_cleanup: purged"
                         );

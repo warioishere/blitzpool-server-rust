@@ -701,6 +701,21 @@ where
     Ok(r.rows_affected())
 }
 
+pub async fn delete_old_pool_rejected_statistics<'e, E>(
+    executor: E,
+    cutoff_ms: i64,
+) -> Result<u64, DbError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let r = sqlx::query(r#"DELETE FROM pool_rejected_statistics_entity WHERE "time" < $1"#)
+        .bind(cutoff_ms)
+        .execute(executor)
+        .await
+        .map_err(DbError::from)?;
+    Ok(r.rows_affected())
+}
+
 /// When the pool first saw one `(address, clientName)` pair —
 /// see [`device_first_seen`].
 #[derive(Debug, Clone, PartialEq, Eq)]
