@@ -201,6 +201,31 @@ pub async fn delete_address_live_keys(
     Ok(deleted)
 }
 
+/// Each session's freshest share time (`updated_at_ms`), positionally
+/// aligned; `None` without a live hash. The liveness sweep needs no more,
+/// and an error must make it skip, never sweep.
+pub async fn last_share_ms_for_sessions<S: SessionKey>(
+    redis: Option<&ConnectionManager>,
+    sessions: &[S],
+) -> Result<Vec<Option<i64>>, LiveReadError> {
+    if sessions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut conn = redis.ok_or(LiveReadError::NotConfigured)?.clone();
+    let mut out = Vec::with_capacity(sessions.len());
+    for chunk in sessions.chunks(FETCH_CHUNK) {
+        let mut pipe = redis::pipe();
+        for s in chunk {
+            pipe.cmd("HGET")
+                .arg(live_key::key_of(s))
+                .arg(F_UPDATED_AT_MS);
+        }
+        let stamps: Vec<Option<String>> = bounded(pipe.query_async(&mut conn)).await?;
+        out.extend(stamps.into_iter().map(|t| t.and_then(|t| t.parse().ok())));
+    }
+    Ok(out)
+}
+
 /// The live half of one session. Missing fields default to 0 / `None`; a
 /// wholly missing hash is `None` from [`live_fields_for_sessions`].
 #[derive(Clone, Debug, Default, PartialEq)]

@@ -416,14 +416,11 @@ async fn sweep_kill_half(
         .map_err(|e| format!("front live set: {e}"))?;
     // The key outlives the session (its TTL only cleans up); a share
     // newer than the cutoff is the evidence.
-    let alive = bp_client_live::live_fields_for_sessions(Some(redis), &candidates)
+    let alive = bp_client_live::last_share_ms_for_sessions(Some(redis), &candidates)
         .await
         .map_err(|e| format!("live-key check: {e}"))?
         .into_iter()
-        .map(|lf| {
-            lf.and_then(|lf| lf.updated_at_ms)
-                .is_some_and(|ts| ts >= cutoff_ms)
-        });
+        .map(|ts| ts.is_some_and(|ts| ts >= cutoff_ms));
 
     let mut missing_now = StrikeSet::with_capacity(candidates.len());
     let mut addresses = Vec::new();
@@ -474,18 +471,16 @@ async fn sweep_repair_half(
     if deleted.is_empty() {
         return Ok(0);
     }
-    let live = bp_client_live::live_fields_for_sessions(Some(redis), &deleted)
+    let last_shares = bp_client_live::last_share_ms_for_sessions(Some(redis), &deleted)
         .await
         .map_err(|e| format!("live-field check: {e}"))?;
 
     let mut addresses = Vec::new();
     let mut client_names = Vec::new();
     let mut session_ids = Vec::new();
-    for (d, lf) in deleted.iter().zip(live) {
+    for (d, last_share) in deleted.iter().zip(last_shares) {
         // Touched after it was retired → it never stopped mining.
-        let touched_after = lf
-            .and_then(|lf| lf.updated_at_ms)
-            .is_some_and(|ts| ts > d.deleted_at);
+        let touched_after = last_share.is_some_and(|ts| ts > d.deleted_at);
         if touched_after {
             addresses.push(d.address.as_str().to_string());
             client_names.push(d.client_name.clone());
