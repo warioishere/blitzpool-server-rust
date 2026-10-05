@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            address AS \"address!: AddressId\",\n            \"clientName\" AS \"client_name!\",\n            shares AS \"shares!\",\n            \"rejectedShares\" AS \"rejected_shares!\"\n           FROM worker_shares_entity\n           WHERE address = $1 AND \"clientName\" = $2 LIMIT 1",
+  "query": "SELECT\n            address AS \"address!: AddressId\",\n            \"clientName\" AS \"client_name!\",\n            shares AS \"shares!\",\n            \"rejectedShares\" AS \"rejected_shares!\"\n           FROM worker_shares_entity\n           WHERE address = $1",
   "describe": {
     "columns": [
       {
@@ -26,7 +26,6 @@
     ],
     "parameters": {
       "Left": [
-        "Text",
         "Text"
       ]
     },
@@ -37,5 +36,5 @@
       false
     ]
   },
-  "hash": "053d4c1343b5730bee2094b937e509d3f96e30175291168b4efcd5076c72e836"
+  "hash": "c6d3fc02eb82f7ad8f61c484e4b3179775721983fc4d21b862e2127dcb1c770b"
 }

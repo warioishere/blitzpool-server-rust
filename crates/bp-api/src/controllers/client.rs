@@ -8,12 +8,13 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use bp_common::AddressId;
 use bp_db::{
     find_address_settings, find_client, find_client_statistics_since_for_address,
-    find_clients_by_address, find_worker_shares, reset_address_settings_best_difficulty,
+    find_clients_by_address, find_worker_shares_for_address,
+    reset_address_settings_best_difficulty, WorkerSharesRow,
 };
 use serde::Serialize;
 
@@ -362,20 +363,27 @@ async fn worker_shares(
             key,
             TtlKind::ClientWorkerShares,
             async move {
-                // `worker_shares_entity` is keyed (address, clientName) — pull the
-                // worker list, then one lookup per worker.
+                // The address's connected workers, each with its lifetime row
+                // if it has one, in name order.
                 let clients = find_clients_by_address(&s.pool, &addr).await?;
                 let names: BTreeSet<String> = clients.into_iter().map(|c| c.client_name).collect();
-                let mut out = Vec::with_capacity(names.len());
-                for name in names {
-                    if let Some(row) = find_worker_shares(&s.pool, &addr, &name).await? {
-                        out.push(WorkerShareEntry {
+                let mut totals: HashMap<String, WorkerSharesRow> =
+                    find_worker_shares_for_address(&s.pool, &addr)
+                        .await?
+                        .into_iter()
+                        .map(|row| (row.client_name.clone(), row))
+                        .collect();
+                let out: Vec<WorkerShareEntry> = names
+                    .into_iter()
+                    .filter_map(|name| {
+                        let row = totals.remove(&name)?;
+                        Some(WorkerShareEntry {
                             worker_name: name,
                             total_shares: row.shares as i64,
                             total_rejected: row.rejected_shares as i64,
-                        });
-                    }
-                }
+                        })
+                    })
+                    .collect();
                 Ok(out)
             },
         )

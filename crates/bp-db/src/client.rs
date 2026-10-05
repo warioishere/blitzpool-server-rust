@@ -298,11 +298,11 @@ pub struct WorkerSharesRow {
     pub rejected_shares: f64,
 }
 
-pub async fn find_worker_shares(
+/// Every `worker_shares_entity` row of one address.
+pub async fn find_worker_shares_for_address(
     pool: &PgPool,
     address: &AddressId,
-    client_name: &str,
-) -> Result<Option<WorkerSharesRow>, DbError> {
+) -> Result<Vec<WorkerSharesRow>, DbError> {
     sqlx::query_as!(
         WorkerSharesRow,
         r#"SELECT
@@ -311,11 +311,10 @@ pub async fn find_worker_shares(
             shares AS "shares!",
             "rejectedShares" AS "rejected_shares!"
            FROM worker_shares_entity
-           WHERE address = $1 AND "clientName" = $2 LIMIT 1"#,
-        address.as_str(),
-        client_name
+           WHERE address = $1"#,
+        address.as_str()
     )
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await
     .map_err(DbError::from)
 }

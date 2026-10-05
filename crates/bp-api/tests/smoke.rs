@@ -839,3 +839,70 @@ async fn best_difficulty_today_rejects_missing_or_out_of_window_since() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
     assert_eq!(json["code"], "invalid-address");
 }
+
+/// `/worker-shares` lists the address's connected workers that have a
+/// lifetime row, in name order; a row of a worker without a session stays
+/// out, a connected worker without a row too.
+#[tokio::test]
+async fn worker_shares_lists_connected_workers_with_a_row_in_name_order() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    // Own address: no sibling test in this binary touches it.
+    let addr = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh";
+    let cleanup = || async {
+        for table in ["client_entity", "worker_shares_entity"] {
+            let _ = sqlx::query(&format!("DELETE FROM {table} WHERE address = $1"))
+                .bind(addr)
+                .execute(&pool)
+                .await;
+        }
+    };
+    cleanup().await;
+    for (worker, session) in [
+        ("rig_b", "wsB00001"),
+        ("rig_a", "wsA00001"),
+        ("rig_c", "wsC00001"),
+    ] {
+        sqlx::query(
+            r#"INSERT INTO client_entity (address, "clientName", "sessionId", "startTime")
+               VALUES ($1, $2, $3, 0)"#,
+        )
+        .bind(addr)
+        .bind(worker)
+        .bind(session)
+        .execute(&pool)
+        .await
+        .expect("seed client");
+    }
+    // rig_c is connected without a row; rig_gone has a row but no session.
+    for (worker, shares, rejected) in [
+        ("rig_a", 100.0, 1.0),
+        ("rig_b", 250.0, 3.0),
+        ("rig_gone", 9.0, 0.0),
+    ] {
+        sqlx::query(
+            r#"INSERT INTO worker_shares_entity (address, "clientName", shares, "rejectedShares")
+               VALUES ($1, $2, $3, $4)"#,
+        )
+        .bind(addr)
+        .bind(worker)
+        .bind(shares)
+        .bind(rejected)
+        .execute(&pool)
+        .await
+        .expect("seed worker shares");
+    }
+
+    let (status, body) = get_json(pool.clone(), &format!("/api/client/{addr}/worker-shares")).await;
+    cleanup().await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        serde_json::json!([
+            {"workerName": "rig_a", "totalShares": 100, "totalRejected": 1},
+            {"workerName": "rig_b", "totalShares": 250, "totalRejected": 3},
+        ])
+    );
+}

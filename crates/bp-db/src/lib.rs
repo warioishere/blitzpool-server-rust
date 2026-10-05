@@ -28,7 +28,7 @@ pub use redis_backup::{
 };
 
 pub use address::{
-    find_address_settings, find_best_difficulty_tracker,
+    find_address_settings, find_address_settings_for_addresses, find_best_difficulty_tracker,
     find_best_difficulty_trackers_for_addresses, find_high_scores,
     reset_address_settings_best_difficulty, upsert_best_difficulty_trackers, AddressSettingsRow,
     BestDifficultyTrackerRow, HighScoreRow,
@@ -63,7 +63,7 @@ pub use client::{
     find_active_session_keys, find_active_sessions_for_addresses, find_client,
     find_client_statistics_since_for_address, find_clients_by_address,
     find_max_difficulty_since_for_addresses, find_pool_worker_counts_since,
-    find_recently_deleted_sessions, find_stale_active_sessions, find_worker_shares,
+    find_recently_deleted_sessions, find_stale_active_sessions, find_worker_shares_for_address,
     raise_client_best_difficulties, revive_sessions, soft_delete_sessions,
     update_sv2_user_agent_by_address, upsert_client, ClientRow, ClientStatisticsRow, ClientUpsert,
     DeletedSessionRow, DeviceFirstSeenRow, PoolWorkerCounts, WorkerSharesRow,

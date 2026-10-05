@@ -949,6 +949,13 @@ async fn by_id(
                 std::collections::HashSet::new()
             };
 
+            let best_by_address: HashMap<String, f64> =
+                bp_db::find_address_settings_for_addresses(&s.pool, &addr_strings)
+                    .await?
+                    .into_iter()
+                    .map(|row| (row.address.as_str().to_string(), row.best_difficulty))
+                    .collect();
+
             // Roster-wide session stats in two round trips, not two per member.
             let sessions =
                 bp_db::find_active_sessions_for_addresses(&s.pool, &addr_strings).await?;
@@ -998,10 +1005,7 @@ async fn by_id(
                 let hashrate = per_addr_hashrate.get(addr_str).copied().unwrap_or(0.0);
                 let start_time = start_times.get(addr_str).copied();
                 let last_seen = last_seen_by_address.get(addr_str).copied().or(start_time);
-                let best_difficulty = bp_db::find_address_settings(&s.pool, &m.address)
-                    .await?
-                    .map(|x| x.best_difficulty)
-                    .unwrap_or(0.0);
+                let best_difficulty = best_by_address.get(addr_str).copied().unwrap_or(0.0);
                 entries.push(MemberEntry {
                     member_id: member_id(id, addr_str),
                     address_label: labels
