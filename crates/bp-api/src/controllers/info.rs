@@ -1229,6 +1229,22 @@ async fn pool_started_at(state: &crate::state::AppState) -> chrono::DateTime<chr
     }
 }
 
+/// Session rows in the shape the `userAgents` aggregation groups.
+pub(crate) fn user_agent_rows(
+    sessions: Vec<bp_db::ClientRow>,
+) -> Vec<bp_client_live::UserAgentSessionRow> {
+    sessions
+        .into_iter()
+        .map(|r| bp_client_live::UserAgentSessionRow {
+            user_agent: r.user_agent,
+            address: r.address.into_inner(),
+            worker: r.client_name,
+            session_id: r.session_id,
+            best_difficulty: r.best_difficulty,
+        })
+        .collect()
+}
+
 async fn info(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
     let s = state.clone();
     let bytes = state
@@ -1239,15 +1255,7 @@ async fn info(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
             async move {
                 let blocks = find_found_blocks(&s.pool).await?;
                 let sessions = bp_db::find_active_session_keys(&s.pool).await?;
-                let rows: Vec<bp_client_live::UserAgentSessionRow> = sessions
-                    .into_iter()
-                    .map(|r| bp_client_live::UserAgentSessionRow {
-                        user_agent: r.user_agent,
-                        address: r.address.into_inner(),
-                        worker: r.client_name,
-                        session_id: r.session_id,
-                    })
-                    .collect();
+                let rows = user_agent_rows(sessions);
                 let agents = crate::error::or_degraded(
                     bp_client_live::aggregate_by_user_agent(s.redis.as_ref(), &rows).await,
                     || bp_client_live::aggregate_offline(&rows),

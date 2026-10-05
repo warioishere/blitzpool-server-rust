@@ -20,36 +20,22 @@ use crate::touch_buffer::{TouchEntry, TouchKey};
 /// Keys per script invocation, bounding one EVAL's server blocking time.
 const CHUNK: usize = 400;
 
-/// Touch write. `ARGV[1]` = TTL seconds, then a stride of 5 per key:
-/// best difficulty (max-merged with the stored one, so a later flush cannot
-/// regress it), current difficulty and hashrate ("" keeps the stored value),
-/// channel count, last-seen epoch-ms.
+/// Touch write. `ARGV[1]` = TTL seconds, then a stride of 4 per key:
+/// current difficulty and hashrate ("" keeps the stored value), channel count,
+/// last-seen epoch-ms. The session's best lives on its Postgres row.
 const TOUCH_LIVE_LUA: &str = r#"
 local ttl = tonumber(ARGV[1])
 for i = 1, #KEYS do
-    local base = 1 + (i - 1) * 5
+    local base = 1 + (i - 1) * 4
     local key = KEYS[i]
-    -- No `or 0` fallback here on purpose: `tonumber` only yields nil
-    -- for a string that is not a number at all ("abc", ""), and every
-    -- argument is `f32::to_string()`, which always is one. Measured
-    -- against this Redis: tonumber("inf") = inf, tonumber("NaN") = nan
-    -- — neither is nil. Non-finite values are kept out one layer up, in
-    -- `TouchBuffer::record`, because they would poison a reader's sums,
-    -- not because they would break this script.
-    local best = tonumber(ARGV[base + 1])
-    local prev = tonumber(redis.call('HGET', key, 'best_difficulty'))
-    if prev and prev > best then
-        best = prev
-    end
     redis.call('HSET', key,
-        'best_difficulty', tostring(best),
-        'channel_count', ARGV[base + 4],
-        'updated_at_ms', ARGV[base + 5])
-    if ARGV[base + 2] ~= '' then
-        redis.call('HSET', key, 'current_difficulty', ARGV[base + 2])
+        'channel_count', ARGV[base + 3],
+        'updated_at_ms', ARGV[base + 4])
+    if ARGV[base + 1] ~= '' then
+        redis.call('HSET', key, 'current_difficulty', ARGV[base + 1])
     end
-    if ARGV[base + 3] ~= '' then
-        redis.call('HSET', key, 'hash_rate', ARGV[base + 3])
+    if ARGV[base + 2] ~= '' then
+        redis.call('HSET', key, 'hash_rate', ARGV[base + 2])
     end
     redis.call('EXPIRE', key, ttl)
 end
@@ -77,17 +63,16 @@ struct Batch {
     args: Vec<String>,
 }
 
-/// Chunked touch batches, stride 5 (see [`TOUCH_LIVE_LUA`]).
+/// Chunked touch batches, stride 4 (see [`TOUCH_LIVE_LUA`]).
 fn build_touch_batches(snapshot: &HashMap<TouchKey, TouchEntry>) -> Vec<Batch> {
     let entries: Vec<(&TouchKey, &TouchEntry)> = snapshot.iter().collect();
     entries
         .chunks(CHUNK)
         .map(|chunk| {
             let mut keys = Vec::with_capacity(chunk.len());
-            let mut args = Vec::with_capacity(chunk.len() * 5);
+            let mut args = Vec::with_capacity(chunk.len() * 4);
             for (k, v) in chunk {
                 keys.push(client_live_key(&k.address, &k.client_name, &k.session_id));
-                args.push(v.share_diff.to_string());
                 args.push(v.current_diff.map(|d| d.to_string()).unwrap_or_default());
                 args.push(v.hash_rate.map(|r| r.to_string()).unwrap_or_default());
                 args.push(v.channel_count.to_string());
@@ -193,7 +178,7 @@ impl LiveSessionStore {
 mod tests {
     use super::*;
     use bp_common::live_client_key::{
-        F_BEST_DIFFICULTY, F_CHANNEL_COUNT, F_CURRENT_DIFFICULTY, F_HASH_RATE, F_UPDATED_AT_MS,
+        F_CHANNEL_COUNT, F_CURRENT_DIFFICULTY, F_HASH_RATE, F_UPDATED_AT_MS,
     };
     use bp_test_support::{connect_redis_in_range_or_skip, redis_db};
 
@@ -219,7 +204,6 @@ mod tests {
     #[test]
     fn lua_field_names_match_the_shared_schema() {
         for field in [
-            F_BEST_DIFFICULTY,
             F_CURRENT_DIFFICULTY,
             F_HASH_RATE,
             F_CHANNEL_COUNT,
@@ -234,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn touch_batch_layout_is_stride_five_per_key() {
+    fn touch_batch_layout_is_stride_four_per_key() {
         let mut snap = HashMap::new();
         snap.insert(key(1), entry());
         let batches = build_touch_batches(&snap);
@@ -242,8 +226,8 @@ mod tests {
         assert_eq!(batches[0].keys.len(), 1);
         assert_eq!(
             batches[0].args,
-            vec!["100.5", "64", "5000000000000", "2", "1700000000000"],
-            "stride must be best, current, hashrate, channels, updated_at"
+            vec!["64", "5000000000000", "2", "1700000000000"],
+            "stride must be current, hashrate, channels, updated_at"
         );
     }
 
@@ -259,8 +243,8 @@ mod tests {
             },
         );
         let batches = build_touch_batches(&snap);
+        assert_eq!(batches[0].args[0], "", "None sentinel is the empty string");
         assert_eq!(batches[0].args[1], "", "None sentinel is the empty string");
-        assert_eq!(batches[0].args[2], "", "None sentinel is the empty string");
     }
 
     /// A failing first chunk does not stop the second from being written.
@@ -311,7 +295,7 @@ mod tests {
         let batches = build_touch_batches(&snap);
         assert_eq!(batches.len(), 2, "CHUNK+1 entries need a second invocation");
         assert_eq!(batches[0].keys.len() + batches[1].keys.len(), CHUNK + 1);
-        assert_eq!(batches[0].args.len(), batches[0].keys.len() * 5);
+        assert_eq!(batches[0].args.len(), batches[0].keys.len() * 4);
 
         let writes: Vec<(TouchKey, f64)> = (0..CHUNK + 1).map(|n| (key(n), 1.0)).collect();
         let batches = build_hashrate_batches(&writes);

@@ -19,10 +19,6 @@ pub const F_HASH_RATE: &str = "hash_rate";
 pub const F_CURRENT_DIFFICULTY: &str = "current_difficulty";
 /// Hash field: channel count of the session's freshest share.
 pub const F_CHANNEL_COUNT: &str = "channel_count";
-/// Hash field: per-session best share difficulty, max-merged within the key's
-/// life and reset by eviction. Nothing durable reads it; the all-time best in
-/// `address_settings_entity` is the one to trust.
-pub const F_BEST_DIFFICULTY: &str = "best_difficulty";
 /// Hash field: epoch-ms timestamp of the freshest accepted share.
 pub const F_UPDATED_AT_MS: &str = "updated_at_ms";
 

@@ -178,15 +178,7 @@ async fn root_inner(state: &SharedState) -> Result<RootResponse, ApiError> {
         Vec::new()
     } else {
         let sessions = bp_db::find_active_sessions_for_addresses(&state.pool, &addresses).await?;
-        let rows: Vec<bp_client_live::UserAgentSessionRow> = sessions
-            .into_iter()
-            .map(|r| bp_client_live::UserAgentSessionRow {
-                user_agent: r.user_agent,
-                address: r.address.into_inner(),
-                worker: r.client_name,
-                session_id: r.session_id,
-            })
-            .collect();
+        let rows = super::info::user_agent_rows(sessions);
         crate::error::or_degraded(
             bp_client_live::aggregate_by_user_agent(state.redis.as_ref(), &rows).await,
             || bp_client_live::aggregate_offline(&rows),

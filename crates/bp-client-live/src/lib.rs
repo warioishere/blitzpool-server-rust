@@ -10,8 +10,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use bp_common::live_client_key::{
-    self as live_key, SessionKey, CLIENT_LIVE_PREFIX, F_BEST_DIFFICULTY, F_HASH_RATE, KEY_SEP,
-    SCAN_PATTERN_ALL,
+    self as live_key, SessionKey, CLIENT_LIVE_PREFIX, F_HASH_RATE, KEY_SEP, SCAN_PATTERN_ALL,
 };
 use bp_common::AddressId;
 use redis::aio::ConnectionManager;
@@ -182,32 +181,6 @@ pub async fn delete_address_live_keys(
     Ok(deleted)
 }
 
-/// Session half of a best-difficulty reset, else every worker row keeps the
-/// old value. `HDEL`, not `HSET 0`: a missing field means "no sample yet",
-/// a 0 would render as a best of zero. A share landing mid-clear sets the
-/// correct post-reset value anyway.
-pub async fn clear_address_best_difficulty(
-    redis: Option<&ConnectionManager>,
-    address: &AddressId,
-) -> Result<u64, LiveReadError> {
-    let mut conn = redis.ok_or(LiveReadError::NotConfigured)?.clone();
-    let keys = scan_keys(
-        &mut conn,
-        &live_key::scan_pattern_for_address(address.as_str()),
-    )
-    .await?;
-    let mut cleared = 0u64;
-    for chunk in keys.chunks(FETCH_CHUNK) {
-        let mut pipe = redis::pipe();
-        for key in chunk {
-            pipe.cmd("HDEL").arg(key).arg(F_BEST_DIFFICULTY);
-        }
-        let removed: Vec<u64> = bounded(pipe.query_async(&mut conn)).await?;
-        cleared += removed.iter().sum::<u64>();
-    }
-    Ok(cleared)
-}
-
 /// Pipelined `EXISTS`, positionally aligned. The liveness sweep must SKIP
 /// on an error, never sweep: "cannot ask Redis" is not "no key".
 pub async fn live_keys_exist<S: SessionKey>(
@@ -238,7 +211,6 @@ pub struct LiveFields {
     pub current_difficulty: Option<f64>,
     /// `None` on a watchdog-created partial hash — render as 1 channel.
     pub channel_count: Option<i32>,
-    pub best_difficulty: f64,
     /// Epoch-ms of the freshest accepted share.
     pub updated_at_ms: Option<i64>,
 }
@@ -253,7 +225,6 @@ fn parse_live_fields(pairs: Vec<(String, String)>) -> Option<LiveFields> {
             live_key::F_HASH_RATE => lf.hash_rate = value.parse().unwrap_or(0.0),
             live_key::F_CURRENT_DIFFICULTY => lf.current_difficulty = value.parse().ok(),
             live_key::F_CHANNEL_COUNT => lf.channel_count = value.parse().ok(),
-            live_key::F_BEST_DIFFICULTY => lf.best_difficulty = value.parse().unwrap_or(0.0),
             live_key::F_UPDATED_AT_MS => lf.updated_at_ms = value.parse().ok(),
             _ => {}
         }
@@ -290,6 +261,8 @@ pub struct UserAgentSessionRow {
     pub address: String,
     pub worker: String,
     pub session_id: String,
+    /// The session's best, from its Postgres row.
+    pub best_difficulty: f64,
 }
 
 impl SessionKey for UserAgentSessionRow {
@@ -347,9 +320,9 @@ fn group_user_agents(
         if row.user_agent.is_some() {
             entry.count += 1;
         }
+        entry.best_difficulty = entry.best_difficulty.max(row.best_difficulty);
         if let Some(lf) = lf {
             entry.total_hash_rate += lf.hash_rate;
-            entry.best_difficulty = entry.best_difficulty.max(lf.best_difficulty);
         }
     }
     let mut out: Vec<UserAgentAgg> = groups.into_values().collect();
@@ -392,46 +365,42 @@ mod tests {
         // Watchdog-created hash: only hash_rate.
         let lf = parse_live_fields(vec![("hash_rate".into(), "1234.5".into())]).unwrap();
         assert_eq!(lf.hash_rate, 1234.5);
-        assert_eq!(
-            lf.best_difficulty, 0.0,
-            "absent best defaults like the PG column"
-        );
         assert_eq!(lf.channel_count, None);
         // Empty hash = missing key (HGETALL on a missing key is empty).
         assert_eq!(parse_live_fields(vec![]), None);
         // Unknown fields are ignored, not an error.
         let lf = parse_live_fields(vec![
-            ("best_difficulty".into(), "7.5".into()),
+            ("hash_rate".into(), "7.5".into()),
             ("some_future_field".into(), "x".into()),
         ])
         .unwrap();
-        assert_eq!(lf.best_difficulty, 7.5);
+        assert_eq!(lf.hash_rate, 7.5);
     }
 
     #[test]
     fn user_agent_grouping_keeps_the_sql_count_semantics() {
-        let row = |ua: Option<&str>, n: usize| UserAgentSessionRow {
+        let row = |ua: Option<&str>, n: usize, best: f64| UserAgentSessionRow {
             user_agent: ua.map(String::from),
             address: format!("addr{n}"),
             worker: "w".into(),
             session_id: format!("s{n}"),
+            best_difficulty: best,
         };
-        let lf = |hr: f64, best: f64| {
+        let lf = |hr: f64| {
             Some(LiveFields {
                 hash_rate: hr,
-                best_difficulty: best,
                 ..Default::default()
             })
         };
         let rows = vec![
-            row(Some("bitaxe"), 1),
-            row(Some("bitaxe"), 2),
-            row(None, 3),
-            row(Some("nerdminer"), 4),
+            row(Some("bitaxe"), 1, 5.0),
+            row(Some("bitaxe"), 2, 7.0),
+            row(None, 3, 9.0),
+            row(Some("nerdminer"), 4, 1.0),
         ];
-        // Session 2 has no live hash at all — counted, but contributes
-        // no numbers (a PG-active row whose Redis key expired).
-        let live = vec![lf(10.0, 5.0), None, lf(3.0, 9.0), lf(1.0, 1.0)];
+        // Session 2 has no live hash (a paused miner whose Redis key
+        // expired): counted, no hashrate, but its row keeps its best.
+        let live = vec![lf(10.0), None, lf(3.0), lf(1.0)];
         let out = group_user_agents(&rows, &live);
         assert_eq!(out.len(), 3);
         let bitaxe = out
@@ -440,7 +409,10 @@ mod tests {
             .unwrap();
         assert_eq!(bitaxe.count, 2, "count counts rows, not live hashes");
         assert_eq!(bitaxe.total_hash_rate, 10.0);
-        assert_eq!(bitaxe.best_difficulty, 5.0);
+        assert_eq!(
+            bitaxe.best_difficulty, 7.0,
+            "the best comes from the row, live hash or not"
+        );
         let null_group = out.iter().find(|g| g.user_agent.is_none()).unwrap();
         assert_eq!(
             null_group.count, 0,

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Coalesces per-session share updates in a [`TouchBuffer`] and flushes them
-//! periodically into the `client:live:*` Redis hashes ([`crate::live_store`])
-//! instead of a write per share. `hash_rate` is vardiff's session rate; once
+//! periodically: the session's best onto its Postgres row, the rest into the
+//! `client:live:*` Redis hashes ([`crate::live_store`]), instead of a write
+//! per share. `hash_rate` is vardiff's session rate; once
 //! the shares stop, [`crate::hashrate_watchdog`] zeroes it.
 
 use std::sync::Mutex;
@@ -11,6 +12,8 @@ use hashbrown::{Equivalent, HashMap};
 use tokio::sync::oneshot;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, warn};
+
+use sqlx::PgPool;
 
 use crate::live_store::LiveSessionStore;
 
@@ -66,7 +69,7 @@ impl Equivalent<TouchKey> for TouchKeyRef<'_> {
 /// fields hold the latest observed value.
 #[derive(Clone)]
 pub(crate) struct TouchEntry {
-    pub share_diff: f32,
+    pub share_diff: f64,
     pub current_diff: Option<f32>,
     pub hash_rate: Option<f64>,
     pub channel_count: i32,
@@ -100,14 +103,14 @@ impl TouchBuffer {
     pub(crate) fn record(
         &self,
         key: TouchKeyRef<'_>,
-        share_diff: f32,
+        share_diff: f64,
         current_diff: Option<f32>,
         hash_rate: f64,
         channel_count: i32,
         updated_at_ms: i64,
     ) {
-        // Stored as "inf"/"NaN" in Redis, non-finite values would poison
-        // every sum a reader builds.
+        // Postgres sorts NaN above every number, so one would pin the
+        // session's best for good; non-finite live fields poison readers' sums.
         if !share_diff.is_finite() {
             return;
         }
@@ -182,14 +185,28 @@ impl TouchBuffer {
 }
 
 /// One flush pass; rebuffers on a failed write and returns sessions written.
-/// Without a live store the snapshot is dropped, not rebuffered, or the
+/// Both writes are idempotent, so a retry after a half-failed pass is safe.
+/// Without a live store the live half is dropped, not rebuffered, or the
 /// buffer would grow without bound.
-pub(crate) async fn flush_once(buffer: &TouchBuffer, live: Option<&LiveSessionStore>) -> u64 {
+pub(crate) async fn flush_once(
+    buffer: &TouchBuffer,
+    pool: &PgPool,
+    live: Option<&LiveSessionStore>,
+) -> u64 {
     let snapshot = buffer.drain();
     if snapshot.is_empty() {
         return 0;
     }
     let n = snapshot.len();
+    if let Err(e) = raise_bests(pool, &snapshot).await {
+        warn!(
+            error = %e,
+            buffered = n,
+            "session best write failed; rebuffering for retry"
+        );
+        buffer.rebuffer(snapshot);
+        return 0;
+    }
     let Some(store) = live else {
         warn!(
             dropped = n,
@@ -214,9 +231,29 @@ pub(crate) async fn flush_once(buffer: &TouchBuffer, live: Option<&LiveSessionSt
     }
 }
 
+/// Write each session's flushed best onto its row where it is a new record.
+async fn raise_bests(
+    pool: &PgPool,
+    snapshot: &HashMap<TouchKey, TouchEntry>,
+) -> Result<u64, bp_db::DbError> {
+    let mut addresses = Vec::with_capacity(snapshot.len());
+    let mut client_names = Vec::with_capacity(snapshot.len());
+    let mut session_ids = Vec::with_capacity(snapshot.len());
+    let mut bests = Vec::with_capacity(snapshot.len());
+    for (k, v) in snapshot.iter().filter(|(_, v)| v.share_diff > 0.0) {
+        addresses.push(k.address.clone());
+        client_names.push(k.client_name.clone());
+        session_ids.push(k.session_id.clone());
+        bests.push(v.share_diff);
+    }
+    bp_db::raise_client_best_difficulties(pool, &addresses, &client_names, &session_ids, &bests)
+        .await
+}
+
 /// Flush loop; flushes once more on shutdown to drain the residual buffer.
 pub(crate) async fn run_flush_loop(
     buffer: std::sync::Arc<TouchBuffer>,
+    pool: PgPool,
     live: Option<std::sync::Arc<LiveSessionStore>>,
     flush_interval: Duration,
     mut shutdown_rx: oneshot::Receiver<()>,
@@ -226,7 +263,7 @@ pub(crate) async fn run_flush_loop(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                flush_once(&buffer, live.as_deref()).await;
+                flush_once(&buffer, &pool, live.as_deref()).await;
             }
             _ = &mut shutdown_rx => {
                 debug!("client touch flush loop received shutdown");
@@ -236,7 +273,7 @@ pub(crate) async fn run_flush_loop(
     }
     // The shutdown drain is the last TTL refresh those sessions get;
     // afterwards they age out on the TTL like any silent session.
-    let drained = flush_once(&buffer, live.as_deref()).await;
+    let drained = flush_once(&buffer, &pool, live.as_deref()).await;
     debug!(final_drained = drained, "client touch flush loop exited");
 }
 
@@ -343,8 +380,8 @@ mod tests {
             client_name: "wkr".into(),
             session_id: "sess".into(),
         };
-        b.record(kref(&k), f32::INFINITY, None, 0.0, 1, 1);
-        b.record(kref(&k), f32::NAN, None, 0.0, 1, 1);
+        b.record(kref(&k), f64::INFINITY, None, 0.0, 1, 1);
+        b.record(kref(&k), f64::NAN, None, 0.0, 1, 1);
         assert_eq!(b.len(), 0, "an unusable share_diff creates no entry");
 
         // A finite share with a non-finite vardiff target and rate keeps

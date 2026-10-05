@@ -98,6 +98,7 @@ impl SessionPersistenceEngine {
         let (touch_tx, touch_rx) = oneshot::channel();
         let touch_join = tokio::spawn(run_flush_loop(
             self.touch_buffer.clone(),
+            self.pool.clone(),
             self.live_store.clone(),
             self.config.touch_flush_interval,
             touch_rx,
@@ -180,9 +181,10 @@ impl SessionPersistenceEngineHandle {
         crate::row_debounce::flush_once(&self.row_debounce, &self.pool, self.row_debounce_age).await
     }
 
-    /// One touch-flush pass into the `client:live:*` hashes, exactly like a tick.
+    /// One touch-flush pass (row bests + `client:live:*` hashes), exactly like a tick.
     pub async fn flush_touches_now(&self) -> u64 {
-        crate::touch_buffer::flush_once(&self.touch_buffer, self.live_store.as_deref()).await
+        crate::touch_buffer::flush_once(&self.touch_buffer, &self.pool, self.live_store.as_deref())
+            .await
     }
 
     /// One watchdog pass that treats `silence` as the cutoff (a tick uses

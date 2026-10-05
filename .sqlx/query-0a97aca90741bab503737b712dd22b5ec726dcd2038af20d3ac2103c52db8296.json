@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE client_entity AS c\n           SET \"bestDifficulty\" = u.best\n           FROM unnest($1::varchar[], $2::varchar[], $3::varchar[], $4::float8[])\n                AS u(address, client_name, session_id, best)\n           WHERE c.address = u.address\n             AND c.\"clientName\" = u.client_name\n             AND c.\"sessionId\" = u.session_id\n             AND c.\"bestDifficulty\" < u.best",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "VarcharArray",
+        "VarcharArray",
+        "VarcharArray",
+        "Float8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0a97aca90741bab503737b712dd22b5ec726dcd2038af20d3ac2103c52db8296"
+}

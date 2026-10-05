@@ -867,7 +867,7 @@ pub(crate) async fn build_show_workers(
             .current_difficulty
             .map(|d| format!("{d}"))
             .unwrap_or_else(|| "–".to_string());
-        let best = format_number_suffix(lf.best_difficulty);
+        let best = format_number_suffix(w.best_difficulty);
         worker_de.push(format!(
             "• {name}\nHashrate: {hr}H/s\nAktuelle Difficulty: {cur}\nBeste Difficulty: {best}"
         ));

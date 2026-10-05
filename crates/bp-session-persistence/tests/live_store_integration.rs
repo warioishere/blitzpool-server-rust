@@ -11,8 +11,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bp_common::live_client_key::{
-    client_live_key, F_BEST_DIFFICULTY, F_CHANNEL_COUNT, F_CURRENT_DIFFICULTY, F_HASH_RATE,
-    F_UPDATED_AT_MS,
+    client_live_key, F_CHANNEL_COUNT, F_CURRENT_DIFFICULTY, F_HASH_RATE, F_UPDATED_AT_MS,
 };
 use bp_session_persistence::{
     SessionPersistenceConfig, SessionPersistenceEngine, SessionPersistenceEngineHandle,
@@ -102,6 +101,14 @@ async fn hgetall(conn: &mut ConnectionManager, key: &str) -> HashMap<String, Str
         .expect("HGETALL")
 }
 
+async fn row_best(pool: &PgPool, session_id: &str) -> f64 {
+    sqlx::query_scalar(r#"SELECT "bestDifficulty" FROM client_entity WHERE "sessionId" = $1"#)
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .expect("session row")
+}
+
 async fn ttl(conn: &mut ConnectionManager, key: &str) -> i64 {
     redis::cmd("TTL")
         .arg(key)
@@ -110,7 +117,8 @@ async fn ttl(conn: &mut ConnectionManager, key: &str) -> i64 {
         .expect("TTL")
 }
 
-/// A touch flush lands in the session hash with a TTL (none = immortal under `volatile-lru`).
+/// A touch flush lands the best on the row and the rest in the session hash
+/// with a TTL (none = immortal under `volatile-lru`).
 #[tokio::test]
 async fn touch_flush_dual_writes_hash_and_ttl() {
     let Some(pool) = pg_or_skip().await else {
@@ -137,13 +145,15 @@ async fn touch_flush_dual_writes_hash_and_ttl() {
     let rows = handle.flush_touches_now().await;
     assert_eq!(rows, 1, "flush reports the session it wrote");
 
+    assert_eq!(
+        row_best(&pool, "sessL001").await,
+        100.5,
+        "the row got the best"
+    );
+
     // Redis got the touch.
     let key = client_live_key(&address, "rig1", "sessL001");
     let hash = hgetall(&mut redis, &key).await;
-    assert_eq!(
-        hash.get(F_BEST_DIFFICULTY).map(String::as_str),
-        Some("100.5")
-    );
     assert_eq!(
         hash.get(F_CURRENT_DIFFICULTY).map(String::as_str),
         Some("64")
@@ -205,14 +215,14 @@ async fn a_late_consumed_share_keeps_its_acceptance_time() {
     cleanup(&pool, prefix).await;
 }
 
-/// A best-difficulty reset clears only that field of one address; a lower share then wins.
+/// The shared reset zeroes the session bests of one address only; a lower
+/// share then sets the best afresh.
 #[tokio::test]
-async fn clearing_the_live_best_takes_one_field_from_one_address() {
+async fn a_reset_zeroes_one_addresss_session_bests() {
     let Some(pool) = pg_or_skip().await else {
         return;
     };
-    let Some(mut redis) = connect_redis_in_range_or_skip(redis_db::SESSION_PERSISTENCE, 7).await
-    else {
+    let Some(redis) = connect_redis_in_range_or_skip(redis_db::SESSION_PERSISTENCE, 7).await else {
         return;
     };
     let prefix = "test_lv_clear_";
@@ -234,69 +244,36 @@ async fn clearing_the_live_best_takes_one_field_from_one_address() {
     sink.record_accepted(share(&other, "rig1", "sessC002", 543.5, 32.0, 1))
         .await;
     handle.flush_touches_now().await;
-
-    let my_key = client_live_key(&mine, "rig1", "sessC001");
-    let other_key = client_live_key(&other, "rig1", "sessC002");
-
-    // Precondition, or "it is gone" below would pass on an empty hash.
     assert_eq!(
-        hgetall(&mut redis, &my_key)
-            .await
-            .get(F_BEST_DIFFICULTY)
-            .map(String::as_str),
-        Some("100.5"),
-        "precondition: the session recorded a best to clear"
+        row_best(&pool, "sessC001").await,
+        100.5,
+        "precondition: the session recorded a best to reset"
     );
 
-    let cleared = bp_client_live::clear_address_best_difficulty(
-        Some(&redis),
+    bp_db::reset_address_settings_best_difficulty(
+        &pool,
         &bp_common::AddressId::new(mine.clone()).expect("address"),
     )
     .await
-    .expect("clear");
-    assert_eq!(cleared, 1, "one field removed, from the one live session");
+    .expect("reset");
 
-    let hash = hgetall(&mut redis, &my_key).await;
     assert_eq!(
-        hash.get(F_BEST_DIFFICULTY),
-        None,
-        "the best is gone from the session hash"
+        row_best(&pool, "sessC001").await,
+        0.0,
+        "the reset zeroed it"
     );
-    // The rest of the hash is live telemetry, not a record — untouched.
     assert_eq!(
-        hash.get(F_CURRENT_DIFFICULTY).map(String::as_str),
-        Some("64")
-    );
-    assert_eq!(hash.get(F_CHANNEL_COUNT).map(String::as_str), Some("2"));
-    assert!(
-        hash.contains_key(F_UPDATED_AT_MS),
-        "liveness timestamp survives the clear"
-    );
-    assert!(
-        ttl(&mut redis, &my_key).await > 0,
-        "clearing a field must not strip the key's TTL"
+        row_best(&pool, "sessC002").await,
+        543.5,
+        "another miner's best is not collateral"
     );
 
-    // Negative control: another miner's record is not collateral.
-    assert_eq!(
-        hgetall(&mut redis, &other_key)
-            .await
-            .get(F_BEST_DIFFICULTY)
-            .map(String::as_str),
-        Some("543.5"),
-        "the clear is scoped to one address"
-    );
-
-    // A lower share now sets the best: the old high is gone, not masked.
     sink.record_accepted(share(&mine, "rig1", "sessC001", 7.25, 64.0, 2))
         .await;
     handle.flush_touches_now().await;
     assert_eq!(
-        hgetall(&mut redis, &my_key)
-            .await
-            .get(F_BEST_DIFFICULTY)
-            .map(String::as_str),
-        Some("7.25"),
+        row_best(&pool, "sessC001").await,
+        7.25,
         "post-reset the best rebuilds from the next share, not from the old high"
     );
 
@@ -304,7 +281,7 @@ async fn clearing_the_live_best_takes_one_field_from_one_address() {
     cleanup(&pool, prefix).await;
 }
 
-/// `best_difficulty` stays monotone across flushes while other fields overwrite.
+/// A lower later flush never lowers the row's best.
 #[tokio::test]
 async fn best_difficulty_is_monotone_across_flushes() {
     let Some(pool) = pg_or_skip().await else {
@@ -330,25 +307,78 @@ async fn best_difficulty_is_monotone_across_flushes() {
     sink.record_accepted(share(&address, "rig1", "sessL002", 100.0, 64.0, 1))
         .await;
     handle.flush_touches_now().await;
-    let hash = hgetall(&mut redis, &key).await;
-    assert_eq!(hash.get(F_BEST_DIFFICULTY).map(String::as_str), Some("100"));
+    assert_eq!(row_best(&pool, "sessL002").await, 100.0);
 
-    // A later window whose best is LOWER must not regress the stored
-    // best — while its other fields do overwrite.
     sink.record_accepted(share(&address, "rig1", "sessL002", 50.0, 64.0, 3))
         .await;
     handle.flush_touches_now().await;
-    let hash = hgetall(&mut redis, &key).await;
     assert_eq!(
-        hash.get(F_CHANNEL_COUNT).map(String::as_str),
+        hgetall(&mut redis, &key)
+            .await
+            .get(F_CHANNEL_COUNT)
+            .map(String::as_str),
         Some("3"),
         "second flush must have landed (latest-wins field)"
     );
     assert_eq!(
-        hash.get(F_BEST_DIFFICULTY).map(String::as_str),
-        Some("100"),
-        "a lower later window must not regress best_difficulty"
+        row_best(&pool, "sessL002").await,
+        100.0,
+        "a lower later window must not regress the best"
     );
+
+    handle.shutdown().await;
+    cleanup(&pool, prefix).await;
+}
+
+/// A paused miner's live key expires; its session keeps the best.
+#[tokio::test]
+async fn a_session_keeps_its_best_when_its_live_key_expires() {
+    let Some(pool) = pg_or_skip().await else {
+        return;
+    };
+    let Some(mut redis) = connect_redis_in_range_or_skip(redis_db::SESSION_PERSISTENCE, 10).await
+    else {
+        return;
+    };
+    let prefix = "test_lv_pause_";
+    cleanup(&pool, prefix).await;
+
+    let handle = spawn_engine(&pool, redis.clone()).await;
+    let hook = handle.session_persistence_hook();
+    let sink = handle.client_row_touch_sink();
+    let address = format!("{prefix}carl");
+    let key = client_live_key(&address, "rig1", "sessL010");
+
+    hook.register_session("sessL010", &address, "rig1", None)
+        .await;
+    handle.flush_births_now().await;
+    sink.record_accepted(share(&address, "rig1", "sessL010", 123.0, 64.0, 1))
+        .await;
+    handle.flush_touches_now().await;
+
+    // The key's TTL runs out during the pause.
+    let _: i64 = redis::cmd("DEL")
+        .arg(&key)
+        .query_async(&mut redis)
+        .await
+        .expect("DEL");
+    let rows = bp_db::find_clients_by_address(
+        &pool,
+        &bp_common::AddressId::new(address.clone()).expect("address"),
+    )
+    .await
+    .expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].best_difficulty, 123.0,
+        "the listed session keeps its best"
+    );
+
+    // Shares resume lower; the best stays.
+    sink.record_accepted(share(&address, "rig1", "sessL010", 5.0, 64.0, 1))
+        .await;
+    handle.flush_touches_now().await;
+    assert_eq!(row_best(&pool, "sessL010").await, 123.0);
 
     handle.shutdown().await;
     cleanup(&pool, prefix).await;
@@ -694,7 +724,6 @@ async fn composed_reader_returns_the_writers_fields_in_position() {
     .expect("composed read");
     assert_eq!(live.len(), 2);
     let lf = live[0].as_ref().expect("flushed session has live fields");
-    assert!((lf.best_difficulty - 100.5).abs() < 0.01);
     assert_eq!(lf.current_difficulty, Some(64.0));
     assert_eq!(lf.channel_count, Some(2));
     assert_eq!(lf.hash_rate, 5.0e12, "the share's vardiff rate");

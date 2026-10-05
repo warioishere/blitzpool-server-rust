@@ -66,10 +66,10 @@ impl SharedSessionPersistence for SessionPersistenceHook {
     }
 }
 
-/// Bumps the session's `client:live:*` hash (TTL, best/current difficulty,
-/// vardiff's hashrate, channel count) on every accepted share, buffered to
-/// one write per session per flush, and tells the watchdog the session is
-/// still sending.
+/// Buffers every accepted share for the session's best (onto its row) and its
+/// `client:live:*` hash (TTL, current difficulty, vardiff's hashrate, channel
+/// count), one write per session per flush, and tells the watchdog the
+/// session is still sending.
 #[derive(Clone)]
 pub struct ClientRowTouchSink {
     buffer: Arc<TouchBuffer>,
@@ -100,7 +100,7 @@ impl SharedAcceptedShareSink for ClientRowTouchSink {
         // `effective_difficulty` is the session's current vardiff target.
         self.buffer.record(
             key,
-            share.submission_difficulty as f32,
+            share.submission_difficulty,
             Some(share.effective_difficulty as f32),
             share.hash_rate,
             share.channel_count as i32,

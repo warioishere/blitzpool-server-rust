@@ -191,10 +191,9 @@ fn epoch_ms_to_iso(ms: i64) -> Option<String> {
         .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
-/// Reset a miner's own best difficulty and its notification baseline, so the
-/// API and the bot command leave the same state. `"allTimeBestDifficulty"`
-/// (the public record) is never touched. Callers must also clear the Redis
-/// session bests (`bp_client_live::clear_address_best_difficulty`).
+/// Reset a miner's own best difficulty, its notification baseline and the
+/// bests of its connected sessions, so every caller leaves the same state.
+/// `"allTimeBestDifficulty"` (the public record) is never touched.
 pub async fn reset_address_settings_best_difficulty(
     pool: &PgPool,
     address: &AddressId,
@@ -219,5 +218,16 @@ pub async fn reset_address_settings_best_difficulty(
     .execute(pool)
     .await
     .map_err(DbError::from)?;
+    let mut tx = pool.begin().await.map_err(DbError::from)?;
+    crate::client::take_client_entity_bulk_write_lock(&mut tx).await?;
+    sqlx::query!(
+        r#"UPDATE client_entity SET "bestDifficulty" = 0
+           WHERE address = $1 AND "bestDifficulty" > 0"#,
+        address.as_str()
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(DbError::from)?;
+    tx.commit().await.map_err(DbError::from)?;
     Ok(result.rows_affected())
 }

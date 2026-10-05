@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            address AS \"address!: AddressId\",\n            \"clientName\" AS \"client_name!\",\n            \"sessionId\" AS \"session_id!\",\n            \"userAgent\" AS \"user_agent?\",\n            \"startTime\" AS \"start_time!\"\n           FROM client_entity\n           WHERE \"deletedAt\" IS NULL",
+  "query": "SELECT\n            address AS \"address!: AddressId\",\n            \"clientName\" AS \"client_name!\",\n            \"sessionId\" AS \"session_id!\",\n            \"userAgent\" AS \"user_agent?\",\n            \"startTime\" AS \"start_time!\",\n            \"bestDifficulty\" AS \"best_difficulty!\"\n           FROM client_entity\n           WHERE address = ANY($1) AND \"deletedAt\" IS NULL",
   "describe": {
     "columns": [
       {
@@ -27,18 +27,26 @@
         "ordinal": 4,
         "name": "start_time!",
         "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "best_difficulty!",
+        "type_info": "Float8"
       }
     ],
     "parameters": {
-      "Left": []
+      "Left": [
+        "TextArray"
+      ]
     },
     "nullable": [
       false,
       false,
       false,
       true,
+      false,
       false
     ]
   },
-  "hash": "ba129a36555607a9f6480770287a4d213bb493f636b39fc5f39ef42052993ae5"
+  "hash": "38255cb683032c2bea67ca9c0dd1d2dc6770902c54079a826ebdf5317f58350f"
 }

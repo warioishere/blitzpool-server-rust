@@ -22,6 +22,9 @@ pub struct ClientRow {
     pub user_agent: Option<String>,
     #[sqlx(rename = "startTime")]
     pub start_time: i64,
+    /// Best accepted share of this session; survives pauses with the row.
+    #[sqlx(rename = "bestDifficulty")]
+    pub best_difficulty: f64,
 }
 
 impl bp_common::live_client_key::SessionKey for ClientRow {
@@ -49,7 +52,8 @@ pub async fn find_client(
             "clientName" AS "client_name!",
             "sessionId" AS "session_id!",
             "userAgent" AS "user_agent?",
-            "startTime" AS "start_time!"
+            "startTime" AS "start_time!",
+            "bestDifficulty" AS "best_difficulty!"
            FROM client_entity
            WHERE address = $1 AND "clientName" = $2 AND "sessionId" = $3 LIMIT 1"#,
         address.as_str(),
@@ -73,7 +77,8 @@ pub async fn find_clients_by_address(
             "clientName" AS "client_name!",
             "sessionId" AS "session_id!",
             "userAgent" AS "user_agent?",
-            "startTime" AS "start_time!"
+            "startTime" AS "start_time!",
+            "bestDifficulty" AS "best_difficulty!"
            FROM client_entity
            WHERE address = $1 AND "deletedAt" IS NULL
            ORDER BY "clientName", "sessionId""#,
@@ -95,7 +100,8 @@ pub async fn find_active_session_keys(pool: &PgPool) -> Result<Vec<ClientRow>, D
             "clientName" AS "client_name!",
             "sessionId" AS "session_id!",
             "userAgent" AS "user_agent?",
-            "startTime" AS "start_time!"
+            "startTime" AS "start_time!",
+            "bestDifficulty" AS "best_difficulty!"
            FROM client_entity
            WHERE "deletedAt" IS NULL"#,
     )
@@ -121,7 +127,8 @@ pub async fn find_active_sessions_for_addresses(
             "clientName" AS "client_name!",
             "sessionId" AS "session_id!",
             "userAgent" AS "user_agent?",
-            "startTime" AS "start_time!"
+            "startTime" AS "start_time!",
+            "bestDifficulty" AS "best_difficulty!"
            FROM client_entity
            WHERE address = ANY($1) AND "deletedAt" IS NULL"#,
         addresses,
@@ -479,7 +486,7 @@ const CLIENT_ENTITY_BULK_WRITE_LOCK: i64 = 0x636c_6e74_6277; // "clntbw"
 
 /// Take [`CLIENT_ENTITY_BULK_WRITE_LOCK`] for the rest of `tx`; the `_xact_`
 /// variant releases on rollback too, so an error cannot leak the lock.
-async fn take_client_entity_bulk_write_lock(
+pub(crate) async fn take_client_entity_bulk_write_lock(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<(), DbError> {
     sqlx::query!(
@@ -500,6 +507,43 @@ pub async fn bulk_upsert_clients(pool: &PgPool, rows: &[ClientUpsert]) -> Result
     let n = upsert_clients_stmt(&mut *tx, rows).await?;
     tx.commit().await.map_err(DbError::from)?;
     Ok(n)
+}
+
+/// Raise each session's `bestDifficulty` to its flushed best where that beats
+/// the stored value (parallel key arrays). Rows already at or above it are not
+/// written, so writes follow new records, not shares. A session whose row is
+/// not born yet matches nothing.
+pub async fn raise_client_best_difficulties(
+    pool: &PgPool,
+    addresses: &[String],
+    client_names: &[String],
+    session_ids: &[String],
+    bests: &[f64],
+) -> Result<u64, DbError> {
+    if addresses.is_empty() {
+        return Ok(0);
+    }
+    let mut tx = pool.begin().await.map_err(DbError::from)?;
+    take_client_entity_bulk_write_lock(&mut tx).await?;
+    let result = sqlx::query!(
+        r#"UPDATE client_entity AS c
+           SET "bestDifficulty" = u.best
+           FROM unnest($1::varchar[], $2::varchar[], $3::varchar[], $4::float8[])
+                AS u(address, client_name, session_id, best)
+           WHERE c.address = u.address
+             AND c."clientName" = u.client_name
+             AND c."sessionId" = u.session_id
+             AND c."bestDifficulty" < u.best"#,
+        addresses,
+        client_names,
+        session_ids,
+        bests,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(DbError::from)?;
+    tx.commit().await.map_err(DbError::from)?;
+    Ok(result.rows_affected())
 }
 
 /// Soft-delete every active row with this `sessionId`. The PK does not make
@@ -539,7 +583,8 @@ where
             "clientName" AS "client_name!",
             "sessionId" AS "session_id!",
             "userAgent" AS "user_agent?",
-            "startTime" AS "start_time!"
+            "startTime" AS "start_time!",
+            "bestDifficulty" AS "best_difficulty!"
            FROM client_entity
            WHERE "updatedAt" < $1 AND "deletedAt" IS NULL"#,
         cutoff_ms

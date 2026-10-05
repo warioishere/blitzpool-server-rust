@@ -320,7 +320,7 @@ async fn by_address(
                             session_id: c.session_id,
                             extranonce: overrides.get(&c.client_name).cloned(),
                             name: c.client_name,
-                            best_difficulty: format!("{:.2}", lf.best_difficulty),
+                            best_difficulty: format!("{:.2}", c.best_difficulty),
                             hash_rate: lf.hash_rate,
                             current_difficulty: lf.current_difficulty,
                             channel_count: lf.channel_count.unwrap_or(1),
@@ -452,16 +452,9 @@ async fn by_worker(
             if matching.is_empty() {
                 return Err(ApiError::NotFound);
             }
-            // Max over the worker's live per-session bests (a session
-            // without a live hash contributes nothing, like a 0 column).
-            let live = crate::error::or_degraded(
-                bp_client_live::live_fields_for_sessions(s.redis.as_ref(), &matching).await,
-                || vec![None; matching.len()],
-            )?;
-            let best_difficulty = live
+            let best_difficulty = matching
                 .iter()
-                .flatten()
-                .map(|lf| lf.best_difficulty)
+                .map(|c| c.best_difficulty)
                 .fold(0.0_f64, f64::max)
                 .floor() as i64;
 
@@ -538,19 +531,6 @@ async fn by_session(
                 let row = find_client(&s.pool, &addr, &worker, &session)
                     .await?
                     .ok_or(ApiError::NotFound)?;
-                let live = crate::error::or_degraded(
-                    bp_client_live::live_fields_for_sessions(
-                        s.redis.as_ref(),
-                        &[(addr.as_str(), worker.as_str(), session.as_str())],
-                    )
-                    .await,
-                    || vec![None],
-                )?;
-                let live_best = live
-                    .first()
-                    .and_then(|o| o.as_ref())
-                    .map(|lf| lf.best_difficulty)
-                    .unwrap_or(0.0);
 
                 let now = bp_common::now_ms();
                 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
@@ -574,7 +554,7 @@ async fn by_session(
                 Ok(SessionResponse {
                     session_id: row.session_id,
                     name: row.client_name,
-                    best_difficulty: live_best.floor() as i64,
+                    best_difficulty: row.best_difficulty.floor() as i64,
                     chart_data,
                     start_time: crate::time_range::format_iso_ms(row.start_time),
                 })
@@ -623,16 +603,9 @@ async fn reset_address(
     Path(address): Path<String>,
 ) -> Result<Json<StatusResponse>, ApiError> {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
-    // Clears the per-address value and the notification baseline. The
-    // public `allTimeBestDifficulty` is untouched by design.
+    // The per-address value, the notification baseline and the session
+    // bests. The public `allTimeBestDifficulty` is untouched by design.
     reset_address_settings_best_difficulty(&state.pool, &addr).await?;
-    // Best-effort second half: the per-session bests in Redis. A failure
-    // here leaves stale worker rows until their next share, which is a
-    // display lag, not a wrong total — so it must not fail the reset.
-    if let Err(e) = bp_client_live::clear_address_best_difficulty(state.redis.as_ref(), &addr).await
-    {
-        tracing::warn!(target: "bp_api", error = %e, address = %addr, "reset: live best-difficulty clear failed");
-    }
     invalidate_address_cache(&state, &addr).await;
     Ok(Json(StatusResponse {
         status: "reset",

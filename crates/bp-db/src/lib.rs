@@ -66,9 +66,10 @@ pub use client::{
     find_client_rejected_statistics_since_for_address, find_client_statistics_since_for_address,
     find_clients_by_address, find_max_difficulty_since_for_addresses, find_pool_worker_rows_since,
     find_recently_deleted_sessions, find_stale_active_sessions, find_worker_shares,
-    revive_sessions, soft_delete_sessions, update_sv2_user_agent_by_address, upsert_client,
-    ClientRejectedStatisticsRow, ClientRow, ClientStatisticsRow, ClientUpsert, DeletedSessionRow,
-    DeviceFirstSeenRow, PoolWorkerRow, WorkerSharesRow,
+    raise_client_best_difficulties, revive_sessions, soft_delete_sessions,
+    update_sv2_user_agent_by_address, upsert_client, ClientRejectedStatisticsRow, ClientRow,
+    ClientStatisticsRow, ClientUpsert, DeletedSessionRow, DeviceFirstSeenRow, PoolWorkerRow,
+    WorkerSharesRow,
 };
 pub use custom_extranonce::{
     all_custom_extranonces, delete_extranonce_challenge, find_custom_extranonces_for_address,

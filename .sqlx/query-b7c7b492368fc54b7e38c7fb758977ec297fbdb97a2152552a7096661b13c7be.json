@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE client_entity SET \"bestDifficulty\" = 0\n           WHERE address = $1 AND \"bestDifficulty\" > 0",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b7c7b492368fc54b7e38c7fb758977ec297fbdb97a2152552a7096661b13c7be"
+}
