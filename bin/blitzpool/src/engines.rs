@@ -44,7 +44,6 @@ use crate::boot::FoundationHandles;
 pub(crate) struct EngineHandles {
     pub(crate) pplns: Option<PplnsEngine>,
     pub(crate) group_solo: Option<GroupSoloEngine>,
-    pub(crate) stats: ShareStatsEngineHandle,
     pub(crate) session_persistence: SessionPersistenceEngineHandle,
     pub(crate) mode_gate: Arc<BlitzpoolModeGate>,
     /// The front's sinks that stamp each share and publish it to the stream.
@@ -106,7 +105,6 @@ pub(crate) async fn spawn(
     let mode_gate = Arc::new(BlitzpoolModeGate::new());
     let pplns = spawn_pplns(cfg, handles, read_only).await?;
     let group_solo = spawn_group_solo(cfg, handles, read_only).await?;
-    let stats = spawn_stats(handles);
     let session_persistence = spawn_session_persistence(handles).await?;
     let blockparty_payouts = blockparty_payouts(cfg, handles)?;
 
@@ -131,7 +129,6 @@ pub(crate) async fn spawn(
     Ok(EngineHandles {
         pplns,
         group_solo,
-        stats,
         session_persistence,
         mode_gate,
         accepted_sink,
@@ -307,7 +304,8 @@ fn blockparty_payouts(
 
 // ─── ShareStats engine ───────────────────────────────────────────
 
-fn spawn_stats(handles: &FoundationHandles) -> ShareStatsEngineHandle {
+/// The share-stats engine, spawned only by the stream consumer that feeds it.
+pub(crate) fn spawn_stats(handles: &FoundationHandles) -> ShareStatsEngineHandle {
     let cfg = StatsSinkConfig {
         // Spreads the 60 s loops across the minute.
         tick_offset: crate::crons::offsets::STATS_SINK_FLUSH,
