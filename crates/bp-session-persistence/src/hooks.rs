@@ -12,7 +12,6 @@ use sqlx::PgPool;
 use tokio::time::Instant;
 use tracing::warn;
 
-use crate::diff_stat_buffer::{DiffStatBuffer, DiffStatKeyRef};
 use crate::hashrate_watchdog::HashrateWatchdog;
 use crate::row_debounce::RowDebounce;
 use crate::touch_buffer::{TouchBuffer, TouchKeyRef};
@@ -103,43 +102,5 @@ impl SharedAcceptedShareSink for ClientRowTouchSink {
             share.ts_ms,
         );
         self.watchdog.record(key, Instant::now());
-    }
-}
-
-/// One difficulty-statistics slot (1 hour) in ms.
-const DIFF_STAT_SLOT_MS: i64 = 60 * 60 * 1000;
-
-/// Records the per-`(address, worker, hour-slot)` max share difficulty into
-/// `client_difficulty_statistics_entity`, batched: an inline upsert per new
-/// max would burst after a restart and at every hour rollover.
-#[derive(Clone)]
-pub struct ClientDifficultyStatisticsSink {
-    buffer: Arc<DiffStatBuffer>,
-}
-
-impl ClientDifficultyStatisticsSink {
-    pub(crate) fn new(buffer: Arc<DiffStatBuffer>) -> Self {
-        Self { buffer }
-    }
-}
-
-#[async_trait]
-impl SharedAcceptedShareSink for ClientDifficultyStatisticsSink {
-    async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
-        let candidate = share.submission_difficulty;
-        if !candidate.is_finite() || candidate <= 0.0 {
-            return;
-        }
-        // The hour the share was accepted in, not the hour it was consumed in.
-        let slot = (share.ts_ms / DIFF_STAT_SLOT_MS) * DIFF_STAT_SLOT_MS;
-        self.buffer.record(
-            DiffStatKeyRef {
-                address: share.address,
-                worker: share.worker,
-                slot_ms: slot,
-            },
-            candidate as f32,
-            share.ts_ms,
-        );
     }
 }

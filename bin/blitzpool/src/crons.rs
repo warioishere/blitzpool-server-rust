@@ -531,13 +531,10 @@ pub(crate) fn spawn_old_stats_cleanup(pool: PgPool, cancel: CancellationToken) -
                 _ = ticker.tick() => {
                     let now = Utc::now().timestamp_millis();
                     let stats_cutoff = now - STATS_RETENTION.as_millis() as i64;
-                    let hourly_cutoff =
-                        (stats_cutoff / (60 * 60 * 1000)) * (60 * 60 * 1000);
                     let client_cutoff = now - CLIENT_HARD_DELETE_RETENTION.as_millis() as i64;
 
-                    let mut totals: [(&str, u64); 5] = [
+                    let mut totals: [(&str, u64); 4] = [
                         ("client_statistics", 0),
-                        ("client_difficulty_statistics", 0),
                         ("pool_mode_hashrate", 0),
                         ("client_entity_hard_delete", 0),
                         ("email_verification_purge", 0),
@@ -546,32 +543,26 @@ pub(crate) fn spawn_old_stats_cleanup(pool: PgPool, cancel: CancellationToken) -
                         Ok(n) => totals[0].1 = n,
                         Err(err) => warn!(%err, "delete_old_client_statistics"),
                     }
-                    match bp_db::delete_old_client_difficulty_statistics(&pool, hourly_cutoff).await {
-                        Ok(n) => totals[1].1 = n,
-                        Err(err) => warn!(%err, "delete_old_client_difficulty_statistics"),
-                    }
                     match bp_db::delete_old_pool_mode_hashrate(&pool, stats_cutoff).await {
-                        Ok(n) => totals[2].1 = n,
+                        Ok(n) => totals[1].1 = n,
                         Err(err) => warn!(%err, "delete_old_pool_mode_hashrate"),
                     }
                     match bp_db::delete_old_clients(&pool, client_cutoff).await {
-                        Ok(n) => totals[3].1 = n,
+                        Ok(n) => totals[2].1 = n,
                         Err(err) => warn!(%err, "delete_old_clients"),
                     }
                     match bp_db::delete_expired_email_verifications(&pool, now).await {
-                        Ok(n) => totals[4].1 = n,
+                        Ok(n) => totals[3].1 = n,
                         Err(err) => warn!(%err, "delete_expired_email_verifications"),
                     }
                     let total: u64 = totals.iter().map(|(_, n)| *n).sum();
                     if total > 0 {
                         info!(
                             client_statistics = totals[0].1,
-                            client_difficulty_statistics = totals[1].1,
-                            pool_mode_hashrate = totals[2].1,
-                            client_entity_hard_delete = totals[3].1,
-                            email_verification_purge = totals[4].1,
+                            pool_mode_hashrate = totals[1].1,
+                            client_entity_hard_delete = totals[2].1,
+                            email_verification_purge = totals[3].1,
                             stats_cutoff,
-                            hourly_cutoff,
                             client_cutoff,
                             "crons.old_stats_cleanup: purged"
                         );

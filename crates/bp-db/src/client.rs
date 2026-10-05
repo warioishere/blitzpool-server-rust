@@ -285,46 +285,6 @@ pub struct ClientStatisticsRow {
     pub max_difficulty: f32,
 }
 
-/// Upserts per-slot maxima; `GREATEST` so a lower share never lowers a slot.
-/// The caller MUST collapse duplicates per `(address, clientName, slotTime)`:
-/// Postgres errors when one `ON CONFLICT DO UPDATE` hits a row twice. No
-/// advisory lock because one flush loop is the only writer; a second needs one.
-pub async fn bulk_upsert_client_difficulty_statistics(
-    pool: &PgPool,
-    addresses: &[String],
-    client_names: &[String],
-    slot_times: &[i64],
-    max_difficulties: &[f32],
-    updated_ats: &[i64],
-) -> Result<u64, DbError> {
-    let result = sqlx::query!(
-        r#"INSERT INTO client_difficulty_statistics_entity
-               (address, "clientName", "slotTime", "maxDifficulty", "createdAt", "updatedAt")
-           SELECT
-               unnest($1::text[]),
-               unnest($2::text[]),
-               unnest($3::bigint[]),
-               unnest($4::real[]),
-               unnest($5::bigint[]),
-               unnest($5::bigint[])
-           ON CONFLICT (address, "clientName", "slotTime") DO UPDATE SET
-               "maxDifficulty" = GREATEST(
-                   EXCLUDED."maxDifficulty",
-                   client_difficulty_statistics_entity."maxDifficulty"
-               ),
-               "updatedAt" = EXCLUDED."updatedAt""#,
-        addresses,
-        client_names,
-        slot_times,
-        max_difficulties,
-        updated_ats,
-    )
-    .execute(pool)
-    .await
-    .map_err(DbError::from)?;
-    Ok(result.rows_affected())
-}
-
 #[derive(Clone, Debug, FromRow)]
 pub struct WorkerSharesRow {
     pub address: AddressId,
@@ -723,21 +683,6 @@ where
     E: sqlx::PgExecutor<'e>,
 {
     let r = sqlx::query(r#"DELETE FROM client_statistics_entity WHERE "time" < $1"#)
-        .bind(cutoff_ms)
-        .execute(executor)
-        .await
-        .map_err(DbError::from)?;
-    Ok(r.rows_affected())
-}
-
-pub async fn delete_old_client_difficulty_statistics<'e, E>(
-    executor: E,
-    cutoff_ms: i64,
-) -> Result<u64, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    let r = sqlx::query(r#"DELETE FROM client_difficulty_statistics_entity WHERE "slotTime" < $1"#)
         .bind(cutoff_ms)
         .execute(executor)
         .await

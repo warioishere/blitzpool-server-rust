@@ -13,8 +13,6 @@ pub struct SessionPersistenceConfig {
     pub touch_flush_interval: Duration,
     /// How often the watchdog looks for sessions that stopped sending shares.
     pub hashrate_watchdog_interval: Duration,
-    /// Flush interval for the per-slot max-difficulty upserts.
-    pub diff_stat_flush_interval: Duration,
     /// How long a session must survive before its `client_entity` row is
     /// written. Must stay well below the device-status gate's `online_dwell`,
     /// which treats a device without a row as absent. `ZERO` is legal.
@@ -31,7 +29,6 @@ impl Default for SessionPersistenceConfig {
         Self {
             touch_flush_interval: Duration::from_secs(30),
             hashrate_watchdog_interval: Duration::from_secs(60),
-            diff_stat_flush_interval: Duration::from_secs(30),
             row_debounce: Duration::from_secs(15),
             row_flush_interval: Duration::from_secs(5),
             live_ttl: Duration::from_secs(5 * 60),
@@ -49,12 +46,6 @@ impl SessionPersistenceConfig {
         if self.hashrate_watchdog_interval.is_zero() {
             return Err(SessionPersistenceError::Config(
                 "hashrate_watchdog_interval must be > 0".to_string(),
-            ));
-        }
-        // `tokio::time::interval` panics on a zero interval.
-        if self.diff_stat_flush_interval.is_zero() {
-            return Err(SessionPersistenceError::Config(
-                "diff_stat_flush_interval must be > 0".to_string(),
             ));
         }
         // `row_debounce` may be zero: it is an age threshold, not a timer.

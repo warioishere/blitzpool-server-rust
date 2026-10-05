@@ -661,39 +661,39 @@ async fn best_difficulty_today_maxes_workers_and_slots_from_since() {
     };
     // Own address: no sibling test in this binary touches it.
     let addr = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    let slot = bp_stats::SLOT_DURATION_MS;
     let hour: i64 = 60 * 60 * 1000;
-    // `since` on an hour boundary, one hour back, so `since + 1h` is the
-    // current hour and every seeded slot lies inside the accepted window.
-    let since = (bp_common::now_ms() / hour) * hour - hour;
-    // Values exactly representable as f32 (the column is `real`). The
-    // highest one sits in the slot BEFORE `since`, so it only shows up in
-    // the answer if the boundary is wrong.
+    // `since` on a slot boundary an hour back, inside the accepted window.
+    let since = (bp_common::now_ms() / slot) * slot - hour;
+    // Rows are keyed by slot END. Values exactly representable as f32 (the
+    // column is `real`). The highest one is the slot that ends at `since`,
+    // i.e. lies before it, so it only shows up if the boundary is wrong.
     let rows: [(&str, i64, f32); 4] = [
-        ("rig_a", since - hour, 9_000.5),
-        ("rig_a", since, 1_500.25),
-        ("rig_b", since, 800.0),
-        ("rig_b", since + hour, 2_048.75),
+        ("rig_a", since, 9_000.5),
+        ("rig_a", since + slot, 1_500.25),
+        ("rig_b", since + slot, 800.0),
+        ("rig_b", since + 2 * slot, 2_048.75),
     ];
     let cleanup = || async {
-        let _ = sqlx::query("DELETE FROM client_difficulty_statistics_entity WHERE address = $1")
+        let _ = sqlx::query("DELETE FROM client_statistics_entity WHERE address = $1")
             .bind(addr)
             .execute(&pool)
             .await;
     };
     cleanup().await;
-    for (worker, slot, max) in rows {
+    for (worker, slot_end, max) in rows {
         sqlx::query(
-            r#"INSERT INTO client_difficulty_statistics_entity
-                 (address, "clientName", "slotTime", "maxDifficulty")
-               VALUES ($1, $2, $3, $4)"#,
+            r#"INSERT INTO client_statistics_entity
+                 (address, "clientName", "sessionId", "time", shares, "maxDifficulty")
+               VALUES ($1, $2, 's1', $3, 1, $4)"#,
         )
         .bind(addr)
         .bind(worker)
-        .bind(slot)
+        .bind(slot_end)
         .bind(max)
         .execute(&pool)
         .await
-        .expect("seed diff stat");
+        .expect("seed client stats");
     }
 
     let today = get_json(
@@ -701,22 +701,22 @@ async fn best_difficulty_today_maxes_workers_and_slots_from_since() {
         &format!("/api/client/{addr}/best-difficulty/today?since={since}"),
     )
     .await;
-    // Negative control: one hour earlier the pre-`since` row is in range,
+    // Negative control: one slot earlier the pre-`since` row is in range,
     // so it exists and a missing 9000.5 above is the filter, not the seed.
     let earlier = get_json(
         pool.clone(),
         &format!(
             "/api/client/{addr}/best-difficulty/today?since={}",
-            since - hour
+            since - slot
         ),
     )
     .await;
-    // One ms past the slot start excludes that slot: no flooring to the hour.
+    // One ms past a slot's start excludes that slot: nothing before `since`.
     let past_slot = get_json(
         pool.clone(),
         &format!(
             "/api/client/{addr}/best-difficulty/today?since={}",
-            since - hour + 1
+            since - slot + 1
         ),
     )
     .await;
@@ -728,6 +728,64 @@ async fn best_difficulty_today_maxes_workers_and_slots_from_since() {
     assert_eq!(earlier.1["bestDifficulty"], serde_json::json!(9000.5));
     assert_eq!(past_slot.0, StatusCode::OK, "{}", past_slot.1);
     assert_eq!(past_slot.1["bestDifficulty"], serde_json::json!(2048.75));
+}
+
+/// Hourly buckets take the max of the 10-minute slots that START in the
+/// hour: the slot ending on the hour belongs to the hour before.
+#[tokio::test]
+async fn diff_scores_folds_slots_into_the_hour_they_start_in() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    // Own address: no sibling test in this binary touches it.
+    let addr = "bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l";
+    let slot = bp_stats::SLOT_DURATION_MS;
+    let hour: i64 = 60 * 60 * 1000;
+    let h = (bp_common::now_ms() / hour) * hour - 3 * hour;
+    let rows: [(i64, f32); 3] = [
+        (h + slot, 100.0),      // [h, h+10m): hour h
+        (h + hour, 700.0),      // [h+50m, h+60m): still hour h
+        (h + hour + slot, 5.0), // [h+60m, h+70m): hour h+1
+    ];
+    let cleanup = || async {
+        let _ = sqlx::query("DELETE FROM client_statistics_entity WHERE address = $1")
+            .bind(addr)
+            .execute(&pool)
+            .await;
+    };
+    cleanup().await;
+    for (slot_end, max) in rows {
+        sqlx::query(
+            r#"INSERT INTO client_statistics_entity
+                 (address, "clientName", "sessionId", "time", shares, "maxDifficulty")
+               VALUES ($1, 'rig', 's1', $2, 1, $3)"#,
+        )
+        .bind(addr)
+        .bind(slot_end)
+        .bind(max)
+        .execute(&pool)
+        .await
+        .expect("seed client stats");
+    }
+    let (status, body) = get_json(pool.clone(), &format!("/api/client/{addr}/diff-scores")).await;
+    cleanup().await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let at = |t: i64| -> Option<f64> {
+        let label = chrono::DateTime::from_timestamp_millis(t)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        body["slotData"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["time"] == label)
+            .unwrap_or_else(|| panic!("no bucket {label} in {body}"))["difficulty"]
+            .as_f64()
+    };
+    assert_eq!(at(h), Some(700.0));
+    assert_eq!(at(h + hour), Some(5.0));
 }
 
 #[tokio::test]

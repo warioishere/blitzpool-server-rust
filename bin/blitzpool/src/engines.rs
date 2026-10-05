@@ -560,7 +560,6 @@ pub(crate) fn build_accepted_sinks(
     let aux: Vec<Arc<dyn SharedAcceptedShareSink>> = vec![
         Arc::new(ShareStatsAcceptedSink::new(stats.accumulators())),
         Arc::new(session_persistence.client_row_touch_sink()),
-        Arc::new(session_persistence.client_difficulty_statistics_sink()),
         Arc::new(crate::live_mode_marker::LiveModeMarkerSink::new(
             redis,
             Arc::new(bp_mining_mode::MarkDebouncer::new()),

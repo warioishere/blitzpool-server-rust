@@ -624,6 +624,8 @@ async fn purge_address_stats(pool: &sqlx::PgPool, addr: &AddressId) -> Result<()
     .execute(pool)
     .await
     .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
+    // Nothing writes the next two tables; the deletes clear what they still
+    // hold for this address until a migration drops them.
     sqlx::query!(
         r#"DELETE FROM client_rejected_statistics_entity WHERE address = $1"#,
         addr.as_str()
@@ -770,24 +772,19 @@ async fn diff_scores(
             let start_slot = (since / one_hour_ms) * one_hour_ms;
             let end_slot = (now / one_hour_ms) * one_hour_ms;
 
-            let rows = sqlx::query!(
-                r#"SELECT "slotTime" AS "slot_time: i64",
-                          MAX("maxDifficulty") AS "max_diff: f32"
-                   FROM client_difficulty_statistics_entity
-                   WHERE address = $1
-                     AND "slotTime" BETWEEN $2 AND $3
-                   GROUP BY "slotTime""#,
-                addr.as_str(),
-                start_slot,
-                end_slot,
+            let rows = bp_db::find_max_difficulty_since_for_addresses(
+                &s.pool,
+                std::slice::from_ref(&addr),
+                start_slot + bp_stats::SLOT_DURATION_MS,
             )
-            .fetch_all(&s.pool)
-            .await
-            .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
+            .await?;
 
+            // A 10-minute slot (keyed by its end) belongs to the hour it starts in.
             let mut by_slot: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
-            for r in rows {
-                by_slot.insert(r.slot_time, r.max_diff.unwrap_or(0.0) as f64);
+            for (slot_end, max) in rows {
+                let hour = ((slot_end - bp_stats::SLOT_DURATION_MS) / one_hour_ms) * one_hour_ms;
+                let best = by_slot.entry(hour).or_insert(0.0);
+                *best = best.max(f64::from(max));
             }
             let mut slot_data = Vec::new();
             let mut t = start_slot;
@@ -806,8 +803,9 @@ async fn diff_scores(
 
 // ─── GET /api/client/:address/best-difficulty/today ──────────────
 //
-// Best share since the caller's local midnight `since`: not floored to the
-// hour, so nothing pre-midnight shows; not cached, as `since` varies by zone.
+// Best share since the caller's local midnight `since`, from the 10-minute
+// slots that start at or after it, so nothing pre-midnight shows; not
+// cached, as `since` varies by zone.
 
 /// Oldest `since` accepted, relative to now. A local midnight is at most
 /// 24 h back, 25 h on a DST fall-back day; the extra hour is room for
@@ -849,19 +847,18 @@ async fn best_difficulty_today(
             "since must be within the last 26 h and at most 1 h ahead",
         ));
     }
-    let best = sqlx::query_scalar!(
-        r#"SELECT MAX("maxDifficulty") AS "max_diff: f32"
-           FROM client_difficulty_statistics_entity
-           WHERE address = $1
-             AND "slotTime" >= $2"#,
-        addr.as_str(),
-        since,
+    // Only slots that start at or after `since`: a slot is keyed by its end.
+    let best = bp_db::find_max_difficulty_since_for_addresses(
+        &state.pool,
+        std::slice::from_ref(&addr),
+        since + bp_stats::SLOT_DURATION_MS,
     )
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
+    .await?
+    .into_iter()
+    .map(|(_, max)| f64::from(max))
+    .fold(0.0, f64::max);
     Ok(Json(BestDifficultyTodayResponse {
-        best_difficulty: best.map_or(0.0, f64::from),
+        best_difficulty: best,
     }))
 }
 

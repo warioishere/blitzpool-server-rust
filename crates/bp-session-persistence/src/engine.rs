@@ -16,10 +16,9 @@ use tracing::warn;
 use redis::aio::ConnectionManager;
 
 use crate::config::SessionPersistenceConfig;
-use crate::diff_stat_buffer::{run_flush_loop as run_diff_stat_flush_loop, DiffStatBuffer};
 use crate::error::SessionPersistenceError;
 use crate::hashrate_watchdog::{run_watchdog_loop, HashrateWatchdog};
-use crate::hooks::{ClientDifficultyStatisticsSink, ClientRowTouchSink, SessionPersistenceHook};
+use crate::hooks::{ClientRowTouchSink, SessionPersistenceHook};
 use crate::live_store::LiveSessionStore;
 use crate::row_debounce::{run_birth_loop, RowDebounce};
 use crate::touch_buffer::{run_flush_loop, TouchBuffer};
@@ -29,7 +28,6 @@ pub struct SessionPersistenceEngine {
     config: SessionPersistenceConfig,
     touch_buffer: Arc<TouchBuffer>,
     hashrate_watchdog: Arc<HashrateWatchdog>,
-    diff_stat_buffer: Arc<DiffStatBuffer>,
     row_debounce: Arc<RowDebounce>,
     live_store: Option<Arc<LiveSessionStore>>,
 }
@@ -55,7 +53,6 @@ impl SessionPersistenceEngine {
             config,
             touch_buffer: Arc::new(TouchBuffer::default()),
             hashrate_watchdog: Arc::new(HashrateWatchdog::default()),
-            diff_stat_buffer: Arc::new(DiffStatBuffer::default()),
             row_debounce: Arc::new(RowDebounce::default()),
             live_store,
         })
@@ -77,7 +74,6 @@ impl SessionPersistenceEngine {
             pool: self.pool,
             touch_buffer: self.touch_buffer,
             hashrate_watchdog: self.hashrate_watchdog,
-            diff_stat_buffer: self.diff_stat_buffer,
             row_debounce: self.row_debounce,
             row_debounce_age: self.config.row_debounce,
             live_store: self.live_store,
@@ -112,25 +108,16 @@ impl SessionPersistenceEngine {
             watchdog_rx,
         ));
 
-        let (diff_tx, diff_rx) = oneshot::channel();
-        let diff_join = tokio::spawn(run_diff_stat_flush_loop(
-            self.diff_stat_buffer.clone(),
-            self.pool.clone(),
-            self.config.diff_stat_flush_interval,
-            diff_rx,
-        ));
-
         SessionPersistenceEngineHandle {
             pool: self.pool,
             touch_buffer: self.touch_buffer,
             hashrate_watchdog: self.hashrate_watchdog,
-            diff_stat_buffer: self.diff_stat_buffer,
             row_debounce: self.row_debounce,
             row_debounce_age: self.config.row_debounce,
             live_store: self.live_store,
             shutdown: Arc::new(std::sync::Mutex::new(ShutdownState {
-                txs: vec![birth_tx, touch_tx, watchdog_tx, diff_tx],
-                joins: vec![birth_join, touch_join, watchdog_join, diff_join],
+                txs: vec![birth_tx, touch_tx, watchdog_tx],
+                joins: vec![birth_join, touch_join, watchdog_join],
             })),
         }
     }
@@ -151,7 +138,6 @@ pub struct SessionPersistenceEngineHandle {
     pool: PgPool,
     touch_buffer: Arc<TouchBuffer>,
     hashrate_watchdog: Arc<HashrateWatchdog>,
-    diff_stat_buffer: Arc<DiffStatBuffer>,
     row_debounce: Arc<RowDebounce>,
     row_debounce_age: Duration,
     live_store: Option<Arc<LiveSessionStore>>,
@@ -203,12 +189,6 @@ impl SessionPersistenceEngineHandle {
     /// accepted share, buffered until the next touch flush.
     pub fn client_row_touch_sink(&self) -> ClientRowTouchSink {
         ClientRowTouchSink::new(self.touch_buffer.clone(), self.hashrate_watchdog.clone())
-    }
-
-    /// Hook that records the per-`(address, worker, hour-slot)` max share
-    /// difficulty for the diff-scores chart.
-    pub fn client_difficulty_statistics_sink(&self) -> ClientDifficultyStatisticsSink {
-        ClientDifficultyStatisticsSink::new(self.diff_stat_buffer.clone())
     }
 
     /// Signal every loop and join them; idempotent across handle clones.
