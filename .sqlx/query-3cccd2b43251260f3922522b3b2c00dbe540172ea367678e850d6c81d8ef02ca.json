@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT \"time\" AS \"time!\", MAX(\"maxDifficulty\") AS \"max_difficulty!\"\n           FROM client_statistics_entity\n           WHERE \"deletedAt\" IS NULL AND address = ANY($1) AND \"time\" >= $2\n           GROUP BY \"time\"",
+  "query": "SELECT \"time\" AS \"time!\", MAX(\"maxDifficulty\") AS \"max_difficulty!\"\n           FROM client_statistics_entity\n           WHERE address = ANY($1) AND \"time\" >= $2\n           GROUP BY \"time\"",
   "describe": {
     "columns": [
       {
@@ -25,5 +25,5 @@
       null
     ]
   },
-  "hash": "c7e158d23f37ff3e7304e00974c782f17f7fadbf9525d89c6ea221adc4d3e66e"
+  "hash": "3cccd2b43251260f3922522b3b2c00dbe540172ea367678e850d6c81d8ef02ca"
 }

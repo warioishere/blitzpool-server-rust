@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT \"time\" AS \"time!\",\n                  COUNT(DISTINCT address) AS \"addresses!\",\n                  COUNT(DISTINCT (address, \"clientName\")) AS \"workers!\"\n             FROM client_statistics_entity\n            WHERE \"time\" >= $1\n            GROUP BY \"time\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "time!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "addresses!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "workers!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "be14e6432d790db9c061051d0ff88df002de3c37458b4aefaf70643be56472d4"
+}

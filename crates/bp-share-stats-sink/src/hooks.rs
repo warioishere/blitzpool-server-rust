@@ -8,13 +8,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bp_common::AddressId;
+use bp_db::pg_text;
 use bp_share_hook::{
     RejectedReason, SharedAcceptedShare, SharedAcceptedShareSink, SharedRejectedShare,
     SharedRejectedShareSink,
 };
 use bp_stats::{
-    ClientRejectedKey, ClientStatisticsKey, ClientStatisticsRecord, TimeSlot,
-    MAX_REASONABLE_DIFFICULTY,
+    ClientStatisticsKey, ClientStatisticsRecord, TimeSlot, WorkerKey, MAX_REASONABLE_DIFFICULTY,
 };
 
 use crate::flush::Accumulators;
@@ -46,9 +46,10 @@ impl SharedAcceptedShareSink for ShareStatsAcceptedSink {
             Ok(a) => a,
             Err(_) => return, // pre-authorize-rejected shapes can't be keyed
         };
+        let worker = pg_text(share.worker);
         let key = ClientStatisticsKey {
             address: address_id.clone(),
-            client_name: share.worker.to_string(),
+            client_name: worker.to_string(),
             session_id: share.session_id.to_string(),
             slot,
         };
@@ -56,26 +57,26 @@ impl SharedAcceptedShareSink for ShareStatsAcceptedSink {
             key,
             &ClientStatisticsRecord {
                 shares: diff,
-                accepted_count: 1.0,
                 max_difficulty: bp_stats::share_max(share.submission_difficulty),
                 ..Default::default()
             },
         );
         // Best difficulty tracks the solved difficulty, which can exceed the
         // credited one.
+        let user_agent = share.user_agent.map(pg_text);
         self.accumulators.best_difficulty.add(
             &address_id,
             share.submission_difficulty,
-            share.user_agent,
+            user_agent.as_deref(),
         );
         self.accumulators
             .share_totals
-            .add(address_id, share.worker.to_string(), diff);
+            .add(address_id, worker.into_owned(), diff);
     }
 }
 
-/// A reject before authorize has no address: it bumps only the pool-wide
-/// counters.
+/// A reject before authorize has neither address nor worker: it bumps only
+/// the pool-wide counters.
 pub struct ShareStatsRejectedSink {
     accumulators: Arc<Accumulators>,
 }
@@ -102,36 +103,32 @@ impl SharedRejectedShareSink for ShareStatsRejectedSink {
             .pool_rejected
             .add(slot, reason, difficulty);
 
-        let Some(addr) = share.address else {
+        let (Some(addr), Some(worker)) = (share.address, share.worker) else {
             return;
         };
+        let worker = pg_text(worker);
         let address_id = match AddressId::new(addr.to_string()) {
             Ok(a) => a,
             Err(_) => return,
         };
 
-        self.accumulators.client_rejected.add(
-            ClientRejectedKey {
+        self.accumulators.share_totals.add_worker_rejected(
+            WorkerKey {
                 address: address_id.clone(),
-                slot,
-                reason,
+                client_name: worker.to_string(),
             },
-            1.0,
             difficulty,
         );
 
         let key = ClientStatisticsKey {
             address: address_id.clone(),
-            client_name: share.worker.unwrap_or("").to_string(),
+            client_name: worker.to_string(),
             session_id: share.session_id.to_string(),
             slot,
         };
-        let mut delta = ClientStatisticsRecord {
-            rejected_count: 1.0,
-            ..Default::default()
-        };
-        // One column pair per reason, no folds, so the counters sum to
-        // `rejected_count`; a new `RejectedReason` variant needs its own pair.
+        let mut delta = ClientStatisticsRecord::default();
+        // One column pair per reason, no folds; a new `RejectedReason`
+        // variant needs its own pair.
         match reason {
             RejectedReason::JobNotFound => {
                 delta.rejected_job_not_found_count = 1.0;
@@ -189,11 +186,11 @@ mod tests {
         })
         .await;
 
-        let pool = accs.pool_shares.drain();
+        let pool = accs.pool_shares.take();
         let pool = pool.values().next().expect("one pool slot");
         assert_eq!((pool.accepted, pool.max_difficulty), (10.0, 4096.0));
 
-        let clients = accs.client_statistics.drain();
+        let clients = accs.client_statistics.take();
         let client = clients.values().next().expect("one client row");
         assert_eq!((client.shares, client.max_difficulty), (10.0, 4096.0));
     }

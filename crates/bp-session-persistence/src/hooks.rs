@@ -12,8 +12,6 @@ use sqlx::PgPool;
 use tokio::time::Instant;
 use tracing::warn;
 
-use crate::diff_stat_buffer::{DiffStatBuffer, DiffStatKeyRef};
-use crate::hashrate_watchdog::HashrateWatchdog;
 use crate::row_debounce::RowDebounce;
 use crate::touch_buffer::{TouchBuffer, TouchKeyRef};
 
@@ -68,33 +66,27 @@ impl SharedSessionPersistence for SessionPersistenceHook {
 
 /// Buffers every accepted share for the session's best (onto its row) and its
 /// `client:live:*` hash (TTL, current difficulty, vardiff's hashrate, channel
-/// count), one write per session per flush, and tells the watchdog the
-/// session is still sending.
+/// count, freshest share), one write per session per flush.
 #[derive(Clone)]
 pub struct ClientRowTouchSink {
     buffer: Arc<TouchBuffer>,
-    watchdog: Arc<HashrateWatchdog>,
 }
 
 impl ClientRowTouchSink {
-    pub(crate) fn new(buffer: Arc<TouchBuffer>, watchdog: Arc<HashrateWatchdog>) -> Self {
-        Self { buffer, watchdog }
+    pub(crate) fn new(buffer: Arc<TouchBuffer>) -> Self {
+        Self { buffer }
     }
 }
 
 #[async_trait]
 impl SharedAcceptedShareSink for ClientRowTouchSink {
     async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
-        // An SV2 user_identity without `.<name>` gives an empty worker; the
-        // session row was registered as "default", so this keeps the PK match.
-        let worker = if share.worker.is_empty() {
-            "default"
-        } else {
-            share.worker
-        };
+        // The worker keys the row's best write too, which Postgres rejects
+        // with a NUL in it.
+        let worker = bp_db::pg_text(share.worker);
         let key = TouchKeyRef {
             address: share.address,
-            client_name: worker,
+            client_name: &worker,
             session_id: share.session_id,
         };
         // `effective_difficulty` is the session's current vardiff target.
@@ -107,51 +99,6 @@ impl SharedAcceptedShareSink for ClientRowTouchSink {
             // The front's accept time, not ours: a later stamp on a share that
             // arrives after the disconnect would make `kill_dead_clients`
             // revive a session that is already gone.
-            share.ts_ms,
-        );
-        self.watchdog.record(key, Instant::now());
-    }
-}
-
-/// One difficulty-statistics slot (1 hour) in ms.
-const DIFF_STAT_SLOT_MS: i64 = 60 * 60 * 1000;
-
-/// Records the per-`(address, worker, hour-slot)` max share difficulty into
-/// `client_difficulty_statistics_entity`, batched: an inline upsert per new
-/// max would burst after a restart and at every hour rollover.
-#[derive(Clone)]
-pub struct ClientDifficultyStatisticsSink {
-    buffer: Arc<DiffStatBuffer>,
-}
-
-impl ClientDifficultyStatisticsSink {
-    pub(crate) fn new(buffer: Arc<DiffStatBuffer>) -> Self {
-        Self { buffer }
-    }
-}
-
-#[async_trait]
-impl SharedAcceptedShareSink for ClientDifficultyStatisticsSink {
-    async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
-        let candidate = share.submission_difficulty;
-        if !candidate.is_finite() || candidate <= 0.0 {
-            return;
-        }
-        // The hour the share was accepted in, not the hour it was consumed in.
-        let slot = (share.ts_ms / DIFF_STAT_SLOT_MS) * DIFF_STAT_SLOT_MS;
-        // Same "default" PK convention as the client-row touch sink.
-        let worker = if share.worker.is_empty() {
-            "default"
-        } else {
-            share.worker
-        };
-        self.buffer.record(
-            DiffStatKeyRef {
-                address: share.address,
-                worker,
-                slot_ms: slot,
-            },
-            candidate as f32,
             share.ts_ms,
         );
     }

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE address_settings_entity SET shares = 0 WHERE address = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "63a09f0d45f8ef26922aa87ac19a09fa6071b74be5b0d2c1b83d81b387e9c4b3"
+}

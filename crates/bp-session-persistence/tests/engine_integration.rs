@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use bp_session_persistence::{SessionPersistenceConfig, SessionPersistenceEngine};
-use bp_share_hook::{SharedAcceptedShare, SharedAcceptedShareSink, SharedSessionPersistence};
+use bp_share_hook::SharedSessionPersistence;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use tokio::sync::Mutex;
 
@@ -251,7 +251,7 @@ async fn a_poisoned_birth_row_is_isolated_and_dropped_after_bounded_retries() {
         .await;
 
     // Flush 1: bulk fails on the poisoned row, the per-row fallback
-    // births the healthy one and rebuffers the poison (attempt 1).
+    // births the healthy one and keeps the poison for retry (attempt 1).
     handle.flush_births_now().await;
     let healthy: i64 =
         sqlx::query_scalar(r#"SELECT count(*) FROM client_entity WHERE "sessionId" = $1"#)
@@ -266,7 +266,7 @@ async fn a_poisoned_birth_row_is_isolated_and_dropped_after_bounded_retries() {
     assert_eq!(
         handle.pending_births(),
         1,
-        "the poisoned row is rebuffered, not silently gone"
+        "the poisoned row is kept for retry, not silently gone"
     );
 
     // Flushes 2 + 3: still failing → dropped at the attempt cap.
@@ -358,96 +358,4 @@ async fn engine_shutdown_is_a_drop_no_op() {
     }
     // Sleep tiny window: confirms no pending tasks panic.
     tokio::time::sleep(Duration::from_millis(20)).await;
-}
-
-/// The hourly max difficulty reaches PG only via the flush, and `shutdown()` keeps the window.
-#[tokio::test]
-async fn diff_stats_sink_keeps_per_slot_maximum() {
-    let _guard = ENGINE_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
-        return;
-    };
-    let address = "bcrt1qdiffstatsinktest00000000000000000000";
-    let del = |p: PgPool| async move {
-        let _ =
-            sqlx::query(r#"DELETE FROM client_difficulty_statistics_entity WHERE address = $1"#)
-                .bind(address)
-                .execute(&p)
-                .await;
-    };
-    del(pool.clone()).await;
-
-    // Long interval so only the shutdown drain, never a tick, can write.
-    let handle = SessionPersistenceEngine::spawn(
-        SessionPersistenceConfig {
-            diff_stat_flush_interval: Duration::from_secs(3_600),
-            ..Default::default()
-        },
-        pool.clone(),
-        None,
-    )
-    .await
-    .expect("spawn engine");
-    let sink = handle.client_difficulty_statistics_sink();
-    // The row lands in the hour the share was accepted in, not the sink's.
-    let accepted_at = bp_common::now_ms() - 2 * 3_600_000;
-    let share = |submission_difficulty: f64| SharedAcceptedShare {
-        address,
-        worker: "rig1",
-        session_id: "sess-diff",
-        effective_difficulty: 1024.0,
-        submission_difficulty,
-        user_agent: Some("bitaxe"),
-        is_block_candidate: false,
-        hash_rate: 0.0,
-        channel_count: 1,
-        ts_ms: accepted_at,
-        share_id: "",
-        mode: bp_share_hook::MiningMode::Solo,
-        group_id: None,
-    };
-
-    sink.record_accepted(share(1_000.0)).await; // first → max 1000
-    sink.record_accepted(share(50_000.0)).await; // new max
-    sink.record_accepted(share(2_000.0)).await; // below max → no change
-
-    // Nothing may be in the DB yet: the share path does not write.
-    let pending: i64 = sqlx::query_scalar(
-        r#"SELECT count(*) FROM client_difficulty_statistics_entity WHERE address = $1"#,
-    )
-    .bind(address)
-    .fetch_one(&pool)
-    .await
-    .expect("count before flush");
-    assert_eq!(
-        pending, 0,
-        "the share path must not write; the flush loop does"
-    );
-
-    handle.shutdown().await;
-
-    let row = sqlx::query(
-        r#"SELECT MAX("maxDifficulty")::float8 AS m, MIN("slotTime") AS lo, MAX("slotTime") AS hi
-               FROM client_difficulty_statistics_entity WHERE address = $1"#,
-    )
-    .bind(address)
-    .fetch_one(&pool)
-    .await
-    .expect("query max");
-    let max: f64 = row.try_get("m").expect("max column");
-    let hour = accepted_at / 3_600_000 * 3_600_000;
-    assert_eq!(
-        (
-            row.try_get::<i64, _>("lo").unwrap(),
-            row.try_get::<i64, _>("hi").unwrap()
-        ),
-        (hour, hour),
-        "one row, in the hour the shares were accepted"
-    );
-    assert!(
-        (max - 50_000.0).abs() < 1.0,
-        "expected per-slot max 50000, got {max}"
-    );
-
-    del(pool).await;
 }

@@ -949,6 +949,13 @@ async fn by_id(
                 std::collections::HashSet::new()
             };
 
+            let best_by_address: HashMap<String, f64> =
+                bp_db::find_address_settings_for_addresses(&s.pool, &addr_strings)
+                    .await?
+                    .into_iter()
+                    .map(|row| (row.address.as_str().to_string(), row.best_difficulty))
+                    .collect();
+
             // Roster-wide session stats in two round trips, not two per member.
             let sessions =
                 bp_db::find_active_sessions_for_addresses(&s.pool, &addr_strings).await?;
@@ -998,10 +1005,7 @@ async fn by_id(
                 let hashrate = per_addr_hashrate.get(addr_str).copied().unwrap_or(0.0);
                 let start_time = start_times.get(addr_str).copied();
                 let last_seen = last_seen_by_address.get(addr_str).copied().or(start_time);
-                let best_difficulty = bp_db::find_address_settings(&s.pool, &m.address)
-                    .await?
-                    .map(|x| x.best_difficulty)
-                    .unwrap_or(0.0);
+                let best_difficulty = best_by_address.get(addr_str).copied().unwrap_or(0.0);
                 entries.push(MemberEntry {
                     member_id: member_id(id, addr_str),
                     address_label: labels
@@ -1709,14 +1713,15 @@ fn jr_to_api_error(e: bp_group_mgmt_engine::JoinRequestServiceError) -> ApiError
 //
 // Over the group's current members, on the per-address slot grid.
 
-use crate::controllers::info::{rejected_by_reason_slots, RejectSlotsResponse};
+use crate::controllers::info::{
+    client_reject_samples, rejected_by_reason_slots, RejectSlotsResponse,
+};
 use crate::time_range::{
     accepted_slot_data, chart_slot_boundaries, max_difficulty_slot_data, ChartPoint, Range,
     SlotDataResponse,
 };
 
-use crate::time_range::SLOT_SECONDS;
-use bp_common::HASHES_PER_DIFFICULTY_1;
+use crate::time_range::slot_hashrate;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1751,18 +1756,16 @@ async fn group_chart(
             // Sparse: only slots that received shares get a point.
             let mut slot_shares: std::collections::BTreeMap<i64, f64> =
                 std::collections::BTreeMap::new();
-            for a in &addrs {
-                let rows =
-                    bp_db::find_client_statistics_since_for_address(&s.pool, a, since).await?;
-                for r in rows.iter().filter(|r| r.time < cutoff) {
-                    *slot_shares.entry(r.time).or_insert(0.0) += r.shares as f64;
-                }
+            let rows =
+                bp_db::find_client_statistics_since_for_addresses(&s.pool, &addrs, since).await?;
+            for r in rows.iter().filter(|r| r.time < cutoff) {
+                *slot_shares.entry(r.time).or_insert(0.0) += r.shares as f64;
             }
             Ok(slot_shares
                 .into_iter()
                 .map(|(t, shares)| ChartPoint {
                     label: crate::time_range::format_iso_ms(t),
-                    data: (shares * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round(),
+                    data: slot_hashrate(shares),
                 })
                 .collect())
         })
@@ -1784,12 +1787,8 @@ async fn group_accepted(
             let now = bp_common::now_ms();
             let since = now - range.window_ms();
             let addrs = collect_group_member_addresses(&s, id).await?;
-            let mut rows = Vec::new();
-            for a in &addrs {
-                rows.extend(
-                    bp_db::find_client_statistics_since_for_address(&s.pool, a, since).await?,
-                );
-            }
+            let rows =
+                bp_db::find_client_statistics_since_for_addresses(&s.pool, &addrs, since).await?;
             // Difficulty-weighted like the per-client endpoint, so it stays
             // flat at constant hashrate.
             Ok(accepted_slot_data(
@@ -1839,17 +1838,11 @@ async fn group_rejected(
             let now = bp_common::now_ms();
             let since = now - range.window_ms();
             let addrs = collect_group_member_addresses(&s, id).await?;
-            let mut rows = Vec::new();
-            for a in &addrs {
-                rows.extend(
-                    bp_db::find_client_rejected_statistics_since_for_address(&s.pool, a, since)
-                        .await?,
-                );
-            }
+            let rows =
+                bp_db::find_client_statistics_since_for_addresses(&s.pool, &addrs, since).await?;
             Ok(rejected_by_reason_slots(
                 &chart_slot_boundaries(since),
-                rows.iter()
-                    .map(|r| (r.time, (r.reason.as_str(), r.count as f64, r.shares as f64))),
+                rows.iter().flat_map(client_reject_samples),
             ))
         })
         .await?;

@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bp_common::AddressId;
 use bp_db::{
-    find_address_settings, find_best_difficulty_scan_addresses,
+    find_address_settings_for_addresses, find_best_difficulty_scan_addresses,
     find_best_difficulty_trackers_for_addresses, upsert_best_difficulty_trackers,
 };
 use sqlx::PgPool;
@@ -119,9 +119,16 @@ async fn run_once(pool: &PgPool, dispatcher: &NotificationDispatcher) -> Result<
         return Ok(());
     }
 
-    // One bulk read of the persisted baselines, then per-address
-    // current-best lookups. The tracker row is the dedup baseline.
+    // Two bulk reads: the current bests and the tracker rows, the
+    // notification baseline.
     let addr_strings: Vec<String> = addresses.iter().map(|a| a.as_str().to_string()).collect();
+    let current_bests: Vec<(AddressId, f64)> =
+        find_address_settings_for_addresses(pool, &addr_strings)
+            .await
+            .map_err(|e| format!("settings read: {e}"))?
+            .into_iter()
+            .map(|row| (row.address, row.best_difficulty))
+            .collect();
     let tracked: HashMap<String, f64> =
         find_best_difficulty_trackers_for_addresses(pool, &addr_strings)
             .await
@@ -134,16 +141,7 @@ async fn run_once(pool: &PgPool, dispatcher: &NotificationDispatcher) -> Result<
     let mut upsert_diff: Vec<f64> = Vec::new();
     let mut notify: Vec<(AddressId, f64)> = Vec::new();
 
-    for address in addresses {
-        let settings = match find_address_settings(pool, &address).await {
-            Ok(Some(row)) => row,
-            Ok(None) => continue,
-            Err(e) => {
-                warn!(target: "bp_notifications::cron::best_difficulty", error = %e, address = %address.as_str(), "settings read");
-                continue;
-            }
-        };
-        let current = settings.best_difficulty;
+    for (address, current) in current_bests {
         let action = classify(current, tracked.get(address.as_str()).copied());
         if action.upsert {
             upsert_addr.push(address.as_str().to_string());

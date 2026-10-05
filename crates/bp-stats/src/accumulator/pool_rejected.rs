@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Per-slot per-reason pool-wide rejected counts (number of shares, not
-//! diff sum).
+//! Per-slot per-reason pool-wide rejected difficulty (the difficulty sum,
+//! not the number of shares).
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -30,18 +30,17 @@ impl PoolRejectedAccumulator {
     }
 
     pub fn add(&self, slot: TimeSlot, reason: RejectedReason, count: f64) {
-        if !count.is_finite() || count <= 0.0 {
-            return;
-        }
         self.inner.lock().add(slot, reason, count);
     }
 
-    pub fn drain(&self) -> PoolRejectedSnapshot {
-        self.inner.lock().drain()
+    /// Empty the accumulator for a flush.
+    pub fn take(&self) -> PoolRejectedSnapshot {
+        self.inner.lock().take()
     }
 
-    pub fn confirm(&self, snapshot: &PoolRejectedSnapshot) {
-        self.inner.lock().confirm(snapshot);
+    /// Hand back an unwritten [`Self::take`].
+    pub fn restore(&self, snapshot: PoolRejectedSnapshot) {
+        self.inner.lock().restore(snapshot);
     }
 
     pub fn len(&self) -> usize {
@@ -68,7 +67,7 @@ mod tests {
         acc.add(slot(1_000), RejectedReason::JobNotFound, 1.0);
         acc.add(slot(1_000), RejectedReason::LowDifficulty, 1.0);
         acc.add(slot(2_000), RejectedReason::DuplicateShare, 1.0);
-        let snap = acc.drain();
+        let snap = acc.take();
         assert_eq!(
             snap.get(&slot(1_000))
                 .unwrap()
@@ -90,11 +89,12 @@ mod tests {
     }
 
     #[test]
-    fn confirm_drops_empty_slots() {
+    fn take_empties_and_restore_hands_back() {
         let acc = PoolRejectedAccumulator::new();
         acc.add(slot(1_000), RejectedReason::JobNotFound, 5.0);
-        let snap = acc.drain();
-        acc.confirm(&snap);
+        let snap = acc.take();
         assert!(acc.is_empty());
+        acc.restore(snap);
+        assert_eq!(acc.len(), 1);
     }
 }

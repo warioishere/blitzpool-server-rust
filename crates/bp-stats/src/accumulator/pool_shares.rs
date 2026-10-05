@@ -5,9 +5,8 @@
 use parking_lot::Mutex;
 use std::collections::HashMap;
 
-use super::{flushed_max, share_max};
+use super::share_max;
 use crate::buffer::{BufferRecord, RecordDeltaBuffer};
-use crate::constants::MAX_REASONABLE_DIFFICULTY;
 use crate::slot::TimeSlot;
 
 /// Per-slot pool-shares counters. `accepted` and `rejected` are diff sums
@@ -28,12 +27,6 @@ impl BufferRecord for PoolSharesRecord {
         self.accepted += rhs.accepted;
         self.rejected += rhs.rejected;
         self.max_difficulty = self.max_difficulty.max(rhs.max_difficulty);
-    }
-    fn sub_assign_clamped(&mut self, rhs: &Self) -> bool {
-        self.accepted -= rhs.accepted;
-        self.rejected -= rhs.rejected;
-        self.max_difficulty = flushed_max(self.max_difficulty, rhs.max_difficulty);
-        self.accepted <= 0.0 && self.rejected <= 0.0 && self.max_difficulty <= 0.0
     }
 }
 
@@ -57,11 +50,8 @@ impl PoolSharesAccumulator {
     }
 
     /// The credited `diff` goes into the sum, the difficulty actually solved
-    /// into the slot maximum. Non-finite or out-of-range values are dropped.
+    /// into the slot maximum.
     pub fn add_accepted(&self, slot: TimeSlot, diff: f64, submission_difficulty: f64) {
-        if !diff.is_finite() || diff <= 0.0 || diff > MAX_REASONABLE_DIFFICULTY {
-            return;
-        }
         self.inner.lock().add(
             slot,
             &PoolSharesRecord {
@@ -73,9 +63,6 @@ impl PoolSharesAccumulator {
     }
 
     pub fn add_rejected(&self, slot: TimeSlot, diff: f64) {
-        if !diff.is_finite() || diff <= 0.0 || diff > MAX_REASONABLE_DIFFICULTY {
-            return;
-        }
         self.inner.lock().add(
             slot,
             &PoolSharesRecord {
@@ -86,12 +73,14 @@ impl PoolSharesAccumulator {
         );
     }
 
-    pub fn drain(&self) -> PoolSharesSnapshot {
-        self.inner.lock().drain()
+    /// Empty the accumulator for a flush.
+    pub fn take(&self) -> PoolSharesSnapshot {
+        self.inner.lock().take()
     }
 
-    pub fn confirm(&self, snapshot: &PoolSharesSnapshot) {
-        self.inner.lock().confirm(snapshot);
+    /// Hand back an unwritten [`Self::take`].
+    pub fn restore(&self, snapshot: PoolSharesSnapshot) {
+        self.inner.lock().restore(snapshot);
     }
 
     pub fn len(&self) -> usize {
@@ -112,12 +101,12 @@ mod tests {
     }
 
     #[test]
-    fn add_then_drain_returns_summed_diff() {
+    fn add_then_take_returns_summed_diff() {
         let acc = PoolSharesAccumulator::new();
         acc.add_accepted(slot(1_000), 100.0, 100.0);
         acc.add_accepted(slot(1_000), 50.0, 50.0);
         acc.add_rejected(slot(1_000), 7.0);
-        let snap = acc.drain();
+        let snap = acc.take();
         assert_eq!(
             snap.get(&slot(1_000)),
             Some(&PoolSharesRecord {
@@ -129,54 +118,27 @@ mod tests {
     }
 
     #[test]
-    fn drain_is_non_clearing_until_confirm() {
+    fn take_empties_the_accumulator() {
         let acc = PoolSharesAccumulator::new();
         acc.add_accepted(slot(1_000), 100.0, 100.0);
-        let _ = acc.drain();
-        // Still in the buffer until confirm runs.
-        assert_eq!(acc.len(), 1);
-    }
-
-    #[test]
-    fn confirm_subtracts_and_drops_empty_buckets() {
-        let acc = PoolSharesAccumulator::new();
-        acc.add_accepted(slot(1_000), 100.0, 100.0);
-        let snap = acc.drain();
-        acc.confirm(&snap);
+        let _ = acc.take();
         assert!(acc.is_empty());
     }
 
     #[test]
-    fn concurrent_adds_during_flush_survive_confirm() {
+    fn restore_adds_onto_writes_made_during_the_flush() {
         let acc = PoolSharesAccumulator::new();
-        acc.add_accepted(slot(1_000), 100.0, 100.0);
-        let snap = acc.drain();
-        // Concurrent write between drain and confirm.
+        acc.add_accepted(slot(1_000), 100.0, 4_096.0);
+        let snap = acc.take(); // the flush fails
         acc.add_accepted(slot(1_000), 25.0, 25.0);
-        acc.confirm(&snap);
-        let residual = acc.drain();
-        assert_eq!(residual.get(&slot(1_000)).map(|r| r.accepted), Some(25.0));
-    }
-
-    #[test]
-    fn over_range_diff_is_discarded() {
-        let acc = PoolSharesAccumulator::new();
-        acc.add_accepted(
-            slot(1_000),
-            MAX_REASONABLE_DIFFICULTY * 10.0,
-            MAX_REASONABLE_DIFFICULTY * 10.0,
+        acc.restore(snap);
+        let merged = acc.take();
+        assert_eq!(merged[&slot(1_000)].accepted, 125.0);
+        assert_eq!(
+            merged[&slot(1_000)].max_difficulty,
+            4_096.0,
+            "a max never drops"
         );
-        assert!(acc.is_empty());
-    }
-
-    #[test]
-    fn non_finite_and_zero_diff_are_discarded() {
-        let acc = PoolSharesAccumulator::new();
-        acc.add_accepted(slot(1_000), f64::NAN, f64::NAN);
-        acc.add_accepted(slot(1_000), f64::INFINITY, f64::INFINITY);
-        acc.add_accepted(slot(1_000), 0.0, 0.0);
-        acc.add_accepted(slot(1_000), -5.0, -5.0);
-        assert!(acc.is_empty());
     }
 
     #[test]
@@ -185,42 +147,10 @@ mod tests {
         acc.add_accepted(slot(1_000), 10.0, 10.0);
         acc.add_accepted(slot(2_000), 20.0, 20.0);
         acc.add_rejected(slot(2_000), 1.0);
-        let snap = acc.drain();
+        let snap = acc.take();
         assert_eq!(snap.len(), 2);
         assert_eq!(snap.get(&slot(1_000)).unwrap().accepted, 10.0);
         assert_eq!(snap.get(&slot(2_000)).unwrap().accepted, 20.0);
         assert_eq!(snap.get(&slot(2_000)).unwrap().rejected, 1.0);
-    }
-
-    /// The slot maximum keeps the highest share, and a flush clears it
-    /// unless a higher share arrived meanwhile.
-    #[test]
-    fn slot_max_survives_a_flush_only_when_raised_meanwhile() {
-        let acc = PoolSharesAccumulator::new();
-        acc.add_accepted(slot(1_000), 10.0, 500.0);
-        acc.add_accepted(slot(1_000), 10.0, 300.0);
-        let snap = acc.drain();
-        assert_eq!(
-            snap.get(&slot(1_000)).map(|r| r.max_difficulty),
-            Some(500.0)
-        );
-
-        // A lower share during the flush: nothing owed after confirm.
-        acc.add_accepted(slot(1_000), 10.0, 400.0);
-        acc.confirm(&snap);
-        let residual = acc.drain();
-        assert_eq!(
-            residual.get(&slot(1_000)).map(|r| r.max_difficulty),
-            Some(0.0)
-        );
-
-        // A higher share during a flush: still owed after confirm.
-        let snap = acc.drain();
-        acc.add_accepted(slot(1_000), 10.0, 900.0);
-        acc.confirm(&snap);
-        assert_eq!(
-            acc.drain().get(&slot(1_000)).map(|r| r.max_difficulty),
-            Some(900.0)
-        );
     }
 }

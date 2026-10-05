@@ -8,12 +8,13 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use bp_common::AddressId;
 use bp_db::{
-    find_address_settings, find_client, find_client_statistics_since_for_address,
-    find_clients_by_address, find_worker_shares, reset_address_settings_best_difficulty,
+    find_address_settings, find_client, find_client_statistics_since_for_addresses,
+    find_clients_by_address, find_worker_shares_for_address,
+    reset_address_settings_best_difficulty, WorkerSharesRow,
 };
 use serde::Serialize;
 
@@ -47,7 +48,9 @@ pub(crate) fn routes() -> Router<SharedState> {
 
 // ─── time-range chart endpoints ──────────────────────────────────
 
-use crate::controllers::info::{rejected_by_reason_slots, RejectSlotsResponse};
+use crate::controllers::info::{
+    client_reject_samples, rejected_by_reason_slots, RejectSlotsResponse,
+};
 use crate::time_range::{
     accepted_slot_data, chart_slot_boundaries, fold_into_slots, max_difficulty_slot_data,
     sum_into_slots, ChartPoint, Range, SlotDataResponse,
@@ -62,8 +65,7 @@ struct RangeQuery {
     range: Option<String>,
 }
 
-use crate::time_range::SLOT_SECONDS;
-use bp_common::HASHES_PER_DIFFICULTY_1;
+use crate::time_range::slot_hashrate;
 
 async fn chart(
     State(state): State<SharedState>,
@@ -79,8 +81,12 @@ async fn chart(
         .get_or_fetch::<Vec<ChartPoint>, _, ApiError>(key, TtlKind::ClientChart, async move {
             let now = bp_common::now_ms();
             let since = now - range.window_ms();
-            let rows =
-                bp_db::find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
+            let rows = bp_db::find_client_statistics_since_for_addresses(
+                &s.pool,
+                std::slice::from_ref(&addr),
+                since,
+            )
+            .await?;
             Ok(chart_points(
                 &chart_slot_boundaries(since),
                 rows.iter().map(|r| (r.time, r.shares as f64)),
@@ -99,7 +105,7 @@ fn chart_points(
         .into_iter()
         .map(|(b, shares)| ChartPoint {
             label: crate::time_range::format_iso_ms(b),
-            data: (shares * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round(),
+            data: slot_hashrate(shares),
         })
         .collect()
 }
@@ -118,8 +124,12 @@ async fn accepted(
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::ClientAccepted, async move {
             let now = bp_common::now_ms();
             let since = now - range.window_ms();
-            let rows =
-                bp_db::find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
+            let rows = bp_db::find_client_statistics_since_for_addresses(
+                &s.pool,
+                std::slice::from_ref(&addr),
+                since,
+            )
+            .await?;
             // Diff-1-weighted accepted shares (sum of share difficulty), not
             // the raw count: it tracks work, so the chart stays flat when
             // vardiff trades share size for share rate. (The rejected
@@ -148,11 +158,15 @@ async fn max_difficulty(
         .cache
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::ClientAccepted, async move {
             let since = bp_common::now_ms() - range.window_ms();
-            let rows =
-                bp_db::find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
+            let rows = bp_db::find_max_difficulty_since_for_addresses(
+                &s.pool,
+                std::slice::from_ref(&addr),
+                since,
+            )
+            .await?;
             Ok(max_difficulty_slot_data(
                 &chart_slot_boundaries(since),
-                rows.iter().map(|r| (r.time, r.max_difficulty as f64)),
+                rows.into_iter().map(|(t, max)| (t, max as f64)),
             ))
         })
         .await?;
@@ -173,8 +187,12 @@ async fn workers(
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::ClientWorkers, async move {
             let now = bp_common::now_ms();
             let since = now - range.window_ms();
-            let rows =
-                bp_db::find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
+            let rows = bp_db::find_client_statistics_since_for_addresses(
+                &s.pool,
+                std::slice::from_ref(&addr),
+                since,
+            )
+            .await?;
             Ok(worker_slots(
                 &chart_slot_boundaries(since),
                 rows.iter()
@@ -224,13 +242,15 @@ async fn rejected(
             async move {
                 let now = bp_common::now_ms();
                 let since = now - range.window_ms();
-                let rows =
-                    bp_db::find_client_rejected_statistics_since_for_address(&s.pool, &addr, since)
-                        .await?;
+                let rows = bp_db::find_client_statistics_since_for_addresses(
+                    &s.pool,
+                    std::slice::from_ref(&addr),
+                    since,
+                )
+                .await?;
                 Ok(rejected_by_reason_slots(
                     &chart_slot_boundaries(since),
-                    rows.iter()
-                        .map(|r| (r.time, (r.reason.as_str(), r.count as f64, r.shares as f64))),
+                    rows.iter().flat_map(client_reject_samples),
                 ))
             },
         )
@@ -362,20 +382,27 @@ async fn worker_shares(
             key,
             TtlKind::ClientWorkerShares,
             async move {
-                // `worker_shares_entity` is keyed (address, clientName) — pull the
-                // worker list, then one lookup per worker.
+                // The address's connected workers, each with its lifetime row
+                // if it has one, in name order.
                 let clients = find_clients_by_address(&s.pool, &addr).await?;
                 let names: BTreeSet<String> = clients.into_iter().map(|c| c.client_name).collect();
-                let mut out = Vec::with_capacity(names.len());
-                for name in names {
-                    if let Some(row) = find_worker_shares(&s.pool, &addr, &name).await? {
-                        out.push(WorkerShareEntry {
+                let mut totals: HashMap<String, WorkerSharesRow> =
+                    find_worker_shares_for_address(&s.pool, &addr)
+                        .await?
+                        .into_iter()
+                        .map(|row| (row.client_name.clone(), row))
+                        .collect();
+                let out: Vec<WorkerShareEntry> = names
+                    .into_iter()
+                    .filter_map(|name| {
+                        let row = totals.remove(&name)?;
+                        Some(WorkerShareEntry {
                             worker_name: name,
                             total_shares: row.shares as i64,
                             total_rejected: row.rejected_shares as i64,
-                        });
-                    }
-                }
+                        })
+                    })
+                    .collect();
                 Ok(out)
             },
         )
@@ -461,7 +488,12 @@ async fn by_worker(
             let now = bp_common::now_ms();
             let since = now - range.window_ms();
             let cutoff = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
-            let rows = find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
+            let rows = find_client_statistics_since_for_addresses(
+                &s.pool,
+                std::slice::from_ref(&addr),
+                since,
+            )
+            .await?;
             let mut grouped: BTreeMap<i64, WorkerChartEntry> = BTreeMap::new();
             for r in rows
                 .iter()
@@ -485,7 +517,7 @@ async fn by_worker(
                 entry.rejected_stale_diff1 += r.rejected_stale_diff1 as f64;
             }
             for e in grouped.values_mut() {
-                e.data = (e.accepted * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round();
+                e.data = slot_hashrate(e.accepted);
             }
             let chart_data: Vec<WorkerChartEntry> = grouped.into_values().collect();
             Ok(WorkerResponse {
@@ -536,7 +568,12 @@ async fn by_session(
                 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
                 let since = now - DAY_MS;
                 let cutoff = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
-                let rows = find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
+                let rows = find_client_statistics_since_for_addresses(
+                    &s.pool,
+                    std::slice::from_ref(&addr),
+                    since,
+                )
+                .await?;
                 let mut grouped: BTreeMap<i64, f64> = BTreeMap::new();
                 for r in rows.iter().filter(|r| {
                     r.client_name == worker && r.session_id == session && r.time < cutoff
@@ -547,7 +584,7 @@ async fn by_session(
                     .into_iter()
                     .map(|(t, shares)| ChartPoint {
                         label: crate::time_range::format_iso_ms(t),
-                        data: (shares * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round(),
+                        data: slot_hashrate(shares),
                     })
                     .collect();
 
@@ -587,6 +624,7 @@ async fn invalidate_address_cache(state: &SharedState, addr: &AddressId) {
         "CLIENT_WORKER_SHARES_",
         "CLIENT_WORKERS_",
         "CLIENT_ACCEPTED_",
+        "CLIENT_MAX_DIFFICULTY_",
         "CLIENT_REJECTED_",
         "CLIENT_DIFF_SCORES_",
         "CLIENT_WORKER_GROUP_",
@@ -614,8 +652,8 @@ async fn reset_address(
 }
 
 /// Helper used by both delete-stats and delete-all to wipe every
-/// per-address row across the four statistics tables + the worker
-/// totals plus reset the address-level best-difficulty hints.
+/// per-address row across the statistics tables + the worker totals, zero
+/// the address total with them, and reset the address-level best.
 async fn purge_address_stats(pool: &sqlx::PgPool, addr: &AddressId) -> Result<(), ApiError> {
     sqlx::query!(
         r#"DELETE FROM client_statistics_entity WHERE address = $1"#,
@@ -624,6 +662,8 @@ async fn purge_address_stats(pool: &sqlx::PgPool, addr: &AddressId) -> Result<()
     .execute(pool)
     .await
     .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
+    // Nothing writes the next two tables; the deletes clear what they still
+    // hold for this address until a migration drops them.
     sqlx::query!(
         r#"DELETE FROM client_rejected_statistics_entity WHERE address = $1"#,
         addr.as_str()
@@ -640,6 +680,15 @@ async fn purge_address_stats(pool: &sqlx::PgPool, addr: &AddressId) -> Result<()
     .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
     sqlx::query!(
         r#"DELETE FROM worker_shares_entity WHERE address = $1"#,
+        addr.as_str()
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
+    // The address total and the worker totals count the same shares; zeroed
+    // together, both start over from the same point.
+    sqlx::query!(
+        r#"UPDATE address_settings_entity SET shares = 0 WHERE address = $1"#,
         addr.as_str()
     )
     .execute(pool)
@@ -684,8 +733,7 @@ async fn delete_all(
     // What stays is the leaderboard record, which carries no address.
     sqlx::query!(
         r#"UPDATE address_settings_entity
-           SET shares = 0,
-               "miscCoinbaseScriptData" = NULL,
+           SET "miscCoinbaseScriptData" = NULL,
                "updatedAt" = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
            WHERE address = $1"#,
         addr.as_str()
@@ -730,12 +778,14 @@ struct DiffScoresResponse {
     slot_data: Vec<DiffScoreSlot>,
 }
 
+/// One diff-scores bucket.
+const HOUR_MS: i64 = 60 * 60 * 1000;
+
 /// Cache lifetime of a `diff-scores` response: longer ranges are cached
 /// longer, but never past the next full hour. The response ends in an hourly
 /// bucket, and scoreboard periods start on the hour, so a response cached
 /// across that boundary would hide the new period's first bucket.
 fn diff_scores_ttl_secs(range_label: &str, now_ms: i64) -> u64 {
-    const HOUR_MS: i64 = 3_600_000;
     let by_range: u64 = match range_label {
         "7d" => 1800,
         "30d" => 7200,
@@ -759,35 +809,32 @@ async fn diff_scores(
     let bytes = state
         .cache
         .get_or_fetch_secs::<DiffScoresResponse, _, ApiError>(key, ttl_secs, async move {
+            // "30d" serves the scoreboard's calendar month, which reaches back
+            // up to 31 days from the 1st in its own time zone: 32 days cover
+            // that, the same span `client_statistics_entity` is kept for.
             let hours: i64 = match range_label.as_str() {
                 "7d" => 24 * 7,
-                "30d" => 24 * 30,
+                "30d" => 24 * 32,
                 _ => 24,
             };
-            let one_hour_ms: i64 = 60 * 60 * 1000;
             let now = bp_common::now_ms();
-            let since = now - hours * one_hour_ms;
-            let start_slot = (since / one_hour_ms) * one_hour_ms;
-            let end_slot = (now / one_hour_ms) * one_hour_ms;
+            let since = now - hours * HOUR_MS;
+            let start_slot = (since / HOUR_MS) * HOUR_MS;
+            let end_slot = (now / HOUR_MS) * HOUR_MS;
 
-            let rows = sqlx::query!(
-                r#"SELECT "slotTime" AS "slot_time: i64",
-                          MAX("maxDifficulty") AS "max_diff: f32"
-                   FROM client_difficulty_statistics_entity
-                   WHERE address = $1
-                     AND "slotTime" BETWEEN $2 AND $3
-                   GROUP BY "slotTime""#,
-                addr.as_str(),
-                start_slot,
-                end_slot,
+            let rows = bp_db::find_max_difficulty_since_for_addresses(
+                &s.pool,
+                std::slice::from_ref(&addr),
+                start_slot + bp_stats::SLOT_DURATION_MS,
             )
-            .fetch_all(&s.pool)
-            .await
-            .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
+            .await?;
 
+            // A 10-minute slot (keyed by its end) belongs to the hour it starts in.
             let mut by_slot: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
-            for r in rows {
-                by_slot.insert(r.slot_time, r.max_diff.unwrap_or(0.0) as f64);
+            for (slot_end, max) in rows {
+                let hour = ((slot_end - bp_stats::SLOT_DURATION_MS) / HOUR_MS) * HOUR_MS;
+                let best = by_slot.entry(hour).or_insert(0.0);
+                *best = best.max(f64::from(max));
             }
             let mut slot_data = Vec::new();
             let mut t = start_slot;
@@ -796,7 +843,7 @@ async fn diff_scores(
                     time: crate::time_range::format_iso_ms(t),
                     difficulty: by_slot.get(&t).copied().unwrap_or(0.0),
                 });
-                t += one_hour_ms;
+                t += HOUR_MS;
             }
             Ok(DiffScoresResponse { slot_data })
         })
@@ -806,8 +853,9 @@ async fn diff_scores(
 
 // ─── GET /api/client/:address/best-difficulty/today ──────────────
 //
-// Best share since the caller's local midnight `since`: not floored to the
-// hour, so nothing pre-midnight shows; not cached, as `since` varies by zone.
+// Best share since the caller's local midnight `since`, from the 10-minute
+// slots that start at or after it, so nothing pre-midnight shows; not
+// cached, as `since` varies by zone.
 
 /// Oldest `since` accepted, relative to now. A local midnight is at most
 /// 24 h back, 25 h on a DST fall-back day; the extra hour is room for
@@ -849,19 +897,18 @@ async fn best_difficulty_today(
             "since must be within the last 26 h and at most 1 h ahead",
         ));
     }
-    let best = sqlx::query_scalar!(
-        r#"SELECT MAX("maxDifficulty") AS "max_diff: f32"
-           FROM client_difficulty_statistics_entity
-           WHERE address = $1
-             AND "slotTime" >= $2"#,
-        addr.as_str(),
-        since,
+    // Only slots that start at or after `since`: a slot is keyed by its end.
+    let best = bp_db::find_max_difficulty_since_for_addresses(
+        &state.pool,
+        std::slice::from_ref(&addr),
+        since + bp_stats::SLOT_DURATION_MS,
     )
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
+    .await?
+    .into_iter()
+    .map(|(_, max)| f64::from(max))
+    .fold(0.0, f64::max);
     Ok(Json(BestDifficultyTodayResponse {
-        best_difficulty: best.map_or(0.0, f64::from),
+        best_difficulty: best,
     }))
 }
 

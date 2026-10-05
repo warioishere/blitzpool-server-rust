@@ -649,13 +649,16 @@ async fn main() -> ExitCode {
         None
     };
 
+    // Only the stream consumer feeds the share-stats engine.
+    let stats = consumes_streams.then(|| engines::spawn_stats(&handles));
+
     // Drain the accepted-share stream into the engine sinks, two consumer
     // groups by durability class.
-    let satellite_consumer = if consumes_streams {
+    let satellite_consumer = if let Some(stats) = &stats {
         let sinks = engines::build_accepted_sinks(
             engines.pplns.as_ref(),
             engines.group_solo.as_ref(),
-            &engines.stats,
+            stats,
             &engines.session_persistence,
             handles.redis.clone(),
         );
@@ -719,8 +722,8 @@ async fn main() -> ExitCode {
         None
     };
 
-    let rejected_consumer = if consumes_streams {
-        let sinks = engines::build_rejected_sinks(engines.group_solo.as_ref(), &engines.stats);
+    let rejected_consumer = if let Some(stats) = &stats {
+        let sinks = engines::build_rejected_sinks(engines.group_solo.as_ref(), stats);
         let rej_redis = handles.dedicated_redis(&cfg.redis, "rejected").await;
         Some(crate::rejected_consumer::spawn(rej_redis, sinks))
     } else {
@@ -904,7 +907,7 @@ async fn main() -> ExitCode {
         "bound: process live. Send SIGTERM or Ctrl+C to shut down."
     );
     let engine_shutdown = EngineShutdownHandles {
-        stats: engines.stats,
+        stats,
         pplns: engines.pplns,
         group_solo: engines.group_solo,
         session_persistence: engines.session_persistence,
@@ -931,10 +934,11 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Shutdown-relevant engine handles. `stats` consumes its handle for the
-/// final drain; `session_persistence` drains its buffered touch updates.
+/// Shutdown-relevant engine handles. `stats`, held by the stream consumer,
+/// consumes its handle for the final drain; `session_persistence` drains its
+/// buffered touch updates.
 struct EngineShutdownHandles {
-    stats: bp_share_stats_sink::ShareStatsEngineHandle,
+    stats: Option<bp_share_stats_sink::ShareStatsEngineHandle>,
     pplns: Option<bp_pplns_engine::engine::PplnsEngine>,
     group_solo: Option<bp_group_solo_engine::engine::GroupSoloEngine>,
     session_persistence: bp_session_persistence::SessionPersistenceEngineHandle,
@@ -1039,7 +1043,9 @@ async fn wait_for_shutdown(
     if let Some(g) = engine_shutdown.group_solo.as_ref() {
         g.shutdown();
     }
-    engine_shutdown.stats.shutdown().await;
+    if let Some(stats) = engine_shutdown.stats {
+        stats.shutdown().await;
+    }
     listeners.shutdown().await;
     engine_shutdown.session_persistence.shutdown().await;
 }
@@ -1325,9 +1331,7 @@ fn print_hooks_error_help(err: &HooksError) {
 fn log_engines_summary(e: &EngineHandles) {
     tracing::info!(
         pplns = e.pplns.is_some(),
-        group_solo_ready = true,
-        stats_ready = true,
-        session_persistence_ready = true,
+        group_solo = e.group_solo.is_some(),
         "engine handles summary"
     );
 }
@@ -1381,14 +1385,6 @@ fn print_engine_error_help(err: &EngineError) {
             eprintln!(
                 "hint: the active-group check reads `pplns_group` from Postgres; \
                  check the `[database]` connection."
-            );
-        }
-        EngineError::Stats(_) => {
-            eprintln!(
-                "hint: the share-stats engine couldn't bootstrap. Likely \
-                 cause: the `seed_if_empty` migration hit a PG row-level \
-                 constraint. Inspect the DB tracing output above the \
-                 error line for the failing query."
             );
         }
         EngineError::SessionPersistence(_) => {

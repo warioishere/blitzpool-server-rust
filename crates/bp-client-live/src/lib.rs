@@ -10,7 +10,8 @@ use std::future::Future;
 use std::time::Duration;
 
 use bp_common::live_client_key::{
-    self as live_key, SessionKey, CLIENT_LIVE_PREFIX, F_HASH_RATE, KEY_SEP, SCAN_PATTERN_ALL,
+    self as live_key, SessionKey, CLIENT_LIVE_PREFIX, F_HASH_RATE, F_UPDATED_AT_MS,
+    HASHRATE_SILENCE_MS, KEY_SEP, SCAN_PATTERN_ALL,
 };
 use bp_common::AddressId;
 use redis::aio::ConnectionManager;
@@ -83,27 +84,46 @@ async fn scan_live_keys(conn: &mut ConnectionManager) -> Result<Vec<String>, Liv
     scan_keys(conn, SCAN_PATTERN_ALL).await
 }
 
-/// Pipelined `HGET hash_rate` over `keys`, summed per key's address
-/// into `acc`. A key that expired between SCAN and HGET, or a partial
-/// hash without the field yet, contributes nothing.
+/// The rate a session reads: vardiff's stored rate while its freshest share
+/// is younger than [`HASHRATE_SILENCE_MS`], else 0. Without a timestamp the
+/// session counts as silent.
+fn live_rate(hash_rate: Option<f64>, updated_at_ms: Option<i64>, now_ms: i64) -> f64 {
+    match updated_at_ms {
+        Some(ts) if now_ms - ts <= HASHRATE_SILENCE_MS => hash_rate.unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+/// Pipelined `HMGET hash_rate updated_at_ms` over `keys`, summed per key's
+/// address into `acc`. A key that expired between SCAN and HMGET, or a
+/// silent session, contributes nothing.
 async fn accumulate_rates(
     conn: &mut ConnectionManager,
     keys: &[String],
     acc: &mut HashMap<String, f64>,
 ) -> Result<(), LiveReadError> {
+    let now = bp_common::now_ms();
     for chunk in keys.chunks(FETCH_CHUNK) {
         let mut pipe = redis::pipe();
         for key in chunk {
-            pipe.cmd("HGET").arg(key).arg(F_HASH_RATE);
+            pipe.cmd("HMGET")
+                .arg(key)
+                .arg(F_HASH_RATE)
+                .arg(F_UPDATED_AT_MS);
         }
-        let rates: Vec<Option<String>> = bounded(pipe.query_async(conn)).await?;
-        for (key, rate) in chunk.iter().zip(rates) {
-            let (Some(addr), Some(rate)) = (address_of(key), rate) else {
+        let fields: Vec<(Option<String>, Option<String>)> = bounded(pipe.query_async(conn)).await?;
+        for (key, (rate, updated_at)) in chunk.iter().zip(fields) {
+            let Some(addr) = address_of(key) else {
                 continue;
             };
-            let Ok(rate) = rate.parse::<f64>() else {
+            let rate = live_rate(
+                rate.and_then(|r| r.parse().ok()),
+                updated_at.and_then(|t| t.parse().ok()),
+                now,
+            );
+            if rate == 0.0 {
                 continue;
-            };
+            }
             if let Some(sum) = acc.get_mut(addr) {
                 *sum += rate;
             } else {
@@ -114,7 +134,7 @@ async fn accumulate_rates(
     Ok(())
 }
 
-/// Live hashrate of the whole pool; the key's TTL is the liveness clock.
+/// Live hashrate of the whole pool.
 pub async fn pool_hashrate(redis: Option<&ConnectionManager>) -> Result<f64, LiveReadError> {
     let mut conn = redis.ok_or(LiveReadError::NotConfigured)?.clone();
     let keys = scan_live_keys(&mut conn).await?;
@@ -181,12 +201,13 @@ pub async fn delete_address_live_keys(
     Ok(deleted)
 }
 
-/// Pipelined `EXISTS`, positionally aligned. The liveness sweep must SKIP
-/// on an error, never sweep: "cannot ask Redis" is not "no key".
-pub async fn live_keys_exist<S: SessionKey>(
+/// Each session's freshest share time (`updated_at_ms`), positionally
+/// aligned; `None` without a live hash. The liveness sweep needs no more,
+/// and an error must make it skip, never sweep.
+pub async fn last_share_ms_for_sessions<S: SessionKey>(
     redis: Option<&ConnectionManager>,
     sessions: &[S],
-) -> Result<Vec<bool>, LiveReadError> {
+) -> Result<Vec<Option<i64>>, LiveReadError> {
     if sessions.is_empty() {
         return Ok(Vec::new());
     }
@@ -195,10 +216,12 @@ pub async fn live_keys_exist<S: SessionKey>(
     for chunk in sessions.chunks(FETCH_CHUNK) {
         let mut pipe = redis::pipe();
         for s in chunk {
-            pipe.cmd("EXISTS").arg(live_key::key_of(s));
+            pipe.cmd("HGET")
+                .arg(live_key::key_of(s))
+                .arg(F_UPDATED_AT_MS);
         }
-        let flags: Vec<bool> = bounded(pipe.query_async(&mut conn)).await?;
-        out.extend(flags);
+        let stamps: Vec<Option<String>> = bounded(pipe.query_async(&mut conn)).await?;
+        out.extend(stamps.into_iter().map(|t| t.and_then(|t| t.parse().ok())));
     }
     Ok(out)
 }
@@ -209,26 +232,29 @@ pub async fn live_keys_exist<S: SessionKey>(
 pub struct LiveFields {
     pub hash_rate: f64,
     pub current_difficulty: Option<f64>,
-    /// `None` on a watchdog-created partial hash — render as 1 channel.
+    /// `None` without the field — render as 1 channel.
     pub channel_count: Option<i32>,
     /// Epoch-ms of the freshest accepted share.
     pub updated_at_ms: Option<i64>,
 }
 
-fn parse_live_fields(pairs: Vec<(String, String)>) -> Option<LiveFields> {
+/// One live hash as read at `now_ms`; a silent session reads hashrate 0.
+fn parse_live_fields(pairs: Vec<(String, String)>, now_ms: i64) -> Option<LiveFields> {
     if pairs.is_empty() {
         return None;
     }
     let mut lf = LiveFields::default();
+    let mut stored_rate = None;
     for (field, value) in pairs {
         match field.as_str() {
-            live_key::F_HASH_RATE => lf.hash_rate = value.parse().unwrap_or(0.0),
+            live_key::F_HASH_RATE => stored_rate = value.parse().ok(),
             live_key::F_CURRENT_DIFFICULTY => lf.current_difficulty = value.parse().ok(),
             live_key::F_CHANNEL_COUNT => lf.channel_count = value.parse().ok(),
             live_key::F_UPDATED_AT_MS => lf.updated_at_ms = value.parse().ok(),
             _ => {}
         }
     }
+    lf.hash_rate = live_rate(stored_rate, lf.updated_at_ms, now_ms);
     Some(lf)
 }
 
@@ -249,7 +275,8 @@ pub async fn live_fields_for_sessions<S: SessionKey>(
             pipe.cmd("HGETALL").arg(live_key::key_of(s));
         }
         let hashes: Vec<Vec<(String, String)>> = bounded(pipe.query_async(&mut conn)).await?;
-        out.extend(hashes.into_iter().map(parse_live_fields));
+        let now = bp_common::now_ms();
+        out.extend(hashes.into_iter().map(|h| parse_live_fields(h, now)));
     }
     Ok(out)
 }
@@ -360,21 +387,41 @@ mod tests {
         assert_eq!(address_of("pplns:window:total"), None);
     }
 
+    const NOW: i64 = 1_790_000_000_000;
+
+    fn hash(rate: &str, updated_at: i64) -> Vec<(String, String)> {
+        vec![
+            ("hash_rate".into(), rate.into()),
+            ("updated_at_ms".into(), updated_at.to_string()),
+            ("current_difficulty".into(), "512".into()),
+            ("channel_count".into(), "2".into()),
+        ]
+    }
+
     #[test]
-    fn live_fields_parse_tolerates_partial_hashes() {
-        // Watchdog-created hash: only hash_rate.
-        let lf = parse_live_fields(vec![("hash_rate".into(), "1234.5".into())]).unwrap();
-        assert_eq!(lf.hash_rate, 1234.5);
+    fn a_session_reads_its_rate_until_the_silence_and_zero_after() {
+        let fresh = parse_live_fields(hash("1234.5", NOW - HASHRATE_SILENCE_MS), NOW).unwrap();
+        assert_eq!(fresh.hash_rate, 1234.5, "at the threshold it still counts");
+        let silent = parse_live_fields(hash("1234.5", NOW - HASHRATE_SILENCE_MS - 1), NOW).unwrap();
+        assert_eq!(silent.hash_rate, 0.0, "past it the session is silent");
+        // Silence zeroes only the rate; the rest of the session stays readable.
+        assert_eq!(silent.current_difficulty, Some(512.0));
+        assert_eq!(silent.channel_count, Some(2));
+        assert_eq!(silent.updated_at_ms, Some(NOW - HASHRATE_SILENCE_MS - 1));
+    }
+
+    #[test]
+    fn live_fields_parse_tolerates_missing_and_unknown_fields() {
+        // No timestamp: nothing says the session is hashing.
+        let lf = parse_live_fields(vec![("hash_rate".into(), "7.5".into())], NOW).unwrap();
+        assert_eq!(lf.hash_rate, 0.0);
         assert_eq!(lf.channel_count, None);
         // Empty hash = missing key (HGETALL on a missing key is empty).
-        assert_eq!(parse_live_fields(vec![]), None);
+        assert_eq!(parse_live_fields(vec![], NOW), None);
         // Unknown fields are ignored, not an error.
-        let lf = parse_live_fields(vec![
-            ("hash_rate".into(), "7.5".into()),
-            ("some_future_field".into(), "x".into()),
-        ])
-        .unwrap();
-        assert_eq!(lf.hash_rate, 7.5);
+        let mut fields = hash("7.5", NOW);
+        fields.push(("some_future_field".into(), "x".into()));
+        assert_eq!(parse_live_fields(fields, NOW).unwrap().hash_rate, 7.5);
     }
 
     #[test]

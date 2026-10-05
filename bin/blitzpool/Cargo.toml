@@ -42,6 +42,7 @@ bp-group-solo-engine = { workspace = true }
 bp-blockparty = { workspace = true }
 bp-blockparty-engine = { workspace = true }
 bp-share-stats-sink = { workspace = true }
+bp-stats = { workspace = true }
 bp-session-persistence = { workspace = true }
 
 # Production hook impls (`hooks.rs`) — invitation + verification

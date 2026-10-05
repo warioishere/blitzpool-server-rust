@@ -57,20 +57,21 @@ impl BestDifficultyAccumulator {
         }
     }
 
-    /// Snapshot WITHOUT clearing; an entry is only dropped once
-    /// [`Self::confirm`] has seen it persisted.
-    pub fn drain(&self) -> BestDifficultySnapshot {
-        self.inner.lock().clone()
+    /// Empty the accumulator for a flush.
+    pub fn take(&self) -> BestDifficultySnapshot {
+        std::mem::take(&mut *self.inner.lock())
     }
 
-    /// Drop persisted entries, but keep one whose max grew mid-flush so the
-    /// next tick writes the higher value.
-    pub fn confirm(&self, snapshot: &BestDifficultySnapshot) {
+    /// Hand back an unwritten [`Self::take`]: per address the higher best
+    /// wins, with the user agent that set it.
+    pub fn restore(&self, snapshot: BestDifficultySnapshot) {
         let mut guard = self.inner.lock();
-        for (address, confirmed) in snapshot {
-            if let Some(live) = guard.get(address) {
-                if live.best_difficulty <= confirmed.best_difficulty {
-                    guard.remove(address);
+        for (address, entry) in snapshot {
+            match guard.get_mut(&address) {
+                Some(live) if live.best_difficulty >= entry.best_difficulty => {}
+                Some(live) => *live = entry,
+                None => {
+                    guard.insert(address, entry);
                 }
             }
         }
@@ -91,7 +92,7 @@ mod tests {
         acc.add(&a("bc1qalice"), 100.0, Some("bitaxe"));
         acc.add(&a("bc1qalice"), 250.0, Some("nerdqaxe"));
         acc.add(&a("bc1qalice"), 40.0, Some("worker")); // lower — ignored
-        let snap = acc.drain();
+        let snap = acc.take();
         let e = snap.get(&a("bc1qalice")).unwrap();
         assert_eq!(e.best_difficulty, 250.0);
         assert_eq!(e.user_agent.as_deref(), Some("nerdqaxe"));
@@ -103,34 +104,33 @@ mod tests {
         acc.add(&a("bc1qbob"), f64::NAN, None);
         acc.add(&a("bc1qbob"), 0.0, None);
         acc.add(&a("bc1qbob"), -5.0, None);
-        assert!(acc.drain().is_empty());
+        assert!(acc.take().is_empty());
     }
 
     #[test]
-    fn drain_does_not_clear_confirm_drops_persisted() {
+    fn take_empties_the_accumulator() {
         let acc = BestDifficultyAccumulator::new();
         acc.add(&a("bc1qalice"), 100.0, Some("x"));
-        let snap = acc.drain();
         assert_eq!(
-            acc.drain().get(&a("bc1qalice")).unwrap().best_difficulty,
+            acc.take().get(&a("bc1qalice")).unwrap().best_difficulty,
             100.0
         );
-        acc.confirm(&snap);
-        assert!(acc.drain().is_empty(), "confirmed entry dropped");
+        assert!(acc.take().is_empty());
     }
 
     #[test]
-    fn confirm_keeps_a_higher_value_that_arrived_mid_flush() {
+    fn restore_keeps_the_higher_of_snapshot_and_mid_flush_value() {
         let acc = BestDifficultyAccumulator::new();
         acc.add(&a("bc1qalice"), 100.0, Some("x"));
-        let snap = acc.drain(); // 100 persisted by the flush
-        acc.add(&a("bc1qalice"), 300.0, Some("y")); // new high arrives mid-flush
-        acc.confirm(&snap);
-        let e = acc.drain().get(&a("bc1qalice")).cloned().unwrap();
-        assert_eq!(
-            e.best_difficulty, 300.0,
-            "higher mid-flush value survives confirm"
-        );
-        assert_eq!(e.user_agent.as_deref(), Some("y"));
+        acc.add(&a("bc1qbob"), 900.0, Some("b"));
+        let snap = acc.take(); // the flush fails
+        acc.add(&a("bc1qalice"), 300.0, Some("y")); // higher, mid-flush
+        acc.add(&a("bc1qbob"), 50.0, Some("c")); // lower, mid-flush
+        acc.restore(snap);
+        let after = acc.take();
+        assert_eq!(after[&a("bc1qalice")].best_difficulty, 300.0);
+        assert_eq!(after[&a("bc1qalice")].user_agent.as_deref(), Some("y"));
+        assert_eq!(after[&a("bc1qbob")].best_difficulty, 900.0);
+        assert_eq!(after[&a("bc1qbob")].user_agent.as_deref(), Some("b"));
     }
 }

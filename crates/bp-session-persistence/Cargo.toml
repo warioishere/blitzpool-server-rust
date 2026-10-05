@@ -16,7 +16,6 @@ bp-db = { workspace = true }
 # Protocol-agnostic per-share + session hook surface — see
 # bp-share-hook crate docs. Same trait used for SV1 + SV2 servers.
 bp-share-hook = { workspace = true }
-bp-share = { workspace = true }
 
 tokio = { workspace = true }
 async-trait = { workspace = true }

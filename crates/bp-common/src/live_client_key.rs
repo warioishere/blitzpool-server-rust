@@ -12,8 +12,8 @@ pub const CLIENT_LIVE_PREFIX: &str = "client:live:";
 /// cannot appear in a Bitcoin address.
 pub const KEY_SEP: char = '\u{1f}';
 
-/// Hash field: live hashrate in H/s. May be the ONLY field present: the
-/// watchdog's write can recreate an expired key with just this field.
+/// Hash field: vardiff's hashrate in H/s at the freshest share. It stays in
+/// the hash when the shares stop; readers zero it past [`HASHRATE_SILENCE_MS`].
 pub const F_HASH_RATE: &str = "hash_rate";
 /// Hash field: latest vardiff target observed on an accepted share.
 pub const F_CURRENT_DIFFICULTY: &str = "current_difficulty";
@@ -21,6 +21,11 @@ pub const F_CURRENT_DIFFICULTY: &str = "current_difficulty";
 pub const F_CHANNEL_COUNT: &str = "channel_count";
 /// Hash field: epoch-ms timestamp of the freshest accepted share.
 pub const F_UPDATED_AT_MS: &str = "updated_at_ms";
+
+/// A session whose freshest share is older than this reads hashrate 0. At the
+/// vardiff target of 15 shares/min a hashing session practically never goes
+/// this quiet, so a miner with far fewer shares per minute reads 0 between them.
+pub const HASHRATE_SILENCE_MS: i64 = 120_000;
 
 /// Anything that identifies one mining session, so the key is built in one
 /// place from whatever a reader already holds.

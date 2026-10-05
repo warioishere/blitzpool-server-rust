@@ -2,10 +2,10 @@
 
 //! Domain accumulators on top of the generic buffers. Each holds a short,
 //! await-free `Mutex`; `add_*` is infallible because the share path must not
-//! fail, so out-of-range or non-finite inputs are dropped silently.
+//! fail. The stats sink drops out-of-range or non-finite difficulties before
+//! they get here.
 
 mod best_difficulty;
-mod client_rejected;
 mod client_statistics;
 mod pool_mode_hashrate;
 mod pool_rejected;
@@ -13,7 +13,6 @@ mod pool_shares;
 mod share_totals;
 
 pub use best_difficulty::{BestDifficultyAccumulator, BestDifficultyEntry, BestDifficultySnapshot};
-pub use client_rejected::{ClientRejectedAccumulator, ClientRejectedKey, ClientRejectedSnapshot};
 pub use client_statistics::{
     ClientStatisticsAccumulator, ClientStatisticsKey, ClientStatisticsRecord,
     ClientStatisticsSnapshot,
@@ -32,17 +31,6 @@ pub fn share_max(submission_difficulty: f64) -> f64 {
         submission_difficulty
     } else {
         0.0
-    }
-}
-
-/// A slot maximum after a flush of `flushed` succeeded. The database merges
-/// maxima with `GREATEST`, so a buffered value no higher than the one written
-/// is done; a higher one arrived during the flush and is still owed.
-pub(crate) fn flushed_max(buffered: f64, flushed: f64) -> f64 {
-    if buffered <= flushed {
-        0.0
-    } else {
-        buffered
     }
 }
 

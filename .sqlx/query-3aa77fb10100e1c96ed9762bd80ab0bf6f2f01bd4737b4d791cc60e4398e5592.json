@@ -1,0 +1,113 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            address AS \"address!: AddressId\",\n            \"clientName\" AS \"client_name!\",\n            \"sessionId\" AS \"session_id!\",\n            \"time\" AS \"time!\",\n            shares AS \"shares!\",\n            \"rejectedJobNotFoundCount\" AS \"rejected_job_not_found_count!\",\n            \"rejectedJobNotFoundDiff1\" AS \"rejected_job_not_found_diff1!\",\n            \"rejectedDuplicateShareCount\" AS \"rejected_duplicate_share_count!\",\n            \"rejectedDuplicateShareDiff1\" AS \"rejected_duplicate_share_diff1!\",\n            \"rejectedLowDifficultyShareCount\" AS \"rejected_low_difficulty_share_count!\",\n            \"rejectedLowDifficultyShareDiff1\" AS \"rejected_low_difficulty_share_diff1!\",\n            \"rejectedVersionRollingCount\" AS \"rejected_version_rolling_count!\",\n            \"rejectedVersionRollingDiff1\" AS \"rejected_version_rolling_diff1!\",\n            \"rejectedStaleCount\" AS \"rejected_stale_count!\",\n            \"rejectedStaleDiff1\" AS \"rejected_stale_diff1!\",\n            \"maxDifficulty\" AS \"max_difficulty!\"\n           FROM client_statistics_entity\n           WHERE address = ANY($1) AND \"time\" >= $2\n           ORDER BY array_position($1, address::text), \"time\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address!: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "client_name!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "session_id!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "time!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "shares!",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 5,
+        "name": "rejected_job_not_found_count!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "rejected_job_not_found_diff1!",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 7,
+        "name": "rejected_duplicate_share_count!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "rejected_duplicate_share_diff1!",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 9,
+        "name": "rejected_low_difficulty_share_count!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 10,
+        "name": "rejected_low_difficulty_share_diff1!",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 11,
+        "name": "rejected_version_rolling_count!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 12,
+        "name": "rejected_version_rolling_diff1!",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 13,
+        "name": "rejected_stale_count!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 14,
+        "name": "rejected_stale_diff1!",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 15,
+        "name": "max_difficulty!",
+        "type_info": "Float4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "3aa77fb10100e1c96ed9762bd80ab0bf6f2f01bd4737b4d791cc60e4398e5592"
+}

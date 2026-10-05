@@ -7,13 +7,12 @@
 //! each test runs inside a rolled-back transaction.
 
 use bp_db::{
-    bulk_upsert_address_settings, bulk_upsert_client_rejected_statistics_entity,
-    bulk_upsert_client_statistics_entity, bulk_upsert_pool_mode_hashrate,
-    bulk_upsert_pool_rejected_statistics, bulk_upsert_pool_share_statistics,
-    bulk_upsert_worker_shares_entity, count_worker_shares, find_max_difficulty_since_for_addresses,
-    seed_worker_shares_from_client_statistics, AddressSettingsUpsert, ClientRejectedStatsUpsert,
-    ClientStatsUpsert, PoolModeHashrateUpsert, PoolRejectedStatsUpsert, PoolShareStatsUpsert,
-    WorkerSharesUpsert,
+    bulk_upsert_address_settings, bulk_upsert_client_statistics_entity,
+    bulk_upsert_pool_mode_hashrate, bulk_upsert_pool_rejected_statistics,
+    bulk_upsert_pool_share_statistics, bulk_upsert_worker_shares_entity,
+    delete_old_pool_rejected_statistics, find_max_difficulty_since_for_addresses,
+    AddressSettingsUpsert, ClientStatsUpsert, PoolModeHashrateUpsert, PoolRejectedStatsUpsert,
+    PoolShareStatsUpsert, WorkerSharesUpsert,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 
@@ -222,7 +221,7 @@ async fn pool_rejected_stats_composite_key_increment() {
     tx.rollback().await.expect("rollback");
 }
 
-// ── client_statistics_entity (15 cols, batchable) ────────────────────
+// ── client_statistics_entity ─────────────────────────────────────────
 
 #[tokio::test]
 async fn client_stats_insert_then_increment_every_field() {
@@ -232,22 +231,13 @@ async fn client_stats_insert_then_increment_every_field() {
     let mut tx = pool.begin().await.expect("begin tx");
     let slot = unique_slot(4);
 
-    let mk = |shares: f32,
-              accepted: i32,
-              rejected: i32,
-              jnf: i32,
-              dup: i32,
-              low: i32,
-              vr: i32,
-              stale: i32| {
+    let mk = |shares: f32, jnf: i32, dup: i32, low: i32, vr: i32, stale: i32| {
         ClientStatsUpsert {
             address: "test_cs_alice".to_string(),
             client_name: "w1".to_string(),
             session_id: "sess0001".to_string(),
             time_ms: slot,
             shares,
-            accepted_count: accepted,
-            rejected_count: rejected,
             rejected_job_not_found_count: jnf,
             rejected_job_not_found_diff1: jnf as f32 * 0.5,
             rejected_duplicate_share_count: dup,
@@ -265,18 +255,19 @@ async fn client_stats_insert_then_increment_every_field() {
         }
     };
 
-    bulk_upsert_client_statistics_entity(&mut *tx, &[mk(100.0, 5, 3, 1, 1, 1, 2, 4)])
+    bulk_upsert_client_statistics_entity(&mut *tx, &[mk(100.0, 1, 1, 1, 2, 4)])
         .await
         .expect("first");
     // Second call: every numeric field accumulates.
-    bulk_upsert_client_statistics_entity(&mut *tx, &[mk(50.0, 2, 0, 0, 0, 0, 3, 6)])
+    bulk_upsert_client_statistics_entity(&mut *tx, &[mk(50.0, 1, 2, 3, 3, 6)])
         .await
         .expect("second");
 
     let row = sqlx::query(
-        r#"SELECT shares, "acceptedCount", "rejectedCount",
-                  "rejectedJobNotFoundCount", "rejectedDuplicateShareCount",
-                  "rejectedLowDifficultyShareCount",
+        r#"SELECT shares,
+                  "rejectedJobNotFoundCount", "rejectedJobNotFoundDiff1",
+                  "rejectedDuplicateShareCount", "rejectedDuplicateShareDiff1",
+                  "rejectedLowDifficultyShareCount", "rejectedLowDifficultyShareDiff1",
                   "rejectedVersionRollingCount", "rejectedVersionRollingDiff1",
                   "rejectedStaleCount", "rejectedStaleDiff1", "maxDifficulty"
            FROM client_statistics_entity
@@ -291,21 +282,25 @@ async fn client_stats_insert_then_increment_every_field() {
     .expect("read");
 
     let shares: f32 = row.get("shares");
-    let accepted: i32 = row.get("acceptedCount");
-    let rejected: i32 = row.get("rejectedCount");
     let jnf: i32 = row.get("rejectedJobNotFoundCount");
+    let jnf_diff: f32 = row.get("rejectedJobNotFoundDiff1");
     let dup: i32 = row.get("rejectedDuplicateShareCount");
+    let dup_diff: f32 = row.get("rejectedDuplicateShareDiff1");
     let low: i32 = row.get("rejectedLowDifficultyShareCount");
+    let low_diff: f32 = row.get("rejectedLowDifficultyShareDiff1");
     let vr: i32 = row.get("rejectedVersionRollingCount");
     let vr_diff: f32 = row.get("rejectedVersionRollingDiff1");
     let stale: i32 = row.get("rejectedStaleCount");
     let stale_diff: f32 = row.get("rejectedStaleDiff1");
     assert!((shares - 150.0).abs() < 0.01);
-    assert_eq!(accepted, 7);
-    assert_eq!(rejected, 3);
-    assert_eq!(jnf, 1);
-    assert_eq!(dup, 1);
-    assert_eq!(low, 1);
+    // Each pair at its own count and multiplier, so a swapped bind or a
+    // wrong `$n` index lands on another pair's value.
+    assert_eq!(jnf, 2);
+    assert!((jnf_diff - 1.0).abs() < 0.001, "got {jnf_diff}");
+    assert_eq!(dup, 3);
+    assert!((dup_diff - 0.75).abs() < 0.001, "got {dup_diff}");
+    assert_eq!(low, 4);
+    assert!((low_diff - 0.4).abs() < 0.001, "got {low_diff}");
     // 2 + 3, at a multiplier no other pair uses — a swapped bind would land
     // on one of the others' values instead.
     assert_eq!(vr, 5);
@@ -339,8 +334,6 @@ async fn max_difficulty_for_addresses_is_the_members_maximum_per_slot() {
         session_id: "sess0001".to_string(),
         time_ms,
         shares: 1.0,
-        accepted_count: 1,
-        rejected_count: 0,
         rejected_job_not_found_count: 0,
         rejected_job_not_found_diff1: 0.0,
         rejected_duplicate_share_count: 0,
@@ -392,8 +385,6 @@ async fn client_stats_distinct_keys_stay_independent() {
         session_id: "sessA".to_string(),
         time_ms: slot,
         shares: 10.0,
-        accepted_count: 1,
-        rejected_count: 0,
         rejected_job_not_found_count: 0,
         rejected_job_not_found_diff1: 0.0,
         rejected_duplicate_share_count: 0,
@@ -422,48 +413,6 @@ async fn client_stats_distinct_keys_stay_independent() {
     .await
     .expect("count");
     assert_eq!(cnt, 2);
-
-    tx.rollback().await.expect("rollback");
-}
-
-// ── client_rejected_statistics ───────────────────────────────────────
-
-#[tokio::test]
-async fn client_rejected_stats_dual_field_increment() {
-    let Some(pool) = connect_or_skip().await else {
-        return;
-    };
-    let mut tx = pool.begin().await.expect("begin tx");
-    let slot = unique_slot(6);
-
-    let rows = vec![ClientRejectedStatsUpsert {
-        address: "test_crs_a".to_string(),
-        time_ms: slot,
-        reason: "low-difficulty".to_string(),
-        count: 2.0,
-        shares: 0.5,
-    }];
-    bulk_upsert_client_rejected_statistics_entity(&mut *tx, &rows)
-        .await
-        .expect("first");
-    bulk_upsert_client_rejected_statistics_entity(&mut *tx, &rows)
-        .await
-        .expect("second");
-
-    let row = sqlx::query(
-        r#"SELECT count, shares FROM client_rejected_statistics_entity
-           WHERE address = $1 AND "time" = $2 AND reason = $3"#,
-    )
-    .bind("test_crs_a")
-    .bind(slot)
-    .bind("low-difficulty")
-    .fetch_one(&mut *tx)
-    .await
-    .expect("read");
-    let count: f32 = row.get("count");
-    let shares: f32 = row.get("shares");
-    assert!((count - 4.0).abs() < 0.01);
-    assert!((shares - 1.0).abs() < 0.01);
 
     tx.rollback().await.expect("rollback");
 }
@@ -875,105 +824,45 @@ async fn worker_shares_composite_pk_upsert_increments() {
     tx.rollback().await.expect("rollback");
 }
 
-// ── seed bootstrap ───────────────────────────────────────────────────
-
+/// The retention delete removes rows strictly older than the cutoff.
 #[tokio::test]
-async fn count_worker_shares_returns_zero_after_truncate_in_tx() {
+async fn pool_rejected_retention_keeps_the_cutoff_slot() {
     let Some(pool) = connect_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
-    sqlx::query("TRUNCATE worker_shares_entity")
-        .execute(&mut *tx)
-        .await
-        .expect("truncate");
-    let n = count_worker_shares(&mut *tx).await.expect("count");
-    assert_eq!(n, 0);
-    tx.rollback().await.expect("rollback");
-}
-
-#[tokio::test]
-async fn seed_aggregates_client_statistics_into_worker_shares() {
-    let Some(pool) = connect_or_skip().await else {
-        return;
-    };
-    let mut tx = pool.begin().await.expect("begin tx");
-    sqlx::query("TRUNCATE worker_shares_entity")
-        .execute(&mut *tx)
-        .await
-        .expect("truncate ws");
-    sqlx::query("TRUNCATE client_statistics_entity")
-        .execute(&mut *tx)
-        .await
-        .expect("truncate cs");
-
-    let slot = unique_slot(7);
-    // Two slots for the same (addr, clientName); seed should sum.
-    let stats = vec![
-        ClientStatsUpsert {
-            address: "test_seed_alice".to_string(),
-            client_name: "w1".to_string(),
-            session_id: "s1".to_string(),
-            time_ms: slot,
-            shares: 30.0,
-            accepted_count: 1,
-            rejected_count: 0,
-            rejected_job_not_found_count: 0,
-            rejected_job_not_found_diff1: 0.0,
-            rejected_duplicate_share_count: 0,
-            rejected_duplicate_share_diff1: 0.0,
-            rejected_low_difficulty_share_count: 1,
-            rejected_low_difficulty_share_diff1: 0.5,
-            rejected_version_rolling_count: 0,
-            rejected_version_rolling_diff1: 0.0,
-            rejected_stale_count: 0,
-            rejected_stale_diff1: 0.0,
-            max_difficulty: 0.0,
-        },
-        ClientStatsUpsert {
-            address: "test_seed_alice".to_string(),
-            client_name: "w1".to_string(),
-            session_id: "s2".to_string(),
-            time_ms: slot + 1,
-            shares: 70.0,
-            accepted_count: 2,
-            rejected_count: 0,
-            rejected_job_not_found_count: 0,
-            rejected_job_not_found_diff1: 0.0,
-            rejected_duplicate_share_count: 0,
-            rejected_duplicate_share_diff1: 0.0,
-            rejected_low_difficulty_share_count: 1,
-            rejected_low_difficulty_share_diff1: 0.75,
-            rejected_version_rolling_count: 0,
-            rejected_version_rolling_diff1: 0.0,
-            rejected_stale_count: 0,
-            rejected_stale_diff1: 0.0,
-            max_difficulty: 0.0,
-        },
-    ];
-    bulk_upsert_client_statistics_entity(&mut *tx, &stats)
-        .await
-        .expect("seed cs rows");
-
-    let inserted = seed_worker_shares_from_client_statistics(&mut *tx)
-        .await
-        .expect("seed");
-    assert_eq!(inserted, 1, "one aggregated row");
-
-    let row = sqlx::query(
-        r#"SELECT shares, "rejectedShares" FROM worker_shares_entity
-           WHERE address = $1 AND "clientName" = $2"#,
+    let cutoff = unique_slot(9);
+    bulk_upsert_pool_rejected_statistics(
+        &mut *tx,
+        &[
+            PoolRejectedStatsUpsert {
+                time_ms: cutoff - 1,
+                reason: "Stale".to_string(),
+                count: 1.0,
+            },
+            PoolRejectedStatsUpsert {
+                time_ms: cutoff,
+                reason: "Stale".to_string(),
+                count: 2.0,
+            },
+        ],
     )
-    .bind("test_seed_alice")
-    .bind("w1")
-    .fetch_one(&mut *tx)
     .await
-    .expect("read seeded");
-    let shares: f64 = row.get("shares");
-    let rejected: f64 = row.get("rejectedShares");
-    assert!((shares - 100.0).abs() < 0.01, "sum of 30+70: {shares}");
-    // Sum of low-diff diff1: 0.5 + 0.75 = 1.25 (jnf+dup were zero).
-    assert!((rejected - 1.25).abs() < 0.01, "rejected sum: {rejected}");
+    .expect("seed");
+
+    delete_old_pool_rejected_statistics(&mut *tx, cutoff)
+        .await
+        .expect("delete");
+    let left: Vec<i64> = sqlx::query_scalar(
+        r#"SELECT "time" FROM pool_rejected_statistics_entity
+           WHERE "time" IN ($1, $2) ORDER BY "time""#,
+    )
+    .bind(cutoff - 1)
+    .bind(cutoff)
+    .fetch_all(&mut *tx)
+    .await
+    .expect("read");
+    assert_eq!(left, vec![cutoff]);
 
     tx.rollback().await.expect("rollback");
 }

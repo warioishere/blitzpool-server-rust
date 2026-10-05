@@ -141,28 +141,31 @@ pub async fn find_active_sessions_for_addresses(
 // ── Time-range readers ───────────────────────────────────────────────
 // Raw rows only: bucketing is endpoint-specific, so the API layer does it.
 
-/// Minimal projection for counting distinct workers per slot; unordered
-/// because the caller buckets into a map, so PG skips a sort.
-#[derive(Clone, Debug, FromRow)]
-pub struct PoolWorkerRow {
+/// Distinct miners of one slot: addresses, and `(address, worker)` pairs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolWorkerCounts {
     pub time: i64,
-    pub address: String,
-    #[sqlx(rename = "clientName")]
-    pub client_name: String,
+    pub addresses: i64,
+    pub workers: i64,
 }
 
-pub async fn find_pool_worker_rows_since<'e, E>(
+/// Distinct addresses and workers per slot from `since_ms` on, counted in
+/// Postgres so one row per slot crosses the wire instead of one per session.
+pub async fn find_pool_worker_counts_since<'e, E>(
     executor: E,
     since_ms: i64,
-) -> Result<Vec<PoolWorkerRow>, DbError>
+) -> Result<Vec<PoolWorkerCounts>, DbError>
 where
     E: sqlx::PgExecutor<'e>,
 {
     sqlx::query_as!(
-        PoolWorkerRow,
-        r#"SELECT "time" AS "time!", address AS "address!", "clientName" AS "client_name!"
+        PoolWorkerCounts,
+        r#"SELECT "time" AS "time!",
+                  COUNT(DISTINCT address) AS "addresses!",
+                  COUNT(DISTINCT (address, "clientName")) AS "workers!"
              FROM client_statistics_entity
-            WHERE "deletedAt" IS NULL AND "time" >= $1"#,
+            WHERE "time" >= $1
+            GROUP BY "time""#,
         since_ms,
     )
     .fetch_all(executor)
@@ -170,26 +173,23 @@ where
     .map_err(DbError::from)
 }
 
-/// One address's `client_statistics_entity` rows from `since_ms` on, by time.
-pub async fn find_client_statistics_since_for_address(
+/// The `client_statistics_entity` rows of `addresses` from `since_ms` on, in
+/// one query: address by address in the order given, each by time, so a sum
+/// over them adds in the same order as one read per address would.
+pub async fn find_client_statistics_since_for_addresses(
     pool: &PgPool,
-    address: &AddressId,
+    addresses: &[AddressId],
     since_ms: i64,
 ) -> Result<Vec<ClientStatisticsRow>, DbError> {
+    let addresses: Vec<String> = addresses.iter().map(|a| a.as_str().to_string()).collect();
     sqlx::query_as!(
         ClientStatisticsRow,
         r#"SELECT
-            "deletedAt" AS "deleted_at?",
-            "createdAt" AS "created_at!",
-            "updatedAt" AS "updated_at!",
-            id AS "id!",
             address AS "address!: AddressId",
             "clientName" AS "client_name!",
             "sessionId" AS "session_id!",
             "time" AS "time!",
             shares AS "shares!",
-            "acceptedCount" AS "accepted_count!",
-            "rejectedCount" AS "rejected_count!",
             "rejectedJobNotFoundCount" AS "rejected_job_not_found_count!",
             "rejectedJobNotFoundDiff1" AS "rejected_job_not_found_diff1!",
             "rejectedDuplicateShareCount" AS "rejected_duplicate_share_count!",
@@ -202,9 +202,9 @@ pub async fn find_client_statistics_since_for_address(
             "rejectedStaleDiff1" AS "rejected_stale_diff1!",
             "maxDifficulty" AS "max_difficulty!"
            FROM client_statistics_entity
-           WHERE "deletedAt" IS NULL AND address = $1 AND "time" >= $2
-           ORDER BY "time" ASC"#,
-        address.as_str(),
+           WHERE address = ANY($1) AND "time" >= $2
+           ORDER BY array_position($1, address::text), "time""#,
+        &addresses,
         since_ms,
     )
     .fetch_all(pool)
@@ -226,7 +226,7 @@ where
     let rows = sqlx::query!(
         r#"SELECT "time" AS "time!", MAX("maxDifficulty") AS "max_difficulty!"
            FROM client_statistics_entity
-           WHERE "deletedAt" IS NULL AND address = ANY($1) AND "time" >= $2
+           WHERE address = ANY($1) AND "time" >= $2
            GROUP BY "time""#,
         &addresses,
         since_ms,
@@ -240,44 +240,8 @@ where
         .collect())
 }
 
-/// `client_rejected_statistics_entity` rows for one address from `since_ms`.
-pub async fn find_client_rejected_statistics_since_for_address(
-    pool: &PgPool,
-    address: &AddressId,
-    since_ms: i64,
-) -> Result<Vec<ClientRejectedStatisticsRow>, DbError> {
-    sqlx::query_as!(
-        ClientRejectedStatisticsRow,
-        r#"SELECT
-            "deletedAt" AS "deleted_at?",
-            "createdAt" AS "created_at!",
-            "updatedAt" AS "updated_at!",
-            id AS "id!",
-            address AS "address!: AddressId",
-            "time" AS "time!",
-            reason AS "reason!",
-            count AS "count!",
-            shares AS "shares!"
-           FROM client_rejected_statistics_entity
-           WHERE "deletedAt" IS NULL AND address = $1 AND "time" >= $2
-           ORDER BY "time" ASC"#,
-        address.as_str(),
-        since_ms,
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(DbError::from)
-}
-
 #[derive(Clone, Debug, FromRow)]
 pub struct ClientStatisticsRow {
-    #[sqlx(rename = "deletedAt")]
-    pub deleted_at: Option<i64>,
-    #[sqlx(rename = "createdAt")]
-    pub created_at: i64,
-    #[sqlx(rename = "updatedAt")]
-    pub updated_at: i64,
-    pub id: i32,
     pub address: AddressId,
     #[sqlx(rename = "clientName")]
     pub client_name: String,
@@ -285,10 +249,6 @@ pub struct ClientStatisticsRow {
     pub session_id: String,
     pub time: i64,
     pub shares: f32,
-    #[sqlx(rename = "acceptedCount")]
-    pub accepted_count: i32,
-    #[sqlx(rename = "rejectedCount")]
-    pub rejected_count: i32,
     #[sqlx(rename = "rejectedJobNotFoundCount")]
     pub rejected_job_not_found_count: i32,
     #[sqlx(rename = "rejectedJobNotFoundDiff1")]
@@ -314,62 +274,6 @@ pub struct ClientStatisticsRow {
     pub max_difficulty: f32,
 }
 
-/// Upserts per-slot maxima; `GREATEST` so a lower share never lowers a slot.
-/// The caller MUST collapse duplicates per `(address, clientName, slotTime)`:
-/// Postgres errors when one `ON CONFLICT DO UPDATE` hits a row twice. No
-/// advisory lock because one flush loop is the only writer; a second needs one.
-pub async fn bulk_upsert_client_difficulty_statistics(
-    pool: &PgPool,
-    addresses: &[String],
-    client_names: &[String],
-    slot_times: &[i64],
-    max_difficulties: &[f32],
-    updated_ats: &[i64],
-) -> Result<u64, DbError> {
-    let result = sqlx::query!(
-        r#"INSERT INTO client_difficulty_statistics_entity
-               (address, "clientName", "slotTime", "maxDifficulty", "createdAt", "updatedAt")
-           SELECT
-               unnest($1::text[]),
-               unnest($2::text[]),
-               unnest($3::bigint[]),
-               unnest($4::real[]),
-               unnest($5::bigint[]),
-               unnest($5::bigint[])
-           ON CONFLICT (address, "clientName", "slotTime") DO UPDATE SET
-               "maxDifficulty" = GREATEST(
-                   EXCLUDED."maxDifficulty",
-                   client_difficulty_statistics_entity."maxDifficulty"
-               ),
-               "updatedAt" = EXCLUDED."updatedAt""#,
-        addresses,
-        client_names,
-        slot_times,
-        max_difficulties,
-        updated_ats,
-    )
-    .execute(pool)
-    .await
-    .map_err(DbError::from)?;
-    Ok(result.rows_affected())
-}
-
-#[derive(Clone, Debug, FromRow)]
-pub struct ClientRejectedStatisticsRow {
-    #[sqlx(rename = "deletedAt")]
-    pub deleted_at: Option<i64>,
-    #[sqlx(rename = "createdAt")]
-    pub created_at: i64,
-    #[sqlx(rename = "updatedAt")]
-    pub updated_at: i64,
-    pub id: i32,
-    pub address: AddressId,
-    pub time: i64,
-    pub reason: String,
-    pub count: f32,
-    pub shares: f32,
-}
-
 #[derive(Clone, Debug, FromRow)]
 pub struct WorkerSharesRow {
     pub address: AddressId,
@@ -380,11 +284,11 @@ pub struct WorkerSharesRow {
     pub rejected_shares: f64,
 }
 
-pub async fn find_worker_shares(
+/// Every `worker_shares_entity` row of one address.
+pub async fn find_worker_shares_for_address(
     pool: &PgPool,
     address: &AddressId,
-    client_name: &str,
-) -> Result<Option<WorkerSharesRow>, DbError> {
+) -> Result<Vec<WorkerSharesRow>, DbError> {
     sqlx::query_as!(
         WorkerSharesRow,
         r#"SELECT
@@ -393,11 +297,10 @@ pub async fn find_worker_shares(
             shares AS "shares!",
             "rejectedShares" AS "rejected_shares!"
            FROM worker_shares_entity
-           WHERE address = $1 AND "clientName" = $2 LIMIT 1"#,
-        address.as_str(),
-        client_name
+           WHERE address = $1"#,
+        address.as_str()
     )
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await
     .map_err(DbError::from)
 }
@@ -567,8 +470,8 @@ where
 
 /// Candidates (not verdicts) of the dead-session sweep: `updatedAt` is not
 /// touched per share, so age alone does not mean silent. The cron soft-deletes
-/// via [`soft_delete_sessions`] only those whose live hash is gone; the cutoff
-/// is the birth grace period.
+/// via [`soft_delete_sessions`] only those without a recent share in their
+/// live hash; the cutoff is the birth grace period.
 pub async fn find_stale_active_sessions<'e, E>(
     executor: E,
     cutoff_ms: i64,
@@ -775,36 +678,6 @@ where
     Ok(r.rows_affected())
 }
 
-pub async fn delete_old_client_rejected_statistics<'e, E>(
-    executor: E,
-    cutoff_ms: i64,
-) -> Result<u64, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    let r = sqlx::query(r#"DELETE FROM client_rejected_statistics_entity WHERE "time" < $1"#)
-        .bind(cutoff_ms)
-        .execute(executor)
-        .await
-        .map_err(DbError::from)?;
-    Ok(r.rows_affected())
-}
-
-pub async fn delete_old_client_difficulty_statistics<'e, E>(
-    executor: E,
-    cutoff_ms: i64,
-) -> Result<u64, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    let r = sqlx::query(r#"DELETE FROM client_difficulty_statistics_entity WHERE "slotTime" < $1"#)
-        .bind(cutoff_ms)
-        .execute(executor)
-        .await
-        .map_err(DbError::from)?;
-    Ok(r.rows_affected())
-}
-
 pub async fn delete_old_pool_mode_hashrate<'e, E>(
     executor: E,
     cutoff_ms: i64,
@@ -813,6 +686,21 @@ where
     E: sqlx::PgExecutor<'e>,
 {
     let r = sqlx::query(r#"DELETE FROM pool_mode_hashrate WHERE "time" < $1"#)
+        .bind(cutoff_ms)
+        .execute(executor)
+        .await
+        .map_err(DbError::from)?;
+    Ok(r.rows_affected())
+}
+
+pub async fn delete_old_pool_rejected_statistics<'e, E>(
+    executor: E,
+    cutoff_ms: i64,
+) -> Result<u64, DbError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let r = sqlx::query(r#"DELETE FROM pool_rejected_statistics_entity WHERE "time" < $1"#)
         .bind(cutoff_ms)
         .execute(executor)
         .await

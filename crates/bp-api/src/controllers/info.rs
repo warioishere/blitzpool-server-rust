@@ -824,7 +824,7 @@ use crate::time_range::{
 };
 use axum::extract::Query;
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -832,8 +832,7 @@ struct RangeQuery {
     range: Option<String>,
 }
 
-use crate::time_range::SLOT_SECONDS;
-use bp_common::HASHES_PER_DIFFICULTY_1;
+use crate::time_range::slot_hashrate;
 
 async fn chart(
     State(state): State<SharedState>,
@@ -855,7 +854,7 @@ async fn chart(
                 .filter(|r| r.time < cutoff)
                 .map(|r| ChartPoint {
                     label: crate::time_range::format_iso_ms(r.time),
-                    data: (r.accepted as f64 * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round(),
+                    data: slot_hashrate(r.accepted as f64),
                 })
                 .collect())
         })
@@ -922,35 +921,37 @@ async fn workers(
         .cache
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::Workers, async move {
             let since = bp_common::now_ms() - range.window_ms();
-            let rows = bp_db::find_pool_worker_rows_since(&s.pool, since).await?;
+            let counts = bp_db::find_pool_worker_counts_since(&s.pool, since).await?;
             Ok(worker_slots(
                 &chart_slot_boundaries(since),
-                rows.iter()
-                    .map(|r| (r.time, (r.address.as_str(), r.client_name.as_str()))),
+                counts
+                    .into_iter()
+                    .map(|c| (c.time, (c.addresses, c.workers))),
             ))
         })
         .await?;
     Ok(JsonBytes(bytes))
 }
 
-/// `(time, (address, worker))` samples → distinct addresses + workers per slot.
-fn worker_slots<'a>(
+/// `(slot end, (addresses, workers))` counts → one bucket per slot. A row's
+/// time is a slot end, so each lands on its own boundary and nothing is
+/// counted twice.
+fn worker_slots(
     boundaries: &[i64],
-    samples: impl IntoIterator<Item = (i64, (&'a str, &'a str))>,
+    counts: impl IntoIterator<Item = (i64, (i64, i64))>,
 ) -> SlotDataResponse {
-    type Seen = (HashSet<String>, HashSet<(String, String)>);
     let slots = fold_into_slots(
         boundaries,
-        samples,
-        |(addresses, workers): &mut Seen, (address, worker)| {
-            addresses.insert(address.to_string());
-            workers.insert((address.to_string(), worker.to_string()));
+        counts,
+        |(addresses, workers): &mut (i64, i64), (a, w)| {
+            *addresses += a;
+            *workers += w;
         },
     );
     SlotDataResponse::from_slots(slots, |(addresses, workers)| {
         BTreeMap::from([
-            ("addresses".to_string(), addresses.len() as f64),
-            ("workers".to_string(), workers.len() as f64),
+            ("addresses".to_string(), addresses as f64),
+            ("workers".to_string(), workers as f64),
         ])
     })
 }
@@ -1058,6 +1059,48 @@ pub(crate) struct RejectSlotsResponse {
     slot_data: Vec<RejectedSlot>,
 }
 
+/// One `(time, (reason, count, diff1))` sample per reject reason of a
+/// `client_statistics_entity` row, the input [`rejected_by_reason_slots`]
+/// takes. The `match` makes a new `RejectedReason` a compile error here.
+pub(crate) fn client_reject_samples(
+    r: &bp_db::ClientStatisticsRow,
+) -> impl Iterator<Item = (i64, (&'static str, f64, f64))> + '_ {
+    use bp_stats::RejectedReason as R;
+    [
+        R::JobNotFound,
+        R::DuplicateShare,
+        R::LowDifficulty,
+        R::VersionRollingNotAllowed,
+        R::Stale,
+    ]
+    .into_iter()
+    .map(move |reason| {
+        let (count, diff1) = match reason {
+            R::JobNotFound => (
+                r.rejected_job_not_found_count,
+                r.rejected_job_not_found_diff1,
+            ),
+            R::DuplicateShare => (
+                r.rejected_duplicate_share_count,
+                r.rejected_duplicate_share_diff1,
+            ),
+            R::LowDifficulty => (
+                r.rejected_low_difficulty_share_count,
+                r.rejected_low_difficulty_share_diff1,
+            ),
+            R::VersionRollingNotAllowed => (
+                r.rejected_version_rolling_count,
+                r.rejected_version_rolling_diff1,
+            ),
+            R::Stale => (r.rejected_stale_count, r.rejected_stale_diff1),
+        };
+        (
+            r.time,
+            (reason.as_str(), f64::from(count), f64::from(diff1)),
+        )
+    })
+}
+
 pub(crate) fn rejected_by_reason_slots<'a>(
     boundaries: &[i64],
     samples: impl IntoIterator<Item = (i64, (&'a str, f64, f64))>,
@@ -1117,24 +1160,6 @@ async fn shares(State(state): State<SharedState>) -> Result<JsonBytes, ApiError>
             async move {
                 let now = bp_common::now_ms();
                 const DAY: i64 = 24 * 60 * 60 * 1000;
-                let day_rows = bp_db::find_pool_share_statistics_since(&s.pool, now - DAY).await?;
-                let fortnight_rows =
-                    bp_db::find_pool_share_statistics_since(&s.pool, now - 14 * DAY).await?;
-                let month_rows =
-                    bp_db::find_pool_share_statistics_since(&s.pool, now - 30 * DAY).await?;
-                let accepted_1d = day_rows.iter().map(|r| r.accepted as f64).sum::<f64>();
-                let rejected_1d = day_rows.iter().map(|r| r.rejected as f64).sum::<f64>();
-                let accepted_14d = fortnight_rows
-                    .iter()
-                    .map(|r| r.accepted as f64)
-                    .sum::<f64>();
-                let rejected_14d = fortnight_rows
-                    .iter()
-                    .map(|r| r.rejected as f64)
-                    .sum::<f64>();
-                let accepted_30d = month_rows.iter().map(|r| r.accepted as f64).sum::<f64>();
-                let rejected_30d = month_rows.iter().map(|r| r.rejected as f64).sum::<f64>();
-
                 // With no block ever found, epoch yields the cumulative total.
                 let last_block_at: Option<i64> = sqlx::query_scalar(
                     r#"SELECT MAX("createdAt") FROM blocks_entity WHERE "deletedAt" IS NULL"#,
@@ -1144,12 +1169,23 @@ async fn shares(State(state): State<SharedState>) -> Result<JsonBytes, ApiError>
                 .ok()
                 .flatten();
                 let since_block = last_block_at.unwrap_or(0);
-                let block_rows =
-                    bp_db::find_pool_share_statistics_since(&s.pool, since_block).await?;
-                let accepted_since_block =
-                    block_rows.iter().map(|r| r.accepted as f64).sum::<f64>();
-                let rejected_since_block =
-                    block_rows.iter().map(|r| r.rejected as f64).sum::<f64>();
+                // One read back to the earliest window; each sum filters it.
+                let rows = bp_db::find_pool_share_statistics_since(
+                    &s.pool,
+                    since_block.min(now - 30 * DAY),
+                )
+                .await?;
+                let sums = |since: i64| {
+                    rows.iter()
+                        .filter(|r| r.time >= since)
+                        .fold((0.0, 0.0), |(a, r), row| {
+                            (a + row.accepted as f64, r + row.rejected as f64)
+                        })
+                };
+                let (accepted_1d, rejected_1d) = sums(now - DAY);
+                let (accepted_14d, rejected_14d) = sums(now - 14 * DAY);
+                let (accepted_30d, rejected_30d) = sums(now - 30 * DAY);
+                let (accepted_since_block, rejected_since_block) = sums(since_block);
 
                 Ok(SharesResponse {
                     accepted_1d,
@@ -1327,7 +1363,7 @@ async fn chart_mode(
                 label: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(r.time)
                     .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
                     .unwrap_or_default(),
-                data: ((r.diff as f64) * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round(),
+                data: slot_hashrate(r.diff as f64),
             })
             .collect(),
     ))
@@ -1380,16 +1416,9 @@ mod slot_json_tests {
     /// `/api/info/workers` — distinct addresses and (address, worker) pairs.
     #[test]
     fn workers_json_is_unchanged() {
-        let samples = vec![
-            (T0, ("a1", "w1")),
-            (T0, ("a1", "w2")),
-            (T0, ("a2", "w1")),
-            (T0, ("a1", "w1")),
-            (T0 + S + 9, ("a3", "w1")),
-            (T0 + 3 * S, ("a9", "w9")),
-        ];
+        let counts = vec![(T0, (2, 3)), (T0 + S, (1, 1)), (T0 + 3 * S, (1, 1))];
         assert_eq!(
-            json(&worker_slots(&BOUNDARIES, samples)),
+            json(&worker_slots(&BOUNDARIES, counts)),
             r#"{"slotData":[{"time":"2023-11-14T22:20:00.000Z","counts":{"addresses":2,"workers":3}},{"time":"2023-11-14T22:30:00.000Z","counts":{"addresses":1,"workers":1}},{"time":"2023-11-14T22:40:00.000Z","counts":{"addresses":0,"workers":0}}]}"#
         );
     }
@@ -1408,6 +1437,68 @@ mod slot_json_tests {
         assert_eq!(
             json(&rejected_slots(&BOUNDARIES, samples)),
             r#"{"slotData":[{"time":"2023-11-14T22:20:00.000Z","counts":{"DuplicateShare":0,"JobNotFound":3,"LowDifficultyShare":0.10000000149011612,"NotSubscribed":0,"OtherUnknown":3,"Stale":0,"UnauthorizedWorker":0,"VersionRollingNotAllowed":0}},{"time":"2023-11-14T22:30:00.000Z","counts":{"DuplicateShare":0,"JobNotFound":0,"LowDifficultyShare":0,"NotSubscribed":0,"OtherUnknown":0,"Stale":4,"UnauthorizedWorker":0,"VersionRollingNotAllowed":0}},{"time":"2023-11-14T22:40:00.000Z","counts":{"DuplicateShare":0,"JobNotFound":0,"LowDifficultyShare":0,"NotSubscribed":0,"OtherUnknown":0,"Stale":0,"UnauthorizedWorker":0,"VersionRollingNotAllowed":0}}]}"#
+        );
+    }
+
+    /// A client row with every reject column at zero except the given ones.
+    fn client_row(time: i64, worker: &str) -> bp_db::ClientStatisticsRow {
+        bp_db::ClientStatisticsRow {
+            address: bp_common::AddressId::new("bc1qalice".to_string()).unwrap(),
+            client_name: worker.to_string(),
+            session_id: "s".to_string(),
+            time,
+            shares: 0.0,
+            rejected_job_not_found_count: 0,
+            rejected_job_not_found_diff1: 0.0,
+            rejected_duplicate_share_count: 0,
+            rejected_duplicate_share_diff1: 0.0,
+            rejected_low_difficulty_share_count: 0,
+            rejected_low_difficulty_share_diff1: 0.0,
+            rejected_version_rolling_count: 0,
+            rejected_version_rolling_diff1: 0.0,
+            rejected_stale_count: 0,
+            rejected_stale_diff1: 0.0,
+            max_difficulty: 0.0,
+        }
+    }
+
+    /// The per-reason columns of `client_statistics_entity`, summed over
+    /// workers, give the JSON the per-address reject rows gave: the one
+    /// table the rejected charts read now carries the same numbers.
+    #[test]
+    fn client_reject_columns_match_the_per_reason_rows() {
+        let mut a = client_row(T0, "w1");
+        a.rejected_job_not_found_count = 2;
+        a.rejected_job_not_found_diff1 = 1.5;
+        a.rejected_stale_count = 1;
+        a.rejected_stale_diff1 = 0.25;
+        let mut b = client_row(T0, "w2");
+        b.rejected_job_not_found_count = 1;
+        b.rejected_job_not_found_diff1 = 0.5;
+        b.rejected_version_rolling_count = 3;
+        b.rejected_version_rolling_diff1 = 6.0;
+        let mut c = client_row(T0 + S + 7, "w1");
+        c.rejected_duplicate_share_count = 4;
+        c.rejected_duplicate_share_diff1 = 2.0;
+        c.rejected_low_difficulty_share_count = 5;
+        c.rejected_low_difficulty_share_diff1 = 1.25;
+        // Accepted-only row: contributes nothing.
+        let d = client_row(T0 + S, "w3");
+        let rows = [a, b, c, d];
+
+        let per_reason_rows = vec![
+            (T0, ("JobNotFound", 3.0, 2.0)),
+            (T0, ("Stale", 1.0, 0.25)),
+            (T0, ("VersionRollingNotAllowed", 3.0, 6.0)),
+            (T0 + S + 7, ("DuplicateShare", 4.0, 2.0)),
+            (T0 + S + 7, ("LowDifficultyShare", 5.0, 1.25)),
+        ];
+        assert_eq!(
+            json(&rejected_by_reason_slots(
+                &BOUNDARIES,
+                rows.iter().flat_map(client_reject_samples)
+            )),
+            json(&rejected_by_reason_slots(&BOUNDARIES, per_reason_rows)),
         );
     }
 }

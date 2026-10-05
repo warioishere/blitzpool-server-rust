@@ -44,7 +44,6 @@ use crate::boot::FoundationHandles;
 pub(crate) struct EngineHandles {
     pub(crate) pplns: Option<PplnsEngine>,
     pub(crate) group_solo: Option<GroupSoloEngine>,
-    pub(crate) stats: ShareStatsEngineHandle,
     pub(crate) session_persistence: SessionPersistenceEngineHandle,
     pub(crate) mode_gate: Arc<BlitzpoolModeGate>,
     /// The front's sinks that stamp each share and publish it to the stream.
@@ -76,8 +75,6 @@ pub(crate) enum EngineError {
     GroupSoloDisabledWithActiveGroups { count: usize },
     #[error("group-solo: active-group check failed: {0}")]
     GroupSoloActiveGroups(#[from] bp_db::DbError),
-    #[error("share-stats engine spawn failed: {0}")]
-    Stats(#[from] bp_share_stats_sink::error::SinkError),
     #[error("session-persistence engine spawn failed: {0}")]
     SessionPersistence(#[from] bp_session_persistence::error::SessionPersistenceError),
     #[error("invalid bitcoin address {0:?}: {1}")]
@@ -108,7 +105,6 @@ pub(crate) async fn spawn(
     let mode_gate = Arc::new(BlitzpoolModeGate::new());
     let pplns = spawn_pplns(cfg, handles, read_only).await?;
     let group_solo = spawn_group_solo(cfg, handles, read_only).await?;
-    let stats = spawn_stats(handles).await?;
     let session_persistence = spawn_session_persistence(handles).await?;
     let blockparty_payouts = blockparty_payouts(cfg, handles)?;
 
@@ -133,7 +129,6 @@ pub(crate) async fn spawn(
     Ok(EngineHandles {
         pplns,
         group_solo,
-        stats,
         session_persistence,
         mode_gate,
         accepted_sink,
@@ -309,20 +304,19 @@ fn blockparty_payouts(
 
 // ─── ShareStats engine ───────────────────────────────────────────
 
-async fn spawn_stats(handles: &FoundationHandles) -> Result<ShareStatsEngineHandle, EngineError> {
+/// The share-stats engine, spawned only by the stream consumer that feeds it.
+pub(crate) fn spawn_stats(handles: &FoundationHandles) -> ShareStatsEngineHandle {
     let cfg = StatsSinkConfig {
         // Spreads the 60 s loops across the minute.
-        startup_offset: crate::crons::offsets::STATS_SINK_FLUSH,
+        tick_offset: crate::crons::offsets::STATS_SINK_FLUSH,
         ..StatsSinkConfig::default()
     };
     info!(
         flush_interval = ?cfg.flush_interval,
-        seed_on_spawn = cfg.seed_on_spawn,
-        startup_offset = ?cfg.startup_offset,
+        tick_offset = ?cfg.tick_offset,
         "share-stats: spawning engine"
     );
-    let handle = ShareStatsEngine::spawn(cfg, handles.db.pool().clone()).await?;
-    Ok(handle)
+    ShareStatsEngine::spawn(cfg, handles.db.pool().clone())
 }
 
 // ─── Session-persistence engine ──────────────────────────────────
@@ -331,10 +325,11 @@ async fn spawn_session_persistence(
     handles: &FoundationHandles,
 ) -> Result<SessionPersistenceEngineHandle, EngineError> {
     let cfg = SessionPersistenceConfig {
-        // Same duration as the sweep's staleness cutoff, but this TTL runs
-        // from the last touch flush, the cutoff from the row's birth: the
-        // key is the liveness signal, the age only a birth grace.
-        live_ttl: crate::crons::STALE_CLIENT_TTL,
+        // Two hours after the last share: a paused miner keeps its
+        // difficulty, channels and last share on display, and the sweep's
+        // revive half still finds the last share of a session soft-deleted
+        // up to its lookback ago. Liveness comes from `updated_at_ms`.
+        live_ttl: crate::crons::CLIENT_HARD_DELETE_RETENTION,
         ..SessionPersistenceConfig::default()
     };
     info!(
@@ -560,7 +555,6 @@ pub(crate) fn build_accepted_sinks(
     let aux: Vec<Arc<dyn SharedAcceptedShareSink>> = vec![
         Arc::new(ShareStatsAcceptedSink::new(stats.accumulators())),
         Arc::new(session_persistence.client_row_touch_sink()),
-        Arc::new(session_persistence.client_difficulty_statistics_sink()),
         Arc::new(crate::live_mode_marker::LiveModeMarkerSink::new(
             redis,
             Arc::new(bp_mining_mode::MarkDebouncer::new()),

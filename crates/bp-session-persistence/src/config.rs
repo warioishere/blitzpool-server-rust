@@ -9,20 +9,18 @@ use crate::error::SessionPersistenceError;
 /// Constructed once at `bin/blitzpool` startup, immutable thereafter.
 #[derive(Clone, Debug)]
 pub struct SessionPersistenceConfig {
-    /// Flush interval for the touch updates into the `client:live:*` hashes.
+    /// Flush interval for the touch updates: the session's best onto its
+    /// row, the rest into the `client:live:*` hashes.
     pub touch_flush_interval: Duration,
-    /// How often the watchdog looks for sessions that stopped sending shares.
-    pub hashrate_watchdog_interval: Duration,
-    /// Flush interval for the per-slot max-difficulty upserts.
-    pub diff_stat_flush_interval: Duration,
     /// How long a session must survive before its `client_entity` row is
     /// written. Must stay well below the device-status gate's `online_dwell`,
     /// which treats a device without a row as absent. `ZERO` is legal.
     pub row_debounce: Duration,
     /// Flush interval for the batched row births.
     pub row_flush_interval: Duration,
-    /// TTL of the `client:live:*` hashes, wired to the dead-session sweep's
-    /// staleness cutoff so both clocks agree. Only the touch flush refreshes it.
+    /// TTL of the `client:live:*` hashes. Cleanup only: readers judge a
+    /// session by the hash's `updated_at_ms`, so the key may outlive it.
+    /// Only the touch flush refreshes it.
     pub live_ttl: Duration,
 }
 
@@ -30,11 +28,9 @@ impl Default for SessionPersistenceConfig {
     fn default() -> Self {
         Self {
             touch_flush_interval: Duration::from_secs(30),
-            hashrate_watchdog_interval: Duration::from_secs(60),
-            diff_stat_flush_interval: Duration::from_secs(30),
             row_debounce: Duration::from_secs(15),
             row_flush_interval: Duration::from_secs(5),
-            live_ttl: Duration::from_secs(5 * 60),
+            live_ttl: Duration::from_secs(2 * 60 * 60),
         }
     }
 }
@@ -44,17 +40,6 @@ impl SessionPersistenceConfig {
         if self.touch_flush_interval.is_zero() {
             return Err(SessionPersistenceError::Config(
                 "touch_flush_interval must be > 0".to_string(),
-            ));
-        }
-        if self.hashrate_watchdog_interval.is_zero() {
-            return Err(SessionPersistenceError::Config(
-                "hashrate_watchdog_interval must be > 0".to_string(),
-            ));
-        }
-        // `tokio::time::interval` panics on a zero interval.
-        if self.diff_stat_flush_interval.is_zero() {
-            return Err(SessionPersistenceError::Config(
-                "diff_stat_flush_interval must be > 0".to_string(),
             ));
         }
         // `row_debounce` may be zero: it is an age threshold, not a timer.
@@ -86,15 +71,6 @@ mod tests {
     fn zero_flush_interval_rejected() {
         let cfg = SessionPersistenceConfig {
             touch_flush_interval: Duration::ZERO,
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn zero_hashrate_watchdog_interval_rejected() {
-        let cfg = SessionPersistenceConfig {
-            hashrate_watchdog_interval: Duration::ZERO,
             ..Default::default()
         };
         assert!(cfg.validate().is_err());

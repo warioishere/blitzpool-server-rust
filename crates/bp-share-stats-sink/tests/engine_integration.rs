@@ -11,7 +11,7 @@ use std::time::Duration;
 use bp_common::AddressId;
 use bp_share_stats_sink::config::StatsSinkConfig;
 use bp_share_stats_sink::engine::ShareStatsEngine;
-use bp_stats::{ClientStatisticsKey, ClientStatisticsRecord, RejectedReason, TimeSlot, WorkerKey};
+use bp_stats::{ClientStatisticsKey, ClientStatisticsRecord, RejectedReason, TimeSlot};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use tokio::sync::Mutex;
 
@@ -56,7 +56,6 @@ async fn cleanup(pool: &PgPool, slot_time_ms: i64, prefix: &str) {
     }
     for sql in [
         r#"DELETE FROM client_statistics_entity WHERE address LIKE $1"#,
-        r#"DELETE FROM client_rejected_statistics_entity WHERE address LIKE $1"#,
         r#"DELETE FROM worker_shares_entity WHERE address LIKE $1"#,
         r#"DELETE FROM address_settings_entity WHERE address LIKE $1"#,
     ] {
@@ -99,18 +98,11 @@ async fn engine_spawn_tick_flushes_to_pg_then_shutdown_drains() {
     let prefix = "test_engine_e2e_";
     cleanup(&pool, slot.as_millis(), prefix).await;
 
-    // The seed touches the whole table and would collide with parallel
-    // tests; `seed_integration` covers it.
     let cfg = StatsSinkConfig {
         flush_interval: Duration::from_millis(80),
-        client_stats_batch_size: 1000,
-        slot_aligned_flush: false,
-        seed_on_spawn: false,
-        startup_offset: Duration::ZERO,
+        tick_offset: Duration::ZERO,
     };
-    let handle = ShareStatsEngine::spawn(cfg, pool.clone())
-        .await
-        .expect("spawn engine");
+    let handle = ShareStatsEngine::spawn(cfg, pool.clone());
 
     // Same path the share hooks take.
     let accs = handle.accumulators();
@@ -126,17 +118,11 @@ async fn engine_spawn_tick_flushes_to_pg_then_shutdown_drains() {
         },
         &ClientStatisticsRecord {
             shares: 50.0,
-            accepted_count: 1.0,
             ..Default::default()
         },
     );
-    accs.share_totals.add_worker(
-        WorkerKey {
-            address: addr(&format!("{prefix}miner")),
-            client_name: "wkr".to_string(),
-        },
-        50.0,
-    );
+    accs.share_totals
+        .add(addr(&format!("{prefix}miner")), "wkr".to_string(), 50.0);
 
     // Poll instead of sleeping a few ticks: a loaded runner can take far
     // longer to commit.
@@ -168,33 +154,6 @@ async fn engine_spawn_tick_flushes_to_pg_then_shutdown_drains() {
 }
 
 #[tokio::test]
-async fn engine_reader_exposes_pending_residuals_before_flush() {
-    let _guard = ENGINE_TEST_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
-        return;
-    };
-
-    let cfg = StatsSinkConfig {
-        flush_interval: Duration::from_secs(3600), // never tick in this test
-        client_stats_batch_size: 1000,
-        slot_aligned_flush: false,
-        seed_on_spawn: false,
-        startup_offset: Duration::ZERO,
-    };
-    let engine = ShareStatsEngine::new(cfg, pool);
-    let reader = engine.reader();
-    let accs = engine.accumulators();
-
-    assert_eq!(reader.pending_pool_shares(), 0);
-    accs.pool_shares
-        .add_accepted(TimeSlot::from_millis(32_503_680_011_001), 25.0, 25.0);
-    assert_eq!(reader.pending_pool_shares(), 1);
-    // Clones share the backing state.
-    let reader_clone = reader.clone();
-    assert_eq!(reader_clone.pending_pool_shares(), 1);
-}
-
-#[tokio::test]
 async fn engine_handle_shutdown_is_idempotent_against_dropped_handle() {
     // Dropping the handle without an explicit shutdown must not panic.
     let _guard = ENGINE_TEST_LOCK.lock().await;
@@ -205,15 +164,10 @@ async fn engine_handle_shutdown_is_idempotent_against_dropped_handle() {
         let _handle = ShareStatsEngine::spawn(
             StatsSinkConfig {
                 flush_interval: Duration::from_millis(100),
-                client_stats_batch_size: 1000,
-                slot_aligned_flush: false,
-                seed_on_spawn: false,
-                startup_offset: Duration::ZERO,
+                tick_offset: Duration::ZERO,
             },
             pool,
-        )
-        .await
-        .expect("spawn");
+        );
         // Dropping detaches the task; it drains and exits on its own.
     }
     // Let the detached task run; tokio would log a panic there.

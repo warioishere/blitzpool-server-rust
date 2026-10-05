@@ -51,6 +51,31 @@ pub async fn find_address_settings(
     .map_err(DbError::from)
 }
 
+/// `address_settings_entity` rows of many addresses in one round trip; an
+/// address without a row is absent from the result.
+pub async fn find_address_settings_for_addresses(
+    pool: &PgPool,
+    addresses: &[String],
+) -> Result<Vec<AddressSettingsRow>, DbError> {
+    sqlx::query_as!(
+        AddressSettingsRow,
+        r#"SELECT
+            "deletedAt" AS "deleted_at?",
+            "createdAt" AS "created_at!",
+            "updatedAt" AS "updated_at!",
+            address AS "address!: AddressId",
+            shares AS "shares!",
+            "bestDifficulty" AS "best_difficulty!",
+            "miscCoinbaseScriptData" AS "misc_coinbase_script_data?",
+            "bestDifficultyUserAgent" AS "best_difficulty_user_agent?"
+           FROM address_settings_entity WHERE address = ANY($1)"#,
+        addresses
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::from)
+}
+
 #[derive(Clone, Debug, FromRow)]
 pub struct BestDifficultyTrackerRow {
     #[sqlx(rename = "deletedAt")]

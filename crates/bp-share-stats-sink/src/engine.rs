@@ -1,29 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Top-level coordinator: spawn background flush task, expose
-//! [`ReaderView`] for the API surface, propagate shutdown.
+//! Top-level coordinator: spawn the background flush task, hand the
+//! accumulators to the share hooks, propagate shutdown.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use bp_stats::{FlushHealthMonitor, TimeSlot};
+use bp_stats::TimeSlot;
 use sqlx::PgPool;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, instrument, warn};
 
 use crate::config::StatsSinkConfig;
-use crate::error::SinkError;
-use crate::flush::{flush_once, Accumulators, Flusher};
-use crate::reader::ReaderView;
-use crate::seed::seed_if_empty;
+use crate::flush::{flush_once, Accumulators, FlushScope};
 
-/// Accumulators are written by the share hooks from many tasks, the health
-/// monitor only by the flush task; both sit behind `Arc` for `ReaderView`.
+/// Accumulators are written by the share hooks from many tasks and drained
+/// by the flush task.
 pub struct ShareStatsEngine {
     config: StatsSinkConfig,
     pool: PgPool,
     accumulators: Arc<Accumulators>,
-    health: Arc<std::sync::Mutex<FlushHealthMonitor<Flusher>>>,
 }
 
 impl ShareStatsEngine {
@@ -34,32 +31,13 @@ impl ShareStatsEngine {
             config,
             pool,
             accumulators: Arc::new(Accumulators::default()),
-            health: Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default())),
         }
     }
 
-    /// Builds the engine, runs `seed_if_empty` when `config.seed_on_spawn`,
-    /// and spawns the flush task.
+    /// Builds the engine and spawns the flush task.
     #[instrument(skip(pool), fields(flush_interval = ?config.flush_interval), name = "stats_sink.spawn")]
-    pub async fn spawn(
-        config: StatsSinkConfig,
-        pool: PgPool,
-    ) -> Result<ShareStatsEngineHandle, SinkError> {
-        let engine = Self::new(config, pool);
-        if engine.config.seed_on_spawn {
-            if let Some(rows) = seed_if_empty(&engine.pool).await? {
-                debug!(rows, "stats_sink: seed_if_empty bootstrapped worker_shares");
-            }
-        }
-        Ok(engine.spawn_internal())
-    }
-
-    /// Cheap-to-clone read-only handle.
-    pub fn reader(&self) -> ReaderView {
-        ReaderView {
-            accumulators: self.accumulators.clone(),
-            health: self.health.clone(),
-        }
+    pub fn spawn(config: StatsSinkConfig, pool: PgPool) -> ShareStatsEngineHandle {
+        Self::new(config, pool).spawn_internal()
     }
 
     /// Hook impls clone this `Arc` into the share path.
@@ -69,16 +47,15 @@ impl ShareStatsEngine {
 
     fn spawn_internal(self) -> ShareStatsEngineHandle {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let pool = self.pool.clone();
-        let accs = self.accumulators.clone();
-        let health = self.health.clone();
-        let reader = self.reader();
-        let cfg = self.config.clone();
-
-        let join = tokio::spawn(run_flush_loop(pool, accs, health, cfg, shutdown_rx));
+        let join = tokio::spawn(run_flush_loop(
+            self.pool,
+            self.accumulators.clone(),
+            self.config,
+            shutdown_rx,
+        ));
 
         ShareStatsEngineHandle {
-            reader,
+            accumulators: self.accumulators,
             shutdown_tx: Some(shutdown_tx),
             join: Some(join),
         }
@@ -88,18 +65,14 @@ impl ShareStatsEngine {
 /// [`Self::shutdown`] waits for the final drain; dropping the handle only
 /// detaches the task, which then drains on its own.
 pub struct ShareStatsEngineHandle {
-    reader: ReaderView,
+    accumulators: Arc<Accumulators>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join: Option<JoinHandle<()>>,
 }
 
 impl ShareStatsEngineHandle {
-    pub fn reader(&self) -> ReaderView {
-        self.reader.clone()
-    }
-
     pub fn accumulators(&self) -> Arc<Accumulators> {
-        self.reader.accumulators.clone()
+        self.accumulators.clone()
     }
 
     /// Returns once the flush task has drained residuals and exited.
@@ -119,35 +92,16 @@ impl ShareStatsEngineHandle {
 async fn run_flush_loop(
     pool: PgPool,
     accs: Arc<Accumulators>,
-    health: Arc<std::sync::Mutex<FlushHealthMonitor<Flusher>>>,
     cfg: StatsSinkConfig,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
     info!("stats_sink flush loop started");
-    let start = tokio::time::Instant::now() + cfg.flush_interval + cfg.startup_offset;
-    let mut ticker = tokio::time::interval_at(start, cfg.flush_interval);
-    // Skips the t=0 firing and staggers this loop against the other 60 s
-    // crons so their PG load does not coincide.
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    let mut last_slot = TimeSlot::current();
     loop {
-        // On a slot change flush at once, so the ended slot's residuals
-        // commit before the chart-visibility cutoff.
-        if cfg.slot_aligned_flush {
-            let current = TimeSlot::current();
-            if current != last_slot {
-                debug!(prev = ?last_slot, current = ?current, "slot transition — spot flush");
-                flush_once(&pool, &accs, &health, cfg.client_stats_batch_size).await;
-                last_slot = current;
-                continue;
-            }
-        }
-
+        let wait = until_next_tick(bp_common::now_ms(), cfg.flush_interval, cfg.tick_offset);
         tokio::select! {
-            _ = ticker.tick() => {
-                flush_once(&pool, &accs, &health, cfg.client_stats_batch_size).await;
-                last_slot = TimeSlot::current();
+            _ = tokio::time::sleep(wait) => {
+                let scope = FlushScope::Before(TimeSlot::current());
+                flush_once(&pool, &accs, scope).await;
             }
             _ = &mut shutdown_rx => {
                 debug!("stats_sink received shutdown");
@@ -157,5 +111,42 @@ async fn run_flush_loop(
     }
 
     info!("stats_sink final drain");
-    flush_once(&pool, &accs, &health, cfg.client_stats_batch_size).await;
+    flush_once(&pool, &accs, FlushScope::All).await;
+}
+
+/// Time until the next tick: `offset` past each wall-clock multiple of
+/// `period`. Wall clock, not process start, so an ended slot is written at
+/// its end plus `offset` whenever the process came up.
+fn until_next_tick(now_ms: i64, period: Duration, offset: Duration) -> Duration {
+    let period = (period.as_millis() as i64).max(1);
+    let offset = offset.as_millis() as i64 % period;
+    let next = (now_ms - offset).div_euclid(period) * period + period + offset;
+    Duration::from_millis((next - now_ms) as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIN: Duration = Duration::from_secs(60);
+    const OFFSET: Duration = Duration::from_secs(17);
+
+    #[test]
+    fn the_tick_lands_offset_past_the_next_minute() {
+        let minute = 60_000_i64;
+        // On a minute boundary.
+        let t0 = 1_790_000_000_000 / minute * minute;
+        // Just past the boundary: wait until :17 of this minute.
+        assert_eq!(
+            until_next_tick(t0 + 1_000, MIN, OFFSET),
+            Duration::from_secs(16)
+        );
+        // Exactly on :17: the tick just fired, the next one is a period away.
+        assert_eq!(until_next_tick(t0 + 17_000, MIN, OFFSET), MIN);
+        // Past :17: wait into the next minute.
+        assert_eq!(
+            until_next_tick(t0 + 30_000, MIN, OFFSET),
+            Duration::from_secs(47)
+        );
+    }
 }

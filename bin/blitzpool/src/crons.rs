@@ -34,19 +34,26 @@ use crate::live_sessions::RedisLiveSessions;
 /// Tick of the `kill_dead_clients` poller.
 const KILL_DEAD_TICK: Duration = Duration::from_secs(60);
 
-/// Staleness cutoff for the `kill_dead_clients` sweep: sessions whose
-/// `updatedAt` is older than this become sweep candidates. Also the TTL of
-/// the `client:live:*` hashes (see `engines::spawn_session_persistence`),
-/// so the two clocks agree.
-pub(crate) const STALE_CLIENT_TTL: Duration = Duration::from_secs(5 * 60);
+/// Staleness cutoff for the `kill_dead_clients` sweep: a session whose row
+/// birth is older than this is a candidate, and one whose freshest share
+/// (the `client:live:*` hash's `updated_at_ms`) is older too is swept.
+pub(crate) const STALE_CLIENT_CUTOFF: Duration = Duration::from_secs(5 * 60);
 
 /// Per-cron startup offsets, small primes so ticks of different crons
 /// rarely collide. Keep them distinct within each period family
-/// (60 s, 60 min, 24 h) so two crons of one family never align.
+/// (60 s, 60 min, 24 h) so two crons of one family never align. They count
+/// from process start, except `STATS_SINK_FLUSH`, which counts from each
+/// full wall-clock minute.
 pub(crate) mod offsets {
     use std::time::Duration;
     pub(crate) const KILL_DEAD: Duration = Duration::from_secs(0);
     pub(crate) const STATS_SINK_FLUSH: Duration = Duration::from_secs(17);
+    // An ended client slot reaches Postgres this long after its end; charts
+    // show it from the visibility buffer on, so a later write reads empty.
+    const _: () = assert!(
+        (STATS_SINK_FLUSH.as_millis() as i64) < bp_stats::CHART_VISIBILITY_BUFFER_MS,
+        "STATS_SINK_FLUSH must stay inside the chart visibility buffer"
+    );
     pub(crate) const OLD_STATS_CLEANUP: Duration = Duration::from_secs(7);
     pub(crate) const NETWORK_DIFFICULTY: Duration = Duration::from_secs(23);
     pub(crate) const HOURLY_STATS: Duration = Duration::from_secs(31);
@@ -330,7 +337,7 @@ fn spawn_kill_dead_clients_loop(
                 }
                 _ = ticker.tick() => {
                     let cutoff_ms =
-                        Utc::now().timestamp_millis() - STALE_CLIENT_TTL.as_millis() as i64;
+                        Utc::now().timestamp_millis() - STALE_CLIENT_CUTOFF.as_millis() as i64;
                     match sweep_dead_sessions_once(&pool, &redis, cutoff_ms, &mut strikes).await {
                         Ok(o) if o.is_quiet() => {}
                         Ok(o) => info!(
@@ -357,7 +364,7 @@ fn spawn_kill_dead_clients_loop(
     })
 }
 
-/// Session triples whose live key was missing on the previous tick.
+/// Session triples without a recent share on the previous tick.
 /// Bounded by the candidate count, replaced wholesale every pass.
 type StrikeSet = std::collections::HashSet<(String, String, String)>;
 
@@ -379,10 +386,11 @@ impl SweepOutcome {
     }
 }
 
-/// One reconcile pass: a session a front holds is alive; otherwise only a live
-/// key missing on TWO passes sweeps, since the keyspace is empty after a Redis
-/// restart. A row whose live hash postdates its soft-delete is revived. Any
-/// error aborts the pass: "cannot ask" and "no key" must never collapse.
+/// One reconcile pass: a session a front holds is alive; otherwise only a
+/// session without a share since the cutoff on TWO passes sweeps, since the
+/// keyspace is empty after a Redis restart. A row whose live hash postdates
+/// its soft-delete is revived. Any error aborts the pass: "cannot ask" and
+/// "no key" must never collapse.
 async fn sweep_dead_sessions_once(
     pool: &PgPool,
     redis: &redis::aio::ConnectionManager,
@@ -408,15 +416,19 @@ async fn sweep_kill_half(
         return Ok(0);
     }
     // `Err` is "cannot ask" and aborts the pass; `None` is "no front
-    // publishes sessions" (e.g. Redis just restarted) and leaves the key
-    // verdict below in charge.
+    // publishes sessions" (e.g. Redis just restarted) and leaves the
+    // last-share verdict below in charge.
     let held = RedisLiveSessions::new(redis.clone())
         .sessions()
         .await
         .map_err(|e| format!("front live set: {e}"))?;
-    let alive = bp_client_live::live_keys_exist(Some(redis), &candidates)
+    // The key outlives the session (its TTL only cleans up); a share
+    // newer than the cutoff is the evidence.
+    let alive = bp_client_live::last_share_ms_for_sessions(Some(redis), &candidates)
         .await
-        .map_err(|e| format!("live-key check: {e}"))?;
+        .map_err(|e| format!("live-key check: {e}"))?
+        .into_iter()
+        .map(|ts| ts.is_some_and(|ts| ts >= cutoff_ms));
 
     let mut missing_now = StrikeSet::with_capacity(candidates.len());
     let mut addresses = Vec::new();
@@ -467,18 +479,16 @@ async fn sweep_repair_half(
     if deleted.is_empty() {
         return Ok(0);
     }
-    let live = bp_client_live::live_fields_for_sessions(Some(redis), &deleted)
+    let last_shares = bp_client_live::last_share_ms_for_sessions(Some(redis), &deleted)
         .await
         .map_err(|e| format!("live-field check: {e}"))?;
 
     let mut addresses = Vec::new();
     let mut client_names = Vec::new();
     let mut session_ids = Vec::new();
-    for (d, lf) in deleted.iter().zip(live) {
+    for (d, last_share) in deleted.iter().zip(last_shares) {
         // Touched after it was retired → it never stopped mining.
-        let touched_after = lf
-            .and_then(|lf| lf.updated_at_ms)
-            .is_some_and(|ts| ts > d.deleted_at);
+        let touched_after = last_share.is_some_and(|ts| ts > d.deleted_at);
         if touched_after {
             addresses.push(d.address.as_str().to_string());
             client_names.push(d.client_name.clone());
@@ -507,15 +517,22 @@ const WEEKLY_TICK: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// 90-day inactivity threshold: subscriptions whose `lastNotificationAt`
 /// (or `createdAt` when never notified) is older than this are hard-deleted.
 const STALE_PUSH_SUBSCRIPTION_TTL: Duration = Duration::from_secs(90 * 24 * 60 * 60);
-/// 14-day cutoff for the per-(address, worker, session, slot) detail
-/// tables — UI charts only render 1d/3d/7d windows.
-const STATS_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+/// Cutoff for `client_statistics_entity`, the per-session detail table. The
+/// longest period read from it is the difficulty scoreboard's calendar
+/// month (diff-scores, up to 31 days), plus a day for the scoreboard's time
+/// zone.
+const STATS_RETENTION: Duration = Duration::from_secs(32 * 24 * 60 * 60);
+/// Cutoff for the pool-wide breakdowns (`pool_mode_hashrate`,
+/// `pool_rejected_statistics_entity`): the longest chart range, `range=1m`.
+/// `pool_share_statistics_entity` keeps everything, because the share
+/// total since the last block reaches back as far as that block.
+const POOL_BREAKDOWN_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// Cutoff for soft-deleted clients before hard-delete. Nothing reads them
 /// longer (the device-status seed looks back 1 h, "known device" lives in
 /// Redis), and keeping them scatters live rows that every bulk writer re-logs.
-const CLIENT_HARD_DELETE_RETENTION: Duration = Duration::from_secs(2 * 60 * 60);
+pub(crate) const CLIENT_HARD_DELETE_RETENTION: Duration = Duration::from_secs(2 * 60 * 60);
 
-/// Hourly cron: purge stats older than `STATS_RETENTION`, hard-delete
+/// Hourly cron: purge stats past their retention, hard-delete
 /// clients soft-deleted longer than [`CLIENT_HARD_DELETE_RETENTION`], and
 /// drop expired email verifications.
 pub(crate) fn spawn_old_stats_cleanup(pool: PgPool, cancel: CancellationToken) -> JoinHandle<()> {
@@ -531,15 +548,13 @@ pub(crate) fn spawn_old_stats_cleanup(pool: PgPool, cancel: CancellationToken) -
                 _ = ticker.tick() => {
                     let now = Utc::now().timestamp_millis();
                     let stats_cutoff = now - STATS_RETENTION.as_millis() as i64;
-                    let hourly_cutoff =
-                        (stats_cutoff / (60 * 60 * 1000)) * (60 * 60 * 1000);
+                    let pool_cutoff = now - POOL_BREAKDOWN_RETENTION.as_millis() as i64;
                     let client_cutoff = now - CLIENT_HARD_DELETE_RETENTION.as_millis() as i64;
 
-                    let mut totals: [(&str, u64); 6] = [
+                    let mut totals: [(&str, u64); 5] = [
                         ("client_statistics", 0),
-                        ("client_rejected_statistics", 0),
-                        ("client_difficulty_statistics", 0),
                         ("pool_mode_hashrate", 0),
+                        ("pool_rejected_statistics", 0),
                         ("client_entity_hard_delete", 0),
                         ("email_verification_purge", 0),
                     ];
@@ -547,37 +562,32 @@ pub(crate) fn spawn_old_stats_cleanup(pool: PgPool, cancel: CancellationToken) -
                         Ok(n) => totals[0].1 = n,
                         Err(err) => warn!(%err, "delete_old_client_statistics"),
                     }
-                    match bp_db::delete_old_client_rejected_statistics(&pool, stats_cutoff).await {
+                    match bp_db::delete_old_pool_mode_hashrate(&pool, pool_cutoff).await {
                         Ok(n) => totals[1].1 = n,
-                        Err(err) => warn!(%err, "delete_old_client_rejected_statistics"),
-                    }
-                    match bp_db::delete_old_client_difficulty_statistics(&pool, hourly_cutoff).await {
-                        Ok(n) => totals[2].1 = n,
-                        Err(err) => warn!(%err, "delete_old_client_difficulty_statistics"),
-                    }
-                    match bp_db::delete_old_pool_mode_hashrate(&pool, stats_cutoff).await {
-                        Ok(n) => totals[3].1 = n,
                         Err(err) => warn!(%err, "delete_old_pool_mode_hashrate"),
                     }
+                    match bp_db::delete_old_pool_rejected_statistics(&pool, pool_cutoff).await {
+                        Ok(n) => totals[2].1 = n,
+                        Err(err) => warn!(%err, "delete_old_pool_rejected_statistics"),
+                    }
                     match bp_db::delete_old_clients(&pool, client_cutoff).await {
-                        Ok(n) => totals[4].1 = n,
+                        Ok(n) => totals[3].1 = n,
                         Err(err) => warn!(%err, "delete_old_clients"),
                     }
                     match bp_db::delete_expired_email_verifications(&pool, now).await {
-                        Ok(n) => totals[5].1 = n,
+                        Ok(n) => totals[4].1 = n,
                         Err(err) => warn!(%err, "delete_expired_email_verifications"),
                     }
                     let total: u64 = totals.iter().map(|(_, n)| *n).sum();
                     if total > 0 {
                         info!(
                             client_statistics = totals[0].1,
-                            client_rejected_statistics = totals[1].1,
-                            client_difficulty_statistics = totals[2].1,
-                            pool_mode_hashrate = totals[3].1,
-                            client_entity_hard_delete = totals[4].1,
-                            email_verification_purge = totals[5].1,
+                            pool_mode_hashrate = totals[1].1,
+                            pool_rejected_statistics = totals[2].1,
+                            client_entity_hard_delete = totals[3].1,
+                            email_verification_purge = totals[4].1,
                             stats_cutoff,
-                            hourly_cutoff,
+                            pool_cutoff,
                             client_cutoff,
                             "crons.old_stats_cleanup: purged"
                         );
@@ -724,8 +734,8 @@ mod sweep_tests {
     }
 
     /// Two-strike rule: pass 1 sweeps nothing, and on pass 2 only the
-    /// keyless session dies; the live-keyed one survives however old its
-    /// birth row is.
+    /// session without a live hash dies; the one with a recent share
+    /// survives however old its birth row is.
     #[tokio::test]
     async fn a_missing_key_sweeps_only_on_the_second_pass() {
         let _guard = SWEEP_LOCK.lock().await;
@@ -763,6 +773,47 @@ mod sweep_tests {
             "live-keyed session survives"
         );
         assert!(!active(&pool, "swpB0001").await, "keyless session is swept");
+
+        cleanup(&pool, addr).await;
+    }
+
+    /// A live hash whose freshest share is older than the cutoff counts as
+    /// missing: the key outlives the session, its timestamp is the verdict.
+    #[tokio::test]
+    async fn a_live_key_without_a_recent_share_sweeps_on_the_second_pass() {
+        let _guard = SWEEP_LOCK.lock().await;
+        let Some(pool) = connect_pg_or_skip().await else {
+            return;
+        };
+        // Shares DB_TWO_STRIKE: SWEEP_LOCK serializes these tests and the
+        // connect flushes the database.
+        let Some(mut redis) =
+            connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, DB_TWO_STRIKE).await
+        else {
+            return;
+        };
+        let addr = "test_sweep_stale_addr";
+        cleanup(&pool, addr).await;
+        seed_aged(&pool, addr, "swpS0001").await;
+        seed_aged(&pool, addr, "swpS0002").await;
+        // Both keys exist; only the second saw a share after the cutoff.
+        put_live_key(&mut redis, addr, "swpS0001", 1_000).await;
+        put_live_key(&mut redis, addr, "swpS0002", 3_000).await;
+
+        let mut strikes = StrikeSet::new();
+        let first = sweep_dead_sessions_once(&pool, &redis, 2_000, &mut strikes)
+            .await
+            .expect("first pass");
+        assert_eq!(first.swept, 0, "one observation must not sweep anything");
+        let second = sweep_dead_sessions_once(&pool, &redis, 2_000, &mut strikes)
+            .await
+            .expect("second pass");
+        assert_eq!(second.swept, 1);
+        assert!(
+            !active(&pool, "swpS0001").await,
+            "a stale key does not keep a session"
+        );
+        assert!(active(&pool, "swpS0002").await, "a fresh share does");
 
         cleanup(&pool, addr).await;
     }
@@ -852,9 +903,9 @@ mod sweep_tests {
         cleanup(&pool, addr).await;
     }
 
-    /// The front's word outranks the key: a held session without a live
-    /// key survives both passes, an unheld keyless one is swept on pass 2,
-    /// and an unheld one with a live key survives on the key alone.
+    /// The front's word outranks the live hash: a held session without one
+    /// survives both passes, an unheld one without one is swept on pass 2,
+    /// and an unheld one with a recent share survives on that alone.
     #[tokio::test]
     async fn a_session_a_front_still_holds_is_never_swept() {
         let _guard = SWEEP_LOCK.lock().await;
@@ -891,7 +942,7 @@ mod sweep_tests {
         );
         assert!(
             active(&pool, "frtC0001").await,
-            "a live key still counts where the front says nothing"
+            "a recent share still counts where the front says nothing"
         );
 
         cleanup(&pool, addr).await;

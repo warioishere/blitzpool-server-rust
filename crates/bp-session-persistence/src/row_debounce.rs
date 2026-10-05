@@ -195,7 +195,7 @@ pub(crate) async fn flush_once(debounce: &RowDebounce, pool: &PgPool, min_age: D
                         warn!(
                             error = %e,
                             session_id = %key.session_id,
-                            "client row birth hit a transient error; rebuffering for retry"
+                            "client row birth hit a transient error; kept for retry"
                         );
                         keep.push((key, state));
                     }

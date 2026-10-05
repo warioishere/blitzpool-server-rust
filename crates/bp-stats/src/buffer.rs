@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Hot-path write buffers that a periodic flush drains in bulk. The delta
-//! buffers only snapshot on `drain` and subtract on `confirm`, so writes made
-//! during a flush survive it. Locking is the caller's job (each accumulator
-//! holds a `Mutex`).
+//! Hot-path write buffers that a periodic flush empties in bulk: `take`
+//! removes what is due, and a failed write hands it back with `restore`,
+//! which merges into whatever arrived meanwhile. Locking is the caller's
+//! job (each accumulator holds a `Mutex`).
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -13,19 +13,16 @@ use std::hash::Hash;
 /// A record of numeric fields used as the value in [`RecordDeltaBuffer`].
 pub trait BufferRecord: Default + Clone {
     /// True iff every field is zero (or negative); such buckets are left out
-    /// of `drain` snapshots.
+    /// of `take`.
     fn is_zero(&self) -> bool;
 
+    /// Merge `rhs` in: sums add, maxima take the larger value.
     fn add_assign(&mut self, rhs: &Self);
-
-    /// Subtract field-wise, clamping at zero so a residual never turns
-    /// negative. Returns `true` when the bucket is empty and can be removed.
-    fn sub_assign_clamped(&mut self, rhs: &Self) -> bool;
 }
 
 // ─── NumberDeltaBuffer ──────────────────────────────────────────────────────
 
-/// Additive `f64` deltas keyed by `K`. `drain` returns only positive values
+/// Additive `f64` deltas keyed by `K`. `take` returns only positive values
 /// so the flusher never writes no-op rows.
 pub struct NumberDeltaBuffer<K> {
     map: HashMap<K, f64>,
@@ -55,7 +52,7 @@ impl<K> NumberDeltaBuffer<K> {
 
 impl<K> NumberDeltaBuffer<K>
 where
-    K: Clone + Eq + Hash,
+    K: Eq + Hash,
 {
     /// Zero and non-finite deltas are ignored so one NaN cannot poison a key.
     pub fn add(&mut self, key: K, delta: f64) {
@@ -65,30 +62,17 @@ where
         *self.map.entry(key).or_insert(0.0) += delta;
     }
 
-    pub fn get(&self, key: &K) -> Option<f64> {
-        self.map.get(key).copied()
-    }
-
-    /// Snapshot positive entries. Does **not** clear the buffer.
-    pub fn drain(&self) -> HashMap<K, f64> {
-        let mut out = HashMap::with_capacity(self.map.len());
-        for (k, v) in &self.map {
-            if *v > 0.0 {
-                out.insert(k.clone(), *v);
-            }
-        }
+    /// Empty the buffer, returning its positive entries.
+    pub fn take(&mut self) -> HashMap<K, f64> {
+        let mut out = std::mem::take(&mut self.map);
+        out.retain(|_, v| *v > 0.0);
         out
     }
 
-    /// Subtract a drained snapshot; keys left at ≤ 0 are removed.
-    pub fn confirm(&mut self, snapshot: &HashMap<K, f64>) {
-        for (k, flushed) in snapshot {
-            if let Some(current) = self.map.get_mut(k) {
-                *current -= flushed;
-                if *current <= 0.0 {
-                    self.map.remove(k);
-                }
-            }
+    /// Hand back an unwritten [`Self::take`].
+    pub fn restore(&mut self, snapshot: HashMap<K, f64>) {
+        for (k, v) in snapshot {
+            self.add(k, v);
         }
     }
 }
@@ -124,8 +108,8 @@ impl<O, I> NestedDeltaBuffer<O, I> {
 
 impl<O, I> NestedDeltaBuffer<O, I>
 where
-    O: Clone + Eq + Hash,
-    I: Clone + Eq + Hash,
+    O: Eq + Hash,
+    I: Eq + Hash,
 {
     pub fn add(&mut self, outer: O, inner: I, delta: f64) {
         if delta == 0.0 || !delta.is_finite() {
@@ -135,39 +119,22 @@ where
         *entry.entry(inner).or_insert(0.0) += delta;
     }
 
-    /// Deep snapshot of positive entries; does not clear the buffer.
-    pub fn drain(&self) -> HashMap<O, HashMap<I, f64>> {
-        let mut out = HashMap::with_capacity(self.map.len());
-        for (o, inner) in &self.map {
-            let mut copy = HashMap::with_capacity(inner.len());
-            for (k, v) in inner {
-                if *v > 0.0 {
-                    copy.insert(k.clone(), *v);
-                }
-            }
-            if !copy.is_empty() {
-                out.insert(o.clone(), copy);
-            }
-        }
+    /// Empty the buffer, returning its positive entries.
+    pub fn take(&mut self) -> HashMap<O, HashMap<I, f64>> {
+        let mut out = std::mem::take(&mut self.map);
+        out.retain(|_, inner| {
+            inner.retain(|_, v| *v > 0.0);
+            !inner.is_empty()
+        });
         out
     }
 
-    /// Subtract a drained snapshot; emptied keys are removed.
-    pub fn confirm(&mut self, snapshot: &HashMap<O, HashMap<I, f64>>) {
-        for (o, inner_snap) in snapshot {
-            let Some(current_inner) = self.map.get_mut(o) else {
-                continue;
-            };
-            for (k, flushed) in inner_snap {
-                if let Some(have) = current_inner.get_mut(k) {
-                    *have -= flushed;
-                    if *have <= 0.0 {
-                        current_inner.remove(k);
-                    }
-                }
-            }
-            if current_inner.is_empty() {
-                self.map.remove(o);
+    /// Hand back an unwritten [`Self::take`].
+    pub fn restore(&mut self, snapshot: HashMap<O, HashMap<I, f64>>) {
+        for (o, inner) in snapshot {
+            let entry = self.map.entry(o).or_default();
+            for (i, v) in inner {
+                *entry.entry(i).or_insert(0.0) += v;
             }
         }
     }
@@ -175,7 +142,7 @@ where
 
 // ─── RecordDeltaBuffer ──────────────────────────────────────────────────────
 
-/// Map of key → multi-field record, additive per field.
+/// Map of key → multi-field record, merged per field.
 pub struct RecordDeltaBuffer<K, R: BufferRecord> {
     map: HashMap<K, R>,
 }
@@ -204,7 +171,7 @@ impl<K, R: BufferRecord> RecordDeltaBuffer<K, R> {
 
 impl<K, R> RecordDeltaBuffer<K, R>
 where
-    K: Clone + Eq + Hash,
+    K: Eq + Hash,
     R: BufferRecord,
 {
     pub fn add(&mut self, key: K, delta: &R) {
@@ -214,27 +181,29 @@ where
         self.map.entry(key).or_default().add_assign(delta);
     }
 
-    /// Snapshot every non-zero bucket. Does **not** clear the buffer.
-    pub fn drain(&self) -> HashMap<K, R> {
-        let mut out = HashMap::with_capacity(self.map.len());
-        for (k, r) in &self.map {
-            if !r.is_zero() {
-                out.insert(k.clone(), r.clone());
+    /// Empty the buffer, returning every non-zero bucket.
+    pub fn take(&mut self) -> HashMap<K, R> {
+        self.take_where(|_| true)
+    }
+
+    /// Remove and return the non-zero buckets whose key matches; the rest
+    /// stay buffered.
+    pub fn take_where(&mut self, mut due: impl FnMut(&K) -> bool) -> HashMap<K, R> {
+        let mut out = HashMap::new();
+        for (k, r) in std::mem::take(&mut self.map) {
+            if !due(&k) {
+                self.map.insert(k, r);
+            } else if !r.is_zero() {
+                out.insert(k, r);
             }
         }
         out
     }
 
-    /// Subtract a drained snapshot; emptied buckets are removed.
-    pub fn confirm(&mut self, snapshot: &HashMap<K, R>) {
-        for (k, snap) in snapshot {
-            let Some(current) = self.map.get_mut(k) else {
-                continue;
-            };
-            let all_zero = current.sub_assign_clamped(snap);
-            if all_zero {
-                self.map.remove(k);
-            }
+    /// Hand back an unwritten part of a [`Self::take`].
+    pub fn restore(&mut self, snapshot: impl IntoIterator<Item = (K, R)>) {
+        for (k, r) in snapshot {
+            self.map.entry(k).or_default().add_assign(&r);
         }
     }
 }
@@ -246,45 +215,27 @@ mod tests {
     // ─── NumberDeltaBuffer ───────────────────────────────────────────────
 
     #[test]
-    fn number_buffer_drains_positive_entries_only() {
+    fn number_buffer_takes_positive_entries_only() {
         let mut buf: NumberDeltaBuffer<&'static str> = NumberDeltaBuffer::new();
         buf.add("a", 5.0);
-        buf.add("b", -3.0); // counted internally but filtered by drain
+        buf.add("b", -3.0); // counted internally but filtered by take
         buf.add("c", 0.0); // no-op
-        let snap = buf.drain();
+        let snap = buf.take();
         assert_eq!(snap.get("a"), Some(&5.0));
         assert!(!snap.contains_key("b"));
         assert!(!snap.contains_key("c"));
+        assert!(buf.is_empty(), "take empties the buffer");
     }
 
     #[test]
-    fn number_buffer_drain_is_non_clearing() {
+    fn number_buffer_restore_adds_onto_writes_made_during_the_flush() {
         let mut buf: NumberDeltaBuffer<&'static str> = NumberDeltaBuffer::new();
         buf.add("a", 10.0);
-        let _ = buf.drain();
-        // Still in the buffer until confirm() runs.
-        assert_eq!(buf.get(&"a"), Some(10.0));
-    }
-
-    #[test]
-    fn number_buffer_confirm_subtracts_snapshot() {
-        let mut buf: NumberDeltaBuffer<&'static str> = NumberDeltaBuffer::new();
-        buf.add("a", 10.0);
-        let snap = buf.drain();
-        // Concurrent write during the flush.
+        let snap = buf.take();
+        // Concurrent write during the flush, which then fails.
         buf.add("a", 3.0);
-        buf.confirm(&snap);
-        // Residual = 10 + 3 - 10 = 3.
-        assert_eq!(buf.get(&"a"), Some(3.0));
-    }
-
-    #[test]
-    fn number_buffer_confirm_removes_zero_residual() {
-        let mut buf: NumberDeltaBuffer<&'static str> = NumberDeltaBuffer::new();
-        buf.add("a", 10.0);
-        let snap = buf.drain();
-        buf.confirm(&snap);
-        assert_eq!(buf.get(&"a"), None);
+        buf.restore(snap);
+        assert_eq!(buf.take().get("a"), Some(&13.0));
     }
 
     #[test]
@@ -299,90 +250,108 @@ mod tests {
     // ─── NestedDeltaBuffer ───────────────────────────────────────────────
 
     #[test]
-    fn nested_buffer_add_and_drain() {
+    fn nested_buffer_add_and_take() {
         let mut buf: NestedDeltaBuffer<i64, &'static str> = NestedDeltaBuffer::new();
         buf.add(1_000, "solo", 100.0);
         buf.add(1_000, "pplns", 50.0);
         buf.add(2_000, "solo", 25.0);
-        let snap = buf.drain();
+        let snap = buf.take();
         assert_eq!(snap.len(), 2);
         assert_eq!(snap.get(&1_000).unwrap().get("solo"), Some(&100.0));
         assert_eq!(snap.get(&1_000).unwrap().get("pplns"), Some(&50.0));
         assert_eq!(snap.get(&2_000).unwrap().get("solo"), Some(&25.0));
-    }
-
-    #[test]
-    fn nested_buffer_confirm_drops_empty_outer_keys() {
-        let mut buf: NestedDeltaBuffer<i64, &'static str> = NestedDeltaBuffer::new();
-        buf.add(1_000, "solo", 100.0);
-        let snap = buf.drain();
-        buf.confirm(&snap);
         assert!(buf.is_empty());
     }
 
     #[test]
-    fn nested_buffer_concurrent_writes_survive_confirm() {
+    fn nested_buffer_restore_adds_onto_writes_made_during_the_flush() {
         let mut buf: NestedDeltaBuffer<i64, &'static str> = NestedDeltaBuffer::new();
         buf.add(1_000, "solo", 100.0);
-        let snap = buf.drain();
-        // Concurrent writes during the flush.
+        let snap = buf.take();
         buf.add(1_000, "solo", 30.0);
         buf.add(1_000, "pplns", 7.0);
-        buf.confirm(&snap);
-        let residual = buf.drain();
-        assert_eq!(residual.get(&1_000).unwrap().get("solo"), Some(&30.0));
-        assert_eq!(residual.get(&1_000).unwrap().get("pplns"), Some(&7.0));
+        buf.restore(snap);
+        let merged = buf.take();
+        assert_eq!(merged.get(&1_000).unwrap().get("solo"), Some(&130.0));
+        assert_eq!(merged.get(&1_000).unwrap().get("pplns"), Some(&7.0));
     }
 
     // ─── RecordDeltaBuffer ───────────────────────────────────────────────
 
     #[derive(Default, Clone, Debug, PartialEq)]
-    struct TwoField {
-        a: f64,
-        b: f64,
+    struct SumAndMax {
+        sum: f64,
+        max: f64,
     }
 
-    impl BufferRecord for TwoField {
+    impl BufferRecord for SumAndMax {
         fn is_zero(&self) -> bool {
-            self.a == 0.0 && self.b == 0.0
+            self.sum == 0.0 && self.max == 0.0
         }
         fn add_assign(&mut self, rhs: &Self) {
-            self.a += rhs.a;
-            self.b += rhs.b;
-        }
-        fn sub_assign_clamped(&mut self, rhs: &Self) -> bool {
-            self.a -= rhs.a;
-            self.b -= rhs.b;
-            self.a <= 0.0 && self.b <= 0.0
+            self.sum += rhs.sum;
+            self.max = self.max.max(rhs.max);
         }
     }
 
     #[test]
     fn record_buffer_zero_input_is_a_no_op() {
-        let mut buf: RecordDeltaBuffer<&'static str, TwoField> = RecordDeltaBuffer::new();
-        buf.add("k", &TwoField { a: 0.0, b: 0.0 });
+        let mut buf: RecordDeltaBuffer<&'static str, SumAndMax> = RecordDeltaBuffer::new();
+        buf.add("k", &SumAndMax { sum: 0.0, max: 0.0 });
         assert!(buf.is_empty());
     }
 
     #[test]
-    fn record_buffer_drain_skips_all_zero_buckets() {
+    fn record_buffer_take_skips_all_zero_buckets() {
         // A write and its negation leave an allocated all-zero bucket.
-        let mut buf: RecordDeltaBuffer<&'static str, TwoField> = RecordDeltaBuffer::new();
-        buf.add("k", &TwoField { a: 5.0, b: 3.0 });
-        buf.add("k", &TwoField { a: -5.0, b: -3.0 });
-        let snap = buf.drain();
-        assert!(!snap.contains_key("k"));
+        let mut buf: RecordDeltaBuffer<&'static str, SumAndMax> = RecordDeltaBuffer::new();
+        buf.add("k", &SumAndMax { sum: 5.0, max: 0.0 });
+        buf.add(
+            "k",
+            &SumAndMax {
+                sum: -5.0,
+                max: 0.0,
+            },
+        );
+        assert!(!buf.take().contains_key("k"));
     }
 
     #[test]
-    fn record_buffer_confirm_subtracts_and_drops_zero() {
-        let mut buf: RecordDeltaBuffer<&'static str, TwoField> = RecordDeltaBuffer::new();
-        buf.add("k", &TwoField { a: 10.0, b: 7.0 });
-        let snap = buf.drain();
-        // Concurrent partial-overlap write.
-        buf.add("k", &TwoField { a: 2.0, b: 0.0 });
-        buf.confirm(&snap);
-        let residual = buf.drain();
-        assert_eq!(residual.get("k"), Some(&TwoField { a: 2.0, b: 0.0 }));
+    fn record_buffer_take_where_leaves_the_rest_buffered() {
+        let mut buf: RecordDeltaBuffer<i64, SumAndMax> = RecordDeltaBuffer::new();
+        buf.add(1, &SumAndMax { sum: 1.0, max: 1.0 });
+        buf.add(2, &SumAndMax { sum: 2.0, max: 2.0 });
+        let due = buf.take_where(|k| *k < 2);
+        assert_eq!(due.keys().copied().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(buf.take().keys().copied().collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[test]
+    fn record_buffer_restore_sums_and_keeps_the_larger_max() {
+        let mut buf: RecordDeltaBuffer<&'static str, SumAndMax> = RecordDeltaBuffer::new();
+        buf.add(
+            "k",
+            &SumAndMax {
+                sum: 10.0,
+                max: 700.0,
+            },
+        );
+        let snap = buf.take();
+        // A write during the flush, which then fails.
+        buf.add(
+            "k",
+            &SumAndMax {
+                sum: 2.0,
+                max: 50.0,
+            },
+        );
+        buf.restore(snap);
+        assert_eq!(
+            buf.take().get("k"),
+            Some(&SumAndMax {
+                sum: 12.0,
+                max: 700.0
+            })
+        );
     }
 }

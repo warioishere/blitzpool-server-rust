@@ -484,7 +484,7 @@ async fn push_status_for_unknown_address_returns_empty_shape() {
         .await
         .expect("oneshot");
     assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+    let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(json["subscriptionCount"], 0);
     assert!(json["subscriptions"].is_array());
@@ -565,13 +565,12 @@ async fn worker_chart_breaks_rejects_down_by_every_reason() {
     sqlx::query(
         r#"INSERT INTO client_statistics_entity
              (address, "clientName", "sessionId", "time", shares,
-              "acceptedCount", "rejectedCount",
               "rejectedJobNotFoundCount",       "rejectedJobNotFoundDiff1",
               "rejectedDuplicateShareCount",    "rejectedDuplicateShareDiff1",
               "rejectedLowDifficultyShareCount","rejectedLowDifficultyShareDiff1",
               "rejectedVersionRollingCount",    "rejectedVersionRollingDiff1",
               "rejectedStaleCount",             "rejectedStaleDiff1")
-           VALUES ($1,$2,$3,$4, 10, 1, 15, 1,0.5, 2,0.25, 3,0.125, 4,0.0625, 5,0.03125)"#,
+           VALUES ($1,$2,$3,$4, 10, 1,0.5, 2,0.25, 3,0.125, 4,0.0625, 5,0.03125)"#,
     )
     .bind(addr)
     .bind(worker)
@@ -627,7 +626,7 @@ async fn worker_chart_breaks_rejects_down_by_every_reason() {
         + n("rejectedLowDifficultyShare")
         + n("rejectedVersionRolling")
         + n("rejectedStale");
-    assert_eq!(sum, 15.0, "breakdown must sum to rejectedCount, got {sum}");
+    assert_eq!(sum, 15.0, "the breakdown covers all 15 rejects, got {sum}");
     // Diff-1 weights ride along per reason and must not be cross-wired.
     assert_eq!(n("rejectedVersionRollingDiff1"), 0.0625);
     assert_eq!(n("rejectedStaleDiff1"), 0.03125);
@@ -648,7 +647,7 @@ async fn get_json(pool: PgPool, uri: &str) -> (StatusCode, serde_json::Value) {
         .await
         .expect("oneshot");
     let status = resp.status();
-    let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+    let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
     let json = serde_json::from_slice(&bytes)
         .unwrap_or_else(|e| panic!("non-JSON body for {uri} ({e}): {bytes:?}"));
     (status, json)
@@ -661,39 +660,39 @@ async fn best_difficulty_today_maxes_workers_and_slots_from_since() {
     };
     // Own address: no sibling test in this binary touches it.
     let addr = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    let slot = bp_stats::SLOT_DURATION_MS;
     let hour: i64 = 60 * 60 * 1000;
-    // `since` on an hour boundary, one hour back, so `since + 1h` is the
-    // current hour and every seeded slot lies inside the accepted window.
-    let since = (bp_common::now_ms() / hour) * hour - hour;
-    // Values exactly representable as f32 (the column is `real`). The
-    // highest one sits in the slot BEFORE `since`, so it only shows up in
-    // the answer if the boundary is wrong.
+    // `since` on a slot boundary an hour back, inside the accepted window.
+    let since = (bp_common::now_ms() / slot) * slot - hour;
+    // Rows are keyed by slot END. Values exactly representable as f32 (the
+    // column is `real`). The highest one is the slot that ends at `since`,
+    // i.e. lies before it, so it only shows up if the boundary is wrong.
     let rows: [(&str, i64, f32); 4] = [
-        ("rig_a", since - hour, 9_000.5),
-        ("rig_a", since, 1_500.25),
-        ("rig_b", since, 800.0),
-        ("rig_b", since + hour, 2_048.75),
+        ("rig_a", since, 9_000.5),
+        ("rig_a", since + slot, 1_500.25),
+        ("rig_b", since + slot, 800.0),
+        ("rig_b", since + 2 * slot, 2_048.75),
     ];
     let cleanup = || async {
-        let _ = sqlx::query("DELETE FROM client_difficulty_statistics_entity WHERE address = $1")
+        let _ = sqlx::query("DELETE FROM client_statistics_entity WHERE address = $1")
             .bind(addr)
             .execute(&pool)
             .await;
     };
     cleanup().await;
-    for (worker, slot, max) in rows {
+    for (worker, slot_end, max) in rows {
         sqlx::query(
-            r#"INSERT INTO client_difficulty_statistics_entity
-                 (address, "clientName", "slotTime", "maxDifficulty")
-               VALUES ($1, $2, $3, $4)"#,
+            r#"INSERT INTO client_statistics_entity
+                 (address, "clientName", "sessionId", "time", shares, "maxDifficulty")
+               VALUES ($1, $2, 's1', $3, 1, $4)"#,
         )
         .bind(addr)
         .bind(worker)
-        .bind(slot)
+        .bind(slot_end)
         .bind(max)
         .execute(&pool)
         .await
-        .expect("seed diff stat");
+        .expect("seed client stats");
     }
 
     let today = get_json(
@@ -701,22 +700,22 @@ async fn best_difficulty_today_maxes_workers_and_slots_from_since() {
         &format!("/api/client/{addr}/best-difficulty/today?since={since}"),
     )
     .await;
-    // Negative control: one hour earlier the pre-`since` row is in range,
+    // Negative control: one slot earlier the pre-`since` row is in range,
     // so it exists and a missing 9000.5 above is the filter, not the seed.
     let earlier = get_json(
         pool.clone(),
         &format!(
             "/api/client/{addr}/best-difficulty/today?since={}",
-            since - hour
+            since - slot
         ),
     )
     .await;
-    // One ms past the slot start excludes that slot: no flooring to the hour.
+    // One ms past a slot's start excludes that slot: nothing before `since`.
     let past_slot = get_json(
         pool.clone(),
         &format!(
             "/api/client/{addr}/best-difficulty/today?since={}",
-            since - hour + 1
+            since - slot + 1
         ),
     )
     .await;
@@ -728,6 +727,64 @@ async fn best_difficulty_today_maxes_workers_and_slots_from_since() {
     assert_eq!(earlier.1["bestDifficulty"], serde_json::json!(9000.5));
     assert_eq!(past_slot.0, StatusCode::OK, "{}", past_slot.1);
     assert_eq!(past_slot.1["bestDifficulty"], serde_json::json!(2048.75));
+}
+
+/// Hourly buckets take the max of the 10-minute slots that START in the
+/// hour: the slot ending on the hour belongs to the hour before.
+#[tokio::test]
+async fn diff_scores_folds_slots_into_the_hour_they_start_in() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    // Own address: no sibling test in this binary touches it.
+    let addr = "bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l";
+    let slot = bp_stats::SLOT_DURATION_MS;
+    let hour: i64 = 60 * 60 * 1000;
+    let h = (bp_common::now_ms() / hour) * hour - 3 * hour;
+    let rows: [(i64, f32); 3] = [
+        (h + slot, 100.0),      // [h, h+10m): hour h
+        (h + hour, 700.0),      // [h+50m, h+60m): still hour h
+        (h + hour + slot, 5.0), // [h+60m, h+70m): hour h+1
+    ];
+    let cleanup = || async {
+        let _ = sqlx::query("DELETE FROM client_statistics_entity WHERE address = $1")
+            .bind(addr)
+            .execute(&pool)
+            .await;
+    };
+    cleanup().await;
+    for (slot_end, max) in rows {
+        sqlx::query(
+            r#"INSERT INTO client_statistics_entity
+                 (address, "clientName", "sessionId", "time", shares, "maxDifficulty")
+               VALUES ($1, 'rig', 's1', $2, 1, $3)"#,
+        )
+        .bind(addr)
+        .bind(slot_end)
+        .bind(max)
+        .execute(&pool)
+        .await
+        .expect("seed client stats");
+    }
+    let (status, body) = get_json(pool.clone(), &format!("/api/client/{addr}/diff-scores")).await;
+    cleanup().await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let at = |t: i64| -> Option<f64> {
+        let label = chrono::DateTime::from_timestamp_millis(t)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        body["slotData"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["time"] == label)
+            .unwrap_or_else(|| panic!("no bucket {label} in {body}"))["difficulty"]
+            .as_f64()
+    };
+    assert_eq!(at(h), Some(700.0));
+    assert_eq!(at(h + hour), Some(5.0));
 }
 
 #[tokio::test]
@@ -780,4 +837,227 @@ async fn best_difficulty_today_rejects_missing_or_out_of_window_since() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
     assert_eq!(json["code"], "invalid-address");
+}
+
+/// `/worker-shares` lists the address's connected workers that have a
+/// lifetime row, in name order; a row of a worker without a session stays
+/// out, a connected worker without a row too.
+#[tokio::test]
+async fn worker_shares_lists_connected_workers_with_a_row_in_name_order() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    // Own address: no sibling test in this binary touches it.
+    let addr = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh";
+    let cleanup = || async {
+        for table in ["client_entity", "worker_shares_entity"] {
+            let _ = sqlx::query(&format!("DELETE FROM {table} WHERE address = $1"))
+                .bind(addr)
+                .execute(&pool)
+                .await;
+        }
+    };
+    cleanup().await;
+    for (worker, session) in [
+        ("rig_b", "wsB00001"),
+        ("rig_a", "wsA00001"),
+        ("rig_c", "wsC00001"),
+    ] {
+        sqlx::query(
+            r#"INSERT INTO client_entity (address, "clientName", "sessionId", "startTime")
+               VALUES ($1, $2, $3, 0)"#,
+        )
+        .bind(addr)
+        .bind(worker)
+        .bind(session)
+        .execute(&pool)
+        .await
+        .expect("seed client");
+    }
+    // rig_c is connected without a row; rig_gone has a row but no session.
+    for (worker, shares, rejected) in [
+        ("rig_a", 100.0, 1.0),
+        ("rig_b", 250.0, 3.0),
+        ("rig_gone", 9.0, 0.0),
+    ] {
+        sqlx::query(
+            r#"INSERT INTO worker_shares_entity (address, "clientName", shares, "rejectedShares")
+               VALUES ($1, $2, $3, $4)"#,
+        )
+        .bind(addr)
+        .bind(worker)
+        .bind(shares)
+        .bind(rejected)
+        .execute(&pool)
+        .await
+        .expect("seed worker shares");
+    }
+
+    let (status, body) = get_json(pool.clone(), &format!("/api/client/{addr}/worker-shares")).await;
+    cleanup().await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        serde_json::json!([
+            {"workerName": "rig_a", "totalShares": 100, "totalRejected": 1},
+            {"workerName": "rig_b", "totalShares": 250, "totalRejected": 3},
+        ])
+    );
+}
+
+/// `/max-difficulty` per address: the highest share of each visible slot
+/// over all its sessions, every other slot 0.
+#[tokio::test]
+async fn client_max_difficulty_takes_the_best_session_per_slot() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    // Own address: no sibling test in this binary touches it.
+    let addr = "bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h";
+    let last = bp_stats::slot::chart_visibility_cutoff_slot()
+        .previous()
+        .as_millis();
+    let earlier = last - bp_stats::SLOT_DURATION_MS;
+    let rows: [(&str, i64, f32); 4] = [
+        ("mxs00001", earlier, 300.0),
+        ("mxs00002", earlier, 4_096.5),
+        ("mxs00001", last, 77.25),
+        ("mxs00002", last, 12.0),
+    ];
+    let cleanup = || async {
+        let _ = sqlx::query("DELETE FROM client_statistics_entity WHERE address = $1")
+            .bind(addr)
+            .execute(&pool)
+            .await;
+    };
+    cleanup().await;
+    for (session, slot_end, max) in rows {
+        sqlx::query(
+            r#"INSERT INTO client_statistics_entity
+                 (address, "clientName", "sessionId", "time", shares, "maxDifficulty")
+               VALUES ($1, 'rig', $2, $3, 1, $4)"#,
+        )
+        .bind(addr)
+        .bind(session)
+        .bind(slot_end)
+        .bind(max)
+        .execute(&pool)
+        .await
+        .expect("seed client stats");
+    }
+    let (status, body) =
+        get_json(pool.clone(), &format!("/api/client/{addr}/max-difficulty")).await;
+    cleanup().await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let slots = body["slotData"].as_array().expect("slotData");
+    let at = |t: i64| -> f64 {
+        let label = chrono::DateTime::from_timestamp_millis(t)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        slots
+            .iter()
+            .find(|e| e["time"] == label)
+            .unwrap_or_else(|| panic!("no slot {label}"))["counts"]["maxDifficulty"]
+            .as_f64()
+            .expect("number")
+    };
+    assert_eq!(at(earlier), 4_096.5);
+    assert_eq!(at(last), 77.25);
+    let nonzero = slots
+        .iter()
+        .filter(|e| e["counts"]["maxDifficulty"].as_f64() != Some(0.0))
+        .count();
+    assert_eq!(nonzero, 2, "every other slot reads 0");
+}
+
+/// delete-stats zeroes the address total together with the worker totals,
+/// so both count from the same start afterwards; the public record stays.
+#[tokio::test]
+async fn delete_stats_zeroes_the_address_total_with_the_workers() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    // Own address: no sibling test in this binary touches it.
+    let addr = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
+    let cleanup = || async {
+        for table in ["address_settings_entity", "worker_shares_entity"] {
+            let _ = sqlx::query(&format!("DELETE FROM {table} WHERE address = $1"))
+                .bind(addr)
+                .execute(&pool)
+                .await;
+        }
+    };
+    cleanup().await;
+    sqlx::query(
+        r#"INSERT INTO address_settings_entity
+             (address, shares, "bestDifficulty", "allTimeBestDifficulty")
+           VALUES ($1, 500, 64, 4096)"#,
+    )
+    .bind(addr)
+    .execute(&pool)
+    .await
+    .expect("seed address");
+    sqlx::query(
+        r#"INSERT INTO worker_shares_entity (address, "clientName", shares, "rejectedShares")
+           VALUES ($1, 'rig', 500, 0)"#,
+    )
+    .bind(addr)
+    .execute(&pool)
+    .await
+    .expect("seed worker");
+
+    let resp = build_router(minimal_state(pool.clone()))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/client/{addr}/delete-stats"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("oneshot");
+    let status = resp.status();
+    let (shares, all_time): (f64, f64) = sqlx::query_as(
+        r#"SELECT shares, "allTimeBestDifficulty" FROM address_settings_entity WHERE address = $1"#,
+    )
+    .bind(addr)
+    .fetch_one(&pool)
+    .await
+    .expect("address row stays");
+    let workers: i64 =
+        sqlx::query_scalar(r#"SELECT COUNT(*) FROM worker_shares_entity WHERE address = $1"#)
+            .bind(addr)
+            .fetch_one(&pool)
+            .await
+            .expect("count workers");
+    cleanup().await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(workers, 0, "worker totals are gone");
+    assert_eq!(shares, 0.0, "the address total starts over with them");
+    assert_eq!(all_time, 4096.0, "the public record is never lowered");
+}
+
+/// `diff-scores?range=30d` reaches back past a 31-day calendar month plus a
+/// time-zone offset, so the scoreboard's month starts inside the window.
+#[tokio::test]
+async fn diff_scores_month_window_covers_a_31_day_month() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let addr = "bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h";
+    let (status, body) = get_json(pool, &format!("/api/client/{addr}/diff-scores?range=30d")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first = body["slotData"][0]["time"].as_str().expect("first bucket");
+    let first_ms = chrono::DateTime::parse_from_rfc3339(first)
+        .expect("iso time")
+        .timestamp_millis();
+    let hour: i64 = 60 * 60 * 1000;
+    assert!(
+        first_ms <= bp_common::now_ms() - 31 * 24 * hour - 14 * hour,
+        "first bucket {first} must lie before a 31-day month in any zone"
+    );
 }

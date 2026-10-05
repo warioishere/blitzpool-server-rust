@@ -22,16 +22,12 @@ pub async fn find_pool_share_statistics_since(
     sqlx::query_as!(
         PoolShareStatisticsRow,
         r#"SELECT
-            "deletedAt" AS "deleted_at?",
-            "createdAt" AS "created_at!",
-            "updatedAt" AS "updated_at!",
-            id AS "id!",
             "time" AS "time!",
             accepted AS "accepted!",
             rejected AS "rejected!",
             "maxDifficulty" AS "max_difficulty!"
            FROM pool_share_statistics_entity
-           WHERE "deletedAt" IS NULL AND "time" >= $1
+           WHERE "time" >= $1
            ORDER BY "time" ASC"#,
         since_ms,
     )
@@ -49,15 +45,11 @@ pub async fn find_pool_rejected_statistics_since(
     sqlx::query_as!(
         PoolRejectedStatisticsRow,
         r#"SELECT
-            "deletedAt" AS "deleted_at?",
-            "createdAt" AS "created_at!",
-            "updatedAt" AS "updated_at!",
-            id AS "id!",
             "time" AS "time!",
             reason AS "reason!",
             count AS "count!"
            FROM pool_rejected_statistics_entity
-           WHERE "deletedAt" IS NULL AND "time" >= $1
+           WHERE "time" >= $1
            ORDER BY "time" ASC"#,
         since_ms,
     )
@@ -78,8 +70,6 @@ pub async fn find_pool_mode_hashrate_since(
     sqlx::query_as!(
         PoolModeHashrateRow,
         r#"SELECT
-            id AS "id!",
-            mode AS "mode!: MiningMode",
             "time" AS "time!",
             diff AS "diff!"
            FROM pool_mode_hashrate
@@ -95,13 +85,6 @@ pub async fn find_pool_mode_hashrate_since(
 
 #[derive(Clone, Debug, FromRow)]
 pub struct PoolShareStatisticsRow {
-    #[sqlx(rename = "deletedAt")]
-    pub deleted_at: Option<i64>,
-    #[sqlx(rename = "createdAt")]
-    pub created_at: i64,
-    #[sqlx(rename = "updatedAt")]
-    pub updated_at: i64,
-    pub id: i32,
     pub time: i64,
     pub accepted: f32,
     pub rejected: f32,
@@ -112,13 +95,6 @@ pub struct PoolShareStatisticsRow {
 
 #[derive(Clone, Debug, FromRow)]
 pub struct PoolRejectedStatisticsRow {
-    #[sqlx(rename = "deletedAt")]
-    pub deleted_at: Option<i64>,
-    #[sqlx(rename = "createdAt")]
-    pub created_at: i64,
-    #[sqlx(rename = "updatedAt")]
-    pub updated_at: i64,
-    pub id: i32,
     pub time: i64,
     pub reason: String,
     pub count: f32,
@@ -126,8 +102,6 @@ pub struct PoolRejectedStatisticsRow {
 
 #[derive(Clone, Debug, FromRow)]
 pub struct PoolModeHashrateRow {
-    pub id: i32,
-    pub mode: MiningMode,
     pub time: i64,
     pub diff: f32,
 }
