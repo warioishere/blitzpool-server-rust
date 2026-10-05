@@ -67,30 +67,30 @@ impl ShareTotalsAccumulator {
         self.worker_rejected.lock().add(key, diff);
     }
 
-    // ─── Coordinator drain / confirm ────────────────────────────────
+    // ─── Coordinator take / restore ─────────────────────────────────
 
-    pub fn drain_addresses(&self) -> AddressTotalsSnapshot {
-        self.address.lock().drain()
+    pub fn take_addresses(&self) -> AddressTotalsSnapshot {
+        self.address.lock().take()
     }
 
-    pub fn confirm_addresses(&self, snapshot: &AddressTotalsSnapshot) {
-        self.address.lock().confirm(snapshot);
+    pub fn restore_addresses(&self, snapshot: AddressTotalsSnapshot) {
+        self.address.lock().restore(snapshot);
     }
 
-    pub fn drain_workers(&self) -> WorkerTotalsSnapshot {
-        self.worker.lock().drain()
+    pub fn take_workers(&self) -> WorkerTotalsSnapshot {
+        self.worker.lock().take()
     }
 
-    pub fn confirm_workers(&self, snapshot: &WorkerTotalsSnapshot) {
-        self.worker.lock().confirm(snapshot);
+    pub fn restore_workers(&self, snapshot: WorkerTotalsSnapshot) {
+        self.worker.lock().restore(snapshot);
     }
 
-    pub fn drain_workers_rejected(&self) -> WorkerTotalsSnapshot {
-        self.worker_rejected.lock().drain()
+    pub fn take_workers_rejected(&self) -> WorkerTotalsSnapshot {
+        self.worker_rejected.lock().take()
     }
 
-    pub fn confirm_workers_rejected(&self, snapshot: &WorkerTotalsSnapshot) {
-        self.worker_rejected.lock().confirm(snapshot);
+    pub fn restore_workers_rejected(&self, snapshot: WorkerTotalsSnapshot) {
+        self.worker_rejected.lock().restore(snapshot);
     }
 }
 
@@ -113,8 +113,8 @@ mod tests {
     fn convenience_add_fans_to_both_buffers() {
         let acc = ShareTotalsAccumulator::new();
         acc.add(a("bc1qalice"), "w1".into(), 100.0);
-        let addrs = acc.drain_addresses();
-        let workers = acc.drain_workers();
+        let addrs = acc.take_addresses();
+        let workers = acc.take_workers();
         assert_eq!(addrs.get(&a("bc1qalice")), Some(&100.0));
         assert_eq!(workers.get(&worker_key("bc1qalice", "w1")), Some(&100.0));
     }
@@ -124,37 +124,28 @@ mod tests {
         let acc = ShareTotalsAccumulator::new();
         acc.add(a("bc1qalice"), "w1".into(), 100.0);
         acc.add(a("bc1qalice"), "w2".into(), 50.0);
-        let workers = acc.drain_workers();
+        let workers = acc.take_workers();
         assert_eq!(workers.len(), 2);
-        let addrs = acc.drain_addresses();
+        let addrs = acc.take_addresses();
         // Address total sums across workers.
         assert_eq!(addrs.get(&a("bc1qalice")), Some(&150.0));
     }
 
     #[test]
-    fn drain_is_non_clearing_until_confirm() {
+    fn take_empties_and_restore_adds_onto_writes_made_during_the_flush() {
         let acc = ShareTotalsAccumulator::new();
         acc.add(a("bc1qalice"), "w1".into(), 100.0);
-        let _ = acc.drain_addresses();
-        let _ = acc.drain_workers();
-        let again = acc.drain_addresses();
-        assert_eq!(again.get(&a("bc1qalice")), Some(&100.0));
-    }
-
-    #[test]
-    fn confirm_subtracts_and_preserves_concurrent_adds() {
-        let acc = ShareTotalsAccumulator::new();
-        acc.add(a("bc1qalice"), "w1".into(), 100.0);
-        let addr_snap = acc.drain_addresses();
-        let worker_snap = acc.drain_workers();
-        // Concurrent write during the flush.
+        let addr_snap = acc.take_addresses();
+        let worker_snap = acc.take_workers();
+        assert!(acc.take_addresses().is_empty(), "take empties");
+        // A write during the flush, which then fails.
         acc.add(a("bc1qalice"), "w1".into(), 10.0);
-        acc.confirm_addresses(&addr_snap);
-        acc.confirm_workers(&worker_snap);
-        assert_eq!(acc.drain_addresses().get(&a("bc1qalice")), Some(&10.0));
+        acc.restore_addresses(addr_snap);
+        acc.restore_workers(worker_snap);
+        assert_eq!(acc.take_addresses().get(&a("bc1qalice")), Some(&110.0));
         assert_eq!(
-            acc.drain_workers().get(&worker_key("bc1qalice", "w1")),
-            Some(&10.0)
+            acc.take_workers().get(&worker_key("bc1qalice", "w1")),
+            Some(&110.0)
         );
     }
 }

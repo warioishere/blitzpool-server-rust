@@ -251,7 +251,7 @@ async fn a_poisoned_birth_row_is_isolated_and_dropped_after_bounded_retries() {
         .await;
 
     // Flush 1: bulk fails on the poisoned row, the per-row fallback
-    // births the healthy one and rebuffers the poison (attempt 1).
+    // births the healthy one and keeps the poison for retry (attempt 1).
     handle.flush_births_now().await;
     let healthy: i64 =
         sqlx::query_scalar(r#"SELECT count(*) FROM client_entity WHERE "sessionId" = $1"#)
@@ -266,7 +266,7 @@ async fn a_poisoned_birth_row_is_isolated_and_dropped_after_bounded_retries() {
     assert_eq!(
         handle.pending_births(),
         1,
-        "the poisoned row is rebuffered, not silently gone"
+        "the poisoned row is kept for retry, not silently gone"
     );
 
     // Flushes 2 + 3: still failing → dropped at the attempt cap.

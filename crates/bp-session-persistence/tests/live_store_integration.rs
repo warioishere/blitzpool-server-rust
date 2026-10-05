@@ -522,10 +522,7 @@ async fn redis_down_does_not_hang_the_flush() {
     let rows = tokio::time::timeout(Duration::from_secs(10), handle.flush_touches_now())
         .await
         .expect("flush must not hang on a dead Redis");
-    assert_eq!(
-        rows, 0,
-        "nothing written — the snapshot is rebuffered for retry"
-    );
+    assert_eq!(rows, 0, "nothing written — the snapshot is kept for retry");
 
     // The PG birth path is untouched by the Redis outage.
     let born: i64 =

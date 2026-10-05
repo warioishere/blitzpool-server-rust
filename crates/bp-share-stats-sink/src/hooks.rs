@@ -186,11 +186,11 @@ mod tests {
         })
         .await;
 
-        let pool = accs.pool_shares.drain();
+        let pool = accs.pool_shares.take();
         let pool = pool.values().next().expect("one pool slot");
         assert_eq!((pool.accepted, pool.max_difficulty), (10.0, 4096.0));
 
-        let clients = accs.client_statistics.drain();
+        let clients = accs.client_statistics.take();
         let client = clients.values().next().expect("one client row");
         assert_eq!((client.shares, client.max_difficulty), (10.0, 4096.0));
     }

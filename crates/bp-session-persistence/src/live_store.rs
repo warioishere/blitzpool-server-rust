@@ -11,7 +11,7 @@ use tokio::time::Duration;
 
 /// Upper bound for one script invocation: a manager mid-reconnect would
 /// make the flush loops wait out its whole retry ladder instead of
-/// failing fast and rebuffering.
+/// failing fast and keeping the batch for retry.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 use crate::touch_buffer::{TouchEntry, TouchKey};

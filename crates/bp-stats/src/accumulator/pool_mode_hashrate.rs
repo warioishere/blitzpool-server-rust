@@ -38,12 +38,14 @@ impl PoolModeHashrateAccumulator {
         self.inner.lock().add(slot, mode, diff);
     }
 
-    pub fn drain(&self) -> PoolModeHashrateSnapshot {
-        self.inner.lock().drain()
+    /// Empty the accumulator for a flush.
+    pub fn take(&self) -> PoolModeHashrateSnapshot {
+        self.inner.lock().take()
     }
 
-    pub fn confirm(&self, snapshot: &PoolModeHashrateSnapshot) {
-        self.inner.lock().confirm(snapshot);
+    /// Hand back an unwritten [`Self::take`].
+    pub fn restore(&self, snapshot: PoolModeHashrateSnapshot) {
+        self.inner.lock().restore(snapshot);
     }
 
     pub fn len(&self) -> usize {
@@ -70,7 +72,7 @@ mod tests {
         acc.add(slot(1_000), MiningMode::Pplns, 50.0);
         acc.add(slot(1_000), MiningMode::Solo, 25.0);
         acc.add(slot(2_000), MiningMode::GroupSolo, 7.0);
-        let snap = acc.drain();
+        let snap = acc.take();
         assert_eq!(
             snap.get(&slot(1_000)).unwrap().get(&MiningMode::Solo),
             Some(&125.0)
@@ -86,12 +88,13 @@ mod tests {
     }
 
     #[test]
-    fn confirm_drops_empty_slots() {
+    fn take_empties_and_restore_hands_back() {
         let acc = PoolModeHashrateAccumulator::new();
         acc.add(slot(1_000), MiningMode::Solo, 100.0);
-        let snap = acc.drain();
-        acc.confirm(&snap);
+        let snap = acc.take();
         assert!(acc.is_empty());
+        acc.restore(snap);
+        assert_eq!(acc.len(), 1);
     }
 
     #[test]

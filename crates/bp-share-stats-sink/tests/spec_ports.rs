@@ -3,7 +3,7 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! Statistics-coordinator edge cases: batch splitting, special characters in
+//! Statistics-coordinator edge cases: a large flush, special characters in
 //! `clientName`, and the per-worker rejected difficulty in
 //! `worker_shares_entity`.
 
@@ -60,10 +60,10 @@ async fn cleanup(pool: &PgPool, prefix: &str) {
     }
 }
 
-// ── 1500 rows split across batch_size=1000 ───────────────────────────
+// ── 1500 rows in one statement ───────────────────────────────────────
 
 #[tokio::test]
-async fn client_statistics_1500_rows_split_across_batches() {
+async fn client_statistics_1500_rows_land_in_one_statement() {
     let _guard = SPEC_PORT_LOCK.lock().await;
     let Some(pool) = connect_or_skip().await else {
         return;
@@ -71,7 +71,7 @@ async fn client_statistics_1500_rows_split_across_batches() {
     let prefix = "test_spec_batch_";
     cleanup(&pool, prefix).await;
 
-    // 1500 distinct addresses must split into a 1000-row and a 500-row batch.
+    // The columns travel as arrays, so 1500 rows add no bind parameters.
     let slot = TimeSlot::from_millis(32_503_680_100_000);
     let accs = Arc::new(Accumulators::default());
     for i in 0..1500u32 {
@@ -91,7 +91,7 @@ async fn client_statistics_1500_rows_split_across_batches() {
     }
 
     let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs, &health, 1000, FlushScope::All).await;
+    flush_once(&pool, &accs, &health, FlushScope::All).await;
 
     let count: i64 = sqlx::query_scalar(
         r#"SELECT COUNT(*) FROM client_statistics_entity WHERE address LIKE $1"#,
@@ -100,10 +100,7 @@ async fn client_statistics_1500_rows_split_across_batches() {
     .fetch_one(&pool)
     .await
     .expect("count");
-    assert_eq!(
-        count, 1500,
-        "all 1500 rows must land — 1000-row first batch + 500-row second"
-    );
+    assert_eq!(count, 1500, "all 1500 rows land in one upsert");
 
     cleanup(&pool, prefix).await;
 }
@@ -153,7 +150,7 @@ async fn client_name_with_special_chars_roundtrips_through_unnest() {
     }
 
     let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs, &health, 1000, FlushScope::All).await;
+    flush_once(&pool, &accs, &health, FlushScope::All).await;
 
     // Each stress-named row landed both in client_statistics and in
     // worker_shares_entity with the same byte-identical clientName.
@@ -185,10 +182,8 @@ async fn client_name_with_special_chars_roundtrips_through_unnest() {
 /// Empties the pool-wide accumulators: the sink books every reject into the
 /// current real slot, and only the worker row is under test here.
 fn drop_pool_rows(accs: &Accumulators) {
-    let pool = accs.pool_shares.drain();
-    accs.pool_shares.confirm(&pool);
-    let rejected = accs.pool_rejected.drain();
-    accs.pool_rejected.confirm(&rejected);
+    accs.pool_shares.take();
+    accs.pool_rejected.take();
 }
 
 /// One reject from `session` through the sink, as the stream consumer feeds it.
@@ -230,7 +225,7 @@ async fn rejected_diff_per_worker_aggregates_across_sessions() {
     drop_pool_rows(&accs);
 
     let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs, &health, 1000, FlushScope::All).await;
+    flush_once(&pool, &accs, &health, FlushScope::All).await;
 
     let rejected: f64 = sqlx::query_scalar(
         r#"SELECT "rejectedShares" FROM worker_shares_entity
@@ -263,7 +258,7 @@ async fn a_zero_difficulty_reject_writes_no_worker_row() {
     drop_pool_rows(&accs);
 
     let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
-    flush_once(&pool, &accs, &health, 1000, FlushScope::All).await;
+    flush_once(&pool, &accs, &health, FlushScope::All).await;
 
     let row = sqlx::query_scalar::<_, Option<f64>>(
         r#"SELECT "rejectedShares" FROM worker_shares_entity

@@ -104,7 +104,7 @@ async fn run_flush_loop(
         tokio::select! {
             _ = tokio::time::sleep(wait) => {
                 let scope = FlushScope::Before(TimeSlot::current());
-                flush_once(&pool, &accs, &health, cfg.client_stats_batch_size, scope).await;
+                flush_once(&pool, &accs, &health, scope).await;
             }
             _ = &mut shutdown_rx => {
                 debug!("stats_sink received shutdown");
@@ -114,14 +114,7 @@ async fn run_flush_loop(
     }
 
     info!("stats_sink final drain");
-    flush_once(
-        &pool,
-        &accs,
-        &health,
-        cfg.client_stats_batch_size,
-        FlushScope::All,
-    )
-    .await;
+    flush_once(&pool, &accs, &health, FlushScope::All).await;
 }
 
 /// Time until the next tick: `offset` past each wall-clock multiple of

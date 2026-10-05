@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Coordinator-tick flush: drain each accumulator, upsert its table, confirm
-//! on success. One flusher's PG error does not abort the tick; unconfirmed
-//! deltas carry over to the next one.
+//! Coordinator-tick flush: take each accumulator's due part, upsert its
+//! table, hand it back on failure. One flusher's PG error does not abort the
+//! tick; the handed-back deltas go out with the next one.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -68,19 +68,19 @@ pub enum FlushScope {
     All,
 }
 
-/// One coordinator tick, sequenced per flusher so a failed table stays
-/// unconfirmed while the others proceed.
+/// One coordinator tick, sequenced per flusher. Each takes what is due and
+/// hands it back on a failed write, so one table's outage leaves the others
+/// flowing and loses nothing.
 pub async fn flush_once(
     pool: &PgPool,
     accs: &Accumulators,
     health: &Arc<std::sync::Mutex<FlushHealthMonitor<Flusher>>>,
-    batch_size: usize,
     scope: FlushScope,
 ) {
     flush_pool_shares(pool, accs, health).await;
     flush_pool_mode_hashrate(pool, accs, health).await;
     flush_pool_rejected(pool, accs, health).await;
-    flush_client_statistics(pool, accs, health, batch_size, scope).await;
+    flush_client_statistics(pool, accs, health, scope).await;
     flush_address_settings(pool, accs, health).await;
     flush_worker_totals(pool, accs, health).await;
 }
@@ -90,7 +90,7 @@ async fn flush_pool_shares(
     accs: &Accumulators,
     health: &Arc<std::sync::Mutex<FlushHealthMonitor<Flusher>>>,
 ) {
-    let snapshot = accs.pool_shares.drain();
+    let snapshot = accs.pool_shares.take();
     if snapshot.is_empty() {
         record_success(health, Flusher::PoolShares);
         return;
@@ -105,12 +105,10 @@ async fn flush_pool_shares(
         })
         .collect();
     match bulk_upsert_pool_share_statistics(pool, &rows).await {
-        Ok(_) => {
-            accs.pool_shares.confirm(&snapshot);
-            record_success(health, Flusher::PoolShares);
-        }
+        Ok(_) => record_success(health, Flusher::PoolShares),
         Err(e) => {
             warn!(error = %e, "pool_share_statistics flush failed");
+            accs.pool_shares.restore(snapshot);
             record_failure(health, Flusher::PoolShares);
         }
     }
@@ -121,7 +119,7 @@ async fn flush_pool_mode_hashrate(
     accs: &Accumulators,
     health: &Arc<std::sync::Mutex<FlushHealthMonitor<Flusher>>>,
 ) {
-    let snapshot = accs.pool_mode_hashrate.drain();
+    let snapshot = accs.pool_mode_hashrate.take();
     if snapshot.is_empty() {
         record_success(health, Flusher::PoolModeHashrate);
         return;
@@ -137,12 +135,10 @@ async fn flush_pool_mode_hashrate(
         }
     }
     match bulk_upsert_pool_mode_hashrate(pool, &rows).await {
-        Ok(_) => {
-            accs.pool_mode_hashrate.confirm(&snapshot);
-            record_success(health, Flusher::PoolModeHashrate);
-        }
+        Ok(_) => record_success(health, Flusher::PoolModeHashrate),
         Err(e) => {
             warn!(error = %e, "pool_mode_hashrate flush failed");
+            accs.pool_mode_hashrate.restore(snapshot);
             record_failure(health, Flusher::PoolModeHashrate);
         }
     }
@@ -153,7 +149,7 @@ async fn flush_pool_rejected(
     accs: &Accumulators,
     health: &Arc<std::sync::Mutex<FlushHealthMonitor<Flusher>>>,
 ) {
-    let snapshot = accs.pool_rejected.drain();
+    let snapshot = accs.pool_rejected.take();
     if snapshot.is_empty() {
         record_success(health, Flusher::PoolRejected);
         return;
@@ -169,12 +165,10 @@ async fn flush_pool_rejected(
         }
     }
     match bulk_upsert_pool_rejected_statistics(pool, &rows).await {
-        Ok(_) => {
-            accs.pool_rejected.confirm(&snapshot);
-            record_success(health, Flusher::PoolRejected);
-        }
+        Ok(_) => record_success(health, Flusher::PoolRejected),
         Err(e) => {
             warn!(error = %e, "pool_rejected_statistics flush failed");
+            accs.pool_rejected.restore(snapshot);
             record_failure(health, Flusher::PoolRejected);
         }
     }
@@ -184,13 +178,12 @@ async fn flush_client_statistics(
     pool: &PgPool,
     accs: &Accumulators,
     health: &Arc<std::sync::Mutex<FlushHealthMonitor<Flusher>>>,
-    batch_size: usize,
     scope: FlushScope,
 ) {
-    let mut snapshot = accs.client_statistics.drain();
-    if let FlushScope::Before(current) = scope {
-        snapshot.retain(|key, _| key.slot < current);
-    }
+    let snapshot = match scope {
+        FlushScope::Before(current) => accs.client_statistics.take_before(current),
+        FlushScope::All => accs.client_statistics.take(),
+    };
     if snapshot.is_empty() {
         record_success(health, Flusher::ClientStatistics);
         return;
@@ -218,54 +211,33 @@ async fn flush_client_statistics(
             max_difficulty: rec.max_difficulty as f32,
         })
         .collect();
-
-    // Batch to stay under PG param-count caps. Confirm only the
-    // successfully-flushed slice so a mid-batch failure retries cleanly.
-    let mut confirmed_any_failure = false;
-    let mut confirmed_keys: Vec<&bp_stats::ClientStatisticsKey> =
-        Vec::with_capacity(snapshot.len());
-    for (chunk, keys_chunk) in rows
-        .chunks(batch_size)
-        .zip(snapshot.keys().collect::<Vec<_>>().chunks(batch_size))
-    {
-        match bulk_upsert_client_statistics_entity(pool, chunk).await {
-            Ok(_) => confirmed_keys.extend(keys_chunk.iter().copied()),
-            Err(e) => {
-                warn!(error = %e, batch_len = chunk.len(), "client_statistics batch failed");
-                confirmed_any_failure = true;
-            }
+    // One statement: the columns travel as arrays, so the row count does not
+    // add bind parameters.
+    match bulk_upsert_client_statistics_entity(pool, &rows).await {
+        Ok(_) => record_success(health, Flusher::ClientStatistics),
+        Err(e) => {
+            warn!(error = %e, rows = rows.len(), "client_statistics flush failed");
+            accs.client_statistics.restore(snapshot);
+            record_failure(health, Flusher::ClientStatistics);
         }
-    }
-    if !confirmed_keys.is_empty() {
-        let partial: bp_stats::ClientStatisticsSnapshot = confirmed_keys
-            .iter()
-            .map(|k| ((*k).clone(), snapshot.get(*k).cloned().unwrap_or_default()))
-            .collect();
-        accs.client_statistics.confirm(&partial);
-    }
-    if confirmed_any_failure {
-        record_failure(health, Flusher::ClientStatistics);
-    } else {
-        record_success(health, Flusher::ClientStatistics);
     }
 }
 
 /// Folds share totals and best difficulty into one `address_settings_entity`
-/// upsert per address; both accumulators are confirmed only on success.
+/// upsert per address; a failed write hands both back.
 async fn flush_address_settings(
     pool: &PgPool,
     accs: &Accumulators,
     health: &Arc<std::sync::Mutex<FlushHealthMonitor<Flusher>>>,
 ) {
-    let shares_snapshot = accs.share_totals.drain_addresses();
-    let best_snapshot = accs.best_difficulty.drain();
+    let shares_snapshot = accs.share_totals.take_addresses();
+    let best_snapshot = accs.best_difficulty.take();
     if shares_snapshot.is_empty() && best_snapshot.is_empty() {
         record_success(health, Flusher::AddressSettings);
         return;
     }
 
-    // Union by address: the two drain/confirm cycles are independent, so an
-    // address may appear on either side or both.
+    // Union by address: an address may appear on either side or both.
     let mut merged: HashMap<String, (f64, f64, Option<String>)> = HashMap::new();
     for (addr, delta) in &shares_snapshot {
         merged.insert(addr.as_str().to_string(), (*delta, 0.0, None));
@@ -293,27 +265,25 @@ async fn flush_address_settings(
         .collect();
 
     match bulk_upsert_address_settings(pool, &rows).await {
-        Ok(_) => {
-            accs.share_totals.confirm_addresses(&shares_snapshot);
-            accs.best_difficulty.confirm(&best_snapshot);
-            record_success(health, Flusher::AddressSettings);
-        }
+        Ok(_) => record_success(health, Flusher::AddressSettings),
         Err(e) => {
             warn!(error = %e, "address_settings flush failed");
+            accs.share_totals.restore_addresses(shares_snapshot);
+            accs.best_difficulty.restore(best_snapshot);
             record_failure(health, Flusher::AddressSettings);
         }
     }
 }
 
-/// Accepted and rejected deltas per worker in one upsert; both buffers are
-/// confirmed only on success.
+/// Accepted and rejected deltas per worker in one upsert; a failed write
+/// hands both back.
 async fn flush_worker_totals(
     pool: &PgPool,
     accs: &Accumulators,
     health: &Arc<std::sync::Mutex<FlushHealthMonitor<Flusher>>>,
 ) {
-    let snapshot = accs.share_totals.drain_workers();
-    let rejected = accs.share_totals.drain_workers_rejected();
+    let snapshot = accs.share_totals.take_workers();
+    let rejected = accs.share_totals.take_workers_rejected();
     if snapshot.is_empty() && rejected.is_empty() {
         record_success(health, Flusher::WorkerTotals);
         return;
@@ -345,13 +315,11 @@ async fn flush_worker_totals(
         )
         .collect();
     match bulk_upsert_worker_shares_entity(pool, &rows).await {
-        Ok(_) => {
-            accs.share_totals.confirm_workers(&snapshot);
-            accs.share_totals.confirm_workers_rejected(&rejected);
-            record_success(health, Flusher::WorkerTotals);
-        }
+        Ok(_) => record_success(health, Flusher::WorkerTotals),
         Err(e) => {
             warn!(error = %e, "worker_shares_entity flush failed");
+            accs.share_totals.restore_workers(snapshot);
+            accs.share_totals.restore_workers_rejected(rejected);
             record_failure(health, Flusher::WorkerTotals);
         }
     }

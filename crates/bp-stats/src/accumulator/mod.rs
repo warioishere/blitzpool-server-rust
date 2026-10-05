@@ -33,17 +33,6 @@ pub fn share_max(submission_difficulty: f64) -> f64 {
     }
 }
 
-/// A slot maximum after a flush of `flushed` succeeded. The database merges
-/// maxima with `GREATEST`, so a buffered value no higher than the one written
-/// is done; a higher one arrived during the flush and is still owed.
-pub(crate) fn flushed_max(buffered: f64, flushed: f64) -> f64 {
-    if buffered <= flushed {
-        0.0
-    } else {
-        buffered
-    }
-}
-
 /// Why a share was rejected. The string forms are stored verbatim in the
 /// `reason` columns and read by the frontend, so they must not change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

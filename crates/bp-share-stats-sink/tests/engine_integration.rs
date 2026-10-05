@@ -100,7 +100,6 @@ async fn engine_spawn_tick_flushes_to_pg_then_shutdown_drains() {
 
     let cfg = StatsSinkConfig {
         flush_interval: Duration::from_millis(80),
-        client_stats_batch_size: 1000,
         tick_offset: Duration::ZERO,
     };
     let handle = ShareStatsEngine::spawn(cfg, pool.clone());
@@ -171,7 +170,6 @@ async fn engine_handle_shutdown_is_idempotent_against_dropped_handle() {
         let _handle = ShareStatsEngine::spawn(
             StatsSinkConfig {
                 flush_interval: Duration::from_millis(100),
-                client_stats_batch_size: 1000,
                 tick_offset: Duration::ZERO,
             },
             pool,

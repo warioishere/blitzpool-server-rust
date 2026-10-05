@@ -38,17 +38,17 @@ async fn rejected_share_with_address_fans_into_four_accumulators() {
     ))
     .await;
 
-    let snap = accs.pool_shares.drain();
+    let snap = accs.pool_shares.take();
     assert_eq!(snap.values().next().unwrap().rejected, 25.0);
-    let pr = accs.pool_rejected.drain();
+    let pr = accs.pool_rejected.take();
     // Difficulty sum per (slot, reason), not a share count: the chart
     // plots rejected diff-1 per reason.
     assert_eq!(
         pr.values().next().unwrap()[&RejectedReason::LowDifficulty],
         25.0
     );
-    assert_eq!(accs.share_totals.drain_workers_rejected().len(), 1);
-    assert_eq!(accs.client_statistics.drain().len(), 1);
+    assert_eq!(accs.share_totals.take_workers_rejected().len(), 1);
+    assert_eq!(accs.client_statistics.take().len(), 1);
 }
 
 #[tokio::test]
@@ -60,13 +60,13 @@ async fn rejected_share_without_address_skips_per_address_buckets() {
         .await;
 
     assert_eq!(
-        accs.pool_shares.drain().values().next().unwrap().rejected,
+        accs.pool_shares.take().values().next().unwrap().rejected,
         10.0
     );
-    assert_eq!(accs.pool_rejected.drain().len(), 1);
-    assert_eq!(accs.share_totals.drain_workers_rejected().len(), 0);
-    assert_eq!(accs.client_statistics.drain().len(), 0);
-    assert_eq!(accs.share_totals.drain_addresses().len(), 0);
+    assert_eq!(accs.pool_rejected.take().len(), 1);
+    assert_eq!(accs.share_totals.take_workers_rejected().len(), 0);
+    assert_eq!(accs.client_statistics.take().len(), 0);
+    assert_eq!(accs.share_totals.take_addresses().len(), 0);
 }
 
 #[tokio::test]
@@ -83,11 +83,11 @@ async fn rejected_share_with_invalid_address_short_circuits() {
     .await;
 
     assert_eq!(
-        accs.pool_shares.drain().values().next().unwrap().rejected,
+        accs.pool_shares.take().values().next().unwrap().rejected,
         5.0
     );
-    assert_eq!(accs.pool_rejected.drain().len(), 1);
-    assert_eq!(accs.share_totals.drain_workers_rejected().len(), 0);
+    assert_eq!(accs.pool_rejected.take().len(), 1);
+    assert_eq!(accs.share_totals.take_workers_rejected().len(), 0);
 }
 
 #[tokio::test]
@@ -105,9 +105,9 @@ async fn rejected_share_non_finite_difficulty_is_silently_discarded() {
         .await;
     }
 
-    assert_eq!(accs.pool_shares.drain().len(), 0);
-    assert_eq!(accs.pool_rejected.drain().len(), 0);
-    assert_eq!(accs.share_totals.drain_workers_rejected().len(), 0);
+    assert_eq!(accs.pool_shares.take().len(), 0);
+    assert_eq!(accs.pool_rejected.take().len(), 0);
+    assert_eq!(accs.share_totals.take_workers_rejected().len(), 0);
 }
 
 #[tokio::test]
@@ -124,7 +124,7 @@ async fn rejected_share_classifies_jnf_dup_low_into_separate_diff1_fields() {
             .await;
     }
 
-    let cs = accs.client_statistics.drain();
+    let cs = accs.client_statistics.take();
     assert_eq!(cs.len(), 1);
     let rec = cs.values().next().unwrap();
     assert_eq!(rec.rejected_job_not_found_diff1, 7.0);

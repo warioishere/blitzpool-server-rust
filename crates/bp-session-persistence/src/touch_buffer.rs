@@ -147,14 +147,14 @@ impl TouchBuffer {
     }
 
     /// Take the whole buffer in one lock pass.
-    fn drain(&self) -> HashMap<TouchKey, TouchEntry> {
+    fn take(&self) -> HashMap<TouchKey, TouchEntry> {
         let mut guard = self.guard();
         std::mem::take(&mut *guard)
     }
 
-    /// Fold a drained snapshot back after a failed flush. Live writes are
+    /// Hand back a taken snapshot after a failed flush. Live writes are
     /// newer, so for latest-wins fields the snapshot only fills `None` slots.
-    fn rebuffer(&self, snap: HashMap<TouchKey, TouchEntry>) {
+    fn restore(&self, snap: HashMap<TouchKey, TouchEntry>) {
         let mut guard = self.guard();
         for (k, v) in snap {
             guard
@@ -184,16 +184,16 @@ impl TouchBuffer {
     }
 }
 
-/// One flush pass; rebuffers on a failed write and returns sessions written.
+/// One flush pass; hands back a failed write and returns sessions written.
 /// Both writes are idempotent, so a retry after a half-failed pass is safe.
-/// Without a live store the live half is dropped, not rebuffered, or the
+/// Without a live store the live half is dropped, not handed back, or the
 /// buffer would grow without bound.
 pub(crate) async fn flush_once(
     buffer: &TouchBuffer,
     pool: &PgPool,
     live: Option<&LiveSessionStore>,
 ) -> u64 {
-    let snapshot = buffer.drain();
+    let snapshot = buffer.take();
     if snapshot.is_empty() {
         return 0;
     }
@@ -202,9 +202,9 @@ pub(crate) async fn flush_once(
         warn!(
             error = %e,
             buffered = n,
-            "session best write failed; rebuffering for retry"
+            "session best write failed; kept for retry"
         );
-        buffer.rebuffer(snapshot);
+        buffer.restore(snapshot);
         return 0;
     }
     let Some(store) = live else {
@@ -223,9 +223,9 @@ pub(crate) async fn flush_once(
             warn!(
                 error = %e,
                 buffered = n,
-                "live-session touch write failed; rebuffering for retry"
+                "live-session touch write failed; kept for retry"
             );
-            buffer.rebuffer(snapshot);
+            buffer.restore(snapshot);
             0
         }
     }
@@ -302,7 +302,7 @@ mod tests {
         buf.record(kref(&key), 50.0, Some(16.0), 2.0e12, 1, 2000);
         buf.record(kref(&key), 200.0, None, 0.0, 3, 1500);
 
-        let snap = buf.drain();
+        let snap = buf.take();
         assert_eq!(snap.len(), 1);
         let entry = snap.get(&key).unwrap();
         assert_eq!(entry.share_diff, 200.0, "running max");
@@ -320,14 +320,14 @@ mod tests {
     }
 
     #[test]
-    fn rebuffer_merges_with_live_writes() {
+    fn restore_merges_with_live_writes() {
         let buf = TouchBuffer::default();
         let key = TouchKey {
             address: "addr".into(),
             client_name: "wkr".into(),
             session_id: "sess".into(),
         };
-        // Simulate "drained" snapshot.
+        // Simulate a taken snapshot.
         let mut snap = HashMap::new();
         snap.insert(
             key.clone(),
@@ -341,16 +341,16 @@ mod tests {
         );
         // Meanwhile a new share landed.
         buf.record(kref(&key), 50.0, Some(16.0), 2.0e12, 1, 2000);
-        // DB failed → rebuffer the snapshot.
-        buf.rebuffer(snap);
+        // DB failed → hand the snapshot back.
+        buf.restore(snap);
 
-        let merged = buf.drain();
+        let merged = buf.take();
         let entry = merged.get(&key).unwrap();
-        assert_eq!(entry.share_diff, 100.0, "max of rebuffered+live");
+        assert_eq!(entry.share_diff, 100.0, "max of restored+live");
         assert_eq!(
             entry.current_diff,
             Some(16.0),
-            "live write keeps its value (rebuffer doesn't clobber non-None with older value)"
+            "live write keeps its value (restore doesn't clobber non-None with older value)"
         );
         assert_eq!(entry.hash_rate, Some(2.0e12), "same for the live rate");
         assert_eq!(entry.updated_at_ms, 2000);
@@ -366,7 +366,7 @@ mod tests {
         };
         buf.record(kref(&key), 1.0, None, 0.0, 1, 1);
         assert_eq!(buf.len(), 1);
-        let snap = buf.drain();
+        let snap = buf.take();
         assert_eq!(snap.len(), 1);
         assert_eq!(buf.len(), 0);
     }
@@ -388,7 +388,7 @@ mod tests {
         // the entry but drops the unusable fields.
         b.record(kref(&k), 5.0, Some(f32::INFINITY), f64::NAN, 1, 1);
         assert_eq!(b.len(), 1);
-        let snap = b.drain();
+        let snap = b.take();
         let e = snap.values().next().expect("entry");
         assert_eq!(e.share_diff, 5.0);
         assert_eq!(e.current_diff, None, "non-finite current_diff is dropped");
@@ -412,7 +412,7 @@ mod tests {
         assert_eq!(buf.len(), 2, "distinct identity is a separate entry");
 
         // Retrievable by the owned key: both hash and compare identically.
-        let snap = buf.drain();
+        let snap = buf.take();
         let owned = TouchKey {
             address: "bc1qxyz".into(),
             client_name: "rig1".into(),
