@@ -19,8 +19,5 @@ pub use accumulator::{
     WorkerTotalsSnapshot,
 };
 pub use buffer::{BufferRecord, NestedDeltaBuffer, NumberDeltaBuffer, RecordDeltaBuffer};
-pub use constants::{
-    CHART_VISIBILITY_BUFFER, CHART_VISIBILITY_BUFFER_MS, MAX_REASONABLE_DIFFICULTY,
-    SLOT_DURATION_MS,
-};
+pub use constants::{CHART_VISIBILITY_BUFFER_MS, MAX_REASONABLE_DIFFICULTY, SLOT_DURATION_MS};
 pub use slot::{chart_visibility_cutoff_slot, TimeSlot};

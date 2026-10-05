@@ -30,9 +30,6 @@ impl PoolRejectedAccumulator {
     }
 
     pub fn add(&self, slot: TimeSlot, reason: RejectedReason, count: f64) {
-        if !count.is_finite() || count <= 0.0 {
-            return;
-        }
         self.inner.lock().add(slot, reason, count);
     }
 

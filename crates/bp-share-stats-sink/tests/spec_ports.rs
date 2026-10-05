@@ -52,6 +52,7 @@ async fn cleanup(pool: &PgPool, prefix: &str) {
     for sql in [
         r#"DELETE FROM client_statistics_entity WHERE address LIKE $1"#,
         r#"DELETE FROM worker_shares_entity WHERE address LIKE $1"#,
+        r#"DELETE FROM address_settings_entity WHERE address LIKE $1"#,
     ] {
         let _ = sqlx::query(sql)
             .bind(format!("{prefix}%"))
@@ -136,13 +137,8 @@ async fn client_name_with_special_chars_roundtrips_through_unnest() {
                 ..Default::default()
             },
         );
-        accs.share_totals.add_worker(
-            bp_stats::WorkerKey {
-                address: addr(&format!("{prefix}{i}")),
-                client_name: (*name).to_string(),
-            },
-            1.0,
-        );
+        accs.share_totals
+            .add(addr(&format!("{prefix}{i}")), (*name).to_string(), 1.0);
     }
     flush_once(&pool, &accs, FlushScope::All).await;
 

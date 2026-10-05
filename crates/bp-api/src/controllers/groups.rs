@@ -1721,8 +1721,7 @@ use crate::time_range::{
     SlotDataResponse,
 };
 
-use crate::time_range::SLOT_SECONDS;
-use bp_common::HASHES_PER_DIFFICULTY_1;
+use crate::time_range::slot_hashrate;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1768,7 +1767,7 @@ async fn group_chart(
                 .into_iter()
                 .map(|(t, shares)| ChartPoint {
                     label: crate::time_range::format_iso_ms(t),
-                    data: (shares * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round(),
+                    data: slot_hashrate(shares),
                 })
                 .collect())
         })

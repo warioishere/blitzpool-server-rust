@@ -2,7 +2,8 @@
 
 //! Domain accumulators on top of the generic buffers. Each holds a short,
 //! await-free `Mutex`; `add_*` is infallible because the share path must not
-//! fail, so out-of-range or non-finite inputs are dropped silently.
+//! fail. The stats sink drops out-of-range or non-finite difficulties before
+//! they get here.
 
 mod best_difficulty;
 mod client_statistics;

@@ -7,7 +7,6 @@ use std::collections::HashMap;
 
 use super::share_max;
 use crate::buffer::{BufferRecord, RecordDeltaBuffer};
-use crate::constants::MAX_REASONABLE_DIFFICULTY;
 use crate::slot::TimeSlot;
 
 /// Per-slot pool-shares counters. `accepted` and `rejected` are diff sums
@@ -51,11 +50,8 @@ impl PoolSharesAccumulator {
     }
 
     /// The credited `diff` goes into the sum, the difficulty actually solved
-    /// into the slot maximum. Non-finite or out-of-range values are dropped.
+    /// into the slot maximum.
     pub fn add_accepted(&self, slot: TimeSlot, diff: f64, submission_difficulty: f64) {
-        if !diff.is_finite() || diff <= 0.0 || diff > MAX_REASONABLE_DIFFICULTY {
-            return;
-        }
         self.inner.lock().add(
             slot,
             &PoolSharesRecord {
@@ -67,9 +63,6 @@ impl PoolSharesAccumulator {
     }
 
     pub fn add_rejected(&self, slot: TimeSlot, diff: f64) {
-        if !diff.is_finite() || diff <= 0.0 || diff > MAX_REASONABLE_DIFFICULTY {
-            return;
-        }
         self.inner.lock().add(
             slot,
             &PoolSharesRecord {
@@ -146,27 +139,6 @@ mod tests {
             4_096.0,
             "a max never drops"
         );
-    }
-
-    #[test]
-    fn over_range_diff_is_discarded() {
-        let acc = PoolSharesAccumulator::new();
-        acc.add_accepted(
-            slot(1_000),
-            MAX_REASONABLE_DIFFICULTY * 10.0,
-            MAX_REASONABLE_DIFFICULTY * 10.0,
-        );
-        assert!(acc.is_empty());
-    }
-
-    #[test]
-    fn non_finite_and_zero_diff_are_discarded() {
-        let acc = PoolSharesAccumulator::new();
-        acc.add_accepted(slot(1_000), f64::NAN, f64::NAN);
-        acc.add_accepted(slot(1_000), f64::INFINITY, f64::INFINITY);
-        acc.add_accepted(slot(1_000), 0.0, 0.0);
-        acc.add_accepted(slot(1_000), -5.0, -5.0);
-        assert!(acc.is_empty());
     }
 
     #[test]

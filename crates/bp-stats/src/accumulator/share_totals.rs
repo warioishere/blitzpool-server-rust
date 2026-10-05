@@ -43,17 +43,10 @@ impl ShareTotalsAccumulator {
 
     // ─── Hot path ────────────────────────────────────────────────────
 
-    pub fn add_address(&self, address: AddressId, diff: f64) {
-        self.address.lock().add(address, diff);
-    }
-
-    pub fn add_worker(&self, key: WorkerKey, diff: f64) {
-        self.worker.lock().add(key, diff);
-    }
-
+    /// One accepted share's difficulty, onto its address and its worker.
     pub fn add(&self, address: AddressId, client_name: String, diff: f64) {
-        self.add_address(address.clone(), diff);
-        self.add_worker(
+        self.address.lock().add(address.clone(), diff);
+        self.worker.lock().add(
             WorkerKey {
                 address,
                 client_name,

@@ -95,7 +95,13 @@ async fn rejected_share_non_finite_difficulty_is_silently_discarded() {
     let accs = Arc::new(Accumulators::default());
     let sink = ShareStatsRejectedSink::new(accs.clone());
 
-    for diff in [f64::NAN, f64::INFINITY, 0.0, -5.0] {
+    for diff in [
+        f64::NAN,
+        f64::INFINITY,
+        0.0,
+        -5.0,
+        bp_stats::MAX_REASONABLE_DIFFICULTY * 10.0,
+    ] {
         sink.record_rejected(share(
             Some("bc1qalice"),
             "sess",
@@ -134,4 +140,46 @@ async fn rejected_share_classifies_jnf_dup_low_into_separate_diff1_fields() {
         + rec.rejected_duplicate_share_count
         + rec.rejected_low_difficulty_share_count;
     assert_eq!(counts, 3.0, "one count per reject, each under its reason");
+}
+
+/// The sink is the one gate for an unusable credited difficulty: nothing of
+/// such a share reaches any accumulator.
+#[tokio::test]
+async fn accepted_share_with_unusable_difficulty_is_silently_discarded() {
+    use bp_share_hook::{SharedAcceptedShare, SharedAcceptedShareSink};
+    use bp_share_stats_sink::hooks::ShareStatsAcceptedSink;
+    use bp_stats::MAX_REASONABLE_DIFFICULTY;
+
+    let accs = Arc::new(Accumulators::default());
+    let sink = ShareStatsAcceptedSink::new(accs.clone());
+    for diff in [
+        f64::NAN,
+        f64::INFINITY,
+        0.0,
+        -5.0,
+        MAX_REASONABLE_DIFFICULTY * 10.0,
+    ] {
+        sink.record_accepted(SharedAcceptedShare {
+            address: "bc1qalice",
+            worker: "w1",
+            session_id: "sess",
+            effective_difficulty: diff,
+            submission_difficulty: diff,
+            user_agent: None,
+            is_block_candidate: false,
+            hash_rate: 0.0,
+            channel_count: 1,
+            ts_ms: 0,
+            share_id: "",
+            mode: bp_share_hook::MiningMode::Solo,
+            group_id: None,
+        })
+        .await;
+    }
+
+    assert!(accs.pool_shares.take().is_empty());
+    assert!(accs.pool_mode_hashrate.take().is_empty());
+    assert!(accs.client_statistics.take().is_empty());
+    assert!(accs.share_totals.take_addresses().is_empty());
+    assert!(accs.best_difficulty.take().is_empty());
 }

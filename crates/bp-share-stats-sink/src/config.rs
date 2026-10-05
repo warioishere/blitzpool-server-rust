@@ -12,7 +12,7 @@ pub struct StatsSinkConfig {
     /// How far past each wall-clock period the tick fires, so this flush
     /// does not coincide with the other 60 s loops. An ended slot reaches
     /// Postgres this long after its end, which must stay inside
-    /// `bp_stats::CHART_VISIBILITY_BUFFER` or charts show it empty.
+    /// `bp_stats::CHART_VISIBILITY_BUFFER_MS` or charts show it empty.
     pub tick_offset: Duration,
 }
 

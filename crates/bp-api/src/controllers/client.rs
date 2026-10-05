@@ -65,8 +65,7 @@ struct RangeQuery {
     range: Option<String>,
 }
 
-use crate::time_range::SLOT_SECONDS;
-use bp_common::HASHES_PER_DIFFICULTY_1;
+use crate::time_range::slot_hashrate;
 
 async fn chart(
     State(state): State<SharedState>,
@@ -102,7 +101,7 @@ fn chart_points(
         .into_iter()
         .map(|(b, shares)| ChartPoint {
             label: crate::time_range::format_iso_ms(b),
-            data: (shares * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round(),
+            data: slot_hashrate(shares),
         })
         .collect()
 }
@@ -493,7 +492,7 @@ async fn by_worker(
                 entry.rejected_stale_diff1 += r.rejected_stale_diff1 as f64;
             }
             for e in grouped.values_mut() {
-                e.data = (e.accepted * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round();
+                e.data = slot_hashrate(e.accepted);
             }
             let chart_data: Vec<WorkerChartEntry> = grouped.into_values().collect();
             Ok(WorkerResponse {
@@ -555,7 +554,7 @@ async fn by_session(
                     .into_iter()
                     .map(|(t, shares)| ChartPoint {
                         label: crate::time_range::format_iso_ms(t),
-                        data: (shares * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round(),
+                        data: slot_hashrate(shares),
                     })
                     .collect();
 
@@ -741,12 +740,14 @@ struct DiffScoresResponse {
     slot_data: Vec<DiffScoreSlot>,
 }
 
+/// One diff-scores bucket.
+const HOUR_MS: i64 = 60 * 60 * 1000;
+
 /// Cache lifetime of a `diff-scores` response: longer ranges are cached
 /// longer, but never past the next full hour. The response ends in an hourly
 /// bucket, and scoreboard periods start on the hour, so a response cached
 /// across that boundary would hide the new period's first bucket.
 fn diff_scores_ttl_secs(range_label: &str, now_ms: i64) -> u64 {
-    const HOUR_MS: i64 = 3_600_000;
     let by_range: u64 = match range_label {
         "7d" => 1800,
         "30d" => 7200,
@@ -775,11 +776,10 @@ async fn diff_scores(
                 "30d" => 24 * 30,
                 _ => 24,
             };
-            let one_hour_ms: i64 = 60 * 60 * 1000;
             let now = bp_common::now_ms();
-            let since = now - hours * one_hour_ms;
-            let start_slot = (since / one_hour_ms) * one_hour_ms;
-            let end_slot = (now / one_hour_ms) * one_hour_ms;
+            let since = now - hours * HOUR_MS;
+            let start_slot = (since / HOUR_MS) * HOUR_MS;
+            let end_slot = (now / HOUR_MS) * HOUR_MS;
 
             let rows = bp_db::find_max_difficulty_since_for_addresses(
                 &s.pool,
@@ -791,7 +791,7 @@ async fn diff_scores(
             // A 10-minute slot (keyed by its end) belongs to the hour it starts in.
             let mut by_slot: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
             for (slot_end, max) in rows {
-                let hour = ((slot_end - bp_stats::SLOT_DURATION_MS) / one_hour_ms) * one_hour_ms;
+                let hour = ((slot_end - bp_stats::SLOT_DURATION_MS) / HOUR_MS) * HOUR_MS;
                 let best = by_slot.entry(hour).or_insert(0.0);
                 *best = best.max(f64::from(max));
             }
@@ -802,7 +802,7 @@ async fn diff_scores(
                     time: crate::time_range::format_iso_ms(t),
                     difficulty: by_slot.get(&t).copied().unwrap_or(0.0),
                 });
-                t += one_hour_ms;
+                t += HOUR_MS;
             }
             Ok(DiffScoresResponse { slot_data })
         })

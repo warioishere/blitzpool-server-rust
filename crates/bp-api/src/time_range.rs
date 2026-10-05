@@ -162,10 +162,14 @@ pub fn format_iso_ms_opt(ms: Option<i64>) -> Option<String> {
     ms.map(format_iso_ms)
 }
 
-// ─── shared constants ──────────────────────────────────────────────
+// ─── hashrate ──────────────────────────────────────────────────────
 
-/// 10-minute slot duration in seconds; divisor in hashrate conversion.
-pub const SLOT_SECONDS: f64 = SLOT_MS as f64 / 1000.0;
+/// The hashrate one slot's share difficulty stands for, in H/s rounded to a
+/// whole number: `diff1` difficulty-1 shares over the slot's seconds.
+pub fn slot_hashrate(diff1: f64) -> f64 {
+    const SLOT_SECONDS: f64 = SLOT_MS as f64 / 1000.0;
+    (diff1 * bp_common::HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round()
+}
 
 // ─── shared response shapes ────────────────────────────────────────
 

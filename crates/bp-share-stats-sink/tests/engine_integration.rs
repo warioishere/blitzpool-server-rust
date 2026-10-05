@@ -11,7 +11,7 @@ use std::time::Duration;
 use bp_common::AddressId;
 use bp_share_stats_sink::config::StatsSinkConfig;
 use bp_share_stats_sink::engine::ShareStatsEngine;
-use bp_stats::{ClientStatisticsKey, ClientStatisticsRecord, RejectedReason, TimeSlot, WorkerKey};
+use bp_stats::{ClientStatisticsKey, ClientStatisticsRecord, RejectedReason, TimeSlot};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use tokio::sync::Mutex;
 
@@ -121,13 +121,8 @@ async fn engine_spawn_tick_flushes_to_pg_then_shutdown_drains() {
             ..Default::default()
         },
     );
-    accs.share_totals.add_worker(
-        WorkerKey {
-            address: addr(&format!("{prefix}miner")),
-            client_name: "wkr".to_string(),
-        },
-        50.0,
-    );
+    accs.share_totals
+        .add(addr(&format!("{prefix}miner")), "wkr".to_string(), 50.0);
 
     // Poll instead of sleeping a few ticks: a loaded runner can take far
     // longer to commit.

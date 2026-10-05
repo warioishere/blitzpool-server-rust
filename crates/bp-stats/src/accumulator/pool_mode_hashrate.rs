@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use bp_common::MiningMode;
 
 use crate::buffer::NestedDeltaBuffer;
-use crate::constants::MAX_REASONABLE_DIFFICULTY;
 use crate::slot::TimeSlot;
 
 pub type PoolModeHashrateSnapshot = HashMap<TimeSlot, HashMap<MiningMode, f64>>;
@@ -30,11 +29,7 @@ impl PoolModeHashrateAccumulator {
         }
     }
 
-    /// Non-finite or out-of-range values are dropped.
     pub fn add(&self, slot: TimeSlot, mode: MiningMode, diff: f64) {
-        if !diff.is_finite() || diff <= 0.0 || diff > MAX_REASONABLE_DIFFICULTY {
-            return;
-        }
         self.inner.lock().add(slot, mode, diff);
     }
 
@@ -95,18 +90,5 @@ mod tests {
         assert!(acc.is_empty());
         acc.restore(snap);
         assert_eq!(acc.len(), 1);
-    }
-
-    #[test]
-    fn over_range_and_non_finite_are_discarded() {
-        let acc = PoolModeHashrateAccumulator::new();
-        acc.add(
-            slot(1_000),
-            MiningMode::Solo,
-            MAX_REASONABLE_DIFFICULTY * 2.0,
-        );
-        acc.add(slot(1_000), MiningMode::Solo, f64::NAN);
-        acc.add(slot(1_000), MiningMode::Solo, 0.0);
-        assert!(acc.is_empty());
     }
 }

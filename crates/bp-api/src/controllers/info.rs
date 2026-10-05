@@ -832,8 +832,7 @@ struct RangeQuery {
     range: Option<String>,
 }
 
-use crate::time_range::SLOT_SECONDS;
-use bp_common::HASHES_PER_DIFFICULTY_1;
+use crate::time_range::slot_hashrate;
 
 async fn chart(
     State(state): State<SharedState>,
@@ -855,7 +854,7 @@ async fn chart(
                 .filter(|r| r.time < cutoff)
                 .map(|r| ChartPoint {
                     label: crate::time_range::format_iso_ms(r.time),
-                    data: (r.accepted as f64 * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round(),
+                    data: slot_hashrate(r.accepted as f64),
                 })
                 .collect())
         })
@@ -1364,7 +1363,7 @@ async fn chart_mode(
                 label: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(r.time)
                     .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
                     .unwrap_or_default(),
-                data: ((r.diff as f64) * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round(),
+                data: slot_hashrate(r.diff as f64),
             })
             .collect(),
     ))
