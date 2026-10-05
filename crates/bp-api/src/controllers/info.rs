@@ -1161,24 +1161,6 @@ async fn shares(State(state): State<SharedState>) -> Result<JsonBytes, ApiError>
             async move {
                 let now = bp_common::now_ms();
                 const DAY: i64 = 24 * 60 * 60 * 1000;
-                let day_rows = bp_db::find_pool_share_statistics_since(&s.pool, now - DAY).await?;
-                let fortnight_rows =
-                    bp_db::find_pool_share_statistics_since(&s.pool, now - 14 * DAY).await?;
-                let month_rows =
-                    bp_db::find_pool_share_statistics_since(&s.pool, now - 30 * DAY).await?;
-                let accepted_1d = day_rows.iter().map(|r| r.accepted as f64).sum::<f64>();
-                let rejected_1d = day_rows.iter().map(|r| r.rejected as f64).sum::<f64>();
-                let accepted_14d = fortnight_rows
-                    .iter()
-                    .map(|r| r.accepted as f64)
-                    .sum::<f64>();
-                let rejected_14d = fortnight_rows
-                    .iter()
-                    .map(|r| r.rejected as f64)
-                    .sum::<f64>();
-                let accepted_30d = month_rows.iter().map(|r| r.accepted as f64).sum::<f64>();
-                let rejected_30d = month_rows.iter().map(|r| r.rejected as f64).sum::<f64>();
-
                 // With no block ever found, epoch yields the cumulative total.
                 let last_block_at: Option<i64> = sqlx::query_scalar(
                     r#"SELECT MAX("createdAt") FROM blocks_entity WHERE "deletedAt" IS NULL"#,
@@ -1188,12 +1170,23 @@ async fn shares(State(state): State<SharedState>) -> Result<JsonBytes, ApiError>
                 .ok()
                 .flatten();
                 let since_block = last_block_at.unwrap_or(0);
-                let block_rows =
-                    bp_db::find_pool_share_statistics_since(&s.pool, since_block).await?;
-                let accepted_since_block =
-                    block_rows.iter().map(|r| r.accepted as f64).sum::<f64>();
-                let rejected_since_block =
-                    block_rows.iter().map(|r| r.rejected as f64).sum::<f64>();
+                // One read back to the earliest window; each sum filters it.
+                let rows = bp_db::find_pool_share_statistics_since(
+                    &s.pool,
+                    since_block.min(now - 30 * DAY),
+                )
+                .await?;
+                let sums = |since: i64| {
+                    rows.iter()
+                        .filter(|r| r.time >= since)
+                        .fold((0.0, 0.0), |(a, r), row| {
+                            (a + row.accepted as f64, r + row.rejected as f64)
+                        })
+                };
+                let (accepted_1d, rejected_1d) = sums(now - DAY);
+                let (accepted_14d, rejected_14d) = sums(now - 14 * DAY);
+                let (accepted_30d, rejected_30d) = sums(now - 30 * DAY);
+                let (accepted_since_block, rejected_since_block) = sums(since_block);
 
                 Ok(SharesResponse {
                     accepted_1d,
