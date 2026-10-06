@@ -112,10 +112,10 @@ const READ_COMMANDS: &[&str] = &[
     "/difficulty",
     "/next_difficulty",
     "/pplns_status",
-    "/group_status",
+    "/team_status",
     "/pplns_top",
-    "/group_members",
-    "/group_history",
+    "/team_members",
+    "/team_history",
 ];
 
 /// Parse the *first whitespace-delimited token* of `text` (case-insensitive)

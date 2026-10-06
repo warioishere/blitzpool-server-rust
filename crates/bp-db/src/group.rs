@@ -130,8 +130,8 @@ pub async fn find_group_member_by_address(
     .map_err(DbError::from)
 }
 
-/// All members of a group. Used by `/group_members` and
-/// `/group_status`. Returns rows ordered by `joinedAt ASC` so the
+/// All members of a group. Used by `/team_members` and
+/// `/team_status`. Returns rows ordered by `joinedAt ASC` so the
 /// founder is listed first.
 pub async fn find_pplns_group_members_for_group(
     pool: &PgPool,
@@ -177,7 +177,7 @@ pub struct PplnsGroupBlockHistoryRow {
 }
 
 /// Most recent `limit` payout rows for a group, newest first. Powers
-/// `/group_history`.
+/// `/team_history`.
 pub async fn find_recent_group_block_history(
     pool: &PgPool,
     group_id: Uuid,

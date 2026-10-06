@@ -56,7 +56,7 @@ struct PendingBestdiffReset {
 pub struct CommandHandler {
     pool: PgPool,
     /// Redis handle for the `client:live:*` hashrate reads
-    /// (`/poolhashrate`, `/pplns_status`, `/group_status`). `None`
+    /// (`/poolhashrate`, `/pplns_status`, `/team_status`). `None`
     /// degrades those to their error/0 fallbacks.
     redis: Option<redis::aio::ConnectionManager>,
     telegram: Option<Arc<TelegramAdapter>>,
@@ -116,8 +116,8 @@ impl CommandHandler {
     }
 
     /// Attach engine-reader handles so the engine-driven read
-    /// commands (`/pplns_status`, `/pplns_top`, `/group_status`,
-    /// `/group_members`, `/show_workers`) can answer with live data
+    /// commands (`/pplns_status`, `/pplns_top`, `/team_status`,
+    /// `/team_members`, `/show_workers`) can answer with live data
     /// instead of the not-configured fallback. Builder-style.
     pub fn with_engines(
         mut self,
@@ -1005,7 +1005,7 @@ impl CommandHandler {
                 }
                 None => need_address_text(lang).to_string(),
             },
-            "/group_history" => match self.origin_address(transport).await {
+            "/team_history" => match self.origin_address(transport).await {
                 Some(addr) => super::read::build_group_history(&self.pool, lang, &addr).await,
                 None => need_address_text(lang).to_string(),
             },
@@ -1020,7 +1020,7 @@ impl CommandHandler {
                 Some(engine) => super::read::build_pplns_top(engine, lang).await,
                 None => engine_unconfigured_text(lang, "PPLNS").to_string(),
             },
-            "/group_status" => {
+            "/team_status" => {
                 match (
                     self.origin_address(transport).await,
                     &self.group_solo_engine,
@@ -1036,10 +1036,10 @@ impl CommandHandler {
                         .await
                     }
                     (None, _) => need_address_text(lang).to_string(),
-                    (_, None) => engine_unconfigured_text(lang, "Group-Solo").to_string(),
+                    (_, None) => engine_unconfigured_text(lang, team_mining_name(lang)).to_string(),
                 }
             }
-            "/group_members" => {
+            "/team_members" => {
                 match (
                     self.origin_address(transport).await,
                     &self.group_solo_engine,
@@ -1048,7 +1048,7 @@ impl CommandHandler {
                         super::read::build_group_members(&self.pool, engine, lang, &addr).await
                     }
                     (None, _) => need_address_text(lang).to_string(),
-                    (_, None) => engine_unconfigured_text(lang, "Group-Solo").to_string(),
+                    (_, None) => engine_unconfigured_text(lang, team_mining_name(lang)).to_string(),
                 }
             }
             "/show_workers" => match self.origin_address(transport).await {
@@ -1091,6 +1091,14 @@ fn engine_unconfigured_text(lang: Language, engine_name: &str) -> String {
     match lang {
         Language::De => format!("{engine_name}-Engine ist auf diesem Pool nicht konfiguriert."),
         Language::En => format!("{engine_name} engine is not configured on this pool."),
+    }
+}
+
+/// The user-facing name of Group-Solo.
+fn team_mining_name(lang: Language) -> &'static str {
+    match lang {
+        Language::De => "Team-Mining",
+        Language::En => "Team Mining",
     }
 }
 

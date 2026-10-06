@@ -263,7 +263,7 @@ pub(crate) async fn build_stats(
     }
 }
 
-// ── /group_history <address> ─────────────────────────────────────────
+// ── /team_history <address> ─────────────────────────────────────────
 
 pub(super) async fn build_group_history(
     pool: &PgPool,
@@ -284,8 +284,8 @@ pub(super) async fn build_group_history(
         Ok(Some(row)) => row,
         Ok(None) => {
             return match lang {
-                Language::De => "Gruppe nicht mehr verfügbar.".to_string(),
-                Language::En => "Group is no longer available.".to_string(),
+                Language::De => "Team nicht mehr verfügbar.".to_string(),
+                Language::En => "Team is no longer available.".to_string(),
             }
         }
         Err(e) => {
@@ -383,15 +383,15 @@ fn db_error_text(lang: Language) -> String {
 fn not_in_group_text(lang: Language, address: &str) -> String {
     let short = short_address(address);
     match lang {
-        Language::De => format!("{short} ist in keiner Gruppe."),
-        Language::En => format!("{short} is not in any group."),
+        Language::De => format!("{short} ist in keinem Team."),
+        Language::En => format!("{short} is not in any team."),
     }
 }
 
 fn group_unavailable_text(lang: Language) -> String {
     match lang {
-        Language::De => "Gruppe nicht mehr verfügbar.".to_string(),
-        Language::En => "Group is no longer available.".to_string(),
+        Language::De => "Team nicht mehr verfügbar.".to_string(),
+        Language::En => "Team is no longer available.".to_string(),
     }
 }
 
@@ -567,7 +567,7 @@ pub(super) async fn build_pplns_top(pplns: &Arc<PplnsEngine>, lang: Language) ->
     }
 }
 
-// ── /group_status <address> ──────────────────────────────────────────
+// ── /team_status <address> ──────────────────────────────────────────
 
 pub(super) async fn build_group_status(
     pool: &PgPool,
@@ -660,9 +660,9 @@ pub(super) async fn build_group_status(
 
     match lang {
         Language::De => format!(
-            "Gruppe: {name}\n\
+            "Team: {name}\n\
             Aktive Miner (Round): {active_count}\n\
-            Gruppen-Hashrate: {group_h}\n\
+            Team-Hashrate: {group_h}\n\
             Dein Anteil: {pct:.2}% ({my_sh})\n\
             Round-Shares gesamt: {total_sh}\n\
             Round-Rejected: {rej_sh}\n\
@@ -675,9 +675,9 @@ pub(super) async fn build_group_status(
             rej_sh = format_number_suffix(total_rejected),
         ),
         Language::En => format!(
-            "Group: {name}\n\
+            "Team: {name}\n\
             Active miners (round): {active_count}\n\
-            Group hashrate: {group_h}\n\
+            Team hashrate: {group_h}\n\
             Your share: {pct:.2}% ({my_sh})\n\
             Round shares total: {total_sh}\n\
             Round rejected: {rej_sh}\n\
@@ -692,7 +692,7 @@ pub(super) async fn build_group_status(
     }
 }
 
-// ── /group_members <address> ─────────────────────────────────────────
+// ── /team_members <address> ─────────────────────────────────────────
 
 pub(super) async fn build_group_members(
     pool: &PgPool,
@@ -978,11 +978,11 @@ mod tests {
     fn group_unavailable_text_per_language() {
         assert_eq!(
             group_unavailable_text(Language::De),
-            "Gruppe nicht mehr verfügbar."
+            "Team nicht mehr verfügbar."
         );
         assert_eq!(
             group_unavailable_text(Language::En),
-            "Group is no longer available."
+            "Team is no longer available."
         );
     }
 

@@ -70,7 +70,7 @@ Or paste this link: <a href=\"{href_attr}\" style=\"color:{primary};\">{href_tex
             text = COLOR_TEXT,
             muted = COLOR_MUTED,
             primary = COLOR_PRIMARY,
-            button = button_html(&ctx.group_url, "Open group dashboard", true),
+            button = button_html(&ctx.group_url, "Open team dashboard", true),
             href_attr = escape_attr(&ctx.group_url),
             href_text = escape_html(&ctx.group_url),
         )
@@ -78,7 +78,7 @@ Or paste this link: <a href=\"{href_attr}\" style=\"color:{primary};\">{href_tex
         format!(
             "\n\
 <p style=\"margin:0;font-size:14px;line-height:1.6;color:{text};\">\n  \
-No further action is needed. You can request to join other public groups any time.\n\
+No further action is needed. You can request to join other public teams any time.\n\
 </p>\n",
             text = COLOR_TEXT,
         )
@@ -115,7 +115,7 @@ fn render_text(ctx: &JoinDecisionContext, decision: JoinDecision) -> String {
             "",
             &format!("Address: {}", ctx.address),
             "",
-            &format!("Open group dashboard: {}", ctx.group_url),
+            &format!("Open team dashboard: {}", ctx.group_url),
         ]
         .join("\n"),
         JoinDecision::Rejected => [
@@ -123,7 +123,7 @@ fn render_text(ctx: &JoinDecisionContext, decision: JoinDecision) -> String {
             "",
             &format!("Address: {}", ctx.address),
             "",
-            "No further action is needed. You can request to join other public groups any time.",
+            "No further action is needed. You can request to join other public teams any time.",
         ]
         .join("\n"),
     }
@@ -161,7 +161,7 @@ mod tests {
     fn approved_html_has_button_and_dashboard_url() {
         let c = render_join_decision(&ctx(), JoinDecision::Approved);
         assert!(c.html.contains("Welcome \u{2014} request approved"));
-        assert!(c.html.contains(">Open group dashboard</a>"));
+        assert!(c.html.contains(">Open team dashboard</a>"));
         assert!(c.html.contains("<strong>approved</strong>"));
         assert!(c.html.contains("bc1qjoiner"));
         assert!(c.html.contains("PoolPals"));
@@ -172,9 +172,9 @@ mod tests {
         let c = render_join_decision(&ctx(), JoinDecision::Rejected);
         assert!(c.html.contains("Request declined</h1>"));
         assert!(c.html.contains("<strong>declined</strong>"));
-        assert!(!c.html.contains("Open group dashboard"));
+        assert!(!c.html.contains("Open team dashboard"));
         assert!(c.html.contains(
-            "No further action is needed. You can request to join other public groups any time."
+            "No further action is needed. You can request to join other public teams any time."
         ));
     }
 
@@ -187,7 +187,7 @@ mod tests {
 \n\
 Address: bc1qjoiner\n\
 \n\
-Open group dashboard: https://blitzpool.example/#/app/bc1qjoiner/payout-group"
+Open team dashboard: https://blitzpool.example/#/app/bc1qjoiner/payout-group"
         );
     }
 
@@ -200,7 +200,7 @@ Open group dashboard: https://blitzpool.example/#/app/bc1qjoiner/payout-group"
 \n\
 Address: bc1qjoiner\n\
 \n\
-No further action is needed. You can request to join other public groups any time."
+No further action is needed. You can request to join other public teams any time."
         );
     }
 
