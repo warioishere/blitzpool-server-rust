@@ -1,5 +1,11 @@
 # Deployment runbook (core / api / payout / notify)
 
+> **Run a release, not `main`.** `main` is the development branch and can change
+> config keys, migrations or behaviour without warning. To operate a pool, use
+> the latest [release](https://github.com/warioishere/blitzpool-server-rust/releases)
+> or the `stable` branch, which only ever points at the latest release, and read
+> the release's **Upgrade notes** before every update.
+
 Run blitzpool as **four processes** from one image + one shared config so a
 back-office fix can be deployed by recreating a single container — the
 **miners never reconnect** (the core stays up), the **API/charts stay up** when

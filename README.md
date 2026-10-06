@@ -6,6 +6,12 @@ This is the **ground-up Rust rebuild** of the original TypeScript Blitzpool — 
 
 License: **GNU AGPL v3 (AGPL-3.0-or-later)**.
 
+> **Run a release, not `main`.** `main` is the development branch and can change
+> config keys, migrations or behaviour without warning. To operate a pool, use
+> the latest [release](https://github.com/warioishere/blitzpool-server-rust/releases)
+> or the `stable` branch, which only ever points at the latest release, and read
+> the release's **Upgrade notes** before every update.
+
 ---
 
 ## What makes Blitzpool different

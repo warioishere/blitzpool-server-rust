@@ -1,5 +1,11 @@
 # Deploying Blitzpool
 
+> **Run a release, not `main`.** `main` is the development branch and can change
+> config keys, migrations or behaviour without warning. To operate a pool, use
+> the latest [release](https://github.com/warioishere/blitzpool-server-rust/releases)
+> or the `stable` branch, which only ever points at the latest release, and read
+> the release's **Upgrade notes** before every update.
+
 This sets up a working **Solo** pool: every block pays the miner who found it.
 PPLNS, Group-Solo and Blockparty are optional and switched on later by adding
 config sections (see [Enabling more payout modes](#enabling-more-payout-modes)).
@@ -41,7 +47,7 @@ Protocol) and uses JSON-RPC only for one-off calls.
 ## 1. Get the code and create the config
 
 ```bash
-git clone https://github.com/warioishere/blitzpool-server-rust.git
+git clone --branch stable https://github.com/warioishere/blitzpool-server-rust.git
 cd blitzpool-server-rust/simple-setup
 cp ../blitzpool.example.toml blitzpool.toml
 docker compose build
@@ -198,10 +204,11 @@ silently moved to Solo; dissolve the groups first or keep `[group_solo]`.
 
 ## Operating
 
-**Update:**
+**Update:** read the **Upgrade notes** of every release since yours first;
+they name config keys to remove and anything else the update needs.
 
 ```bash
-git pull
+git pull                                # on `stable`: the latest release
 docker compose build
 docker compose up -d --no-deps back     # no miner notices this
 docker compose up -d --no-deps front    # miners reconnect
