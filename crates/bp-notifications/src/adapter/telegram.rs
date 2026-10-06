@@ -171,6 +171,38 @@ impl TelegramAdapter {
         .map(|_| ())
     }
 
+    /// `setMyCommands`: the command menu shown to clients of `language_code`,
+    /// or to every client without a list of its own when `None`. Commands go
+    /// without the leading slash.
+    pub async fn set_my_commands(
+        &self,
+        commands: &[(&str, &str)],
+        language_code: Option<&str>,
+    ) -> AdapterResult<()> {
+        #[derive(Serialize)]
+        struct BotCommand<'a> {
+            command: &'a str,
+            description: &'a str,
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            commands: Vec<BotCommand<'a>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            language_code: Option<&'a str>,
+        }
+        let body = Body {
+            commands: commands
+                .iter()
+                .map(|(command, description)| BotCommand {
+                    command,
+                    description,
+                })
+                .collect(),
+            language_code,
+        };
+        self.post("setMyCommands", &body, None).await.map(|_| ())
+    }
+
     /// POST a JSON body to a Bot API method, mapping HTTP status into
     /// the adapter's error taxonomy. Returns the raw success response
     /// so callers that need the result payload can decode it.

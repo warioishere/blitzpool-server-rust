@@ -12,13 +12,13 @@ use bp_notifications::adapter::{
     AdapterError, NtfyAdapter, NtfyConfig as AdapterNtfyConfig, TelegramAdapter,
     TelegramConfig as AdapterTelegramConfig,
 };
-use bp_notifications::command::{ChatLanguageMap, CommandHandler};
+use bp_notifications::command::{register_command_menu, ChatLanguageMap, CommandHandler};
 use bp_notifications::listener::{
     spawn_ntfy_listener, spawn_telegram_listener, NtfyListenerConfig, TelegramListenerConfig,
 };
 use thiserror::Error;
 use tokio::sync::{watch, Notify};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::boot::FoundationHandles;
 use crate::engines::EngineHandles;
@@ -136,7 +136,14 @@ pub(crate) fn spawn(
             .with_ntfy_reconnect(ntfy_reconnect.clone()),
     );
 
-    let telegram_shutdown = telegram_adapter.as_ref().map(|_| {
+    let telegram_shutdown = telegram_adapter.as_ref().map(|adapter| {
+        let menu_adapter = Arc::clone(adapter);
+        tokio::spawn(async move {
+            match register_command_menu(&menu_adapter).await {
+                Ok(()) => info!("listeners.telegram: command menu registered"),
+                Err(e) => warn!(error = %e, "listeners.telegram: command menu registration failed"),
+            }
+        });
         let bot_token = cfg
             .notifications
             .telegram
