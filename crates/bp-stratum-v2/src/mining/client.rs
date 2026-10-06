@@ -1864,7 +1864,24 @@ pub fn apply_template_broadcast<C: Clock>(
         }
     }
 
+    note_work_available(state);
     outcome
+}
+
+/// Tell the vardiff of every channel that holds a job that it has work; only
+/// the first report per channel has an effect.
+fn note_work_available<C: Clock>(state: &mut MiningSessionState<C>) {
+    let MiningSessionState {
+        channels, vardiff, ..
+    } = state;
+    for (channel_id, channel) in channels.iter() {
+        if channel.standard_jobs.is_empty() && channel.extended_jobs.is_empty() {
+            continue;
+        }
+        if let Some(engine) = vardiff.get_mut(channel_id) {
+            engine.note_work_available();
+        }
+    }
 }
 
 // ── handle_set_custom_mining_job ────────────────────────────────────
@@ -2214,6 +2231,7 @@ pub fn handle_set_custom_mining_job<C: Clock>(
         },
     );
 
+    note_work_available(state);
     HandlerOutcome::with_frame(OutboundFrame::SetCustomMiningJobSuccess {
         channel_id: input.channel_id,
         request_id: input.request_id,
@@ -3891,6 +3909,7 @@ pub(crate) mod tests {
             &open_ext(1, &format!("{}.w", REGTEST_ADDR)),
             vec![0; 4],
         );
+        send_first_job(&mut s);
         let cid = s.primary_channel.unwrap();
         let job = ExtendedJob {
             payouts_fingerprint: [0u8; 32],
@@ -3959,7 +3978,48 @@ pub(crate) mod tests {
             &open_std(1, &format!("{}.w", REGTEST_ADDR)),
             vec![0; 4],
         );
+        send_first_job(&mut s);
         s
+    }
+
+    /// Send every channel a job, as the server does right after open.
+    fn send_first_job(s: &mut MiningSessionState<Arc<TestClock>>) {
+        let _ = apply_template_broadcast(
+            s,
+            &broadcast(TemplateChange::NewBlock, [0xAB; 32]),
+            &synthetic_mining_job_inputs(),
+            0,
+            None,
+        );
+    }
+
+    /// A channel is judged only once it got a job: ten minutes without one
+    /// hold, and they do not count as silence once the job goes out.
+    #[test]
+    fn a_channel_is_eased_down_only_once_it_got_a_job() {
+        let clock = Arc::new(TestClock::new(0));
+        let mut s = MiningSessionState::new(clock.clone(), 1, port_cfg());
+        handle_setup_connection(&mut s, &good_setup());
+        let _ = handle_open_standard_mining_channel(
+            &mut s,
+            &open_std(1, &format!("{}.w", REGTEST_ADDR)),
+            vec![0; 4],
+        );
+        let cid = s.primary_channel.unwrap();
+        clock.advance_ms(600_000);
+        let out = apply_vardiff_check(&mut s);
+        assert!(out.outbound.is_empty(), "no job yet, no retarget");
+
+        send_first_job(&mut s);
+        assert!(
+            !s.channels[&cid].standard_jobs.is_empty(),
+            "precondition: the broadcast stored a job"
+        );
+        clock.advance_ms(61_000);
+        let _ = apply_vardiff_check(&mut s);
+        // One silent minute at 1024 bounds the rate at 512; counting the ten
+        // minutes before the job as well would read 64.
+        assert_eq!(s.channels[&cid].session_difficulty, Difficulty(512.0));
     }
 
     #[test]
@@ -4184,6 +4244,7 @@ pub(crate) mod tests {
                 &open_std(1, &format!("{}.w", REGTEST_ADDR)),
                 vec![0; 4],
             );
+            send_first_job(&mut s);
             let cid = s.primary_channel.unwrap();
             let claim = UpdateChannelInput {
                 channel_id: cid,
@@ -4193,11 +4254,16 @@ pub(crate) mod tests {
             // State the claim once so later sends are repeats, then let
             // the descent run through total silence.
             let _ = handle_update_channel(&mut s, &claim);
+            let claimed = s.channels[&cid].session_difficulty.as_f64();
             for _ in 0..6 {
                 clock.advance_ms(60_000);
                 let _ = apply_vardiff_check(&mut s);
             }
             let before = s.channels[&cid].session_difficulty.as_f64();
+            assert!(
+                before < claimed,
+                "min_difficulty={min_diff}: precondition: the descent moved from {claimed}"
+            );
 
             // Re-assert it repeatedly, as a translator does.
             for _ in 0..3 {
@@ -5352,6 +5418,45 @@ pub(crate) mod tests {
             }
             _ => panic!("expected SetCustomMiningJobError"),
         }
+    }
+
+    /// A JDC's declared job is work for the vardiff, like a pool-built one:
+    /// before it the channel gathers no silence, after it it does. Normally a
+    /// pool job came first; this covers a channel whose pool job failed to
+    /// build.
+    #[test]
+    fn a_custom_job_gives_the_channel_work() {
+        let mut s = solo_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        assert!(
+            s.channels[&cid].extended_jobs.is_empty(),
+            "precondition: no job yet"
+        );
+        s.clock.advance_ms(120_000);
+        assert_eq!(s.vardiff[&cid].silence_implied_max_difficulty(), None);
+
+        let token = Token([1u8; 16]);
+        let entry = bridge_entry_for(token, REGTEST_ADDR, 42);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &custom_job_input(cid, token),
+            Some(&job_ref_for(&entry)),
+            None,
+            None,
+            1_000,
+        );
+        assert!(
+            matches!(
+                out.outbound[0],
+                OutboundFrame::SetCustomMiningJobSuccess { .. }
+            ),
+            "precondition: the job was accepted"
+        );
+        s.clock.advance_ms(61_000);
+        assert!(
+            s.vardiff[&cid].silence_implied_max_difficulty().is_some(),
+            "a minute of silence on a declared job is evidence"
+        );
     }
 
     /// A declared job is accepted and stored with the assembled non-witness coinbase.

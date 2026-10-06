@@ -228,6 +228,9 @@ pub struct VarDiffEngine<C: Clock> {
     // was too thin to measure. The up-step cap lifts only when it agrees.
     previous_measurement: Option<f64>,
     accepted_any: bool,
+    // Whether the miner was ever given work. Without it there is nothing to
+    // measure: no retarget and no silence evidence.
+    has_work: bool,
 
     // Display hashrate, by 10-minute slot.
     hash_rate: f64,
@@ -278,6 +281,7 @@ impl<C: Clock> VarDiffEngine<C> {
             highest_assigned: difficulty,
             previous_measurement: None,
             accepted_any: false,
+            has_work: false,
             hash_rate: 0.0,
             current_slot: None,
             previous_slot_time_ms: 0,
@@ -309,11 +313,22 @@ impl<C: Clock> VarDiffEngine<C> {
             && window.span_ms >= VARDIFF_MIN_WINDOW_MS)
             .then(|| window.arrivals / window.exposure * self.target_share_interval_s);
         if window.shares >= VARDIFF_MIN_SHARES {
-            self.previous = None;
-            self.current = Bucket::empty(now);
+            self.start_window(now);
         }
         self.difficulty = difficulty;
         self.highest_assigned = self.highest_assigned.max(difficulty);
+    }
+
+    /// Report that the miner has work to mine. Until the first report the
+    /// engine proposes nothing and gathers no silence; the first one starts
+    /// the window, so time spent without work (no template yet, no payouts to
+    /// build a job from) never reads as a miner that went quiet. Later reports
+    /// change nothing.
+    pub fn note_work_available(&mut self) {
+        if !self.has_work {
+            self.has_work = true;
+            self.start_window(self.clock.now_ms());
+        }
     }
 
     /// Record an accepted share at its credited (post-clamp) difficulty.
@@ -347,12 +362,12 @@ impl<C: Clock> VarDiffEngine<C> {
     }
 
     /// Highest difficulty the window's evidence is consistent with, or `None`
-    /// once a share was accepted or the window is too short or already
-    /// measured. Lets a caller weigh a declared hashrate against observation:
+    /// before any work, once a share was accepted, or while the window is too
+    /// short or already measured. Lets a caller weigh a declared hashrate against observation:
     /// "no share yet" alone is normal for a fresh proxy channel; a long
     /// silence that rules the number out is not.
     pub fn silence_implied_max_difficulty(&self) -> Option<f64> {
-        if self.accepted_any {
+        if self.accepted_any || !self.has_work {
             return None;
         }
         let window = self.window(self.clock.now_ms());
@@ -365,6 +380,9 @@ impl<C: Clock> VarDiffEngine<C> {
     /// Next difficulty for the session, or `None` for no retarget. A result is
     /// a power of two or `min_difficulty`, never NaN or infinite.
     pub fn suggested_difficulty(&self, client_difficulty: f64) -> Option<f64> {
+        if !self.has_work {
+            return None;
+        }
         let window = self.window(self.clock.now_ms());
         if window.span_ms < VARDIFF_MIN_WINDOW_MS {
             return None;
@@ -387,16 +405,16 @@ impl<C: Clock> VarDiffEngine<C> {
     }
 
     fn record_arrival(&mut self, now: u64, credited_difficulty: f64) {
+        // A share is only ever mined on work.
+        self.has_work = true;
         self.drop_window_if_clock_stepped_back(now);
         if self.window_shares() == 0 {
             // The first arrival opens a fresh window and carries no weight:
             // its work was done before the window began, and dropping the
             // silence before it keeps a miner that only just started from
             // being measured against time it may not have been mining.
-            self.previous = None;
-            self.current = Bucket::empty(now);
+            self.start_window(now);
             self.current.shares = 1;
-            self.segment_start_ms = now;
             return;
         }
         self.current.arrivals += credited_difficulty / self.difficulty;
@@ -426,10 +444,15 @@ impl<C: Clock> VarDiffEngine<C> {
 
     fn drop_window_if_clock_stepped_back(&mut self, now: u64) {
         if now < self.segment_start_ms {
-            self.previous = None;
-            self.current = Bucket::empty(now);
-            self.segment_start_ms = now;
+            self.start_window(now);
         }
+    }
+
+    /// Drop the window and start an empty one at `now`.
+    fn start_window(&mut self, now: u64) {
+        self.previous = None;
+        self.current = Bucket::empty(now);
+        self.segment_start_ms = now;
     }
 
     /// Fold the open segment's exposure into the current bucket and restart
@@ -612,9 +635,12 @@ mod tests {
 
     // ── helpers ──────────────────────────────────────────────────────────
 
-    /// A 6 shares/min engine (target gap 10 s) opening at `initial`.
+    /// A 6 shares/min engine (target gap 10 s) opening at `initial`, with
+    /// work from the start.
     fn engine(clock: &TestClock, initial: f64) -> VarDiffEngine<&TestClock> {
-        VarDiffEngine::new(clock, 6.0, 0.00001, initial)
+        let mut e = VarDiffEngine::new(clock, 6.0, 0.00001, initial);
+        e.note_work_available();
+        e
     }
 
     /// One closed-loop cycle: tick, ask, APPLY and report the proposal.
@@ -1062,6 +1088,40 @@ mod tests {
         );
     }
 
+    /// A miner without work cannot be judged, and the time it spent without
+    /// work is not silence once work arrives: an hour with no template must
+    /// not walk the difficulty down the moment the first job goes out.
+    #[test]
+    fn time_without_work_is_not_silence() {
+        let clock = TestClock::new(0);
+        let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001, 1_048_576.0);
+        clock.advance_ms(3_600_000);
+        assert_eq!(
+            e.suggested_difficulty(1_048_576.0),
+            None,
+            "no work, no retarget"
+        );
+        assert_eq!(
+            e.silence_implied_max_difficulty(),
+            None,
+            "no work, no evidence"
+        );
+
+        e.note_work_available();
+        clock.advance_ms(30_000);
+        assert_eq!(
+            e.suggested_difficulty(1_048_576.0),
+            None,
+            "the hour without work was counted as silence"
+        );
+        clock.advance_ms(31_000);
+        assert!(
+            e.suggested_difficulty(1_048_576.0)
+                .is_some_and(|d| d < 1_048_576.0),
+            "a minute of silence with work must still descend"
+        );
+    }
+
     // ── the upper bound ───────────────────────────────────────────────
 
     /// A session that advertises 10× its real hashrate and lands no share
@@ -1093,6 +1153,7 @@ mod tests {
         // 0.6 shares/min → a 100 s mean gap. 90 s of quiet is ordinary.
         let clock = TestClock::new(1_000);
         let mut sparse = VarDiffEngine::new(&clock, 0.6, 0.00001, 4096.0);
+        sparse.note_work_available();
         let mut diff = 4096.0;
         assert!(
             !cycle(&mut sparse, &clock, 90_000, &mut diff),
@@ -1102,6 +1163,7 @@ mod tests {
         // 15 shares/min → a 4 s mean gap. The same 90 s is ~22 missed gaps.
         let clock = TestClock::new(1_000);
         let mut dense = VarDiffEngine::new(&clock, 15.0, 0.00001, 4096.0);
+        dense.note_work_available();
         let mut diff = 4096.0;
         assert!(
             cycle(&mut dense, &clock, 90_000, &mut diff),
@@ -1210,6 +1272,7 @@ mod tests {
     fn descent_respects_the_configured_floor() {
         let clock = TestClock::new(1_000);
         let mut e = VarDiffEngine::new(&clock, 6.0, 500.0, 1_048_576.0);
+        e.note_work_available();
         e.note_difficulty_assigned(65_536.0);
         let mut diff = 65_536.0;
         for _ in 0..200 {

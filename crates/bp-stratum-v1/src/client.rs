@@ -531,7 +531,8 @@ pub(crate) fn handle_submit<C: Clock>(
 /// Vardiff retarget, polled on the timer and after each accepted current-diff
 /// share. A retarget sends `mining.set_difficulty` plus a notify with
 /// `clean_jobs=false`: in-flight shares at the old difficulty are covered by
-/// the ckpool-style clamp, not by a job flush.
+/// the ckpool-style clamp, not by a job flush. A session never sent a notify
+/// is not judged (see [`VarDiffEngine::note_work_available`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_vardiff_check<C: Clock>(
     state: &mut SessionState<C>,
@@ -545,14 +546,6 @@ pub(crate) fn apply_vardiff_check<C: Clock>(
 ) -> HandlerOutcome {
     let mut out = HandlerOutcome::default();
     state.last_difficulty_check_ms = now_ms;
-
-    // Silence counts as evidence, so only judge a session that could have
-    // mined: without a handshake there is no miner, and without a template
-    // an outage would walk every session down to the floor and make them
-    // all flood on recovery.
-    if !state.stratum_initialized || current_template.is_none() {
-        return out;
-    }
 
     let Some(target) = state.vardiff.suggested_difficulty(state.session_difficulty) else {
         return out;
@@ -624,6 +617,7 @@ pub(crate) fn apply_new_template<C: Clock>(
         now_ms,
     ) {
         out.push_frame(frame);
+        state.vardiff.note_work_available();
     }
     out
 }
@@ -713,7 +707,7 @@ mod tests {
         Arc::new(JobRegistry::from_server_config(&server_config()))
     }
 
-    /// Vardiff only judges a session with a handshake and a template.
+    /// A template a session can be sent a notify for.
     fn mineable_template() -> Arc<ActiveSV1Template> {
         let t = ActiveSV1Template::from_template(bp_template_distribution::ActiveTemplate {
             template_id: 1,
@@ -1314,15 +1308,36 @@ mod tests {
         )
     }
 
-    /// A session that never reaches its port's start difficulty is walked
-    /// down on the wire.
+    /// A session is judged only once it got work. Without a notify it holds
+    /// however long it stays quiet; with one, a session that never reaches
+    /// its port's start difficulty is walked down on the wire.
     #[test]
-    fn a_session_with_no_share_ever_is_eased_down_on_the_wire() {
+    fn a_session_is_eased_down_only_once_it_got_work() {
         let clock = Arc::new(TestClock::new(0));
         let sc = server_config();
         let port = solo_port(1_000_000.0); // a high-diff port
         let mut state = SessionState::new(clock.clone(), &sc, &port, "abcd1234".to_string());
         state.stratum_initialized = true;
+        state.authorization = Some(authorize_req(REGTEST_ADDR));
+        clock.advance_ms(600_000);
+        let out = vardiff_check_now(&mut state, &sc, &port, &clock);
+        assert!(out.outbound_frames.is_empty(), "no notify yet, no retarget");
+
+        let notify = apply_new_template(
+            &mut state,
+            &sc,
+            &port,
+            &empty_registry(),
+            &MiningJobCache::new(),
+            &Arc::new(template_for_regtest()),
+            &solo_payouts_fixture(REGTEST_ADDR),
+            false,
+            clock.now_ms(),
+        );
+        assert!(
+            !notify.outbound_frames.is_empty(),
+            "precondition: a notify went out"
+        );
         clock.advance_ms(61_000);
         let out = vardiff_check_now(&mut state, &sc, &port, &clock);
         let frame = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
@@ -1331,8 +1346,8 @@ mod tests {
             "expected a set_difficulty frame, got {frame}"
         );
         assert!(
-            state.session_difficulty < 1_000_000.0,
-            "session stayed at {}",
+            state.session_difficulty == 524_288.0,
+            "the ten minutes before the notify were counted as silence: {}",
             state.session_difficulty
         );
     }
