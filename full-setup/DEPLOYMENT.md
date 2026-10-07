@@ -16,7 +16,7 @@ notification change.
 |---|---|---|---|
 | `blitzpool-core` | `front` | Stratum listeners + share producer + block submit + JDP | **miners reconnect** — avoid unless fixing the share path / coinbase math |
 | `blitzpool-api` | `api` | read-only HTTP API (charts, admin) | none (read-only; recreate freely) |
-| `blitzpool-payout` | `payout,stats` | PPLNS + Group-Solo + Blockparty ledger (block-found ledger apply), confirmation watcher, maintenance crons, statistics | API + miners + notifications unaffected; a few seconds of accounting lag, then catches up |
+| `blitzpool-payout` | `payout,stats` | PPLNS + Team Mining + Blockparty ledger (block-found ledger apply), confirmation watcher, maintenance crons, statistics | API + miners + notifications unaffected; a few seconds of accounting lag, then catches up |
 | `blitzpool-notify` | `notify` | dispatcher (FCM/Web-Push/Telegram/ntfy), command listeners, notification crons (network-/best-difficulty, hourly stats), notify-only fan-out of block-found + device-status | payout + API + miners unaffected; recreate freely for a notification change |
 
 All four share `../.local/blitzpool.toml`. The topology comes from
@@ -95,7 +95,7 @@ the infra.
 > the new image — i.e. disconnect the miners. Naming the service (with
 > `--no-deps`) keeps the swap surgical.
 
-**Accounting / payout / stats fix** (most common — PPLNS ledger, Group-Solo,
+**Accounting / payout / stats fix** (most common — PPLNS ledger, Team Mining,
 Blockparty, crons, notifications, charts data) → recreate only `payout`:
 
 ```bash

@@ -7,7 +7,7 @@
 > the release's **Upgrade notes** before every update.
 
 This sets up a working **Solo** pool: every block pays the miner who found it.
-PPLNS, Group-Solo and Blockparty are optional and switched on later by adding
+PPLNS, Team Mining and Blockparty are optional and switched on later by adding
 config sections (see [Enabling more payout modes](#enabling-more-payout-modes)).
 
 Everything below runs from the `simple-setup/` directory with Docker Compose.
@@ -186,8 +186,8 @@ every key.
 | Mode | Section | Also needs |
 |---|---|---|
 | PPLNS | `[pplns]` | publish ports `3340` and `3349` in `docker-compose.yml` |
-| Group-Solo | `[group_solo]` | `[smtp]` and `pool_base_url`: members verify an email before joining |
-| Blockparty | `[blockparty]` | `[smtp]` and `pool_base_url`, as for Group-Solo |
+| Team Mining | `[group_solo]` | `[smtp]` and `pool_base_url` for the verification and invite emails; members prove their address by email or by signature |
+| Blockparty | `[blockparty]` | `[smtp]` and `pool_base_url`, as for Team Mining |
 
 Every mode's section carries its own `fee_address` and `fee_percent`;
 nothing is inherited from another section. On Solo the fee is optional.
@@ -198,9 +198,9 @@ After a config change, restart both pool processes:
 docker compose up -d --force-recreate front back
 ```
 
-A section that is removed again switches its mode off. For Group-Solo the
-pool refuses to start while active groups still exist, so no member is
-silently moved to Solo; dissolve the groups first or keep `[group_solo]`.
+A section that is removed again switches its mode off. For Team Mining the
+pool refuses to start while active teams still exist, so no member is
+silently moved to Solo; dissolve the teams first or keep `[group_solo]`.
 
 ## Operating
 

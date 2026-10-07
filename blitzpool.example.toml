@@ -5,7 +5,7 @@
 # see DEPLOYMENT.md for running without Docker or with your own node.
 #
 # Solo only: every block pays the miner who found it (minus the optional dev
-# fee). PPLNS, Group-Solo and Blockparty are switched on by adding their
+# fee). PPLNS, Team Mining and Blockparty are switched on by adding their
 # sections; blitzpool.full.example.toml shows all of them.
 #
 # Process roles are not set here: each process gets them from

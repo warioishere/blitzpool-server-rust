@@ -232,11 +232,11 @@ can't — pick anything from `0x02000000` on.
 ## Solo-only
 
 The feature only works while mining **Solo**, because a non-Solo (PPLNS /
-Group-Solo / Blockparty) miner does not hash its own dedicated coinbase, so a
+Team Mining / Blockparty) miner does not hash its own dedicated coinbase, so a
 custom prefix there could overlap another miner's search space.
 
 - The API rejects addresses it can tell are non-Solo — members of a group /
-  Group-Solo / Blockparty, or an address currently mining in the PPLNS window —
+  Team Mining / Blockparty, or an address currently mining in the PPLNS window —
   with `409 not-solo-mode`. This is checked both when issuing the challenge and
   on every `set`.
 - A non-grouped address that mines PPLNS purely by connecting on a PPLNS port

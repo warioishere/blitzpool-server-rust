@@ -9,7 +9,7 @@
 network = "mainnet"
 pool_identifier = "blitzpool"
 # Public URL of the web UI, no trailing slash. Needed for the links in
-# verification and invitation emails (Group-Solo, Blockparty).
+# verification and invitation emails (Team Mining, Blockparty).
 pool_base_url = "https://pool.example.com"
 
 [bitcoin_rpc]
@@ -97,11 +97,12 @@ min_payout_sats = 10000
 # enabled = true
 # max_weight_budget = 200000
 
-# ── Group-Solo ───────────────────────────────────────────────────────
-# Miners form a group; a block found by any member is split among the
-# members by their shares in the current round. Members need a verified
-# email, so this needs [smtp] and pool_base_url. Per-group settings (round
-# reset, finder bonus, payout mode) are set per group through the API.
+# ── Team Mining ──────────────────────────────────────────────────────
+# Miners form a team; a block found by any member is split among the
+# members, by their shares in the current round (Prop) or over the last N
+# days (Window). Members prove their address by email or by signature; the
+# email path needs [smtp] and pool_base_url. Per-team settings (payout mode,
+# round reset, finder bonus) are set per team through the API.
 [group_solo]
 fee_address = "CHANGE-ME"
 fee_percent = 1.5
