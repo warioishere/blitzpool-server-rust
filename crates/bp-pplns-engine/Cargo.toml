@@ -48,12 +48,12 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
-# Snapshot serialization (pplns:snapshot Redis hash fields are JSON-encoded
-# arrays/maps mirroring the TS coinbase-snapshot.ts shape).
+# The settlement snapshot travels inside the block-found event and the
+# parked pending-block blob.
 serde = { workspace = true }
-serde_json = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 # Integration tests against docker-Redis need direct redis-rs access
 # (for FLUSHDB / direct zset inspection).

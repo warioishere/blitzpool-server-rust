@@ -29,64 +29,50 @@ use tracing::{error, info, warn};
 use crate::block_confirmation::{settle_block, SettleFailure};
 use crate::boot::FoundationHandles;
 use crate::engines::{BlitzpoolModeGate, EngineHandles};
-use crate::pending_blocks::{
-    put_pending_block, GroupKind, PendingBlock, PendingGroup, SettlementMode,
-};
+use crate::pending_blocks::{put_pending_block, PendingBlock, PendingSettlement};
 
 /// The Core→Satellite block-found event: the front submits and records the
-/// block, the payout Satellite applies the ledger from this. Its wire form is
-/// replayed by other processes, so field names and `Option`s are format.
+/// block, the payout Satellite applies the ledger from this. Producer and
+/// consumer run the same version: a release that changes this format deploys
+/// with the block-found stream fully acked.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct BlockFoundEvent {
     /// Miner-authorized payout address.
     pub address: String,
     pub worker: String,
     pub session_id: String,
-    /// Wire form of [`Booking`], read through [`Self::booking`]. An `Option`
-    /// because a rolling deploy has old and new producers in flight at once.
-    pub reward_sats: Option<u64>,
+    /// What the apply side does with the ledger.
+    pub booking: Booking,
     /// Big-endian block-hash hex: the idempotent history-row key and the
-    /// PPLNS confirmation-gating key.
-    pub block_hash: Option<String>,
+    /// confirmation-gating key.
+    pub block_hash: String,
     /// 80-byte header hex (LE), stored in `blocks_entity.blockData`.
     pub block_data: String,
     /// Resolved on the Core, the only side holding the mode gate.
     pub mode: MiningMode,
-    /// Group UUID for `GroupSolo` / `Blockparty`, else `None`.
-    pub group_id: Option<String>,
+    /// Group for `GroupSolo` / `Blockparty`, else `None`.
+    pub group_id: Option<uuid::Uuid>,
     /// Derived on the Core right after submit: the chain may have advanced by
     /// the time a Satellite consumes the event.
     pub height: i32,
     /// PPLNS settlement inputs of the winning job's distribution, resolved at
     /// the block-found instant: the Redis keys they come from are overwritten
-    /// or expire before the apply side runs. The wire name is format only.
-    #[serde(default, rename = "groupsolo_weight_snapshot")]
+    /// or expire before the apply side runs.
     pub weight_snapshot: Option<bp_pplns_engine::window::snapshot::StoredWeightSnapshot>,
     /// Identity of the payout list the winning job's coinbase pays, so what is
     /// booked is what the coinbase paid. `None` when the pool did not build the
-    /// coinbase. The `pplns_` name is wire format; the field serves every mode.
-    #[serde(default)]
-    pub pplns_payouts_fingerprint: Option<[u8; 32]>,
+    /// coinbase.
+    pub payouts_fingerprint: Option<[u8; 32]>,
     /// What the found block's coinbase actually paid, decoded on the Core;
     /// settlement books `claim − paid` from it. `None` (undecodable, or
     /// [`Booking::RecordOnly`]) makes every mode book nothing.
-    #[serde(default)]
     pub actual_coinbase: Option<ActualCoinbase>,
-}
-
-impl BlockFoundEvent {
-    /// What this event asks the apply side to do with the ledger.
-    pub(crate) fn booking(&self) -> Booking {
-        match self.reward_sats {
-            Some(reward_sats) => Booking::Book { reward_sats },
-            None => Booking::RecordOnly,
-        }
-    }
 }
 
 /// Whether a found block goes into its mode's ledger, or is only recorded
 /// (`blocks_entity` row + notification).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub(crate) enum Booking {
     /// `reward_sats` is what the coinbase claims. Settlement only logs it and
     /// books from the block's own coinbase.
@@ -94,16 +80,6 @@ pub(crate) enum Booking {
     /// For a block whose distribution was never bookable, or whose pool-built
     /// SV2 custom-job coinbase did not decode.
     RecordOnly,
-}
-
-impl Booking {
-    /// The event's wire form, see [`BlockFoundEvent::reward_sats`].
-    fn wire_reward_sats(self) -> Option<u64> {
-        match self {
-            Self::Book { reward_sats } => Some(reward_sats),
-            Self::RecordOnly => None,
-        }
-    }
 }
 
 /// What identifies a JDC-found block in `blocks_entity`. `session_id` lands in
@@ -133,7 +109,7 @@ struct BlockFoundInputs {
     block_hash: String,
     /// The 80-byte header as hex (LE), for `blocks_entity.blockData`.
     block_data: String,
-    pplns_payouts_fingerprint: Option<[u8; 32]>,
+    payouts_fingerprint: Option<[u8; 32]>,
     actual_coinbase: Option<ActualCoinbase>,
 }
 
@@ -324,7 +300,7 @@ impl TdpBlockSubmissionSink {
             booking: Booking::Book { reward_sats },
             block_hash: record.block_hash,
             block_data: record.block_data,
-            pplns_payouts_fingerprint: Some(payouts_fingerprint),
+            payouts_fingerprint: Some(payouts_fingerprint),
             actual_coinbase,
         })
         .await
@@ -344,7 +320,7 @@ impl TdpBlockSubmissionSink {
             booking: Booking::RecordOnly,
             block_hash: record.block_hash,
             block_data: record.block_data,
-            pplns_payouts_fingerprint: None,
+            payouts_fingerprint: None,
             actual_coinbase: None,
         })
         .await
@@ -398,7 +374,7 @@ impl TdpBlockSubmissionSink {
             booking,
             block_hash,
             block_data,
-            pplns_payouts_fingerprint,
+            payouts_fingerprint,
             actual_coinbase,
         } = found;
         let resolved = self.mode_gate.lookup_mode(&address);
@@ -429,7 +405,7 @@ impl TdpBlockSubmissionSink {
             warn!(%err, address = %address, height, "block-found: blocks_entity insert failed");
         }
 
-        let job_payouts_fingerprint = pool_built(pplns_payouts_fingerprint);
+        let job_payouts_fingerprint = pool_built(payouts_fingerprint);
         let weight_snapshot = self
             .resolve_weight_snapshot(resolved, &address, job_payouts_fingerprint, height)
             .await;
@@ -438,12 +414,12 @@ impl TdpBlockSubmissionSink {
             address,
             worker,
             session_id,
-            pplns_payouts_fingerprint,
-            reward_sats: booking.wire_reward_sats(),
-            block_hash: Some(block_hash),
+            payouts_fingerprint,
+            booking,
+            block_hash,
             block_data,
             mode: resolved.mode(),
-            group_id: resolved.group_id().map(|g| g.to_string()),
+            group_id: resolved.group_id(),
             height,
             weight_snapshot,
             actual_coinbase,
@@ -578,19 +554,16 @@ impl BlockFoundApplier {
     /// never books, else apply immediately. Parking inputs, not results, lets
     /// several blocks pend at once. Never substitute another
     /// `weight_snapshot`: that books what the chain didn't pay.
-    #[allow(clippy::too_many_arguments)]
     async fn gate_or_apply(
         &self,
         address_str: &str,
         height: i32,
         reward: u64,
-        block_hash_hex: Option<&str>,
-        weight_snapshot: Option<bp_pplns_engine::window::snapshot::StoredWeightSnapshot>,
+        block_hash: &str,
         actual: Option<&bp_coinbase_snapshot::ActualCoinbase>,
-        payouts_fingerprint: Option<[u8; 32]>,
-        group: Option<PendingGroup>,
+        settlement: PendingSettlement,
     ) {
-        let mode = SettlementMode::of(group.as_ref()).label();
+        let mode = settlement.label();
         // Settlement is `claim − paid` against the block's own coinbase.
         let Some(actual) = actual else {
             error!(
@@ -602,22 +575,12 @@ impl BlockFoundApplier {
             );
             return;
         };
-        // The confirmation watcher's key and the idempotent history-row key.
-        let Some(block_hash) = block_hash_hex else {
-            error!(
-                address = address_str,
-                height, mode, "block-found: event carries no block hash — NOT booked"
-            );
-            return;
-        };
         let pending = PendingBlock {
             block_hash: block_hash.to_string(),
             found_at_ms: chrono::Utc::now().timestamp_millis(),
             block_height: height,
-            weight_snapshot,
-            actual_coinbase: Some(actual.clone()),
-            payouts_fingerprint,
-            group,
+            actual_coinbase: actual.clone(),
+            settlement,
         };
 
         match self.redis.as_ref() {
@@ -648,26 +611,20 @@ impl BlockFoundApplier {
             ),
         }
 
-        self.apply_now(address_str, reward, &pending, actual).await;
+        self.apply_now(address_str, reward, &pending).await;
     }
 
     /// Fallback of [`Self::gate_or_apply`]; the same settlement the
     /// confirmation watcher runs, on the same blob it would have parked.
-    async fn apply_now(
-        &self,
-        address_str: &str,
-        reward: u64,
-        pending: &PendingBlock,
-        actual: &bp_coinbase_snapshot::ActualCoinbase,
-    ) {
+    async fn apply_now(&self, address_str: &str, reward: u64, pending: &PendingBlock) {
         let height = pending.block_height;
-        let label = pending.mode().label();
+        let label = pending.settlement.label();
         let settlers = crate::block_confirmation::Settlers {
             pplns: self.pplns.as_ref(),
             group_solo: self.group_solo.as_ref(),
             blockparty: self.blockparty.as_ref(),
         };
-        let applied = settle_block(&settlers, pending, actual).await;
+        let applied = settle_block(&settlers, pending).await;
         match applied {
             Ok(history_inserted) => {
                 self.settle_distributions().await;
@@ -688,14 +645,10 @@ impl BlockFoundApplier {
             ),
             Err(SettleFailure::UnusableGroup) => warn!(
                 address = address_str,
-                group_id = pending
-                    .group
-                    .as_ref()
-                    .map(|g| g.group_id.as_str())
-                    .unwrap_or("-"),
+                group_id = ?pending.settlement.group_id(),
                 height,
                 mode = label,
-                "block-found: group id unusable or group gone — NOT booked"
+                "block-found: group gone — NOT booked"
             ),
             Err(SettleFailure::Engine(err)) => warn!(
                 %err, address = address_str, height,
@@ -709,7 +662,7 @@ impl BlockFoundApplier {
     /// step is logged and the others continue.
     pub(crate) async fn apply_block_found(&self, event: &BlockFoundEvent) {
         let address_str = event.address.as_str();
-        let block_hash_hex = event.block_hash.clone();
+        let block_hash = event.block_hash.as_str();
         let height = event.height;
 
         if let Err(err) = AddressId::new(address_str.to_string()) {
@@ -721,7 +674,7 @@ impl BlockFoundApplier {
             return;
         }
 
-        match (event.mode, event.booking()) {
+        match (event.mode, event.booking) {
             (MiningMode::Solo, _) => {
                 info!(
                     address = address_str,
@@ -748,11 +701,12 @@ impl BlockFoundApplier {
                         address_str,
                         height,
                         reward,
-                        block_hash_hex.as_deref(),
-                        event.weight_snapshot.clone(),
+                        block_hash,
                         event.actual_coinbase.as_ref(),
-                        event.pplns_payouts_fingerprint,
-                        None, // pool-wide accounting: no group context
+                        PendingSettlement::Pplns {
+                            weight_snapshot: event.weight_snapshot.clone(),
+                            payouts_fingerprint: event.payouts_fingerprint,
+                        },
                     )
                     .await
                 }
@@ -766,29 +720,15 @@ impl BlockFoundApplier {
                 Booking::Book {
                     reward_sats: reward,
                 },
-            ) => match (event.group_id.as_deref(), self.blockparty.as_ref()) {
-                (Some(group_id_str), Some(_payouts)) => {
-                    if let Err(err) = uuid::Uuid::parse_str(group_id_str) {
-                        warn!(
-                            %err,
-                            address = address_str,
-                            group_id = group_id_str,
-                            "block-found: Blockparty group_id is not a valid UUID — skipping history-row write"
-                        );
-                        return;
-                    }
+            ) => match (event.group_id, self.blockparty.as_ref()) {
+                (Some(group_id), Some(_payouts)) => {
                     self.gate_or_apply(
                         address_str,
                         height,
                         reward,
-                        block_hash_hex.as_deref(),
-                        None,
+                        block_hash,
                         event.actual_coinbase.as_ref(),
-                        None,
-                        Some(PendingGroup {
-                            group_id: group_id_str.to_string(),
-                            kind: GroupKind::Blockparty,
-                        }),
+                        PendingSettlement::Blockparty { group_id },
                     )
                     .await;
                 }
@@ -807,36 +747,20 @@ impl BlockFoundApplier {
                     reward_sats: reward,
                 },
             ) => {
-                match (event.group_id.as_deref(), self.group_solo.as_ref()) {
-                    (Some(group_id_str), Some(_engine)) => {
-                        // Refuse early rather than park a blob the apply
-                        // could never resolve.
-                        if let Err(err) = uuid::Uuid::parse_str(group_id_str) {
-                            warn!(
-                                %err,
-                                address = address_str,
-                                group_id = group_id_str,
-                                "block-found: Group-Solo group_id is not a valid UUID — skipping ledger-write"
-                            );
-                            return;
-                        }
+                match (event.group_id, self.group_solo.as_ref()) {
+                    (Some(group_id), Some(_engine)) => {
                         // Only a coinbase the pool built pays the group's
                         // distribution; booking any other would reset the
                         // round for a block that may not have paid the group.
-                        match pool_built(event.pplns_payouts_fingerprint) {
-                            Some(fingerprint) => {
+                        match pool_built(event.payouts_fingerprint) {
+                            Some(_) => {
                                 self.gate_or_apply(
                                     address_str,
                                     height,
                                     reward,
-                                    block_hash_hex.as_deref(),
-                                    None,
+                                    block_hash,
                                     event.actual_coinbase.as_ref(),
-                                    Some(fingerprint),
-                                    Some(PendingGroup {
-                                        group_id: group_id_str.to_string(),
-                                        kind: GroupKind::GroupSolo,
-                                    }),
+                                    PendingSettlement::GroupSolo { group_id },
                                 )
                                 .await;
                             }
@@ -844,7 +768,7 @@ impl BlockFoundApplier {
                             // books is the one the operator must hear about.
                             None => error!(
                                 address = address_str,
-                                group_id = group_id_str,
+                                %group_id,
                                 height,
                                 "block-found: Group-Solo block on a coinbase the pool did not \
                                  build — NOT booked and the round NOT reset"
@@ -1019,7 +943,7 @@ impl TdpBlockSubmissionSink {
             booking: Booking::Book { reward_sats },
             block_hash: block_hash_display(header),
             block_data: hex::encode(header),
-            pplns_payouts_fingerprint: Some(payouts_fingerprint),
+            payouts_fingerprint: Some(payouts_fingerprint),
             actual_coinbase: actual,
         })
         .await;
@@ -1083,7 +1007,7 @@ impl Sv2BlockSubmissionSink for TdpBlockSubmissionSink {
                 booking,
                 block_hash: block_hash_display(&accept.header),
                 block_data: hex::encode(accept.header),
-                pplns_payouts_fingerprint: Some(fingerprint),
+                payouts_fingerprint: Some(fingerprint),
                 actual_coinbase: actual,
             })
             .await;
@@ -1321,9 +1245,9 @@ mod tests {
         );
     }
 
-    /// Pins that both `Booking` wire forms round-trip through `reward_sats`.
+    /// Pins that both `Booking` forms round-trip through the event.
     #[test]
-    fn booking_round_trips_through_the_wire_reward_field() {
+    fn booking_round_trips_through_the_event() {
         for booking in [
             Booking::Book {
                 reward_sats: 312_500_000,
@@ -1331,17 +1255,13 @@ mod tests {
             Booking::RecordOnly,
         ] {
             let event = BlockFoundEvent {
-                reward_sats: booking.wire_reward_sats(),
+                booking,
                 ..record_only_event()
             };
             let json = serde_json::to_string(&event).expect("serialize");
             let back: BlockFoundEvent = serde_json::from_str(&json).expect("deserialize");
-            assert_eq!(back.booking(), booking);
+            assert_eq!(back.booking, booking);
         }
-        let mut old = serde_json::to_value(record_only_event()).expect("to value");
-        old["reward_sats"] = serde_json::Value::Null;
-        let back: BlockFoundEvent = serde_json::from_value(old).expect("from value");
-        assert_eq!(back.booking(), Booking::RecordOnly);
     }
 
     fn record_only_event() -> BlockFoundEvent {
@@ -1349,14 +1269,14 @@ mod tests {
             address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
             worker: "jdp".to_string(),
             session_id: "sess1".to_string(),
-            reward_sats: None,
-            block_hash: Some("00000000deadbeef".to_string()),
+            booking: Booking::RecordOnly,
+            block_hash: "00000000deadbeef".to_string(),
             block_data: "ab".repeat(80),
             mode: MiningMode::Pplns,
             group_id: None,
             height: 870_123,
             weight_snapshot: None,
-            pplns_payouts_fingerprint: None,
+            payouts_fingerprint: None,
             actual_coinbase: None,
         }
     }
@@ -1382,12 +1302,14 @@ mod tests {
         let event = BlockFoundEvent {
             actual_coinbase: None,
             weight_snapshot: Some(weight_snapshot.clone()),
-            pplns_payouts_fingerprint: None,
+            payouts_fingerprint: None,
             address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
             worker: "rig1".to_string(),
             session_id: "sess1".to_string(),
-            reward_sats: Some(312_500_000),
-            block_hash: Some("00000000deadbeef".to_string()),
+            booking: Booking::Book {
+                reward_sats: 312_500_000,
+            },
+            block_hash: "00000000deadbeef".to_string(),
             block_data: "ab".repeat(80),
             mode: MiningMode::Pplns,
             group_id: None,
@@ -1397,7 +1319,12 @@ mod tests {
         let back: BlockFoundEvent = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.mode, MiningMode::Pplns);
         assert_eq!(back.height, 870_123);
-        assert_eq!(back.reward_sats, Some(312_500_000));
+        assert_eq!(
+            back.booking,
+            Booking::Book {
+                reward_sats: 312_500_000
+            }
+        );
         assert_eq!(back.address, event.address);
         assert_eq!(back.block_data, event.block_data);
         assert_eq!(back.weight_snapshot, Some(weight_snapshot));

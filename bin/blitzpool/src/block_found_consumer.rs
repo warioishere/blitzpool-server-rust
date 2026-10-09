@@ -106,7 +106,7 @@ mod tests {
     use sqlx::PgPool;
 
     use super::*;
-    use crate::block_sink::{BlockFoundApplier, BlockFoundEvent};
+    use crate::block_sink::{BlockFoundApplier, BlockFoundEvent, Booking};
 
     const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
     const ADDR: &str = "bcrt1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l";
@@ -115,12 +115,12 @@ mod tests {
         BlockFoundEvent {
             actual_coinbase: None,
             weight_snapshot: None,
-            pplns_payouts_fingerprint: None,
+            payouts_fingerprint: None,
             address: ADDR.to_string(),
             worker: "rig1".to_string(),
             session_id: "sid".to_string(),
-            reward_sats: None,
-            block_hash: Some("00".repeat(32)),
+            booking: Booking::RecordOnly,
+            block_hash: "00".repeat(32),
             block_data: "00".repeat(80),
             mode: MiningMode::Solo,
             group_id: None,

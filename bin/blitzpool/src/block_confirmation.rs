@@ -20,7 +20,7 @@ use tracing::{error, info, warn};
 
 use crate::pending_blocks::{
     count_pending_at, load_pending_blocks, park_unbookable_block, remove_pending_block,
-    PendingBlock, SettlementMode, PENDING_KEY, UNBOOKABLE_KEY,
+    PendingBlock, PendingSettlement, PENDING_KEY, UNBOOKABLE_KEY,
 };
 
 /// Fallback re-check cadence; bounds the latency when the TDP stream stalls.
@@ -153,25 +153,21 @@ async fn classify_block(bitcoin_rpc: &BitcoinRpc, block_hash: &str, depth: i64) 
     }
 }
 
-/// Load every entry in the pending store, prune unparsable ones, discard
-/// orphaned ones, and return the CONFIRMED entries. They stay in the store
-/// until the caller applies them, so a failed apply is retried next tick.
+/// Load every entry in the pending store, discard orphaned ones, and return
+/// the CONFIRMED entries. They stay in the store until the caller applies
+/// them, so a failed apply is retried next tick.
 async fn collect_confirmed(
     bitcoin_rpc: &BitcoinRpc,
     conn: &mut ConnectionManager,
     depth: i64,
 ) -> Vec<PendingBlock> {
-    let (pending, unparsable) = match load_pending_blocks(conn).await {
+    let pending = match load_pending_blocks(conn).await {
         Ok(v) => v,
         Err(err) => {
             warn!(%err, "block-confirmation: load pending failed; retry next tick");
             return Vec::new();
         }
     };
-    for hash in unparsable {
-        warn!(block_hash = %hash, "block-confirmation: pruning unparsable pending entry");
-        let _ = remove_pending_block(conn, &hash).await;
-    }
 
     let mut confirmed = Vec::new();
     for pb in pending {
@@ -241,26 +237,7 @@ async fn reconcile(
     let confirmed = collect_confirmed(bitcoin_rpc, &mut conn, depth).await;
 
     for pb in confirmed {
-        // Settlement is `claim − paid` against the block's OWN coinbase;
-        // without its payments there is nothing to settle against.
-        let Some(actual) = pb.actual_coinbase.clone() else {
-            // Park, don't destroy: the blob is the only record of this block.
-            let parked = park_unbookable_block(&mut conn, &pb).await.is_ok();
-            error!(
-                block_hash = %pb.block_hash,
-                height = pb.block_height,
-                parked,
-                unbookable_key = UNBOOKABLE_KEY,
-                "block-confirmation: parked block carries no parsed coinbase — moved to the \
-                 unbookable store; reprocess it from the block's own coinbase"
-            );
-            if parked {
-                let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
-            }
-            continue;
-        };
-
-        let applied = settle_block(settlers, &pb, &actual).await;
+        let applied = settle_block(settlers, &pb).await;
 
         match applied {
             Ok(history_inserted) => {
@@ -270,7 +247,7 @@ async fn reconcile(
                 info!(
                     block_hash = %pb.block_hash,
                     height = pb.block_height,
-                    group = pb.group.as_ref().map(|g| g.group_id.as_str()).unwrap_or("-"),
+                    group = ?pb.settlement.group_id(),
                     history_inserted,
                     "block-confirmation: confirmed → payout history applied"
                 );
@@ -324,27 +301,22 @@ pub(crate) struct Settlers<'a> {
 pub(crate) async fn settle_block(
     settlers: &Settlers<'_>,
     pb: &PendingBlock,
-    actual: &bp_coinbase_snapshot::ActualCoinbase,
 ) -> Result<u64, SettleFailure> {
     let height = pb.block_height;
-    match pb.mode() {
-        SettlementMode::GroupSolo(group) => {
+    let actual = &pb.actual_coinbase;
+    match &pb.settlement {
+        PendingSettlement::GroupSolo { group_id } => {
             let engine = settlers.group_solo.ok_or(SettleFailure::NoEngine)?;
-            let Ok(group_uuid) = uuid::Uuid::parse_str(&group.group_id) else {
-                return Err(SettleFailure::UnusableGroup);
-            };
             // Books from the coinbase alone; the snapshot inputs are PPLNS's.
             engine
-                .on_block_found(group_uuid, height, actual)
+                .on_block_found(*group_id, height, actual)
                 .await
                 .map(|o| o.history_inserted)
                 .map_err(|e| SettleFailure::Engine(SettleError::GroupSolo(e)))
         }
-        SettlementMode::Blockparty(group) => {
+        PendingSettlement::Blockparty { group_id } => {
             let payouts = settlers.blockparty.ok_or(SettleFailure::NoEngine)?;
-            let Ok(group_uuid) = uuid::Uuid::parse_str(&group.group_id) else {
-                return Err(SettleFailure::UnusableGroup);
-            };
+            let group_uuid = *group_id;
             // The split is recomputed from the roster, which cannot change
             // while the party is routable, so it is the one the coinbase paid.
             let reward = bp_common::Sats(actual.total_value_sats as i64);
@@ -368,14 +340,17 @@ pub(crate) async fn settle_block(
                 .map(|row| u64::from(row.is_some()))
                 .map_err(blockparty_err)
         }
-        SettlementMode::Pplns => settlers
+        PendingSettlement::Pplns {
+            weight_snapshot,
+            payouts_fingerprint,
+        } => settlers
             .pplns
             .ok_or(SettleFailure::NoEngine)?
             .on_block_found(
                 height,
                 actual,
-                pb.weight_snapshot.clone(),
-                pb.payouts_fingerprint,
+                weight_snapshot.clone(),
+                *payouts_fingerprint,
             )
             .await
             .map(|o| o.history_inserted)
@@ -389,18 +364,17 @@ pub(crate) enum SettleFailure {
     /// This process has no engine for the block's mode.
     #[error("no engine wired for this block's mode")]
     NoEngine,
-    /// A group-mode block whose group id does not parse, or a Blockparty
-    /// whose group no longer exists.
-    #[error("unusable group id")]
+    /// A Blockparty group that does not exist.
+    #[error("blockparty group does not exist")]
     UnusableGroup,
     #[error(transparent)]
     Engine(SettleError),
 }
 
 impl SettleFailure {
-    /// Will a retry fail the same way? An unparsable group id stays
-    /// unparsable, so it is terminal like the engines' own verdicts. A
-    /// missing engine is not: another process may own the block.
+    /// Will a retry fail the same way? A deleted group stays deleted, so it
+    /// is terminal like the engines' own verdicts. A missing engine is not:
+    /// another process may own the block.
     pub(crate) fn is_terminal(&self) -> bool {
         match self {
             SettleFailure::NoEngine => false,
@@ -472,8 +446,6 @@ mod declared_block_booking_regtest {
     const DB_GROUP_BOOKS_THE_COINBASE: u8 = 21;
     const DB_GROUP_NO_OVERWRITE: u8 = 22;
     const DB_GROUP_REFUSES_WITHOUT_COINBASE: u8 = 23;
-    const DB_UNUSABLE_GROUP: u8 = 30;
-    const DB_NO_PARSED_COINBASE: u8 = 31;
     const DB_LOST_SUBMIT: u8 = 0;
 
     /// The production default of `[pplns] confirmation_depth`.
@@ -1118,105 +1090,6 @@ mod declared_block_booking_regtest {
             c.unbookable_count().await > unbookable_before,
             "the conflict must PARK as unbookable, not report success — a silent \
              Ok lets the watcher drop a block whose miners were paid on-chain"
-        );
-
-        c.teardown().await;
-    }
-
-    /// A parked Group-Solo block whose group id does not parse can be booked
-    /// by nothing, but its blob is the only record of what the coinbase paid,
-    /// so it moves to the unbookable store instead of being deleted. Only the
-    /// unbookable count tells a park from a discard.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_group_block_with_an_unusable_group_id_parks_as_unbookable() {
-        let Some(c) = Chain::setup(DB_UNUSABLE_GROUP).await else {
-            return;
-        };
-        c.node
-            .generate_to_self(DEPTH)
-            .await
-            .expect("bury to confirmation depth");
-        let mut conn = c.redis.clone();
-        crate::pending_blocks::put_pending_block(
-            &mut conn,
-            &crate::pending_blocks::PendingBlock {
-                block_hash: c.block_hash.clone(),
-                found_at_ms: 0,
-                block_height: c.height as i32,
-                weight_snapshot: None,
-                actual_coinbase: Some(c.actual.clone()),
-                payouts_fingerprint: Some(c.fingerprint),
-                group: Some(crate::pending_blocks::PendingGroup {
-                    group_id: "not-a-uuid".to_string(),
-                    kind: crate::pending_blocks::GroupKind::GroupSolo,
-                }),
-            },
-        )
-        .await
-        .expect("park the block");
-        let unbookable_before = c.unbookable_count().await;
-
-        c.reconcile_once().await;
-
-        let still_pending =
-            crate::pending_blocks::count_pending_at(&mut conn, crate::pending_blocks::PENDING_KEY)
-                .await
-                .expect("count pending");
-        assert_eq!(
-            still_pending, 0,
-            "precondition: the watcher must have confirmed and handled the block"
-        );
-        assert!(
-            c.unbookable_count().await > unbookable_before,
-            "a block nothing can book must PARK as unbookable — deleting it throws \
-             away the only record of what its coinbase paid"
-        );
-
-        c.teardown().await;
-    }
-
-    /// A parked block without a parsed coinbase can be settled by nothing
-    /// either. Same rule as the unusable group id above: it moves to the
-    /// unbookable store instead of being deleted.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_block_without_a_parsed_coinbase_parks_as_unbookable() {
-        let Some(c) = Chain::setup(DB_NO_PARSED_COINBASE).await else {
-            return;
-        };
-        c.node
-            .generate_to_self(DEPTH)
-            .await
-            .expect("bury to confirmation depth");
-        let mut conn = c.redis.clone();
-        crate::pending_blocks::put_pending_block(
-            &mut conn,
-            &crate::pending_blocks::PendingBlock {
-                block_hash: c.block_hash.clone(),
-                found_at_ms: 0,
-                block_height: c.height as i32,
-                weight_snapshot: None,
-                actual_coinbase: None,
-                payouts_fingerprint: Some(c.fingerprint),
-                group: None,
-            },
-        )
-        .await
-        .expect("park the block");
-        let unbookable_before = c.unbookable_count().await;
-
-        c.reconcile_once().await;
-
-        let still_pending =
-            crate::pending_blocks::count_pending_at(&mut conn, crate::pending_blocks::PENDING_KEY)
-                .await
-                .expect("count pending");
-        assert_eq!(
-            still_pending, 0,
-            "precondition: the watcher must have confirmed and handled the block"
-        );
-        assert!(
-            c.unbookable_count().await > unbookable_before,
-            "a block without a parsed coinbase must PARK as unbookable, not be discarded"
         );
 
         c.teardown().await;
@@ -1872,7 +1745,7 @@ mod blockparty_settlement {
     use bp_common::{AddressId, Sats};
 
     use super::{settle_block, SettleFailure, Settlers};
-    use crate::pending_blocks::{GroupKind, PendingBlock, PendingGroup};
+    use crate::pending_blocks::{PendingBlock, PendingSettlement};
 
     const REWARD: u64 = 312_500_000;
     const FOUND_AT_MS: i64 = 1_700_000_000_123;
@@ -1928,13 +1801,8 @@ mod blockparty_settlement {
             block_hash: format!("{:064x}", group_id.as_u128()),
             found_at_ms: FOUND_AT_MS,
             block_height: 900_000,
-            weight_snapshot: None,
-            actual_coinbase: Some(actual.clone()),
-            payouts_fingerprint: None,
-            group: Some(PendingGroup {
-                group_id: group_id.to_string(),
-                kind: GroupKind::Blockparty,
-            }),
+            actual_coinbase: actual.clone(),
+            settlement: PendingSettlement::Blockparty { group_id },
         };
 
         let without = Settlers {
@@ -1942,7 +1810,7 @@ mod blockparty_settlement {
             group_solo: None,
             blockparty: None,
         };
-        let refused = settle_block(&without, &pb, &actual).await;
+        let refused = settle_block(&without, &pb).await;
         assert!(
             matches!(refused, Err(SettleFailure::NoEngine)),
             "{refused:?}"
@@ -1953,7 +1821,7 @@ mod blockparty_settlement {
             group_solo: None,
             blockparty: Some(&payouts),
         };
-        assert_eq!(settle_block(&with, &pb, &actual).await.expect("settle"), 1);
+        assert_eq!(settle_block(&with, &pb).await.expect("settle"), 1);
 
         let rows = bp_db::list_blockparty_block_history(&pg, group_id)
             .await
@@ -1982,11 +1850,58 @@ mod blockparty_settlement {
         );
 
         assert_eq!(
-            settle_block(&with, &pb, &actual).await.expect("replay"),
+            settle_block(&with, &pb).await.expect("replay"),
             0,
             "a replay must not insert a second row"
         );
 
         bp_test_support::cleanup_blockparty_rows(&pg, &[&admin, &member]).await;
+    }
+}
+
+#[cfg(test)]
+mod pending_store {
+    use std::time::Duration;
+
+    use bp_bitcoin::{BitcoinRpc, BitcoinRpcConfig, RpcAuth};
+    use redis::AsyncCommands;
+
+    use crate::pending_blocks::PENDING_KEY;
+
+    /// A blob this version cannot parse (here: one missing required fields)
+    /// stays in the pending store untouched. Nothing settles it and nothing
+    /// deletes it; the confirmation pass only skips it.
+    #[tokio::test]
+    async fn a_blob_that_does_not_parse_stays_in_the_pending_store() {
+        let Some(mut conn) = bp_test_support::connect_redis_in_range_or_skip(
+            bp_test_support::redis_db::BLITZPOOL_BIN_2,
+            2,
+        )
+        .await
+        else {
+            return;
+        };
+        let foreign = r#"{"block_hash":"ab","found_at_ms":1,"block_height":2}"#;
+        let _: () = conn.hset(PENDING_KEY, "ab", foreign).await.unwrap();
+        // Only a parsed block reaches `getblockheader`, so this is never dialed.
+        let rpc = BitcoinRpc::new(BitcoinRpcConfig {
+            url: "http://127.0.0.1:1".to_string(),
+            auth: RpcAuth::UserPassword {
+                user: "u".to_string(),
+                password: "p".to_string(),
+            },
+            timeout: Some(Duration::from_millis(200)),
+        })
+        .unwrap();
+
+        let confirmed = super::collect_confirmed(&rpc, &mut conn, 3).await;
+
+        assert!(confirmed.is_empty(), "an unparsed blob must not settle");
+        let kept: Option<String> = conn.hget(PENDING_KEY, "ab").await.unwrap();
+        assert_eq!(
+            kept.as_deref(),
+            Some(foreign),
+            "the blob is the only record of what that block paid — it must stay"
+        );
     }
 }

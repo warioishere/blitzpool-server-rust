@@ -41,10 +41,7 @@ pub struct WeightSnapshotEntry {
 
 /// Persistent weight distribution (schema 3): settlement INPUTS, not outcomes,
 /// so `claim(T_actual) − paid` is correct at any revenue, pool or JDC job.
-/// `deny_unknown_fields` is load-bearing: a pending blob with an unknown field
-/// is refused instead of settled with that value silently dropped.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct StoredWeightSnapshot {
     /// Distribution order (published first — the coinbase output order).
     pub entries: Vec<WeightSnapshotEntry>,
@@ -332,29 +329,6 @@ mod tests {
         assert!(
             parse_weight_hash(&h).is_none(),
             "a pre-proportion snapshot must be refused, not silently stripped of its bonus"
-        );
-    }
-
-    /// A pending blob with an unknown `finder_bonus` field is refused; without it, it round-trips.
-    #[test]
-    fn a_pending_blob_carrying_the_retired_bonus_is_refused() {
-        let s = weight_snapshot_fixture();
-        let mut v = serde_json::to_value(&s).expect("serialize");
-        v.as_object_mut().unwrap().insert(
-            "finder_bonus".to_string(),
-            serde_json::json!(["bc1qold", 50_000]),
-        );
-        let json = serde_json::to_string(&v).unwrap();
-        assert!(
-            serde_json::from_str::<StoredWeightSnapshot>(&json).is_err(),
-            "a blob still carrying finder_bonus must not deserialize into the \
-             proportional model — its bonus would silently leave `extras_total`"
-        );
-        // The same blob without that field parses.
-        let clean = serde_json::to_string(&s).unwrap();
-        assert_eq!(
-            serde_json::from_str::<StoredWeightSnapshot>(&clean).expect("round-trips"),
-            s
         );
     }
 
