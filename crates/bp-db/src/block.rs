@@ -70,8 +70,8 @@ pub async fn found_block_miner_at_height(
 
 /// `true` when a payout ledger booked value for `height`; unlike
 /// [`found_block_miner_at_height`] this proves miners were credited. Only rows
-/// that moved value count, since PPLNS writes 0-sat rows for late arrivers.
-/// Solo blocks keep no ledger, so their absence here is not a miss.
+/// that moved value count. Solo blocks keep no ledger, so their absence here
+/// is not a miss.
 pub async fn payout_recorded_at_height(pool: &PgPool, height: i32) -> Result<bool, DbError> {
     let found = sqlx::query_scalar!(
         r#"SELECT (

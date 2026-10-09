@@ -132,7 +132,7 @@ pub use pplns::{
     aggregate_pplns_balances, bulk_insert_pplns_payout_history,
     bulk_update_pplns_last_accepted_share_at, bulk_upsert_pplns_balances, find_pplns_balance,
     find_pplns_balances_for_addresses_locked, find_pplns_balances_with_open_balance,
-    pplns_booked_value_rows_at_height, take_pplns_settlement_lock,
+    pplns_booked_rows_at_height, take_pplns_settlement_lock,
     update_pplns_balance_sats_if_unchanged, BalanceUpsert, PayoutHistoryInsert,
     PplnsBalanceAggregate, PplnsBalanceRow, TouchUpdate, PPLNS_SETTLEMENT_LOCK,
 };

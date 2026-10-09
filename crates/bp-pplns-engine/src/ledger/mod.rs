@@ -18,8 +18,8 @@ pub use bp_db::TouchUpdate;
 pub use bp_coinbase_snapshot::{ApplyDistributionResult, LedgerError, PayoutRowType};
 
 /// One audit row, built from the block's own coinbase settled against the
-/// snapshot: per address paid, per ledger delta that stayed off-chain, and a
-/// zero row per late arriver.
+/// snapshot: per address paid, and per ledger delta that stayed off-chain.
+/// Every row moves value; an address the block left untouched gets none.
 #[derive(Clone, Debug)]
 pub struct AuditRow {
     pub address: AddressId,
@@ -54,12 +54,11 @@ pub async fn apply_distribution(
 ) -> Result<ApplyDistributionResult, LedgerError> {
     // Height is the only identity of a booked block. Existing history is a
     // redelivery (passes silently) or a reorged block (must not be skipped
-    // silently); identical value-bearing rows mean replaying moves nothing.
-    let booked = bp_db::pplns_booked_value_rows_at_height(&mut *tx, block_height).await?;
+    // silently); identical rows mean replaying moves nothing.
+    let booked = bp_db::pplns_booked_rows_at_height(&mut *tx, block_height).await?;
     if !booked.is_empty() {
         let mut want: Vec<(String, i64)> = rows
             .iter()
-            .filter(|r| r.paid_sats.0 != 0)
             .map(|r| (r.address.as_str().to_string(), r.paid_sats.0))
             .collect();
         want.sort();

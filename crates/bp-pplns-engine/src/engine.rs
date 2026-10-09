@@ -297,11 +297,8 @@ impl PplnsEngine {
         // The balance write is absolute, so `current` MUST be read `FOR UPDATE`
         // in the writing transaction, or a dust sweep committing in between is
         // undone; the settlement lock covers what `FOR UPDATE` cannot, the rows
-        // a concurrent settlement is about to create. The window read stays
-        // outside: it only picks late-arriver rows, and a Redis stall must not
-        // hold a PG transaction open.
+        // a concurrent settlement is about to create.
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let current_window = self.inner.window.read_window_by_address().await?;
         let addresses = Self::addresses_to_settle(&snapshot, actual);
 
         let mut tx = self.inner.pool.begin().await.map_err(LedgerError::from)?;
@@ -313,7 +310,7 @@ impl PplnsEngine {
                 .map(|r| (r.address.as_str().to_string(), r))
                 .collect();
         let (audit_rows, balance_writes) =
-            Self::build_writes_from_weight_snapshot(&snapshot, &current_window, actual, &existing)?;
+            Self::build_writes_from_weight_snapshot(&snapshot, actual, &existing)?;
         let outcome =
             apply_distribution(&mut tx, block_height, &audit_rows, &balance_writes, now_ms).await?;
         tx.commit().await.map_err(LedgerError::from)?;
@@ -354,7 +351,6 @@ impl PplnsEngine {
     /// `existing` must already be locked by the caller's transaction.
     fn build_writes_from_weight_snapshot(
         snapshot: &StoredWeightSnapshot,
-        current_window: &HashMap<String, f64>,
         actual: &ActualCoinbase,
         existing: &HashMap<String, PplnsBalanceRow>,
     ) -> Result<(Vec<AuditRow>, Vec<BalanceWrite>), EngineError> {
@@ -451,20 +447,6 @@ impl PplnsEngine {
             });
         }
 
-        // Late arrivers: active in the window, unknown to the snapshot, unpaid.
-        for addr_str in current_window.keys() {
-            if *addr_str == snapshot.fee_address
-                || in_snapshot.contains(addr_str.as_str())
-                || paid_to(addr_str) > 0
-            {
-                continue;
-            }
-            let Ok(addr_id) = AddressId::new(addr_str.clone()) else {
-                continue;
-            };
-            audit_rows.push(pending_row(addr_id, Sats(0)));
-        }
-
         Ok((audit_rows, balance_writes))
     }
 
@@ -532,7 +514,7 @@ mod tests {
 
     /// Pins every branch of the settlement writes: exactly paid, withheld,
     /// overpaid, indebted, nothing owed, fee address as an entry, paid outside
-    /// the snapshot (valid, invalid, zero, fee), late arrivers.
+    /// the snapshot (valid, invalid, zero, fee). Nothing else gets a row.
     #[test]
     fn settlement_writes_cover_every_branch() {
         const FEE: &str = "fee_addr";
@@ -564,18 +546,6 @@ mod tests {
             ]),
             total_value_sats: 1_000_000,
         };
-        let window: HashMap<String, f64> = [
-            ("exact", 1.0),
-            ("late", 2.0),
-            ("outsider", 3.0),
-            (FEE, 4.0),
-            ("bad late", 5.0),
-            ("owed_nothing", 6.0),
-            ("zero_outsider", 7.0),
-        ]
-        .iter()
-        .map(|(a, d)| (a.to_string(), *d))
-        .collect();
         let existing: HashMap<String, PplnsBalanceRow> = [
             balance_row("exact", 100, 5_000),
             balance_row("indebted", -500, 0),
@@ -585,7 +555,7 @@ mod tests {
         .collect();
 
         let (audit, writes) =
-            PplnsEngine::build_writes_from_weight_snapshot(&snapshot, &window, &actual, &existing)
+            PplnsEngine::build_writes_from_weight_snapshot(&snapshot, &actual, &existing)
                 .expect("writes");
 
         // Snapshot entries come first, in snapshot order.
@@ -622,11 +592,9 @@ mod tests {
             [
                 "exact 377333 37.7333 coinbase",
                 "indebted 94333 0.0000 pending",
-                "late 0 0.0000 pending",
                 "outsider 1000 0.1000 coinbase",
                 "overpaid 300000 30.0000 coinbase",
                 "withheld 283000 0.0000 pending",
-                "zero_outsider 0 0.0000 pending",
             ],
             "audit rows"
         );

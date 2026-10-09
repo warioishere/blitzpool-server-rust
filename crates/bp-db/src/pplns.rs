@@ -281,11 +281,10 @@ where
     Ok(result.rows_affected())
 }
 
-/// Non-zero payout rows at `block_height`, sorted, to tell a replay from a
-/// different block at the same height (the table has no `blockHash`). Zero
-/// "late arriver" rows depend on the moving window, so they are excluded;
-/// the rest follows from the block's own coinbase.
-pub async fn pplns_booked_value_rows_at_height<'e, E>(
+/// Payout rows at `block_height`, sorted, to tell a replay from a different
+/// block at the same height (the table has no `blockHash`). They follow from
+/// the block's own coinbase and its snapshot alone.
+pub async fn pplns_booked_rows_at_height<'e, E>(
     executor: E,
     block_height: i32,
 ) -> Result<Vec<(String, i64)>, DbError>
@@ -295,7 +294,7 @@ where
     let rows = sqlx::query!(
         r#"SELECT address, "paidSats" AS paid_sats
              FROM pplns_payout_history
-            WHERE "blockHeight" = $1 AND "paidSats" <> 0
+            WHERE "blockHeight" = $1
             ORDER BY address"#,
         block_height,
     )

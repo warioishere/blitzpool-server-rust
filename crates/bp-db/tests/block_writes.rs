@@ -136,8 +136,8 @@ async fn drop_history(pool: &PgPool, heights: &[i32]) {
     }
 }
 
-/// MONEY: a block with only 0-sat late-arriver rows is NOT booked, so the
-/// chain reconcile still reports it.
+/// MONEY: a block with only 0-sat rows is NOT booked, so the chain reconcile
+/// still reports it.
 #[tokio::test]
 async fn zero_sat_rows_alone_do_not_count_as_a_recorded_payout() {
     let Some(pool) = connect_or_skip().await else {
@@ -145,7 +145,7 @@ async fn zero_sat_rows_alone_do_not_count_as_a_recorded_payout() {
     };
     drop_history(&pool, &[H_ZERO_ROWS_ONLY, H_REAL_PAYOUT]).await;
 
-    // Late-arriver rows only, every one of them 0 sats.
+    // Rows that move no value, every one of them 0 sats.
     seed_history(&pool, H_ZERO_ROWS_ONLY, "bc1qlate1", 0, "pending").await;
     seed_history(&pool, H_ZERO_ROWS_ONLY, "bc1qlate2", 0, "pending").await;
     // Precondition: rows DO exist, so a plain `EXISTS` would see them.

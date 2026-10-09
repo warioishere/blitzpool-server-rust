@@ -265,7 +265,7 @@ async fn on_block_found_applies_distribution_from_snapshot() {
             .distribution
             .published()
             .any(|e| e.address.as_str() == ADDR),
-        "the miner must be a published coinbase output, not a late-arriver row"
+        "the miner must be a published coinbase output"
     );
     let block_height = 9_997_001;
     // Existing history at this height reads as "already booked", and
@@ -401,10 +401,6 @@ async fn a_block_settles_from_its_parked_blob_after_the_snapshot_key_is_gone() {
     drop_harness(h).await;
 }
 
-// ── A booked block stays booked, whatever the row set does ─────────
-// Late-arriver rows can grow the row set between two applies, so "already
-// booked" cannot be inferred from new rows being inserted.
-
 /// The window counts every address with shares; the coinbase pays only the
 /// miners at or above `min_payout`. The published-output count reports the
 /// coinbase, so a miner below the line is in the first and not the second.
@@ -461,10 +457,9 @@ async fn a_second_apply_of_the_same_block_moves_no_money() {
     };
     const BIG: &str = "bc1qc7slrfxkknqcq2jevvvkdgvrt8080852dfjewde450xdlk4ugp7szw5tk9";
     const TINY: &str = "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0";
-    const LATECOMER: &str = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2";
     const REWARD: u64 = 3_000_000_000;
     let height: i32 = 9_997_201;
-    for addr in [BIG, TINY, LATECOMER] {
+    for addr in [BIG, TINY] {
         cleanup_addr(&h.pool, addr, &[height]).await;
     }
 
@@ -495,23 +490,6 @@ async fn a_second_apply_of_the_same_block_moves_no_money() {
         "precondition: the withheld miner carries a credit to double"
     );
 
-    // A late arriver grows the replay's row set by one.
-    h.engine
-        .record_share(None, LATECOMER, 50.0, ts(3))
-        .await
-        .unwrap();
-    let window = h
-        .engine
-        .window()
-        .read_window_by_address()
-        .await
-        .expect("window read");
-    assert!(
-        window.contains_key(LATECOMER),
-        "precondition: the latecomer must be in the window the apply reads, \
-         or the row set does not grow and this test proves nothing"
-    );
-
     let second = h
         .engine
         .on_block_found(height, &actual, snapshot_for(&h.engine, &fp).await)
@@ -531,7 +509,7 @@ async fn a_second_apply_of_the_same_block_moves_no_money() {
         "a replayed block must write nothing at all (got {second:?})"
     );
 
-    for addr in [BIG, TINY, LATECOMER] {
+    for addr in [BIG, TINY] {
         cleanup_addr(&h.pool, addr, &[height]).await;
     }
     drop_harness(h).await;
