@@ -1286,15 +1286,12 @@ mod tests {
                 address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
                 score_weight: 1_000_000_000_000,
                 balance_sats: 0,
-                wire_weight: 1_000_000_000_000,
-                dust_limit: 546,
             }],
             score_total: 1_000_000_000_000,
             fee_ppm: 15_000,
             fee_address: "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"
                 .to_string(),
             reference_revenue_sats: 312_500_000,
-            weight_p: 15_228_426_395,
         };
         let event = BlockFoundEvent {
             actual_coinbase: None,

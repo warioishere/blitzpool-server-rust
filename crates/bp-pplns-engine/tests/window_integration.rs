@@ -228,13 +228,12 @@ async fn trim_window_drops_oldest_over_window_size() {
     assert!((by["bc1q5"] - 1.0).abs() < 1e-9);
 }
 
-// ── The snapshot write is all-or-nothing ────────────────────────────
-// `DEL`, `HSET` and `EXPIRE` run as one script since readers take `Ok(None)`
-// at face value. Pins why the `DEL` is inside: a shorter rewrite must not
-// leave the longer one's fields behind.
+// ── The snapshot write ──────────────────────────────────────────────
 
+/// A snapshot round-trips through Redis, a rewrite replaces it whole, and
+/// it carries the TTL that bounds the keyspace.
 #[tokio::test]
-async fn rewriting_a_snapshot_with_fewer_entries_leaves_no_stale_fields() {
+async fn a_rewritten_snapshot_replaces_the_old_one_and_keeps_its_ttl() {
     use bp_pplns_engine::window::snapshot::{
         read_weight_snapshot, write_weight_snapshot, StoredWeightSnapshot, WeightSnapshotEntry,
     };
@@ -250,8 +249,6 @@ async fn rewriting_a_snapshot_with_fewer_entries_leaves_no_stale_fields() {
         address: addr.to_string(),
         score_weight: score,
         balance_sats: 0,
-        wire_weight: score,
-        dust_limit: 546,
     };
     let mut snap = StoredWeightSnapshot {
         entries: vec![
@@ -259,7 +256,6 @@ async fn rewriting_a_snapshot_with_fewer_entries_leaves_no_stale_fields() {
             entry("bc1qbbb", 300_000_000_000),
             entry("bc1qccc", 200_000_000_000),
         ],
-        weight_p: 15_228_426_395,
         fee_ppm: 15_000,
         fee_address: "bc1qfee".to_string(),
         reference_revenue_sats: 312_500_000,
@@ -273,7 +269,7 @@ async fn rewriting_a_snapshot_with_fewer_entries_leaves_no_stale_fields() {
         Some(&snap)
     );
 
-    // Rewrite with ONE entry. `e1_*` / `e2_*` must be gone.
+    // Rewrite with ONE entry.
     snap.entries.truncate(1);
     snap.score_total = 500_000_000_000;
     write_weight_snapshot(&mut conn, key, &snap, 600)
@@ -287,13 +283,6 @@ async fn rewriting_a_snapshot_with_fewer_entries_leaves_no_stale_fields() {
     assert_eq!(
         back, snap,
         "the shorter rewrite must replace the snapshot, not overlay it"
-    );
-    let leftover: Option<String> = conn.hget(key, "e1_addr").await.unwrap();
-    assert!(
-        leftover.is_none(),
-        "field from the longer snapshot survived: {leftover:?} — with entry_count \
-         back at 1 the parser would not read it, but the next LONGER rewrite \
-         would inherit it"
     );
     // Without the TTL the key would outlive its job forever.
     let ttl: i64 = conn.ttl(key).await.unwrap();

@@ -516,8 +516,6 @@ mod tests {
             address: address.to_string(),
             score_weight,
             balance_sats,
-            wire_weight: score_weight,
-            dust_limit: 546,
         }
     }
 
@@ -547,7 +545,6 @@ mod tests {
                 snap_entry("owed_nothing", 0, 0),
                 snap_entry(FEE, 50, 0),
             ],
-            weight_p: 10,
             fee_ppm: 10_000,
             fee_address: FEE.to_string(),
             reference_revenue_sats: 1_000_000,
