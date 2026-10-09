@@ -89,6 +89,20 @@ pub async fn find_pplns_balance(
     .map_err(DbError::from)
 }
 
+/// Advisory lock serialising PPLNS settlements across processes. A settlement
+/// writes absolute balances, and `FOR UPDATE` cannot lock the row of an
+/// address that has none yet, so two settlements crediting the same new miner
+/// would otherwise keep only one of the credits.
+pub const PPLNS_SETTLEMENT_LOCK: i64 = 0x7070_6c6e_7373; // "pplnss"
+
+/// Take [`PPLNS_SETTLEMENT_LOCK`] for the rest of `tx`. Every settlement takes
+/// it before reading balances.
+pub async fn take_pplns_settlement_lock(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), DbError> {
+    crate::pool::take_xact_lock(tx, PPLNS_SETTLEMENT_LOCK).await
+}
+
 /// Load balances `FOR UPDATE` inside the settlement's transaction: it writes
 /// back absolute sums, so an unlocked read would undo a concurrent dust sweep.
 /// `ORDER BY address` fixes lock acquisition order to avoid deadlocks; every

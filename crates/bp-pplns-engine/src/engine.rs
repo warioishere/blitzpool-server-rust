@@ -18,7 +18,6 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -69,8 +68,6 @@ pub enum EngineError {
         actual_reward: u64,
         subsidy: u64,
     },
-    #[error("on_block_found already in flight — concurrent block-find for same engine")]
-    BlockFoundInProgress,
     #[error("invalid address in snapshot: {0}")]
     Address(#[from] InvalidAddressError),
 }
@@ -88,8 +85,7 @@ impl EngineError {
             EngineError::Redis(_)
             | EngineError::Window(_)
             | EngineError::Db(_)
-            | EngineError::Distribution(_)
-            | EngineError::BlockFoundInProgress => false,
+            | EngineError::Distribution(_) => false,
         }
     }
 }
@@ -107,7 +103,6 @@ struct Inner {
     touch_buffer: Arc<TouchBuffer>,
     config: PplnsEngineConfig,
     cancel_tx: watch::Sender<bool>,
-    block_found_in_progress: AtomicBool,
 }
 
 impl PplnsEngine {
@@ -190,7 +185,6 @@ impl PplnsEngine {
                 touch_buffer,
                 config,
                 cancel_tx,
-                block_found_in_progress: AtomicBool::new(false),
             }),
         })
     }
@@ -285,28 +279,6 @@ impl PplnsEngine {
         actual: &ActualCoinbase,
         snapshot: StoredWeightSnapshot,
     ) -> Result<ApplyDistributionResult, EngineError> {
-        if self
-            .inner
-            .block_found_in_progress
-            .swap(true, Ordering::SeqCst)
-        {
-            return Err(EngineError::BlockFoundInProgress);
-        }
-        let result = self
-            .on_block_found_inner(block_height, actual, snapshot)
-            .await;
-        self.inner
-            .block_found_in_progress
-            .store(false, Ordering::SeqCst);
-        result
-    }
-
-    async fn on_block_found_inner(
-        &self,
-        block_height: i32,
-        actual: &ActualCoinbase,
-        snapshot: StoredWeightSnapshot,
-    ) -> Result<ApplyDistributionResult, EngineError> {
         if let Err(subsidy) =
             actual.check_subsidy(block_height, self.inner.config.subsidy_halving_interval)
         {
@@ -324,13 +296,16 @@ impl PplnsEngine {
         }
         // The balance write is absolute, so `current` MUST be read `FOR UPDATE`
         // in the writing transaction, or a dust sweep committing in between is
-        // undone. The window read stays outside: it only picks late-arriver rows,
-        // and a Redis stall must not hold a PG transaction open.
+        // undone; the settlement lock covers what `FOR UPDATE` cannot, the rows
+        // a concurrent settlement is about to create. The window read stays
+        // outside: it only picks late-arriver rows, and a Redis stall must not
+        // hold a PG transaction open.
         let now_ms = chrono::Utc::now().timestamp_millis();
         let current_window = self.inner.window.read_window_by_address().await?;
         let addresses = Self::addresses_to_settle(&snapshot, actual);
 
         let mut tx = self.inner.pool.begin().await.map_err(LedgerError::from)?;
+        bp_db::take_pplns_settlement_lock(&mut tx).await?;
         let existing: HashMap<String, PplnsBalanceRow> =
             bp_db::find_pplns_balances_for_addresses_locked(&mut *tx, &addresses)
                 .await?
@@ -669,12 +644,5 @@ mod tests {
             ],
             "balance writes"
         );
-    }
-
-    #[test]
-    fn block_found_in_progress_error_is_displayable() {
-        let e = EngineError::BlockFoundInProgress;
-        let s = format!("{e}");
-        assert!(s.contains("in flight"), "got: {s}");
     }
 }

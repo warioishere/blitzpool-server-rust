@@ -1601,3 +1601,59 @@ async fn a_row_swept_between_freeze_and_apply_is_not_restored() {
     cleanup_addr(&h.pool, DORMANT, &[height]).await;
     drop_harness(h).await;
 }
+
+// ── Settlements are serialised by the database ─────────────────────
+// `FOR UPDATE` cannot lock a balance row that does not exist yet, so two
+// settlements crediting the same new miner would keep only one credit.
+
+#[tokio::test]
+async fn a_settlement_waits_while_another_holds_the_settlement_lock() {
+    let _guard = balance_table_lock().lock().await;
+    let h = match spawn_or_skip(5, "test_engine_lock_").await {
+        Some(h) => h,
+        None => return,
+    };
+    const ADDR_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    const REWARD: u64 = 312_500_000;
+    let height = 9_997_401;
+    cleanup_addr(&h.pool, ADDR_A, &[height]).await;
+    h.engine
+        .record_share(None, ADDR_A, 100.0, ts(1))
+        .await
+        .unwrap();
+    let dist = h.engine.build_distribution(REWARD).await.expect("build ok");
+    let snapshot = snapshot_for(&h.engine, &dist.payouts_fingerprint()).await;
+    let actual = actual_paying_exactly(&dist, REWARD);
+
+    // Another settlement, in this process or any other, holds the lock.
+    let mut holder = h.pool.acquire().await.expect("connection");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(bp_db::PPLNS_SETTLEMENT_LOCK)
+        .execute(&mut *holder)
+        .await
+        .expect("take the lock");
+
+    let engine = h.engine.clone();
+    let settle =
+        tokio::spawn(async move { engine.on_block_found(height, &actual, snapshot).await });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !settle.is_finished(),
+        "a settlement must wait while another one holds the settlement lock"
+    );
+
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(bp_db::PPLNS_SETTLEMENT_LOCK)
+        .execute(&mut *holder)
+        .await
+        .expect("release the lock");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), settle)
+        .await
+        .expect("the settlement proceeds once the lock is free")
+        .expect("task")
+        .expect("settled");
+    assert!(outcome.history_inserted >= 1, "settlement wrote its rows");
+
+    cleanup_addr(&h.pool, ADDR_A, &[height]).await;
+    drop_harness(h).await;
+}

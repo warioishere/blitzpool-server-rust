@@ -42,8 +42,9 @@ pub fn pending_row(address: AddressId, delta_sats: Sats) -> AuditRow {
 
 /// Book one block: audit rows plus absolute balances. An already-booked height
 /// writes nothing, since a replay would re-apply `current + delta` and pay twice.
-/// Runs in the caller's transaction, which must hold the rows under
-/// [`bp_db::find_pplns_balances_for_addresses_locked`] (also serializing concurrent applies).
+/// Runs in the caller's transaction, which must hold
+/// [`bp_db::take_pplns_settlement_lock`] and the rows under
+/// [`bp_db::find_pplns_balances_for_addresses_locked`].
 pub async fn apply_distribution(
     tx: &mut sqlx::PgConnection,
     block_height: i32,

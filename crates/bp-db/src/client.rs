@@ -387,19 +387,11 @@ where
 /// Any multi-row writer of `client_entity` MUST take this lock.
 const CLIENT_ENTITY_BULK_WRITE_LOCK: i64 = 0x636c_6e74_6277; // "clntbw"
 
-/// Take [`CLIENT_ENTITY_BULK_WRITE_LOCK`] for the rest of `tx`; the `_xact_`
-/// variant releases on rollback too, so an error cannot leak the lock.
+/// Take [`CLIENT_ENTITY_BULK_WRITE_LOCK`] for the rest of `tx`.
 pub(crate) async fn take_client_entity_bulk_write_lock(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<(), DbError> {
-    sqlx::query!(
-        "SELECT pg_advisory_xact_lock($1)",
-        CLIENT_ENTITY_BULK_WRITE_LOCK
-    )
-    .execute(&mut **tx)
-    .await
-    .map_err(DbError::from)?;
-    Ok(())
+    crate::pool::take_xact_lock(tx, CLIENT_ENTITY_BULK_WRITE_LOCK).await
 }
 
 /// Insert / upsert N client rows in one statement — the row-birth flush

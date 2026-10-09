@@ -88,3 +88,13 @@ pub enum DbError {
     #[error("unknown mining mode: {0}")]
     Mode(#[from] bp_common::UnknownMiningModeError),
 }
+
+/// Take advisory lock `key` until the caller's transaction ends; the
+/// `_xact_` variant releases on rollback too, so an error cannot leak it.
+pub(crate) async fn take_xact_lock(conn: &mut sqlx::PgConnection, key: i64) -> Result<(), DbError> {
+    sqlx::query!("SELECT pg_advisory_xact_lock($1)", key)
+        .execute(conn)
+        .await
+        .map_err(DbError::from)?;
+    Ok(())
+}
