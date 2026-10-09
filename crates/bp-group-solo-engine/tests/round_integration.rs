@@ -164,7 +164,7 @@ async fn reset_for_block_found_preserves_last_accepted_share_at() {
         .await
         .unwrap();
 
-    store.reset_for_block_found(group).await.unwrap();
+    store.reset_for_block_found(group, 1).await.unwrap();
 
     let mut conn = conn;
     let by_addr_exists: bool = conn.exists(key_by_address(group)).await.unwrap();
@@ -436,7 +436,7 @@ async fn a_redelivered_share_is_still_deduped_across_a_round_reset() {
         .await
         .expect("ok"));
     // …a block is found for the group and the round is wiped…
-    store.reset_for_block_found(group).await.unwrap();
+    store.reset_for_block_found(group, 1).await.unwrap();
     // …and only now does the batch get redelivered (the ack never landed).
     let replay = store
         .record_share(Some("ep9:7"), group, addr, 100.0, 1_700_000_000_000)

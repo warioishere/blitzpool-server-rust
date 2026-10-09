@@ -447,6 +447,7 @@ mod declared_block_booking_regtest {
     const DB_GROUP_BOOKS_THE_COINBASE: u8 = 21;
     const DB_GROUP_NO_OVERWRITE: u8 = 22;
     const DB_GROUP_REFUSES_WITHOUT_COINBASE: u8 = 23;
+    const DB_NO_SNAPSHOT: u8 = 30;
     const DB_LOST_SUBMIT: u8 = 0;
 
     /// The production default of `[pplns] confirmation_depth`.
@@ -1092,6 +1093,54 @@ mod declared_block_booking_regtest {
             "the conflict must PARK as unbookable, not report success — a silent \
              Ok lets the watcher drop a block whose miners were paid on-chain"
         );
+
+        c.teardown().await;
+    }
+
+    /// A parked PPLNS block whose settlement inputs were not resolved when it
+    /// was found can be booked by nothing. Once confirmed it moves to the
+    /// unbookable store instead of being dropped or retried forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pplns_block_without_its_snapshot_parks_as_unbookable() {
+        let Some(c) = Chain::setup(DB_NO_SNAPSHOT).await else {
+            return;
+        };
+        c.node
+            .generate_to_self(DEPTH)
+            .await
+            .expect("bury to confirmation depth");
+        let mut conn = c.redis.clone();
+        crate::pending_blocks::put_pending_block(
+            &mut conn,
+            &crate::pending_blocks::PendingBlock {
+                block_hash: c.block_hash.clone(),
+                found_at_ms: 0,
+                block_height: c.height as i32,
+                actual_coinbase: c.actual.clone(),
+                settlement: crate::pending_blocks::PendingSettlement::Pplns {
+                    weight_snapshot: None,
+                },
+            },
+        )
+        .await
+        .expect("park the block");
+        let unbookable_before = c.unbookable_count().await;
+
+        c.reconcile_once().await;
+
+        let still_pending =
+            crate::pending_blocks::count_pending_at(&mut conn, crate::pending_blocks::PENDING_KEY)
+                .await
+                .expect("count pending");
+        assert_eq!(
+            still_pending, 0,
+            "precondition: the watcher must have confirmed and handled the block"
+        );
+        assert!(
+            c.unbookable_count().await > unbookable_before,
+            "a block without its settlement inputs must PARK as unbookable, not be discarded"
+        );
+        assert!(c.coinbase_rows().await.is_empty(), "nothing booked");
 
         c.teardown().await;
     }

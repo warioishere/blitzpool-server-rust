@@ -491,10 +491,10 @@ impl GroupSoloEngine {
 
     /// Book a found block from its OWN coinbase, then move the round on. No
     /// settlement: withheld value goes to the pool ([`bp_pplns::WithheldValue::ToPool`]),
-    /// so what the coinbase paid is the whole truth. Idempotent via the
-    /// `(groupId, blockHeight, address)` UNIQUE key: only the call that books
-    /// the block moves the round on, so a redelivery or a concurrent second
-    /// apply leaves the shares mined since untouched.
+    /// so what the coinbase paid is the whole truth. Idempotent: the history
+    /// via the `(groupId, blockHeight, address)` UNIQUE key, the round reset
+    /// via [`crate::round::key_reset_height`], so a redelivery leaves the
+    /// shares mined since untouched and a retry completes an interrupted reset.
     pub async fn on_block_found(
         &self,
         group_id: Uuid,
@@ -556,19 +556,22 @@ impl GroupSoloEngine {
         )
         .await?;
 
-        if outcome.history_inserted == 0 {
-            info!(%group_id, block_height,
-                "group-solo: block already booked — round left as it stands");
-            return Ok(outcome);
-        }
         match mode {
             PayoutMode::Window => {
                 info!(%group_id,
                     "group-solo: window mode — no per-block round reset (window self-trims by age)");
             }
             PayoutMode::Prop if reset_on_block => {
-                if let Err(e) = self.inner.round.reset_for_block_found(&group_key).await {
-                    warn!(%group_id, error = %e, "round.reset_for_block_found failed — non-fatal");
+                // An error leaves the block pending: the history is booked,
+                // and the retry finishes the reset.
+                if !self
+                    .inner
+                    .round
+                    .reset_for_block_found(&group_key, block_height)
+                    .await?
+                {
+                    info!(%group_id, block_height,
+                        "group-solo: round already reset for this block — left as it stands");
                 }
             }
             PayoutMode::Prop => {

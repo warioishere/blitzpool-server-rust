@@ -41,6 +41,12 @@ pub fn key_best_share(group_id: &str) -> String {
 pub fn key_applied(group_id: &str) -> String {
     key(group_id, "applied")
 }
+/// Height of the block the round was last reset for, so each booked block
+/// resets it once: a redelivery finds its own height and leaves the round
+/// alone, a retry after a failed or interrupted reset finds another.
+pub fn key_reset_height(group_id: &str) -> String {
+    key(group_id, "reset-height")
+}
 
 // ── Window-mode keys (PayoutMode::Window only) ──────────────────────
 // Kept under the `groupsolo:{id}:` prefix so backup/restore covers them.
@@ -557,9 +563,20 @@ impl GroupRoundStore {
     // ── Round-reset paths ──────────────────────────────────────────
 
     /// Block-found reset: wipe round state but keep
-    /// `last-accepted-share-at` (the inactivity clock survives).
-    pub async fn reset_for_block_found(&self, group_id: &str) -> Result<(), RoundError> {
+    /// `last-accepted-share-at` (the inactivity clock survives). `false` when
+    /// the round was already reset for `block_height`. Compared for equality,
+    /// not order: heights start over on a fresh regtest chain.
+    pub async fn reset_for_block_found(
+        &self,
+        group_id: &str,
+        block_height: i32,
+    ) -> Result<bool, RoundError> {
         let mut conn = self.conn.clone();
+        let marker = key_reset_height(group_id);
+        let last: Option<i32> = conn.get(&marker).await?;
+        if last == Some(block_height) {
+            return Ok(false);
+        }
         let keys = vec![
             key_by_address(group_id),
             key_rejected_shares(group_id),
@@ -569,7 +586,9 @@ impl GroupRoundStore {
         ];
         let _: i64 = conn.del(keys).await?;
         self.delete_window_keys(&mut conn, group_id).await?;
-        Ok(())
+        // Last, so an interrupted reset is redone by the retry.
+        let _: () = conn.set(&marker, block_height).await?;
+        Ok(true)
     }
 
     /// Scheduled (calendar-aligned) reset: wipe everything including

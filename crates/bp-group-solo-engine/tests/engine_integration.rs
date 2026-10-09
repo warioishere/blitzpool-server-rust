@@ -530,6 +530,67 @@ async fn a_redelivered_apply_does_not_reset_the_round_again() {
     drop_harness(h).await;
 }
 
+// ── Test 3b6 — a retry completes a reset the first apply did not reach ──
+#[tokio::test]
+async fn a_retry_completes_a_reset_the_first_apply_did_not_reach() {
+    use bp_group_solo_engine::history::{apply_distribution, AuditRow};
+
+    let h = match spawn_or_skip(16, None).await {
+        Some(h) => h,
+        None => return,
+    };
+    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+    let reward = 312_500_000;
+    let height = 9_995_041;
+
+    h.engine
+        .record_share(None, h.group_id, finder.as_str(), 100.0, 1)
+        .await
+        .unwrap();
+    let booked = h
+        .engine
+        .build_distribution(h.group_id, reward, &finder)
+        .await
+        .expect("build");
+    let actual = actual_paying_exactly(&booked, reward);
+
+    // The first apply committed the block's history, then stopped before the
+    // round reset.
+    let rows = [AuditRow {
+        address: finder.clone(),
+        paid_sats: bp_common::Sats(actual.paid_by_address[finder.as_str()] as i64),
+        percent: 100.0,
+        shares_in_round: 100,
+        total_shares_in_round: 100,
+    }];
+    let first = apply_distribution(&h.pool, h.group_id, height, &rows, 1)
+        .await
+        .expect("history booked");
+    assert_eq!(
+        first.history_inserted, 1,
+        "precondition: the history is booked"
+    );
+    let before = h.engine.reader().round_stats(h.group_id).await.unwrap();
+    assert_eq!(
+        before.total_shares, 100.0,
+        "precondition: the round was not reset yet"
+    );
+
+    let retry = h
+        .engine
+        .on_block_found(h.group_id, height, &actual)
+        .await
+        .expect("the retry applies");
+    assert_eq!(retry.history_inserted, 0, "the retry books nothing twice");
+    let after = h.engine.reader().round_stats(h.group_id).await.unwrap();
+    assert_eq!(
+        after.total_shares, 0.0,
+        "the retry must finish the reset the first apply did not reach"
+    );
+
+    drop_harness(h).await;
+}
+
 // ── Test 3c — resetRoundOnBlock=false leaves the round intact ──────
 #[tokio::test]
 async fn on_block_found_keeps_round_when_reset_flag_false() {

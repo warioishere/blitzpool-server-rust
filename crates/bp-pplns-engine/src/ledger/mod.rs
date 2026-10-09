@@ -57,12 +57,7 @@ pub async fn apply_distribution(
     // silently); identical rows mean replaying moves nothing.
     let booked = bp_db::pplns_booked_rows_at_height(&mut *tx, block_height).await?;
     if !booked.is_empty() {
-        let mut want: Vec<(String, i64)> = rows
-            .iter()
-            .map(|r| (r.address.as_str().to_string(), r.paid_sats.0))
-            .collect();
-        want.sort();
-        if booked == want {
+        if is_replay(booked.clone(), rows) {
             return Ok(ApplyDistributionResult {
                 history_inserted: 0,
                 balances_affected: 0,
@@ -71,7 +66,7 @@ pub async fn apply_distribution(
         return Err(LedgerError::HeightBookedByAnotherBlock {
             block_height,
             booked_rows: booked.len(),
-            incoming_rows: want.len(),
+            incoming_rows: rows.len(),
         });
     }
 
@@ -108,6 +103,19 @@ pub async fn apply_distribution(
     })
 }
 
+/// Whether `rows` are exactly the rows already booked at their height. Both
+/// sides are sorted here: the database orders by its collation, which need
+/// not match byte order for mixed-case addresses.
+fn is_replay(mut booked: Vec<(String, i64)>, rows: &[AuditRow]) -> bool {
+    let mut want: Vec<(String, i64)> = rows
+        .iter()
+        .map(|r| (r.address.as_str().to_string(), r.paid_sats.0))
+        .collect();
+    booked.sort();
+    want.sort();
+    booked == want
+}
+
 /// Absolute new balance for one address. Separate from [`AuditRow`]: a block
 /// can touch a balance without a history row and vice versa.
 #[derive(Clone, Debug)]
@@ -120,6 +128,21 @@ pub struct BalanceWrite {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A replay is recognised whatever order the database returned the
+    /// booked rows in.
+    #[test]
+    fn a_replay_matches_regardless_of_the_database_row_order() {
+        let rows = [
+            pending_row(AddressId::new("1Bxx").unwrap(), Sats(100)),
+            pending_row(AddressId::new("1axx").unwrap(), Sats(200)),
+        ];
+        // A collation that ignores case first puts `1a…` before `1B…`.
+        let collation_order = vec![("1axx".to_string(), 200), ("1Bxx".to_string(), 100)];
+        assert!(is_replay(collation_order, &rows));
+        let other_block = vec![("1axx".to_string(), 200), ("1Bxx".to_string(), 99)];
+        assert!(!is_replay(other_block, &rows));
+    }
 
     #[test]
     fn pending_row_marks_zero_percent() {

@@ -132,12 +132,17 @@ pub(crate) async fn count_pending_at(
     conn.hlen(key).await
 }
 
-/// Hashes of every block still awaiting confirmation; unparsable fields
-/// included, since those are still parked too.
+/// Hashes of the parked blocks this version can settle. A blob that does not
+/// parse is left out, so the chain reconcile reports its block as unbooked
+/// instead of waiting on it forever.
 pub(crate) async fn pending_block_hashes(
     conn: &mut ConnectionManager,
 ) -> Result<std::collections::HashSet<String>, RedisError> {
-    conn.hkeys(PENDING_KEY).await
+    Ok(load_pending_blocks(conn)
+        .await?
+        .into_iter()
+        .map(|pb| pb.block_hash)
+        .collect())
 }
 
 /// Load every block in the pending store. A field that does not parse stays
@@ -192,7 +197,8 @@ mod tests {
     }
 
     /// The reconcile check looks a block up by the hash the chain reports, so
-    /// the store must key each parked block by exactly that hash.
+    /// the store must key each parked block by exactly that hash. A blob this
+    /// version cannot settle is not reported as parked.
     #[tokio::test]
     async fn a_parked_block_is_listed_by_its_hash_until_removed() {
         let Some(mut conn) = bp_test_support::connect_redis_in_range_or_skip(
@@ -221,10 +227,16 @@ mod tests {
         )
         .await
         .unwrap();
+        let _: () = conn
+            .hset(PENDING_KEY, "unreadable", r#"{"block_hash":"unreadable"}"#)
+            .await
+            .unwrap();
         assert_eq!(
             pending_block_hashes(&mut conn).await.unwrap(),
-            [hash.clone()].into()
+            [hash.clone()].into(),
+            "only the block this version can settle counts as parked"
         );
+        let _: () = conn.hdel(PENDING_KEY, "unreadable").await.unwrap();
 
         remove_pending_block(&mut conn, &hash).await.unwrap();
         assert!(pending_block_hashes(&mut conn).await.unwrap().is_empty());
