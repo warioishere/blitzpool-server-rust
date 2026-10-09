@@ -24,9 +24,7 @@ use crate::config::{ConfigError, GroupSoloEngineConfig};
 use crate::distribution::{
     BuiltDistribution, DistributionBuilder, DistributionConfig, DistributionError,
 };
-use crate::history::{
-    apply_distribution, ApplyDistributionResult, AuditRow, GroupPayoutRowType, LedgerError,
-};
+use crate::history::{apply_distribution, ApplyDistributionResult, AuditRow, LedgerError};
 use crate::reset::{spawn_per_group_task, GroupResetRunner, ResetError, ResetSchedule};
 
 use crate::round::{GroupRoundStore, RoundError, WINDOW_BUCKET_MS};
@@ -625,7 +623,6 @@ fn history_rows_from_coinbase(
                 .map(|f| f.round() as i64)
                 .unwrap_or(0),
             total_shares_in_round,
-            row_type: GroupPayoutRowType::Coinbase,
         });
     }
 

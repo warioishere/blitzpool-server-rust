@@ -10,13 +10,12 @@ use bp_db::{bulk_insert_pplns_group_block_history, GroupPayoutHistoryInsert};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-// Shared with PPLNS so the rowType wire strings have one source of truth.
-pub use bp_coinbase_snapshot::{
-    ApplyDistributionResult, LedgerError, PayoutRowType as GroupPayoutRowType,
-};
+use bp_coinbase_snapshot::PayoutRowType;
+pub use bp_coinbase_snapshot::{ApplyDistributionResult, LedgerError};
 
-/// One row in the payout history. `sharesInRound` + `totalSharesInRound`
-/// record the round split the coinbase was built from.
+/// One row in the payout history, always a coinbase payment: Group-Solo books
+/// nothing besides what the coinbase paid. `sharesInRound` +
+/// `totalSharesInRound` record the round split the coinbase was built from.
 #[derive(Clone, Debug)]
 pub struct AuditRow {
     pub address: AddressId,
@@ -24,7 +23,6 @@ pub struct AuditRow {
     pub percent: f32,
     pub shares_in_round: i64,
     pub total_shares_in_round: i64,
-    pub row_type: GroupPayoutRowType,
 }
 
 /// Write one block's payout history for one group in one transaction. A
@@ -48,7 +46,7 @@ pub async fn apply_distribution(
             percent: r.percent,
             shares_in_round: r.shares_in_round,
             total_shares_in_round: r.total_shares_in_round,
-            row_type: r.row_type.as_wire().to_string(),
+            row_type: PayoutRowType::Coinbase.as_wire().to_string(),
             created_at_ms: now_ms,
         })
         .collect();
@@ -60,16 +58,4 @@ pub async fn apply_distribution(
         history_inserted,
         balances_affected: 0,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn payout_row_type_wire_strings_are_stable() {
-        assert_eq!(GroupPayoutRowType::Coinbase.as_wire(), "coinbase");
-        assert_eq!(GroupPayoutRowType::Pending.as_wire(), "pending");
-        assert_eq!(GroupPayoutRowType::DustSweep.as_wire(), "dust-sweep");
-    }
 }
