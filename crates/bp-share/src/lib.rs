@@ -293,18 +293,6 @@ pub struct ExtraProjection {
     pub divisor: u128,
 }
 
-/// Folds a ledger into the pairs [`project_extras`] consumes. Trivial but
-/// shared, because build and settlement must agree to the satoshi. The
-/// Group-Solo finder bonus is score weight, not a satoshi extra.
-pub fn extras_from_ledger<'a>(
-    entries: impl IntoIterator<Item = (&'a str, u64, i64)>,
-) -> Vec<(u64, i64)> {
-    entries
-        .into_iter()
-        .map(|(_address, score_weight, balance_sats)| (score_weight, balance_sats))
-        .collect()
-}
-
 /// Resolves signed per-address ledger extras into what the block can honour:
 /// scaled pro rata to the solvency cap, and each debt floored at what its
 /// own payout is worth (the rest stays on the ledger), else the block pays

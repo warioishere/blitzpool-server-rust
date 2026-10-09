@@ -18,7 +18,7 @@ pub use actual::ActualCoinbase;
 pub use budget::{
     is_wrongtype, read_coinbase_budget, write_coinbase_budget, PPLNS_COINBASE_BUDGET_KEY,
 };
-pub use build::{sanitize_and_build, BuildRequest, BuiltDistribution};
+pub use build::{build_with_bootstrap, BuildRequest, BuiltDistribution};
 pub use ledger::{ApplyDistributionResult, LedgerError, PayoutRowType};
 
 /// Redis per-address share aggregate (`address → diff-1 sum`) into the

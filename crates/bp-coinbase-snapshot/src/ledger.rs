@@ -28,16 +28,6 @@ impl PayoutRowType {
             Self::DustSweep => "dust-sweep",
         }
     }
-
-    /// Inverse of [`Self::as_wire`]. `None` for an unrecognised string.
-    pub fn from_wire(s: &str) -> Option<Self> {
-        match s {
-            "coinbase" => Some(Self::Coinbase),
-            "pending" => Some(Self::Pending),
-            "dust-sweep" => Some(Self::DustSweep),
-            _ => None,
-        }
-    }
 }
 
 /// Error from an apply-distribution transaction.

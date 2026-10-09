@@ -12,12 +12,10 @@ use bitcoin::{Address, Network, Transaction};
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ActualCoinbase {
     /// Address → sats the coinbase paid it, EXCLUDING the pool output
-    /// (output 0). Aggregated per address, so a script paid twice
-    /// counts once with the sum.
+    /// (`pay_P`, output 0 by §4 order), so a fee address that also mines
+    /// shows only its miner output. Aggregated per address, so a script
+    /// paid twice counts once with the sum.
     pub paid_by_address: HashMap<String, u64>,
-    /// The pool output (`pay_P`, output 0 by §4 order), kept apart because
-    /// the fee address may also mine and its two outputs must not blend.
-    pub pool_paid_sats: u64,
     /// `Σ` of ALL output values = the block's actual revenue `T`.
     pub total_value_sats: u64,
 }
@@ -29,13 +27,11 @@ impl ActualCoinbase {
     /// value under §4 and are counted only into `total_value_sats`.
     pub fn from_coinbase(coinbase: &Transaction, network: Network) -> Self {
         let mut paid_by_address: HashMap<String, u64> = HashMap::new();
-        let mut pool_paid_sats = 0u64;
         let mut total_value_sats = 0u64;
         for (index, output) in coinbase.output.iter().enumerate() {
             let sats = output.value.to_sat();
             total_value_sats = total_value_sats.saturating_add(sats);
             if index == 0 {
-                pool_paid_sats = sats;
                 continue;
             }
             if sats == 0 {
@@ -47,8 +43,20 @@ impl ActualCoinbase {
         }
         Self {
             paid_by_address,
-            pool_paid_sats,
             total_value_sats,
+        }
+    }
+
+    /// The one hard settlement gate, shared by every engine that books from
+    /// a coinbase: one paying less than its own subsidy forfeited money no
+    /// healthy template would, so it is not booked unattended. `Err` carries
+    /// the subsidy it fell short of.
+    pub fn check_subsidy(&self, block_height: i32, halving_interval: u32) -> Result<(), u64> {
+        let subsidy = bp_share::block_subsidy_sats(block_height, halving_interval);
+        if self.total_value_sats < subsidy {
+            Err(subsidy)
+        } else {
+            Ok(())
         }
     }
 
@@ -106,7 +114,6 @@ mod tests {
             },
         ]);
         let actual = ActualCoinbase::from_coinbase(&tx, Network::Bitcoin);
-        assert_eq!(actual.pool_paid_sats, 400);
         assert_eq!(actual.total_value_sats, 1000);
         assert_eq!(actual.paid_by_address.len(), 1);
         assert_eq!(actual.paid_by_address[MINER], 600);
@@ -116,7 +123,6 @@ mod tests {
     fn percent_of_total_is_share_of_actual_revenue() {
         let actual = ActualCoinbase {
             paid_by_address: HashMap::new(),
-            pool_paid_sats: 0,
             total_value_sats: 3_125_004_321,
         };
         for paid in [0u64, 1, 546, 1_000_000, 1_562_502_160, 3_125_004_321] {
@@ -127,7 +133,6 @@ mod tests {
         }
         let empty = ActualCoinbase {
             paid_by_address: HashMap::new(),
-            pool_paid_sats: 0,
             total_value_sats: 0,
         };
         assert_eq!(empty.percent_of_total(600), 0.0);
@@ -147,8 +152,10 @@ mod tests {
             },
         ]);
         let actual = ActualCoinbase::from_coinbase(&tx, Network::Bitcoin);
-        assert_eq!(actual.pool_paid_sats, 400);
-        assert_eq!(actual.paid_by_address[FEE], 600);
+        assert_eq!(
+            actual.paid_by_address[FEE], 600,
+            "only the miner output, the pool output stays out"
+        );
     }
 
     /// Duplicate miner outputs aggregate per address.

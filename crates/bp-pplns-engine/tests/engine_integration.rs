@@ -10,6 +10,7 @@
 use bp_common::AddressId;
 use bp_pplns_engine::config::PplnsEngineConfig;
 use bp_pplns_engine::engine::PplnsEngine;
+use bp_pplns_engine::window::snapshot::resolve_snapshot_for_block_found;
 use bp_pplns_engine::window::NetworkDifficulty;
 use redis::{aio::ConnectionManager, Client};
 use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -156,7 +157,6 @@ fn actual_paying_exactly(
     }
     bp_coinbase_snapshot::ActualCoinbase {
         paid_by_address,
-        pool_paid_sats: entries[0].1,
         total_value_sats: t,
     }
 }
@@ -284,12 +284,12 @@ async fn on_block_found_applies_distribution_from_snapshot() {
     assert!(count.0 >= 1, "audit row present in PG");
 
     // The snapshot survives the apply: it serves every block of this distribution.
-    let snap = h
-        .engine
-        .window()
-        .read_weight_snapshot_for(&result.payouts_fingerprint())
-        .await
-        .expect("ok");
+    let snap = resolve_snapshot_for_block_found(
+        &mut h.engine.window().connection_for_snapshot(),
+        &result.payouts_fingerprint(),
+    )
+    .await
+    .expect("ok");
     assert!(snap.is_some(), "weight snapshot outlives the apply");
 
     let _ = sqlx::query(r#"DELETE FROM pplns_payout_history WHERE "blockHeight" = $1"#)
@@ -785,27 +785,6 @@ async fn reader_ledger_summary_aggregates_open_balances() {
     drop_harness(h).await;
 }
 
-// ── Test 6 — fee_config returns engine settings synchronously ──────
-
-#[tokio::test]
-async fn reader_fee_config_returns_engine_settings() {
-    let h = match spawn_or_skip(5, "test_engine_fees_").await {
-        Some(h) => h,
-        None => return,
-    };
-    let cfg = h.engine.reader().fee_config();
-    assert_eq!(cfg.min_payout_sats, 5_000); // default
-    assert_eq!(cfg.coinbase_weight_budget, 50_000); // default
-    assert_eq!(cfg.fee_percent, 0.0); // default
-    assert_eq!(
-        cfg.fee_address.as_deref(),
-        Some(TEST_FEE_ADDRESS),
-        "the harness fee anchor must surface through the reader"
-    );
-
-    drop_harness(h).await;
-}
-
 // ── Test 7 — current_distribution sorts descending by share count ──
 
 #[tokio::test]
@@ -1219,9 +1198,7 @@ async fn a_redelivered_apply_books_nothing_and_the_snapshot_outlives_its_block()
         .expect("prepare ok");
 
     assert!(
-        h.engine
-            .window()
-            .read_weight_snapshot_for(&fp)
+        resolve_snapshot_for_block_found(&mut h.engine.window().connection_for_snapshot(), &fp)
             .await
             .expect("read ok")
             .is_some(),
@@ -1312,12 +1289,13 @@ async fn a_block_frozen_before_an_earlier_apply_still_books_correctly() {
     );
 
     assert!(
-        h.engine
-            .window()
-            .read_weight_snapshot_for(&fp_second)
-            .await
-            .expect("read ok")
-            .is_some(),
+        resolve_snapshot_for_block_found(
+            &mut h.engine.window().connection_for_snapshot(),
+            &fp_second
+        )
+        .await
+        .expect("read ok")
+        .is_some(),
         "the shared weight snapshot must survive the first apply"
     );
     let _prepared_second = h

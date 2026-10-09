@@ -122,13 +122,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn payout_row_type_wire_strings_are_correct() {
-        assert_eq!(PayoutRowType::Coinbase.as_wire(), "coinbase");
-        assert_eq!(PayoutRowType::Pending.as_wire(), "pending");
-        assert_eq!(PayoutRowType::DustSweep.as_wire(), "dust-sweep");
-    }
-
-    #[test]
     fn pending_row_marks_zero_percent() {
         let row = pending_row(AddressId::new("bc1qbar").unwrap(), Sats(-2_500));
         assert_eq!(row.percent, 0.0);

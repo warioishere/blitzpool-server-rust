@@ -11,12 +11,6 @@ use std::time::Duration;
 use redis::{aio::ConnectionManager, AsyncCommands, RedisError};
 use tracing::warn;
 
-/// Delete a snapshot key (called after `on_block_found` consumed it).
-pub async fn delete_snapshot(conn: &mut ConnectionManager, key: &str) -> Result<(), RedisError> {
-    let _: () = conn.del(key).await?;
-    Ok(())
-}
-
 // ===========================================================================
 // Weight snapshot (schema 3) — settlement INPUTS, not satoshi outcomes
 // ===========================================================================
@@ -64,11 +58,11 @@ impl StoredWeightSnapshot {
     /// Recomputed rather than stored so build and settlement share one
     /// [`bp_share::project_extras`] and cannot drift apart.
     pub fn extras_total(&self) -> i64 {
-        let extras = bp_share::extras_from_ledger(
-            self.entries
-                .iter()
-                .map(|e| (e.address.as_str(), e.score_weight, e.balance_sats)),
-        );
+        let extras: Vec<(u64, i64)> = self
+            .entries
+            .iter()
+            .map(|e| (e.score_weight, e.balance_sats))
+            .collect();
         bp_share::project_extras(
             &extras,
             self.score_total,
@@ -89,7 +83,7 @@ impl StoredWeightSnapshot {
                     score_weight: e.score_weight,
                     balance_sats: e.balance_sats,
                     wire_weight: e.wire_weight,
-                    dust_limit: e.dust_limit,
+                    dust_limit: bp_pplns::DUST_LIMIT_SATS as u32,
                 })
                 .collect(),
             weight_p: d.weight_p,
@@ -365,7 +359,7 @@ mod tests {
             fee_percent: 1.0,
             fee_address: &fee,
             coinbase_weight_budget: 50_000,
-            min_payout_sats: Some(Sats(5_000)),
+            min_payout_sats: Sats(5_000),
             finder_bonus_ppm: 0,
             finder_address: None,
             reference_revenue_sats: 312_500_000,
@@ -410,7 +404,7 @@ mod tests {
                 fee_percent: 1.5,
                 fee_address: &fee,
                 coinbase_weight_budget: 50_000,
-                min_payout_sats: Some(Sats(5_000)),
+                min_payout_sats: Sats(5_000),
                 finder_bonus_ppm: bonus_ppm,
                 finder_address: Some(&a1),
                 reference_revenue_sats: 312_500_000,

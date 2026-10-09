@@ -31,9 +31,6 @@ pub struct WindowStats {
     pub window_size: f64,
     /// Distinct addresses currently contributing.
     pub miner_count: u32,
-    /// Engine's view of network difficulty; the TDP template stream is
-    /// the source of truth.
-    pub network_difficulty: f64,
 }
 
 impl ReaderView<'_> {
@@ -41,17 +38,10 @@ impl ReaderView<'_> {
         let by_addr = self.engine.window().read_window_by_address().await?;
         let total_shares: f64 = by_addr.values().sum();
         let window_size = self.engine.window().window_size();
-        let network_difficulty = window_size
-            / if self.engine.config().window_factor > 0.0 {
-                self.engine.config().window_factor
-            } else {
-                1.0
-            };
         Ok(WindowStats {
             total_shares,
             window_size,
             miner_count: by_addr.len() as u32,
-            network_difficulty,
         })
     }
 }
@@ -224,27 +214,5 @@ impl ReaderView<'_> {
             lifetime_paid_sats: agg.lifetime_paid_sats,
             abandoned_balance_days: cfg.abandoned_balance_days,
         })
-    }
-}
-
-// ── Fee configuration (synchronous; no I/O) ───────────────────────
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct FeeConfig {
-    pub fee_address: Option<String>,
-    pub fee_percent: f64,
-    pub min_payout_sats: i64,
-    pub coinbase_weight_budget: u32,
-}
-
-impl ReaderView<'_> {
-    pub fn fee_config(&self) -> FeeConfig {
-        let cfg = self.engine.config();
-        FeeConfig {
-            fee_address: cfg.fee_address.as_ref().map(|a| a.as_str().to_string()),
-            fee_percent: cfg.fee_percent,
-            min_payout_sats: cfg.min_payout_sats.0,
-            coinbase_weight_budget: cfg.coinbase_weight_budget,
-        }
     }
 }

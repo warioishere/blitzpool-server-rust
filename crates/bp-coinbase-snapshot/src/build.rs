@@ -1,22 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! The one weight build both payout engines run: drop unusable addresses and
-//! project onto weights ([`sanitize_and_build`]). One copy keeps the modes
-//! from drifting; share sourcing, caching, persistence and post-build steps
-//! stay per engine.
+//! The one weight build both payout engines run ([`build_with_bootstrap`]). One
+//! copy keeps the modes from drifting; share sourcing, caching, persistence
+//! and post-build steps stay per engine. Unusable addresses are dropped by
+//! the builder itself.
 
 use std::collections::HashMap;
 
 use bp_common::{AddressId, Sats};
 use bp_pplns::{
-    build_weight_distribution, is_valid_payout_address, WeightBuildError, WeightDistribution,
-    WeightDistributionInput, WithheldValue,
+    build_weight_distribution, WeightBuildError, WeightDistribution, WeightDistributionInput,
+    WithheldValue,
 };
 use tracing::warn;
 
 /// Everything the weight model needs that the two modes disagree on.
-/// The share and balance maps come in by value because the sanitize pass
-/// consumes them; both callers build them fresh per build anyway.
+/// The share map comes in by value because the bootstrap may add the
+/// claimant to it; both callers build it fresh per build anyway.
 pub struct BuildRequest<'a> {
     pub address_shares: HashMap<AddressId, f64>,
     /// Signed ledger balances. Group-Solo passes an empty map — it keeps
@@ -58,31 +58,11 @@ impl BuiltDistribution {
     }
 }
 
-/// Sanitize and build, applying the empty-source bootstrap. Pure, no I/O, so
-/// every decision that moves satoshis is testable without Redis.
-pub fn sanitize_and_build(
+/// Build, applying the empty-source bootstrap. Pure, no I/O, so every
+/// decision that moves satoshis is testable without Redis.
+pub fn build_with_bootstrap(
     mut req: BuildRequest<'_>,
 ) -> Result<WeightDistribution, WeightBuildError> {
-    // One unparseable address would fail `address_to_script` and with it
-    // every miner's job; the dropped row is not paid this block (PPLNS keeps
-    // it in the ledger).
-    let shares_before = req.address_shares.len();
-    let balances_before = req.balances.len();
-    req.address_shares
-        .retain(|a, _| is_valid_payout_address(a.as_str()));
-    req.balances
-        .retain(|a, _| is_valid_payout_address(a.as_str()));
-    let shares_dropped = shares_before - req.address_shares.len();
-    let balances_dropped = balances_before - req.balances.len();
-    if shares_dropped + balances_dropped > 0 {
-        warn!(
-            scope = req.scope,
-            shares_dropped,
-            balances_dropped,
-            "distribution: dropped unparseable payout addresses before the coinbase build"
-        );
-    }
-
     // Owned apart from `req` so the retry can add the claimant while `build`
     // borrows the rest.
     let mut shares = std::mem::take(&mut req.address_shares);
@@ -93,7 +73,7 @@ pub fn sanitize_and_build(
             fee_percent: req.fee_percent,
             fee_address: req.fee_address,
             coinbase_weight_budget: req.coinbase_weight_budget,
-            min_payout_sats: Some(req.min_payout_sats),
+            min_payout_sats: req.min_payout_sats,
             finder_bonus_ppm: req.finder_bonus_ppm,
             finder_address: req.finder_address,
             reference_revenue_sats: req.reference_revenue_sats,
@@ -179,7 +159,7 @@ mod bootstrap_tests {
     fn an_empty_source_with_a_claimant_pays_that_miner_not_the_pool() {
         let fee = addr(FEE);
         let claimant = addr(MINER);
-        let d = sanitize_and_build(request(
+        let d = build_with_bootstrap(request(
             HashMap::new(),
             HashMap::new(),
             &fee,
@@ -233,7 +213,7 @@ mod bootstrap_tests {
     fn an_empty_source_without_a_claimant_stays_refused() {
         let fee = addr(FEE);
         assert_eq!(
-            sanitize_and_build(request(HashMap::new(), HashMap::new(), &fee, None)),
+            build_with_bootstrap(request(HashMap::new(), HashMap::new(), &fee, None)),
             Err(WeightBuildError::NoScoredMiners)
         );
     }
@@ -243,7 +223,7 @@ mod bootstrap_tests {
     fn a_populated_source_ignores_the_claimant() {
         let fee = addr(FEE);
         let claimant = addr(MINER);
-        let d = sanitize_and_build(request(
+        let d = build_with_bootstrap(request(
             HashMap::from([(addr(OTHER), 1.0)]),
             HashMap::new(),
             &fee,
@@ -259,12 +239,13 @@ mod bootstrap_tests {
         );
     }
 
-    /// A source empty only after sanitizing bootstraps too.
+    /// A source empty only after the builder drops its unpayable addresses
+    /// bootstraps too.
     #[test]
     fn a_source_of_only_unpayable_addresses_bootstraps_too() {
         let fee = addr(FEE);
         let claimant = addr(MINER);
-        let d = sanitize_and_build(request(
+        let d = build_with_bootstrap(request(
             HashMap::from([(AddressId::new("synthseed800001").unwrap(), 100.0)]),
             HashMap::new(),
             &fee,
@@ -280,7 +261,7 @@ mod bootstrap_tests {
         const CREDIT: i64 = 10_000_000;
         let fee = addr(FEE);
         let claimant = addr(MINER);
-        let d = sanitize_and_build(request(
+        let d = build_with_bootstrap(request(
             HashMap::new(),
             HashMap::from([(addr(OTHER), Sats(CREDIT))]),
             &fee,

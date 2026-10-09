@@ -62,17 +62,9 @@ impl ProductionPayoutResolver {
         }
     }
 
-    /// Resolution core for SV1 and SV2. The flag says whether a block found on
-    /// this list could be booked (for PPLNS: the list came from the engine AND
-    /// its snapshot landed); one call yields both, so they agree.
-    async fn resolve_internal(
-        &self,
-        miner_address: &str,
-        reward_sats: u64,
-    ) -> (ResolvedPayouts, bool) {
-        let result = self.mode_gate.lookup_mode(miner_address);
-        let vouchable = books_without_a_snapshot(result.mode());
-        match result {
+    /// Resolution core for SV1 and SV2.
+    async fn resolve_internal(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts {
+        match self.mode_gate.lookup_mode(miner_address) {
             MiningModeResult::Solo => {
                 // An admin of an unconfirmed Blockparty routes as Solo but
                 // the coinbase pays the pool-fee address, so the admin cannot
@@ -81,28 +73,23 @@ impl ProductionPayoutResolver {
                     .blockparty_pending_fee_route(miner_address, reward_sats)
                     .await
                 {
-                    return (ResolvedPayouts::unsnapshotted(route), vouchable);
+                    return ResolvedPayouts::unsnapshotted(route);
                 }
-                (
-                    ResolvedPayouts::unsnapshotted(solo_payouts(
-                        miner_address,
-                        &self.solo_fee,
-                        reward_sats,
-                    )),
-                    vouchable,
-                )
+                ResolvedPayouts::unsnapshotted(solo_payouts(
+                    miner_address,
+                    &self.solo_fee,
+                    reward_sats,
+                ))
             }
             MiningModeResult::Pplns => self.pplns_payouts(miner_address, reward_sats).await,
             MiningModeResult::Blockparty(group_id) => {
-                let resolved = blockparty_payouts(
+                blockparty_payouts(
                     self.blockparty.as_deref().map(BlockpartyService::payouts),
                     miner_address,
                     reward_sats,
                     group_id,
                 )
-                .await;
-                let bookable = vouchable && !resolved.is_none();
-                (resolved, bookable)
+                .await
             }
             MiningModeResult::GroupSolo(group_id) => {
                 self.group_solo_payouts(miner_address, reward_sats, group_id)
@@ -112,17 +99,17 @@ impl ProductionPayoutResolver {
     }
 }
 
-/// A PPLNS or Group-Solo build as this template's coinbase list, plus whether a
-/// block found on it can be booked. Evaluated with ext 0x0003/Payout Computation
-/// at this template's revenue, the same formula a JDC runs with its own. An
-/// unbookable build still stands: failing would hand this miner the whole block.
+/// A PPLNS or Group-Solo build as this template's coinbase list, evaluated with
+/// ext 0x0003/Payout Computation at this template's revenue, the same formula a
+/// JDC runs with its own. An unbookable build still stands: failing would hand
+/// this miner the whole block.
 fn lower_built(
     scope: &'static str,
     group_id: Option<Uuid>,
     built: &BuiltDistribution,
     miner_address: &str,
     reward_sats: u64,
-) -> (ResolvedPayouts, bool) {
+) -> ResolvedPayouts {
     if !built.bookable {
         warn!(
             scope,
@@ -134,19 +121,16 @@ fn lower_built(
         );
     }
     match built.distribution.payout_entries_at(reward_sats) {
-        Ok(entries) => (
-            ResolvedPayouts {
-                entries: entries
-                    .into_iter()
-                    .map(|(address, sats)| PayoutEntry {
-                        address: address.into_inner(),
-                        sats,
-                    })
-                    .collect(),
-                payouts_fingerprint: built.payouts_fingerprint(),
-            },
-            built.bookable,
-        ),
+        Ok(entries) => ResolvedPayouts {
+            entries: entries
+                .into_iter()
+                .map(|(address, sats)| PayoutEntry {
+                    address: address.into_inner(),
+                    sats,
+                })
+                .collect(),
+            payouts_fingerprint: built.payouts_fingerprint(),
+        },
         Err(err) => {
             error!(
                 %err,
@@ -156,7 +140,7 @@ fn lower_built(
                 reward_sats,
                 "ext 0x0003/Payout Computation evaluation failed; serving NO JOB"
             );
-            (ResolvedPayouts::none(), false)
+            ResolvedPayouts::none()
         }
     }
 }
@@ -195,17 +179,6 @@ async fn blockparty_payouts(
             );
             ResolvedPayouts::none()
         }
-    }
-}
-
-/// Can a block on this mode be booked without resolving a distribution snapshot?
-/// Solo books no ledger row, Blockparty recomputes its splits and Group-Solo
-/// books from the coinbase alone, so yes. PPLNS settles from the snapshot this
-/// exact list was stored under, and a fallback list names one never written.
-fn books_without_a_snapshot(mode: MiningMode) -> bool {
-    match mode {
-        MiningMode::Solo | MiningMode::Blockparty | MiningMode::GroupSolo => true,
-        MiningMode::Pplns => false,
     }
 }
 
@@ -274,18 +247,13 @@ fn is_empty_share_window(err: &bp_pplns_engine::engine::EngineError) -> bool {
 }
 
 impl ProductionPayoutResolver {
-    /// Returns the list and its bookable flag; see [`Self::resolve_internal`].
-    async fn pplns_payouts(
-        &self,
-        miner_address: &str,
-        reward_sats: u64,
-    ) -> (ResolvedPayouts, bool) {
+    async fn pplns_payouts(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts {
         let Some(pplns) = self.pplns.as_ref() else {
             error!(
                 miner_address,
                 "PPLNS mode in gate but `[pplns]` is absent from config; serving NO JOB"
             );
-            return (ResolvedPayouts::none(), false);
+            return ResolvedPayouts::none();
         };
         // The pool-wide build is shared and cannot name a claimant; an empty
         // window (`NoScoredMiners`) is answered per-miner below.
@@ -337,7 +305,7 @@ impl ProductionPayoutResolver {
         };
         match built {
             Some(result) => lower_built("PPLNS", None, &result, miner_address, reward_sats),
-            None => (ResolvedPayouts::none(), false),
+            None => ResolvedPayouts::none(),
         }
     }
 
@@ -354,20 +322,19 @@ impl ProductionPayoutResolver {
         Some(pending_fee_route_payouts(route, reward_sats))
     }
 
-    /// Returns the list and its bookable flag; see [`Self::resolve_internal`].
     async fn group_solo_payouts(
         &self,
         miner_address: &str,
         reward_sats: u64,
         group_id: Uuid,
-    ) -> (ResolvedPayouts, bool) {
+    ) -> ResolvedPayouts {
         let Some(group_solo) = self.group_solo.as_ref() else {
             error!(
                 miner_address,
                 %group_id,
                 "Group-Solo mode in gate but `[group_solo]` is absent from config; serving NO JOB"
             );
-            return (ResolvedPayouts::none(), false);
+            return ResolvedPayouts::none();
         };
         // The connecting miner is the finder for the group's finder bonus.
         let finder = match AddressId::new(miner_address.to_string()) {
@@ -377,7 +344,7 @@ impl ProductionPayoutResolver {
                     miner_address,
                     "GroupSolo miner address failed AddressId parse; serving NO JOB"
                 );
-                return (ResolvedPayouts::none(), false);
+                return ResolvedPayouts::none();
             }
         };
         match group_solo
@@ -399,7 +366,7 @@ impl ProductionPayoutResolver {
                     reward_sats,
                     "Group-Solo distribution build failed; serving NO JOB until it succeeds"
                 );
-                (ResolvedPayouts::none(), false)
+                ResolvedPayouts::none()
             }
         }
     }
@@ -410,8 +377,7 @@ impl ProductionPayoutResolver {
 #[async_trait]
 impl bp_stratum_v1::PayoutResolver for ProductionPayoutResolver {
     async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts {
-        // Building a job needs the list, not the accounting promise.
-        self.resolve_internal(miner_address, reward_sats).await.0
+        self.resolve_internal(miner_address, reward_sats).await
     }
 
     fn resolve_stream(&self, miner_address: &str) -> bp_common::StreamKind {
@@ -430,7 +396,6 @@ impl bp_stratum_v2::hooks::PayoutResolver for ProductionPayoutResolver {
     ) -> ResolvedPayouts {
         self.resolve_internal(miner_address.as_str(), reward_sats)
             .await
-            .0
     }
 
     fn resolve_stream(&self, miner_address: &AddressId) -> bp_common::StreamKind {
@@ -490,7 +455,7 @@ impl ProductionDistributionSource {
                 script_pubkey: script,
                 weight: entry.wire_weight,
             });
-            dust_limits.push(entry.dust_limit);
+            dust_limits.push(bp_pplns::DUST_LIMIT_SATS as u32);
         }
         Some(bp_stratum_v2::bridge::BuiltPayoutDistribution {
             pool_payout: bp_stratum_v2::jdp::payout_distribution::WeightedOutput {
@@ -737,25 +702,6 @@ mod tests {
     use super::*;
 
     const TEST_REWARD: u64 = 5_000_000_000;
-
-    /// Only PPLNS needs a snapshot to book. The flag gates the whole
-    /// block-found emission, not just a snapshot lookup.
-    #[test]
-    fn the_modes_that_resolve_no_snapshot_can_always_be_booked() {
-        assert!(
-            books_without_a_snapshot(MiningMode::Solo),
-            "solo writes no engine ledger row — nothing a fallback could invalidate"
-        );
-        assert!(
-            books_without_a_snapshot(MiningMode::Blockparty),
-            "blockparty recomputes its splits and keys on the block hash"
-        );
-        assert!(
-            books_without_a_snapshot(MiningMode::GroupSolo),
-            "group-solo books what the coinbase paid and keeps no ledger"
-        );
-        assert!(!books_without_a_snapshot(MiningMode::Pplns));
-    }
 
     /// Pins the full mode → JDP distribution map, every mode named.
     #[test]
@@ -1006,7 +952,7 @@ mod tests {
     }
 
     /// Pins what PPLNS and Group-Solo hand the job builder: the §4 list at
-    /// this revenue, the fingerprint, and bookable only with the snapshot.
+    /// this revenue and the fingerprint, with or without the snapshot.
     #[test]
     fn a_built_distribution_lowers_to_its_payout_list() {
         use std::collections::HashMap;
@@ -1020,7 +966,7 @@ mod tests {
             fee_percent: 1.5,
             fee_address: &fee,
             coinbase_weight_budget: 50_000,
-            min_payout_sats: Some(Sats(5_000)),
+            min_payout_sats: Sats(5_000),
             finder_bonus_ppm: 0,
             finder_address: None,
             reference_revenue_sats: TEST_REWARD,
@@ -1045,7 +991,7 @@ mod tests {
                 distribution: distribution.clone(),
                 bookable: promised,
             };
-            let (resolved, bookable) = lower_built("PPLNS", None, &built, "m", reward);
+            let resolved = lower_built("PPLNS", None, &built, "m", reward);
             let got: Vec<(String, u64)> = resolved
                 .entries
                 .into_iter()
@@ -1056,7 +1002,6 @@ mod tests {
                 "the coinbase stands with or without the snapshot"
             );
             assert_eq!(resolved.payouts_fingerprint, distribution.fingerprint);
-            assert_eq!(bookable, promised);
         }
     }
 

@@ -199,8 +199,6 @@ return 1
 pub enum RoundError {
     #[error("redis: {0}")]
     Redis(#[from] RedisError),
-    #[error("malformed share entry: {0:?}")]
-    MalformedEntry(String),
 }
 
 // ── BestShare ──────────────────────────────────────────────────────

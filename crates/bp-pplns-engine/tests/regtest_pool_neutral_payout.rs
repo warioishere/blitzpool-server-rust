@@ -244,7 +244,8 @@ async fn withheld_miner_is_funded_by_the_other_miners_not_by_the_pool() {
     // Withheld weight folded into `weight_P` would pay the pool a claim the
     // ledger still owes the miner.
     let fee_only_1 = (t_1 as i64 * fee_ppm as i64) / 1_000_000;
-    let pool_pay_1 = actual_1.pool_paid_sats as i64;
+    // Output 0 is the pool output by §4 order.
+    let pool_pay_1 = coinbase_tx_1.output[0].value.to_sat() as i64;
     let rounding_slack_1 = 1 + published_1.len() as i64;
     assert!(
         (pool_pay_1 - fee_only_1).abs() <= rounding_slack_1,
@@ -408,7 +409,7 @@ async fn withheld_miner_is_funded_by_the_other_miners_not_by_the_pool() {
 
     // ── (7) Two blocks, two fees — no more ────────────────────────
     let fee_only_2 = (t_2 as i64 * weights_2.fee_ppm as i64) / 1_000_000;
-    let pool_pay_2 = actual_2.pool_paid_sats as i64;
+    let pool_pay_2 = coinbase_tx_2.output[0].value.to_sat() as i64;
     let pool_total = pool_pay_1 + pool_pay_2;
     let fee_total = fee_only_1 + fee_only_2;
     let published_2 = weights_2.published().count() as i64;

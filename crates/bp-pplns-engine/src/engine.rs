@@ -42,7 +42,7 @@ use crate::ledger::{
 use crate::sweep::{spawn_daily_task, DustSweepRunner, SystemClock};
 use crate::window::{snapshot::StoredWeightSnapshot, NetworkDifficulty, WindowError, WindowStore};
 use bp_coinbase_snapshot::ActualCoinbase;
-use bp_share::{block_subsidy_sats, claim_sats};
+use bp_share::claim_sats;
 
 /// Errors surfaced across the engine boundary.
 #[derive(Debug, Error)]
@@ -164,10 +164,6 @@ impl PplnsEngine {
             config.abandoned_balance_days,
         );
         window.bootstrap_window_if_needed().await?;
-        // Must run before the first trim, or the age rule reads ids as 1970 and
-        // drops the whole window. Not gated on `background_tasks`: the trim runs
-        // wherever the share stream is consumed, which this constructor cannot see.
-        window.restamp_legacy_bucket_scores().await?;
         let dist_cfg = DistributionConfig::from_engine_config(&config);
         let distribution_builder = DistributionBuilder::new(pool.clone(), window.clone(), dist_cfg);
         let touch_buffer = Arc::new(TouchBuffer::new());
@@ -347,10 +343,9 @@ impl PplnsEngine {
             }
         };
 
-        // The one hard gate: no honest template pays less than its own subsidy,
-        // so such a block is not booked blind.
-        let subsidy = block_subsidy_sats(block_height, self.inner.config.subsidy_halving_interval);
-        if actual.total_value_sats < subsidy {
+        if let Err(subsidy) =
+            actual.check_subsidy(block_height, self.inner.config.subsidy_halving_interval)
+        {
             error!(
                 subsidy,
                 actual_reward = actual.total_value_sats,
@@ -631,7 +626,6 @@ mod tests {
                 ("zero_outsider", 0),
                 (FEE, 7_000),
             ]),
-            pool_paid_sats: 10_000,
             total_value_sats: 1_000_000,
         };
         let window: HashMap<String, f64> = [

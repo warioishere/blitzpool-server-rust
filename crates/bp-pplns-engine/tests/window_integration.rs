@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use bp_pplns_engine::window::{
     bucket_key, NetworkDifficulty, WindowStore, KEY_APPLIED, KEY_BUCKETS, KEY_WINDOW_BY_ADDRESS,
-    KEY_WINDOW_TOTAL, LEGACY_SCORE_CEILING,
+    KEY_WINDOW_TOTAL,
 };
 use redis::{aio::ConnectionManager, AsyncCommands, Client};
 
@@ -348,38 +348,6 @@ async fn a_bucket_ahead_of_the_aggregate_does_not_strand_a_negative_entry() {
         (by["bc1q5"] - 1.0).abs() < 1e-9,
         "the fresh share survives: {by:?}"
     );
-}
-
-// ── Test 5 — read_window_by_address falls back to summing buckets ───
-
-#[tokio::test]
-async fn read_window_by_address_falls_back_to_buckets() {
-    let conn = match connect_or_skip(4).await {
-        Some(c) => c,
-        None => return,
-    };
-    let (store, _) = make_store(conn.clone(), 1_000_000.0, 10_000);
-
-    store
-        .record_share(None, "bc1qfoo", 42.5, 1700)
-        .await
-        .unwrap();
-    store
-        .record_share(None, "bc1qbar", 17.5, 1701)
-        .await
-        .unwrap();
-    store
-        .record_share(None, "bc1qfoo", 8.0, 1702)
-        .await
-        .unwrap();
-
-    // Wipe the by-address hash → read must rebuild from the live buckets.
-    let mut conn_mut = conn.clone();
-    let _: () = conn_mut.del(KEY_WINDOW_BY_ADDRESS).await.unwrap();
-
-    let by_addr = store.read_window_by_address().await.unwrap();
-    assert!((by_addr["bc1qfoo"] - 50.5).abs() < 1e-9);
-    assert!((by_addr["bc1qbar"] - 17.5).abs() < 1e-9);
 }
 
 // ── Test 6 — record_share with zero network-diff is a no-op trim-wise ─
@@ -941,113 +909,6 @@ async fn a_second_share_does_not_refresh_its_buckets_age() {
         after[0].1,
         opened_score
     );
-}
-
-/// Restamping keeps every bucket and the FIFO order, and a trim right after
-/// spares them. Eleven buckets is the smallest set where text order (`"10"`
-/// before `"2"`) would show.
-#[tokio::test]
-async fn restamping_legacy_scores_keeps_the_window_and_its_order() {
-    let Some(mut conn) = connect_or_skip(18).await else {
-        return;
-    };
-    let (store, _nd) = make_aged_store(conn.clone(), /*bucket_shares=*/ 1, 90);
-
-    for i in 1..=11 {
-        store
-            .record_share(None, &format!("addr_{i}"), 10.0, ms_ago(0))
-            .await
-            .unwrap();
-    }
-    // Rewrite the index the way a pre-timestamp window looks: score == id.
-    for i in 1..=11 {
-        let _: () = conn
-            .zadd(KEY_BUCKETS, i.to_string(), i as f64)
-            .await
-            .unwrap();
-    }
-
-    let converted = store.restamp_legacy_bucket_scores().await.unwrap();
-    assert_eq!(converted, 11, "every legacy score must be converted");
-
-    let scored: Vec<(String, f64)> = conn.zrange_withscores(KEY_BUCKETS, 0, -1).await.unwrap();
-    assert_eq!(scored.len(), 11, "conversion must not drop a bucket");
-    for (member, score) in &scored {
-        assert!(
-            *score >= LEGACY_SCORE_CEILING as f64,
-            "bucket {member} still carries a legacy score {score}"
-        );
-    }
-    let order: Vec<&str> = scored.iter().map(|(m, _)| m.as_str()).collect();
-    assert_eq!(
-        order,
-        vec!["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"],
-        "FIFO order must survive — lexicographic order would put 10 before 2"
-    );
-
-    // Freshly stamped buckets are young and must all survive a trim.
-    store
-        .record_share(None, "addr_trigger", 10.0, ms_ago(0))
-        .await
-        .unwrap();
-    let after: Vec<String> = conn.zrange(KEY_BUCKETS, 0, -1).await.unwrap();
-    assert_eq!(
-        after.len(),
-        12,
-        "the converted buckets are young; the trim must leave every one, got {after:?}"
-    );
-
-    // Idempotent.
-    assert_eq!(store.restamp_legacy_bucket_scores().await.unwrap(), 0);
-}
-
-/// An inert entry below the score floor, stuck at rank 0, does not block the
-/// aged buckets behind it.
-#[tokio::test]
-async fn an_inert_entry_does_not_block_the_buckets_behind_it() {
-    let Some(mut conn) = connect_or_skip(20).await else {
-        return;
-    };
-    let (store, _nd) = make_aged_store(conn.clone(), /*bucket_shares=*/ 1, 90);
-
-    // Inserted FIRST: every `record_share` trims, so an aged bucket created
-    // earlier would already be gone. Such an entry can appear after startup,
-    // e.g. a `RESTORE` into a live pool.
-    let _: () = conn.zadd(KEY_BUCKETS, "9999", 1.0).await.unwrap();
-
-    // Opened 100 days ago; protected while active, so later shares must move
-    // the counter past it.
-    store
-        .record_share(None, "addr_old", 10.0, ms_ago(100))
-        .await
-        .unwrap();
-    let head: Vec<String> = conn.zrange(KEY_BUCKETS, 0, 0).await.unwrap();
-    assert_eq!(
-        head,
-        vec!["9999"],
-        "precondition: the inert entry is the head"
-    );
-
-    for addr in ["addr_b", "addr_c", "addr_trigger"] {
-        store
-            .record_share(None, addr, 10.0, ms_ago(0))
-            .await
-            .unwrap();
-    }
-
-    let index: Vec<String> = conn.zrange(KEY_BUCKETS, 0, -1).await.unwrap();
-    assert!(
-        index.contains(&"9999".to_string()),
-        "a score below the floor reads as no timestamp, not as 1970 — it stays put"
-    );
-    let by_addr: HashMap<String, String> = conn.hgetall(KEY_WINDOW_BY_ADDRESS).await.unwrap();
-    assert!(
-        !by_addr.contains_key("addr_old"),
-        "and the aged bucket behind it must still be dropped, got {by_addr:?}"
-    );
-    for still_here in ["addr_b", "addr_c", "addr_trigger"] {
-        assert!(by_addr.contains_key(still_here), "{still_here} must stay");
-    }
 }
 
 /// The bucket still taking shares is never dropped, however old or wherever

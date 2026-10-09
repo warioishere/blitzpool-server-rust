@@ -167,7 +167,6 @@ mod tests {
             block_height: 840_000,
             actual_coinbase: ActualCoinbase {
                 paid_by_address: [("bc1qminer".to_string(), 600)].into(),
-                pool_paid_sats: 400,
                 total_value_sats: 1_000,
             },
             settlement: PendingSettlement::Blockparty { group_id },
@@ -204,7 +203,6 @@ mod tests {
                 block_height: 900_000,
                 actual_coinbase: ActualCoinbase {
                     paid_by_address: Default::default(),
-                    pool_paid_sats: 0,
                     total_value_sats: 0,
                 },
                 settlement: PendingSettlement::Pplns {

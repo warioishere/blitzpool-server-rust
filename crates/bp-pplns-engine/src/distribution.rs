@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bp_coinbase_snapshot::{sanitize_and_build, BuildRequest};
+use bp_coinbase_snapshot::{build_with_bootstrap, BuildRequest};
 use bp_common::{AddressId, Sats};
 use bp_db::{find_pplns_balances_with_open_balance, PplnsBalanceRow};
 use bp_pplns::WeightBuildError;
@@ -100,21 +100,12 @@ pub struct DistributionBuilder {
 
 impl DistributionBuilder {
     pub fn new(pool: PgPool, window: WindowStore, config: DistributionConfig) -> Self {
-        Self::with_cache_ttl(pool, window, config, DEFAULT_CACHE_TTL)
-    }
-
-    pub fn with_cache_ttl(
-        pool: PgPool,
-        window: WindowStore,
-        config: DistributionConfig,
-        cache_ttl: Duration,
-    ) -> Self {
         Self {
             pool,
             window,
             config,
-            cache: InflightResultCache::new(cache_ttl),
-            inputs_cache: InflightResultCache::new(cache_ttl),
+            cache: InflightResultCache::new(DEFAULT_CACHE_TTL),
+            inputs_cache: InflightResultCache::new(DEFAULT_CACHE_TTL),
             inputs_loads: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -313,7 +304,7 @@ async fn build_and_snapshot(
     conn: &mut redis::aio::ConnectionManager,
     ttl_secs: u32,
 ) -> Result<BuiltDistribution, WeightBuildError> {
-    let distribution = sanitize_and_build(req)?;
+    let distribution = build_with_bootstrap(req)?;
 
     // Settlement books `claim(T_actual) − paid` from the real coinbase, so one
     // snapshot serves every job built from this distribution, JDC jobs included.

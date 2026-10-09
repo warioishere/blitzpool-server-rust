@@ -285,8 +285,7 @@ async fn fees(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
             async move {
                 let engine = require_pplns(&s)?;
                 let group_solo = s.group_solo.as_ref().map(|g| g.config());
-                let cfg = engine.reader().fee_config();
-                let raw_cfg = engine.config();
+                let cfg = engine.config();
                 let coinbase_weight_budget =
                     live_pplns_budget(&s, cfg.coinbase_weight_budget).await;
                 // The blockspace cut's worst-case ceiling at this budget. The
@@ -297,7 +296,7 @@ async fn fees(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
                 let max_miner_outputs_adaptive = max_miner_outputs;
                 Ok(FeesResponse {
                     fee_percent: cfg.fee_percent,
-                    fee_address: cfg.fee_address,
+                    fee_address: cfg.fee_address.as_ref().map(|a| a.as_str().to_string()),
                     coinbase_weight_budget,
                     group_fee_percent: group_solo.map(|g| g.fee_percent),
                     group_fee_address: group_solo
@@ -308,13 +307,13 @@ async fn fees(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
                         .as_ref()
                         .map(|b| b.payouts().fee_percent()),
                     dust_limit_sats: DUST_LIMIT_SATS,
-                    min_payout_sats: cfg.min_payout_sats,
+                    min_payout_sats: cfg.min_payout_sats.0,
                     coinbase_base_weight: COINBASE_BASE_WEIGHT,
                     coinbase_output_weight: COINBASE_OUTPUT_WEIGHT,
                     coinbase_witness_commitment_weight: COINBASE_WITNESS_COMMITMENT_WEIGHT,
                     max_miner_outputs,
                     max_miner_outputs_adaptive,
-                    min_difficulty: raw_cfg.min_difficulty,
+                    min_difficulty: cfg.min_difficulty,
                 })
             },
         )

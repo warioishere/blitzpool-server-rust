@@ -22,10 +22,9 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-pub use bp_cron_utils::{next_3am_utc, Clock, SystemClock, TestClock};
+use crate::ledger::PayoutRowType;
 
-/// `rowType` of sweep-emitted history rows.
-pub const ROW_TYPE_SWEEP: &str = "dust-sweep";
+pub use bp_cron_utils::{next_3am_utc, Clock, SystemClock, TestClock};
 
 // ── Errors + stats ──────────────────────────────────────────────────
 
@@ -224,7 +223,7 @@ impl<C: Clock> DustSweepRunner<C> {
                     address: credit_addr.as_str().to_string(),
                     paid_sats: amount,
                     percent: 0.0,
-                    row_type: ROW_TYPE_SWEEP.to_string(),
+                    row_type: PayoutRowType::DustSweep.as_wire().to_string(),
                     created_at_ms: now_ms,
                 },
                 PayoutHistoryInsert {
@@ -232,7 +231,7 @@ impl<C: Clock> DustSweepRunner<C> {
                     address: debit_addr.as_str().to_string(),
                     paid_sats: amount,
                     percent: 0.0,
-                    row_type: ROW_TYPE_SWEEP.to_string(),
+                    row_type: PayoutRowType::DustSweep.as_wire().to_string(),
                     created_at_ms: now_ms,
                 },
             ],

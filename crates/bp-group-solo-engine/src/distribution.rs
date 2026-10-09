@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bp_coinbase_snapshot::{sanitize_and_build, share_map_from_redis_hash, BuildRequest};
+use bp_coinbase_snapshot::{build_with_bootstrap, share_map_from_redis_hash, BuildRequest};
 use bp_common::{AddressId, Sats};
 use bp_db::{find_group, DbError};
 use bp_inflight_cache::InflightResultCache;
@@ -81,20 +81,11 @@ pub struct DistributionBuilder {
 
 impl DistributionBuilder {
     pub fn new(pool: PgPool, round: GroupRoundStore, config: DistributionConfig) -> Self {
-        Self::with_cache_ttl(pool, round, config, DEFAULT_CACHE_TTL)
-    }
-
-    pub fn with_cache_ttl(
-        pool: PgPool,
-        round: GroupRoundStore,
-        config: DistributionConfig,
-        cache_ttl: Duration,
-    ) -> Self {
         Self {
             pool,
             round,
             config,
-            cache: InflightResultCache::new(cache_ttl),
+            cache: InflightResultCache::new(DEFAULT_CACHE_TTL),
         }
     }
 
@@ -198,7 +189,7 @@ async fn compute_distribution(
         .fee_address
         .as_ref()
         .ok_or(DistributionError::NoFeeAddress)?;
-    let distribution = sanitize_and_build(BuildRequest {
+    let distribution = build_with_bootstrap(BuildRequest {
         address_shares,
         balances: HashMap::new(),
         fee_address,

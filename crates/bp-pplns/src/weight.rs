@@ -5,7 +5,6 @@
 use std::str::FromStr;
 
 use bitcoin::{Address, AddressType};
-use bp_common::Sats;
 
 pub use bp_common::DUST_LIMIT_SATS;
 
@@ -33,32 +32,23 @@ pub const COINBASE_WITNESS_COMMITMENT_WEIGHT: u32 = 188;
 /// varint growth past 65 535 outputs).
 pub const BUDGET_SAFETY_MARGIN_WU: u32 = 200;
 
+/// What the blockspace cut reserves before the first miner output: the
+/// structure, the segwit commitment and the pool output, which is structural
+/// under §4 and counted at the worst-case type.
+pub(crate) const CUT_RESERVED_WEIGHT: u32 =
+    COINBASE_BASE_WEIGHT + COINBASE_WITNESS_COMMITMENT_WEIGHT + COINBASE_OUTPUT_WEIGHT;
+
 /// Smallest budget that publishes one miner output: what the blockspace cut
 /// reserves plus one worst-case ([`COINBASE_OUTPUT_WEIGHT`]) output. Below it
 /// the cut publishes nothing and the §4 residual (`pay_P = T − Σpay`) hands
 /// the pool the whole block, hence a hard config floor.
-pub const MIN_COINBASE_WEIGHT_BUDGET: u32 = COINBASE_BASE_WEIGHT
-    + BUDGET_SAFETY_MARGIN_WU
-    + COINBASE_WITNESS_COMMITMENT_WEIGHT
-    + COINBASE_OUTPUT_WEIGHT // the pool output — structural under §4
-    + COINBASE_OUTPUT_WEIGHT; // one miner output, worst-case type
+pub const MIN_COINBASE_WEIGHT_BUDGET: u32 =
+    CUT_RESERVED_WEIGHT + BUDGET_SAFETY_MARGIN_WU + COINBASE_OUTPUT_WEIGHT;
 
 /// Hard cap on the Group-Solo finder bonus in ppm of the miner cut (50 %),
 /// a typo guard rather than policy. Must stay below 1 000 000: the bonus
 /// weight is `S·ppm/(1e6 − ppm)` and the divisor has to remain positive.
 pub const MAX_FINDER_BONUS_PPM: u32 = 500_000;
-
-/// Resolve the operational minimum-payout setting from raw env input.
-/// Clamped to ≥ DUST_LIMIT_SATS (Bitcoin Core relay policy floor).
-pub fn resolve_min_payout_sats(raw: Option<&str>) -> Sats {
-    let parsed = raw
-        .and_then(|s| s.parse::<i64>().ok())
-        .filter(|v| *v > 0)
-        .map(|v| v as u64)
-        .unwrap_or(DEFAULT_MIN_PAYOUT_SATS);
-    let value = parsed.max(DUST_LIMIT_SATS);
-    Sats(value as i64)
-}
 
 /// Whether `bitcoin::Address` can parse the address, network-agnostic.
 /// An unparseable address would abort the whole coinbase build for every
@@ -94,10 +84,7 @@ pub fn output_weight_for_address(address: &str) -> u32 {
 /// the blockspace cut does: one slot too many would let `GroupService` admit
 /// a member the coinbase cannot pay, whose share then goes to the pool.
 pub fn max_coinbase_outputs(budget: u32) -> u64 {
-    let fixed = COINBASE_BASE_WEIGHT
-        + BUDGET_SAFETY_MARGIN_WU
-        + COINBASE_WITNESS_COMMITMENT_WEIGHT
-        + COINBASE_OUTPUT_WEIGHT; // the pool output — structural under §4
+    let fixed = CUT_RESERVED_WEIGHT + BUDGET_SAFETY_MARGIN_WU;
     if budget <= fixed {
         return 1;
     }
@@ -179,45 +166,6 @@ pub fn validate_fee_payout_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn resolve_min_payout_uses_default_when_missing() {
-        assert_eq!(
-            resolve_min_payout_sats(None),
-            Sats(DEFAULT_MIN_PAYOUT_SATS as i64)
-        );
-    }
-
-    #[test]
-    fn resolve_min_payout_uses_default_when_garbage() {
-        assert_eq!(resolve_min_payout_sats(Some("notanumber")), Sats(5_000));
-    }
-
-    #[test]
-    fn resolve_min_payout_clamps_to_dust_limit() {
-        // Caller asked for 100 sats — below the relay-policy floor.
-        assert_eq!(
-            resolve_min_payout_sats(Some("100")),
-            Sats(DUST_LIMIT_SATS as i64)
-        );
-    }
-
-    #[test]
-    fn resolve_min_payout_accepts_explicit_higher_value() {
-        assert_eq!(resolve_min_payout_sats(Some("10000")), Sats(10_000));
-    }
-
-    #[test]
-    fn resolve_min_payout_rejects_zero_and_negative() {
-        assert_eq!(
-            resolve_min_payout_sats(Some("0")),
-            Sats(DEFAULT_MIN_PAYOUT_SATS as i64)
-        );
-        assert_eq!(
-            resolve_min_payout_sats(Some("-100")),
-            Sats(DEFAULT_MIN_PAYOUT_SATS as i64)
-        );
-    }
 
     #[test]
     fn output_weight_by_address_type() {

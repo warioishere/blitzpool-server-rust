@@ -9,7 +9,8 @@
 use std::sync::Arc;
 
 use bp_common::{AddressId, Sats};
-use bp_pplns_engine::sweep::{DustSweepRunner, SweepStats, TestClock, ROW_TYPE_SWEEP};
+use bp_pplns_engine::ledger::PayoutRowType;
+use bp_pplns_engine::sweep::{DustSweepRunner, SweepStats, TestClock};
 use chrono::{TimeZone, Utc};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use tokio::sync::Mutex;
@@ -169,7 +170,7 @@ async fn sweep_exact_pair_zeroes_both_balance_rows() {
     .unwrap();
     assert_eq!(audit.len(), 2);
     assert_eq!(audit[0].1, 5_000);
-    assert_eq!(audit[0].2, ROW_TYPE_SWEEP);
+    assert_eq!(audit[0].2, PayoutRowType::DustSweep.as_wire());
     assert_eq!(
         audit[0].3, audit[1].3,
         "both audit rows share blockHeight (same pair)"
@@ -555,7 +556,7 @@ async fn a_balance_that_moved_since_the_run_started_is_not_overwritten() {
         r#"SELECT count(*) FROM pplns_payout_history WHERE address LIKE $1 AND "rowType" = $2"#,
     )
     .bind(format!("{PREFIX}%"))
-    .bind(ROW_TYPE_SWEEP)
+    .bind(PayoutRowType::DustSweep.as_wire())
     .fetch_one(&pool)
     .await
     .unwrap();

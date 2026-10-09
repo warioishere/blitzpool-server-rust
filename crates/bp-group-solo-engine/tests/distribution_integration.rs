@@ -24,8 +24,8 @@ const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
 /// Pool-output recipient, distinct from every miner address used here.
 const FEE_ADDR: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
 
-/// Parseable addresses: a shape-only placeholder is dropped by the build's
-/// sanitize pass and leaves an empty share map that proves nothing.
+/// Parseable addresses: a shape-only placeholder is dropped by the weight
+/// builder and leaves an empty share map that proves nothing.
 const FINDER_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
 
 struct Harness {

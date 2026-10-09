@@ -1794,7 +1794,6 @@ mod blockparty_settlement {
         );
         let actual = ActualCoinbase {
             paid_by_address: HashMap::new(),
-            pool_paid_sats: 0,
             total_value_sats: REWARD,
         };
         let pb = PendingBlock {

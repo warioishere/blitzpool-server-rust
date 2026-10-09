@@ -180,7 +180,6 @@ fn actual_paying_exactly(
     }
     bp_coinbase_snapshot::ActualCoinbase {
         paid_by_address,
-        pool_paid_sats: entries[0].1,
         total_value_sats: t,
     }
 }

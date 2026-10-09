@@ -21,16 +21,14 @@ pub(crate) const DEFAULT_RETENTION: Duration = Duration::from_secs(48 * 3600);
 /// `(scope, SCAN MATCH pattern)` for every backed-up state.
 const SCOPES: &[(&str, &str)] = &[("pplns", "pplns:*"), ("groupsolo", "groupsolo:*")];
 
-/// Transient temp key the PPLNS cold-start rebuild fills before an atomic
-/// `RENAME`; never worth backing up (and confusing on restore).
-const SKIP_SUFFIX: &str = ":by-address:rebuild";
-
-/// Keys that describe the running process's jobs rather than restorable
-/// state: the per-job PPLNS distribution snapshots, which nothing looks up
-/// after a Redis loss, and the published-output count, which a restore would
-/// bring back without its TTL and so freeze at a stale value.
+/// Keys that describe the running process rather than restorable state: the
+/// per-job PPLNS distribution snapshots, which nothing looks up after a Redis
+/// loss, the published-output count, which a restore would bring back without
+/// its TTL and so freeze at a stale value, and the cold-start rebuild's temp key.
 fn is_job_state(key: &str) -> bool {
-    key.starts_with("pplns:snapshot:") || key == bp_pplns_engine::window::KEY_PUBLISHED_OUTPUTS
+    key.starts_with("pplns:snapshot:")
+        || key == bp_pplns_engine::window::KEY_PUBLISHED_OUTPUTS
+        || key == bp_pplns_engine::window::KEY_WINDOW_REBUILD
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -118,7 +116,7 @@ pub(crate) async fn run_backup_once(
 
     for (scope, pattern) in SCOPES {
         for key in scan_keys(redis, pattern).await? {
-            if key.ends_with(SKIP_SUFFIX) || is_job_state(&key) {
+            if is_job_state(&key) {
                 continue;
             }
             // `Option`: the key may vanish between SCAN and DUMP (trim/reset).
@@ -269,13 +267,15 @@ mod tests {
     const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
     const RETENTION_MS: i64 = 48 * 3600 * 1000;
 
-    /// Job state (per-job snapshots, the published-output count) is skipped,
+    /// Job state (per-job snapshots, the published-output count, the rebuild
+    /// temp key) is skipped,
     /// window and round state are not.
     #[test]
     fn job_state_is_classified_apart_from_restorable_state() {
         let fp = "ab".repeat(32);
         assert!(is_job_state(&format!("pplns:snapshot:{fp}")));
         assert!(is_job_state("pplns:published_outputs"));
+        assert!(is_job_state("pplns:window:by-address:rebuild"));
 
         assert!(!is_job_state("pplns:window:by-address"));
         assert!(!is_job_state("pplns:window:total"));

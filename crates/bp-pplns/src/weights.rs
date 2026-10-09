@@ -12,8 +12,7 @@ use bp_share::weights_fingerprint_from_parts;
 
 use crate::weight::{
     is_valid_payout_address, output_weight_for_address, BUDGET_SAFETY_MARGIN_WU,
-    COINBASE_BASE_WEIGHT, COINBASE_OUTPUT_WEIGHT, COINBASE_WITNESS_COMMITMENT_WEIGHT,
-    DEFAULT_COINBASE_WEIGHT_BUDGET, DUST_LIMIT_SATS, MAX_FINDER_BONUS_PPM,
+    CUT_RESERVED_WEIGHT, DUST_LIMIT_SATS, MAX_FINDER_BONUS_PPM,
 };
 use crate::BudgetTelemetry;
 
@@ -33,11 +32,6 @@ pub struct WeightEntry {
     pub score_weight: u64,
     pub balance_sats: i64,
     pub wire_weight: u64,
-    /// §3.1 per-output dust limit: the consensus floor
-    /// ([`DUST_LIMIT_SATS`]) for every entry. The pool's `min_payout`
-    /// decides whether an entry is published at all instead, because a
-    /// §4 prune would pay the pruned value to the pool output.
-    pub dust_limit: u32,
 }
 
 /// What the publisher, the pool's own coinbase build and settlement need, in
@@ -88,14 +82,17 @@ impl WeightDistribution {
 
     /// The pool's own coinbase at revenue `t` in §4 order: the pool output
     /// (`pay_P`, absorbing rounding and dust) first, then the kept miners.
-    /// The same evaluation a JDC runs with its own template revenue.
+    /// The same evaluation a JDC runs with its own template revenue. Every
+    /// §3.1 dust limit is the consensus floor [`DUST_LIMIT_SATS`]: the pool's
+    /// `min_payout` decides at build time who is published at all, because a
+    /// §4 prune would pay the pruned value to the pool output.
     pub fn payout_entries_at(
         &self,
         t: u64,
     ) -> Result<Vec<(AddressId, u64)>, bp_share::WeightPayoutError> {
         let published: Vec<&WeightEntry> = self.published().collect();
         let weights: Vec<u64> = published.iter().map(|e| e.wire_weight).collect();
-        let dusts: Vec<u32> = published.iter().map(|e| e.dust_limit).collect();
+        let dusts = vec![DUST_LIMIT_SATS as u32; published.len()];
         let amounts = bp_share::compute_payout_amounts(self.weight_p, &weights, &dusts, t)?;
         let mut out = Vec::with_capacity(1 + published.len());
         out.push((self.fee_address.clone(), amounts.pool_pay));
@@ -136,14 +133,14 @@ pub struct WeightDistributionInput<'a> {
     /// Pool output recipient. The weight model has no distribution
     /// without it — `pay_P` is structural (§4).
     pub fee_address: &'a AddressId,
-    /// Max weight units for coinbase outputs; `0` means
-    /// `DEFAULT_COINBASE_WEIGHT_BUDGET`. Any `additional_outputs` (§3.1, e.g.
+    /// Max weight units for coinbase outputs, validated against
+    /// `MIN_COINBASE_WEIGHT_BUDGET`. Any `additional_outputs` (§3.1, e.g.
     /// OP_RETURN) must be reserved here too: one already outweighs the margin.
     pub coinbase_weight_budget: u32,
     /// An entry whose §4 amount at `reference_revenue_sats` falls short of
-    /// this is not published and settles as credit. Clamped to at least
-    /// `DUST_LIMIT_SATS`, which `None` means.
-    pub min_payout_sats: Option<Sats>,
+    /// this is not published and settles as credit. Validated to be at least
+    /// `DUST_LIMIT_SATS` (`validate_fee_payout_budget`).
+    pub min_payout_sats: Sats,
     /// Group-Solo finder bonus in ppm of the miner cut, clamped to
     /// [`MAX_FINDER_BONUS_PPM`]. A proportion, because a fixed satoshi bonus
     /// cannot be paid exactly by a party using its own template revenue (§4).
@@ -210,12 +207,9 @@ pub fn build_weight_distribution(
     let t_ref = input.reference_revenue_sats;
 
     // The pool's operational threshold in satoshis. Kept as u64, not
-    // narrowed to the u32 wire `dust_limit`, so an oversized min_payout
-    // cannot wrap below the floor the `.max()` guarantees.
-    let min_payout: u64 = input
-        .min_payout_sats
-        .map(|s| s.0.max(DUST_LIMIT_SATS as i64) as u64)
-        .unwrap_or(DUST_LIMIT_SATS);
+    // narrowed to the u32 wire dust limit, so an oversized min_payout
+    // cannot wrap below the consensus floor.
+    let min_payout = input.min_payout_sats.0 as u64;
 
     // 1 % = 10_000 ppm. fee_percent is pre-validated to [0, 100].
     let fee_ppm = (input.fee_percent * 10_000.0).round() as u32;
@@ -286,7 +280,7 @@ pub fn build_weight_distribution(
     // at every revenue. It lands on the SCORE weight, so it is part of the
     // settlement claim: no entry in `extras`, no solvency cap.
     let bonus_ppm = input.finder_bonus_ppm.min(MAX_FINDER_BONUS_PPM);
-    if bonus_ppm > 0 && score_total > 0 {
+    if bonus_ppm > 0 {
         if let Some(finder) = input.finder_address {
             if is_valid_payout_address(finder.as_str()) && !is_fee(finder) {
                 let boost = ((score_total as u128 * bonus_ppm as u128)
@@ -316,11 +310,10 @@ pub fn build_weight_distribution(
     // A boost dilutes its own entry too, so `boost_i = extra_i·S/(pot − X)`
     // pays `(u_i/S)·(pot − X) + extra_i`: the score share of what the promises
     // leave plus the entry's own promise. A debt shrinks it by exactly the debt.
-    let extras = bp_share::extras_from_ledger(
-        entries
-            .iter()
-            .map(|c| (c.address.as_str(), c.score_weight, c.balance_sats)),
-    );
+    let extras: Vec<(u64, i64)> = entries
+        .iter()
+        .map(|c| (c.score_weight, c.balance_sats))
+        .collect();
     let projection = bp_share::project_extras(&extras, score_total, fee_ppm, t_ref);
     for (c, extra) in entries.iter_mut().zip(&projection.effective) {
         if !publish_all {
@@ -369,16 +362,11 @@ pub fn build_weight_distribution(
     // Greedy keep in published order while the real serialized weight
     // fits the budget; trimmed entries leave the published set and settle
     // off-chain (§3.1). Where their value goes is decided at `weight_p`.
-    let budget = if input.coinbase_weight_budget == 0 {
-        DEFAULT_COINBASE_WEIGHT_BUDGET
-    } else {
-        input.coinbase_weight_budget
-    };
-    let effective_budget = budget.saturating_sub(BUDGET_SAFETY_MARGIN_WU);
-    let fixed_overhead =
-        COINBASE_BASE_WEIGHT + COINBASE_WITNESS_COMMITMENT_WEIGHT + COINBASE_OUTPUT_WEIGHT; // the pool_payout output, worst-case type
-    let mut used_weight = fixed_overhead;
-    let mut desired_weight = fixed_overhead;
+    let effective_budget = input
+        .coinbase_weight_budget
+        .saturating_sub(BUDGET_SAFETY_MARGIN_WU);
+    let mut used_weight = CUT_RESERVED_WEIGHT;
+    let mut desired_weight = CUT_RESERVED_WEIGHT;
     let mut trimmed_count: u32 = 0;
     for c in entries.iter_mut() {
         if c.wire_weight == 0 {
@@ -439,11 +427,6 @@ pub fn build_weight_distribution(
                 score_weight: c.score_weight,
                 balance_sats: c.balance_sats,
                 wire_weight: c.wire_weight,
-                // The consensus floor, not `min_payout`: the threshold
-                // was applied by withholding above, and publishing it here
-                // would send withheld value into the §4 residual (the
-                // pool output).
-                dust_limit: DUST_LIMIT_SATS as u32,
             })
             .collect(),
         weight_p,
@@ -464,6 +447,9 @@ pub fn build_weight_distribution(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::weight::{
+        COINBASE_BASE_WEIGHT, COINBASE_OUTPUT_WEIGHT, COINBASE_WITNESS_COMMITMENT_WEIGHT,
+    };
 
     fn addr(s: &str) -> AddressId {
         AddressId::new(s.to_string()).expect("valid test address")
@@ -485,7 +471,7 @@ mod tests {
             fee_percent: 1.5,
             fee_address,
             coinbase_weight_budget: 50_000,
-            min_payout_sats: Some(Sats(5_000)),
+            min_payout_sats: Sats(5_000),
             finder_bonus_ppm: 0,
             finder_address: None,
             reference_revenue_sats: 312_500_000,
@@ -534,7 +520,7 @@ mod tests {
                     // Every miner gets an equal 1/ceiling slice of a whole
                     // block, so `min_payout` never withholds anyone — the
                     // blockspace cut is the only thing that can trim here.
-                    min_payout_sats: Some(Sats(546)),
+                    min_payout_sats: Sats(546),
                     ..base_input(&shares, &balances, &fee)
                 })
                 .unwrap();
@@ -559,7 +545,7 @@ mod tests {
                 let d = build_weight_distribution(WeightDistributionInput {
                     coinbase_weight_budget: budget,
                     fee_percent,
-                    min_payout_sats: Some(Sats(546)),
+                    min_payout_sats: Sats(546),
                     ..base_input(&shares, &balances, &fee)
                 })
                 .unwrap();
@@ -836,15 +822,13 @@ mod tests {
             i64::MAX,
         ] {
             let mut input = base_input(&shares, &balances, &fee);
-            input.min_payout_sats = Some(Sats(min_payout));
+            input.min_payout_sats = Sats(min_payout);
             let d = build_weight_distribution(input).unwrap();
             assert_eq!(
                 d.published().count(),
                 0,
                 "min_payout {min_payout} exceeds the whole block, yet an output was published"
             );
-            // The wire limit is the consensus floor and nothing else.
-            assert_eq!(d.entries[0].dust_limit, DUST_LIMIT_SATS as u32);
         }
     }
 
@@ -1329,7 +1313,7 @@ mod tests {
         let withheld = build_weight_distribution(pool_keeps_overflow(&shares, &balances, &fee))
             .expect("withheld build");
         let mut all_published_input = pool_keeps_overflow(&shares, &balances, &fee);
-        all_published_input.min_payout_sats = Some(Sats(DUST_LIMIT_SATS as i64));
+        all_published_input.min_payout_sats = Sats(DUST_LIMIT_SATS as i64);
         let all_published =
             build_weight_distribution(all_published_input).expect("all-published build");
 
@@ -1409,13 +1393,13 @@ mod tests {
         let fee = addr(FEE);
 
         let mut untrimmed = pool_keeps_overflow(&shares, &balances, &fee);
-        untrimmed.min_payout_sats = Some(Sats(DUST_LIMIT_SATS as i64));
+        untrimmed.min_payout_sats = Sats(DUST_LIMIT_SATS as i64);
         let untrimmed = build_weight_distribution(untrimmed).expect("untrimmed");
         assert_eq!(untrimmed.published().count(), 3);
 
         // Budget for the fixed overhead plus two miner outputs.
         let mut trimmed = pool_keeps_overflow(&shares, &balances, &fee);
-        trimmed.min_payout_sats = Some(Sats(DUST_LIMIT_SATS as i64));
+        trimmed.min_payout_sats = Sats(DUST_LIMIT_SATS as i64);
         trimmed.coinbase_weight_budget = COINBASE_BASE_WEIGHT
             + BUDGET_SAFETY_MARGIN_WU
             + COINBASE_WITNESS_COMMITMENT_WEIGHT
@@ -1680,7 +1664,7 @@ mod tests {
         assert!(d.score_total > 0);
 
         let mut oversized = base_input(&shares, &balances, &fee);
-        oversized.min_payout_sats = Some(Sats(i64::MAX));
+        oversized.min_payout_sats = Sats(i64::MAX);
         let d = build_weight_distribution(oversized).expect("an oversized min_payout still builds");
         assert_eq!(d.published().count(), 0);
         assert!(d.score_total > 0);

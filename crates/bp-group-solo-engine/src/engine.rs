@@ -533,12 +533,9 @@ impl GroupSoloEngine {
     ) -> Result<ApplyDistributionResult, EngineError> {
         let group_key = group_id.to_string();
 
-        // The one hard gate: a coinbase that pays less than its own
-        // subsidy destroyed money it was entitled to, which no healthy
-        // template produces.
-        let subsidy =
-            bp_share::block_subsidy_sats(block_height, self.inner.config.subsidy_halving_interval);
-        if actual.total_value_sats < subsidy {
+        if let Err(subsidy) =
+            actual.check_subsidy(block_height, self.inner.config.subsidy_halving_interval)
+        {
             error!(
                 %group_id,
                 subsidy,
@@ -807,7 +804,6 @@ mod tests {
                 (FEE_AS_MEMBER.to_string(), 100_000_000),
                 (UNPAID.to_string(), 0),
             ]),
-            pool_paid_sats: 12_500_000,
             total_value_sats: 312_500_000,
         };
         let rows = history_rows_from_coinbase(Uuid::nil(), &actual, &HashMap::new(), 0);

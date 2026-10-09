@@ -15,6 +15,7 @@ use bp_pplns_engine::config::PplnsEngineConfig;
 use bp_pplns_engine::distribution::{
     BuiltDistribution, DistributionBuilder, DistributionConfig, DistributionError,
 };
+use bp_pplns_engine::window::snapshot::resolve_snapshot_for_block_found;
 use bp_pplns_engine::window::{NetworkDifficulty, WindowStore};
 
 /// Pool-output recipient; the weight model has no distribution without one.
@@ -199,10 +200,12 @@ async fn build_with_shares_only_returns_payouts_and_writes_snapshot() {
     };
     assert!(score_of(&addr_a_id) > score_of(&addr_b_id));
 
-    let snapshot = window
-        .read_weight_snapshot_for(&result.payouts_fingerprint())
-        .await
-        .expect("read snapshot ok");
+    let snapshot = resolve_snapshot_for_block_found(
+        &mut window.connection_for_snapshot(),
+        &result.payouts_fingerprint(),
+    )
+    .await
+    .expect("read snapshot ok");
     let parsed = snapshot.expect("snapshot persisted");
     assert_eq!(parsed.reference_revenue_sats, 312_500_000);
     assert_eq!(parsed.entries.len(), result.distribution.entries.len());
@@ -425,11 +428,13 @@ async fn distinct_references_share_one_fingerprinted_snapshot() {
         "same settlement inputs must share one snapshot identity"
     );
 
-    let snap = window
-        .read_weight_snapshot_for(&first.payouts_fingerprint())
-        .await
-        .expect("read ok")
-        .expect("snapshot present");
+    let snap = resolve_snapshot_for_block_found(
+        &mut window.connection_for_snapshot(),
+        &first.payouts_fingerprint(),
+    )
+    .await
+    .expect("read ok")
+    .expect("snapshot present");
     // Last writer wins; settlement never reads the reference as an amount.
     assert!(
         snap.reference_revenue_sats == 312_500_000 || snap.reference_revenue_sats == 312_499_137
@@ -526,11 +531,13 @@ async fn the_bootstrap_build_pays_the_asking_miner() {
     // Bookable: the snapshot landed under its own fingerprint.
     assert!(result.bookable);
     let window = build_window(&h).await;
-    assert!(window
-        .read_weight_snapshot_for(&result.payouts_fingerprint())
-        .await
-        .expect("read ok")
-        .is_some());
+    assert!(resolve_snapshot_for_block_found(
+        &mut window.connection_for_snapshot(),
+        &result.payouts_fingerprint()
+    )
+    .await
+    .expect("read ok")
+    .is_some());
 
     cleanup_addresses(&h.pool, &[ADDR]).await;
     cleanup(&h.pool, &h.address_prefix).await;

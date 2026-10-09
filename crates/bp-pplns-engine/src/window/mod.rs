@@ -33,8 +33,7 @@ pub const KEY_WINDOW_BY_ADDRESS: &str = "pplns:window:by-address";
 pub const KEY_WINDOW_REBUILD: &str = "pplns:window:by-address:rebuild";
 /// Index zset of live bucket ids. Score = epoch-ms of the bucket's FIRST share
 /// (`ZADD NX`), so score order is FIFO order; since it is the opening time, the
-/// trim never touches the bucket still being filled. Scores below
-/// [`LEGACY_SCORE_CEILING`] are bucket ids, converted at startup.
+/// trim never touches the bucket still being filled.
 pub const KEY_BUCKETS: &str = "pplns:buckets";
 /// Coinbase distribution snapshot. See [`mod@snapshot`].
 pub const KEY_SNAPSHOT: &str = "pplns:snapshot";
@@ -54,11 +53,6 @@ pub fn bucket_key(bucket_id: &str) -> String {
 /// Default shares-per-bucket when `[pplns] bucket_shares` is not configured.
 pub const DEFAULT_BUCKET_SHARES: u64 = 10_000;
 
-/// Below this, a [`KEY_BUCKETS`] score is a bucket id, not an epoch-ms. An id
-/// would need 1e16 shares at the default bucket size to reach it, so the two
-/// ranges cannot meet. See [`WindowStore::restamp_legacy_bucket_scores`].
-pub const LEGACY_SCORE_CEILING: i64 = 1_000_000_000_000;
-
 /// Buckets one trim may drop, so one share on the hot path never pays for a whole
 /// backlog; the next share resumes. The window can therefore sit over `windowSize`
 /// for a few appends and a block found then settles against more weight. Deliberate:
@@ -76,8 +70,7 @@ const DEDUP_KEEP: i64 = 100_000;
 const TRIM_BATCH_LUA: &str = r#"
 local total = tonumber(redis.call('GET', KEYS[1]) or '0') or 0
 local max_size = tonumber(ARGV[1]) or 0
-local bucket_shares = tonumber(ARGV[4]) or 1
-if bucket_shares < 1 then bucket_shares = 1 end
+local bucket_shares = tonumber(ARGV[3])
 
 -- The bucket new shares are landing in. Never a candidate: it is still
 -- filling, and its score is when it OPENED, which says nothing about the work
@@ -87,10 +80,10 @@ local active = tostring(math.floor(counter / bucket_shares))
 
 local bucket_id = nil
 
--- Age rule, by score range. Anything in [floor, cutoff) qualifies wherever it
+-- Age rule, by score range. Anything before the cutoff qualifies wherever it
 -- sits in the index; two entries are read so an active bucket in first place
 -- does not hide the next candidate.
-local aged = redis.call('ZRANGEBYSCORE', KEYS[3], ARGV[3], ARGV[2], 'LIMIT', 0, 2)
+local aged = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', ARGV[2], 'LIMIT', 0, 2)
 for i = 1, #aged do
     if aged[i] ~= active then bucket_id = aged[i] break end
 end
@@ -162,10 +155,6 @@ return 1
 pub enum WindowError {
     #[error("redis: {0}")]
     Redis(#[from] RedisError),
-    /// A window entry that does not parse; returned only from explicit read
-    /// paths so callers can surface a critical alert.
-    #[error("malformed share entry: {0:?}")]
-    MalformedEntry(String),
 }
 
 // ── Network difficulty view ──────────────────────────────────────────
@@ -201,12 +190,13 @@ impl NetworkDifficulty {
 pub struct WindowStore {
     conn: ConnectionManager,
     window_factor: f64,
-    /// Shares per bucket; id = `floor(counter / bucket_shares)` over [`KEY_COUNTER`].
+    /// Shares per bucket, never 0 ([`crate::config::PplnsEngineConfig::try_new`]);
+    /// id = `floor(counter / bucket_shares)` over [`KEY_COUNTER`].
     /// ⛔ Only lower it, or change it against an empty window: raising it lands new
     /// shares in an existing bucket, whose old opening time then ages them out early.
     bucket_shares: u64,
     net_diff: NetworkDifficulty,
-    /// Age rule for [`TRIM_BATCH_LUA`], in days, never 0. Shares the
+    /// Age rule for [`TRIM_BATCH_LUA`], in days, never 0 (same validation). Shares the
     /// `abandoned_balance_days` knob with the dust sweep: both mean "miner is gone".
     max_age_days: u32,
 }
@@ -222,14 +212,9 @@ impl WindowStore {
         Self {
             conn,
             window_factor,
-            bucket_shares: if bucket_shares == 0 {
-                DEFAULT_BUCKET_SHARES
-            } else {
-                bucket_shares
-            },
+            bucket_shares,
             net_diff,
-            // A cutoff of 0 days would age out everything.
-            max_age_days: max_age_days.max(1),
+            max_age_days,
         }
     }
 
@@ -238,34 +223,6 @@ impl WindowStore {
     /// declaring the whole window ancient.
     fn age_cutoff_ms(&self) -> i64 {
         crate::config::abandoned_cutoff_ms(bp_common::now_ms(), self.max_age_days)
-    }
-
-    /// Stamps every [`KEY_BUCKETS`] score below [`LEGACY_SCORE_CEILING`] just under
-    /// "now", so such buckets can age out at all without evicting anything at once.
-    /// Staggered by 1 ms in FIFO order, because equal scores sort by member string
-    /// (`"1000"` before `"999"`). Idempotent; returns how many it converted.
-    pub async fn restamp_legacy_bucket_scores(&self) -> Result<u64, WindowError> {
-        let mut conn = self.conn.clone();
-        let legacy: Vec<String> = conn
-            .zrangebyscore(KEY_BUCKETS, "-inf", format!("({LEGACY_SCORE_CEILING}"))
-            .await?;
-        if legacy.is_empty() {
-            return Ok(0);
-        }
-        // Ascending legacy score is ascending id, the FIFO order to preserve.
-        let base = bp_common::now_ms() - legacy.len() as i64;
-        let items: Vec<(f64, &str)> = legacy
-            .iter()
-            .enumerate()
-            .map(|(i, member)| ((base + i as i64) as f64, member.as_str()))
-            .collect();
-        let _: () = conn.zadd_multiple(KEY_BUCKETS, &items).await?;
-        warn!(
-            converted = legacy.len(),
-            "pplns window: converted bucket index scores from ids to timestamps — the \
-             age rule starts counting from now, nothing is evicted retroactively"
-        );
-        Ok(legacy.len() as u64)
     }
 
     /// `factor × networkDifficulty`, or 0 (size rule off) while
@@ -330,11 +287,9 @@ impl WindowStore {
                 .key(KEY_BUCKETS)
                 .key(KEY_COUNTER)
                 .arg(window_size)
-                // Both bounds go over as preformatted strings: Lua renders a
-                // 13-digit number as `1.789e+12`, which Redis rejects as a
-                // score bound.
+                // Preformatted: Lua renders a 13-digit number as `1.789e+12`,
+                // which Redis rejects as a score bound.
                 .arg(format!("({age_cutoff}"))
-                .arg(LEGACY_SCORE_CEILING.to_string())
                 .arg(self.bucket_shares)
                 .invoke_async(conn)
                 .await?;
@@ -415,37 +370,18 @@ impl WindowStore {
 
     // ── Read paths ──────────────────────────────────────────────────
 
-    /// Current window aggregate (address → diff-1 sum); sums the live buckets when
-    /// the hash is empty, i.e. before the bootstrap rebuild.
+    /// Current window aggregate (address → diff-1 sum), read from the
+    /// authoritative hash.
     pub async fn read_window_by_address(&self) -> Result<HashMap<String, f64>, WindowError> {
         let mut conn = self.conn.clone();
         let hash: HashMap<String, String> = conn.hgetall(KEY_WINDOW_BY_ADDRESS).await?;
-        if !hash.is_empty() {
-            return Ok(hash
-                .into_iter()
-                .filter_map(|(addr, diff_str)| {
-                    let diff: f64 = diff_str.parse().ok()?;
-                    if diff > 0.0 {
-                        Some((addr, diff))
-                    } else {
-                        None
-                    }
-                })
-                .collect());
-        }
-        let bucket_ids: Vec<String> = conn.zrange(KEY_BUCKETS, 0, -1).await?;
-        let mut out: HashMap<String, f64> = HashMap::new();
-        for id in &bucket_ids {
-            let bucket: HashMap<String, String> = conn.hgetall(bucket_key(id)).await?;
-            for (addr, diff_str) in bucket {
-                if let Ok(diff) = diff_str.parse::<f64>() {
-                    if diff > 0.0 {
-                        *out.entry(addr).or_insert(0.0) += diff;
-                    }
-                }
-            }
-        }
-        Ok(out)
+        Ok(hash
+            .into_iter()
+            .filter_map(|(addr, diff_str)| {
+                let diff: f64 = diff_str.parse().ok()?;
+                (diff > 0.0).then_some((addr, diff))
+            })
+            .collect())
     }
 
     /// Cached window total; 0.0 if the key is missing.
@@ -498,17 +434,6 @@ impl WindowStore {
     /// the process that owns a Bitcoin RPC can keep it current.
     pub fn network_difficulty(&self) -> NetworkDifficulty {
         self.net_diff.clone()
-    }
-
-    /// Read the schema-2 weight snapshot for one weights fingerprint.
-    /// `None` when never written, expired, or a different schema.
-    pub async fn read_weight_snapshot_for(
-        &self,
-        weights_fingerprint: &[u8; 32],
-    ) -> Result<Option<snapshot::StoredWeightSnapshot>, RedisError> {
-        let mut conn = self.conn.clone();
-        let key = snapshot_key_for(weights_fingerprint);
-        snapshot::read_weight_snapshot(&mut conn, &key).await
     }
 }
 

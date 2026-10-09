@@ -237,7 +237,7 @@ fn build_distribution(
         fee_percent: 1.5,
         fee_address: fee_addr,
         coinbase_weight_budget,
-        min_payout_sats: None,
+        min_payout_sats: bp_common::Sats(bp_pplns::DUST_LIMIT_SATS as i64),
         finder_bonus_ppm: 0,
         finder_address: None,
         reference_revenue_sats: REGTEST_BLOCK_REWARD_SATS,
