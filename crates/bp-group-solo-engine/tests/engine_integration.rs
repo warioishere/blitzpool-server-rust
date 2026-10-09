@@ -8,7 +8,7 @@
 
 use bp_common::AddressId;
 use bp_group_solo_engine::config::GroupSoloEngineConfig;
-use bp_group_solo_engine::engine::{EngineError, GroupSoloEngine};
+use bp_group_solo_engine::engine::GroupSoloEngine;
 use redis::{aio::ConnectionManager, Client};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use uuid::Uuid;
@@ -476,6 +476,60 @@ async fn a_redelivered_apply_books_nothing() {
     drop_harness(h).await;
 }
 
+// ── Test 3b5 — a redelivered apply leaves the new round alone ──────
+#[tokio::test]
+async fn a_redelivered_apply_does_not_reset_the_round_again() {
+    let h = match spawn_or_skip(11, None).await {
+        Some(h) => h,
+        None => return,
+    };
+    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+    let reward = 312_500_000;
+
+    h.engine
+        .record_share(None, h.group_id, finder.as_str(), 100.0, 1)
+        .await
+        .unwrap();
+    let booked = h
+        .engine
+        .build_distribution(h.group_id, reward, &finder)
+        .await
+        .expect("build");
+    let actual = actual_paying_exactly(&booked, reward);
+    let first = h
+        .engine
+        .on_block_found(h.group_id, 9_995_031, &actual)
+        .await
+        .expect("apply ok");
+    assert!(
+        first.history_inserted >= 1,
+        "precondition: the block booked"
+    );
+    let after_first = h.engine.reader().round_stats(h.group_id).await.unwrap();
+    assert_eq!(
+        after_first.total_shares, 0.0,
+        "precondition: the booking moved the round on"
+    );
+
+    // The next round has started when the same block arrives again.
+    h.engine
+        .record_share(None, h.group_id, finder.as_str(), 40.0, 2)
+        .await
+        .unwrap();
+    h.engine
+        .on_block_found(h.group_id, 9_995_031, &actual)
+        .await
+        .expect("a redelivery is a no-op, not an error");
+
+    let after_replay = h.engine.reader().round_stats(h.group_id).await.unwrap();
+    assert_eq!(
+        after_replay.total_shares, 40.0,
+        "a redelivered block must not wipe the shares mined since it was booked"
+    );
+
+    drop_harness(h).await;
+}
+
 // ── Test 3c — resetRoundOnBlock=false leaves the round intact ──────
 #[tokio::test]
 async fn on_block_found_keeps_round_when_reset_flag_false() {
@@ -585,10 +639,10 @@ async fn duplicate_block_found_does_not_double_the_history() {
     drop_harness(h).await;
 }
 
-// ── Test 4 — re-entrancy guard per group ───────────────────────────
+// ── Test 4 — two concurrent applies of one block book it once ───────
 
 #[tokio::test]
-async fn on_block_found_re_entrancy_guard_per_group() {
+async fn concurrent_applies_of_one_block_book_it_once() {
     let h = match spawn_or_skip(3, None).await {
         Some(h) => h,
         None => return,
@@ -614,19 +668,11 @@ async fn on_block_found_re_entrancy_guard_per_group() {
     let task2 = tokio::spawn(async move { engine2.on_block_found(gid, 9_995_002, &actual2).await });
 
     let (r1, r2) = tokio::join!(task1, task2);
-    let r1 = r1.unwrap();
-    let r2 = r2.unwrap();
-    // The loser is either blocked in-flight or, arriving after the winner,
-    // a no-op redelivery; either way the block is booked once.
-    let mut inserted = 0;
-    for r in [&r1, &r2] {
-        match r {
-            Ok(outcome) => inserted += outcome.history_inserted,
-            Err(EngineError::BlockFoundInProgress { .. }) => {}
-            Err(other) => panic!("unexpected error: {other:?}"),
-        }
-    }
-    assert!(r1.is_ok() || r2.is_ok(), "one call must book the block");
+    // The UNIQUE key decides: whichever insert lands second writes nothing.
+    let inserted: u64 = [r1.unwrap(), r2.unwrap()]
+        .into_iter()
+        .map(|r| r.expect("neither apply errors").history_inserted)
+        .sum();
     assert_eq!(inserted, 1, "one member, booked exactly once");
 
     drop_harness(h).await;

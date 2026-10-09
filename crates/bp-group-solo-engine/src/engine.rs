@@ -4,7 +4,7 @@
 //! per-group reset crons. `on_block_found` books the payout history from the
 //! block's OWN coinbase, never from what the pool intended to pay.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,7 @@ use bp_group_mgmt::group::{window_duration_ms, PayoutMode, RoundResetPreset};
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use thiserror::Error;
-use tokio::sync::{watch, Mutex as TokioMutex};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -58,8 +58,6 @@ pub enum EngineError {
         actual_reward: u64,
         subsidy: u64,
     },
-    #[error("on_block_found already in flight for group {group_id}")]
-    BlockFoundInProgress { group_id: Uuid },
 }
 
 impl EngineError {
@@ -69,15 +67,13 @@ impl EngineError {
     pub fn is_terminal(&self) -> bool {
         match self {
             EngineError::Config(_) | EngineError::RevenueBelowSubsidy { .. } => true,
-            // Infrastructure, and the per-group in-flight guard — all
-            // of these clear on their own.
+            // Infrastructure: these clear on their own.
             EngineError::Redis(_)
             | EngineError::Round(_)
             | EngineError::Db(_)
             | EngineError::Ledger(_)
             | EngineError::Reset(_)
-            | EngineError::Distribution(_)
-            | EngineError::BlockFoundInProgress { .. } => false,
+            | EngineError::Distribution(_) => false,
         }
     }
 }
@@ -98,7 +94,6 @@ struct Inner {
     reset_tasks: StdMutex<HashMap<Uuid, ResetTask>>,
     /// Per-group `on_block_found` re-entrancy guard; async mutex because the
     /// critical section awaits PG + Redis.
-    block_found_in_progress: TokioMutex<HashSet<Uuid>>,
     /// Keeps Postgres off the per-share path. The mode is immutable but the
     /// window length is editable, hence the short [`MODE_CACHE_TTL`].
     mode_cache: StdMutex<HashMap<Uuid, CachedGroupMode>>,
@@ -233,7 +228,6 @@ impl GroupSoloEngine {
                 reset_runner,
                 config,
                 reset_tasks: StdMutex::new(reset_tasks),
-                block_found_in_progress: TokioMutex::new(HashSet::new()),
                 mode_cache: StdMutex::new(HashMap::new()),
                 window_trim_watermark: StdMutex::new(HashMap::new()),
             }),
@@ -500,32 +494,10 @@ impl GroupSoloEngine {
     /// Book a found block from its OWN coinbase, then move the round on. No
     /// settlement: withheld value goes to the pool ([`bp_pplns::WithheldValue::ToPool`]),
     /// so what the coinbase paid is the whole truth. Idempotent via the
-    /// `(groupId, blockHeight, address)` UNIQUE key.
+    /// `(groupId, blockHeight, address)` UNIQUE key: only the call that books
+    /// the block moves the round on, so a redelivery or a concurrent second
+    /// apply leaves the shares mined since untouched.
     pub async fn on_block_found(
-        &self,
-        group_id: Uuid,
-        block_height: i32,
-        actual: &bp_coinbase_snapshot::ActualCoinbase,
-    ) -> Result<ApplyDistributionResult, EngineError> {
-        {
-            let mut in_flight = self.inner.block_found_in_progress.lock().await;
-            if in_flight.contains(&group_id) {
-                return Err(EngineError::BlockFoundInProgress { group_id });
-            }
-            in_flight.insert(group_id);
-        }
-        let result = self
-            .on_block_found_inner(group_id, block_height, actual)
-            .await;
-        self.inner
-            .block_found_in_progress
-            .lock()
-            .await
-            .remove(&group_id);
-        result
-    }
-
-    async fn on_block_found_inner(
         &self,
         group_id: Uuid,
         block_height: i32,
@@ -586,6 +558,11 @@ impl GroupSoloEngine {
         )
         .await?;
 
+        if outcome.history_inserted == 0 {
+            info!(%group_id, block_height,
+                "group-solo: block already booked — round left as it stands");
+            return Ok(outcome);
+        }
         match mode {
             PayoutMode::Window => {
                 info!(%group_id,
@@ -781,14 +758,6 @@ mod tests {
             expires_at: Instant::now(),
         };
         assert_eq!(mode_on_lookup_error(Some(prop)), (PayoutMode::Prop, 0));
-    }
-
-    #[test]
-    fn block_found_in_progress_carries_group_id() {
-        let g = Uuid::new_v4();
-        let e = EngineError::BlockFoundInProgress { group_id: g };
-        let s = format!("{e}");
-        assert!(s.contains(&g.to_string()));
     }
 
     /// Every paid output besides the pool's becomes a row, the fee address
