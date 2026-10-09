@@ -405,9 +405,8 @@ impl TdpBlockSubmissionSink {
             warn!(%err, address = %address, height, "block-found: blocks_entity insert failed");
         }
 
-        let job_payouts_fingerprint = pool_built(payouts_fingerprint);
         let weight_snapshot = self
-            .resolve_weight_snapshot(resolved, &address, job_payouts_fingerprint, height)
+            .resolve_weight_snapshot(resolved, &address, payouts_fingerprint, height)
             .await;
 
         let event = BlockFoundEvent {
@@ -451,10 +450,9 @@ impl TdpBlockSubmissionSink {
     }
 
     /// Resolve PPLNS's settlement inputs at the block-found instant: the
-    /// snapshot key is alive now, usually not later, and is their only store.
-    /// Every mode is decided by the exhaustive `match`. Each `None` path logs
-    /// which case it was, because a JD-client coinbase must not be reprocessed,
-    /// a miss must.
+    /// snapshot key is alive now, not at apply time, and is their only store.
+    /// Every mode is decided by the exhaustive `match`. A coinbase the pool
+    /// did not build has no snapshot; the apply side refuses to book it.
     async fn resolve_weight_snapshot(
         &self,
         mode: MiningModeResult,
@@ -462,20 +460,6 @@ impl TdpBlockSubmissionSink {
         payouts_fingerprint: Option<[u8; 32]>,
         height: i32,
     ) -> Option<bp_pplns_engine::window::snapshot::StoredWeightSnapshot> {
-        let fingerprint = || match payouts_fingerprint {
-            Some(fp) => Some(fp),
-            None => {
-                warn!(
-                    address,
-                    height,
-                    ?mode,
-                    "block-found: job carries no payout fingerprint — the pool did not build \
-                     this coinbase (JD-client custom job), so there is no pool-side \
-                     distribution to book. Do NOT reprocess."
-                );
-                None
-            }
-        };
         match mode {
             // Solo writes no ledger, Blockparty recomputes its fixed shares
             // from the DB, Group-Solo books from the coinbase alone. None of
@@ -491,20 +475,27 @@ impl TdpBlockSubmissionSink {
                     );
                     None
                 })?;
-                let fingerprint = fingerprint()?;
+                let fingerprint = pool_built(payouts_fingerprint)?;
                 match engine.weight_snapshot_for_block_found(&fingerprint).await {
-                    Ok(snap) => Some(snap),
+                    Ok(Some(snap)) => Some(snap),
+                    Ok(None) => {
+                        error!(
+                            address,
+                            height,
+                            fingerprint = %hex::encode(fingerprint),
+                            "block-found: no PPLNS snapshot under the winning job's \
+                             fingerprint — the block will park as unbookable once confirmed"
+                        );
+                        None
+                    }
                     Err(err) => {
-                        // Not fatal for PPLNS: the apply side re-reads the
-                        // fingerprint, though that usually loses to the TTL.
                         error!(
                             %err,
                             address,
                             height,
                             fingerprint = %hex::encode(fingerprint),
-                            "block-found: PPLNS distribution lookup failed — parking the block \
-                             without its settlement inputs; the apply will re-read the \
-                             fingerprint, which usually loses to the snapshot TTL"
+                            "block-found: PPLNS snapshot read failed — the block will park as \
+                             unbookable once confirmed"
                         );
                         None
                     }
@@ -554,6 +545,7 @@ impl BlockFoundApplier {
     /// never books, else apply immediately. Parking inputs, not results, lets
     /// several blocks pend at once. Never substitute another
     /// `weight_snapshot`: that books what the chain didn't pay.
+    #[allow(clippy::too_many_arguments)]
     async fn gate_or_apply(
         &self,
         address_str: &str,
@@ -561,9 +553,22 @@ impl BlockFoundApplier {
         reward: u64,
         block_hash: &str,
         actual: Option<&bp_coinbase_snapshot::ActualCoinbase>,
+        payouts_fingerprint: Option<[u8; 32]>,
         settlement: PendingSettlement,
     ) {
         let mode = settlement.label();
+        // Only a coinbase the pool built pays the mode's distribution; booking
+        // any other would settle, or reset a round, for a block that did not
+        // pay it.
+        if settlement.needs_pool_distribution() && pool_built(payouts_fingerprint).is_none() {
+            error!(
+                address = address_str,
+                height,
+                mode,
+                "block-found: block on a coinbase the pool did not build — NOT booked"
+            );
+            return;
+        }
         // Settlement is `claim − paid` against the block's own coinbase.
         let Some(actual) = actual else {
             error!(
@@ -650,6 +655,12 @@ impl BlockFoundApplier {
                 mode = label,
                 "block-found: group gone — NOT booked"
             ),
+            Err(SettleFailure::SnapshotMissing) => warn!(
+                address = address_str,
+                height,
+                mode = label,
+                "block-found: settlement inputs not resolved at found-time — NOT booked"
+            ),
             Err(SettleFailure::Engine(err)) => warn!(
                 %err, address = address_str, height,
                 "block-found: immediate apply failed"
@@ -703,9 +714,9 @@ impl BlockFoundApplier {
                         reward,
                         block_hash,
                         event.actual_coinbase.as_ref(),
+                        event.payouts_fingerprint,
                         PendingSettlement::Pplns {
                             weight_snapshot: event.weight_snapshot.clone(),
-                            payouts_fingerprint: event.payouts_fingerprint,
                         },
                     )
                     .await
@@ -728,6 +739,7 @@ impl BlockFoundApplier {
                         reward,
                         block_hash,
                         event.actual_coinbase.as_ref(),
+                        event.payouts_fingerprint,
                         PendingSettlement::Blockparty { group_id },
                     )
                     .await;
@@ -749,31 +761,16 @@ impl BlockFoundApplier {
             ) => {
                 match (event.group_id, self.group_solo.as_ref()) {
                     (Some(group_id), Some(_engine)) => {
-                        // Only a coinbase the pool built pays the group's
-                        // distribution; booking any other would reset the
-                        // round for a block that may not have paid the group.
-                        match pool_built(event.payouts_fingerprint) {
-                            Some(_) => {
-                                self.gate_or_apply(
-                                    address_str,
-                                    height,
-                                    reward,
-                                    block_hash,
-                                    event.actual_coinbase.as_ref(),
-                                    PendingSettlement::GroupSolo { group_id },
-                                )
-                                .await;
-                            }
-                            // Falls through to the notification: a block nobody
-                            // books is the one the operator must hear about.
-                            None => error!(
-                                address = address_str,
-                                %group_id,
-                                height,
-                                "block-found: Group-Solo block on a coinbase the pool did not \
-                                 build — NOT booked and the round NOT reset"
-                            ),
-                        }
+                        self.gate_or_apply(
+                            address_str,
+                            height,
+                            reward,
+                            block_hash,
+                            event.actual_coinbase.as_ref(),
+                            event.payouts_fingerprint,
+                            PendingSettlement::GroupSolo { group_id },
+                        )
+                        .await;
                     }
                     (None, _) => warn!(
                         address = address_str,
@@ -1328,5 +1325,71 @@ mod tests {
         assert_eq!(back.address, event.address);
         assert_eq!(back.block_data, event.block_data);
         assert_eq!(back.weight_snapshot, Some(weight_snapshot));
+    }
+
+    /// One rule for every mode that books against a pool-built distribution:
+    /// a block on a coinbase the pool did not build (no or zeroed fingerprint)
+    /// is not parked. A real fingerprint parks (negative control), and
+    /// Blockparty, which recomputes its split from the roster, parks without one.
+    #[tokio::test]
+    async fn only_a_pool_built_coinbase_is_parked_for_booking() {
+        let Some(mut conn) = bp_test_support::connect_redis_in_range_or_skip(
+            bp_test_support::redis_db::BLITZPOOL_BIN_2,
+            3,
+        )
+        .await
+        else {
+            return;
+        };
+        let applier = BlockFoundApplier {
+            redis: Some(conn.clone()),
+            ..Default::default()
+        };
+        let actual = ActualCoinbase {
+            paid_by_address: Default::default(),
+            total_value_sats: 312_500_000,
+        };
+        let group_id = uuid::Uuid::new_v4();
+        let pplns = || PendingSettlement::Pplns {
+            weight_snapshot: None,
+        };
+        let parked = |conn: &mut ConnectionManager, hash: &'static str| {
+            let mut conn = conn.clone();
+            async move {
+                let hashes = crate::pending_blocks::pending_block_hashes(&mut conn)
+                    .await
+                    .expect("pending hashes");
+                hashes.contains(hash)
+            }
+        };
+
+        for (hash, fingerprint, settlement) in [
+            ("pplns-none", None, pplns()),
+            ("pplns-zero", Some([0u8; 32]), pplns()),
+            ("gs-none", None, PendingSettlement::GroupSolo { group_id }),
+        ] {
+            applier
+                .gate_or_apply("bc1q", 1, 0, hash, Some(&actual), fingerprint, settlement)
+                .await;
+            assert!(
+                !parked(&mut conn, hash).await,
+                "{hash}: a coinbase the pool did not build must not be parked for booking"
+            );
+        }
+
+        for (hash, fingerprint, settlement) in [
+            ("pplns-built", Some([7u8; 32]), pplns()),
+            (
+                "gs-built",
+                Some([7u8; 32]),
+                PendingSettlement::GroupSolo { group_id },
+            ),
+            ("bp-none", None, PendingSettlement::Blockparty { group_id }),
+        ] {
+            applier
+                .gate_or_apply("bc1q", 1, 0, hash, Some(&actual), fingerprint, settlement)
+                .await;
+            assert!(parked(&mut conn, hash).await, "{hash} must be parked");
+        }
     }
 }

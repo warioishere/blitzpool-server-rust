@@ -10,7 +10,7 @@
 use bp_common::AddressId;
 use bp_pplns_engine::config::PplnsEngineConfig;
 use bp_pplns_engine::engine::PplnsEngine;
-use bp_pplns_engine::window::snapshot::resolve_snapshot_for_block_found;
+use bp_pplns_engine::window::snapshot::{resolve_snapshot_for_block_found, StoredWeightSnapshot};
 use bp_pplns_engine::window::NetworkDifficulty;
 use redis::{aio::ConnectionManager, Client};
 use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -161,6 +161,22 @@ fn actual_paying_exactly(
     }
 }
 
+/// What the Core stamps into the block-found event for `fp`, read the way
+/// production reads it at found-time.
+async fn snapshot_for_opt(engine: &PplnsEngine, fp: &[u8; 32]) -> Option<StoredWeightSnapshot> {
+    engine
+        .weight_snapshot_for_block_found(fp)
+        .await
+        .expect("snapshot read")
+}
+
+/// [`snapshot_for_opt`] for a build whose snapshot must have landed.
+async fn snapshot_for(engine: &PplnsEngine, fp: &[u8; 32]) -> StoredWeightSnapshot {
+    snapshot_for_opt(engine, fp)
+        .await
+        .expect("the build stored its snapshot")
+}
+
 async fn drop_harness(h: EngineHarness) {
     h.engine.shutdown();
     cleanup(&h.pool, &h.prefix).await;
@@ -268,8 +284,7 @@ async fn on_block_found_applies_distribution_from_snapshot() {
         .on_block_found(
             block_height,
             &actual,
-            None,
-            Some(result.payouts_fingerprint()),
+            snapshot_for(&h.engine, &result.payouts_fingerprint()).await,
         )
         .await
         .expect("ok");
@@ -320,10 +335,9 @@ async fn a_block_settles_from_its_parked_blob_after_the_snapshot_key_is_gone() {
     const BIG: &str = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
     const TINY: &str = "bc1p5d7rjq7g6rdk2yhzks9smlaqtedr4dekq08ge8ztwac72sfr9rusxg3297";
     const REWARD: u64 = 3_000_000_000;
-    let h_without: i32 = 9_997_101;
     let h_with: i32 = 9_997_102;
-    cleanup_addr(&h.pool, BIG, &[h_without, h_with]).await;
-    cleanup_addr(&h.pool, TINY, &[h_without, h_with]).await;
+    cleanup_addr(&h.pool, BIG, &[h_with]).await;
+    cleanup_addr(&h.pool, TINY, &[h_with]).await;
 
     // TINY (~2_999 sat) is under `min_payout`, so it is withheld and its
     // credit exists only in the snapshot; the assertions key on it.
@@ -347,34 +361,29 @@ async fn a_block_settles_from_its_parked_blob_after_the_snapshot_key_is_gone() {
     );
 
     // What the Core stamps into the block-found event.
-    let blob = h
-        .engine
-        .weight_snapshot_for_block_found(&fp)
-        .await
-        .expect("the Core resolves the winning job's inputs at found-time");
+    let blob = snapshot_for(&h.engine, &fp).await;
 
     // The TTL expires during the confirmation window.
     let mut conn = h.engine.window().connection_for_snapshot();
     let key = bp_pplns_engine::window::snapshot_key_for(&fp);
     let _: () = conn.del(&key).await.expect("drop the snapshot key");
 
-    // Negative control: proves the key is really gone.
-    let without_blob = h
+    // Negative control: proves the key is really gone, so the booking below
+    // can only come from the blob.
+    let read_after_expiry = h
         .engine
-        .on_block_found(h_without, &actual, None, Some(fp))
-        .await;
+        .weight_snapshot_for_block_found(&fp)
+        .await
+        .expect("read ok");
     assert!(
-        matches!(
-            without_blob,
-            Err(bp_pplns_engine::engine::EngineError::SnapshotMissing { .. })
-        ),
-        "with the key gone and no blob, the block cannot be booked at all \
-         (got {without_blob:?})"
+        read_after_expiry.is_none(),
+        "with the key gone nothing but the blob holds the inputs \
+         (got {read_after_expiry:?})"
     );
 
     let outcome = h
         .engine
-        .on_block_found(h_with, &actual, Some(blob), Some(fp))
+        .on_block_found(h_with, &actual, blob)
         .await
         .expect("the parked blob is enough to settle from");
     assert!(outcome.history_inserted >= 1, "settlement wrote its rows");
@@ -387,8 +396,8 @@ async fn a_block_settles_from_its_parked_blob_after_the_snapshot_key_is_gone() {
          snapshot destroys"
     );
 
-    cleanup_addr(&h.pool, BIG, &[h_without, h_with]).await;
-    cleanup_addr(&h.pool, TINY, &[h_without, h_with]).await;
+    cleanup_addr(&h.pool, BIG, &[h_with]).await;
+    cleanup_addr(&h.pool, TINY, &[h_with]).await;
     drop_harness(h).await;
 }
 
@@ -473,7 +482,7 @@ async fn a_second_apply_of_the_same_block_moves_no_money() {
 
     let first = h
         .engine
-        .on_block_found(height, &actual, None, Some(fp))
+        .on_block_found(height, &actual, snapshot_for(&h.engine, &fp).await)
         .await
         .expect("first apply books");
     assert!(
@@ -505,7 +514,7 @@ async fn a_second_apply_of_the_same_block_moves_no_money() {
 
     let second = h
         .engine
-        .on_block_found(height, &actual, None, Some(fp))
+        .on_block_found(height, &actual, snapshot_for(&h.engine, &fp).await)
         .await
         .expect("a replayed block-found is a no-op, not an error");
 
@@ -560,7 +569,7 @@ async fn a_different_block_at_the_same_height_is_refused_not_swallowed() {
     let coinbase_a = actual_paying_exactly(&result, REWARD);
     let first = h
         .engine
-        .on_block_found(height, &coinbase_a, None, Some(fp))
+        .on_block_found(height, &coinbase_a, snapshot_for(&h.engine, &fp).await)
         .await
         .expect("first apply books");
     assert!(first.history_inserted >= 1);
@@ -580,7 +589,7 @@ async fn a_different_block_at_the_same_height_is_refused_not_swallowed() {
 
     let err = h
         .engine
-        .on_block_found(height, &coinbase_b, None, Some(fp))
+        .on_block_found(height, &coinbase_b, snapshot_for(&h.engine, &fp).await)
         .await
         .expect_err("a different block at a booked height must not report success");
     assert!(
@@ -673,20 +682,14 @@ async fn later_build_does_not_cost_the_found_block_its_distribution() {
     let block_height = 9_997_101;
     let actual = actual_paying_exactly(&mined, MINED_REWARD);
 
-    // Without a fingerprint there is nothing to book against — refuse.
-    let blind = h
-        .engine
-        .on_block_found(block_height, &actual, None, None)
-        .await;
-    assert!(
-        blind.is_err(),
-        "no fingerprint → nothing to book against; preparing blind must refuse"
-    );
-
     // With it: the block's distribution resolves, later build or not.
     let outcome = h
         .engine
-        .on_block_found(block_height, &actual, None, Some(fingerprint))
+        .on_block_found(
+            block_height,
+            &actual,
+            snapshot_for(&h.engine, &fingerprint).await,
+        )
         .await
         .expect("the job's own distribution must still resolve");
     assert!(outcome.history_inserted >= 1, "audit rows written");
@@ -880,8 +883,7 @@ async fn pplns_sub_payout_credit_carries_forward_until_it_pays_out() {
         .on_block_found(
             h1,
             &actual_paying_exactly(&d1, REWARD),
-            None,
-            Some(d1.payouts_fingerprint()),
+            snapshot_for(&h.engine, &d1.payouts_fingerprint()).await,
         )
         .await
         .expect("apply 1");
@@ -915,8 +917,7 @@ async fn pplns_sub_payout_credit_carries_forward_until_it_pays_out() {
         .on_block_found(
             h2,
             &actual_paying_exactly(&d2, REWARD),
-            None,
-            Some(d2.payouts_fingerprint()),
+            snapshot_for(&h.engine, &d2.payouts_fingerprint()).await,
         )
         .await
         .expect("apply 2");
@@ -963,8 +964,7 @@ async fn gated_apply_before_next_prepare_accumulates_total_paid() {
         .on_block_found(
             h1,
             &actual_paying_exactly(&d1, REWARD),
-            None,
-            Some(d1.payouts_fingerprint()),
+            snapshot_for(&h.engine, &d1.payouts_fingerprint()).await,
         )
         .await
         .expect("prepare 1");
@@ -982,8 +982,7 @@ async fn gated_apply_before_next_prepare_accumulates_total_paid() {
         .on_block_found(
             h2,
             &actual_paying_exactly(&d2, REWARD),
-            None,
-            Some(d2.payouts_fingerprint()),
+            snapshot_for(&h.engine, &d2.payouts_fingerprint()).await,
         )
         .await
         .expect("block 2");
@@ -1023,8 +1022,7 @@ async fn two_blocks_in_sequence_both_accumulate() {
         .on_block_found(
             h1,
             &actual_paying_exactly(&d1, REWARD),
-            None,
-            Some(d1.payouts_fingerprint()),
+            snapshot_for(&h.engine, &d1.payouts_fingerprint()).await,
         )
         .await
         .expect("block 1");
@@ -1041,8 +1039,7 @@ async fn two_blocks_in_sequence_both_accumulate() {
         .on_block_found(
             h2,
             &actual_paying_exactly(&d2, REWARD),
-            None,
-            Some(d2.payouts_fingerprint()),
+            snapshot_for(&h.engine, &d2.payouts_fingerprint()).await,
         )
         .await
         .expect("block 2");
@@ -1121,12 +1118,12 @@ async fn spawn_core_skips_crons_but_build_distribution_works() {
 #[allow(dead_code)]
 fn _force_use(_: AddressId) {}
 
-// ── An unresolvable fingerprint must refuse, never fall back ────────
+// ── An unresolvable fingerprint finds nothing, never another snapshot ──
 // The shared last-writer-wins key may hold a distribution the coinbase did
 // not pay, and booking it would pass the reward check unnoticed.
 
 #[tokio::test]
-async fn unknown_fingerprint_refuses_instead_of_booking_the_shared_key() {
+async fn unknown_fingerprint_resolves_nothing_instead_of_the_shared_key() {
     let _guard = balance_table_lock().lock().await;
     let h = match spawn_or_skip(16, "test_engine_unk_").await {
         Some(h) => h,
@@ -1143,18 +1140,17 @@ async fn unknown_fingerprint_refuses_instead_of_booking_the_shared_key() {
     // would succeed and pass every plausibility check.
     let good = h.engine.build_distribution(REWARD).await.expect("build ok");
 
+    assert!(
+        snapshot_for_opt(&h.engine, &good.payouts_fingerprint())
+            .await
+            .is_some(),
+        "precondition: the good build's snapshot is readable"
+    );
     let never_written = [0x5au8; 32];
-    let err = h
-        .engine
-        .on_block_found(
-            9_997_201,
-            &actual_paying_exactly(&good, REWARD),
-            None,
-            Some(never_written),
-        )
-        .await
-        .expect_err("an unresolvable fingerprint must not be booked from another snapshot");
-    eprintln!("refused with: {err}");
+    assert!(
+        snapshot_for_opt(&h.engine, &never_written).await.is_none(),
+        "an unresolvable fingerprint must not resolve to another snapshot"
+    );
 
     let _ = sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
         .bind(ADDR_A)
@@ -1193,7 +1189,7 @@ async fn a_redelivered_apply_books_nothing_and_the_snapshot_outlives_its_block()
 
     let _prepared = h
         .engine
-        .on_block_found(height, &actual, None, Some(fp))
+        .on_block_found(height, &actual, snapshot_for(&h.engine, &fp).await)
         .await
         .expect("prepare ok");
 
@@ -1206,7 +1202,7 @@ async fn a_redelivered_apply_books_nothing_and_the_snapshot_outlives_its_block()
     );
     let redelivered = h
         .engine
-        .on_block_found(height, &actual, None, Some(fp))
+        .on_block_found(height, &actual, snapshot_for(&h.engine, &fp).await)
         .await
         .expect("a redelivered block-found is a no-op, not an error");
     assert_eq!(
@@ -1277,8 +1273,7 @@ async fn a_block_frozen_before_an_earlier_apply_still_books_correctly() {
         .on_block_found(
             h1,
             &actual_paying_exactly(&dist_first, REWARD_FIRST),
-            None,
-            Some(dist_first.payouts_fingerprint()),
+            snapshot_for(&h.engine, &dist_first.payouts_fingerprint()).await,
         )
         .await
         .expect("prepare first");
@@ -1303,8 +1298,7 @@ async fn a_block_frozen_before_an_earlier_apply_still_books_correctly() {
         .on_block_found(
             h2,
             &actual_paying_exactly(&dist_second, REWARD_SECOND),
-            None,
-            Some(fp_second),
+            snapshot_for(&h.engine, &fp_second).await,
         )
         .await
         .expect("a block frozen before the apply must still be bookable");
@@ -1354,8 +1348,7 @@ async fn a_block_far_off_the_reference_revenue_is_still_booked() {
         .on_block_found(
             h1,
             &actual_paying_exactly(&d1, T_REF),
-            None,
-            Some(d1.payouts_fingerprint()),
+            snapshot_for(&h.engine, &d1.payouts_fingerprint()).await,
         )
         .await
         .expect("apply 1");
@@ -1390,7 +1383,11 @@ async fn a_block_far_off_the_reference_revenue_is_still_booked() {
     );
 
     h.engine
-        .on_block_found(h2, &actual2, None, Some(d2.payouts_fingerprint()))
+        .on_block_found(
+            h2,
+            &actual2,
+            snapshot_for(&h.engine, &d2.payouts_fingerprint()).await,
+        )
         .await
         .expect("a block off the reference revenue must still book");
 
@@ -1447,7 +1444,11 @@ async fn a_coinbase_below_the_block_subsidy_is_refused() {
     let burned = actual_paying_exactly(&d, subsidy - 1);
     let err = h
         .engine
-        .on_block_found(height, &burned, None, Some(d.payouts_fingerprint()))
+        .on_block_found(
+            height,
+            &burned,
+            snapshot_for(&h.engine, &d.payouts_fingerprint()).await,
+        )
         .await
         .expect_err("a coinbase below the subsidy must not book");
     assert!(
@@ -1470,7 +1471,11 @@ async fn a_coinbase_below_the_block_subsidy_is_refused() {
     // One satoshi more books: the gate is exactly the subsidy.
     let honest = actual_paying_exactly(&d, subsidy);
     h.engine
-        .on_block_found(height, &honest, None, Some(d.payouts_fingerprint()))
+        .on_block_found(
+            height,
+            &honest,
+            snapshot_for(&h.engine, &d.payouts_fingerprint()).await,
+        )
         .await
         .expect("a coinbase paying exactly the subsidy books");
 
@@ -1527,7 +1532,11 @@ async fn a_row_swept_between_freeze_and_apply_is_not_restored() {
         .unwrap();
 
     h.engine
-        .on_block_found(height, &actual, None, Some(d.payouts_fingerprint()))
+        .on_block_found(
+            height,
+            &actual,
+            snapshot_for(&h.engine, &d.payouts_fingerprint()).await,
+        )
         .await
         .expect("apply");
 
@@ -1572,7 +1581,11 @@ async fn a_row_swept_between_freeze_and_apply_is_not_restored() {
         .unwrap();
 
     h.engine
-        .on_block_found(height, &actual, None, Some(d.payouts_fingerprint()))
+        .on_block_found(
+            height,
+            &actual,
+            snapshot_for(&h.engine, &d.payouts_fingerprint()).await,
+        )
         .await
         .expect("apply");
 

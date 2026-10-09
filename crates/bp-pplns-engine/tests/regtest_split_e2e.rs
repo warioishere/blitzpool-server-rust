@@ -223,8 +223,11 @@ async fn split_path_distribution_block_accepted_with_satellite_restart() {
         .on_block_found(
             after as i32,
             &actual,
-            None,
-            Some(dist.payouts_fingerprint()),
+            engine
+                .weight_snapshot_for_block_found(&dist.payouts_fingerprint())
+                .await
+                .expect("snapshot read")
+                .expect("snapshot stored"),
         )
         .await
         .expect("on_block_found");

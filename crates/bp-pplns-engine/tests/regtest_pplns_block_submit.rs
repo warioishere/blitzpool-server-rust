@@ -502,7 +502,15 @@ async fn ledger_books_exactly_what_the_accepted_coinbase_paid() {
     );
     assert_eq!(actual.total_value_sats, reward_sats);
     let _prepared = engine
-        .on_block_found(accepted.height as i32, &actual, None, Some(fingerprint))
+        .on_block_found(
+            accepted.height as i32,
+            &actual,
+            engine
+                .weight_snapshot_for_block_found(&fingerprint)
+                .await
+                .expect("snapshot read")
+                .expect("snapshot stored"),
+        )
         .await
         .expect("the mined job's own distribution must resolve for booking");
 

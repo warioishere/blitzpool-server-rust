@@ -340,21 +340,17 @@ pub(crate) async fn settle_block(
                 .map(|row| u64::from(row.is_some()))
                 .map_err(blockparty_err)
         }
-        PendingSettlement::Pplns {
-            weight_snapshot,
-            payouts_fingerprint,
-        } => settlers
-            .pplns
-            .ok_or(SettleFailure::NoEngine)?
-            .on_block_found(
-                height,
-                actual,
-                weight_snapshot.clone(),
-                *payouts_fingerprint,
-            )
-            .await
-            .map(|o| o.history_inserted)
-            .map_err(|e| SettleFailure::Engine(SettleError::Pplns(e))),
+        PendingSettlement::Pplns { weight_snapshot } => {
+            let engine = settlers.pplns.ok_or(SettleFailure::NoEngine)?;
+            let snapshot = weight_snapshot
+                .clone()
+                .ok_or(SettleFailure::SnapshotMissing)?;
+            engine
+                .on_block_found(height, actual, snapshot)
+                .await
+                .map(|o| o.history_inserted)
+                .map_err(|e| SettleFailure::Engine(SettleError::Pplns(e)))
+        }
     }
 }
 
@@ -367,18 +363,23 @@ pub(crate) enum SettleFailure {
     /// A Blockparty group that does not exist.
     #[error("blockparty group does not exist")]
     UnusableGroup,
+    /// A PPLNS block whose settlement inputs could not be read when it was
+    /// found; the snapshot key is gone by now.
+    #[error("pplns settlement inputs were not resolved at found-time")]
+    SnapshotMissing,
     #[error(transparent)]
     Engine(SettleError),
 }
 
 impl SettleFailure {
-    /// Will a retry fail the same way? A deleted group stays deleted, so it
-    /// is terminal like the engines' own verdicts. A missing engine is not:
-    /// another process may own the block.
+    /// Will a retry fail the same way? A deleted group stays deleted and a
+    /// snapshot not resolved at found-time is gone, so both are terminal like
+    /// the engines' own verdicts. A missing engine is not: another process
+    /// may own the block.
     pub(crate) fn is_terminal(&self) -> bool {
         match self {
             SettleFailure::NoEngine => false,
-            SettleFailure::UnusableGroup => true,
+            SettleFailure::UnusableGroup | SettleFailure::SnapshotMissing => true,
             SettleFailure::Engine(e) => e.is_terminal(),
         }
     }

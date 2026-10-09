@@ -272,7 +272,15 @@ async fn withheld_miner_is_funded_by_the_other_miners_not_by_the_pool() {
     );
 
     let _prepared_1 = engine
-        .on_block_found(height_1, &actual_1, None, Some(fingerprint_1))
+        .on_block_found(
+            height_1,
+            &actual_1,
+            engine
+                .weight_snapshot_for_block_found(&fingerprint_1)
+                .await
+                .expect("snapshot read")
+                .expect("snapshot stored"),
+        )
         .await
         .expect("the mined job's own distribution must resolve for booking");
 
@@ -382,7 +390,15 @@ async fn withheld_miner_is_funded_by_the_other_miners_not_by_the_pool() {
     let paid_2 = |address: &str| actual_2.paid_by_address.get(address).copied().unwrap_or(0) as i64;
 
     let _prepared_2 = engine
-        .on_block_found(height_2, &actual_2, None, Some(fingerprint_2))
+        .on_block_found(
+            height_2,
+            &actual_2,
+            engine
+                .weight_snapshot_for_block_found(&fingerprint_2)
+                .await
+                .expect("snapshot read")
+                .expect("snapshot stored"),
+        )
         .await
         .expect("the second block's distribution must resolve for booking");
 

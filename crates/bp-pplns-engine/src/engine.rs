@@ -59,19 +59,6 @@ pub enum EngineError {
     Ledger(#[from] LedgerError),
     #[error("distribution: {0}")]
     Distribution(Arc<DistributionError>),
-    #[error("snapshot missing for block {block_height} — pool restart or expired TTL?")]
-    SnapshotMissing { block_height: i32 },
-    #[error(
-        "no snapshot under the winning job's payout list — the block needs an \
-         operator reprocess from its own coinbase"
-    )]
-    SnapshotMissingForPayouts,
-    #[error(
-        "block {block_height} carried no payout fingerprint — the pool did not \
-         build this coinbase (JD-client custom job), so there is no pool-side \
-         distribution to book"
-    )]
-    NoPayoutFingerprint { block_height: i32 },
     #[error(
         "block {block_height} coinbase pays {actual_reward} sats, less than the \
          {subsidy} sat subsidy the block was entitled to — it forfeited money, so \
@@ -94,9 +81,6 @@ impl EngineError {
     pub fn is_terminal(&self) -> bool {
         match self {
             EngineError::Config(_)
-            | EngineError::SnapshotMissing { .. }
-            | EngineError::SnapshotMissingForPayouts
-            | EngineError::NoPayoutFingerprint { .. }
             | EngineError::RevenueBelowSubsidy { .. }
             | EngineError::Address(_) => true,
             // `LedgerError` decides, so this engine and Group-Solo cannot disagree.
@@ -276,30 +260,30 @@ impl PplnsEngine {
             .map_err(EngineError::Distribution)
     }
 
-    /// Settlement inputs of the winning job's payout list, resolved at found-time
-    /// like Group-Solo's namesake: the confirmed apply can outlast
+    /// Settlement inputs of the winning job's payout list, read at found-time:
+    /// the confirmed apply outlasts
     /// [`crate::config::PplnsEngineConfig::snapshot_ttl_secs`], and the coinbase alone
-    /// cannot tell what the unpaid were owed.
+    /// cannot tell what the unpaid were owed. `None` when no snapshot was stored.
     pub async fn weight_snapshot_for_block_found(
         &self,
         weights_fingerprint: &[u8; 32],
-    ) -> Result<StoredWeightSnapshot, EngineError> {
+    ) -> Result<Option<StoredWeightSnapshot>, EngineError> {
         let mut conn = self.inner.window.connection_for_snapshot();
-        crate::window::snapshot::resolve_snapshot_for_block_found(&mut conn, weights_fingerprint)
-            .await?
-            .ok_or(EngineError::SnapshotMissingForPayouts)
+        Ok(crate::window::snapshot::resolve_snapshot_for_block_found(
+            &mut conn,
+            weights_fingerprint,
+        )
+        .await?)
     }
 
-    /// Settle `claim(T_actual) − paid` per address against the block's OWN coinbase.
-    /// `snapshot` is `None` only when found-time resolution failed; the fingerprint is
-    /// then read back as a second chance. Idempotent via
+    /// Settle `claim(T_actual) − paid` per address against the block's OWN coinbase,
+    /// from the snapshot resolved when the block was found. Idempotent via
     /// [`crate::ledger::apply_distribution`]: a differing redelivery errors, never rebooks.
     pub async fn on_block_found(
         &self,
         block_height: i32,
         actual: &ActualCoinbase,
-        snapshot: Option<StoredWeightSnapshot>,
-        payouts_fingerprint: Option<[u8; 32]>,
+        snapshot: StoredWeightSnapshot,
     ) -> Result<ApplyDistributionResult, EngineError> {
         if self
             .inner
@@ -309,7 +293,7 @@ impl PplnsEngine {
             return Err(EngineError::BlockFoundInProgress);
         }
         let result = self
-            .on_block_found_inner(block_height, actual, snapshot, payouts_fingerprint)
+            .on_block_found_inner(block_height, actual, snapshot)
             .await;
         self.inner
             .block_found_in_progress
@@ -321,28 +305,8 @@ impl PplnsEngine {
         &self,
         block_height: i32,
         actual: &ActualCoinbase,
-        snapshot: Option<StoredWeightSnapshot>,
-        payouts_fingerprint: Option<[u8; 32]>,
+        snapshot: StoredWeightSnapshot,
     ) -> Result<ApplyDistributionResult, EngineError> {
-        let snapshot = match snapshot {
-            Some(s) => s,
-            None => {
-                let fingerprint = payouts_fingerprint
-                    .filter(|fp| fp != &[0u8; 32])
-                    .ok_or(EngineError::NoPayoutFingerprint { block_height })?;
-                self.weight_snapshot_for_block_found(&fingerprint)
-                    .await
-                    .map_err(|e| match e {
-                        // At apply time the TTL won: report the block-scoped
-                        // failure the operator reprocess keys off.
-                        EngineError::SnapshotMissingForPayouts => {
-                            EngineError::SnapshotMissing { block_height }
-                        }
-                        other => other,
-                    })?
-            }
-        };
-
         if let Err(subsidy) =
             actual.check_subsidy(block_height, self.inner.config.subsidy_halving_interval)
         {
@@ -712,12 +676,5 @@ mod tests {
         let e = EngineError::BlockFoundInProgress;
         let s = format!("{e}");
         assert!(s.contains("in flight"), "got: {s}");
-    }
-
-    #[test]
-    fn snapshot_missing_error_carries_block_height() {
-        let e = EngineError::SnapshotMissing { block_height: 9001 };
-        let s = format!("{e}");
-        assert!(s.contains("9001"), "got: {s}");
     }
 }

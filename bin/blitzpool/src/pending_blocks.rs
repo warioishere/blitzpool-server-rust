@@ -42,10 +42,9 @@ pub(crate) struct PendingBlock {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum PendingSettlement {
     Pplns {
-        /// The distribution's settlement inputs, resolved at found-time.
+        /// The distribution's settlement inputs, resolved at found-time;
+        /// `None` when that failed, which nothing can book automatically.
         weight_snapshot: Option<StoredWeightSnapshot>,
-        /// The weights fingerprint the winning job carried.
-        payouts_fingerprint: Option<[u8; 32]>,
     },
     GroupSolo {
         group_id: Uuid,
@@ -56,6 +55,16 @@ pub(crate) enum PendingSettlement {
 }
 
 impl PendingSettlement {
+    /// Whether the mode books against a distribution the pool built, so a
+    /// coinbase without one has nothing to book. Blockparty recomputes its
+    /// split from the roster instead.
+    pub(crate) fn needs_pool_distribution(&self) -> bool {
+        match self {
+            Self::Pplns { .. } | Self::GroupSolo { .. } => true,
+            Self::Blockparty { .. } => false,
+        }
+    }
+
     pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::Pplns { .. } => "pplns",
@@ -207,7 +216,6 @@ mod tests {
                 },
                 settlement: PendingSettlement::Pplns {
                     weight_snapshot: None,
-                    payouts_fingerprint: None,
                 },
             },
         )
