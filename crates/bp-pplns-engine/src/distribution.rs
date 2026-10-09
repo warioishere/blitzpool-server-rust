@@ -281,6 +281,15 @@ async fn build_from_inputs(
     )
     .await?;
 
+    // Informational only: a failed write leaves the API without the count.
+    let published = built.distribution.published().count();
+    if let Err(err) = window
+        .write_published_outputs(published, config.snapshot_ttl_secs)
+        .await
+    {
+        warn!(%err, "pplns: published-output count write failed");
+    }
+
     config
         .coinbase_weight_budget
         .record_sample(built.distribution.budget_telemetry);

@@ -25,11 +25,12 @@ const SCOPES: &[(&str, &str)] = &[("pplns", "pplns:*"), ("groupsolo", "groupsolo
 /// `RENAME`; never worth backing up (and confusing on restore).
 const SKIP_SUFFIX: &str = ":by-address:rebuild";
 
-/// Per-job PPLNS distribution snapshots, skipped as neither restorable nor
-/// few: each belongs to one in-memory job, so after a Redis loss nothing
-/// looks a restored one up.
-fn is_per_job_snapshot(key: &str) -> bool {
-    key.starts_with("pplns:snapshot:")
+/// Keys that describe the running process's jobs rather than restorable
+/// state: the per-job PPLNS distribution snapshots, which nothing looks up
+/// after a Redis loss, and the published-output count, which a restore would
+/// bring back without its TTL and so freeze at a stale value.
+fn is_job_state(key: &str) -> bool {
+    key.starts_with("pplns:snapshot:") || key == bp_pplns_engine::window::KEY_PUBLISHED_OUTPUTS
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -117,7 +118,7 @@ pub(crate) async fn run_backup_once(
 
     for (scope, pattern) in SCOPES {
         for key in scan_keys(redis, pattern).await? {
-            if key.ends_with(SKIP_SUFFIX) || is_per_job_snapshot(&key) {
+            if key.ends_with(SKIP_SUFFIX) || is_job_state(&key) {
                 continue;
             }
             // `Option`: the key may vanish between SCAN and DUMP (trim/reset).
@@ -268,17 +269,19 @@ mod tests {
     const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
     const RETENTION_MS: i64 = 48 * 3600 * 1000;
 
-    /// Per-job snapshots are skipped, window and round state are not.
+    /// Job state (per-job snapshots, the published-output count) is skipped,
+    /// window and round state are not.
     #[test]
-    fn per_job_snapshots_are_classified_apart_from_restorable_state() {
+    fn job_state_is_classified_apart_from_restorable_state() {
         let fp = "ab".repeat(32);
-        assert!(is_per_job_snapshot(&format!("pplns:snapshot:{fp}")));
+        assert!(is_job_state(&format!("pplns:snapshot:{fp}")));
+        assert!(is_job_state("pplns:published_outputs"));
 
-        assert!(!is_per_job_snapshot("pplns:window:by-address"));
-        assert!(!is_per_job_snapshot("pplns:window:total"));
-        assert!(!is_per_job_snapshot("pplns:buckets"));
-        assert!(!is_per_job_snapshot("groupsolo:g1:shares"));
-        assert!(!is_per_job_snapshot("groupsolo:g1:by-address"));
+        assert!(!is_job_state("pplns:window:by-address"));
+        assert!(!is_job_state("pplns:window:total"));
+        assert!(!is_job_state("pplns:buckets"));
+        assert!(!is_job_state("groupsolo:g1:shares"));
+        assert!(!is_job_state("groupsolo:g1:by-address"));
     }
 
     async fn pg_or_skip() -> Option<PgPool> {

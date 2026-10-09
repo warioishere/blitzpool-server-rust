@@ -56,6 +56,14 @@ impl ReaderView<'_> {
     }
 }
 
+impl ReaderView<'_> {
+    /// How many miners the most recently built coinbase pays, as opposed to
+    /// [`WindowStats::miner_count`], which counts every address in the window.
+    pub async fn published_output_count(&self) -> Result<Option<u32>, EngineError> {
+        Ok(self.engine.window().read_published_outputs().await?)
+    }
+}
+
 // ── Per-address window contribution + percent ──────────────────────
 
 #[derive(Clone, Debug, PartialEq)]

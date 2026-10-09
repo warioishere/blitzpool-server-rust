@@ -100,7 +100,24 @@ struct WindowStatsBody {
     total_shares: f64,
     #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     window_size: f64,
+    /// Every address with shares in the window.
     miner_count: u32,
+    /// Miners the most recently built coinbase pays; `null` when no coinbase
+    /// was built recently.
+    miner_output_count: Option<u32>,
+}
+
+impl WindowStatsBody {
+    async fn read(engine: &bp_pplns_engine::engine::PplnsEngine) -> Result<Self, ApiError> {
+        let reader = engine.reader();
+        let ws = reader.window_stats().await?;
+        Ok(Self {
+            total_shares: ws.total_shares,
+            window_size: ws.window_size,
+            miner_count: ws.miner_count,
+            miner_output_count: reader.published_output_count().await?,
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -140,14 +157,9 @@ async fn status(State(state): State<SharedState>) -> Result<JsonBytes, ApiError>
             TtlKind::PplnsStatus,
             async move {
                 let engine = require_pplns(&s)?;
-                let ws = engine.reader().window_stats().await?;
                 Ok(StatusResponse {
                     enabled: true,
-                    window: WindowStatsBody {
-                        total_shares: ws.total_shares,
-                        window_size: ws.window_size,
-                        miner_count: ws.miner_count,
-                    },
+                    window: WindowStatsBody::read(engine).await?,
                 })
             },
         )
@@ -170,7 +182,7 @@ async fn root(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
 
 async fn root_inner(state: &SharedState) -> Result<RootResponse, ApiError> {
     let engine = require_pplns(state)?;
-    let ws = engine.reader().window_stats().await?;
+    let window = WindowStatsBody::read(engine).await?;
     let dist = engine.reader().current_distribution().await?;
     let addresses: Vec<String> = dist.into_iter().map(|a| a.address).collect();
     // Per-address user-agent aggregation.
@@ -194,11 +206,7 @@ async fn root_inner(state: &SharedState) -> Result<RootResponse, ApiError> {
     };
     Ok(RootResponse {
         enabled: true,
-        window: WindowStatsBody {
-            total_shares: ws.total_shares,
-            window_size: ws.window_size,
-            miner_count: ws.miner_count,
-        },
+        window,
         user_agents,
     })
 }

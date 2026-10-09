@@ -38,6 +38,9 @@ pub const KEY_WINDOW_REBUILD: &str = "pplns:window:by-address:rebuild";
 pub const KEY_BUCKETS: &str = "pplns:buckets";
 /// Coinbase distribution snapshot. See [`mod@snapshot`].
 pub const KEY_SNAPSHOT: &str = "pplns:snapshot";
+/// How many miners the most recently built PPLNS coinbase pays, with the
+/// snapshot's TTL so it lapses instead of going stale once no job is built.
+pub const KEY_PUBLISHED_OUTPUTS: &str = "pplns:published_outputs";
 /// Dedup zset `share_id → counter` for exactly-once `record_share`. Capped
 /// to the newest `DEDUP_KEEP` entries by rank. A redelivered share whose
 /// id is still in this set is a no-op. See `RECORD_SHARE_LUA`.
@@ -467,6 +470,26 @@ impl WindowStore {
     }
 
     /// Redis handle for the snapshot write and the block-found read.
+    /// Record how many miners the coinbase just built pays.
+    pub async fn write_published_outputs(
+        &self,
+        count: usize,
+        ttl_seconds: u32,
+    ) -> Result<(), WindowError> {
+        let mut conn = self.conn.clone();
+        let _: () = conn
+            .set_ex(KEY_PUBLISHED_OUTPUTS, count, u64::from(ttl_seconds))
+            .await?;
+        Ok(())
+    }
+
+    /// How many miners the most recently built coinbase pays; `None` once no
+    /// coinbase was built within the snapshot TTL.
+    pub async fn read_published_outputs(&self) -> Result<Option<u32>, WindowError> {
+        let mut conn = self.conn.clone();
+        Ok(conn.get(KEY_PUBLISHED_OUTPUTS).await?)
+    }
+
     pub fn connection_for_snapshot(&self) -> ConnectionManager {
         self.conn.clone()
     }

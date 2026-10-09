@@ -396,6 +396,53 @@ async fn a_block_settles_from_its_parked_blob_after_the_snapshot_key_is_gone() {
 // Late-arriver rows can grow the row set between two applies, so "already
 // booked" cannot be inferred from new rows being inserted.
 
+/// The window counts every address with shares; the coinbase pays only the
+/// miners at or above `min_payout`. The published-output count reports the
+/// coinbase, so a miner below the line is in the first and not the second.
+#[tokio::test]
+async fn the_published_output_count_leaves_out_miners_without_an_output() {
+    let _serial = balance_table_lock().lock().await;
+    let h = match spawn_or_skip(21, "test_pubout_").await {
+        Some(h) => h,
+        None => return,
+    };
+    // Real addresses unique to this test; unparsable ones are dropped.
+    const BIG: &str = "bc1qwqdg6squsna38e46795at95yu9atm8azzmyvckulcc7kytlcckxswvvzej";
+    const TINY: &str = "bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h";
+    cleanup_addr(&h.pool, BIG, &[]).await;
+    cleanup_addr(&h.pool, TINY, &[]).await;
+    assert_eq!(
+        h.engine.reader().published_output_count().await.unwrap(),
+        None,
+        "precondition: no coinbase built yet"
+    );
+
+    h.engine
+        .record_share(None, BIG, 1_000_000.0, ts(1))
+        .await
+        .unwrap();
+    h.engine.record_share(None, TINY, 1.0, ts(2)).await.unwrap();
+    const REWARD: u64 = 3_000_000_000;
+    let result = h.engine.build_distribution(REWARD).await.expect("built");
+    let actual = actual_paying_exactly(&result, REWARD);
+    assert!(
+        actual.paid_by_address.contains_key(BIG) && !actual.paid_by_address.contains_key(TINY),
+        "precondition: BIG has an output and TINY, under min_payout, has none"
+    );
+
+    let stats = h.engine.reader().window_stats().await.unwrap();
+    assert_eq!(stats.miner_count, 2, "the window holds both");
+    assert_eq!(
+        h.engine.reader().published_output_count().await.unwrap(),
+        Some(1),
+        "only BIG has a coinbase output"
+    );
+
+    cleanup_addr(&h.pool, BIG, &[]).await;
+    cleanup_addr(&h.pool, TINY, &[]).await;
+    drop_harness(h).await;
+}
+
 #[tokio::test]
 async fn a_second_apply_of_the_same_block_moves_no_money() {
     let _serial = balance_table_lock().lock().await;
