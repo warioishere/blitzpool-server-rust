@@ -4,7 +4,7 @@
 //! ([`bp_common::extranonce`]). SV2 keys one prefix per channel, and a wire
 //! `channel_id` is only unique within its connection.
 
-pub use bp_common::extranonce::{SharedExtranonceAllocator, SV2_WORKER_ID};
+pub use bp_common::extranonce::{ExtranonceError, SharedExtranonceAllocator, SV2_WORKER_ID};
 
 /// One connection's view of the SV2 allocator. The connection number comes
 /// from the allocator's counter, not the random `session_id`, which can
@@ -24,19 +24,9 @@ impl ConnectionExtranonce {
     }
 
     /// The prefix for `channel_id`; the same one again for a repeated id.
-    /// Empty, and logged, when the partition is exhausted.
-    pub fn allocate(&self, channel_id: u32) -> Vec<u8> {
-        match self.shared.allocate(self.key(channel_id)) {
-            Ok(prefix) => prefix.to_vec(),
-            Err(err) => {
-                tracing::warn!(
-                    channel_id,
-                    "sv2: {err}; opening the channel with an empty (non-unique) \
-                     extranonce prefix"
-                );
-                Vec::new()
-            }
-        }
+    /// `Err(Exhausted)` when the whole partition is in use.
+    pub fn allocate(&self, channel_id: u32) -> Result<[u8; 4], ExtranonceError> {
+        self.shared.allocate(self.key(channel_id))
     }
 
     /// Return `channel_id`'s prefix. A no-op for an id holding none.
@@ -61,14 +51,17 @@ mod tests {
         let a = ConnectionExtranonce::new(shared.clone());
         let b = ConnectionExtranonce::new(shared.clone());
 
-        let p_a = a.allocate(1);
-        let p_b = b.allocate(1);
-        assert_eq!(p_a.len(), 4, "precondition: a real prefix was allocated");
+        let p_a = a.allocate(1).unwrap();
+        let p_b = b.allocate(1).unwrap();
         assert_ne!(
             p_a, p_b,
             "channel 1 on two connections must not share a prefix"
         );
-        assert_eq!(p_a, a.allocate(1), "a repeated channel id keeps its prefix");
+        assert_eq!(
+            Ok(p_a),
+            a.allocate(1),
+            "a repeated channel id keeps its prefix"
+        );
         assert_eq!(shared.allocated_count(), 2);
 
         a.release(1);

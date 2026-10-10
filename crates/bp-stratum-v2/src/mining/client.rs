@@ -101,6 +101,11 @@ pub const ERR_ADDRESS_LOCKED: &str = "address-locked";
 /// region would make an aggregating proxy tear down the upstream.
 pub const ERR_MIN_EXTRANONCE_SIZE_TOO_LARGE: &str = "min-extranonce-size-too-large";
 
+/// `channel-capacity-exhausted` — every extranonce prefix of the pool's
+/// partition is held, so a new channel would share another's search space.
+/// Same code as the SRI pool; not spec-assigned.
+pub const ERR_CHANNEL_CAPACITY_EXHAUSTED: &str = "channel-capacity-exhausted";
+
 /// `invalid-channel-id` — `UpdateChannel` / `CloseChannel` referenced
 /// an unknown channel on this connection.
 pub const ERR_INVALID_CHANNEL_ID: &str = "invalid-channel-id";
@@ -385,7 +390,7 @@ pub struct HandlerOutcome {
 }
 
 impl HandlerOutcome {
-    fn with_frame(frame: OutboundFrame) -> Self {
+    pub(crate) fn with_frame(frame: OutboundFrame) -> Self {
         Self {
             outbound: vec![frame],
             events: Vec::new(),

@@ -36,6 +36,7 @@ use crate::mining::client::{
     handle_request_extensions, handle_set_custom_mining_job, handle_setup_connection,
     handle_submit_shares_extended, handle_submit_shares_standard, handle_update_channel,
     HandlerOutcome, MiningJobInputs, MiningSessionState, OutboundFrame, PortConfig, SessionEvent,
+    ERR_CHANNEL_CAPACITY_EXHAUSTED,
 };
 use bp_template_distribution::{ActiveTemplate, TemplateAssembler, TemplateChange};
 
@@ -1027,10 +1028,37 @@ fn custom_extranonce_broadcast_frames<C: bp_vardiff::Clock>(
     frames
 }
 
+/// Runs an `Open*` handler with the prefix of the channel id it would assign.
+/// An exhausted partition refuses the open rather than handing out a prefix
+/// another channel holds, and a refused open gives its prefix back, so only
+/// open channels hold one.
+fn open_with_prefix<C: bp_vardiff::Clock + Clone>(
+    state: &mut MiningSessionState<C>,
+    extranonce: &ConnectionExtranonce,
+    request_id: u32,
+    open: impl FnOnce(&mut MiningSessionState<C>, Vec<u8>) -> HandlerOutcome,
+) -> HandlerOutcome {
+    let channel_id = state.next_channel_id;
+    let prefix = match extranonce.allocate(channel_id) {
+        Ok(prefix) => prefix,
+        Err(err) => {
+            warn!(channel_id, "sv2: {err}; refusing the channel open");
+            return HandlerOutcome::with_frame(OutboundFrame::OpenMiningChannelError {
+                request_id,
+                error_code: ERR_CHANNEL_CAPACITY_EXHAUSTED.to_string(),
+            });
+        }
+    };
+    let outcome = open(state, prefix.to_vec());
+    if !state.channels.contains_key(&channel_id) {
+        extranonce.release(channel_id);
+    }
+    outcome
+}
+
 /// Route an [`InboundMiningFrame`] to its `handle_*` function. The pool-wide
 /// extranonce allocator is locked only in the Open/Close arms, never on
-/// submit, so share validation does not serialize behind channel churn. A
-/// prefix allocated for a failed open stays held until connection close.
+/// submit, so share validation does not serialize behind channel churn.
 pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
     state: &mut MiningSessionState<C>,
     inbound: InboundMiningFrame,
@@ -1042,12 +1070,14 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
         InboundMiningFrame::SetupConnection(input) => handle_setup_connection(state, &input),
         InboundMiningFrame::RequestExtensions(input) => handle_request_extensions(state, &input),
         InboundMiningFrame::OpenStandardMiningChannel(input) => {
-            let prefix = extranonce.allocate(state.next_channel_id);
-            handle_open_standard_mining_channel(state, &input, prefix)
+            open_with_prefix(state, extranonce, input.request_id, |state, prefix| {
+                handle_open_standard_mining_channel(state, &input, prefix)
+            })
         }
         InboundMiningFrame::OpenExtendedMiningChannel(input) => {
-            let prefix = extranonce.allocate(state.next_channel_id);
-            handle_open_extended_mining_channel(state, &input, prefix)
+            open_with_prefix(state, extranonce, input.request_id, |state, prefix| {
+                handle_open_extended_mining_channel(state, &input, prefix)
+            })
         }
         InboundMiningFrame::UpdateChannel(input) => handle_update_channel(state, &input),
         InboundMiningFrame::CloseChannel(input) => {
@@ -2381,6 +2411,53 @@ mod tests {
             before - 1,
             "close releases the channel's prefix"
         );
+    }
+
+    /// A refused open gives its prefix back: only open channels hold one,
+    /// so a client retrying a bad open cannot drain the partition.
+    #[test]
+    fn dispatch_refused_open_releases_its_extranonce_prefix() {
+        let mut s = fresh_test_session();
+        let shared = fresh_allocator();
+        let alloc = ConnectionExtranonce::new(shared.clone());
+        let bridge = fresh_bridge();
+        let setup = InboundMiningFrame::SetupConnection(SetupConnectionInput {
+            protocol: PROTOCOL_MINING,
+            min_version: 2,
+            max_version: 2,
+            flags: FLAG_REQUIRES_VERSION_ROLLING,
+            vendor: "t".to_string(),
+        });
+        let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, 0);
+        let open = |user_identity: String| {
+            InboundMiningFrame::OpenStandardMiningChannel(
+                crate::mining::client::OpenStandardMiningChannelInput {
+                    request_id: 1,
+                    user_identity,
+                    nominal_hash_rate: 1_000.0,
+                    max_target: [0xFF; 32],
+                },
+            )
+        };
+
+        let out = dispatch_inbound_frame(&mut s, open("not-an-address".into()), &alloc, &bridge, 0);
+        assert!(
+            matches!(
+                out.outbound[0],
+                OutboundFrame::OpenMiningChannelError { .. }
+            ),
+            "precondition: the open is refused, got {:?}",
+            out.outbound
+        );
+        assert_eq!(
+            shared.allocated_count(),
+            0,
+            "the refused open holds no prefix"
+        );
+
+        let _ = dispatch_inbound_frame(&mut s, open(format!("{ADDR}.w")), &alloc, &bridge, 0);
+        assert!(s.primary_channel.is_some(), "precondition: the retry opens");
+        assert_eq!(shared.allocated_count(), 1, "the open channel holds one");
     }
 
     /// Only a refused open yields a refusal reason to log.
