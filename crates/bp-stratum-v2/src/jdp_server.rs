@@ -1251,7 +1251,7 @@ mod tests {
             version: 0x2000_0000,
             coinbase_tx_prefix: vec![0xBB; 8],
             coinbase_tx_suffix: vec![0xCC; 8],
-            wtxid_list: vec![[0x11; 32]],
+            wtxid_list: vec![crate::jdp::tx_validation::wtxid_of(&[0xAB; 32])],
             distribution_id: None,
         }
     }

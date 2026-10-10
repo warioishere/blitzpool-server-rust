@@ -6,12 +6,15 @@
 
 use std::collections::HashMap;
 
+use bitcoin::hashes::{sha256d, Hash};
+
 // ── DeclaredTxs ─────────────────────────────────────────────────────
 
-/// One slot per position in the declared `wtxid_list`: the raw tx when the
-/// template has it, `None` where it must be requested.
+/// One slot per position in the declared `wtxid_list`: the declared wtxid,
+/// with the raw tx when the template has it and `None` where it must be
+/// requested.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DeclaredTxs(Vec<Option<Vec<u8>>>);
+pub struct DeclaredTxs(Vec<([u8; 32], Option<Vec<u8>>)>);
 
 /// The provided list must match the request in count and order
 /// (SV2 JDP/ProvideMissingTransactions.Success); a shorter list would shift
@@ -20,6 +23,12 @@ pub struct DeclaredTxs(Vec<Option<Vec<u8>>>);
 pub enum MergeError {
     #[error("expected {expected} transactions, got {got}")]
     PositionCountMismatch { expected: usize, got: usize },
+    /// The bytes provided for a position are not the transaction declared
+    /// there; keeping them would store a transaction nothing has checked.
+    #[error(
+        "the transaction provided for position {position} does not hash to its declared wtxid"
+    )]
+    WtxidMismatch { position: u32 },
 }
 
 impl DeclaredTxs {
@@ -30,7 +39,7 @@ impl DeclaredTxs {
         Self(
             wtxid_list
                 .iter()
-                .map(|wtxid| template_txs.get(wtxid).cloned())
+                .map(|wtxid| (*wtxid, template_txs.get(wtxid).cloned()))
                 .collect(),
         )
     }
@@ -39,21 +48,21 @@ impl DeclaredTxs {
     pub fn missing_positions(&self) -> Vec<u32> {
         (0u32..)
             .zip(&self.0)
-            .filter_map(|(position, slot)| slot.is_none().then_some(position))
+            .filter_map(|(position, (_, tx))| tx.is_none().then_some(position))
             .collect()
     }
 
     /// The transactions the pool already has, in declaration order.
     pub fn known(&self) -> Vec<&[u8]> {
-        self.0.iter().flatten().map(Vec::as_slice).collect()
+        self.0.iter().filter_map(|(_, tx)| tx.as_deref()).collect()
     }
 
     /// Every transaction in declaration order, or `self` back when one is missing.
     pub fn into_complete(self) -> Result<Vec<Vec<u8>>, Self> {
-        if self.0.iter().any(Option::is_none) {
+        if self.0.iter().any(|(_, tx)| tx.is_none()) {
             return Err(self);
         }
-        Ok(self.0.into_iter().flatten().collect())
+        Ok(self.0.into_iter().filter_map(|(_, tx)| tx).collect())
     }
 
     /// The complete list with `provided` filling the gaps, without copying a tx.
@@ -62,7 +71,7 @@ impl DeclaredTxs {
         provided: &'a [Vec<u8>],
     ) -> Result<Vec<&'a [u8]>, MergeError> {
         fill_gaps(
-            self.0.iter().map(Option::as_deref),
+            self.0.iter().map(|(wtxid, tx)| (*wtxid, tx.as_deref())),
             provided.iter().map(Vec::as_slice),
         )
     }
@@ -73,25 +82,43 @@ impl DeclaredTxs {
     }
 }
 
-/// `provided` into the `None` slots, in order.
-fn fill_gaps<T>(
-    slots: impl IntoIterator<Item = Option<T>>,
+/// `provided` into the `None` slots, in order, each checked against the
+/// wtxid declared at its position.
+fn fill_gaps<T: AsRef<[u8]>>(
+    slots: impl IntoIterator<Item = ([u8; 32], Option<T>)>,
     provided: impl IntoIterator<Item = T, IntoIter: ExactSizeIterator>,
 ) -> Result<Vec<T>, MergeError> {
-    let slots: Vec<Option<T>> = slots.into_iter().collect();
+    let slots: Vec<([u8; 32], Option<T>)> = slots.into_iter().collect();
     let mut provided = provided.into_iter();
-    let expected = slots.iter().filter(|slot| slot.is_none()).count();
+    let expected = slots.iter().filter(|(_, tx)| tx.is_none()).count();
     if provided.len() != expected {
         return Err(MergeError::PositionCountMismatch {
             expected,
             got: provided.len(),
         });
     }
-    Ok(slots
-        .into_iter()
-        .map(|slot| slot.or_else(|| provided.next()))
-        .collect::<Option<Vec<T>>>()
-        .expect("one provided tx per gap, counted above"))
+    (0u32..)
+        .zip(slots)
+        .map(|(position, (wtxid, slot))| match slot {
+            Some(tx) => Ok(tx),
+            None => {
+                let tx = provided
+                    .next()
+                    .expect("one provided tx per gap, counted above");
+                if sha256d::Hash::hash(tx.as_ref()).to_byte_array() != wtxid {
+                    return Err(MergeError::WtxidMismatch { position });
+                }
+                Ok(tx)
+            }
+        })
+        .collect()
+}
+
+/// The wtxid of a raw transaction (sha256d over its serialization), for
+/// fixtures whose provided bytes must match what they declare.
+#[cfg(test)]
+pub(crate) fn wtxid_of(tx: &[u8]) -> [u8; 32] {
+    sha256d::Hash::hash(tx).to_byte_array()
 }
 
 #[cfg(test)]
@@ -142,8 +169,14 @@ mod tests {
 
     // ── completing ─────────────────────────────────────────────────
 
+    /// Known 0xAA and 0xCC, gaps declared as 0xBB and 0xDD.
     fn gapped() -> DeclaredTxs {
-        DeclaredTxs(vec![Some(vec![0xAA]), None, Some(vec![0xCC]), None])
+        DeclaredTxs(vec![
+            (wtxid_of(&[0xAA]), Some(vec![0xAA])),
+            (wtxid_of(&[0xBB]), None),
+            (wtxid_of(&[0xCC]), Some(vec![0xCC])),
+            (wtxid_of(&[0xDD]), None),
+        ])
     }
 
     #[test]
@@ -179,7 +212,26 @@ mod tests {
 
     #[test]
     fn nothing_provided_completes_a_gapless_list() {
-        let txs = DeclaredTxs(vec![Some(vec![0xAA])]);
+        let txs = DeclaredTxs(vec![(wtxid_of(&[0xAA]), Some(vec![0xAA]))]);
         assert_eq!(txs.complete_with(vec![]).unwrap(), vec![vec![0xAA]]);
+    }
+
+    /// Bytes that are not the declared transaction are refused on both paths,
+    /// even with the count right; the declared bytes in the same place pass.
+    #[test]
+    fn a_provided_tx_must_hash_to_the_declared_wtxid() {
+        let swapped = vec![vec![0xBB], vec![0xEE]];
+        let err = MergeError::WtxidMismatch { position: 3 };
+        assert_eq!(gapped().completed_with(&swapped).unwrap_err(), err);
+        assert_eq!(gapped().complete_with(swapped).unwrap_err(), err);
+
+        let in_wrong_order = vec![vec![0xDD], vec![0xBB]];
+        assert_eq!(
+            gapped().complete_with(in_wrong_order).unwrap_err(),
+            MergeError::WtxidMismatch { position: 1 }
+        );
+
+        let declared = vec![vec![0xBB], vec![0xDD]];
+        assert!(gapped().complete_with(declared).is_ok());
     }
 }

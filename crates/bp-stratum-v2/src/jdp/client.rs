@@ -637,8 +637,8 @@ pub fn handle_provide_missing_transactions_success(
             return JdpHandlerOutcome::declare_error(
                 input.request_id,
                 ERR_MISSING_TXS,
-                b"ProvideMissingTransactions.Success does not carry one transaction per \
-                  requested position",
+                b"ProvideMissingTransactions.Success does not carry the requested transactions, \
+                  one per position",
             );
         }
     };
@@ -1431,7 +1431,7 @@ mod tests {
         let mut s = fresh();
         let token = complete_setup_and_allocate(&mut s);
         let wtxid_a = [0x01; 32];
-        let wtxid_b = [0x02; 32];
+        let wtxid_b = crate::jdp::tx_validation::wtxid_of(&[0xFE; 16]);
         let mut tpl = HashMap::new();
         tpl.insert(wtxid_a, vec![0xCA; 16]);
         tpl.insert(wtxid_b, vec![0xFE; 16]);
@@ -2013,7 +2013,7 @@ mod tests {
         let mut s = fresh();
         let token = complete_setup_and_allocate(&mut s);
         let wtxid_a = [0x01; 32];
-        let wtxid_b = [0x02; 32]; // NOT in template
+        let wtxid_b = crate::jdp::tx_validation::wtxid_of(&[0xFE; 16]); // NOT in template
         let mut tpl = HashMap::new();
         tpl.insert(wtxid_a, vec![0xCA; 16]);
         let input = declare(4, token, vec![wtxid_a, wtxid_b]);
@@ -2035,7 +2035,7 @@ mod tests {
     /// Declare one job that needs a round-trip, on a fresh token.
     fn declare_pending(s: &mut JdpSessionState, request_id: u32, now_ms: u64) {
         let known = [0x01; 32];
-        let missing = [0x02; 32];
+        let missing = crate::jdp::tx_validation::wtxid_of(&[0xBB; 16]);
         let mut tpl = HashMap::new();
         tpl.insert(known, vec![0xCA; 16]);
         let token = allocate_another(s, 100 + request_id, now_ms);
@@ -2120,7 +2120,7 @@ mod tests {
         let mut s = fresh();
         let token = complete_setup_and_allocate(&mut s);
         let wtxid_a = [0x01; 32];
-        let wtxid_b = [0x02; 32];
+        let wtxid_b = crate::jdp::tx_validation::wtxid_of(&[0xFE; 16]);
         let mut tpl = HashMap::new();
         tpl.insert(wtxid_a, vec![0xCA; 16]);
         let input = declare(5, token, vec![wtxid_a, wtxid_b]);
@@ -2140,13 +2140,39 @@ mod tests {
         assert!(s.pending_declarations.is_empty());
     }
 
+    /// Bytes that are not the declared transaction get `missing-txs` and the
+    /// declaration is not accepted, though the count is right.
+    #[test]
+    fn provide_missing_with_another_transaction_rejects_missing_txs() {
+        let mut s = fresh();
+        let token = complete_setup_and_allocate(&mut s);
+        let wtxid_a = [0x01; 32];
+        let wtxid_b = crate::jdp::tx_validation::wtxid_of(&[0xFE; 16]);
+        let mut tpl = HashMap::new();
+        tpl.insert(wtxid_a, vec![0xCA; 16]);
+        let input = declare(5, token, vec![wtxid_a, wtxid_b]);
+        let _ = declared(&mut s, &input, &tpl, ctx(3_000));
+        let success = ProvideMissingTransactionsSuccessInput {
+            request_id: 5,
+            transaction_list: vec![vec![0xEE; 16]],
+        };
+        let out = handle_provide_missing_transactions_success(&mut s, success, ctx(4_000));
+        match &out.outbound[0] {
+            JdpOutboundFrame::DeclareMiningJobError { error_code, .. } => {
+                assert_eq!(error_code, ERR_MISSING_TXS);
+            }
+            other => panic!("expected missing-txs, got {other:?}"),
+        }
+        assert!(s.declared_jobs.is_empty(), "nothing may be accepted");
+    }
+
     /// A tip move during the round-trip → `stale-chain-tip`.
     #[test]
     fn provide_missing_with_tip_drift_rejects_stale_chain_tip() {
         let mut s = fresh();
         let token = complete_setup_and_allocate(&mut s);
         let wtxid_a = [0x01; 32];
-        let wtxid_b = [0x02; 32];
+        let wtxid_b = crate::jdp::tx_validation::wtxid_of(&[0xFE; 16]);
         let mut tpl = HashMap::new();
         tpl.insert(wtxid_a, vec![0xCA; 16]);
         let input = declare(5, token, vec![wtxid_a, wtxid_b]);
@@ -2191,7 +2217,7 @@ mod tests {
         let token = complete_setup_and_allocate(&mut s);
         negotiate_0x0003(&mut s);
         let wtxid_a = [0x01; 32];
-        let wtxid_b = [0x02; 32]; // NOT in template → round-trip
+        let wtxid_b = crate::jdp::tx_validation::wtxid_of(&[0xFE; 16]); // NOT in template → round-trip
         let mut tpl = HashMap::new();
         tpl.insert(wtxid_a, vec![0xCA; 16]);
         let entry = distribution_entry(7);
@@ -2238,7 +2264,7 @@ mod tests {
         let token = complete_setup_and_allocate(&mut s);
         negotiate_0x0003(&mut s);
         let wtxid_a = [0x01; 32];
-        let wtxid_b = [0x02; 32];
+        let wtxid_b = crate::jdp::tx_validation::wtxid_of(&[0xFE; 16]);
         let mut tpl = HashMap::new();
         tpl.insert(wtxid_a, vec![0xCA; 16]);
         let entry = distribution_entry(7);
@@ -2310,7 +2336,7 @@ mod tests {
         let mut s = fresh();
         let token = complete_setup_and_allocate(&mut s);
         let wtxid_a = [0x01; 32];
-        let wtxid_b = [0x02; 32];
+        let wtxid_b = crate::jdp::tx_validation::wtxid_of(&[0xFE; 16]);
         let input = declare(6, token, vec![wtxid_a, wtxid_b]);
         let _ = declared(&mut s, &input, &HashMap::new(), ctx(3_000));
         // Two positions asked for, one provided.
@@ -2466,7 +2492,7 @@ mod tests {
         let mut s = fresh();
         let token = complete_setup_and_allocate(&mut s);
         let wtxid_a = [0x01; 32];
-        let wtxid_b = [0x02; 32];
+        let wtxid_b = crate::jdp::tx_validation::wtxid_of(&[0xFE; 16]);
         let mut tpl = HashMap::new();
         tpl.insert(wtxid_a, vec![0xCA; 8]);
         // wtxid_b is not in the template, so the declaration stays pending.
