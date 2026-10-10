@@ -1998,16 +1998,19 @@ pub fn handle_set_custom_mining_job<C: Clock>(
 
     let channel_addr = state.address.as_ref().map(|a| a.as_str()).unwrap_or("");
 
-    // The bindings every allocate-backed job gets; one closure for both
+    // A job on a past tip cannot produce a block, yet its shares would be
+    // credited; off Solo that takes from everyone else in the window. Checked
+    // ahead of the backing because it holds for all of them: a declaration
+    // made on the previous tip is still on hand after the tip changes.
+    if input.prev_hash != tip {
+        return reject(ERR_STALE_CHAIN_TIP);
+    }
+
+    // The binding every allocate-backed job gets; one closure for both
     // Coinbase-only arms so the rule cannot drift apart.
     let bind_allocation = |token: &crate::bridge::AllocatedTokenRef| -> Option<&'static str> {
         if channel_addr != token.miner_address.as_str() {
             return Some(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
-        }
-        // A job on a past tip cannot produce a block, yet its shares would be
-        // credited; off Solo that takes from everyone else in the window.
-        if input.prev_hash != tip {
-            return Some(ERR_STALE_CHAIN_TIP);
         }
         None
     };
@@ -2082,7 +2085,7 @@ pub fn handle_set_custom_mining_job<C: Clock>(
         }
         // Coinbase-only under ext 0x0003: no designated output; the coinbase is
         // judged by the ext 0x0003/Output Verification recompute below. That
-        // covers the coinbase only, so tip and address still need `bind_allocation`.
+        // covers the coinbase only, so the address still needs `bind_allocation`.
         crate::bridge::TokenBacking::DistributionAllocation(token) => {
             if let Some(code) = bind_allocation(token) {
                 return reject(code);
@@ -5550,6 +5553,44 @@ pub(crate) mod tests {
             out.outbound[0],
             OutboundFrame::SetCustomMiningJobSuccess { .. }
         ));
+    }
+
+    /// A declaration made on the previous tip is still on hand after the tip
+    /// changes; a job built from it must get `stale-chain-tip`, as it would
+    /// without a declaration. On the declared tip it passes.
+    #[test]
+    fn a_declared_job_is_bound_to_the_tip_the_pool_last_served() {
+        let token = Token([1u8; 16]);
+        let entry = bridge_entry_for(token, REGTEST_ADDR, 42);
+        assert_eq!(entry.declared_job.prev_hash, [0xAB; 32]);
+
+        for (pool_tip, expected) in [([0xAB; 32], None), ([0xCD; 32], Some(ERR_STALE_CHAIN_TIP))] {
+            let mut s = solo_session_with_extended_channel();
+            let cid = s.primary_channel.unwrap();
+            s.channels.get_mut(&cid).unwrap().latest_extended_prev_hash = Some(pool_tip);
+            let input = custom_job_input(cid, token);
+            assert_eq!(input.prev_hash, entry.declared_job.prev_hash);
+
+            let out = handle_set_custom_mining_job(
+                &mut s,
+                &input,
+                Some(&job_ref_for(&entry)),
+                None,
+                None,
+                1_000,
+            );
+            match (&out.outbound[0], expected) {
+                (OutboundFrame::SetCustomMiningJobSuccess { .. }, None) => {}
+                (OutboundFrame::SetCustomMiningJobError { error_code, .. }, Some(want)) => {
+                    assert_eq!(error_code, want);
+                    assert!(
+                        s.channels.get(&cid).unwrap().extended_jobs.is_empty(),
+                        "a job on a past tip must not be registered"
+                    );
+                }
+                (other, want) => panic!("pool tip {pool_tip:?}: wanted {want:?}, got {other:?}"),
+            }
+        }
     }
 
     /// One miner cannot claim another's declared job.
