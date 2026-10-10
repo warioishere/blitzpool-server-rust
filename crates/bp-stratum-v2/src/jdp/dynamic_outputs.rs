@@ -77,6 +77,24 @@ pub fn declared_coinbase_tx(
     })
 }
 
+/// Version + locktime, which the witness-form assembly indexes against.
+const MIN_COINBASE_LEN: usize = 8;
+
+/// A pushed solution's coinbase (`prefix ‖ extranonce ‖ suffix`), legacy or
+/// already witness-formed. Tried as-is first, because wrapping a witness form
+/// twice decodes silently into a truncated transaction.
+pub fn decode_solution_coinbase(coinbase_raw: &[u8]) -> Option<bitcoin::Transaction> {
+    if coinbase_raw.len() < MIN_COINBASE_LEN {
+        return None;
+    }
+    bitcoin::consensus::deserialize(coinbase_raw)
+        .ok()
+        .or_else(|| {
+            let witness_form = bp_mining_job::assemble_witness_coinbase(coinbase_raw);
+            bitcoin::consensus::deserialize(&witness_form).ok()
+        })
+}
+
 /// Consensus maximum of a coinbase scriptSig (`bad-cb-length`); bounds the
 /// rebuild buffer the declared length sizes.
 const MAX_COINBASE_SCRIPT_SIG_LEN: usize = 100;

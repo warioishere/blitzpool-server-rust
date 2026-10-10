@@ -2,8 +2,9 @@
 
 //! Per-connection store of accepted JDP declarations, FIFO-bounded at
 //! [`MAX_DECLARED_JOBS`] (each holds ~1–2 MB of raw transactions).
-//! `PushSolution` matches by `prev_hash` first, then most recent;
-//! SV2 JDP/PushSolution asks only for the most recent, so this never contradicts it.
+//! `PushSolution` takes the declaration its header solves at the pool's
+//! target; before the pool has one, [`DeclaredJobStore::match_for_solution`]
+//! picks by `prev_hash`, then most recent.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -31,6 +32,10 @@ pub struct DeclaredJob {
     pub coinbase_tx_suffix: Vec<u8>,
     /// Witness-serialised, in merkle-leaf order, coinbase excluded.
     pub raw_transactions: Vec<Vec<u8>>,
+    /// The coinbase's merkle branch over [`Self::raw_transactions`], from
+    /// [`declared_merkle_path`](crate::jdp::custom_job_binding::declared_merkle_path);
+    /// `None` when one of them does not decode.
+    pub merkle_path: Option<Vec<[u8; 32]>>,
     /// The pool's tip at declaration; every `SetCustomMiningJob` on this
     /// declaration is held to it.
     pub prev_hash: [u8; 32],
@@ -140,6 +145,7 @@ mod tests {
             coinbase_tx_prefix: vec![0xAA; 8],
             coinbase_tx_suffix: vec![0xBB; 8],
             raw_transactions: Vec::new(),
+            merkle_path: Some(Vec::new()),
             prev_hash,
             declared_at_ms: declared_at,
             booking: None,

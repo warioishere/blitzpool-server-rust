@@ -27,7 +27,7 @@ use bp_stratum_v2::jdp::dynamic_outputs::{
 };
 use bp_stratum_v2::jdp::payout_distribution::{compute_payout_vector, WeightedOutput};
 use bp_stratum_v2::jdp_server::{
-    AllocateOutcome, CurrentPrevHashProvider, DeclaredJobToValidate, DeclaredJobValidator,
+    AllocateOutcome, ChainTipProvider, DeclaredJobToValidate, DeclaredJobValidator,
     JdpAllocateResolver, JdpBlockSubmissionSink, JdpServerHooks, JobVerdict,
     PayoutDistributionSource, StratumV2JdpServer, TailoredDistribution,
 };
@@ -130,9 +130,13 @@ impl PayoutDistributionSource for FixedSource {
 struct FixedPrevHash;
 
 #[async_trait]
-impl CurrentPrevHashProvider for FixedPrevHash {
+impl ChainTipProvider for FixedPrevHash {
     async fn current_prev_hash(&self) -> Option<[u8; 32]> {
         Some(PREV_HASH)
+    }
+
+    async fn current_target(&self) -> Option<[u8; 32]> {
+        None
     }
 }
 
@@ -219,7 +223,7 @@ async fn jdp_push_distribution_end_to_end() {
     hooks.distribution_source = Arc::new(FixedSource {
         next_id: AtomicU64::new(FIRST_ID),
     });
-    hooks.prev_hash_provider = Arc::new(FixedPrevHash);
+    hooks.chain_tip = Arc::new(FixedPrevHash);
     hooks.block_submission_sink = sink.clone();
     hooks.allocate_resolver = Arc::new(BaseModeAllocateResolver);
 
@@ -966,7 +970,7 @@ async fn a_session_is_served_nothing_until_its_mode_is_known() {
 
     let mut hooks = JdpServerHooks::no_op();
     hooks.distribution_source = source.clone();
-    hooks.prev_hash_provider = Arc::new(FixedPrevHash);
+    hooks.chain_tip = Arc::new(FixedPrevHash);
     hooks.allocate_resolver = Arc::new(BaseModeAllocateResolver);
 
     let server = StratumV2JdpServer::spawn(
@@ -1257,7 +1261,7 @@ fn spawn_jdp_server(
     let noise_config = NoiseConfig::new(TEST_PUB.parse().unwrap(), TEST_PRV.parse().unwrap());
     let mut hooks = JdpServerHooks::no_op();
     hooks.distribution_source = source;
-    hooks.prev_hash_provider = Arc::new(FixedPrevHash);
+    hooks.chain_tip = Arc::new(FixedPrevHash);
     hooks.allocate_resolver = Arc::new(BaseModeAllocateResolver);
     StratumV2JdpServer::spawn(noise_config, hooks, bridge, interval)
 }

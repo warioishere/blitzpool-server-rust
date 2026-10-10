@@ -76,10 +76,14 @@ pub trait TemplateTxProvider: Send + Sync {
     async fn snapshot(&self) -> HashMap<[u8; 32], Vec<u8>>;
 }
 
-/// The pool's current `prev_hash`, stamped on declared jobs for `PushSolution`.
+/// The pool's view of the chain tip, from its own node.
 #[async_trait]
-pub trait CurrentPrevHashProvider: Send + Sync {
+pub trait ChainTipProvider: Send + Sync {
+    /// Stamped on declared jobs and checked against them.
     async fn current_prev_hash(&self) -> Option<[u8; 32]>;
+    /// Little-endian target a block on the tip must meet; gates `PushSolution`
+    /// before anything is rebuilt. `None` before the first template.
+    async fn current_target(&self) -> Option<[u8; 32]>;
 }
 
 use crate::bridge::BuiltPayoutDistribution;
@@ -183,7 +187,7 @@ pub enum JobVerdict {
 pub struct JdpServerHooks {
     pub allocate_resolver: Arc<dyn JdpAllocateResolver>,
     pub template_tx_provider: Arc<dyn TemplateTxProvider>,
-    pub prev_hash_provider: Arc<dyn CurrentPrevHashProvider>,
+    pub chain_tip: Arc<dyn ChainTipProvider>,
     pub block_submission_sink: Arc<dyn JdpBlockSubmissionSink>,
     pub distribution_source: Arc<dyn PayoutDistributionSource>,
     /// `None` → every declaration is accepted on the JDC's word.
@@ -196,7 +200,7 @@ impl JdpServerHooks {
         Self {
             allocate_resolver: n.clone(),
             template_tx_provider: n.clone(),
-            prev_hash_provider: n.clone(),
+            chain_tip: n.clone(),
             block_submission_sink: n.clone(),
             distribution_source: n,
             job_validator: None,
@@ -245,8 +249,12 @@ impl TemplateTxProvider for NoOpJdpHooks {
 }
 
 #[async_trait]
-impl CurrentPrevHashProvider for NoOpJdpHooks {
+impl ChainTipProvider for NoOpJdpHooks {
     async fn current_prev_hash(&self) -> Option<[u8; 32]> {
+        None
+    }
+
+    async fn current_target(&self) -> Option<[u8; 32]> {
         None
     }
 }
@@ -673,7 +681,7 @@ async fn dispatch_jdp_inbound(
                     return refusal;
                 }
             }
-            let current_prev_hash = hooks.prev_hash_provider.current_prev_hash().await;
+            let current_prev_hash = hooks.chain_tip.current_prev_hash().await;
             let distribution =
                 resolve_distribution_acceptance(bridge, session_id, input.distribution_id);
             // The mode of THIS TOKEN's address: a session may hold tokens for
@@ -719,7 +727,7 @@ async fn dispatch_jdp_inbound(
                     return refusal;
                 }
             }
-            let current_prev_hash = hooks.prev_hash_provider.current_prev_hash().await;
+            let current_prev_hash = hooks.chain_tip.current_prev_hash().await;
             // ext 0x0003/Grace Window is judged at ACCEPTANCE: re-resolve to
             // catch a supersession or settlement during the round-trip.
             let pending_distribution_id = state
@@ -748,7 +756,10 @@ async fn dispatch_jdp_inbound(
                 },
             )
         }
-        InboundJdpFrame::PushSolution(input) => handle_push_solution(state, &input),
+        InboundJdpFrame::PushSolution(input) => {
+            let pool_target = hooks.chain_tip.current_target().await;
+            handle_push_solution(state, &input, pool_target)
+        }
     }
 }
 
@@ -1812,6 +1823,7 @@ mod tests {
             coinbase_tx_prefix: vec![],
             coinbase_tx_suffix: vec![],
             raw_transactions: Vec::new(),
+            merkle_path: Some(Vec::new()),
             prev_hash: [0xCC; 32],
             declared_at_ms: 500,
             booking: None,

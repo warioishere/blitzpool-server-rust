@@ -570,6 +570,7 @@ mod tests {
             coinbase_tx_prefix: prefix,
             coinbase_tx_suffix: suffix,
             raw_transactions: Vec::new(),
+            merkle_path: Some(Vec::new()),
             prev_hash: [0xAB; 32],
             declared_at_ms: 1_000,
             booking: None,

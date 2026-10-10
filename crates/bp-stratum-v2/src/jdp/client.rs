@@ -815,6 +815,7 @@ fn accept_declaration(
         version: input.version,
         coinbase_tx_prefix: input.coinbase_tx_prefix.clone(),
         coinbase_tx_suffix: input.coinbase_tx_suffix.clone(),
+        merkle_path: crate::jdp::custom_job_binding::declared_merkle_path(&raw_transactions),
         raw_transactions,
         prev_hash,
         declared_at_ms: ctx.now_ms,
@@ -839,6 +840,7 @@ fn accept_declaration(
 pub fn handle_push_solution(
     state: &mut JdpSessionState,
     input: &PushSolutionInput,
+    pool_target: Option<[u8; 32]>,
 ) -> JdpHandlerOutcome {
     // Drops are WARN-logged: this is a found block. Coinbase-only is normal
     // (SV2 JDP/Coinbase-only Mode, no declaration) and the mining side records it.
@@ -850,18 +852,27 @@ pub fn handle_push_solution(
         );
         return JdpHandlerOutcome::default();
     }
-    let job = match state
-        .declared_jobs
-        .match_for_solution(&input.header.prev_hash)
-    {
-        Some(j) => j,
-        None => {
-            tracing::warn!(
-                prev_hash = %input.header.prev_hash.as_hex(),
-                "jdp: PushSolution dropped — no matching declared job (reconnect gap or stale solution)"
-            );
-            return JdpHandlerOutcome::default();
-        }
+    // `PushSolution` names no declaration, so the one whose header meets the
+    // pool's target is the one solved; a frame matching none is dropped
+    // before any transaction is copied or the block rebuilt.
+    let job = match pool_target {
+        Some(target) => state
+            .declared_jobs
+            .iter()
+            .find(|job| solution_meets_target(job, input, &target)),
+        // Before the first template there is no target to check against.
+        None => state
+            .declared_jobs
+            .match_for_solution(&input.header.prev_hash),
+    };
+    let Some(job) = job else {
+        tracing::warn!(
+            prev_hash = %input.header.prev_hash.as_hex(),
+            declared = state.declared_jobs.len(),
+            "jdp: PushSolution dropped — no declared job yields a header meeting the pool's \
+             target (reconnect gap, stale solution, or not a block)"
+        );
+        return JdpHandlerOutcome::default();
     };
 
     let new_token = job.new_token;
@@ -910,6 +921,41 @@ pub fn handle_push_solution(
             header: input.header,
         }],
     }
+}
+
+/// Whether `input` solves `job` below `target` (little-endian, the pool's own).
+fn solution_meets_target(job: &DeclaredJob, input: &PushSolutionInput, target: &[u8; 32]) -> bool {
+    solution_hash(job, input)
+        .is_some_and(|hash| bp_share::Target::from_le_bytes(*target).is_met_by_le(&hash))
+}
+
+/// The header hash `input` gives on `job`: the declared coinbase with the
+/// pushed extranonce, the declaration's merkle branch and the pushed header
+/// fields. `None` when the coinbase does not decode or the declared
+/// transactions did not.
+fn solution_hash(job: &DeclaredJob, input: &PushSolutionInput) -> Option<[u8; 32]> {
+    use bitcoin::hashes::Hash as _;
+    let merkle_path = job.merkle_path.as_deref()?;
+    let mut coinbase_raw = Vec::with_capacity(
+        job.coinbase_tx_prefix.len() + input.extranonce.len() + job.coinbase_tx_suffix.len(),
+    );
+    coinbase_raw.extend_from_slice(&job.coinbase_tx_prefix);
+    coinbase_raw.extend_from_slice(&input.extranonce);
+    coinbase_raw.extend_from_slice(&job.coinbase_tx_suffix);
+    let coinbase = crate::jdp::dynamic_outputs::decode_solution_coinbase(&coinbase_raw)?;
+    let merkle_root = bp_mining_job::merkle_root_from_coinbase(
+        &coinbase.compute_txid().to_byte_array(),
+        merkle_path,
+    );
+    let header = bp_mining_job::build_block_header(
+        input.header.version as i32,
+        &input.header.prev_hash,
+        &merkle_root,
+        input.header.ntime,
+        input.header.n_bits,
+        input.header.nonce,
+    );
+    Some(bp_share::sha256d(&header))
 }
 
 #[cfg(test)]
@@ -2377,7 +2423,7 @@ mod tests {
                 n_bits: 0,
             },
         };
-        let out = handle_push_solution(&mut s, &solution);
+        let out = handle_push_solution(&mut s, &solution, None);
         assert!(out.outbound.is_empty());
         assert!(out.events.is_empty());
     }
@@ -2396,7 +2442,7 @@ mod tests {
                 n_bits: 0,
             },
         };
-        let out = handle_push_solution(&mut s, &solution);
+        let out = handle_push_solution(&mut s, &solution, None);
         assert!(out.events.is_empty());
     }
 
@@ -2422,7 +2468,7 @@ mod tests {
                 n_bits: 0x1d00_ffff,
             },
         };
-        let out = handle_push_solution(&mut s, &solution);
+        let out = handle_push_solution(&mut s, &solution, None);
         match &out.events[0] {
             JdpSessionEvent::BlockSubmissionCandidate { miner_address, .. } => {
                 assert_eq!(
@@ -2438,6 +2484,85 @@ mod tests {
             }
             other => panic!("expected BlockSubmissionCandidate, got {other:?}"),
         }
+    }
+
+    /// Two transaction-free declarations whose coinbases differ, the older
+    /// one first, and a solution header with a full-width extranonce.
+    fn two_solvable_declarations(s: &mut JdpSessionState) -> (Token, Token, PushSolutionInput) {
+        let first = complete_setup_and_allocate(s);
+        let _ = declared(s, &declare(7, first, vec![]), &HashMap::new(), ctx(3_000));
+        let second = allocate_another(s, 8, 3_100);
+        let mut other = declare(8, second, vec![]);
+        // A different locktime: still a valid coinbase, with another txid.
+        let len = other.coinbase_tx_suffix.len();
+        other.coinbase_tx_suffix[len - 4..].copy_from_slice(&1u32.to_le_bytes());
+        let _ = declared(s, &other, &HashMap::new(), ctx(3_200));
+        let tokens: Vec<Token> = s.declared_jobs.iter().map(|j| j.new_token).collect();
+        assert_eq!(tokens.len(), 2, "precondition: both declarations accepted");
+        let solution = PushSolutionInput {
+            extranonce: vec![0xEE; EXTRANONCE_SLOT],
+            header: SolutionHeader {
+                prev_hash: [0xAB; 32],
+                version: 0x2000_0000,
+                ntime: 0x6500_0001,
+                nonce: 0,
+                n_bits: 0x1d00_ffff,
+            },
+        };
+        (tokens[0], tokens[1], solution)
+    }
+
+    /// A frame whose header meets the pool's target on no declaration is
+    /// dropped before anything is rebuilt; the same frame passes a target it
+    /// meets.
+    #[test]
+    fn a_pushed_solution_below_no_declarations_target_is_dropped() {
+        let mut s = fresh();
+        let (_, _, solution) = two_solvable_declarations(&mut s);
+        let out = handle_push_solution(&mut s, &solution, Some([0u8; 32]));
+        assert!(out.events.is_empty(), "got {:?}", out.events);
+
+        let out = handle_push_solution(&mut s, &solution, Some([0xFF; 32]));
+        assert!(matches!(
+            out.events.first(),
+            Some(JdpSessionEvent::BlockSubmissionCandidate { .. })
+        ));
+    }
+
+    /// The declaration the header actually solves is chosen, even when it is
+    /// the older one the most-recent guess would skip.
+    #[test]
+    fn the_declaration_a_solution_solves_is_the_one_booked() {
+        let mut s = fresh();
+        let (older, newer, mut solution) = two_solvable_declarations(&mut s);
+        let job = |token: Token| s.declared_jobs.get(&token).unwrap().clone();
+        let (older_job, newer_job) = (job(older), job(newer));
+        // A nonce at which the older declaration hashes lower, so a target of
+        // exactly its hash is met by it alone.
+        let target = (0..64)
+            .find_map(|nonce| {
+                solution.header.nonce = nonce;
+                let lo = solution_hash(&older_job, &solution)?;
+                let hi = solution_hash(&newer_job, &solution)?;
+                let lower = bp_share::Target::from_le_bytes(hi).is_met_by_le(&lo) && lo != hi;
+                lower.then_some(lo)
+            })
+            .expect("one of 64 nonces orders the two hashes this way");
+
+        let out = handle_push_solution(&mut s, &solution, Some(target));
+        match out.events.first() {
+            Some(JdpSessionEvent::BlockSubmissionCandidate { declaration, .. }) => {
+                assert_eq!(declaration.new_token, older, "the solved declaration");
+            }
+            other => panic!("expected a candidate, got {other:?}"),
+        }
+        assert_eq!(
+            s.declared_jobs
+                .match_for_solution(&solution.header.prev_hash)
+                .map(|j| j.new_token),
+            Some(newer),
+            "control: the guess would have picked the newer declaration"
+        );
     }
 
     /// A matching solution yields a candidate with the reconstructed coinbase.
@@ -2461,7 +2586,7 @@ mod tests {
                 n_bits: 0x1d00_ffff,
             },
         };
-        let out = handle_push_solution(&mut s, &solution);
+        let out = handle_push_solution(&mut s, &solution, None);
         assert!(out.outbound.is_empty());
         match &out.events[0] {
             JdpSessionEvent::BlockSubmissionCandidate {
@@ -2509,7 +2634,7 @@ mod tests {
                 n_bits: 0,
             },
         };
-        let out = handle_push_solution(&mut s, &solution);
+        let out = handle_push_solution(&mut s, &solution, None);
         assert!(out.events.is_empty());
     }
 }

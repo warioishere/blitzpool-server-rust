@@ -40,18 +40,24 @@ pub enum BindingViolation {
     ExtranonceSlotWidth,
 }
 
+/// The coinbase's merkle branch over the declared transactions, or `None`
+/// when one does not decode. The branch never reads the coinbase's own txid,
+/// so it is computed once per declaration and serves every extranonce.
+pub fn declared_merkle_path(raw_transactions: &[Vec<u8>]) -> Option<Vec<[u8; 32]>> {
+    let mut txids = Vec::with_capacity(1 + raw_transactions.len());
+    txids.push([0u8; 32]);
+    for raw in raw_transactions {
+        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(raw).ok()?;
+        txids.push(tx.compute_txid().to_byte_array());
+    }
+    Some(bp_mining_job::coinbase_merkle_branch(&txids))
+}
+
 /// `None` when the coinbase or a declared transaction cannot be decoded: the
 /// caller must reject, never read it as "nothing to check".
 pub fn binding_from_declared_job(job: &DeclaredJob) -> Option<DeclaredJobBinding> {
     let declared = declared_coinbase_tx(&job.coinbase_tx_prefix, &job.coinbase_tx_suffix)?;
     let tx = &declared.tx;
-
-    let mut txids = Vec::with_capacity(1 + job.raw_transactions.len());
-    txids.push(tx.compute_txid().to_byte_array());
-    for raw in &job.raw_transactions {
-        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(raw).ok()?;
-        txids.push(tx.compute_txid().to_byte_array());
-    }
 
     Some(DeclaredJobBinding {
         version: job.version,
@@ -60,7 +66,7 @@ pub fn binding_from_declared_job(job: &DeclaredJob) -> Option<DeclaredJobBinding
         coinbase_tx_input_n_sequence: tx.input[0].sequence.0,
         coinbase_tx_outputs: bitcoin::consensus::serialize(&tx.output),
         coinbase_tx_locktime: tx.lock_time.to_consensus_u32(),
-        merkle_path: bp_mining_job::coinbase_merkle_branch(&txids),
+        merkle_path: job.merkle_path.clone()?,
         extranonce_slot: declared.extranonce_slot,
     })
 }
@@ -172,7 +178,7 @@ mod tests {
 
     fn declared_job(tx_count: usize) -> DeclaredJob {
         let (coinbase_tx_prefix, coinbase_tx_suffix) = coinbase_parts(&SCRIPT_SIG_PREFIX, &[0x00]);
-        let raw_transactions = (0..tx_count)
+        let raw_transactions: Vec<Vec<u8>> = (0..tx_count)
             .map(|position| a_transaction(0xA0 + position as u8))
             .collect();
         DeclaredJob {
@@ -181,6 +187,7 @@ mod tests {
             version: 0x2000_0000,
             coinbase_tx_prefix,
             coinbase_tx_suffix,
+            merkle_path: declared_merkle_path(&raw_transactions),
             raw_transactions,
             prev_hash: [0xAB; 32],
             declared_at_ms: 1_000,
@@ -342,6 +349,8 @@ mod tests {
     fn an_undecodable_declared_transaction_projects_to_none() {
         let mut job = declared_job(2);
         job.raw_transactions[1] = vec![0xFF, 0xFF];
+        job.merkle_path = declared_merkle_path(&job.raw_transactions);
+        assert!(job.merkle_path.is_none());
         assert!(binding_from_declared_job(&job).is_none());
     }
 

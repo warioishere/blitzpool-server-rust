@@ -18,7 +18,6 @@ use bitcoin::pow::CompactTarget;
 use bitcoin::{BlockHash, Network as BitcoinNetwork, TxMerkleNode};
 use bp_bitcoin::BitcoinRpc;
 use bp_common::{AddressId, StreamKind};
-use bp_mining_job::assemble_witness_coinbase;
 use bp_stratum_v2::jdp::client::{
     parse_user_identifier_as_address, AllocateTokenContext, DeclarationRef, SolutionHeader,
 };
@@ -26,8 +25,8 @@ use bp_stratum_v2::jdp::dynamic_outputs::{
     declared_coinbase_tx, designated_output_blob, CandidateBacking,
 };
 use bp_stratum_v2::jdp_server::{
-    AllocateOutcome, CurrentPrevHashProvider, JdpAllocateResolver, JdpBlockSubmissionSink,
-    JdpServerHooks, PayoutDistributionSource, TemplateTxProvider,
+    AllocateOutcome, ChainTipProvider, JdpAllocateResolver, JdpBlockSubmissionSink, JdpServerHooks,
+    PayoutDistributionSource, TemplateTxProvider,
 };
 use bp_template_distribution::{TdpHandle, TemplateTxCache};
 use tracing::{debug, info, warn};
@@ -81,7 +80,7 @@ pub(crate) fn build_jdp_hooks(
         template_tx_provider: Arc::new(TdpTemplateTxProvider {
             cache: template_tx_cache,
         }),
-        prev_hash_provider: Arc::new(TdpCurrentPrevHashProvider { tdp }),
+        chain_tip: Arc::new(TdpChainTipProvider { tdp }),
         block_submission_sink: block_sink,
         distribution_source,
         job_validator,
@@ -260,19 +259,26 @@ impl TemplateTxProvider for TdpTemplateTxProvider {
     }
 }
 
-// ─── 3. TdpCurrentPrevHashProvider ───────────────────────────────
+// ─── 3. TdpChainTipProvider ───────────────────────────────────────
 
-pub(crate) struct TdpCurrentPrevHashProvider {
+pub(crate) struct TdpChainTipProvider {
     tdp: TdpHandle,
 }
 
 #[async_trait]
-impl CurrentPrevHashProvider for TdpCurrentPrevHashProvider {
+impl ChainTipProvider for TdpChainTipProvider {
     async fn current_prev_hash(&self) -> Option<[u8; 32]> {
         self.tdp
             .current_snapshot()
             .set_new_prev_hash
             .map(|s| s.prev_hash)
+    }
+
+    async fn current_target(&self) -> Option<[u8; 32]> {
+        self.tdp
+            .current_snapshot()
+            .set_new_prev_hash
+            .map(|s| s.target)
     }
 }
 
@@ -311,9 +317,6 @@ impl BlockPropagator for BitcoinRpc {
         }
     }
 }
-
-/// Version + locktime, which the witness-form assembly indexes against.
-const MIN_COINBASE_LEN: usize = 8;
 
 /// What the pool's own node says the next block must satisfy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -424,27 +427,14 @@ fn assemble_declared_block(
     transactions: &[Vec<u8>],
     solution: SolutionHeader,
 ) -> Option<Block> {
-    if coinbase_raw.len() < MIN_COINBASE_LEN {
+    let Some(coinbase_tx) =
+        bp_stratum_v2::jdp::dynamic_outputs::decode_solution_coinbase(coinbase_raw)
+    else {
         warn!(
             len = coinbase_raw.len(),
-            "JDP block: declared coinbase is too short to be a transaction"
+            "JDP block: declared coinbase parses in neither serialisation — not submitting"
         );
         return None;
-    }
-    // Legacy or already witness-formed: try as-is first, because wrapping a
-    // witness form twice decodes silently into a truncated transaction.
-    let coinbase_tx: Transaction = match decode_whole_tx(coinbase_raw) {
-        Some(tx) => tx,
-        None => match decode_whole_tx(&assemble_witness_coinbase(coinbase_raw)) {
-            Some(tx) => tx,
-            None => {
-                warn!(
-                    len = coinbase_raw.len(),
-                    "JDP block: declared coinbase parses in neither serialisation — not submitting"
-                );
-                return None;
-            }
-        },
     };
     let mut txdata: Vec<Transaction> = Vec::with_capacity(1 + transactions.len());
     txdata.push(coinbase_tx);

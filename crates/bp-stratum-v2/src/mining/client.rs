@@ -5369,6 +5369,9 @@ pub(crate) mod tests {
                 version: 0x2000_0000,
                 coinbase_tx_prefix,
                 coinbase_tx_suffix,
+                merkle_path: crate::jdp::custom_job_binding::declared_merkle_path(
+                    &raw_transactions,
+                ),
                 raw_transactions,
                 prev_hash: [0xAB; 32],
                 declared_at_ms: 1_000,
@@ -7514,6 +7517,9 @@ pub(crate) mod tests {
                 version: 0x2000_0000,
                 coinbase_tx_prefix: raw[..index].to_vec(),
                 coinbase_tx_suffix: raw[index + FIXTURE_DECLARED_SLOT..].to_vec(),
+                merkle_path: crate::jdp::custom_job_binding::declared_merkle_path(
+                    &raw_transactions,
+                ),
                 raw_transactions,
                 prev_hash: [0xAB; 32],
                 declared_at_ms: 1_000,
