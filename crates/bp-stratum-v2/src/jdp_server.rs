@@ -952,6 +952,9 @@ pub(crate) fn register_bridge_entries(
                 if let Some(declared_job) = state.declared_jobs.get(new_token) {
                     reg.register(*new_token, declared_job, jdp_session_id);
                 }
+                reg.retain_declared_jobs(jdp_session_id, |token| {
+                    state.declared_jobs.get(token).is_some()
+                });
             }
             // Negotiation is asked explicitly, not inferred from
             // `payout_script: None`: a 0x0003 allocate has empty outputs too.
@@ -1838,6 +1841,69 @@ mod tests {
         assert_eq!(entry.jdp_session_id, 42);
         assert_eq!(entry.miner_address.as_str(), ADDR);
         assert_eq!(entry.declared_prev_hash, [0xCC; 32]);
+    }
+
+    /// A declaration the session store evicts leaves the bridge with it, so
+    /// no custom job binds to one whose transactions are gone; another
+    /// session's entry is untouched.
+    #[tokio::test(flavor = "current_thread")]
+    async fn register_bridge_entries_drops_declarations_the_store_evicted() {
+        use crate::jdp::declarations::{DeclaredJob, MAX_DECLARED_JOBS};
+        let job = |n: u8| DeclaredJob {
+            new_token: Token([n; 16]),
+            miner_address: AddressId::new(ADDR.to_string()).unwrap(),
+            version: 0,
+            coinbase_tx_prefix: vec![],
+            coinbase_tx_suffix: vec![],
+            raw_transactions: Vec::new(),
+            merkle_path: Some(Vec::new()),
+            prev_hash: [0xCC; 32],
+            declared_at_ms: u64::from(n),
+            booking: None,
+            distribution_id: None,
+        };
+        let bridge = fresh_bridge();
+        let mut other_store = fresh_session();
+        other_store.declared_jobs.insert(job(0xF0));
+        register_bridge_entries(
+            &other_store,
+            &bridge,
+            7,
+            &[JdpSessionEvent::JobDeclared {
+                new_token: Token([0xF0; 16]),
+            }],
+        );
+
+        let mut state = fresh_session();
+        let count = MAX_DECLARED_JOBS as u8 + 1;
+        for n in 1..=count {
+            state.declared_jobs.insert(job(n));
+            register_bridge_entries(
+                &state,
+                &bridge,
+                42,
+                &[JdpSessionEvent::JobDeclared {
+                    new_token: Token([n; 16]),
+                }],
+            );
+        }
+
+        let r = bridge.read().unwrap();
+        assert!(
+            state.declared_jobs.get(&Token([1; 16])).is_none(),
+            "precondition: the store evicted the oldest"
+        );
+        assert!(
+            r.job_ref(&Token([1; 16])).is_none(),
+            "evicted, so unbindable"
+        );
+        for n in 2..=count {
+            assert!(r.job_ref(&Token([n; 16])).is_some(), "declaration {n} kept");
+        }
+        assert!(
+            r.job_ref(&Token([0xF0; 16])).is_some(),
+            "other session kept"
+        );
     }
 
     /// Both Coinbase-only allocate kinds register; one that designated nothing

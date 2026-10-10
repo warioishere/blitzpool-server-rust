@@ -344,6 +344,18 @@ impl JdpDeclaredJobRegistry {
         self.entries.insert(token, job_ref);
     }
 
+    /// Drop `jdp_session_id`'s declared jobs that `still_declared` no longer
+    /// holds. The session's store evicts its oldest declaration, raw
+    /// transactions included, so nothing may bind a custom job to it after.
+    pub fn retain_declared_jobs(
+        &mut self,
+        jdp_session_id: u32,
+        still_declared: impl Fn(&Token) -> bool,
+    ) {
+        self.entries
+            .retain(|token, job| job.jdp_session_id != jdp_session_id || still_declared(token));
+    }
+
     /// One declaration authorises exactly one `SetCustomMiningJob`. Removes
     /// only the mining side's record; the JDP session keeps its own copy.
     pub fn consume_declared_job(&mut self, token: &Token) -> bool {
