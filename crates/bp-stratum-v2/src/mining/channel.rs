@@ -63,6 +63,10 @@ pub struct ChannelState {
     /// carries an absolute merkle root.
     pub latest_extended_prev_hash: Option<[u8; 32]>,
     pub latest_extended_n_bits: Option<u32>,
+    /// BIP-34 element of the template behind `latest_extended_prev_hash`
+    /// ([`bp_mining_job::bip34_height_element`]); a custom job's scriptSig
+    /// must begin with it. `None` when no template on that tip supplied one.
+    pub latest_extended_height_element: Option<Vec<u8>>,
 
     /// Channel-local, monotonic job-id counter, bumped on each
     /// `NewMiningJob` / `NewExtendedMiningJob`.
@@ -103,6 +107,7 @@ impl ChannelState {
             extended_jobs: HashMap::new(),
             latest_extended_prev_hash: None,
             latest_extended_n_bits: None,
+            latest_extended_height_element: None,
             next_job_id: 1,
             seen_shares: SeenShares::new(),
             last_sent_job_signature: None,
@@ -130,6 +135,7 @@ impl ChannelState {
             extended_jobs: HashMap::new(),
             latest_extended_prev_hash: None,
             latest_extended_n_bits: None,
+            latest_extended_height_element: None,
             next_job_id: 1,
             seen_shares: SeenShares::new(),
             last_sent_job_signature: None,

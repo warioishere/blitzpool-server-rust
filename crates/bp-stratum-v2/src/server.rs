@@ -2650,6 +2650,7 @@ mod tests {
             let ch = s.channels.get_mut(&cid).expect("channel just opened");
             ch.latest_extended_prev_hash = Some([0xAB; 32]);
             ch.latest_extended_n_bits = Some(0x1d00_ffff);
+            ch.latest_extended_height_element = Some(vec![0x03, 0xC8, 0x00]);
         }
 
         let entry = crate::bridge::PayoutDistributionEntry {
@@ -2920,6 +2921,7 @@ mod tests {
             let ch = s.channels.get_mut(&cid).expect("channel just opened");
             ch.latest_extended_prev_hash = Some([0xAB; 32]);
             ch.latest_extended_n_bits = Some(0x1d00_ffff);
+            ch.latest_extended_height_element = Some(vec![0x03, 0xC8, 0x00]);
         }
         // Group-Solo: tailored entries exist only for Solo and Group-Solo,
         // and `resolve_distribution_reference` refuses to inherit on Solo.

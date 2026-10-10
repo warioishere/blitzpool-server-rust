@@ -39,6 +39,20 @@ pub fn decode_bip34_height(scriptsig: &[u8]) -> Option<u32> {
     Some(height)
 }
 
+/// The element a coinbase scriptSig must begin with under BIP-34
+/// (`bad-cb-height`): the leading data push, or `OP_0` / `OP_1`..`OP_16`,
+/// which is how Core encodes heights up to 16. `None` when `script_sig`
+/// starts with neither.
+pub fn bip34_height_element(script_sig: &[u8]) -> Option<&[u8]> {
+    let first = *script_sig.first()?;
+    let len = match first {
+        0x00 | 0x51..=0x60 => 1,
+        0x01..=0x4b => 1 + usize::from(first),
+        _ => return None,
+    };
+    script_sig.get(..len)
+}
+
 /// Check the BIP-54 coinbase rules on the non-witness serialization.
 pub fn check_coinbase(
     non_witness_coinbase: &[u8],
@@ -100,6 +114,33 @@ mod tests {
             }],
         };
         consensus::serialize(&tx)
+    }
+
+    #[test]
+    fn bip34_height_element_is_the_leading_push_or_small_int() {
+        let push = [0x03, 0x40, 0x0d, 0x03];
+        assert_eq!(
+            bip34_height_element(&[&push[..], &[0xAA]].concat()),
+            Some(&push[..])
+        );
+        assert_eq!(
+            bip34_height_element(&[0x51, 0xAA]),
+            Some(&[0x51][..]),
+            "OP_1"
+        );
+        assert_eq!(bip34_height_element(&[0x60]), Some(&[0x60][..]), "OP_16");
+        assert_eq!(
+            bip34_height_element(&[0x00, 0xAA]),
+            Some(&[0x00][..]),
+            "OP_0"
+        );
+        assert_eq!(bip34_height_element(&push[..3]), None, "truncated push");
+        assert_eq!(
+            bip34_height_element(&[0x4c, 0x01, 0x00]),
+            None,
+            "OP_PUSHDATA1"
+        );
+        assert_eq!(bip34_height_element(&[]), None);
     }
 
     #[test]

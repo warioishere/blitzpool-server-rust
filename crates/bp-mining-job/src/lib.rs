@@ -12,7 +12,10 @@ mod header;
 mod merkle;
 
 pub use address::{address_to_script, AddressError};
-pub use bip54::{check_coinbase as check_coinbase_bip54, decode_bip34_height, Bip54Violation};
+pub use bip54::{
+    bip34_height_element, check_coinbase as check_coinbase_bip54, decode_bip34_height,
+    Bip54Violation,
+};
 pub use cache::{MiningJobCache, MiningJobCacheStats};
 pub use coinbase::{
     assemble_witness_coinbase, build_mining_job, build_mining_job_from_tdp,

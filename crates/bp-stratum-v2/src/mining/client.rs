@@ -115,9 +115,10 @@ pub const ERR_INVALID_CHANNEL_ID: &str = "invalid-channel-id";
 /// SV2 spec — Standard channels don't have an extranonce slot).
 pub const ERR_INVALID_JOB_ID: &str = "invalid-job-id";
 
-/// `invalid-job-param-value-coinbase_prefix` — `coinbase_prefix` plus the
-/// channel's extranonce makes a scriptSig longer than consensus allows
-/// (`bad-cb-length`), so no block mined on the job could be valid.
+/// `invalid-job-param-value-coinbase_prefix` — the scriptSig breaks a
+/// consensus rule, so no block mined on the job could be valid: with the
+/// channel's extranonce it is longer than 100 bytes (`bad-cb-length`), or it
+/// does not open with the block height (BIP-34, `bad-cb-height`).
 pub const ERR_INVALID_JOB_PARAM_COINBASE_PREFIX: &str = "invalid-job-param-value-coinbase_prefix";
 
 /// `invalid-job-param-value-token-mismatch` — the `mining_job_token` was
@@ -1433,6 +1434,8 @@ fn retire_for_new_block(
         .on_tip(&template.prev_hash, now_ms, &lifecycle);
     channel.latest_extended_prev_hash = Some(template.prev_hash);
     channel.latest_extended_n_bits = Some(template.n_bits);
+    channel.latest_extended_height_element =
+        bp_mining_job::bip34_height_element(&template.coinbase_prefix).map(<[u8]>::to_vec);
 }
 
 /// The pool-built extended job for `template`, as stored for share validation.
@@ -1794,6 +1797,12 @@ pub fn apply_template_broadcast<C: Clock>(
                         job.created_at = now_ms;
                         ch.latest_extended_prev_hash = Some(job.prev_hash);
                         ch.latest_extended_n_bits = Some(job.n_bits);
+                        // Only from a template on the job's own tip; else the
+                        // height stays unknown and a custom job waits for one.
+                        ch.latest_extended_height_element = (job.prev_hash == template.prev_hash)
+                            .then(|| bp_mining_job::bip34_height_element(&template.coinbase_prefix))
+                            .flatten()
+                            .map(<[u8]>::to_vec);
                         let (pv, nt, nb, ver) =
                             (job.prev_hash, job.min_ntime, job.n_bits, job.version);
                         let mp = job.merkle_path.clone();
@@ -1961,6 +1970,7 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     // channel is the only tip it can be held to.
     let channel_prev_hash = channel.latest_extended_prev_hash;
     let channel_n_bits = channel.latest_extended_n_bits;
+    let channel_height_element = channel.latest_extended_height_element.clone();
 
     // `n_bits` sets the block-candidate threshold, so it must be the pool's
     // (see [`ERR_INVALID_NBITS`]). Before the channel's first job there is
@@ -2028,6 +2038,26 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             channel_id = input.channel_id,
             script_sig_len,
             "sv2: custom job's coinbase scriptSig exceeds the consensus maximum — rejecting"
+        );
+        return reject(ERR_INVALID_JOB_PARAM_COINBASE_PREFIX);
+    }
+
+    // BIP-34 (`bad-cb-height`): the scriptSig opens with the block height
+    // exactly as the pool's node encodes it for this tip. Without that
+    // encoding the job is refused retryably, as before the first job.
+    let Some(height_element) = channel_height_element.as_deref() else {
+        tracing::warn!(
+            channel_id = input.channel_id,
+            "sv2: custom job on a tip the pool has no BIP-34 height for yet — rejecting retryably"
+        );
+        return reject(ERR_STALE_CHAIN_TIP);
+    };
+    if !input.coinbase_prefix.starts_with(height_element) {
+        tracing::warn!(
+            channel_id = input.channel_id,
+            expected = ?height_element,
+            "sv2: custom job's coinbase scriptSig does not open with the block height \
+             (BIP-34) — rejecting"
         );
         return reject(ERR_INVALID_JOB_PARAM_COINBASE_PREFIX);
     }
@@ -4369,6 +4399,8 @@ pub(crate) mod tests {
             if let Some(ch) = s.channels.get_mut(&cid) {
                 ch.latest_extended_prev_hash = Some([0xAB; 32]);
                 ch.latest_extended_n_bits = Some(0x1d00_ffff);
+                // The height bytes the custom-job fixtures' scriptSig opens with.
+                ch.latest_extended_height_element = Some(vec![0x03, 0xC8, 0x00]);
             }
         }
         s
@@ -5787,6 +5819,58 @@ pub(crate) mod tests {
             }
             other => panic!("expected token-mismatch error, got {other:?}"),
         }
+    }
+
+    /// A scriptSig that does not open with the tip's BIP-34 height is refused;
+    /// the control opens with it and passes; without a known height the job
+    /// waits, retryably.
+    #[test]
+    fn a_custom_job_scriptsig_must_open_with_the_block_height() {
+        let alloc = base_allocation(REGTEST_ADDR, 42);
+        let outputs = [txout(312_500_000, designated_script(REGTEST_ADDR))];
+        for (element, expected) in [
+            (Some(vec![0x03, 0xC8, 0x00]), None),
+            (
+                Some(vec![0x03, 0xC9, 0x00]),
+                Some(ERR_INVALID_JOB_PARAM_COINBASE_PREFIX),
+            ),
+            (None, Some(ERR_STALE_CHAIN_TIP)),
+        ] {
+            let mut s = solo_session_with_extended_channel();
+            let cid = s.primary_channel.unwrap();
+            s.channels
+                .get_mut(&cid)
+                .unwrap()
+                .latest_extended_height_element = element.clone();
+            let input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
+            let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+            match (&out.outbound[0], expected) {
+                (OutboundFrame::SetCustomMiningJobSuccess { .. }, None) => {}
+                (OutboundFrame::SetCustomMiningJobError { error_code, .. }, Some(want)) => {
+                    assert_eq!(error_code, want);
+                    assert!(s.channels.get(&cid).unwrap().extended_jobs.is_empty());
+                }
+                (other, want) => panic!("height {element:?}: wanted {want:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// A block change takes the new tip's BIP-34 element from its template.
+    #[test]
+    fn a_new_block_records_the_templates_height_element() {
+        let mut s = session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let _ = apply_template_broadcast(
+            &mut s,
+            &broadcast(TemplateChange::NewBlock, [0xCC; 32]),
+            &synthetic_mining_job_inputs(),
+            1_000,
+            None,
+        );
+        assert_eq!(
+            s.channels.get(&cid).unwrap().latest_extended_height_element,
+            Some(vec![0x03, 0xC8, 0x00, 0x00])
+        );
     }
 
     /// A scriptSig past the consensus 100 bytes (`bad-cb-length`) is refused
