@@ -10,7 +10,10 @@
 # Stage 4 (runtime):          debian:bookworm-slim with the binary + a
 #                             non-root user. No build toolchain.
 
-ARG RUST_VERSION=1.93
+# Same as rust-toolchain.toml: `cargo chef cook` runs before that file is
+# copied in, so this image's rustc must already meet every dependency's
+# rust-version.
+ARG RUST_VERSION=1.95
 ARG DEBIAN_VERSION=bookworm
 
 FROM rust:${RUST_VERSION}-slim-${DEBIAN_VERSION} AS chef
