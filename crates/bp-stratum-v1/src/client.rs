@@ -511,7 +511,8 @@ pub(crate) fn handle_submit<C: Clock>(
                 RejectReason::JobNotFound
                 | RejectReason::DuplicateShare
                 | RejectReason::LowDifficulty
-                | RejectReason::VersionRollingNotAllowed => false,
+                | RejectReason::VersionRollingNotAllowed
+                | RejectReason::NtimeOutOfRange => false,
             };
             if counts_as_arrival {
                 state.vardiff.note_stale_share();
@@ -1461,6 +1462,12 @@ mod tests {
             clock.now_ms(),
         );
         let job_id = format!("{:x}", reg.peek_next_job_id() - 1);
+        // The template's own timestamp, so the share is inside its ntime window.
+        let ntime_hex = format!("{:08x}", template_for_regtest().header_timestamp);
+        let share = SubmitRequest {
+            ntime_hex: &ntime_hex,
+            ..submit_req(&job_id)
+        };
         // Accept the share once at difficulty 0, past the session's vardiff,
         // so the resubmissions below are true duplicates of an accepted share.
         let extranonce1 = state.extranonce1;
@@ -1472,20 +1479,14 @@ mod tests {
             share_logs: false,
             version_rolling_mask: state.version_rolling_mask,
         };
-        let first = validate_submit(
-            &submit_req(&job_id),
-            &easy,
-            &mut state.share_cache,
-            &reg,
-            clock.now_ms(),
-        );
+        let first = validate_submit(&share, &easy, &mut state.share_cache, &reg, clock.now_ms());
         assert!(
             matches!(first, ShareValidation::Accepted(_)),
             "precondition: the share was accepted once"
         );
         for i in 0..40 {
             clock.advance_ms(10_000);
-            let out = handle_submit(&mut state, &reg, submit_req(&job_id), clock.now_ms());
+            let out = handle_submit(&mut state, &reg, share.clone(), clock.now_ms());
             let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
             assert!(
                 s.contains("Duplicate share"),

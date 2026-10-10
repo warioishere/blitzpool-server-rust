@@ -88,6 +88,9 @@ pub struct StandardTemplateSnapshot {
     pub version: u32,
     pub prev_hash: [u8; 32],
     pub n_bits: u32,
+    /// The template's `header_timestamp`, which the job carries as its
+    /// `min_ntime` (or the activating `SetNewPrevHash` does).
+    pub ntime_start: u32,
     pub coinbase_tx_value_remaining: u64,
 }
 
@@ -248,6 +251,7 @@ mod tests {
             version: 0x2000_0000,
             prev_hash: [0xAB; 32],
             n_bits: 0x1d00_ffff,
+            ntime_start: 0x6500_0000,
             coinbase_tx_value_remaining: 5_000_000_000,
         }
     }
@@ -417,12 +421,14 @@ mod tests {
             version: 0x2000_0000,
             prev_hash: [0xAA; 32],
             n_bits: 0x1d00_ffff,
+            ntime_start: 0x6500_0000,
             coinbase_tx_value_remaining: 5_000_000_000,
         };
         let snap_new = StandardTemplateSnapshot {
             version: 0x2000_0001,
             prev_hash: [0xBB; 32],
             n_bits: 0x1d01_ffff,
+            ntime_start: 0x6500_0000,
             coinbase_tx_value_remaining: 4_900_000_000,
         };
         maps.record_send_for_test(1, Difficulty(1.0), [0x11; 32], snap_old, 1_000);

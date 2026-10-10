@@ -7,13 +7,16 @@ use std::sync::Arc;
 
 use bitcoin::hex::DisplayHex;
 use bp_jobs_lifecycle::{SeenShareRefusal, SeenShares, MAX_SEEN_SHARES_PER_TIP};
-use bp_mining_job::{build_block_header, meets_network_target, merkle_root_from_coinbase};
+use bp_mining_job::{
+    build_block_header, meets_network_target, merkle_root_from_coinbase, ntime_in_window,
+    MAX_FUTURE_BLOCK_TIME,
+};
 use bp_share::{calculate_difficulty, Difficulty, TargetMemo};
 
 use crate::frame::{
     SubmitRequest, ERR_DUPLICATE_SHARE, ERR_JOB_NOT_FOUND, ERR_LOW_DIFFICULTY_SHARE,
-    ERR_OTHER_UNKNOWN, REJECT_DUPLICATE, REJECT_JOB_NOT_FOUND, REJECT_LOW_DIFF, REJECT_STALE,
-    REJECT_VERSION_ROLLING,
+    ERR_OTHER_UNKNOWN, REJECT_DUPLICATE, REJECT_JOB_NOT_FOUND, REJECT_LOW_DIFF, REJECT_NTIME,
+    REJECT_STALE, REJECT_VERSION_ROLLING,
 };
 use crate::jobs::{JobClassification, JobRegistry};
 use crate::notify::ActiveSV1Template;
@@ -33,6 +36,10 @@ pub(crate) enum RejectReason {
     /// Version bits changed outside the negotiated mask, which BIP-310 says the
     /// server rejects. No dedicated SV1 code, so it goes out as [`ERR_OTHER_UNKNOWN`].
     VersionRollingNotAllowed,
+    /// `ntime` outside [`bp_mining_job::ntime_in_window`] of the job's
+    /// template: a block from it would carry a timestamp the job does not
+    /// allow. No dedicated SV1 code, so it goes out as [`ERR_OTHER_UNKNOWN`].
+    NtimeOutOfRange,
 }
 
 impl RejectReason {
@@ -42,7 +49,9 @@ impl RejectReason {
             RejectReason::DuplicateShare => ERR_DUPLICATE_SHARE,
             RejectReason::JobNotFound | RejectReason::Stale => ERR_JOB_NOT_FOUND,
             RejectReason::LowDifficulty => ERR_LOW_DIFFICULTY_SHARE,
-            RejectReason::VersionRollingNotAllowed => ERR_OTHER_UNKNOWN,
+            RejectReason::VersionRollingNotAllowed | RejectReason::NtimeOutOfRange => {
+                ERR_OTHER_UNKNOWN
+            }
         }
     }
 
@@ -54,6 +63,7 @@ impl RejectReason {
             RejectReason::Stale => REJECT_STALE,
             RejectReason::LowDifficulty => REJECT_LOW_DIFF,
             RejectReason::VersionRollingNotAllowed => REJECT_VERSION_ROLLING,
+            RejectReason::NtimeOutOfRange => REJECT_NTIME,
         }
     }
 }
@@ -145,8 +155,8 @@ impl SessionShareCache {
 
 // ── validate_submit ──────────────────────────────────────────────────
 
-/// Checks run cheapest first: job lookup, stale, field parse, version mask, the
-/// duplicate guard on the header hash, then that hash against the
+/// Checks run cheapest first: job lookup, stale, field parse, version mask,
+/// ntime window, the duplicate guard on the header hash, then that hash against the
 /// [`effective_job_difficulty`] target. Only an accepted share is recorded.
 /// Malformed fields reject as `LowDifficulty`, the same end state as a garbled header.
 pub(crate) fn validate_submit(
@@ -197,6 +207,19 @@ pub(crate) fn validate_submit(
             "❌ Share rejected: version-rolling-not-allowed (bits outside the negotiated mask)"
         );
         return ShareValidation::Rejected(RejectReason::VersionRollingNotAllowed.into());
+    }
+
+    let ntime_start = lookup.template.header_timestamp;
+    if !ntime_in_window(ntime, ntime_start) {
+        tracing::warn!(
+            worker = %submit.worker,
+            job_id = %submit.job_id,
+            ntime,
+            ntime_start,
+            "❌ Share rejected: ntime-out-of-range (ntime outside [{ntime_start}, {ntime_start} + {}])",
+            MAX_FUTURE_BLOCK_TIME
+        );
+        return ShareValidation::Rejected(RejectReason::NtimeOutOfRange.into());
     }
 
     // XOR, not BIP-310's `(job_version & ~mask) | (bits & mask)`: that clears a
@@ -715,6 +738,37 @@ mod tests {
                 assert_eq!(a.classification, JobClassification::StaleCreditable)
             }
             ShareValidation::Rejected(r) => panic!("control must be creditable, got {r:?}"),
+        }
+    }
+
+    /// A share is credited only with `ntime` in its template's window; the
+    /// in-window controls show the share is otherwise good.
+    #[test]
+    fn ntime_outside_the_template_window_is_rejected() {
+        let (reg, jid) = populated_registry(DIFF_ONE_N_BITS);
+        let session = easy_session();
+        let start = reg.classify(&jid, 1_500).unwrap().template.header_timestamp;
+        for (ntime, accepted) in [
+            (start, true),
+            (start + MAX_FUTURE_BLOCK_TIME, true),
+            (start - 1, false),
+            (start + MAX_FUTURE_BLOCK_TIME + 1, false),
+        ] {
+            let ntime_hex = format!("{ntime:08x}");
+            let s = SubmitRequest {
+                ntime_hex: &ntime_hex,
+                ..submit(&jid, "deadbeef")
+            };
+            let v = validate_submit(&s, &session, &mut SessionShareCache::new(), &reg, 1_500);
+            match (v, accepted) {
+                (ShareValidation::Accepted(_), true) => {}
+                (ShareValidation::Rejected(r), false) => {
+                    assert_eq!(r.reason, RejectReason::NtimeOutOfRange);
+                    assert_eq!(r.wire_code, ERR_OTHER_UNKNOWN);
+                    assert_eq!(r.wire_message, "Ntime out of range");
+                }
+                (other, _) => panic!("ntime {ntime:#x}: unexpected {other:?}"),
+            }
         }
     }
 

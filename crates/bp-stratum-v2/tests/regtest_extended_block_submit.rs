@@ -10,8 +10,7 @@ use std::time::Duration;
 use bitcoin::Network;
 use bp_jobs_lifecycle::LifecycleConfig;
 use bp_mining_job::{
-    build_block_header, build_mining_job_from_tdp, merkle_root_from_coinbase,
-    version_meets_consensus_floor, PayoutEntry, TdpCoinbaseTemplate,
+    build_mining_job_from_tdp, merkle_root_from_coinbase, PayoutEntry, TdpCoinbaseTemplate,
 };
 use bp_regtest_harness::{RegtestConfig, RegtestNode};
 use bp_share::{sha256d, Difficulty, Target};
@@ -33,15 +32,14 @@ const MINER_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 /// sixteen; rolling only these separates "needs BIP-323" from BIP-320.
 const BIP323_ONLY_VERSION_BITS: u32 = 0x0000_1fe0;
 
-/// How long core gets to act on a submitted block. The reject path uses the
-/// same budget so a slow acceptance cannot pass as "rejected".
+/// How long core gets to act on a submitted block.
 const CORE_ACCEPT_BUDGET: Duration = Duration::from_secs(20);
 
 /// 8-byte miner extranonce: total 12 matches the pool's `EXTRANONCE_SLOT_LEN`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::print_stderr)]
 async fn sv2_extended_8byte_miner_extranonce_block_is_accepted_by_bitcoin_core() {
-    run_block_submit_case(8, 0, true).await;
+    run_block_submit_case(8, 0).await;
 }
 
 /// 6-byte miner extranonce (total 10): the job's scriptSig length varint must
@@ -49,7 +47,7 @@ async fn sv2_extended_8byte_miner_extranonce_block_is_accepted_by_bitcoin_core()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::print_stderr)]
 async fn sv2_extended_6byte_miner_extranonce_block_is_accepted_by_bitcoin_core() {
-    run_block_submit_case(6, 0, true).await;
+    run_block_submit_case(6, 0).await;
 }
 
 /// bitcoin-core accepts a block rolling the BIP-323-only bits and stores them;
@@ -58,35 +56,12 @@ async fn sv2_extended_6byte_miner_extranonce_block_is_accepted_by_bitcoin_core()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::print_stderr)]
 async fn sv2_block_rolling_bip323_version_bits_is_accepted_by_bitcoin_core() {
-    run_block_submit_case(8, BIP323_ONLY_VERSION_BITS, true).await;
+    run_block_submit_case(8, BIP323_ONLY_VERSION_BITS).await;
 }
 
-/// Rolling bit 31 makes the version negative as an `i32`, below the consensus
-/// floor: the pool accepts the share, core rejects the block `bad-version`.
-/// Backs the `scope="unsubmittable"` metric, since the fire-and-forget submit
-/// would lose such a block silently.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::print_stderr)]
-async fn sv2_block_below_consensus_version_floor_is_rejected_by_bitcoin_core() {
-    run_block_submit_case(8, 1 << 31, false).await;
-}
-
-/// Rolling bit 30 keeps the version positive and core accepts the block:
-/// submittability depends on the resulting version, not the rolled bits.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::print_stderr)]
-async fn sv2_block_rolling_bit_30_stays_submittable() {
-    run_block_submit_case(8, 1 << 30, true).await;
-}
-
-/// `rolled_version_bits` is XOR'd into the template version (`0` = no rolling).
-/// `expect_block_accepted`: the tip rises and keeps the bits, or it stays put
-/// while the node proves it still accepts blocks.
-async fn run_block_submit_case(
-    miner_extranonce_size: u8,
-    rolled_version_bits: u32,
-    expect_block_accepted: bool,
-) {
+/// `rolled_version_bits` is XOR'd into the template version (`0` = no rolling);
+/// the tip must rise and keep them.
+async fn run_block_submit_case(miner_extranonce_size: u8, rolled_version_bits: u32) {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
         tracing::warn!(
@@ -214,16 +189,6 @@ async fn run_block_submit_case(
     // template's.
     let header_version = template.version ^ rolled_version_bits;
 
-    // Pin which side of the consensus floor this case is on, so the
-    // expectation is stated in terms of the rule core enforces.
-    assert_eq!(
-        version_meets_consensus_floor(header_version),
-        expect_block_accepted,
-        "case setup is inconsistent: header version 0x{header_version:08x} \
-         (i32 {}) vs expect_block_accepted={expect_block_accepted}",
-        header_version as i32
-    );
-
     let nonce = brute_force_nonce(
         header_version,
         &prev_hash.prev_hash,
@@ -290,122 +255,63 @@ async fn run_block_submit_case(
     .expect("submit_solution IPC call");
 
     // ── What bitcoin-core did with it ────────────────────────────────
-    // The tip shows acceptance but no rejection reason, so the reject branch
-    // re-submits the same block over `submitblock` to read core's reason.
-    if !expect_block_accepted {
-        // Same budget as the accept path, see `CORE_ACCEPT_BUDGET`.
-        let reached = poll_for_height(&node, before_height + 1, CORE_ACCEPT_BUDGET).await;
-        assert!(
-            reached.is_none(),
-            "bitcoin-core accepted a block whose header version is \
-             0x{header_version:08x} (i32 {}); the consensus floor in \
-             `bp_mining_job::MIN_CONSENSUS_BLOCK_VERSION` is then wrong",
-            header_version as i32
+    let after = poll_for_height(&node, before_height + 1, CORE_ACCEPT_BUDGET)
+        .await
+        .expect(
+            "bitcoin-core must advance the chain after submit_solution — \
+             a stuck tip means validate_submit_extended produced bytes \
+             bitcoin-core rejected",
         );
+    assert_eq!(after, before_height + 1);
 
-        // Get the reason. The block is header + one coinbase only if the
-        // template carries no transactions, so assert that.
-        assert!(
-            template.merkle_path.is_empty(),
-            "this reconstruction assumes a coinbase-only template"
-        );
-        let header_bytes = build_block_header(
-            header_version as i32,
-            &prev_hash.prev_hash,
-            &merkle_root,
-            prev_hash.header_timestamp,
-            prev_hash.n_bits,
-            nonce,
-        );
-        let mut block = hex::encode(header_bytes);
-        block.push_str("01"); // tx count varint
-        block.push_str(&hex::encode(&accept.witness_coinbase));
-        let reason = node
-            .submit_block(&block)
-            .await
-            .expect("submitblock RPC")
-            .unwrap_or_default();
-        assert!(
-            reason.contains("bad-version"),
-            "core must reject this block *on version grounds*, not drop it \
-             for some other reason; submitblock said {reason:?} for header \
-             version 0x{header_version:08x}"
-        );
+    // ── The version bits must have survived into the chain ───────
+    // A path that swapped in the template's version would still be accepted.
+    let block_hash = node
+        .rpc_call("getblockhash", json!([after]))
+        .await
+        .expect("getblockhash")
+        .as_str()
+        .expect("block hash is a string")
+        .to_string();
+    let stored_version = node
+        .rpc_call("getblockheader", json!([block_hash]))
+        .await
+        .expect("getblockheader")
+        .get("version")
+        .and_then(Value::as_i64)
+        .expect("header version is a number") as u32;
+    assert_eq!(
+        stored_version, header_version,
+        "bitcoin-core stored a different nVersion than was submitted — \
+         the rolled bits (0x{rolled_version_bits:08x}) did not reach the \
+         chain, so this run proves nothing about them"
+    );
 
-        let still = node.current_height().await.expect("current_height");
-        assert_eq!(
-            still, before_height,
-            "tip moved despite the block being rejected"
-        );
-
-        // Negative control: the node still accepts an ordinary block, so a
-        // dead node cannot pass as "tip did not move".
-        node.generate_to_self(1)
-            .await
-            .expect("node must still accept an ordinary block");
-        let recovered = poll_for_height(&node, before_height + 1, CORE_ACCEPT_BUDGET)
-            .await
-            .expect("node must advance on a normally-mined block");
-        assert_eq!(recovered, before_height + 1);
-    } else {
-        let after = poll_for_height(&node, before_height + 1, CORE_ACCEPT_BUDGET)
-            .await
-            .expect(
-                "bitcoin-core must advance the chain after submit_solution — \
-                 a stuck tip indicates validate_submit_extended produced bytes \
-                 bitcoin-core rejected (the OversizedVarInt bug from 2026-05-17)",
-            );
-        assert_eq!(after, before_height + 1);
-
-        // ── The version bits must have survived into the chain ───────
-        // A path that swapped in the template's version would still be accepted.
-        let block_hash = node
-            .rpc_call("getblockhash", json!([after]))
-            .await
-            .expect("getblockhash")
-            .as_str()
-            .expect("block hash is a string")
-            .to_string();
-        let stored_version = node
-            .rpc_call("getblockheader", json!([block_hash]))
-            .await
-            .expect("getblockheader")
-            .get("version")
-            .and_then(Value::as_i64)
-            .expect("header version is a number") as u32;
-        assert_eq!(
-            stored_version, header_version,
-            "bitcoin-core stored a different nVersion than was submitted — \
-             the rolled bits (0x{rolled_version_bits:08x}) did not reach the \
-             chain, so this run proves nothing about them"
-        );
-
-        // ── ...and core must not have flagged them ───────────────────
-        // Only shows one such block raises nothing; the warning is threshold-based.
-        let warnings = node
-            .rpc_call("getblockchaininfo", json!([]))
-            .await
-            .expect("getblockchaininfo")
-            .get("warnings")
-            .cloned()
-            .unwrap_or(Value::Null);
-        // `warnings` is a string on older cores and an array from v25 on;
-        // any other shape fails rather than skipping the check.
-        let warning_text = match &warnings {
-            Value::String(s) => s.clone(),
-            Value::Array(items) => items
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(" | "),
-            other => panic!("unexpected `warnings` shape from getblockchaininfo: {other}"),
-        };
-        assert!(
-            !warning_text.to_lowercase().contains("unknown"),
-            "bitcoin-core v31 raised an unknown-rules/version warning after a \
-             block rolling 0x{rolled_version_bits:08x}: {warning_text:?}"
-        );
-    }
+    // ── ...and core must not have flagged them ───────────────────
+    // Only shows one such block raises nothing; the warning is threshold-based.
+    let warnings = node
+        .rpc_call("getblockchaininfo", json!([]))
+        .await
+        .expect("getblockchaininfo")
+        .get("warnings")
+        .cloned()
+        .unwrap_or(Value::Null);
+    // `warnings` is a string on older cores and an array from v25 on;
+    // any other shape fails rather than skipping the check.
+    let warning_text = match &warnings {
+        Value::String(s) => s.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" | "),
+        other => panic!("unexpected `warnings` shape from getblockchaininfo: {other}"),
+    };
+    assert!(
+        !warning_text.to_lowercase().contains("unknown"),
+        "bitcoin-core v31 raised an unknown-rules/version warning after a \
+         block rolling 0x{rolled_version_bits:08x}: {warning_text:?}"
+    );
 
     // ── Clean teardown ───────────────────────────────────────────────
     tdp.shutdown().expect("TDP clean shutdown");

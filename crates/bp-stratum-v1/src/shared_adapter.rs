@@ -36,36 +36,39 @@ pub(crate) fn shared_accepted<'a>(
     }
 }
 
-/// One-to-one mapping; a stale share (retired job) stays apart from one for
-/// a job the pool never had or already dropped.
-fn map_sv1_reject(reason: RejectReason) -> RejectedReason {
+/// A stale share (retired job) stays apart from one for a job the pool never
+/// had or already dropped; `None` for an out-of-window ntime, a protocol
+/// validity reject the per-address rejected-stats do not count (as on SV2).
+fn map_sv1_reject(reason: RejectReason) -> Option<RejectedReason> {
     match reason {
-        RejectReason::JobNotFound => RejectedReason::JobNotFound,
-        RejectReason::Stale => RejectedReason::Stale,
-        RejectReason::DuplicateShare => RejectedReason::DuplicateShare,
-        RejectReason::LowDifficulty => RejectedReason::LowDifficulty,
-        RejectReason::VersionRollingNotAllowed => RejectedReason::VersionRollingNotAllowed,
+        RejectReason::JobNotFound => Some(RejectedReason::JobNotFound),
+        RejectReason::Stale => Some(RejectedReason::Stale),
+        RejectReason::DuplicateShare => Some(RejectedReason::DuplicateShare),
+        RejectReason::LowDifficulty => Some(RejectedReason::LowDifficulty),
+        RejectReason::VersionRollingNotAllowed => Some(RejectedReason::VersionRollingNotAllowed),
+        RejectReason::NtimeOutOfRange => None,
     }
 }
 
-/// The shared view of a rejected SV1 share.
+/// The shared view of a rejected SV1 share, or `None` when the stats do not
+/// count it (see [`map_sv1_reject`]).
 pub(crate) fn shared_rejected<'a>(
     address: Option<&'a str>,
     worker: Option<&'a str>,
     session_id: &'a str,
     reason: RejectReason,
     difficulty: f64,
-) -> SharedRejectedShare<'a> {
-    SharedRejectedShare {
+) -> Option<SharedRejectedShare<'a>> {
+    Some(SharedRejectedShare {
         address,
         worker,
         session_id,
-        reason: map_sv1_reject(reason),
+        reason: map_sv1_reject(reason)?,
         difficulty,
         // The producer (Core composite) stamps the group id from the mode
         // gate; the protocol side has none.
         group_id: None,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -172,10 +175,24 @@ mod tests {
     /// job-not-found, so the stale column counts it.
     #[test]
     fn a_stale_reject_keeps_its_own_reason() {
-        let share = shared_rejected(Some("a"), Some("w"), "s", RejectReason::Stale, 8.0);
+        let share = shared_rejected(Some("a"), Some("w"), "s", RejectReason::Stale, 8.0).unwrap();
         assert_eq!(share.reason, RejectedReason::Stale);
         assert_eq!(share.difficulty, 8.0);
-        let share = shared_rejected(Some("a"), Some("w"), "s", RejectReason::JobNotFound, 8.0);
+        let share =
+            shared_rejected(Some("a"), Some("w"), "s", RejectReason::JobNotFound, 8.0).unwrap();
         assert_eq!(share.reason, RejectedReason::JobNotFound);
+    }
+
+    /// An out-of-window ntime never reaches the stats sink, as on SV2.
+    #[test]
+    fn an_ntime_reject_is_not_forwarded() {
+        let r = shared_rejected(
+            Some("a"),
+            Some("w"),
+            "s",
+            RejectReason::NtimeOutOfRange,
+            8.0,
+        );
+        assert!(r.is_none());
     }
 }

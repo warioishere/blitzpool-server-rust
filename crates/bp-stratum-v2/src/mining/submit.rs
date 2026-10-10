@@ -8,6 +8,7 @@
 use bp_jobs_lifecycle::JobClassification;
 use bp_mining_job::{
     assemble_witness_coinbase, build_block_header, meets_network_target, merkle_root_from_coinbase,
+    ntime_in_window, rolls_only_general_purpose_bits, MAX_FUTURE_BLOCK_TIME,
 };
 use bp_share::{calculate_difficulty, sha256d_from_parts, Difficulty, Target};
 use smallvec::SmallVec;
@@ -39,6 +40,15 @@ pub const ERR_DUPLICATE_SHARE: &str = "duplicate-share";
 
 pub const ERR_DIFFICULTY_TOO_LOW: &str = "difficulty-too-low";
 
+/// Share `ntime` outside [`bp_mining_job::ntime_in_window`]: a block from it
+/// would carry a timestamp the job does not allow.
+pub const ERR_INVALID_SHARE: &str = "invalid-share";
+
+/// Share `version` changes bits outside
+/// [`bp_mining_job::BIP323_VERSION_ROLLING_MASK`]: every job allows rolling,
+/// but only of the general-purpose bits.
+pub const ERR_INVALID_NON_ROLLABLE_VERSION_BIT: &str = "invalid-non-rollable-version-bit";
+
 /// Hard reject: with a different extranonce size the reconstructed coinbase
 /// is not what the miner hashed, so the credited work would be unverified.
 pub const ERR_BAD_EXTRANONCE_SIZE: &str = "bad-extranonce-size";
@@ -57,6 +67,10 @@ pub enum RejectReason {
     DifficultyTooLow,
     /// Extended-channel only; see [`ERR_BAD_EXTRANONCE_SIZE`].
     BadExtranonceSize,
+    /// See [`ERR_INVALID_SHARE`].
+    NtimeOutOfRange,
+    /// See [`ERR_INVALID_NON_ROLLABLE_VERSION_BIT`].
+    NonRollableVersionBit,
 }
 
 impl RejectReason {
@@ -67,6 +81,8 @@ impl RejectReason {
             RejectReason::DuplicateShare => ERR_DUPLICATE_SHARE,
             RejectReason::DifficultyTooLow => ERR_DIFFICULTY_TOO_LOW,
             RejectReason::BadExtranonceSize => ERR_BAD_EXTRANONCE_SIZE,
+            RejectReason::NtimeOutOfRange => ERR_INVALID_SHARE,
+            RejectReason::NonRollableVersionBit => ERR_INVALID_NON_ROLLABLE_VERSION_BIT,
         }
     }
 }
@@ -175,6 +191,8 @@ pub struct StandardJobContext<'a> {
     pub prev_hash: [u8; 32],
     /// Encodes the network target the block-found gate checks.
     pub n_bits: u32,
+    /// The job's `min_ntime`; bounds the share's `ntime`.
+    pub ntime_start: u32,
     pub classification: JobClassification,
     /// `None` for `SetCustomMiningJob`-derived jobs.
     pub template_id: Option<u64>,
@@ -207,6 +225,25 @@ pub fn validate_submit_standard(
 
     if job_ctx.classification == JobClassification::StaleRejected {
         return ShareValidation::Rejected(RejectReason::StaleShare.into());
+    }
+
+    if !ntime_in_window(submission.ntime, job_ctx.ntime_start) {
+        return reject_ntime(
+            submission.channel_id,
+            submission.job_id,
+            submission.ntime,
+            job_ctx.ntime_start,
+        );
+    }
+
+    let job_version = job_ctx.template_version as u32;
+    if !rolls_only_general_purpose_bits(submission.version, job_version) {
+        return reject_version(
+            submission.channel_id,
+            submission.job_id,
+            submission.version,
+            job_version,
+        );
     }
 
     // SV2 submits the "Full nVersion field", so it goes into the header as-is.
@@ -328,6 +365,24 @@ pub fn validate_submit_extended(
         return ShareValidation::Rejected(RejectReason::BadExtranonceSize.into());
     }
 
+    if !ntime_in_window(submission.ntime, ext_job.min_ntime) {
+        return reject_ntime(
+            submission.channel_id,
+            submission.job_id,
+            submission.ntime,
+            ext_job.min_ntime,
+        );
+    }
+
+    if !rolls_only_general_purpose_bits(submission.version, ext_job.version) {
+        return reject_version(
+            submission.channel_id,
+            submission.job_id,
+            submission.version,
+            ext_job.version,
+        );
+    }
+
     // The extranonce prefix is read off the JOB, never off the channel:
     // SV2 Mining/SetExtranoncePrefix is effective only from the next job on,
     // so a share for an older job was built with that job's prefix.
@@ -444,6 +499,29 @@ pub fn validate_submit_extended(
     }))
 }
 
+fn reject_ntime(channel_id: u32, job_id: u32, ntime: u32, ntime_start: u32) -> ShareValidation {
+    tracing::warn!(
+        channel_id,
+        job_id,
+        ntime,
+        ntime_start,
+        "❌ Share rejected: invalid-share (ntime outside [{ntime_start}, {ntime_start} + {}])",
+        MAX_FUTURE_BLOCK_TIME
+    );
+    ShareValidation::Rejected(RejectReason::NtimeOutOfRange.into())
+}
+
+fn reject_version(channel_id: u32, job_id: u32, version: u32, job_version: u32) -> ShareValidation {
+    tracing::warn!(
+        channel_id,
+        job_id,
+        version = format_args!("{version:#010x}"),
+        job_version = format_args!("{job_version:#010x}"),
+        "❌ Share rejected: invalid-non-rollable-version-bit"
+    );
+    ShareValidation::Rejected(RejectReason::NonRollableVersionBit.into())
+}
+
 /// A share [`SeenShares`] refused goes out as `duplicate-share` either way:
 /// a full set is not the miner's fault, but no other code fits and the share
 /// must not be credited.
@@ -510,7 +588,7 @@ mod tests {
             version: 0x2000_0000,
             prev_hash: prev,
             n_bits,
-            min_ntime: 0,
+            min_ntime: 0x6500_0000,
             // Must match `ext_channel()`'s prefix: the validator rebuilds the
             // coinbase from the job's prefix.
             extranonce_prefix: vec![0u8; 4],
@@ -529,6 +607,7 @@ mod tests {
             template_version: 0x2000_0000,
             prev_hash: [0xCC; 32],
             n_bits: 0x1d00_ffff,
+            ntime_start: 0x6500_0000,
             classification: class,
             template_id: None,
             coinbase_stratum: &[],
@@ -799,36 +878,89 @@ mod tests {
     /// template bit the miner cleared, which an OR-based rebuild would restore.
     #[test]
     fn standard_header_version_is_the_submitted_version_verbatim() {
-        let ctx = std_ctx(JobClassification::Active);
+        // A template that already sets general-purpose bit 13.
+        let ctx = StandardJobContext {
+            template_version: 0x2000_2000,
+            ..std_ctx(JobClassification::Active)
+        };
         let merkle = [0xDD; 32];
 
-        // Sets a bit the template (0x2000_0000) does not have.
+        // Sets a bit the template does not have.
         let mut ch = std_channel();
         let mut sub = std_submission();
-        sub.version = 0x2000_0001;
+        sub.version = 0x2000_2100;
         let accept = match validate_submit_standard(&mut ch, &sub, easy_diff(), &merkle, &ctx) {
             ShareValidation::Accepted(a) => a,
-            _ => panic!("expected Accept"),
+            other => panic!("expected Accept, got {other:?}"),
         };
         assert_eq!(
             u32::from_le_bytes(accept.header[0..4].try_into().unwrap()),
-            0x2000_0001
+            0x2000_2100
         );
 
-        // Clears bit 29, which the template (0x2000_0000) has.
+        // Clears bit 13, which the template has.
         let mut ch = std_channel();
         let mut sub = std_submission();
-        sub.version = 0x0000_0000;
+        sub.version = 0x2000_0000;
         let accept = match validate_submit_standard(&mut ch, &sub, easy_diff(), &merkle, &ctx) {
             ShareValidation::Accepted(a) => a,
-            _ => panic!("expected Accept"),
+            other => panic!("expected Accept, got {other:?}"),
         };
         assert_eq!(
             u32::from_le_bytes(accept.header[0..4].try_into().unwrap()),
-            0x0000_0000,
+            0x2000_0000,
             "a cleared template bit must survive into the header — an OR-based \
              reconstruction would put it back"
         );
+    }
+
+    /// Bits outside the BIP-323 mask must stay as the job set them, on both
+    /// channel kinds; the controls roll only mask bits and pass.
+    #[test]
+    fn a_version_changing_non_rollable_bits_is_rejected() {
+        let merkle = [0xDD; 32];
+        let job = ext_job([0xCC; 32], 0x1d00_ffff);
+        assert_eq!(job.version, 0x2000_0000);
+        for (version, accepted) in [
+            (0x2000_0000, true),
+            (0x3fff_ffe0, true),
+            (0x2000_0001, false),
+            (0x0000_0000, false),
+            (0x6000_0000, false),
+        ] {
+            let std_out = validate_submit_standard(
+                &mut std_channel(),
+                &SubmitSharesStandardInput {
+                    version,
+                    ..std_submission()
+                },
+                easy_diff(),
+                &merkle,
+                &std_ctx(JobClassification::Active),
+            );
+            let ext_out = validate_ext(
+                &mut ext_channel(),
+                &SubmitSharesExtendedInput {
+                    version,
+                    ..ext_submission()
+                },
+                &job,
+                easy_diff(),
+                0,
+                false,
+                false,
+            );
+            for out in [std_out, ext_out] {
+                match (out, accepted) {
+                    (ShareValidation::Accepted(_), true) => {}
+                    (ShareValidation::Rejected(r), false) => {
+                        assert_eq!(r.reason, RejectReason::NonRollableVersionBit);
+                        assert_eq!(r.wire_code, "invalid-non-rollable-version-bit");
+                    }
+                    (other, _) => panic!("version {version:#010x}: unexpected {other:?}"),
+                }
+            }
+        }
     }
 
     /// Target `0xffff·2^240`: met by every hash except the top 2^-16.
@@ -1160,6 +1292,69 @@ mod tests {
         match again {
             ShareValidation::Rejected(r) => assert_eq!(r.reason, RejectReason::DuplicateShare),
             ShareValidation::Accepted(_) => panic!("same work credited under a second job id"),
+        }
+    }
+
+    // ── ntime window ───────────────────────────────────────────────
+
+    /// A Standard share is credited only with `ntime` in the job's window;
+    /// the in-window controls show the share is otherwise good.
+    #[test]
+    fn standard_ntime_outside_the_job_window_is_invalid_share() {
+        let merkle = [0xDD; 32];
+        let start = std_ctx(JobClassification::Active).ntime_start;
+        for (ntime, accepted) in [
+            (start, true),
+            (start + MAX_FUTURE_BLOCK_TIME, true),
+            (start - 1, false),
+            (start + MAX_FUTURE_BLOCK_TIME + 1, false),
+        ] {
+            let sub = SubmitSharesStandardInput {
+                ntime,
+                ..std_submission()
+            };
+            let out = validate_submit_standard(
+                &mut std_channel(),
+                &sub,
+                easy_diff(),
+                &merkle,
+                &std_ctx(JobClassification::Active),
+            );
+            match (out, accepted) {
+                (ShareValidation::Accepted(_), true) => {}
+                (ShareValidation::Rejected(r), false) => {
+                    assert_eq!(r.reason, RejectReason::NtimeOutOfRange);
+                    assert_eq!(r.wire_code, "invalid-share");
+                }
+                (other, _) => panic!("ntime {ntime:#x}: unexpected {other:?}"),
+            }
+        }
+    }
+
+    /// Extended counterpart, bounded by the job's own `min_ntime`.
+    #[test]
+    fn extended_ntime_outside_the_job_window_is_invalid_share() {
+        let job = ext_job([0xCC; 32], 0x1d00_ffff);
+        let start = job.min_ntime;
+        for (ntime, accepted) in [
+            (start, true),
+            (start + MAX_FUTURE_BLOCK_TIME, true),
+            (start - 1, false),
+            (start + MAX_FUTURE_BLOCK_TIME + 1, false),
+        ] {
+            let sub = SubmitSharesExtendedInput {
+                ntime,
+                ..ext_submission()
+            };
+            let out = validate_ext(&mut ext_channel(), &sub, &job, easy_diff(), 0, false, false);
+            match (out, accepted) {
+                (ShareValidation::Accepted(_), true) => {}
+                (ShareValidation::Rejected(r), false) => {
+                    assert_eq!(r.reason, RejectReason::NtimeOutOfRange);
+                    assert_eq!(r.wire_code, "invalid-share");
+                }
+                (other, _) => panic!("ntime {ntime:#x}: unexpected {other:?}"),
+            }
         }
     }
 }

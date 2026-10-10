@@ -34,6 +34,7 @@ pub(crate) const REJECT_NOT_SUBSCRIBED: &str = "Not subscribed";
 /// Emitted when a miner changes version bits outside the mask it negotiated
 /// (BIP-310).
 pub(crate) const REJECT_VERSION_ROLLING: &str = "Version rolling not allowed";
+pub(crate) const REJECT_NTIME: &str = "Ntime out of range";
 pub(crate) const REJECT_SUGGEST_DISABLED: &str =
     "Suggest difficulty is disabled for this connection";
 pub(crate) const REJECT_INVALID_ADDR: &str = "Invalid Bitcoin address";

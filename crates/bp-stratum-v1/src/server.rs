@@ -865,16 +865,15 @@ pub(crate) async fn process_event<C: bp_vardiff::Clock>(
         SessionEvent::ShareRejected { reason, difficulty } => {
             let address = state.authorization.as_ref().map(|a| a.address.as_str());
             let worker = state.authorization.as_ref().map(|a| a.worker.as_str());
-            hooks
-                .rejected_sink
-                .record_rejected(crate::shared_adapter::shared_rejected(
-                    address,
-                    worker,
-                    &state.session_id_hex,
-                    reason,
-                    difficulty,
-                ))
-                .await;
+            if let Some(share) = crate::shared_adapter::shared_rejected(
+                address,
+                worker,
+                &state.session_id_hex,
+                reason,
+                difficulty,
+            ) {
+                hooks.rejected_sink.record_rejected(share).await;
+            }
             true
         }
         SessionEvent::Disconnect => {

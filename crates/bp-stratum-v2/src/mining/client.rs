@@ -970,7 +970,9 @@ fn feed_vardiff<C: Clock>(
                 RejectReason::InvalidJobId
                 | RejectReason::DuplicateShare
                 | RejectReason::DifficultyTooLow
-                | RejectReason::BadExtranonceSize => false,
+                | RejectReason::BadExtranonceSize
+                | RejectReason::NtimeOutOfRange
+                | RejectReason::NonRollableVersionBit => false,
             };
             if counts_as_arrival {
                 engine.note_stale_share();
@@ -1040,6 +1042,7 @@ pub fn handle_submit_shares_standard<C: Clock>(
         template_version: entry.template_snapshot.version as i32,
         prev_hash: entry.template_snapshot.prev_hash,
         n_bits: entry.template_snapshot.n_bits,
+        ntime_start: entry.template_snapshot.ntime_start,
         classification,
         payouts_fingerprint: entry.payouts_fingerprint,
         template_id: entry.template_id,
@@ -1605,6 +1608,7 @@ pub fn apply_template_broadcast<C: Clock>(
                     version: template.version,
                     prev_hash: template.prev_hash,
                     n_bits: template.n_bits,
+                    ntime_start: template.header_timestamp,
                     coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
                 };
                 channel.standard_jobs.record_send(
@@ -2805,6 +2809,7 @@ pub(crate) mod tests {
             version: 0x2000_0000,
             prev_hash: [0xCC; 32],
             n_bits: 0x1d00_ffff,
+            ntime_start: 0x6500_0000,
             coinbase_tx_value_remaining: 5_000_000_000,
         }
     }
@@ -3147,7 +3152,7 @@ pub(crate) mod tests {
             version: 0x2000_0000,
             prev_hash: [0xCC; 32],
             n_bits: 0x1d00_ffff,
-            min_ntime: 0,
+            min_ntime: 0x6500_0000,
             difficulty: easy,
             coinbase_tx_value_remaining: 5_000_000_000,
             template_id: None,
@@ -3202,7 +3207,7 @@ pub(crate) mod tests {
                 version: 0x2000_0000,
                 prev_hash: [0xCC; 32],
                 n_bits: 0x1d00_ffff,
-                min_ntime: 0,
+                min_ntime: 0x6500_0000,
                 difficulty: Difficulty(1.0 / 4_294_967_296.0),
                 coinbase_tx_value_remaining: 5_000_000_000,
                 template_id: None,
@@ -3928,7 +3933,7 @@ pub(crate) mod tests {
             version: 0x2000_0000,
             prev_hash: [0xCC; 32],
             n_bits: 0x1d00_ffff,
-            min_ntime: 0,
+            min_ntime: 0x6500_0000,
             difficulty: Difficulty(1024.0),
             coinbase_tx_value_remaining: 5_000_000_000,
             template_id: None,
@@ -5060,7 +5065,7 @@ pub(crate) mod tests {
                     version: 0,
                     prev_hash: [0; 32],
                     n_bits: 0,
-                    min_ntime: 0,
+                    min_ntime: 0x6500_0000,
                     difficulty: Difficulty(1.0),
                     coinbase_tx_value_remaining: 5_000_000_000,
                     template_id: None,
@@ -5133,7 +5138,7 @@ pub(crate) mod tests {
                         version: 0,
                         prev_hash: [0; 32],
                         n_bits: 0,
-                        min_ntime: 0,
+                        min_ntime: 0x6500_0000,
                         difficulty: Difficulty(1.0),
                         coinbase_tx_value_remaining: 5_000_000_000,
                         template_id: None,

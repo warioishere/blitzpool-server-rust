@@ -283,8 +283,7 @@ mod tests {
     /// Pins that the version compare is never masked to the BIP-323 bits.
     #[test]
     fn a_bip323_only_difference_is_still_a_version_violation() {
-        /// Bits 5–28 inclusive.
-        const BIP323_MASK: u32 = 0x1fff_ffe0;
+        use bp_mining_job::BIP323_VERSION_ROLLING_MASK as BIP323_MASK;
 
         let binding = binding_from_declared_job(&declared_job(2)).expect("must project");
         assert_eq!(check_custom_job(&binding, mined_from(&binding)), Ok(()));

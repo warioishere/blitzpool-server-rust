@@ -3,15 +3,27 @@
 //! Direct 80-byte block-header assembly for the share-validation hot path.
 //! No `bitcoin::Block` / `Transaction` allocations.
 
-/// Lowest `nVersion` core accepts (`bad-version`), compared as a SIGNED `i32`
-/// with CLTV active. Below it the block is lost silently, since
-/// `submit_solution` is fire-and-forget. Check the resulting version: the
-/// rolled bits alone cannot tell an accepted version from a rejected one.
-pub const MIN_CONSENSUS_BLOCK_VERSION: i32 = 4;
+/// BIP-323's general-purpose nVersion bits (5–28), the ones a miner may roll.
+pub const BIP323_VERSION_ROLLING_MASK: u32 = 0x1fff_ffe0;
 
-/// Whether a block with this version passes [`MIN_CONSENSUS_BLOCK_VERSION`].
-pub fn version_meets_consensus_floor(version: u32) -> bool {
-    (version as i32) >= MIN_CONSENSUS_BLOCK_VERSION
+/// Whether `version` differs from its job's `job_version` only in
+/// [`BIP323_VERSION_ROLLING_MASK`] bits; the rest must stay as the job set
+/// them.
+pub fn rolls_only_general_purpose_bits(version: u32, job_version: u32) -> bool {
+    (version ^ job_version) & !BIP323_VERSION_ROLLING_MASK == 0
+}
+
+/// Bitcoin's `MAX_FUTURE_BLOCK_TIME`: how far a block's nTime may run ahead
+/// of the network-adjusted time, in seconds.
+pub const MAX_FUTURE_BLOCK_TIME: u32 = 7_200;
+
+/// Whether a share's `ntime` lies in `[ntime_start, ntime_start +
+/// MAX_FUTURE_BLOCK_TIME]`, `ntime_start` being the timestamp its job was
+/// issued with. The lower bound is SV2 Mining/SubmitShares.Standard's MUST.
+/// The upper bound is anchored at the template's timestamp, which bitcoind
+/// took from its own clock, so it does not depend on the pool's clock.
+pub fn ntime_in_window(ntime: u32, ntime_start: u32) -> bool {
+    ntime >= ntime_start && ntime <= ntime_start.saturating_add(MAX_FUTURE_BLOCK_TIME)
 }
 
 /// Assemble the 80-byte header, byte-identical to `consensus_encode`.
@@ -49,6 +61,39 @@ pub fn meets_network_target(hash_le: &[u8; 32], n_bits: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Any bit inside the mask may change, any bit outside may not.
+    #[test]
+    fn only_bip323_bits_may_be_rolled() {
+        let job = 0x2000_0000;
+        assert!(rolls_only_general_purpose_bits(job, job));
+        assert!(rolls_only_general_purpose_bits(job | (1 << 5), job));
+        assert!(rolls_only_general_purpose_bits(job | (1 << 28), job));
+        assert!(rolls_only_general_purpose_bits(
+            job | BIP323_VERSION_ROLLING_MASK,
+            job
+        ));
+        assert!(!rolls_only_general_purpose_bits(job | (1 << 4), job));
+        assert!(
+            !rolls_only_general_purpose_bits(job & !(1 << 29), job),
+            "the BIP9 top bits"
+        );
+        assert!(!rolls_only_general_purpose_bits(0, job));
+    }
+
+    /// Both bounds are inclusive; one second past either side is out.
+    #[test]
+    fn ntime_window_bounds_are_inclusive() {
+        let start = 1_700_000_000;
+        assert!(ntime_in_window(start, start));
+        assert!(ntime_in_window(start + MAX_FUTURE_BLOCK_TIME, start));
+        assert!(!ntime_in_window(start - 1, start));
+        assert!(!ntime_in_window(start + MAX_FUTURE_BLOCK_TIME + 1, start));
+        assert!(
+            ntime_in_window(u32::MAX, u32::MAX - 1),
+            "no overflow at the top"
+        );
+    }
 
     /// The target itself is a block, target + 1 is not.
     #[test]
@@ -111,20 +156,5 @@ mod tests {
         )
         .unwrap();
         assert_eq!(header.as_slice(), expected.as_slice());
-    }
-
-    #[test]
-    fn the_consensus_floor_is_the_signed_comparison_core_makes() {
-        // Unsigned, 0x80000000 would be the largest version, not the smallest.
-        assert!(!version_meets_consensus_floor(0));
-        assert!(!version_meets_consensus_floor(3));
-        assert!(version_meets_consensus_floor(4));
-        assert!(version_meets_consensus_floor(0x2000_0000));
-        for v in [0x8000_0000u32, 0xA000_0000, u32::MAX] {
-            assert!(
-                !version_meets_consensus_floor(v),
-                "0x{v:08x} is negative as i32 and must fail the floor"
-            );
-        }
     }
 }

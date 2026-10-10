@@ -20,7 +20,7 @@ pub use coinbase::{
     PayoutEntry, ResolvedPayouts, SoloFeeConfig, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
 };
 pub use header::{
-    build_block_header, meets_network_target, version_meets_consensus_floor,
-    MIN_CONSENSUS_BLOCK_VERSION,
+    build_block_header, meets_network_target, ntime_in_window, rolls_only_general_purpose_bits,
+    BIP323_VERSION_ROLLING_MASK, MAX_FUTURE_BLOCK_TIME,
 };
 pub use merkle::{coinbase_merkle_branch, merkle_root_from_coinbase};

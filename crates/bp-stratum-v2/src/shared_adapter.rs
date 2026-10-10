@@ -50,7 +50,9 @@ fn map_sv2_reject(reason: RejectReason) -> Option<RejectedReason> {
         RejectReason::InvalidJobId => Some(RejectedReason::JobNotFound),
         RejectReason::DuplicateShare => Some(RejectedReason::DuplicateShare),
         RejectReason::DifficultyTooLow => Some(RejectedReason::LowDifficulty),
-        RejectReason::BadExtranonceSize => None,
+        // The same miner fault SV1 counts when bits leave the negotiated mask.
+        RejectReason::NonRollableVersionBit => Some(RejectedReason::VersionRollingNotAllowed),
+        RejectReason::BadExtranonceSize | RejectReason::NtimeOutOfRange => None,
     }
 }
 
@@ -173,5 +175,10 @@ mod tests {
             Some(RejectedReason::LowDifficulty)
         );
         assert_eq!(map_sv2_reject(RejectReason::BadExtranonceSize), None);
+        assert_eq!(map_sv2_reject(RejectReason::NtimeOutOfRange), None);
+        assert_eq!(
+            map_sv2_reject(RejectReason::NonRollableVersionBit),
+            Some(RejectedReason::VersionRollingNotAllowed)
+        );
     }
 }
