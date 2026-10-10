@@ -212,6 +212,33 @@ pub async fn find_client_statistics_since_for_addresses(
     .map_err(DbError::from)
 }
 
+/// Per address, the latest slot (`"time"`, ms) before `before_ms` that
+/// received shares: the last point the charts draw with hashrate above 0.
+/// Addresses without one are absent, as are slots older than the stats
+/// retention.
+pub async fn find_last_share_slot_for_addresses<'e, E>(
+    executor: E,
+    addresses: &[AddressId],
+    before_ms: i64,
+) -> Result<std::collections::HashMap<String, i64>, DbError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let addresses: Vec<String> = addresses.iter().map(|a| a.as_str().to_string()).collect();
+    let rows = sqlx::query!(
+        r#"SELECT address AS "address!", MAX("time") AS "time!"
+           FROM client_statistics_entity
+           WHERE address = ANY($1) AND shares > 0 AND "time" < $2
+           GROUP BY address"#,
+        &addresses,
+        before_ms,
+    )
+    .fetch_all(executor)
+    .await
+    .map_err(DbError::from)?;
+    Ok(rows.into_iter().map(|r| (r.address, r.time)).collect())
+}
+
 /// Highest share difficulty per slot across `addresses` from `since_ms` on,
 /// in one query rather than one per member.
 pub async fn find_max_difficulty_since_for_addresses<'e, E>(

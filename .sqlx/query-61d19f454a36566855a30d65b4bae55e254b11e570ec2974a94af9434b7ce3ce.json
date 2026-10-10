@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT address AS \"address!\", MAX(\"time\") AS \"time!\"\n           FROM client_statistics_entity\n           WHERE address = ANY($1) AND shares > 0 AND \"time\" < $2\n           GROUP BY address",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "time!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "61d19f454a36566855a30d65b4bae55e254b11e570ec2974a94af9434b7ce3ce"
+}

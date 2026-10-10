@@ -703,6 +703,9 @@ struct PublicGroupEntry {
     member_count: usize,
     #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     total_hashrate: f64,
+    /// Start of the latest slot in which a current member had hashrate, in the
+    /// team chart's label format; `null` when none within the stats retention.
+    last_hashrate_at: Option<String>,
 }
 
 async fn list_public(
@@ -748,18 +751,31 @@ async fn list_public(
                     bp_client_live::hashrate_by_address(s.redis.as_ref(), &everyone).await,
                     || zeroed(&everyone),
                 )?;
+                // The team chart's source and cutoff, so list and chart agree.
+                let last_share_slot = bp_db::find_last_share_slot_for_addresses(
+                    &s.pool,
+                    &everyone,
+                    bp_stats::slot::chart_visibility_cutoff_slot().as_millis(),
+                )
+                .await?;
                 let mut items = Vec::with_capacity(rosters.len());
                 for (g, members) in rosters {
                     let total_hashrate: f64 = members
                         .iter()
                         .map(|m| by_address.get(m.address.as_str()).copied().unwrap_or(0.0))
                         .sum();
+                    let last_hashrate_at = members
+                        .iter()
+                        .filter_map(|m| last_share_slot.get(m.address.as_str()).copied())
+                        .max()
+                        .map(crate::time_range::format_iso_ms);
                     let mut summary = GroupSummary::from(g.clone());
                     summary.creator_address = None; // never expose the creator publicly
                     items.push(PublicGroupEntry {
                         summary,
                         member_count: members.len(),
                         total_hashrate,
+                        last_hashrate_at,
                     });
                 }
                 Ok(PublicListResponse {
@@ -2185,6 +2201,7 @@ mod tests {
             summary,
             member_count: 3,
             total_hashrate: 1.5,
+            last_hashrate_at: None,
         };
         let v: Value = serde_json::to_value(&entry).unwrap();
         assert!(
@@ -2194,6 +2211,10 @@ mod tests {
         assert_eq!(v["name"], "g");
         assert_eq!(v["memberCount"], 3);
         assert_eq!(v["isPublic"], true);
+        assert!(
+            v.get("lastHashrateAt").is_some_and(Value::is_null),
+            "a team that never hashed sends lastHashrateAt: null, got: {v}"
+        );
     }
 
     #[test]
