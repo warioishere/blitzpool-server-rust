@@ -96,8 +96,8 @@ pub fn decode_solution_coinbase(coinbase_raw: &[u8]) -> Option<bitcoin::Transact
 }
 
 /// Consensus maximum of a coinbase scriptSig (`bad-cb-length`); bounds the
-/// rebuild buffer the declared length sizes.
-const MAX_COINBASE_SCRIPT_SIG_LEN: usize = 100;
+/// rebuild buffer the declared length sizes, and every custom job.
+pub(crate) const MAX_COINBASE_SCRIPT_SIG_LEN: usize = 100;
 
 /// Bytes of scriptSig the prefix leaves for the extranonce (header is 41 or 43
 /// bytes). ⚠️ The one place "the declaration is a coinbase" is decided: every

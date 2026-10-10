@@ -115,6 +115,11 @@ pub const ERR_INVALID_CHANNEL_ID: &str = "invalid-channel-id";
 /// SV2 spec — Standard channels don't have an extranonce slot).
 pub const ERR_INVALID_JOB_ID: &str = "invalid-job-id";
 
+/// `invalid-job-param-value-coinbase_prefix` — `coinbase_prefix` plus the
+/// channel's extranonce makes a scriptSig longer than consensus allows
+/// (`bad-cb-length`), so no block mined on the job could be valid.
+pub const ERR_INVALID_JOB_PARAM_COINBASE_PREFIX: &str = "invalid-job-param-value-coinbase_prefix";
+
 /// `invalid-job-param-value-token-mismatch` — the `mining_job_token` was
 /// declared under a different miner address than the channel's locked one
 /// (see [`handle_set_custom_mining_job`]'s `bridge_job`).
@@ -2015,6 +2020,18 @@ pub fn handle_set_custom_mining_job<C: Clock>(
         return reject(ERR_STALE_CHAIN_TIP);
     }
 
+    // Same reason, for every backing: a declared job is bounded by its
+    // declaration already, a Coinbase-only one by nothing else.
+    let script_sig_len = input.coinbase_prefix.len() + full_extranonce_size;
+    if script_sig_len > crate::jdp::dynamic_outputs::MAX_COINBASE_SCRIPT_SIG_LEN {
+        tracing::warn!(
+            channel_id = input.channel_id,
+            script_sig_len,
+            "sv2: custom job's coinbase scriptSig exceeds the consensus maximum — rejecting"
+        );
+        return reject(ERR_INVALID_JOB_PARAM_COINBASE_PREFIX);
+    }
+
     // The binding every allocate-backed job gets; one closure for both
     // Coinbase-only arms so the rule cannot drift apart.
     let bind_allocation = |token: &crate::bridge::AllocatedTokenRef| -> Option<&'static str> {
@@ -2194,9 +2211,6 @@ pub fn handle_set_custom_mining_job<C: Clock>(
         .channels
         .get_mut(&input.channel_id)
         .expect("channel existence checked above");
-
-    let full_extranonce_size = channel.full_extranonce_size();
-    let script_sig_len = input.coinbase_prefix.len() + full_extranonce_size;
 
     let coinbase_tx_prefix = bp_mining_job::serialize_coinbase_prefix(
         input.coinbase_tx_version,
@@ -5775,6 +5789,34 @@ pub(crate) mod tests {
         }
     }
 
+    /// A scriptSig past the consensus 100 bytes (`bad-cb-length`) is refused
+    /// and registers no job; exactly 100 is accepted.
+    #[test]
+    fn a_custom_job_scriptsig_is_bounded_by_the_consensus_maximum() {
+        let alloc = base_allocation(REGTEST_ADDR, 42);
+        let outputs = [txout(312_500_000, designated_script(REGTEST_ADDR))];
+        for (extra, accepted) in [(0usize, true), (1, false)] {
+            let mut s = solo_session_with_extended_channel();
+            let cid = s.primary_channel.unwrap();
+            let slot = s.channels.get(&cid).unwrap().full_extranonce_size();
+            let mut input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
+            let len = crate::jdp::dynamic_outputs::MAX_COINBASE_SCRIPT_SIG_LEN - slot + extra;
+            input.coinbase_prefix.resize(len, 0x00);
+            let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+            match (&out.outbound[0], accepted) {
+                (OutboundFrame::SetCustomMiningJobSuccess { .. }, true) => {}
+                (OutboundFrame::SetCustomMiningJobError { error_code, .. }, false) => {
+                    assert_eq!(error_code, ERR_INVALID_JOB_PARAM_COINBASE_PREFIX);
+                    assert!(
+                        s.channels.get(&cid).unwrap().extended_jobs.is_empty(),
+                        "a job no valid block can come from must not be registered"
+                    );
+                }
+                (other, _) => panic!("scriptSig {} bytes: unexpected {other:?}", len + slot),
+            }
+        }
+    }
+
     /// A Coinbase-only job off the pool's last tip gets `stale-chain-tip`; on it, it passes.
     #[test]
     fn a_coinbase_only_job_is_bound_to_the_tip_the_pool_last_served() {
@@ -7253,46 +7295,6 @@ pub(crate) mod tests {
         };
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
-    }
-
-    /// A scriptSig length of 265 encodes as the 3-byte varint `0xFD` + u16-LE.
-    #[test]
-    fn set_custom_mining_job_emits_3byte_varint_for_large_scriptsig() {
-        // Coinbase-only path: a declared job cannot reach this length, but the
-        // assembly must still encode one correctly.
-        let mut s = negotiated_session_with_extended_channel();
-        let cid = s.primary_channel.unwrap();
-        let token = Token([1u8; 16]);
-        let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
-        let blob = conformant_outputs(&entry, 312_500_000);
-        let acc = accepted(entry);
-        let mut input = custom_job_input(cid, token);
-        input.distribution_id = Some(9);
-        input.coinbase_tx_outputs = blob;
-        input.coinbase_prefix = vec![0xAA; 253];
-        let out = handle_set_custom_mining_job(
-            &mut s,
-            &input,
-            None,
-            Some(&distribution_allocation(REGTEST_ADDR, 1)),
-            Some(&acc),
-            1_000,
-        );
-        assert!(
-            matches!(
-                out.outbound[0],
-                OutboundFrame::SetCustomMiningJobSuccess { .. }
-            ),
-            "coinbase-only job must be accepted, got {:?}",
-            out.outbound[0]
-        );
-        let ch = s.channels.get(&cid).unwrap();
-        let ext = ch.extended_jobs.get(&1).expect("must be stored");
-        // The varint at byte 41: 265 = 0x0109.
-        assert_eq!(ext.coinbase_prefix[41], 0xFD);
-        assert_eq!(&ext.coinbase_prefix[42..44], &[0x09, 0x01]);
-        // Then the 253 JDC-prefix bytes.
-        assert_eq!(ext.coinbase_prefix.len(), 41 + 3 + 253);
     }
 
     // ── Declaration binding ────────────────────────────────────────────
