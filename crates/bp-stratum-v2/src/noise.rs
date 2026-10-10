@@ -60,7 +60,7 @@ impl NoiseConfig {
 
 /// Accept a freshly-connected `TcpStream` as a Noise responder with the
 /// [`NoiseConfig`] keys. The handshake timeout is internal to `stratum_apps`;
-/// per-IP fail-ban on failure is the listener loop's concern.
+/// a failed handshake only ends the connection.
 pub async fn accept_pool_noise(
     stream: TcpStream,
     config: &NoiseConfig,

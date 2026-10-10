@@ -431,8 +431,7 @@ async fn run_mining_connection(
 ) -> std::io::Result<()> {
     let session_id_hex = format!("{session_id:08x}");
 
-    // Noise-XK handshake. On failure log and return; the accept loop keeps
-    // the per-IP failure counter.
+    // Noise-XK handshake. On failure log and return.
     let noise = match accept_pool_noise(socket, &noise_config).await {
         Ok(n) => n,
         Err(err) => {
