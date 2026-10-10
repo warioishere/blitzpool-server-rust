@@ -458,11 +458,20 @@ async fn run_mining_connection(
     // Skip the first immediate tick: one full interval before the first
     // check, as on SV1.
     vardiff_tick.tick().await;
+    let setup_deadline = tokio::time::sleep(bp_common::SESSION_SETUP_DEADLINE);
+    tokio::pin!(setup_deadline);
 
     loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
+            _ = &mut setup_deadline, if !state.setup_complete => {
+                debug!(
+                    "sv2 connection {session_id_hex}: no SetupConnection within {:?}; closing",
+                    bp_common::SESSION_SETUP_DEADLINE
+                );
+                break;
+            }
             frame_recv = reader.read_frame() => {
                 // Mark when the inbound frame became available — used to
                 // measure pool-internal submit→ack latency (gated by

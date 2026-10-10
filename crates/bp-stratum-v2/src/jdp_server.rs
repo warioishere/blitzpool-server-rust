@@ -479,10 +479,19 @@ async fn run_jdp_connection(
 
     let mut state = JdpSessionState::new(session_id);
     let mut payouts = payout_session::PayoutSession::new(session_id, &session_id_hex);
+    let setup_deadline = tokio::time::sleep(bp_common::SESSION_SETUP_DEADLINE);
+    tokio::pin!(setup_deadline);
     loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
+            _ = &mut setup_deadline, if !state.setup_complete => {
+                debug!(
+                    "jdp {session_id_hex}: no SetupConnection within {:?}; closing",
+                    bp_common::SESSION_SETUP_DEADLINE
+                );
+                break;
+            }
             changed = dist_rx.changed() => {
                 if changed.is_err() {
                     break; // publisher gone = server shutting down

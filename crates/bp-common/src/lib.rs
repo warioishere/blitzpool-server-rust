@@ -19,6 +19,13 @@ pub const HASHES_PER_DIFFICULTY_1: f64 = 4_294_967_296.0;
 /// Every payout mode floors its coinbase outputs here.
 pub const DUST_LIMIT_SATS: u64 = 546;
 
+/// How long a stratum session may take from its start (after protocol
+/// detection for SV1, after the Noise handshake for SV2 and JDP) to
+/// `mining.subscribe` or a successful `SetupConnection`; a peer that has not
+/// by then is closed. Past that point a session may idle: a JD-Client or proxy
+/// opens its channel only once a miner attaches below it.
+pub const SESSION_SETUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub mod display;
 pub use display::{short_address, short_address_with_tail};
 pub mod extranonce;

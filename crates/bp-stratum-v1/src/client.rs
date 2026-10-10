@@ -81,10 +81,10 @@ pub(crate) struct SessionState<C: Clock> {
 }
 
 impl<C: Clock> SessionState<C> {
-    /// `extranonce1` is seeded from `session_id_hex` only as a fallback; the
-    /// server overwrites it with a pool-wide collision-free prefix
-    /// (`server::SharedExtranonce`) so two sessions never mine identical
-    /// coinbases.
+    /// `extranonce1` is seeded from `session_id_hex` for tests that run
+    /// without an allocator; the server overwrites it with a pool-wide
+    /// collision-free prefix (`server::SharedExtranonce`) so two sessions
+    /// never mine identical coinbases.
     pub(crate) fn new(
         clock: C,
         server_config: &ServerConfig,

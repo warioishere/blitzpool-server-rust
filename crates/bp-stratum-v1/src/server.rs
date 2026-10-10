@@ -417,14 +417,18 @@ async fn run_connection(
     );
     // Extranonce1 is allocated separately from the random session id, which
     // stays the identity for UI, DB and device notifications.
+    // Nothing is registered yet, so returning here skips no teardown. A
+    // prefix another session holds would let both mine identical coinbases.
     let extranonce_guard = extranonce.allocate();
     match extranonce_guard.prefix() {
         Some(prefix) => state.extranonce1 = prefix,
-        None => warn!(
-            session_id = %state.session_id_hex,
-            "sv1: extranonce1 partition exhausted; falling back to the \
-             session-id-derived (non-unique) prefix for this connection"
-        ),
+        None => {
+            warn!(
+                session_id = %state.session_id_hex,
+                "sv1: extranonce1 partition exhausted; closing the connection"
+            );
+            return;
+        }
     }
     let mut current_template = initial_template;
 
@@ -434,11 +438,21 @@ async fn run_connection(
     vardiff_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Wait a full interval before the first vardiff check.
     vardiff_tick.tick().await;
+    let setup_deadline = tokio::time::sleep(bp_common::SESSION_SETUP_DEADLINE);
+    tokio::pin!(setup_deadline);
 
     loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
+            _ = &mut setup_deadline, if !state.stratum_initialized => {
+                debug!(
+                    session_id = %state.session_id_hex,
+                    "sv1: no mining.subscribe within {:?}; closing",
+                    bp_common::SESSION_SETUP_DEADLINE
+                );
+                break;
+            }
             frame = lines.next() => {
                 let line: std::io::Result<Option<String>> = match frame {
                     Some(Ok(l)) => Ok(Some(l)),
@@ -1520,6 +1534,80 @@ mod tests {
             "both extranonce1 must be from worker 1: {en1_a} / {en1_b}"
         );
         assert_ne!(en1_a, en1_b, "two connections must never share extranonce1");
+
+        server.shutdown().await;
+    }
+
+    /// A connection that never subscribes is closed after
+    /// `bp_common::SESSION_SETUP_DEADLINE`; a subscribed one may idle past it.
+    #[tokio::test]
+    async fn a_session_without_subscribe_is_closed_and_a_subscribed_one_may_idle() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::{TcpListener, TcpStream};
+
+        const PAST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(12);
+        assert!(PAST_DEADLINE > bp_common::SESSION_SETUP_DEADLINE);
+        let (_updates_tx, updates_rx) = broadcast::channel(8);
+        let server = StratumV1Server::spawn(
+            server_cfg(),
+            updates_rx,
+            bp_template_distribution::TemplateSnapshot::default(),
+            Vec::new(),
+            ServerHooks::no_op(),
+            SharedExtranonce::new(),
+            Arc::new(MiningJobCache::new()),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let s = server.clone();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (sock, _) = listener.accept().await.unwrap();
+                s.accept_connection(sock, port_cfg());
+            }
+        });
+
+        let silent = TcpStream::connect(addr).await.unwrap();
+        let (idle_read, mut idle_write) = TcpStream::connect(addr).await.unwrap().into_split();
+        let mut idle = BufReader::new(idle_read);
+        idle_write
+            .write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"t/1.0\"]}\n")
+            .await
+            .unwrap();
+        let mut line = String::new();
+        idle.read_line(&mut line).await.unwrap();
+        assert!(
+            line.contains("\"id\":1"),
+            "precondition: subscribed, got {line}"
+        );
+
+        let mut silent = BufReader::new(silent);
+        let mut buf = String::new();
+        let closed = tokio::time::timeout(PAST_DEADLINE, silent.read_line(&mut buf)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0))),
+            "a session with no mining.subscribe must be closed by the deadline"
+        );
+
+        idle_write
+            .write_all(b"{\"id\":2,\"method\":\"mining.subscribe\",\"params\":[\"t/1.0\"]}\n")
+            .await
+            .unwrap();
+        let mut answered = false;
+        for _ in 0..8 {
+            line.clear();
+            if idle.read_line(&mut line).await.unwrap() == 0 {
+                break;
+            }
+            if line.contains("\"id\":2") {
+                answered = true;
+                break;
+            }
+        }
+        assert!(
+            answered,
+            "a subscribed session idling past the deadline must stay open"
+        );
 
         server.shutdown().await;
     }
