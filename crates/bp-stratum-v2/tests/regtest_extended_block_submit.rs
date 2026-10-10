@@ -253,7 +253,7 @@ async fn run_block_submit_case(
         job_lifecycle: *channel.standard_jobs.lifecycle(),
     };
     let validation = validate_submit_extended(
-        &mut channel.submission_cache,
+        &mut channel.seen_shares,
         &view,
         &submission,
         &ext_job,

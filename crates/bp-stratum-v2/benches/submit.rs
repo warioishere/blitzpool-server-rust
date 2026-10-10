@@ -110,7 +110,7 @@ fn run_validate(channel: &mut ChannelState, sub: &SubmitSharesExtendedInput, job
         job_lifecycle: *channel.standard_jobs.lifecycle(),
     };
     let v = validate_submit_extended(
-        &mut channel.submission_cache,
+        &mut channel.seen_shares,
         &view,
         sub,
         job,

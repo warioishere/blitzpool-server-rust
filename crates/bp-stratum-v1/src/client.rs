@@ -585,7 +585,7 @@ pub(crate) fn apply_vardiff_check<C: Clock>(
 // ── New-template event (server-driven; see translator in notify.rs) ──
 
 /// Push a notify for a [`bp_template_distribution::TemplateChange`].
-/// `clean_jobs` is true on a new prevhash, which also clears the dedup cache.
+/// `clean_jobs` is true on a new prevhash.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_new_template<C: Clock>(
     state: &mut SessionState<C>,
@@ -602,9 +602,12 @@ pub(crate) fn apply_new_template<C: Clock>(
     if !state.stratum_initialized {
         return out;
     }
-    if clean_jobs {
-        state.share_cache.clear();
-    }
+    // Every template, not only `clean_jobs`: a no-op on the current tip, and
+    // on a new one the old tip's hashes stay while its jobs can be credited.
+    state
+        .share_cache
+        .seen
+        .on_tip(&template.prev_hash, now_ms, &registry.config());
     if let Some(frame) = build_and_register_notify(
         state,
         server_config,
@@ -1446,18 +1449,47 @@ mod tests {
         let (mut state, sc, port) = measured_session(&clock);
         state.authorization = Some(authorize_req(REGTEST_ADDR));
         let reg = empty_registry();
+        let _ = apply_new_template(
+            &mut state,
+            &sc,
+            &port,
+            &reg,
+            &MiningJobCache::new(),
+            &Arc::new(template_for_regtest()),
+            &solo_payouts_fixture(REGTEST_ADDR),
+            false,
+            clock.now_ms(),
+        );
+        let job_id = format!("{:x}", reg.peek_next_job_id() - 1);
+        // Accept the share once at difficulty 0, past the session's vardiff,
+        // so the resubmissions below are true duplicates of an accepted share.
+        let extranonce1 = state.extranonce1;
+        let easy = SessionContext {
+            extranonce1: &extranonce1,
+            session_difficulty: 0.0,
+            old_session_difficulty: 0.0,
+            diff_change_job_id: None,
+            share_logs: false,
+            version_rolling_mask: state.version_rolling_mask,
+        };
+        let first = validate_submit(
+            &submit_req(&job_id),
+            &easy,
+            &mut state.share_cache,
+            &reg,
+            clock.now_ms(),
+        );
+        assert!(
+            matches!(first, ShareValidation::Accepted(_)),
+            "precondition: the share was accepted once"
+        );
         for i in 0..40 {
             clock.advance_ms(10_000);
-            let out = handle_submit(&mut state, &reg, submit_req("1"), clock.now_ms());
+            let out = handle_submit(&mut state, &reg, submit_req(&job_id), clock.now_ms());
             let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
-            let expected = if i == 0 {
-                "Job not found"
-            } else {
-                "Duplicate share"
-            };
             assert!(
-                s.contains(expected),
-                "submit #{i}: expected {expected}, got {s}"
+                s.contains("Duplicate share"),
+                "submit #{i}: expected Duplicate share, got {s}"
             );
         }
         let _ = vardiff_check_now(&mut state, &sc, &port, &clock);
@@ -1470,14 +1502,16 @@ mod tests {
 
     // ── apply_new_template ────────────────────────────────────────────
 
+    /// A block change keeps the old tip's accepted hashes: its jobs are still
+    /// credited within grace, so clearing them would re-admit a replay.
     #[test]
-    fn new_template_after_init_clears_dedup_on_clean_jobs() {
+    fn new_template_after_init_keeps_dedup_on_clean_jobs() {
         let port = solo_port(16384.0);
         let mut state = fresh_state(TestClock::new(0), &port);
         state.stratum_initialized = true;
         state.authorization = Some(authorize_req(REGTEST_ADDR));
-        state.share_cache.record(&submit_req("99"));
-        assert!(!state.share_cache.is_empty());
+        const OLD_TIP: [u8; 32] = [0x5A; 32];
+        state.share_cache.seen.record(OLD_TIP, [0x11; 32]);
 
         let reg = empty_registry();
         let template = Arc::new(template_for_regtest());
@@ -1493,9 +1527,11 @@ mod tests {
             true,
             0,
         );
-        assert!(
-            state.share_cache.is_empty(),
-            "clean_jobs=true must clear dedup"
+        assert_ne!(template.prev_hash, OLD_TIP);
+        assert_eq!(
+            state.share_cache.seen.check(&OLD_TIP, &[0x11; 32]),
+            Err(bp_jobs_lifecycle::SeenShareRefusal::Duplicate),
+            "the old tip's accepted hash must survive clean_jobs=true"
         );
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert!(s.contains("\"mining.notify\""));
@@ -1509,7 +1545,8 @@ mod tests {
         let mut state = fresh_state(TestClock::new(0), &port);
         state.stratum_initialized = true;
         state.authorization = Some(authorize_req(REGTEST_ADDR));
-        state.share_cache.record(&submit_req("99"));
+        let tip = template_for_regtest().prev_hash;
+        state.share_cache.seen.record(tip, [0x11; 32]);
 
         let reg = empty_registry();
         let template = Arc::new(template_for_regtest());
@@ -1525,8 +1562,9 @@ mod tests {
             false,
             0,
         );
-        assert!(
-            !state.share_cache.is_empty(),
+        assert_eq!(
+            state.share_cache.seen.check(&tip, &[0x11; 32]),
+            Err(bp_jobs_lifecycle::SeenShareRefusal::Duplicate),
             "fee-refresh must NOT clear dedup"
         );
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();

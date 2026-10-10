@@ -5,13 +5,12 @@
 //! [`StandardJobMaps`] and cannot roll extranonce; Extended channels keep
 //! [`ExtendedJob`]s with everything needed to rebuild the coinbase on submit.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use bp_jobs_lifecycle::LifecycleConfig;
+use bp_jobs_lifecycle::{LifecycleConfig, SeenShares};
 use bp_share::{Difficulty, Target, TargetMemo};
 
 use super::jobs::{ExtendedJob, StandardJobMaps};
-use super::submit::ExtranonceBytes;
 
 /// Discriminator between the two SV2 channel topologies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,8 +68,9 @@ pub struct ChannelState {
     /// `NewMiningJob` / `NewExtendedMiningJob`.
     pub next_job_id: u32,
 
-    /// Per-channel submission dedup set. Cleared on block change.
-    pub submission_cache: SubmissionCache,
+    /// Header hashes of accepted shares; see [`SeenShares`] for how long a
+    /// tip's hashes outlive the tip.
+    pub seen_shares: SeenShares,
 
     /// Content signature of the last job sent. A same-block refresh with the
     /// same signature is not re-issued: BraiinsOS resets its hashing pipeline
@@ -104,7 +104,7 @@ impl ChannelState {
             latest_extended_prev_hash: None,
             latest_extended_n_bits: None,
             next_job_id: 1,
-            submission_cache: SubmissionCache::Standard(HashSet::new()),
+            seen_shares: SeenShares::new(),
             last_sent_job_signature: None,
             target_memo: TargetMemo::default(),
         }
@@ -131,7 +131,7 @@ impl ChannelState {
             latest_extended_prev_hash: None,
             latest_extended_n_bits: None,
             next_job_id: 1,
-            submission_cache: SubmissionCache::Extended(HashSet::new()),
+            seen_shares: SeenShares::new(),
             last_sent_job_signature: None,
             target_memo: TargetMemo::default(),
         }
@@ -143,102 +143,11 @@ impl ChannelState {
         self.target_memo.target_for(job_difficulty)
     }
 
-    /// Reset the submission-dedup cache on `SetNewPrevHash`. Only the job
-    /// storage is retired rather than cleared (so in-flight shares resolve
-    /// to `stale-share`, not `invalid-job-id`).
-    pub fn clear_submission_cache(&mut self) {
-        match &mut self.submission_cache {
-            SubmissionCache::Standard(s) => s.clear(),
-            SubmissionCache::Extended(s) => s.clear(),
-        }
-    }
-
     /// Total bytes the miner sees as the "coinbase extranonce slot"
     /// (`prefix + miner-rollable`). Always 12 by design; the constant is
     /// set by [`bp_mining_job::EXTRANONCE_SLOT_LEN`].
     pub fn full_extranonce_size(&self) -> usize {
         self.extranonce_prefix.len() + self.extranonce_size as usize
-    }
-}
-
-// ── SubmissionCache ──────────────────────────────────────────────────
-
-/// Per-channel duplicate-share guard. Standard and Extended submit frames
-/// carry different fields, so each kind has its own key type.
-#[derive(Clone, Debug)]
-pub enum SubmissionCache {
-    Standard(HashSet<StandardDedupKey>),
-    Extended(HashSet<ExtendedDedupKey>),
-}
-
-/// Dedup key for `SubmitSharesStandard`. Field order matches the wire frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct StandardDedupKey {
-    pub job_id: u32,
-    pub nonce: u32,
-    pub ntime: u32,
-    pub version: u32,
-}
-
-/// Dedup key for `SubmitSharesExtended`. Adds the miner-supplied
-/// extranonce bytes to the dedup key.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ExtendedDedupKey {
-    pub job_id: u32,
-    pub nonce: u32,
-    pub ntime: u32,
-    pub version: u32,
-    pub extranonce: ExtranonceBytes,
-}
-
-/// Cap on the dedup set: it is cleared only on a block change and a channel
-/// may keep one `job_id` all block, so a fast miner would grow it without end.
-/// When full, the whole generation is dropped.
-const MAX_SUBMISSION_CACHE: usize = 10_000;
-
-impl SubmissionCache {
-    /// Record a Standard-channel submission. `true` if new, `false` if a
-    /// duplicate. Debug-asserts on an Extended cache.
-    pub fn insert_standard(&mut self, key: StandardDedupKey) -> bool {
-        match self {
-            SubmissionCache::Standard(set) => {
-                if set.len() >= MAX_SUBMISSION_CACHE {
-                    set.clear();
-                }
-                set.insert(key)
-            }
-            SubmissionCache::Extended(_) => {
-                debug_assert!(false, "insert_standard on Extended cache");
-                false
-            }
-        }
-    }
-
-    /// Extended counterpart of [`Self::insert_standard`].
-    pub fn insert_extended(&mut self, key: ExtendedDedupKey) -> bool {
-        match self {
-            SubmissionCache::Extended(set) => {
-                if set.len() >= MAX_SUBMISSION_CACHE {
-                    set.clear();
-                }
-                set.insert(key)
-            }
-            SubmissionCache::Standard(_) => {
-                debug_assert!(false, "insert_extended on Standard cache");
-                false
-            }
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        match self {
-            SubmissionCache::Standard(s) => s.len(),
-            SubmissionCache::Extended(s) => s.len(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }
 
@@ -266,12 +175,11 @@ mod tests {
         assert_eq!(ch.extranonce_size, 0);
         assert!(ch.standard_jobs.is_empty());
         assert!(ch.extended_jobs.is_empty());
-        assert!(ch.submission_cache.is_empty());
-        assert!(matches!(ch.submission_cache, SubmissionCache::Standard(_)));
+        assert!(ch.seen_shares.is_empty());
         assert_eq!(ch.full_extranonce_size(), 4);
     }
 
-    /// Fresh Extended channel: extranonce_size > 0, Extended-cache.
+    /// Fresh Extended channel: extranonce_size > 0.
     #[test]
     fn extended_channel_starts_clean() {
         let ch = ChannelState::new_extended(
@@ -284,7 +192,7 @@ mod tests {
         );
         assert_eq!(ch.kind, ChannelKind::Extended);
         assert_eq!(ch.extranonce_size, 8);
-        assert!(matches!(ch.submission_cache, SubmissionCache::Extended(_)));
+        assert!(ch.seen_shares.is_empty());
         assert_eq!(ch.full_extranonce_size(), 12);
     }
 
@@ -304,96 +212,6 @@ mod tests {
             LifecycleConfig::DEFAULT,
         );
         assert_eq!(ch.declared_max_target, tgt);
-    }
-
-    // ── SubmissionCache ────────────────────────────────────────────
-
-    /// Standard dedup: same key blocked, different key OK.
-    #[test]
-    fn standard_dedup_blocks_duplicate_keys() {
-        let mut cache = SubmissionCache::Standard(HashSet::new());
-        let key = StandardDedupKey {
-            job_id: 1,
-            nonce: 0xdeadbeef,
-            ntime: 100,
-            version: 0x2000_0000,
-        };
-        assert!(cache.insert_standard(key), "first insert is new");
-        assert!(!cache.insert_standard(key), "second is duplicate");
-        let other = StandardDedupKey {
-            nonce: 0x1234,
-            ..key
-        };
-        assert!(cache.insert_standard(other), "different nonce is new");
-        assert_eq!(cache.len(), 2);
-    }
-
-    /// Extended dedup: extranonce bytes are part of the key.
-    #[test]
-    fn extended_dedup_includes_extranonce_in_key() {
-        let mut cache = SubmissionCache::Extended(HashSet::new());
-        let base = ExtendedDedupKey {
-            job_id: 1,
-            nonce: 1,
-            ntime: 1,
-            version: 1,
-            extranonce: ExtranonceBytes::from_slice(&[0x01, 0x02]),
-        };
-        assert!(cache.insert_extended(base.clone()));
-        assert!(!cache.insert_extended(base.clone()));
-        let other_extranonce = ExtendedDedupKey {
-            extranonce: ExtranonceBytes::from_slice(&[0x01, 0x03]),
-            ..base
-        };
-        assert!(cache.insert_extended(other_extranonce));
-        assert_eq!(cache.len(), 2);
-    }
-
-    /// `clear_submission_cache` empties the dedup set (block-change
-    /// trigger).
-    #[test]
-    fn clear_submission_cache_empties_dedup() {
-        let mut ch = ChannelState::new_standard(
-            1,
-            vec![0; 4],
-            Difficulty(1.0),
-            max_target(),
-            LifecycleConfig::DEFAULT,
-        );
-        ch.submission_cache.insert_standard(StandardDedupKey {
-            job_id: 1,
-            nonce: 1,
-            ntime: 1,
-            version: 1,
-        });
-        assert_eq!(ch.submission_cache.len(), 1);
-        ch.clear_submission_cache();
-        assert!(ch.submission_cache.is_empty());
-    }
-
-    /// Clearing keeps the dedup-cache kind matching the channel kind.
-    #[test]
-    fn cache_kind_is_preserved_after_clear() {
-        let mut ch = ChannelState::new_standard(
-            1,
-            vec![0; 4],
-            Difficulty(1.0),
-            max_target(),
-            LifecycleConfig::DEFAULT,
-        );
-        ch.clear_submission_cache();
-        assert!(matches!(ch.submission_cache, SubmissionCache::Standard(_)));
-
-        let mut ch = ChannelState::new_extended(
-            2,
-            vec![0; 4],
-            8,
-            Difficulty(1.0),
-            max_target(),
-            LifecycleConfig::DEFAULT,
-        );
-        ch.clear_submission_cache();
-        assert!(matches!(ch.submission_cache, SubmissionCache::Extended(_)));
     }
 
     // ── full_extranonce_size invariant ─────────────────────────────

@@ -16,11 +16,9 @@ use smallvec::SmallVec;
 /// sizes without a heap allocation per share.
 pub type ExtranonceBytes = SmallVec<[u8; 16]>;
 
-use super::channel::{
-    ChannelKind, ChannelState, ExtendedDedupKey, StandardDedupKey, SubmissionCache,
-};
+use super::channel::{ChannelKind, ChannelState};
 use super::jobs::{classify_extended_job, ExtendedJob};
-use bp_jobs_lifecycle::LifecycleConfig;
+use bp_jobs_lifecycle::{LifecycleConfig, SeenShareRefusal, SeenShares};
 
 // ── Wire codes (SV2 mining-protocol error strings) ───────────────────
 
@@ -33,7 +31,8 @@ pub const ERR_INVALID_JOB_ID: &str = "invalid-job-id";
 /// Job retired past [`bp_jobs_lifecycle::LifecycleConfig::grace_ms`].
 pub const ERR_STALE_SHARE: &str = "stale-share";
 
-/// Re-submitted `(job_id, nonce, ntime, version[, extranonce])`. None of these
+/// A header hash already accepted, or a share refused because its tip's
+/// [`SeenShares`] set is full ([`SeenShareRefusal::Full`]). None of these
 /// codes is spec-assigned: SV2 Overview/Error Codes lets the list differ
 /// between implementations and a receiver MUST log-no-op on unknown codes.
 pub const ERR_DUPLICATE_SHARE: &str = "duplicate-share";
@@ -191,9 +190,8 @@ pub struct StandardJobContext<'a> {
 // ── Standard validation ──────────────────────────────────────────────
 
 /// The caller resolves the channel and the job from
-/// [`crate::mining::jobs::StandardJobMaps`]. The [`StandardDedupKey`] is
-/// cached only on accept, so a rejected share never makes a later valid
-/// resubmission look like a duplicate.
+/// [`crate::mining::jobs::StandardJobMaps`]. Duplicates are judged by the
+/// header hash (see [`SeenShares`]), and only an accepted share is recorded.
 pub fn validate_submit_standard(
     channel: &mut ChannelState,
     submission: &SubmitSharesStandardInput,
@@ -205,17 +203,6 @@ pub fn validate_submit_standard(
         // A call-site error, not a wire-protocol one; rejecting keeps the
         // connection running.
         return ShareValidation::Rejected(RejectReason::InvalidJobId.into());
-    }
-
-    let dedup_key = StandardDedupKey {
-        job_id: submission.job_id,
-        nonce: submission.nonce,
-        ntime: submission.ntime,
-        version: submission.version,
-    };
-
-    if matches!(&channel.submission_cache, SubmissionCache::Standard(s) if s.contains(&dedup_key)) {
-        return ShareValidation::Rejected(RejectReason::DuplicateShare.into());
     }
 
     if job_ctx.classification == JobClassification::StaleRejected {
@@ -233,12 +220,20 @@ pub fn validate_submit_standard(
     );
 
     let pow = calculate_difficulty(&header);
+    if let Err(refusal) = channel
+        .seen_shares
+        .check(&job_ctx.prev_hash, &pow.submission_hash)
+    {
+        return refuse_seen_share(refusal, submission.channel_id, submission.job_id);
+    }
     let job_target = channel.target_for(job_difficulty);
     if !job_target.is_met_by_le(&pow.submission_hash) {
         return ShareValidation::Rejected(RejectReason::DifficultyTooLow.into());
     }
 
-    channel.submission_cache.insert_standard(dedup_key);
+    channel
+        .seen_shares
+        .record(job_ctx.prev_hash, pow.submission_hash);
 
     let is_block_candidate = meets_network_target(&pow.submission_hash, job_ctx.n_bits);
     // An empty `coinbase_stratum` (a `SetCustomMiningJob` job) yields no
@@ -267,9 +262,9 @@ pub fn validate_submit_standard(
 // ── Extended validation ──────────────────────────────────────────────
 
 /// Read-only projection of the channel for the extended validator. A view
-/// instead of `&mut ChannelState` lets the caller lend only the dedup cache
-/// mutably while borrowing the `ExtendedJob` from the same channel, so the
-/// job is not cloned per share.
+/// instead of `&mut ChannelState` lets the caller lend only the
+/// [`SeenShares`] mutably while borrowing the `ExtendedJob` from the same
+/// channel, so the job is not cloned per share.
 #[derive(Clone, Copy, Debug)]
 pub struct ExtendedChannelView {
     pub kind: ChannelKind,
@@ -286,7 +281,7 @@ pub struct ExtendedChannelView {
 /// so a block change between send and submit cannot reclassify the share.
 #[allow(clippy::too_many_arguments)]
 pub fn validate_submit_extended(
-    submission_cache: &mut SubmissionCache,
+    seen_shares: &mut SeenShares,
     view: &ExtendedChannelView,
     submission: &SubmitSharesExtendedInput,
     ext_job: &ExtendedJob,
@@ -302,22 +297,6 @@ pub fn validate_submit_extended(
             submission.channel_id
         );
         return ShareValidation::Rejected(RejectReason::InvalidJobId.into());
-    }
-
-    let dedup_key = ExtendedDedupKey {
-        job_id: submission.job_id,
-        nonce: submission.nonce,
-        ntime: submission.ntime,
-        version: submission.version,
-        extranonce: submission.extranonce.clone(),
-    };
-    if matches!(&*submission_cache, SubmissionCache::Extended(s) if s.contains(&dedup_key)) {
-        tracing::warn!(
-            channel_id = submission.channel_id,
-            job_id = submission.job_id,
-            "❌ Extended share rejected: duplicate-share"
-        );
-        return ShareValidation::Rejected(RejectReason::DuplicateShare.into());
     }
 
     let classification = classify_extended_job(ext_job, now_ms, &view.job_lifecycle);
@@ -376,6 +355,9 @@ pub fn validate_submit_extended(
     );
 
     let pow = calculate_difficulty(&header);
+    if let Err(refusal) = seen_shares.check(&ext_job.prev_hash, &pow.submission_hash) {
+        return refuse_seen_share(refusal, submission.channel_id, submission.job_id);
+    }
     let job_target = view.job_target;
 
     // Needs both `stratum_share_logs` and `RUST_LOG=...,bp_stratum_v2=debug`.
@@ -431,7 +413,7 @@ pub fn validate_submit_extended(
         return ShareValidation::Rejected(RejectReason::DifficultyTooLow.into());
     }
 
-    submission_cache.insert_extended(dedup_key);
+    seen_shares.record(ext_job.prev_hash, pow.submission_hash);
 
     // The job's own n_bits: the hashed header commits to it, not to the
     // latest template.
@@ -460,6 +442,27 @@ pub fn validate_submit_extended(
         effective_worker_name,
         coinbase_tx_value_remaining: ext_job.coinbase_tx_value_remaining,
     }))
+}
+
+/// A share [`SeenShares`] refused goes out as `duplicate-share` either way:
+/// a full set is not the miner's fault, but no other code fits and the share
+/// must not be credited.
+fn refuse_seen_share(refusal: SeenShareRefusal, channel_id: u32, job_id: u32) -> ShareValidation {
+    match refusal {
+        SeenShareRefusal::Duplicate => {
+            tracing::warn!(channel_id, job_id, "❌ Share rejected: duplicate-share");
+        }
+        SeenShareRefusal::Full => {
+            tracing::warn!(
+                channel_id,
+                job_id,
+                "❌ Share rejected: this tip's duplicate guard is full ({} accepted shares), \
+                 so no further share on it can be checked; refused as duplicate-share",
+                bp_jobs_lifecycle::MAX_SEEN_SHARES_PER_TIP
+            );
+        }
+    }
+    ShareValidation::Rejected(RejectReason::DuplicateShare.into())
 }
 
 #[cfg(test)]
@@ -558,7 +561,7 @@ mod tests {
     }
 
     /// Test shim: projects the channel into the `ExtendedChannelView` and
-    /// `&mut submission_cache` the validator takes.
+    /// `&mut seen_shares` the validator takes.
     fn validate_ext(
         ch: &mut ChannelState,
         sub: &SubmitSharesExtendedInput,
@@ -576,7 +579,7 @@ mod tests {
             job_lifecycle: *ch.standard_jobs.lifecycle(),
         };
         validate_submit_extended(
-            &mut ch.submission_cache,
+            &mut ch.seen_shares,
             &view,
             sub,
             job,
@@ -632,7 +635,7 @@ mod tests {
             }
             _ => panic!("expected Accept"),
         }
-        assert_eq!(ch.submission_cache.len(), 1);
+        assert_eq!(ch.seen_shares.len(), 1);
     }
 
     /// A resubmission is a `duplicate-share` without a second cache insert.
@@ -662,12 +665,12 @@ mod tests {
             }
             _ => panic!("expected duplicate to be Rejected(DuplicateShare)"),
         }
-        assert_eq!(ch.submission_cache.len(), 1, "no double-insert");
+        assert_eq!(ch.seen_shares.len(), 1, "no double-insert");
     }
 
-    /// Different `(job, nonce, ntime, version)` tuple is NOT a duplicate.
+    /// A share with a different header is not a duplicate.
     #[test]
-    fn standard_different_dedup_key_is_not_a_duplicate() {
+    fn standard_different_header_is_not_a_duplicate() {
         let mut ch = std_channel();
         let merkle = [0xDD; 32];
         let mut sub = std_submission();
@@ -687,7 +690,48 @@ mod tests {
             &std_ctx(JobClassification::Active),
         );
         assert!(matches!(out, ShareValidation::Accepted(_)));
-        assert_eq!(ch.submission_cache.len(), 2);
+        assert_eq!(ch.seen_shares.len(), 2);
+    }
+
+    /// Replay across a block change: the old job stays creditable for
+    /// `grace_ms`, so its accepted shares must stay duplicates. The control
+    /// shows the same share is creditable to a channel that never saw it.
+    #[test]
+    fn standard_replay_after_block_change_is_a_duplicate() {
+        let merkle = [0xDD; 32];
+        let sub = std_submission();
+        let mut ch = std_channel();
+        let first = validate_submit_standard(
+            &mut ch,
+            &sub,
+            easy_diff(),
+            &merkle,
+            &std_ctx(JobClassification::Active),
+        );
+        assert!(matches!(first, ShareValidation::Accepted(_)));
+
+        ch.seen_shares
+            .on_tip(&[0xEE; 32], 2_000, &LifecycleConfig::DEFAULT);
+        let replay = validate_submit_standard(
+            &mut ch,
+            &sub,
+            easy_diff(),
+            &merkle,
+            &std_ctx(JobClassification::StaleCreditable),
+        );
+        match replay {
+            ShareValidation::Rejected(r) => assert_eq!(r.reason, RejectReason::DuplicateShare),
+            ShareValidation::Accepted(_) => panic!("replayed share credited twice"),
+        }
+
+        let control = validate_submit_standard(
+            &mut std_channel(),
+            &sub,
+            easy_diff(),
+            &merkle,
+            &std_ctx(JobClassification::StaleCreditable),
+        );
+        assert!(matches!(control, ShareValidation::Accepted(_)));
     }
 
     /// `StaleRejected` classification → wire `stale-share`.
@@ -748,7 +792,7 @@ mod tests {
             _ => panic!("expected DifficultyTooLow"),
         }
         // No dedup write on reject.
-        assert_eq!(ch.submission_cache.len(), 0);
+        assert_eq!(ch.seen_shares.len(), 0);
     }
 
     /// The header takes the submitted full nVersion verbatim, including a
@@ -830,7 +874,7 @@ mod tests {
             }
             _ => panic!("expected Accept"),
         }
-        assert_eq!(ch.submission_cache.len(), 1);
+        assert_eq!(ch.seen_shares.len(), 1);
     }
 
     /// The block-candidate gate reads the `n_bits` pinned on the job, not the
@@ -861,14 +905,14 @@ mod tests {
         }
     }
 
-    /// Extended dedup includes the extranonce.
+    /// The extranonce is part of the header, so changing it is new work.
     #[test]
     fn extended_dedup_includes_extranonce() {
         let mut ch = ext_channel();
         let job = ext_job([0xCC; 32], 0x1d00_ffff);
         let mut sub = ext_submission();
         let _ = validate_ext(&mut ch, &sub, &job, easy_diff(), 0, false, false);
-        // Same key → duplicate.
+        // Same header → duplicate.
         let dup = validate_ext(&mut ch, &sub, &job, easy_diff(), 0, false, false);
         assert!(matches!(
             dup,
@@ -922,7 +966,7 @@ mod tests {
             }
             _ => panic!("expected BadExtranonceSize reject"),
         }
-        assert_eq!(ch.submission_cache.len(), 0, "no dedup write on reject");
+        assert_eq!(ch.seen_shares.len(), 0, "no dedup write on reject");
     }
 
     /// A wrong channel kind is rejected rather than panicking.
@@ -1060,6 +1104,62 @@ mod tests {
                 );
             }
             _ => panic!("expected Accept"),
+        }
+    }
+
+    // ── Extended replay ────────────────────────────────────────────
+
+    /// Replay across a block change on an Extended channel; see
+    /// `standard_replay_after_block_change_is_a_duplicate`.
+    #[test]
+    fn extended_replay_after_block_change_is_a_duplicate() {
+        let sub = ext_submission();
+        let mut job = ext_job([0xCC; 32], 0x1d00_ffff);
+        let mut ch = ext_channel();
+        let first = validate_ext(&mut ch, &sub, &job, easy_diff(), 1_000, false, false);
+        assert!(matches!(first, ShareValidation::Accepted(_)));
+
+        job.retired_at = Some(2_000);
+        ch.seen_shares
+            .on_tip(&[0xEE; 32], 2_000, &LifecycleConfig::DEFAULT);
+        let replay = validate_ext(&mut ch, &sub, &job, easy_diff(), 3_000, false, false);
+        match replay {
+            ShareValidation::Rejected(r) => assert_eq!(r.reason, RejectReason::DuplicateShare),
+            ShareValidation::Accepted(_) => panic!("replayed share credited twice"),
+        }
+
+        let control = validate_ext(
+            &mut ext_channel(),
+            &sub,
+            &job,
+            easy_diff(),
+            3_000,
+            false,
+            false,
+        );
+        match control {
+            ShareValidation::Accepted(a) => {
+                assert_eq!(a.classification, JobClassification::StaleCreditable)
+            }
+            ShareValidation::Rejected(r) => panic!("control must be creditable, got {r:?}"),
+        }
+    }
+
+    /// Two job ids with the same content are the same work: the header hash,
+    /// not the job id, decides what is a duplicate.
+    #[test]
+    fn extended_same_work_under_a_second_job_id_is_a_duplicate() {
+        let job = ext_job([0xCC; 32], 0x1d00_ffff);
+        let mut ch = ext_channel();
+        let mut sub = ext_submission();
+        let first = validate_ext(&mut ch, &sub, &job, easy_diff(), 1_000, false, false);
+        assert!(matches!(first, ShareValidation::Accepted(_)));
+
+        sub.job_id = 8;
+        let again = validate_ext(&mut ch, &sub, &job, easy_diff(), 1_000, false, false);
+        match again {
+            ShareValidation::Rejected(r) => assert_eq!(r.reason, RejectReason::DuplicateShare),
+            ShareValidation::Accepted(_) => panic!("same work credited under a second job id"),
         }
     }
 }

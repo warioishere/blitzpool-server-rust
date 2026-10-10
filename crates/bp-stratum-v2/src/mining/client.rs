@@ -1110,7 +1110,7 @@ pub fn handle_submit_shares_extended<C: Clock>(
     };
 
     let validation = validate_submit_extended(
-        &mut channel.submission_cache,
+        &mut channel.seen_shares,
         &view,
         submission,
         ext_job,
@@ -1397,8 +1397,10 @@ impl MiningJobInputs {
 /// from the group-template builder in `apply_template_broadcast`.
 type GroupTemplateParts = (ExtendedJob, Vec<u8>, Vec<u8>, Vec<[u8; 32]>);
 
-/// A new block: retire the channel's jobs, age out the expired ones, clear
-/// its dedup set and record the block context later extended jobs carry.
+/// A new block: retire the channel's jobs, age out the expired ones, move
+/// the duplicate guard to the new tip (the old tip's hashes stay while its
+/// jobs can still be credited) and record the block context later extended
+/// jobs carry.
 fn retire_for_new_block(
     channel: &mut ChannelState,
     template: &bp_template_distribution::ActiveTemplate,
@@ -1412,7 +1414,10 @@ fn retire_for_new_block(
         now_ms,
         channel.standard_jobs.lifecycle(),
     );
-    channel.clear_submission_cache();
+    let lifecycle = *channel.standard_jobs.lifecycle();
+    channel
+        .seen_shares
+        .on_tip(&template.prev_hash, now_ms, &lifecycle);
     channel.latest_extended_prev_hash = Some(template.prev_hash);
     channel.latest_extended_n_bits = Some(template.n_bits);
 }
@@ -2265,7 +2270,7 @@ pub(crate) mod tests {
             job_lifecycle: *ch.standard_jobs.lifecycle(),
         };
         validate_submit_extended(
-            &mut ch.submission_cache,
+            &mut ch.seen_shares,
             &view,
             sub,
             job,
@@ -5031,22 +5036,16 @@ pub(crate) mod tests {
         );
     }
 
-    /// A block change retires jobs of both kinds and clears the dedup cache.
+    /// A block change retires jobs of both kinds and keeps the old tip's
+    /// accepted hashes, whose jobs are still creditable within grace.
     #[test]
-    fn template_broadcast_new_block_retires_and_clears_dedup() {
+    fn template_broadcast_new_block_retires_and_keeps_dedup() {
         let mut s = session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
-        // Pre-seed a dedup-cache entry + a fake ExtendedJob.
+        // Pre-seed an accepted hash on the old tip + a fake ExtendedJob.
         {
             let ch = s.channels.get_mut(&cid).unwrap();
-            ch.submission_cache
-                .insert_extended(crate::mining::channel::ExtendedDedupKey {
-                    job_id: 99,
-                    nonce: 1,
-                    ntime: 1,
-                    version: 1,
-                    extranonce: ExtranonceBytes::from_slice(&[0; 8]),
-                });
+            ch.seen_shares.record([0; 32], [0x11; 32]);
             ch.extended_jobs.insert(
                 99,
                 ExtendedJob {
@@ -5080,9 +5079,10 @@ pub(crate) mod tests {
             None,
         );
         let ch = s.channels.get(&cid).unwrap();
-        assert!(
-            ch.submission_cache.is_empty(),
-            "dedup cache cleared on block change"
+        assert_eq!(
+            ch.seen_shares.check(&[0; 32], &[0x11; 32]),
+            Err(bp_jobs_lifecycle::SeenShareRefusal::Duplicate),
+            "the old tip's accepted hash must survive the block change"
         );
         // Old ExtendedJob is now retired (still present, retired_at set).
         let retired = ch.extended_jobs.get(&99).unwrap();

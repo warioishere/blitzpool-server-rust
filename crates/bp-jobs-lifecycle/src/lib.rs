@@ -4,8 +4,9 @@
 //! lifecycle constants in lock-step. On a block change, in-flight shares for
 //! the old job must still find it: SV2 answers `stale-share` rather than
 //! `invalid-job-id`, and SV1 can credit shares arriving just after the change.
+//! [`SeenShares`] keeps the duplicate guard alive for as long as that credit lasts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
 // ── JobClassification ────────────────────────────────────────────────
@@ -107,6 +108,110 @@ pub fn age_entries<K, E, FCreation, FRetired>(
         if now_ms.saturating_sub(get_creation(entry)) > twice_retention {
             map.remove(&key);
         }
+    }
+}
+
+// ── SeenShares ───────────────────────────────────────────────────────
+
+/// Most header hashes [`SeenShares`] keeps per chain tip. Even at a vardiff
+/// target of 60 shares/min that is over a day on one tip, so only a channel
+/// whose difficulty the vardiff cannot raise gets here.
+pub const MAX_SEEN_SHARES_PER_TIP: usize = 100_000;
+
+/// Why [`SeenShares::check`] refused a share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeenShareRefusal {
+    /// This header hash was already accepted.
+    Duplicate,
+    /// The tip holds [`MAX_SEEN_SHARES_PER_TIP`] hashes. Evicting one would
+    /// let its share be credited again, so nothing more is accepted.
+    Full,
+}
+
+/// Header hashes of accepted shares, so one proof of work is credited once.
+///
+/// Keyed by the header hash, not by the submit fields: two job ids with the
+/// same content hash to the same header, and that is the same work. Hashes are
+/// grouped by the prev-hash they commit to. A tip change keeps the old group,
+/// because shares on the old tip's jobs stay creditable for
+/// [`LifecycleConfig::grace_ms`]; [`Self::on_tip`] drops a group only once it
+/// has been replaced for longer than [`LifecycleConfig::retention_ms`].
+/// Retention rather than grace, because credit runs `grace_ms` from each
+/// job's own retirement, and a job can retire after the tip change (SV1
+/// retires on the next registry pass).
+#[derive(Clone, Debug, Default)]
+pub struct SeenShares {
+    tips: Vec<TipShares>,
+}
+
+#[derive(Clone, Debug)]
+struct TipShares {
+    prev_hash: [u8; 32],
+    /// When another tip took over; `None` while this one is current.
+    replaced_at_ms: Option<u64>,
+    hashes: HashSet<[u8; 32]>,
+}
+
+impl SeenShares {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether a share hashing to `hash` on a job built on `prev_hash` may be
+    /// credited. Runs before the target check, so an exact resubmission is
+    /// reported as a duplicate whatever the difficulty is by then.
+    pub fn check(&self, prev_hash: &[u8; 32], hash: &[u8; 32]) -> Result<(), SeenShareRefusal> {
+        let Some(tip) = self.tips.iter().find(|t| t.prev_hash == *prev_hash) else {
+            return Ok(());
+        };
+        if tip.hashes.contains(hash) {
+            return Err(SeenShareRefusal::Duplicate);
+        }
+        if tip.hashes.len() >= MAX_SEEN_SHARES_PER_TIP {
+            return Err(SeenShareRefusal::Full);
+        }
+        Ok(())
+    }
+
+    /// Records an accepted share. Only a share that passed [`Self::check`]
+    /// and every other check is recorded, so a rejected share never makes a
+    /// later valid submission look like a duplicate.
+    pub fn record(&mut self, prev_hash: [u8; 32], hash: [u8; 32]) {
+        match self.tips.iter_mut().find(|t| t.prev_hash == prev_hash) {
+            Some(tip) => {
+                tip.hashes.insert(hash);
+            }
+            None => self.tips.push(TipShares {
+                prev_hash,
+                replaced_at_ms: None,
+                hashes: HashSet::from([hash]),
+            }),
+        }
+    }
+
+    /// `prev_hash` is now the chain tip: every other group is stamped as
+    /// replaced, and groups replaced longer than `retention_ms` (at least
+    /// `grace_ms`) ago are dropped. A tip that comes back keeps its group,
+    /// since its hashes still describe headers that can be resubmitted.
+    pub fn on_tip(&mut self, prev_hash: &[u8; 32], now_ms: u64, cfg: &LifecycleConfig) {
+        let keep_ms = cfg.retention_ms.max(cfg.grace_ms);
+        self.tips.retain_mut(|t| {
+            if t.prev_hash == *prev_hash {
+                t.replaced_at_ms = None;
+                return true;
+            }
+            let replaced_at = *t.replaced_at_ms.get_or_insert(now_ms);
+            now_ms.saturating_sub(replaced_at) <= keep_ms
+        });
+    }
+
+    /// Hashes held across all tips.
+    pub fn len(&self) -> usize {
+        self.tips.iter().map(|t| t.hashes.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tips.iter().all(|t| t.hashes.is_empty())
     }
 }
 
@@ -247,5 +352,113 @@ mod tests {
         // The newer entry (created_at=1) is the floor-protected one.
         assert!(map.contains_key(&2));
         assert!(!map.contains_key(&1));
+    }
+
+    // ── SeenShares ──────────────────────────────────────────────────
+
+    const TIP_A: [u8; 32] = [0xAA; 32];
+    const TIP_B: [u8; 32] = [0xBB; 32];
+
+    /// `check` then, if it passes, `record`: what a validator does for an
+    /// accepted share.
+    fn admit(seen: &mut SeenShares, tip: [u8; 32], h: [u8; 32]) -> Result<(), SeenShareRefusal> {
+        seen.check(&tip, &h)?;
+        seen.record(tip, h);
+        Ok(())
+    }
+
+    fn hash(n: u32) -> [u8; 32] {
+        let mut h = [0u8; 32];
+        h[..4].copy_from_slice(&n.to_le_bytes());
+        h
+    }
+
+    #[test]
+    fn seen_shares_refuses_the_same_hash_twice() {
+        let mut seen = SeenShares::new();
+        assert_eq!(admit(&mut seen, TIP_A, hash(1)), Ok(()));
+        assert_eq!(
+            admit(&mut seen, TIP_A, hash(1)),
+            Err(SeenShareRefusal::Duplicate)
+        );
+        assert_eq!(admit(&mut seen, TIP_A, hash(2)), Ok(()));
+        assert_eq!(seen.len(), 2);
+    }
+
+    /// The replay window: a tip change keeps the old tip's hashes, because its
+    /// jobs are still credited for `grace_ms`.
+    #[test]
+    fn seen_shares_keeps_a_replaced_tip_through_the_grace_window() {
+        let mut seen = SeenShares::new();
+        admit(&mut seen, TIP_A, hash(1)).unwrap();
+        seen.on_tip(&TIP_B, 10_000, &cfg());
+        assert_eq!(
+            admit(&mut seen, TIP_A, hash(1)),
+            Err(SeenShareRefusal::Duplicate),
+            "a share accepted before the tip change must stay a duplicate after it"
+        );
+        seen.on_tip(&TIP_B, 10_000 + cfg().grace_ms + 1, &cfg());
+        assert_eq!(
+            admit(&mut seen, TIP_A, hash(1)),
+            Err(SeenShareRefusal::Duplicate)
+        );
+    }
+
+    #[test]
+    fn seen_shares_drops_a_tip_replaced_longer_than_retention() {
+        let mut seen = SeenShares::new();
+        admit(&mut seen, TIP_A, hash(1)).unwrap();
+        seen.on_tip(&TIP_B, 10_000, &cfg());
+        seen.on_tip(&TIP_B, 10_000 + cfg().retention_ms, &cfg());
+        assert_eq!(seen.len(), 1, "kept up to and including retention_ms");
+        seen.on_tip(&TIP_B, 10_000 + cfg().retention_ms + 1, &cfg());
+        assert!(seen.is_empty());
+    }
+
+    /// A second `on_tip` for the same new tip must not restart the clock.
+    #[test]
+    fn seen_shares_replaced_clock_starts_at_the_first_tip_change() {
+        let mut seen = SeenShares::new();
+        admit(&mut seen, TIP_A, hash(1)).unwrap();
+        seen.on_tip(&TIP_B, 10_000, &cfg());
+        seen.on_tip(&TIP_B, 10_000 + cfg().retention_ms / 2, &cfg());
+        seen.on_tip(&TIP_B, 10_000 + cfg().retention_ms + 1, &cfg());
+        assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn seen_shares_keeps_hashes_of_a_tip_that_comes_back() {
+        let mut seen = SeenShares::new();
+        admit(&mut seen, TIP_A, hash(1)).unwrap();
+        seen.on_tip(&TIP_B, 10_000, &cfg());
+        seen.on_tip(&TIP_A, 11_000, &cfg());
+        seen.on_tip(&TIP_A, 11_000 + cfg().retention_ms + 1, &cfg());
+        assert_eq!(
+            admit(&mut seen, TIP_A, hash(1)),
+            Err(SeenShareRefusal::Duplicate)
+        );
+    }
+
+    /// A full tip refuses new hashes instead of evicting old ones, which would
+    /// make the evicted shares creditable again.
+    #[test]
+    fn seen_shares_refuses_instead_of_evicting_when_full() {
+        let mut seen = SeenShares::new();
+        for n in 0..MAX_SEEN_SHARES_PER_TIP as u32 {
+            admit(&mut seen, TIP_A, hash(n)).unwrap();
+        }
+        assert_eq!(
+            admit(&mut seen, TIP_A, hash(u32::MAX)),
+            Err(SeenShareRefusal::Full)
+        );
+        assert_eq!(
+            admit(&mut seen, TIP_A, hash(0)),
+            Err(SeenShareRefusal::Duplicate)
+        );
+        assert_eq!(
+            admit(&mut seen, TIP_B, hash(u32::MAX)),
+            Ok(()),
+            "the cap is per tip"
+        );
     }
 }

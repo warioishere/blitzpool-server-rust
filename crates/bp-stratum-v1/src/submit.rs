@@ -3,10 +3,10 @@
 //! Share validation for `mining.submit`: pure logic against the session state and
 //! the shared [`JobRegistry`], no I/O. Share accounting is the caller's job.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use bitcoin::hex::DisplayHex;
+use bp_jobs_lifecycle::{SeenShareRefusal, SeenShares, MAX_SEEN_SHARES_PER_TIP};
 use bp_mining_job::{build_block_header, meets_network_target, merkle_root_from_coinbase};
 use bp_share::{calculate_difficulty, Difficulty, TargetMemo};
 
@@ -126,72 +126,28 @@ pub(crate) struct SessionContext<'a> {
 
 // ── Duplicate-share cache (per session) ──────────────────────────────
 
-/// Per-session duplicate-share cache, cleared on every `clean_jobs=true` notify.
+/// Per-session share state: the duplicate guard and the target memo.
 #[derive(Default)]
 pub(crate) struct SessionShareCache {
-    seen: HashSet<DedupKey>,
+    /// Header hashes of accepted shares; [`SeenShares::on_tip`] is driven by
+    /// every new template, so a tip's hashes outlive its creditable jobs.
+    pub(crate) seen: SeenShares,
     /// Effective difficulty takes at most two values per session (current vs
     /// ratchet-clamped), so memoizing the target pays off.
     target_memo: TargetMemo,
-}
-
-/// Keyed on parsed integers: the same numeric values are the same share
-/// regardless of hex formatting.
-#[derive(Clone, Copy, Eq, PartialEq, Hash)]
-struct DedupKey {
-    job_id: u64,
-    nonce: u32,
-    ntime: u32,
-    version_mask: u32,
-    extranonce2: [u8; 8],
-}
-
-impl DedupKey {
-    /// `None` when any field is malformed — such a share is rejected at
-    /// the parse step anyway, so it never needs a dedup slot.
-    fn from_submit(submit: &SubmitRequest) -> Option<Self> {
-        let (version_mask, nonce, ntime, extranonce2) = parse_submit_fields(submit)?;
-        let job_id = u64::from_str_radix(submit.job_id, 16).ok()?;
-        Some(Self {
-            job_id,
-            nonce,
-            ntime,
-            version_mask,
-            extranonce2,
-        })
-    }
 }
 
 impl SessionShareCache {
     pub(crate) fn new() -> Self {
         Self::default()
     }
-
-    /// `true` if seen before in this session; otherwise records it. A malformed
-    /// submit returns `false` and is rejected at the parse step.
-    pub(crate) fn record(&mut self, submit: &SubmitRequest) -> bool {
-        match DedupKey::from_submit(submit) {
-            Some(key) => !self.seen.insert(key),
-            None => false,
-        }
-    }
-
-    /// Called on a `clean_jobs=true` notify: old shares can no longer collide
-    /// with anything acceptable, and the set would otherwise grow unbounded.
-    pub(crate) fn clear(&mut self) {
-        self.seen.clear();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.seen.is_empty()
-    }
 }
 
 // ── validate_submit ──────────────────────────────────────────────────
 
-/// Checks run cheapest first: duplicate, job lookup, stale, field parse, version
-/// mask, then the hash against the [`effective_job_difficulty`] target.
+/// Checks run cheapest first: job lookup, stale, field parse, version mask, the
+/// duplicate guard on the header hash, then that hash against the
+/// [`effective_job_difficulty`] target. Only an accepted share is recorded.
 /// Malformed fields reject as `LowDifficulty`, the same end state as a garbled header.
 pub(crate) fn validate_submit(
     submit: &SubmitRequest,
@@ -200,17 +156,7 @@ pub(crate) fn validate_submit(
     registry: &JobRegistry,
     now_ms: u64,
 ) -> ShareValidation {
-    // 1. Duplicate.
-    if dedup.record(submit) {
-        tracing::warn!(
-            worker = %submit.worker,
-            job_id = %submit.job_id,
-            "❌ Share rejected: duplicate-share"
-        );
-        return ShareValidation::Rejected(RejectReason::DuplicateShare.into());
-    }
-
-    // 2 + 3. Registry classify.
+    // Registry classify.
     let Some(lookup) = registry.classify(submit.job_id, now_ms) else {
         tracing::warn!(
             worker = %submit.worker,
@@ -273,6 +219,30 @@ pub(crate) fn validate_submit(
     let submission_difficulty = scored.submission_difficulty.as_f64();
     let hash = scored.submission_hash;
 
+    if let Err(refusal) = dedup.seen.check(&lookup.template.prev_hash, &hash) {
+        match refusal {
+            SeenShareRefusal::Duplicate => {
+                tracing::warn!(
+                    worker = %submit.worker,
+                    job_id = %submit.job_id,
+                    "❌ Share rejected: duplicate-share"
+                );
+            }
+            // Not the miner's fault, but no other code fits and the share
+            // must not be credited.
+            SeenShareRefusal::Full => {
+                tracing::warn!(
+                    worker = %submit.worker,
+                    job_id = %submit.job_id,
+                    "❌ Share rejected: this tip's duplicate guard is full ({} accepted shares), \
+                     so no further share on it can be checked; refused as duplicate-share",
+                    MAX_SEEN_SHARES_PER_TIP
+                );
+            }
+        }
+        return ShareValidation::Rejected(RejectReason::DuplicateShare.into());
+    }
+
     let job_id_int = u64::from_str_radix(submit.job_id, 16).ok();
     let effective_diff = effective_job_difficulty(
         job_id_int,
@@ -307,6 +277,8 @@ pub(crate) fn validate_submit(
         );
         return ShareValidation::Rejected(RejectReason::LowDifficulty.into());
     }
+
+    dedup.seen.record(lookup.template.prev_hash, hash);
 
     // Against the network target, independent of the clamped share diff: a
     // stale-creditable hit during a reorg can still find a valid alternative tip.
@@ -511,70 +483,6 @@ mod tests {
         );
     }
 
-    // ── SessionShareCache ─────────────────────────────────────────────
-
-    #[test]
-    fn dedup_detects_identical_submissions() {
-        let mut cache = SessionShareCache::new();
-        let s = submit("1", "deadbeef");
-        assert!(!cache.record(&s)); // first time: not a duplicate
-        assert!(cache.record(&s)); // second time: duplicate
-    }
-
-    #[test]
-    fn dedup_treats_any_field_change_as_a_new_share() {
-        let mut cache = SessionShareCache::new();
-        cache.record(&submit("1", "deadbeef"));
-        // Each of the 5 fields, when changed, must produce a fresh entry.
-        let s2 = SubmitRequest {
-            job_id: "2",
-            ..submit("1", "deadbeef")
-        };
-        let s3 = SubmitRequest {
-            nonce_hex: "feedface",
-            ..submit("1", "deadbeef")
-        };
-        let s4 = SubmitRequest {
-            ntime_hex: "00000001",
-            ..submit("1", "deadbeef")
-        };
-        let s5 = SubmitRequest {
-            extranonce2_hex: "ffffffffffffffff",
-            ..submit("1", "deadbeef")
-        };
-        let s6 = SubmitRequest {
-            version_mask_hex: "0",
-            ..submit("1", "deadbeef")
-        };
-        for s in [s2, s3, s4, s5, s6] {
-            assert!(!cache.record(&s), "expected fresh: {:?}", s);
-        }
-    }
-
-    #[test]
-    fn dedup_clear_resets_the_set() {
-        let mut cache = SessionShareCache::new();
-        cache.record(&submit("1", "deadbeef"));
-        assert_eq!(cache.seen.len(), 1);
-        cache.clear();
-        assert!(cache.is_empty());
-        assert!(!cache.record(&submit("1", "deadbeef")));
-    }
-
-    #[test]
-    fn dedup_malformed_submit_is_not_recorded() {
-        let mut cache = SessionShareCache::new();
-        let bad = SubmitRequest {
-            extranonce2_hex: "xyz", // not valid hex / wrong length
-            ..submit("1", "deadbeef")
-        };
-        assert!(!cache.record(&bad));
-        assert!(cache.is_empty());
-        // A second identical malformed submit is still "not a duplicate".
-        assert!(!cache.record(&bad));
-        assert!(cache.is_empty());
-    }
-
     // ── Rejection paths ───────────────────────────────────────────────
 
     // ── BIP-310 version rolling ───────────────────────────────────────
@@ -727,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_share_before_any_other_check() {
+    fn rejects_duplicate_share() {
         let (reg, jid) = populated_registry(DIFF_ONE_N_BITS);
         let session = easy_session();
         let mut cache = SessionShareCache::new();
@@ -776,6 +684,37 @@ mod tests {
                 assert_eq!(r.wire_message, "stale");
             }
             _ => panic!("expected Stale"),
+        }
+    }
+
+    /// Replay across a block change: the old job stays creditable for
+    /// `grace_ms`, so its accepted shares must stay duplicates. The control
+    /// shows the same share is creditable to a session that never saw it.
+    #[test]
+    fn replay_after_block_change_is_a_duplicate() {
+        let (reg, jid) = populated_registry(DIFF_ONE_N_BITS);
+        let session = easy_session();
+        let mut cache = SessionShareCache::new();
+        let s = submit(&jid, "deadbeef");
+        let first = validate_submit(&s, &session, &mut cache, &reg, 1_500);
+        assert!(matches!(first, ShareValidation::Accepted(_)));
+
+        let mut new_tip = reg.classify(&jid, 1_500).unwrap().template.prev_hash;
+        new_tip[0] ^= 0xFF;
+        reg.cleanup_for_tip(&new_tip, 10_000);
+        cache.seen.on_tip(&new_tip, 10_000, &reg.config());
+        let replay = validate_submit(&s, &session, &mut cache, &reg, 11_000);
+        match replay {
+            ShareValidation::Rejected(r) => assert_eq!(r.reason, RejectReason::DuplicateShare),
+            ShareValidation::Accepted(_) => panic!("replayed share credited twice"),
+        }
+
+        let control = validate_submit(&s, &session, &mut SessionShareCache::new(), &reg, 11_000);
+        match control {
+            ShareValidation::Accepted(a) => {
+                assert_eq!(a.classification, JobClassification::StaleCreditable)
+            }
+            ShareValidation::Rejected(r) => panic!("control must be creditable, got {r:?}"),
         }
     }
 
