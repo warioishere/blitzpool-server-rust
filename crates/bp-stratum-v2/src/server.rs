@@ -31,8 +31,8 @@ use crate::extensions::SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS;
 use crate::extranonce::{ConnectionExtranonce, SharedExtranonceAllocator};
 use crate::hooks::MiningServerHooks;
 use crate::mining::client::{
-    apply_template_broadcast, apply_vardiff_check, handle_close_channel,
-    handle_open_extended_mining_channel, handle_open_standard_mining_channel,
+    apply_template_broadcast, apply_template_change_without_jobs, apply_vardiff_check,
+    handle_close_channel, handle_open_extended_mining_channel, handle_open_standard_mining_channel,
     handle_request_extensions, handle_set_custom_mining_job, handle_setup_connection,
     handle_submit_shares_extended, handle_submit_shares_standard, handle_update_channel,
     HandlerOutcome, MiningJobInputs, MiningSessionState, OutboundFrame, PortConfig, SessionEvent,
@@ -450,7 +450,7 @@ async fn run_mining_connection(
     // the session so the submit validators can gate their per-share
     // traces (`🎯 Extended share difficulty`) on it.
     state.share_logs = server_config.share_logs;
-    let mut current_template = initial_template;
+    state.current_template = initial_template;
 
     let mut vardiff_tick = tokio::time::interval(Duration::from_millis(state.vardiff_interval_ms));
     vardiff_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -636,7 +636,7 @@ async fn run_mining_connection(
                             if !resolved.is_pplns() {
                                 if let Some(alt) = alt_streams.remove(&resolved) {
                                     template_rx = alt.rx;
-                                    current_template = alt.initial;
+                                    state.current_template = alt.initial;
                                     state.stream = resolved;
                                     debug!(
                                         "sv2 connection {session_id_hex}: routed to {} template stream",
@@ -710,10 +710,13 @@ async fn run_mining_connection(
                 // A newly opened channel gets a job + matching `SetNewPrevHash`
                 // from the cached template right after OpenChannelSuccess.
                 // Otherwise the miner waits for the next template, and a
-                // mempool refresh carries no prev_hash.
-                if let (Some((channel_id, _kind)), Some(template)) =
-                    (newly_opened_channel, current_template.clone())
-                {
+                // mempool refresh carries no prev_hash. A work-selection
+                // connection mines only its own custom jobs and gets none.
+                if let (Some((channel_id, _kind)), Some(template), false) = (
+                    newly_opened_channel,
+                    state.current_template.clone(),
+                    state.work_selection,
+                ) {
                     match resolve_template_mining_job_inputs(
                         &state.address,
                         &server_config,
@@ -809,37 +812,51 @@ async fn run_mining_connection(
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
-                current_template = Some(payload.template.clone());
-                // Build a MiningJob only once the connection has an address;
-                // before OpenChannel there is nothing to send.
-                let mining_job_inputs = match resolve_template_mining_job_inputs(
-                    &state.address,
-                    &server_config,
-                    &payload.template,
-                    &hooks,
-                    &job_cache,
-                )
-                .await
-                {
-                    Ok(Some(j)) => j,
-                    Ok(None) => continue,
-                    Err(err) => {
-                        warn!(
-                            "sv2 connection {session_id_hex}: resolve_template_mining_job_inputs failed: {err}"
-                        );
-                        continue;
+                state.current_template = Some(payload.template.clone());
+                // A work-selection connection (SV2 Mining/SetupConnection
+                // `REQUIRES_WORK_SELECTION`) mines only its own custom jobs:
+                // it needs no payouts and gets no pool job. Any other builds a
+                // MiningJob only once it has an address; before OpenChannel
+                // there is nothing to send.
+                let mining_job_inputs = if state.work_selection {
+                    None
+                } else {
+                    match resolve_template_mining_job_inputs(
+                        &state.address,
+                        &server_config,
+                        &payload.template,
+                        &hooks,
+                        &job_cache,
+                    )
+                    .await
+                    {
+                        Ok(Some(j)) => Some(j),
+                        Ok(None) => continue,
+                        Err(err) => {
+                            warn!(
+                                "sv2 connection {session_id_hex}: resolve_template_mining_job_inputs failed: {err}"
+                            );
+                            continue;
+                        }
                     }
                 };
                 // Runs BEFORE the job build so the new job pins a changed
                 // custom extranonce prefix.
                 let mut en_frames = custom_extranonce_broadcast_frames(&mut state, &hooks);
-                let mut outcome = apply_template_broadcast(
-                    &mut state,
-                    &payload,
-                    &mining_job_inputs,
-                    SystemClock.now_ms(),
-                    None,
-                );
+                let mut outcome = match &mining_job_inputs {
+                    Some(inputs) => apply_template_broadcast(
+                        &mut state,
+                        &payload,
+                        inputs,
+                        SystemClock.now_ms(),
+                        None,
+                    ),
+                    None => apply_template_change_without_jobs(
+                        &mut state,
+                        &payload,
+                        SystemClock.now_ms(),
+                    ),
+                };
                 // SV2 Mining/SetExtranoncePrefix must precede the job it
                 // applies to: announce the switch, then the job built with it.
                 if !en_frames.is_empty() {
@@ -2645,13 +2662,11 @@ mod tests {
         );
         let _ = dispatch_inbound_frame(&mut s, open, &alloc, &bridge, 0);
         let cid = s.primary_channel.expect("extended channel opened");
-        {
-            // Custom jobs need served work to pin a block-candidate threshold to.
-            let ch = s.channels.get_mut(&cid).expect("channel just opened");
-            ch.latest_extended_prev_hash = Some([0xAB; 32]);
-            ch.latest_extended_n_bits = Some(0x1d00_ffff);
-            ch.latest_extended_height_element = Some(vec![0x03, 0xC8, 0x00]);
-        }
+        // Custom jobs need a template to pin a block-candidate threshold to;
+        // its scriptSig opens with the BIP-34 push of height 200, as the jobs do.
+        let mut template = active_template_fixture();
+        template.coinbase_prefix = vec![0x02, 0xC8, 0x00];
+        s.current_template = Some(Arc::new(template));
 
         let entry = crate::bridge::PayoutDistributionEntry {
             distribution_id: 5,
@@ -2711,7 +2726,7 @@ mod tests {
             min_ntime: 0x6500_0001,
             n_bits: 0x1d00_ffff,
             coinbase_tx_version: 2,
-            coinbase_prefix: vec![0x03, 0xC8, 0x00],
+            coinbase_prefix: vec![0x02, 0xC8, 0x00],
             coinbase_tx_input_n_sequence: 0xFFFF_FFFF,
             coinbase_tx_outputs: conformant.clone(),
             coinbase_tx_locktime: 0,
@@ -2916,13 +2931,11 @@ mod tests {
             0,
         );
         let cid = s.primary_channel.expect("extended channel opened");
-        {
-            // Custom jobs need served work to pin a block-candidate threshold to.
-            let ch = s.channels.get_mut(&cid).expect("channel just opened");
-            ch.latest_extended_prev_hash = Some([0xAB; 32]);
-            ch.latest_extended_n_bits = Some(0x1d00_ffff);
-            ch.latest_extended_height_element = Some(vec![0x03, 0xC8, 0x00]);
-        }
+        // Custom jobs need a template to pin a block-candidate threshold to;
+        // its scriptSig opens with the BIP-34 push of height 200, as the jobs do.
+        let mut template = active_template_fixture();
+        template.coinbase_prefix = vec![0x02, 0xC8, 0x00];
+        s.current_template = Some(Arc::new(template));
         // Group-Solo: tailored entries exist only for Solo and Group-Solo,
         // and `resolve_distribution_reference` refuses to inherit on Solo.
         s.set_stream(bp_common::StreamKind::GroupSolo);
@@ -2968,7 +2981,7 @@ mod tests {
             .get(&cid)
             .expect("channel opened")
             .full_extranonce_size();
-        let script_sig_prefix = vec![0x03, 0xC8, 0x00];
+        let script_sig_prefix = vec![0x02, 0xC8, 0x00];
         let mut coinbase_tx_prefix = Vec::new();
         coinbase_tx_prefix.extend_from_slice(&2u32.to_le_bytes());
         coinbase_tx_prefix.push(0x01);

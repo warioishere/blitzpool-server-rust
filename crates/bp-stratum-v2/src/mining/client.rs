@@ -436,6 +436,10 @@ pub struct MiningSessionState<C: Clock> {
     /// stream is unwired. Every accounting question reads this one; only template
     /// and submit routing read `stream`.
     pub accounting_stream: StreamKind,
+    /// The template this connection's stream is on. Pool jobs are built from
+    /// it and a custom job is held to its tip. `None` until the stream has
+    /// delivered one.
+    pub current_template: Option<Arc<bp_template_distribution::ActiveTemplate>>,
 
     // Negotiated state from SetupConnection
     pub setup_complete: bool,
@@ -514,6 +518,7 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             user_agent: None,
             stream: StreamKind::Pplns,
             accounting_stream: StreamKind::Pplns,
+            current_template: None,
             setup_complete: false,
             work_selection: false,
             requires_standard_jobs: false,
@@ -1432,10 +1437,6 @@ fn retire_for_new_block(
     channel
         .seen_shares
         .on_tip(&template.prev_hash, now_ms, &lifecycle);
-    channel.latest_extended_prev_hash = Some(template.prev_hash);
-    channel.latest_extended_n_bits = Some(template.n_bits);
-    channel.latest_extended_height_element =
-        bp_mining_job::bip34_height_element(&template.coinbase_prefix).map(<[u8]>::to_vec);
 }
 
 /// The pool-built extended job for `template`, as stored for share validation.
@@ -1516,6 +1517,26 @@ fn job_content_signature(
     coinbase_prefix.hash(&mut h);
     coinbase_suffix.hash(&mut h);
     h.finish()
+}
+
+/// A [`TemplateBroadcast`] for a connection that set `REQUIRES_WORK_SELECTION`
+/// (SV2 Mining/SetupConnection): it mines only the jobs it sets with
+/// `SetCustomMiningJob`, so it gets no pool job. A block change retires its
+/// custom jobs on the old tip.
+pub fn apply_template_change_without_jobs<C: Clock>(
+    state: &mut MiningSessionState<C>,
+    broadcast: &TemplateBroadcast,
+    now_ms: u64,
+) -> HandlerOutcome {
+    match broadcast.change {
+        TemplateChange::NewBlock => {
+            for channel in state.channels.values_mut() {
+                retire_for_new_block(channel, &broadcast.template, now_ms);
+            }
+        }
+        TemplateChange::Refresh => {}
+    }
+    HandlerOutcome::default()
 }
 
 /// Fan a [`TemplateBroadcast`] out to this connection's channels, building a
@@ -1795,14 +1816,6 @@ pub fn apply_template_broadcast<C: Clock>(
                         job.difficulty = ch.session_difficulty;
                         job.extranonce_prefix = ch.extranonce_prefix.clone();
                         job.created_at = now_ms;
-                        ch.latest_extended_prev_hash = Some(job.prev_hash);
-                        ch.latest_extended_n_bits = Some(job.n_bits);
-                        // Only from a template on the job's own tip; else the
-                        // height stays unknown and a custom job waits for one.
-                        ch.latest_extended_height_element = (job.prev_hash == template.prev_hash)
-                            .then(|| bp_mining_job::bip34_height_element(&template.coinbase_prefix))
-                            .flatten()
-                            .map(<[u8]>::to_vec);
                         let (pv, nt, nb, ver) =
                             (job.prev_hash, job.min_ntime, job.n_bits, job.version);
                         let mp = job.merkle_path.clone();
@@ -1966,25 +1979,22 @@ pub fn handle_set_custom_mining_job<C: Clock>(
         return reject(ERR_INVALID_JOB_ID);
     }
     let full_extranonce_size = channel.full_extranonce_size();
-    // A Coinbase-only job has no declaration, so the pool's last tip for this
-    // channel is the only tip it can be held to.
-    let channel_prev_hash = channel.latest_extended_prev_hash;
-    let channel_n_bits = channel.latest_extended_n_bits;
-    let channel_height_element = channel.latest_extended_height_element.clone();
-
-    // `n_bits` sets the block-candidate threshold, so it must be the pool's
-    // (see [`ERR_INVALID_NBITS`]). Before the channel's first job there is
-    // nothing to compare against: refused, never waved through, with the
-    // retryable `stale-chain-tip` since it is a transient not-ready state.
-    let (Some(expected), Some(tip)) = (channel_n_bits, channel_prev_hash) else {
+    // A Coinbase-only job has no declaration, so the tip of the template this
+    // connection is on is the only tip it can be held to. `n_bits` sets the
+    // block-candidate threshold, so it must be the pool's (see
+    // [`ERR_INVALID_NBITS`]). Before the first template there is nothing to
+    // compare against: refused, never waved through, with the retryable
+    // `stale-chain-tip` since it is a transient not-ready state.
+    let Some(template) = state.current_template.clone() else {
         tracing::warn!(
             channel_id = input.channel_id,
             job_n_bits = input.n_bits,
-            "sv2: custom job on a channel the pool has served no extended job yet — rejecting \
-             retryably (nothing to pin its block-candidate threshold to)"
+            "sv2: custom job before the connection has a template — rejecting retryably \
+             (nothing to pin its block-candidate threshold to)"
         );
         return reject(ERR_STALE_CHAIN_TIP);
     };
+    let (expected, tip) = (template.n_bits, template.prev_hash);
     if input.n_bits != expected {
         let on_our_tip = input.prev_hash == tip;
         tracing::warn!(
@@ -2044,11 +2054,12 @@ pub fn handle_set_custom_mining_job<C: Clock>(
 
     // BIP-34 (`bad-cb-height`): the scriptSig opens with the block height
     // exactly as the pool's node encodes it for this tip. Without that
-    // encoding the job is refused retryably, as before the first job.
-    let Some(height_element) = channel_height_element.as_deref() else {
+    // encoding the job is refused retryably, as before the first template.
+    let Some(height_element) = bp_mining_job::bip34_height_element(&template.coinbase_prefix)
+    else {
         tracing::warn!(
             channel_id = input.channel_id,
-            "sv2: custom job on a tip the pool has no BIP-34 height for yet — rejecting retryably"
+            "sv2: custom job on a template without a BIP-34 height — rejecting retryably"
         );
         return reject(ERR_STALE_CHAIN_TIP);
     };
@@ -4384,9 +4395,9 @@ pub(crate) mod tests {
         assert!(s.vardiff_cooldown_elapsed());
     }
 
-    /// A session with one Extended channel the pool HAS served work on: tip and
-    /// `n_bits` are set as `server.rs` does at open, matching the job fixtures.
-    /// Cold-start tests clear them explicitly.
+    /// A session with one Extended channel, on a template whose tip, `n_bits`
+    /// and BIP-34 height (`02 C8 00`, height 200) match the custom-job
+    /// fixtures. Cold-start tests clear it explicitly.
     fn session_with_extended_channel() -> MiningSessionState<Arc<TestClock>> {
         let mut s = fresh_session();
         handle_setup_connection(&mut s, &good_setup());
@@ -4395,15 +4406,24 @@ pub(crate) mod tests {
             &open_ext(1, &format!("{}.w", REGTEST_ADDR)),
             vec![0xAA, 0xBB, 0xCC, 0xDD],
         );
-        if let Some(cid) = s.primary_channel {
-            if let Some(ch) = s.channels.get_mut(&cid) {
-                ch.latest_extended_prev_hash = Some([0xAB; 32]);
-                ch.latest_extended_n_bits = Some(0x1d00_ffff);
-                // The height bytes the custom-job fixtures' scriptSig opens with.
-                ch.latest_extended_height_element = Some(vec![0x03, 0xC8, 0x00]);
-            }
-        }
+        let mut template = active_template(1, [0xAB; 32]);
+        template.coinbase_prefix = vec![0x02, 0xC8, 0x00];
+        s.current_template = Some(Arc::new(template));
         s
+    }
+
+    /// Puts `s` on a copy of its template with `edit` applied.
+    fn edit_template<C: Clock>(
+        s: &mut MiningSessionState<C>,
+        edit: impl FnOnce(&mut ActiveTemplate),
+    ) {
+        let mut t = s
+            .current_template
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| active_template(1, [0xAB; 32]));
+        edit(&mut t);
+        s.current_template = Some(Arc::new(t));
     }
 
     /// TDP-only sessions never receive mining-job frames.
@@ -4424,6 +4444,42 @@ pub(crate) mod tests {
             "TDP client must not receive any frames"
         );
         assert!(out.events.is_empty());
+    }
+
+    /// A work-selection connection gets nothing from a template change, and a
+    /// block change retires the custom jobs it set on the old tip.
+    #[test]
+    fn a_template_change_without_jobs_retires_custom_jobs_only_on_a_new_block() {
+        let alloc = base_allocation(REGTEST_ADDR, 42);
+        let outputs = [txout(312_500_000, designated_script(REGTEST_ADDR))];
+        let mut s = solo_session_with_extended_channel();
+        s.work_selection = true;
+        let cid = s.primary_channel.unwrap();
+        let input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
+        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+        let job_id = match &out.outbound[0] {
+            OutboundFrame::SetCustomMiningJobSuccess { job_id, .. } => *job_id,
+            other => panic!("precondition: the custom job must be accepted, got {other:?}"),
+        };
+        let retired_at = |s: &MiningSessionState<Arc<TestClock>>| {
+            s.channels[&cid].extended_jobs[&job_id].retired_at
+        };
+
+        let out = apply_template_change_without_jobs(
+            &mut s,
+            &broadcast(TemplateChange::Refresh, [0xAB; 32]),
+            2_000,
+        );
+        assert!(out.outbound.is_empty(), "got {:?}", out.outbound);
+        assert_eq!(retired_at(&s), None, "a refresh stays on the tip");
+
+        let out = apply_template_change_without_jobs(
+            &mut s,
+            &broadcast(TemplateChange::NewBlock, [0xCC; 32]),
+            3_000,
+        );
+        assert!(out.outbound.is_empty(), "got {:?}", out.outbound);
+        assert_eq!(retired_at(&s), Some(3_000));
     }
 
     /// The Extended scriptsig_len varint is sized for the channel's own extranonce, not 12.
@@ -4532,9 +4588,6 @@ pub(crate) mod tests {
         let (diff, root) = ch.standard_jobs.lookup(1).expect("entry must exist");
         assert_eq!(root, stored, "stored merkle root must match emitted frame");
         assert_eq!(diff, ch.session_difficulty);
-        // Block context cached for later Refresh.
-        assert_eq!(ch.latest_extended_prev_hash, Some([0xAB; 32]));
-        assert_eq!(ch.latest_extended_n_bits, Some(0x1d00_ffff));
     }
 
     /// A client without `REQUIRES_VERSION_ROLLING` still gets `version_rolling_allowed: true`.
@@ -5300,8 +5353,9 @@ pub(crate) mod tests {
     use crate::jdp::declarations::DeclaredJob as JdpDeclaredJob;
     use crate::tokens::Token;
 
-    /// The scriptSig prefix every fixture below declares and mines (BIP-34 height push).
-    const FIXTURE_SCRIPT_SIG_PREFIX: [u8; 3] = [0x03, 0xC8, 0x00];
+    /// The scriptSig prefix every fixture below declares and mines: the BIP-34
+    /// push of height 200, as the session template's prefix encodes it.
+    const FIXTURE_SCRIPT_SIG_PREFIX: [u8; 3] = [0x02, 0xC8, 0x00];
     /// Extranonce slot the declaration reserves. MUST equal the test channel's
     /// `full_extranonce_size()`, which the binding compares it to.
     const FIXTURE_DECLARED_SLOT: usize = 12;
@@ -5561,7 +5615,7 @@ pub(crate) mod tests {
         // byte 41: scriptSig_len = msg.coinbase_prefix.len(3) + full_extranonce(12) = 15 = 0x0F
         assert_eq!(ext.coinbase_prefix[41], 0x0F);
         // bytes 42..45: the JDC-supplied coinbase_prefix bytes
-        assert_eq!(&ext.coinbase_prefix[42..45], &[0x03, 0xC8, 0x00]);
+        assert_eq!(&ext.coinbase_prefix[42..45], &FIXTURE_SCRIPT_SIG_PREFIX);
         assert_eq!(ext.coinbase_prefix.len(), 45);
         // Suffix: [sequence:4][outputs:1][locktime:4] = 9 bytes.
         assert_eq!(ext.coinbase_suffix.len(), 9);
@@ -5626,7 +5680,7 @@ pub(crate) mod tests {
         for (pool_tip, expected) in [([0xAB; 32], None), ([0xCD; 32], Some(ERR_STALE_CHAIN_TIP))] {
             let mut s = solo_session_with_extended_channel();
             let cid = s.primary_channel.unwrap();
-            s.channels.get_mut(&cid).unwrap().latest_extended_prev_hash = Some(pool_tip);
+            edit_template(&mut s, |t| t.prev_hash = pool_tip);
             let input = custom_job_input(cid, token);
             assert_eq!(input.prev_hash, entry.declared_job.prev_hash);
 
@@ -5828,20 +5882,19 @@ pub(crate) mod tests {
     fn a_custom_job_scriptsig_must_open_with_the_block_height() {
         let alloc = base_allocation(REGTEST_ADDR, 42);
         let outputs = [txout(312_500_000, designated_script(REGTEST_ADDR))];
-        for (element, expected) in [
-            (Some(vec![0x03, 0xC8, 0x00]), None),
+        // The template's scriptSig prefix: the job fixtures open with `02 C8 00`;
+        // an empty prefix carries no BIP-34 element at all.
+        for (template_prefix, expected) in [
+            (vec![0x02, 0xC8, 0x00], None),
             (
-                Some(vec![0x03, 0xC9, 0x00]),
+                vec![0x02, 0xC9, 0x00],
                 Some(ERR_INVALID_JOB_PARAM_COINBASE_PREFIX),
             ),
-            (None, Some(ERR_STALE_CHAIN_TIP)),
+            (vec![], Some(ERR_STALE_CHAIN_TIP)),
         ] {
             let mut s = solo_session_with_extended_channel();
             let cid = s.primary_channel.unwrap();
-            s.channels
-                .get_mut(&cid)
-                .unwrap()
-                .latest_extended_height_element = element.clone();
+            edit_template(&mut s, |t| t.coinbase_prefix = template_prefix.clone());
             let input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
             let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
             match (&out.outbound[0], expected) {
@@ -5850,27 +5903,11 @@ pub(crate) mod tests {
                     assert_eq!(error_code, want);
                     assert!(s.channels.get(&cid).unwrap().extended_jobs.is_empty());
                 }
-                (other, want) => panic!("height {element:?}: wanted {want:?}, got {other:?}"),
+                (other, want) => {
+                    panic!("template prefix {template_prefix:?}: wanted {want:?}, got {other:?}")
+                }
             }
         }
-    }
-
-    /// A block change takes the new tip's BIP-34 element from its template.
-    #[test]
-    fn a_new_block_records_the_templates_height_element() {
-        let mut s = session_with_extended_channel();
-        let cid = s.primary_channel.unwrap();
-        let _ = apply_template_broadcast(
-            &mut s,
-            &broadcast(TemplateChange::NewBlock, [0xCC; 32]),
-            &synthetic_mining_job_inputs(),
-            1_000,
-            None,
-        );
-        assert_eq!(
-            s.channels.get(&cid).unwrap().latest_extended_height_element,
-            Some(vec![0x03, 0xC8, 0x00, 0x00])
-        );
     }
 
     /// A scriptSig past the consensus 100 bytes (`bad-cb-length`) is refused
@@ -5911,8 +5948,8 @@ pub(crate) mod tests {
         for (job_tip, expected) in [([0xAB; 32], None), ([0xCD; 32], Some(ERR_STALE_CHAIN_TIP))] {
             let mut s = solo_session_with_extended_channel();
             let cid = s.primary_channel.unwrap();
-            // The pool has served work on 0xAB.
-            s.channels.get_mut(&cid).unwrap().latest_extended_prev_hash = Some([0xAB; 32]);
+            // The connection's template is on 0xAB.
+            edit_template(&mut s, |t| t.prev_hash = [0xAB; 32]);
 
             let mut input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
             input.prev_hash = job_tip;
@@ -5939,11 +5976,10 @@ pub(crate) mod tests {
         for (job_n_bits, expected) in [(POOL_N_BITS, None), (TRIVIAL, Some(ERR_INVALID_NBITS))] {
             let mut s = solo_session_with_extended_channel();
             let cid = s.primary_channel.unwrap();
-            {
-                let ch = s.channels.get_mut(&cid).unwrap();
-                ch.latest_extended_prev_hash = Some([0xAB; 32]);
-                ch.latest_extended_n_bits = Some(POOL_N_BITS);
-            }
+            edit_template(&mut s, |t| {
+                t.prev_hash = [0xAB; 32];
+                t.n_bits = POOL_N_BITS;
+            });
             let mut input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
             input.n_bits = job_n_bits;
 
@@ -5962,22 +5998,18 @@ pub(crate) mod tests {
         }
     }
 
-    /// Before the pool served the channel anything, a custom job is refused retryably; after, accepted.
+    /// Before the connection has a template, a custom job is refused retryably; after, accepted.
     #[test]
-    fn a_custom_job_is_refused_while_the_pool_has_served_the_channel_nothing() {
+    fn a_custom_job_is_refused_before_the_connection_has_a_template() {
         let alloc = base_allocation(REGTEST_ADDR, 42);
         let outputs = [txout(312_500_000, designated_script(REGTEST_ADDR))];
         const POOL_N_BITS: u32 = 0x1d00_ffff;
         const TRIVIAL: u32 = 0x207f_ffff;
 
-        // Served nothing: both fields `None`; the job carries a trivial threshold.
+        // No template yet; the job carries a trivial threshold.
         let mut s = solo_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
-        {
-            let ch = s.channels.get_mut(&cid).unwrap();
-            ch.latest_extended_prev_hash = None;
-            ch.latest_extended_n_bits = None;
-        }
+        s.current_template = None;
         let mut input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
         input.n_bits = TRIVIAL;
         let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
@@ -5995,15 +6027,14 @@ pub(crate) mod tests {
             "the job must not register — its block-candidate threshold would be the client's"
         );
 
-        // Served: the conformant job goes through, so the refusal above is
-        // about the missing reference point only.
+        // On a template: the conformant job goes through, so the refusal
+        // above is about the missing reference point only.
         let mut s = solo_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
-        {
-            let ch = s.channels.get_mut(&cid).unwrap();
-            ch.latest_extended_prev_hash = Some([0xAB; 32]);
-            ch.latest_extended_n_bits = Some(POOL_N_BITS);
-        }
+        edit_template(&mut s, |t| {
+            t.prev_hash = [0xAB; 32];
+            t.n_bits = POOL_N_BITS;
+        });
         let mut input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
         input.n_bits = POOL_N_BITS;
         input.prev_hash = [0xAB; 32];
@@ -6040,11 +6071,10 @@ pub(crate) mod tests {
         ] {
             let mut s = solo_session_with_extended_channel();
             let cid = s.primary_channel.unwrap();
-            {
-                let ch = s.channels.get_mut(&cid).unwrap();
-                ch.latest_extended_prev_hash = Some(POOL_TIP);
-                ch.latest_extended_n_bits = Some(POOL_N_BITS);
-            }
+            edit_template(&mut s, |t| {
+                t.prev_hash = POOL_TIP;
+                t.n_bits = POOL_N_BITS;
+            });
             let mut input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
             input.prev_hash = job_tip;
             input.n_bits = job_n_bits;
@@ -6425,7 +6455,7 @@ pub(crate) mod tests {
         ] {
             let mut s = negotiated_session_with_extended_channel();
             let cid = s.primary_channel.unwrap();
-            s.channels.get_mut(&cid).unwrap().latest_extended_prev_hash = Some([0xAB; 32]);
+            edit_template(&mut s, |t| t.prev_hash = [0xAB; 32]);
 
             let acc = accepted(entry.clone());
             let mut input = custom_job_input(cid, Token([1u8; 16]));
