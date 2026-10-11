@@ -1384,10 +1384,11 @@ mod tests {
     fn allocate_rate_limited_is_silently_dropped() {
         let mut s = fresh();
         handle_setup_connection(&mut s, &good_setup());
-        let _ = handle_allocate_token(&mut s, &good_alloc(1), alloc_ctx(), 1_000);
-        let _ = handle_allocate_token(&mut s, &good_alloc(2), alloc_ctx(), 1_000);
+        for request_id in 1..=crate::tokens::ALLOCATE_BURST as u32 {
+            let _ = handle_allocate_token(&mut s, &good_alloc(request_id), alloc_ctx(), 1_000);
+        }
         // 999ms later — the burst is spent and nothing has refilled yet.
-        let out = handle_allocate_token(&mut s, &good_alloc(3), alloc_ctx(), 1_999);
+        let out = handle_allocate_token(&mut s, &good_alloc(100), alloc_ctx(), 1_999);
         assert!(out.outbound.is_empty(), "rate-limited alloc must drop");
     }
 
@@ -1404,6 +1405,24 @@ mod tests {
                     Some(JdpOutboundFrame::AllocateMiningJobTokenSuccess { .. })
                 ),
                 "allocate {request_id} of the start burst must be answered"
+            );
+        }
+    }
+
+    /// The start pair plus two more from a chain tip change, all inside one
+    /// second, are answered: a JD-client never re-requests a dropped one.
+    #[test]
+    fn a_tip_change_right_after_connect_still_gets_its_tokens() {
+        let mut s = fresh();
+        handle_setup_connection(&mut s, &good_setup());
+        for (request_id, now_ms) in [(1, 1_000), (2, 1_000), (3, 1_300), (4, 1_360)] {
+            let out = handle_allocate_token(&mut s, &good_alloc(request_id), alloc_ctx(), now_ms);
+            assert!(
+                matches!(
+                    out.outbound.first(),
+                    Some(JdpOutboundFrame::AllocateMiningJobTokenSuccess { .. })
+                ),
+                "allocate {request_id} at {now_ms} ms must be answered"
             );
         }
     }
@@ -1655,7 +1674,10 @@ mod tests {
         let wtxid = [0x01; 32];
         let mut tpl = HashMap::new();
         tpl.insert(wtxid, vec![0xCA; 16]);
-        let _ = handle_allocate_token(&mut s, &good_alloc(4), alloc_ctx(), 1_000);
+        // Spend the rest of the burst.
+        for request_id in 10..9 + crate::tokens::ALLOCATE_BURST as u32 {
+            let _ = handle_allocate_token(&mut s, &good_alloc(request_id), alloc_ctx(), 1_000);
+        }
         let _ = declared(&mut s, &declare(3, token, vec![wtxid]), &tpl, ctx(1_100));
 
         let out = handle_allocate_token(&mut s, &good_alloc(2), alloc_ctx(), 1_500);

@@ -22,9 +22,10 @@ pub const DEFAULT_TOKEN_TTL_MS: u64 = 3_600_000;
 /// SV2 JDP/AllocateMiningJobToken: "rate limited to a rather slow rate".
 pub const DEFAULT_RATE_LIMIT_MS: u64 = 1_000;
 
-/// A JDC requests two tokens back to back on connect and never re-requests an
-/// unanswered one, so the burst must cover both.
-pub const ALLOCATE_BURST: u64 = 2;
+/// A JDC never re-requests an unanswered token, so the burst covers the two it
+/// requests back to back on connect and the several a chain tip change can
+/// bring within one interval.
+pub const ALLOCATE_BURST: u64 = 4;
 
 // ── Token ────────────────────────────────────────────────────────────
 
