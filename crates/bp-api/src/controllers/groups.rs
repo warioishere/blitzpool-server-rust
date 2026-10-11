@@ -67,6 +67,7 @@ pub(crate) fn routes(state: SharedState) -> Router<SharedState> {
             "/api/pplns/groups/join-requests/by-address/{address}",
             get(join_requests_by_address),
         )
+        .route("/api/pplns/groups/public/blocks", get(public_blocks))
         .route("/api/pplns/groups/public/{id}", get(public_one))
         .route("/api/pplns/groups/by-address/{address}", get(by_address))
         .route("/api/pplns/groups/membership/{address}", get(membership))
@@ -866,6 +867,56 @@ async fn public_one(
                     member_count: members.len(),
                     total_hashrate,
                 })
+            },
+        )
+        .await?;
+    Ok(JsonBytes(bytes))
+}
+
+// ─── GET /api/pplns/groups/public/blocks ─────────────────────────
+
+/// How many blocks the public list carries.
+const PUBLIC_TEAM_BLOCKS_LIMIT: i64 = 50;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicTeamBlock {
+    block_height: i32,
+    found_at: String,
+    group_id: Uuid,
+    group_name: String,
+    /// The pool's record of the miner that found the block, unmasked: the
+    /// height and address are public in `/api/info` and on chain. `null` when
+    /// the pool holds no record for the height.
+    finder_address: Option<String>,
+}
+
+/// Blocks found by public teams, newest first. A private or dissolved team's
+/// blocks are left out entirely.
+async fn public_blocks(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
+    let s = state.clone();
+    let bytes = state
+        .cache
+        .get_or_fetch::<Vec<PublicTeamBlock>, _, ApiError>(
+            "GROUP_PUBLIC_BLOCKS".to_string(),
+            TtlKind::GroupPublicDetail,
+            async move {
+                let rows =
+                    bp_db::find_public_group_blocks(&s.pool, PUBLIC_TEAM_BLOCKS_LIMIT).await?;
+                let mut blocks = Vec::with_capacity(rows.len());
+                for r in rows {
+                    let finder_address =
+                        bp_db::found_block_miner_at_height(&s.pool, i64::from(r.block_height))
+                            .await?;
+                    blocks.push(PublicTeamBlock {
+                        block_height: r.block_height,
+                        found_at: crate::time_range::format_iso_ms(r.created_at),
+                        group_id: r.group_id,
+                        group_name: r.name,
+                        finder_address,
+                    });
+                }
+                Ok(blocks)
             },
         )
         .await?;

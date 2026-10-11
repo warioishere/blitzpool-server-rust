@@ -208,6 +208,45 @@ pub async fn find_recent_group_block_history(
     .map_err(DbError::from)
 }
 
+/// One block a public team found, as its payout history records it.
+#[derive(Clone, Debug, FromRow)]
+pub struct PublicGroupBlockRow {
+    #[sqlx(rename = "groupId")]
+    pub group_id: Uuid,
+    pub name: String,
+    #[sqlx(rename = "blockHeight")]
+    pub block_height: i32,
+    /// When the block's payout was booked, the earliest row of that block.
+    #[sqlx(rename = "createdAt")]
+    pub created_at: i64,
+}
+
+/// Newest `limit` blocks of public, undissolved teams, one row per team and
+/// height, highest first.
+pub async fn find_public_group_blocks(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<PublicGroupBlockRow>, DbError> {
+    sqlx::query_as!(
+        PublicGroupBlockRow,
+        r#"SELECT
+            h."groupId" AS "group_id!",
+            g.name AS "name!",
+            h."blockHeight" AS "block_height!",
+            min(h."createdAt") AS "created_at!"
+           FROM pplns_group_block_history h
+           JOIN pplns_group g ON g.id = h."groupId"
+           WHERE g."isPublic" AND g."dissolvedAt" IS NULL
+           GROUP BY h."groupId", g.name, h."blockHeight"
+           ORDER BY h."blockHeight" DESC, min(h."createdAt") DESC
+           LIMIT $1"#,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::from)
+}
+
 // ── Group-Solo payout-history writes ────────────────────────────────
 // No balance table behind these: Group-Solo pays what the coinbase pays
 // and owes nothing afterwards.

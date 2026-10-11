@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            h.\"groupId\" AS \"group_id!\",\n            g.name AS \"name!\",\n            h.\"blockHeight\" AS \"block_height!\",\n            min(h.\"createdAt\") AS \"created_at!\"\n           FROM pplns_group_block_history h\n           JOIN pplns_group g ON g.id = h.\"groupId\"\n           WHERE g.\"isPublic\" AND g.\"dissolvedAt\" IS NULL\n           GROUP BY h.\"groupId\", g.name, h.\"blockHeight\"\n           ORDER BY h.\"blockHeight\" DESC, min(h.\"createdAt\") DESC\n           LIMIT $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "group_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "block_height!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "created_at!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "8e3b2c8a21fba3dee28bbc9add24a55824faab20de984145d2b9bff3d82089c8"
+}

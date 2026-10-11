@@ -1061,3 +1061,122 @@ async fn diff_scores_month_window_covers_a_31_day_month() {
         "first bucket {first} must lie before a 31-day month in any zone"
     );
 }
+
+/// `/public/blocks` is its own route, not `/public/{id}` with a bad id. It
+/// lists each block of a public, undissolved team once, newest first, with
+/// the finder's full address; a private or dissolved team's blocks stay out.
+#[tokio::test]
+async fn public_team_blocks_lists_only_public_teams() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let public = uuid::Uuid::new_v4();
+    let private = uuid::Uuid::new_v4();
+    let dissolved = uuid::Uuid::new_v4();
+    // Heights far above any real or fixture block, distinct per run.
+    let base = 1_500_000_000 + (public.as_u128() % 100_000_000) as i32;
+    const FINDER: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    const MEMBER: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+
+    for (id, is_public, dissolved_at) in [
+        (public, true, None),
+        (private, false, None),
+        (dissolved, true, Some(1_i64)),
+    ] {
+        sqlx::query(
+            r#"INSERT INTO pplns_group (id, name, "creatorAddress", "adminTokenHash", "isPublic", "dissolvedAt")
+               VALUES ($1, $2, $3, 'x', $4, $5)"#,
+        )
+        .bind(id)
+        .bind(format!("smoke-{id}"))
+        .bind(FINDER)
+        .bind(is_public)
+        .bind(dissolved_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    // Two members paid on `base`, one on `base + 1`; one block each for the others.
+    for (id, height, address) in [
+        (public, base, FINDER),
+        (public, base, MEMBER),
+        (public, base + 1, MEMBER),
+        (private, base + 2, MEMBER),
+        (dissolved, base + 3, MEMBER),
+    ] {
+        sqlx::query(
+            r#"INSERT INTO pplns_group_block_history ("groupId", "blockHeight", address, "createdAt")
+               VALUES ($1, $2, $3, 1000)"#,
+        )
+        .bind(id)
+        .bind(height)
+        .bind(address)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    // The pool recorded the finder for `base` only.
+    sqlx::query(
+        r#"INSERT INTO blocks_entity (height, "minerAddress", worker, "sessionId", "blockData")
+           VALUES ($1, $2, 'w', 's', 'd')"#,
+    )
+    .bind(i64::from(base))
+    .bind(FINDER)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let router = build_router(minimal_state(pool.clone()));
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/pplns/groups/public/blocks")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("oneshot");
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+
+    sqlx::query(r#"DELETE FROM blocks_entity WHERE height = $1"#)
+        .bind(i64::from(base))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(r#"DELETE FROM pplns_group_block_history WHERE "groupId" = ANY($1)"#)
+        .bind(vec![public, private, dissolved])
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(r#"DELETE FROM pplns_group WHERE id = ANY($1)"#)
+        .bind(vec![public, private, dissolved])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let ours: Vec<&serde_json::Value> = json
+        .as_array()
+        .expect("a JSON array")
+        .iter()
+        .filter(|b| {
+            let g = b["groupId"].as_str().unwrap_or_default();
+            [public, private, dissolved]
+                .iter()
+                .any(|id| id.to_string() == g)
+        })
+        .collect();
+    assert_eq!(
+        ours.len(),
+        2,
+        "public team only, one entry per height: {ours:?}"
+    );
+    assert_eq!(ours[0]["blockHeight"], base + 1);
+    assert!(ours[0]["finderAddress"].is_null());
+    assert_eq!(ours[1]["blockHeight"], base);
+    assert_eq!(ours[1]["finderAddress"], FINDER);
+    assert_eq!(ours[1]["groupName"], format!("smoke-{public}"));
+    assert!(ours[1]["foundAt"].as_str().is_some());
+}

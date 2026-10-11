@@ -93,9 +93,9 @@ pub use group::{
     find_pplns_group_by_name_not_dissolved, find_pplns_group_creator_member,
     find_pplns_group_join_request_most_recent_rejected,
     find_pplns_group_join_request_pending_in_group, find_pplns_group_member_in_group,
-    find_pplns_group_members_for_group, find_recent_group_block_history, insert_pplns_group,
-    insert_pplns_group_invitation, insert_pplns_group_join_request, insert_pplns_group_member,
-    list_active_pplns_group_flags, list_active_pplns_groups,
+    find_pplns_group_members_for_group, find_public_group_blocks, find_recent_group_block_history,
+    insert_pplns_group, insert_pplns_group_invitation, insert_pplns_group_join_request,
+    insert_pplns_group_member, list_active_pplns_group_flags, list_active_pplns_groups,
     list_pplns_group_join_requests_for_group, list_pplns_group_join_requests_pending_for_address,
     revoke_pending_open_invites_for_group, update_pplns_group_active,
     update_pplns_group_creator_and_admin_token, update_pplns_group_dissolved,
@@ -103,7 +103,7 @@ pub use group::{
     update_pplns_group_last_reset_at, update_pplns_group_member_role,
     update_pplns_group_round_reset_config, GroupPayoutHistoryInsert, PatchField,
     PplnsGroupBlockHistoryRow, PplnsGroupInvitationRow, PplnsGroupJoinRequestRow,
-    PplnsGroupMemberRow, PplnsGroupRow, RoundResetConfigPatch,
+    PplnsGroupMemberRow, PplnsGroupRow, PublicGroupBlockRow, RoundResetConfigPatch,
 };
 pub use notification::{
     delete_ntfy_subscription_by_address, delete_push_subscription_by_endpoint,
