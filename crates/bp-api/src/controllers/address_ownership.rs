@@ -245,8 +245,12 @@ pub(crate) fn verify_message_signature(
         .ok()?;
     let script_type = script_type_label(addr.address_type()?);
 
-    // 1) BIP-322 (any address type, incl. taproot).
-    if bip322::verify_simple_encoded(address, message, signature).is_ok() {
+    // 1) BIP-322 (any address type, incl. taproot). Only `Valid` proves
+    // ownership: `Ok(Inconclusive)` means no signature was checked.
+    if matches!(
+        bip322::verify_simple_encoded(address, message, signature),
+        Ok(bip322::Verification::Valid { .. })
+    ) {
         return Some(("bip322".to_string(), script_type.to_string()));
     }
 
@@ -376,6 +380,29 @@ mod tests {
         assert_eq!(
             verify_message_signature(&p2tr, msg, &sign_bip322(&sk, &p2tr, msg), Network::Bitcoin),
             Some(("bip322".to_string(), "p2tr".to_string()))
+        );
+    }
+
+    // bip322 answers `Ok(Inconclusive)` for a P2SH witness with one item,
+    // without checking a signature. A genuine P2SH proof still verifies.
+    #[test]
+    fn an_inconclusive_bip322_result_does_not_prove_ownership() {
+        let (sk, _pk, cpk) = test_key();
+        let msg = "Blitzpool address-ownership verification\nNonce: xyz";
+        let p2sh = Address::p2shwpkh(&cpk, Network::Bitcoin).to_string();
+
+        assert!(matches!(
+            bip322::verify_simple_encoded(&p2sh, msg, "AQEA"),
+            Ok(bip322::Verification::Inconclusive)
+        ));
+        assert_eq!(
+            verify_message_signature(&p2sh, msg, "AQEA", Network::Bitcoin),
+            None
+        );
+
+        assert_eq!(
+            verify_message_signature(&p2sh, msg, &sign_bip322(&sk, &p2sh, msg), Network::Bitcoin),
+            Some(("bip322".to_string(), "p2sh-p2wpkh".to_string()))
         );
     }
 
