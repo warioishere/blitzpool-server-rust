@@ -30,9 +30,10 @@ pub const VARDIFF_SLOT_DURATION_MS: u64 = 600_000;
 /// Default `target_shares_per_minute` fallback for misconfigured ports.
 pub const VARDIFF_DEFAULT_TARGET_SHARES_PER_MIN: f64 = 6.0;
 
-/// Shortest window a retarget is decided on. It is measured in time, not in
-/// shares, so neither two shares a millisecond apart nor a flood packing
-/// thousands into one millisecond can collapse it.
+/// Shortest window a retarget is decided on, and shortest span a display
+/// hashrate is quoted over. It is measured in time, not in shares, so neither
+/// two shares a millisecond apart nor a flood packing thousands into one
+/// millisecond can collapse it.
 pub const VARDIFF_MIN_WINDOW_MS: u64 = 60_000;
 
 /// Arrivals a window needs before its rate counts as measured. Below this the
@@ -350,8 +351,8 @@ impl<C: Clock> VarDiffEngine<C> {
         self.record_arrival(now, self.difficulty);
     }
 
-    /// Latest display hashrate in hashes/second; `0.0` until two shares
-    /// landed in one slot.
+    /// Latest display hashrate in hashes/second; `0.0` until the shares
+    /// span [`VARDIFF_MIN_WINDOW_MS`].
     pub fn hash_rate(&self) -> f64 {
         self.hash_rate
     }
@@ -553,15 +554,16 @@ impl<C: Clock> VarDiffEngine<C> {
                 // does not quote the pre-silence rate.
                 let elapsed_ms = now.saturating_sub(self.previous_slot_time_ms);
                 let work = self.previous_shares + self.shares;
-                if elapsed_ms > 0 && work > 0.0 {
-                    self.hash_rate = slot_hashrate(work, elapsed_ms);
+                if let Some(rate) = slot_hashrate(work, elapsed_ms) {
+                    self.hash_rate = rate;
                 }
             }
             Some(_) => {
                 self.shares += credited_difficulty;
                 let elapsed_ms = now.saturating_sub(self.previous_slot_time_ms);
-                if self.shares > 0.0 && elapsed_ms > 0 {
-                    self.hash_rate = slot_hashrate(self.previous_shares + self.shares, elapsed_ms);
+                let work = self.previous_shares + self.shares;
+                if let Some(rate) = slot_hashrate(work, elapsed_ms) {
+                    self.hash_rate = rate;
                 }
             }
         }
@@ -573,12 +575,14 @@ fn slot_for(timestamp_ms: u64) -> u64 {
     (timestamp_ms / VARDIFF_SLOT_DURATION_MS) * VARDIFF_SLOT_DURATION_MS + VARDIFF_SLOT_DURATION_MS
 }
 
-/// Hashes/second from credited difficulty over a span; 0.0 for a zero span.
-fn slot_hashrate(work: f64, span_ms: u64) -> f64 {
-    if span_ms == 0 {
-        return 0.0;
+/// Hashes/second from credited difficulty over a span; `None` without work or
+/// for a span shorter than [`VARDIFF_MIN_WINDOW_MS`], over which a few shares
+/// arriving together extrapolate to an arbitrary rate.
+fn slot_hashrate(work: f64, span_ms: u64) -> Option<f64> {
+    if work <= 0.0 || span_ms < VARDIFF_MIN_WINDOW_MS {
+        return None;
     }
-    work * HASHES_PER_DIFFICULTY_1 / (span_ms as f64 / 1000.0)
+    Some(work * HASHES_PER_DIFFICULTY_1 / (span_ms as f64 / 1000.0))
 }
 
 #[cfg(test)]
@@ -797,9 +801,9 @@ mod tests {
         let clock = TestClock::new(1_000);
         let mut e = engine(&clock, 1024.0);
         e.note_share_accepted(1024.0);
-        clock.advance_ms(1_000); // same 10-min slot
+        clock.advance_ms(VARDIFF_MIN_WINDOW_MS); // same 10-min slot
         e.note_share_accepted(2048.0);
-        let expected = 3072.0 * HASHES_PER_DIFFICULTY_1 / 1.0;
+        let expected = 3072.0 * HASHES_PER_DIFFICULTY_1 / 60.0;
         assert!(
             (e.hash_rate() - expected).abs() < 1.0,
             "expected ≈ {expected}, got {}",
@@ -819,6 +823,34 @@ mod tests {
         e.note_share_accepted(512.0);
         assert_eq!(e.previous_shares, 3072.0);
         assert_eq!(e.shares, 512.0);
+    }
+
+    /// Shares arriving together quote no rate, in one slot or across a slot
+    /// boundary, until they span the minimum window.
+    #[test]
+    fn shares_a_millisecond_apart_quote_no_display_rate() {
+        let clock = TestClock::new(1_000);
+        let mut e = engine(&clock, 1024.0);
+        e.note_share_accepted(1024.0);
+        clock.advance_ms(1);
+        e.note_share_accepted(1024.0);
+        assert_eq!(e.hash_rate(), 0.0, "same slot");
+
+        let clock = TestClock::new(VARDIFF_SLOT_DURATION_MS - 1);
+        let mut e = engine(&clock, 1024.0);
+        e.note_share_accepted(1024.0);
+        clock.advance_ms(1);
+        e.note_share_accepted(1024.0);
+        assert_eq!(e.hash_rate(), 0.0, "across a slot boundary");
+
+        clock.advance_ms(VARDIFF_MIN_WINDOW_MS);
+        e.note_share_accepted(1024.0);
+        let expected = 3072.0 * HASHES_PER_DIFFICULTY_1 / 60.001;
+        assert!(
+            (e.hash_rate() - expected).abs() < 1.0,
+            "a minute later the rate is quoted: expected ≈ {expected}, got {}",
+            e.hash_rate()
+        );
     }
 
     /// The first share after a silent slot recomputes over the gap instead
