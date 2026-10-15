@@ -224,8 +224,11 @@ fn require_blockparty(
         .ok_or(ApiError::Unavailable("blockparty-service not wired"))
 }
 
+/// Normalize raw input the way the engine stores rows (`AddressId::normalized`):
+/// only bech32/bech32m is lowercased. Base58 is case-sensitive, so a legacy
+/// address must keep its case to find its own member row.
 fn normalize(addr: &str) -> Result<AddressId, ApiError> {
-    AddressId::new(addr.trim().to_ascii_lowercase()).map_err(|_| ApiError::InvalidAddress)
+    AddressId::normalized(addr).map_err(|_| ApiError::InvalidAddress)
 }
 
 /// JSON `{ "ok": true }` — used by every mutation handler (UI checks
@@ -893,6 +896,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn normalize_keeps_base58_case_and_lowercases_bech32() {
+        let p2pkh = normalize(" 1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2 ").unwrap();
+        assert_eq!(p2pkh.as_str(), "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2");
+        let p2sh = normalize("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy").unwrap();
+        assert_eq!(p2sh.as_str(), "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy");
+        let bech32 = normalize("BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4").unwrap();
+        assert_eq!(
+            bech32.as_str(),
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        );
+        assert!(normalize("   ").is_err());
     }
 
     #[test]
