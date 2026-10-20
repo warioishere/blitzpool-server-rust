@@ -4,6 +4,7 @@
 //! tests can assert sends with [`CapturingEmailHooks`] without SMTP.
 
 use async_trait::async_trait;
+use bp_group_mgmt::group::PayoutMode;
 use std::sync::{Arc, Mutex};
 
 /// Data for [`EmailHooks::send_join_decision`].
@@ -18,7 +19,8 @@ pub struct JoinDecisionEmailContext {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinDecisionOutcome {
-    Approved,
+    /// Carries the group's payout mode, which the welcome mail describes.
+    Approved(PayoutMode),
     Rejected,
 }
 

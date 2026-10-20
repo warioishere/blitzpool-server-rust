@@ -3,6 +3,8 @@
 //! Public join-request approval / rejection template — sent when
 //! `JoinRequestService` approves or rejects a request.
 
+use bp_group_mgmt::group::PayoutMode;
+
 use super::content::EmailContent;
 use super::helpers::{
     button_html, escape_attr, escape_html, sanitize_header, shell_html, COLOR_BG, COLOR_MUTED,
@@ -20,10 +22,11 @@ pub struct JoinDecisionContext {
     pub group_url: String,
 }
 
-/// Which decision branch to render.
+/// Which decision branch to render. An approval names the group's payout
+/// mode, which the welcome text describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinDecision {
-    Approved,
+    Approved(PayoutMode),
     Rejected,
 }
 
@@ -39,7 +42,7 @@ pub fn render_join_decision(ctx: &JoinDecisionContext, decision: JoinDecision) -
 fn subject(ctx: &JoinDecisionContext, decision: JoinDecision) -> String {
     let group = sanitize_header(&ctx.group_name);
     match decision {
-        JoinDecision::Approved => format!("Welcome to {group} \u{2014} Blitz Pool"),
+        JoinDecision::Approved(_) => format!("Welcome to {group} \u{2014} Blitz Pool"),
         JoinDecision::Rejected => {
             format!("Join request to {group} declined \u{2014} Blitz Pool")
         }
@@ -47,7 +50,7 @@ fn subject(ctx: &JoinDecisionContext, decision: JoinDecision) -> String {
 }
 
 fn render_html(ctx: &JoinDecisionContext, decision: JoinDecision) -> String {
-    let is_approved = matches!(decision, JoinDecision::Approved);
+    let is_approved = matches!(decision, JoinDecision::Approved(_));
     let headline = if is_approved {
         "Welcome \u{2014} request approved"
     } else {
@@ -55,11 +58,11 @@ fn render_html(ctx: &JoinDecisionContext, decision: JoinDecision) -> String {
     };
     let decision_word = if is_approved { "approved" } else { "declined" };
 
-    let tail = if is_approved {
+    let tail = if let JoinDecision::Approved(mode) = decision {
         format!(
             "\n\
 <p style=\"margin:0 0 16px;font-size:14px;line-height:1.6;color:{text};\">\n  \
-Your address is now a member. Future blocks will be paid out via the group's PROP-style coinbase split.\n\
+Your address is now a member. {payout}\n\
 </p>\n\
 <table role=\"presentation\" cellspacing=\"0\" cellpadding=\"0\" border=\"0\" style=\"margin:0 0 24px;\">\n  \
 <tr><td>{button}</td></tr>\n\
@@ -68,6 +71,7 @@ Your address is now a member. Future blocks will be paid out via the group's PRO
 Or paste this link: <a href=\"{href_attr}\" style=\"color:{primary};\">{href_text}</a>\n\
 </p>\n",
             text = COLOR_TEXT,
+            payout = payout_sentence(mode),
             muted = COLOR_MUTED,
             primary = COLOR_PRIMARY,
             button = button_html(&ctx.group_url, "Open team dashboard", true),
@@ -107,10 +111,24 @@ Your join request to <strong style=\"color:{primary};\">{group_name}</strong> ha
     shell_html(headline, &body)
 }
 
+/// How the group pays its members, by payout mode.
+fn payout_sentence(mode: PayoutMode) -> &'static str {
+    match mode {
+        PayoutMode::Prop => {
+            "Future blocks are paid out in the coinbase, split by each member's \
+             shares in the current round."
+        }
+        PayoutMode::Window => {
+            "Future blocks are paid out in the coinbase, split by each member's \
+             shares in the group's sliding payout window."
+        }
+    }
+}
+
 fn render_text(ctx: &JoinDecisionContext, decision: JoinDecision) -> String {
     let group = sanitize_header(&ctx.group_name);
     match decision {
-        JoinDecision::Approved => [
+        JoinDecision::Approved(_) => [
             &format!("Your join request to \"{group}\" was approved."),
             "",
             &format!("Address: {}", ctx.address),
@@ -144,7 +162,7 @@ mod tests {
     #[test]
     fn approved_subject() {
         assert_eq!(
-            render_join_decision(&ctx(), JoinDecision::Approved).subject,
+            render_join_decision(&ctx(), JoinDecision::Approved(PayoutMode::Prop)).subject,
             "Welcome to PoolPals \u{2014} Blitz Pool"
         );
     }
@@ -159,12 +177,23 @@ mod tests {
 
     #[test]
     fn approved_html_has_button_and_dashboard_url() {
-        let c = render_join_decision(&ctx(), JoinDecision::Approved);
+        let c = render_join_decision(&ctx(), JoinDecision::Approved(PayoutMode::Prop));
         assert!(c.html.contains("Welcome \u{2014} request approved"));
         assert!(c.html.contains(">Open team dashboard</a>"));
         assert!(c.html.contains("<strong>approved</strong>"));
         assert!(c.html.contains("bc1qjoiner"));
         assert!(c.html.contains("PoolPals"));
+    }
+
+    /// The welcome text describes the group's own payout mode.
+    #[test]
+    fn approved_html_describes_the_groups_payout_mode() {
+        let prop = render_join_decision(&ctx(), JoinDecision::Approved(PayoutMode::Prop)).html;
+        assert!(prop.contains("shares in the current round."));
+        assert!(!prop.contains("sliding payout window"));
+        let window = render_join_decision(&ctx(), JoinDecision::Approved(PayoutMode::Window)).html;
+        assert!(window.contains("shares in the group's sliding payout window."));
+        assert!(!window.contains("current round"));
     }
 
     #[test]
@@ -180,7 +209,7 @@ mod tests {
 
     #[test]
     fn approved_text_layout() {
-        let c = render_join_decision(&ctx(), JoinDecision::Approved);
+        let c = render_join_decision(&ctx(), JoinDecision::Approved(PayoutMode::Prop));
         assert_eq!(
             c.text,
             "Your join request to \"PoolPals\" was approved.\n\
@@ -208,7 +237,7 @@ No further action is needed. You can request to join other public teams any time
     fn group_name_html_escaped_in_body_but_sanitized_in_subject() {
         let mut c_ctx = ctx();
         c_ctx.group_name = "evil<\r\n>group".to_string();
-        let c = render_join_decision(&c_ctx, JoinDecision::Approved);
+        let c = render_join_decision(&c_ctx, JoinDecision::Approved(PayoutMode::Prop));
         // Subject: \r\n stripped (becomes space), `<` preserved (no HTML escape on subject).
         assert_eq!(c.subject, "Welcome to evil<  >group \u{2014} Blitz Pool");
         // Body HTML: escaped.

@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use bp_db::PplnsGroupJoinRequestRow;
+use bp_group_mgmt::group::PayoutMode;
 use bp_group_mgmt::token::TokenHash;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -268,7 +269,9 @@ impl JoinRequestService {
                     to_email: request.email,
                     address: address.as_str().to_string(),
                     group_name: group.name,
-                    outcome: JoinDecisionOutcome::Approved,
+                    outcome: JoinDecisionOutcome::Approved(PayoutMode::parse_or_default(
+                        &group.payout_mode,
+                    )),
                     group_url: url,
                 })
                 .await;

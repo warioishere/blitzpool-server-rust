@@ -232,7 +232,7 @@ impl EmailHooks for SmtpJoinDecisionEmailHooks {
             return;
         };
         let decision = match ctx.outcome {
-            JoinDecisionOutcome::Approved => TplJoinDecision::Approved,
+            JoinDecisionOutcome::Approved(mode) => TplJoinDecision::Approved(mode),
             JoinDecisionOutcome::Rejected => TplJoinDecision::Rejected,
         };
         let tpl_ctx = TplJoinDecisionContext {

@@ -253,7 +253,7 @@ async fn approve_request_adds_member_and_sends_email() {
     assert_eq!(decisions.len(), 1);
     assert!(matches!(
         decisions[0].outcome,
-        JoinDecisionOutcome::Approved
+        JoinDecisionOutcome::Approved(_)
     ));
     cleanup_group(&pool, group_id).await;
     delete_email_for(&pool, &requester).await;

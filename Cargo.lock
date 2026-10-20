@@ -915,6 +915,7 @@ dependencies = [
  "bp-common",
  "bp-cron-utils",
  "bp-db",
+ "bp-group-mgmt",
  "bp-group-solo-engine",
  "bp-http",
  "bp-pplns-engine",
