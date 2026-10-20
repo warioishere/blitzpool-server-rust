@@ -96,7 +96,8 @@ hashbrown = "0.17"
 # Database
 sqlx = { version = "0.8", default-features = false, features = [
     "postgres",
-    "runtime-tokio-rustls",
+    "runtime-tokio",
+    "tls-rustls-ring-native-roots",
     "macros",
     "migrate",
     "uuid",
