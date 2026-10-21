@@ -60,8 +60,8 @@ async fn pplns_blockspace_cut_pure_p2wpkh_fits_about_396_in_budget_50000() {
          either the cut math changed or per-output weight constants changed"
     );
     assert_eq!(
-        coinbase_weight_wu, 49_788,
-        "pure P2WPKH coinbase weight drifted (expected 49788 WU, got {coinbase_weight_wu})"
+        coinbase_weight_wu, 49_796,
+        "pure P2WPKH coinbase weight drifted (expected 49796 WU, got {coinbase_weight_wu})"
     );
     // Pins the budget cap even if the exact equality above is loosened.
     assert!(
@@ -90,8 +90,8 @@ async fn pplns_blockspace_cut_pure_p2tr_caps_at_about_285_in_budget_50000() {
         "pure P2TR cut count drifted (expected 285, got {kept_count})"
     );
     assert_eq!(
-        coinbase_weight_wu, 49_696,
-        "pure P2TR coinbase weight drifted (expected 49696 WU, got {coinbase_weight_wu})"
+        coinbase_weight_wu, 49_704,
+        "pure P2TR coinbase weight drifted (expected 49704 WU, got {coinbase_weight_wu})"
     );
     assert!(
         coinbase_weight_wu <= BUDGET,
@@ -121,8 +121,8 @@ async fn pplns_blockspace_cut_mixed_5050_lands_between_extremes() {
         "mixed cut count drifted (expected 328, got {kept_count})"
     );
     assert_eq!(
-        coinbase_weight_wu, 49_732,
-        "mixed coinbase weight drifted (expected 49732 WU, got {coinbase_weight_wu})"
+        coinbase_weight_wu, 49_740,
+        "mixed coinbase weight drifted (expected 49740 WU, got {coinbase_weight_wu})"
     );
     assert!(
         coinbase_weight_wu <= BUDGET,

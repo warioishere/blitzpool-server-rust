@@ -520,8 +520,8 @@ mod tests {
         let c = coinbase_constraints_from_pplns_budget(None);
         // 50 000 WU / 4 = 12 500 bytes; + 256 byte headroom.
         assert_eq!(c.max_additional_size, 12_500 + 256);
-        // P2PKH payouts and the unpushed extranonce carry sigops; the bound
-        // itself is pinned in bp-mining-job.
+        // P2PKH payouts carry sigops; the bound itself is pinned in
+        // bp-mining-job.
         assert!(c.max_additional_sigops > 0);
     }
 

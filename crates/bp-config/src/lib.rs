@@ -19,11 +19,8 @@ pub struct AppConfig {
     /// RPC + TDP/JDP endpoints are assumed to be on.
     pub network: Network,
     /// Human-readable pool name. Surfaced in `/api/info/pool` +
-    /// Stratum subscribe-response client identifier, and written unpushed
-    /// into every coinbase scriptSig. Printable ASCII only: bitcoin-core counts
-    /// unpushed scriptSig bytes as opcodes, and no printable ASCII byte is a
-    /// signature opcode, which the coinbase sigop reservation relies on.
-    #[serde(deserialize_with = "printable_ascii")]
+    /// Stratum subscribe-response client identifier, and pushed into every
+    /// coinbase scriptSig.
     pub pool_identifier: String,
     /// Public UI base URL (no trailing slash). Used to assemble
     /// invitation + verification links in transactional emails.
@@ -867,20 +864,6 @@ pub enum ConfigError {
     },
 }
 
-/// A string of printable ASCII characters (space through `~`).
-fn printable_ascii<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s = String::deserialize(deserializer)?;
-    if let Some(c) = s.chars().find(|c| !(' '..='~').contains(c)) {
-        return Err(serde::de::Error::custom(format!(
-            "must be printable ASCII, found {c:?}"
-        )));
-    }
-    Ok(s)
-}
-
 impl AppConfig {
     /// The roles this process runs. Empty is fatal at boot (checked in `main`).
     pub fn effective_roles(&self) -> Vec<Role> {
@@ -917,26 +900,6 @@ mod tests {
 
     /// `blitzpool.example.toml` parses against the current schema and is
     /// the Solo-only pool it says it is.
-    /// A pool identifier outside printable ASCII is refused at load: its bytes
-    /// land unpushed in every coinbase scriptSig. The minimal config's plain
-    /// identifier is the control.
-    #[test]
-    fn a_pool_identifier_must_be_printable_ascii() {
-        assert!(AppConfig::from_toml_str(MINIMAL_CFG).is_ok());
-        for bad in ["blitzpool\u{ae}", "pool\\n", "p\u{e4}ol", "pool\\u001b"] {
-            let toml = MINIMAL_CFG.replace(
-                r#"pool_identifier = "blitzpool""#,
-                &format!(r#"pool_identifier = "{bad}""#),
-            );
-            assert!(
-                toml != MINIMAL_CFG,
-                "precondition: the identifier was replaced"
-            );
-            let err = AppConfig::from_toml_str(&toml).expect_err(bad);
-            assert!(err.to_string().contains("printable ASCII"), "{bad}: {err}");
-        }
-    }
-
     #[test]
     fn example_toml_parses() {
         let bytes = include_str!("../../../blitzpool.example.toml");

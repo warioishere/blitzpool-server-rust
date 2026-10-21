@@ -209,14 +209,17 @@ pub fn build_mining_job(
     }
 
     let height_encoded = encode_block_height_minimal(template.block_height);
-    let height_len = height_encoded.len();
-    let padding_len = extranonce_slot_size + 3usize.saturating_sub(height_len);
-    let padding = vec![0u8; padding_len];
+    let pad_len = 3usize.saturating_sub(height_encoded.len());
 
     let identifier_bytes = pool_identifier.as_bytes();
-    let mut script_sig = build_scriptsig(&height_encoded, identifier_bytes, &padding);
+    let mut script_sig = build_scriptsig(
+        &height_encoded,
+        pad_len,
+        identifier_bytes,
+        extranonce_slot_size,
+    );
     if script_sig.len() > MAX_SCRIPT_SIZE {
-        script_sig = build_scriptsig(&height_encoded, &[], &padding);
+        script_sig = build_scriptsig(&height_encoded, pad_len, &[], extranonce_slot_size);
     }
     if script_sig.len() > MAX_SCRIPT_SIZE {
         return Err(MiningJobError::ScriptSigTooLong(script_sig.len()));
@@ -367,11 +370,28 @@ pub(crate) fn assemble_tdp_job(
 }
 
 fn build_tdp_scriptsig(tdp_prefix: &[u8], identifier: &[u8], slot_len: usize) -> Vec<u8> {
-    let mut s = Vec::with_capacity(tdp_prefix.len() + identifier.len() + slot_len);
-    s.extend_from_slice(tdp_prefix);
-    s.extend_from_slice(identifier);
-    s.extend(std::iter::repeat_n(0u8, slot_len));
+    let mut s = tdp_prefix.to_vec();
+    push_identifier_and_slot(&mut s, identifier, slot_len);
     s
+}
+
+/// What the pool adds to a coinbase scriptSig: its identifier (when any) and
+/// the zeroed extranonce slot, each as one data push. bitcoin-core counts
+/// sigops in the coinbase scriptSig and reads unpushed bytes as opcodes, so a
+/// pushed slot carries none whatever a miner rolls into it. The slot stays
+/// last: the extranonce ends the scriptSig.
+fn push_identifier_and_slot(script_sig: &mut Vec<u8>, identifier: &[u8], slot_len: usize) {
+    // Both are far below the 4 GiB a push can carry; an oversized identifier
+    // is dropped by the 100-byte scriptSig check after this.
+    let mut builder = bitcoin::script::Builder::new();
+    if !identifier.is_empty() {
+        let identifier =
+            <&bitcoin::script::PushBytes>::try_from(identifier).expect("a pushable identifier");
+        builder = builder.push_slice(identifier);
+    }
+    let slot = bitcoin::script::PushBytesBuf::try_from(vec![0u8; slot_len])
+        .expect("a pushable extranonce slot");
+    script_sig.extend_from_slice(builder.push_slice(slot).as_bytes());
 }
 
 /// Serialize the coinbase up to the extranonce slot. `scriptsig_len` is the
@@ -426,13 +446,19 @@ fn serialize_coinbase_suffix(
     buf
 }
 
-fn build_scriptsig(height_encoded: &[u8], identifier: &[u8], padding: &[u8]) -> Vec<u8> {
-    let mut s = Vec::with_capacity(1 + height_encoded.len() + identifier.len() + padding.len());
+fn build_scriptsig(
+    height_encoded: &[u8],
+    pad_len: usize,
+    identifier: &[u8],
+    slot_len: usize,
+) -> Vec<u8> {
+    let mut s =
+        Vec::with_capacity(1 + height_encoded.len() + pad_len + identifier.len() + 2 + slot_len);
     // BIP-34 push opcode = length of the encoded height (1..=4 typically).
     s.push(height_encoded.len() as u8);
     s.extend_from_slice(height_encoded);
-    s.extend_from_slice(identifier);
-    s.extend_from_slice(padding);
+    s.extend(std::iter::repeat_n(0u8, pad_len));
+    push_identifier_and_slot(&mut s, identifier, slot_len);
     s
 }
 
@@ -1281,9 +1307,9 @@ mod tests {
 
     #[test]
     fn tdp_build_pool_identifier_dropped_on_overflow() {
-        // TDP prefix already 4 bytes (BIP-34 height push for 800k); add a
-        // 90-char identifier and the resulting scriptsig (4 + 90 + 12 = 106)
-        // overflows the 100-byte limit. Function must drop identifier.
+        // TDP prefix already 4 bytes (BIP-34 height push for 800k); a pushed
+        // 90-char identifier and slot (4 + 2 + 90 + 1 + 12 = 109) overflow the
+        // 100-byte limit. Function must drop identifier.
         let (prefix, outputs) = tdp_template_for([0u8; 32]);
         let payouts = single_payout("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
         let long_id = "x".repeat(90);
@@ -1312,16 +1338,18 @@ mod tests {
         full.extend_from_slice(job.coinbase_suffix());
         let tx = bitcoin::Transaction::consensus_decode(&mut full.as_slice()).unwrap();
         let ss = tx.input[0].script_sig.to_bytes();
-        // BIP-34 prefix (4) + slot (12) = 16 bytes. No identifier bytes.
-        assert_eq!(ss.len(), 4 + EXTRANONCE_SLOT_LEN);
+        // BIP-34 prefix (4) + pushed slot (1 + 12). No identifier bytes.
+        assert_eq!(ss.len(), 4 + 1 + EXTRANONCE_SLOT_LEN);
         assert_eq!(&ss[..4], &prefix[..]);
+        assert_eq!(ss[4] as usize, EXTRANONCE_SLOT_LEN, "the slot is pushed");
         // No 'x' bytes anywhere.
         assert!(!ss.contains(&b'x'));
     }
 
     #[test]
     fn tdp_build_pool_identifier_kept_when_it_fits() {
-        // 4-byte prefix + 10-byte identifier + 12-byte slot = 26 bytes — fits.
+        // 4-byte prefix + pushed 9-byte identifier + pushed 12-byte slot fits.
+        // `B` is 0x42, a push opcode were the identifier unpushed.
         let (prefix, outputs) = tdp_template_for([0u8; 32]);
         let payouts = single_payout("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
         let template = TdpCoinbaseTemplate {
@@ -1349,10 +1377,23 @@ mod tests {
         full.extend_from_slice(job.coinbase_suffix());
         let tx = bitcoin::Transaction::consensus_decode(&mut full.as_slice()).unwrap();
         let ss = tx.input[0].script_sig.to_bytes();
-        // Identifier must be present between prefix and slot.
-        let id_start = prefix.len();
-        let id_end = ss.len() - EXTRANONCE_SLOT_LEN;
-        assert_eq!(&ss[id_start..id_end], b"Blitzpool");
+        // After the prefix: exactly the identifier and the slot, each pushed.
+        let added = bitcoin::Script::from_bytes(&ss[prefix.len()..]);
+        let pushes: Vec<Vec<u8>> = added
+            .instructions()
+            .map(|i| match i.unwrap() {
+                bitcoin::script::Instruction::PushBytes(b) => b.as_bytes().to_vec(),
+                op => panic!("unpushed opcode {op:?}"),
+            })
+            .collect();
+        assert_eq!(
+            pushes,
+            vec![b"Blitzpool".to_vec(), vec![0u8; EXTRANONCE_SLOT_LEN]]
+        );
+        assert!(
+            ss.ends_with(&[0u8; EXTRANONCE_SLOT_LEN]),
+            "the slot ends it"
+        );
     }
 
     #[test]
