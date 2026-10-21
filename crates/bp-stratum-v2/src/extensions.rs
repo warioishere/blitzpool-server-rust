@@ -246,7 +246,8 @@ pub fn resolve_share_worker_name_from_tlv(
         (bare, None) => bare,
         (_prefix, Some(worker)) => worker,
     };
-    (!worker.is_empty()).then(|| worker.to_string())
+    let worker = bp_common::clean_worker_name(worker);
+    (!worker.is_empty()).then_some(worker)
 }
 
 #[cfg(test)]
@@ -417,6 +418,20 @@ mod tests {
     }
 
     // ── resolve_share_worker_name_from_tlv ─────────────────────────
+
+    /// A Worker-ID TLV is cleaned like a channel's worker name; one of
+    /// nothing but control characters keeps the channel's worker.
+    #[test]
+    fn a_worker_id_tlv_name_is_cleaned() {
+        assert_eq!(
+            resolve_share_worker_name_from_tlv(&[worker_tlv("addr.rig\n1")], true).as_deref(),
+            Some("rig1")
+        );
+        assert_eq!(
+            resolve_share_worker_name_from_tlv(&[worker_tlv("\r\n")], true),
+            None
+        );
+    }
 
     fn resolve(user_identity: &str, negotiated: bool) -> Option<String> {
         resolve_share_worker_name_from_tlv(&[worker_tlv(user_identity)], negotiated)

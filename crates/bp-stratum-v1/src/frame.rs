@@ -174,7 +174,8 @@ pub struct AuthorizeRequest {
     /// Substring before the first `.`. NOT yet normalised — address
     /// trim / bech32-lowercase / validation happens downstream.
     pub address: String,
-    /// Substring after the first `.`, or `"worker"` if no dot was found.
+    /// Substring after the first `.`, cleaned by
+    /// [`bp_common::clean_worker_name`]; `"worker"` when that leaves nothing.
     pub worker: String,
     pub password: Option<String>,
 }
@@ -494,8 +495,14 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
             // non-empty name, so a "" client row would go stale and
             // `kill_dead_clients` would sweep a live session.
             let (address, worker) = match bp_common::split_user_identity(&raw_username) {
-                (a, Some(w)) if !w.is_empty() => (a.to_string(), w.to_string()),
-                (a, _) => (a.to_string(), "worker".to_string()),
+                (a, Some(w)) => (a, bp_common::clean_worker_name(w)),
+                (a, None) => (a, String::new()),
+            };
+            let address = address.to_string();
+            let worker = if worker.is_empty() {
+                "worker".to_string()
+            } else {
+                worker
             };
             let password = arr.get(1).and_then(|v| v.as_str()).map(String::from);
             Ok(SV1Request::Authorize(AuthorizeRequest {
@@ -799,6 +806,29 @@ mod tests {
             }
             other => panic!("expected Authorize, got {:?}", other),
         }
+    }
+
+    /// A worker name reaches the database, the UI and the address owner's
+    /// notifications, so line breaks and bidi overrides are dropped; spaces
+    /// and `+` stay, as real device names use them. A name of nothing but
+    /// control characters takes the no-name default.
+    #[test]
+    fn parse_authorize_cleans_the_worker_name() {
+        let worker_of = |username: &str| {
+            let line = serde_json::json!({
+                "id": 3,
+                "method": "mining.authorize",
+                "params": [username, "x"],
+            })
+            .to_string();
+            match parse_request(&line).expect("ok") {
+                SV1Request::Authorize(a) => a.worker,
+                other => panic!("expected Authorize, got {other:?}"),
+            }
+        };
+        assert_eq!(worker_of("bc1qaddress.rig\n1\u{202E}"), "rig1");
+        assert_eq!(worker_of("bc1qaddress.NerdQaxe++ 2"), "NerdQaxe++ 2");
+        assert_eq!(worker_of("bc1qaddress.\r\n"), "worker");
     }
 
     #[test]

@@ -909,8 +909,8 @@ fn resolve_open_context<C: Clock>(
         }
     }
 
-    let worker = match worker_part {
-        Some(w) if !w.is_empty() => w.to_string(),
+    let worker = match worker_part.map(bp_common::clean_worker_name) {
+        Some(w) if !w.is_empty() => w,
         _ => "default".to_string(),
     };
 
@@ -2580,6 +2580,22 @@ pub(crate) mod tests {
                 vec![0x01, 0x02, 0x03, 0x04],
             );
             assert_eq!(s.worker_name, "default", "{identity}");
+        }
+    }
+
+    /// The worker part of `user_identity` is cleaned as on SV1; one of
+    /// nothing but control characters opens as "default".
+    #[test]
+    fn a_channel_worker_name_is_cleaned() {
+        for (worker, expected) in [("rig\n1\u{202E}", "rig1"), ("\r\n", "default")] {
+            let mut s = fresh_session();
+            handle_setup_connection(&mut s, &good_setup());
+            handle_open_standard_mining_channel(
+                &mut s,
+                &open_std(7, &format!("{REGTEST_ADDR}.{worker}")),
+                vec![0x01, 0x02, 0x03, 0x04],
+            );
+            assert_eq!(s.worker_name, expected, "{worker:?}");
         }
     }
 

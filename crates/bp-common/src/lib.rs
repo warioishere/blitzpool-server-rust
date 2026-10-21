@@ -197,6 +197,36 @@ pub fn split_user_identity(identity: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Longest worker name kept, in characters: the width of
+/// `client_entity."clientName"`.
+pub const MAX_WORKER_NAME_CHARS: usize = 64;
+
+/// A miner-chosen worker name as the pool stores and shows it. It reaches the
+/// database, the UI and the address owner's notifications, and anyone can
+/// mine to any address, so control and invisible formatting characters are
+/// removed (line breaks, bidi overrides, zero-width marks) and the name is cut
+/// to [`MAX_WORKER_NAME_CHARS`]. Everything else is kept as sent, spaces
+/// included: the name keys the worker's history.
+pub fn clean_worker_name(raw: &str) -> String {
+    raw.chars()
+        .filter(|&c| !c.is_control() && !is_invisible_format(c))
+        .take(MAX_WORKER_NAME_CHARS)
+        .collect()
+}
+
+/// Formatting characters that render as nothing or reorder the text around
+/// them.
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
 fn validate_address_shape(s: &str) -> Result<(), InvalidAddressError> {
     if s.is_empty() {
         return Err(InvalidAddressError::Empty);
@@ -509,6 +539,32 @@ mod tests {
         // Leading dot: an empty address part.
         assert_eq!(split_user_identity(".rig"), ("", Some("rig")));
         assert_eq!(split_user_identity(""), ("", None));
+    }
+
+    /// Device names as miners send them pass unchanged, a leading space and
+    /// `+` included; control and invisible formatting characters go, and the
+    /// cut counts characters, not bytes, as the `varchar(64)` column does.
+    #[test]
+    fn clean_worker_name_keeps_names_and_drops_what_breaks_text() {
+        for name in [
+            " Lucky LV08",
+            "NerdQaxe++",
+            "Bitaxe 602",
+            "rig.€42",
+            "farm.rig5",
+        ] {
+            assert_eq!(clean_worker_name(name), name);
+        }
+        assert_eq!(clean_worker_name("rig1\nfake line\r\t"), "rig1fake line");
+        assert_eq!(
+            clean_worker_name("a\u{202E}b\u{200B}c\u{FEFF}\u{2066}d"),
+            "abcd"
+        );
+        assert_eq!(clean_worker_name("\u{1b}[31mred\u{7f}\u{85}"), "[31mred");
+        let long = "ä".repeat(MAX_WORKER_NAME_CHARS + 10);
+        let cut = clean_worker_name(&long);
+        assert_eq!(cut.chars().count(), MAX_WORKER_NAME_CHARS);
+        assert!(long.starts_with(&cut));
     }
 
     #[test]
