@@ -725,8 +725,16 @@ async fn dispatch_jdp_inbound(
             // Second leg: re-ask the node with the full set, or an invalid tx
             // could hide among the ones the pool was missing. An unknown
             // `request_id` gets no merge and no node call; the handler refuses it.
+            // Nor does a tip that moved since the declare: the handler answers
+            // that `stale-chain-tip`, which a JDC retries, while the node would
+            // refuse a job on the old tip with its own code, which a JDC treats
+            // as fatal.
+            let tip_before_node = hooks.chain_tip.current_prev_hash().await;
             let completed = hooks.job_validator.as_ref().and_then(|validator| {
                 let pending = state.pending_declarations.get(input.request_id)?;
+                if pending.prev_hash_at_declare != tip_before_node {
+                    return None;
+                }
                 let txs = pending.txs.completed_with(&input.transaction_list).ok()?;
                 Some((validator, &pending.input, txs))
             });
@@ -1517,6 +1525,82 @@ mod tests {
             2,
             "the matching Success must be re-validated"
         );
+    }
+
+    /// A chain tip the tests move between the two legs of a round-trip.
+    struct MovableTip(std::sync::Mutex<Option<[u8; 32]>>);
+
+    #[async_trait]
+    impl ChainTipProvider for MovableTip {
+        async fn current_prev_hash(&self) -> Option<[u8; 32]> {
+            *self.0.lock().unwrap()
+        }
+        async fn current_target(&self) -> Option<[u8; 32]> {
+            None
+        }
+    }
+
+    /// The tip moved during the missing-transactions round-trip: the second
+    /// leg answers `stale-chain-tip`, the one code a JDC retries, without
+    /// asking the node, whose own refusal of a job on the old tip would send
+    /// the JDC into its fallback. On an unchanged tip the node is asked and
+    /// its verdict stands (the control).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_tip_change_during_the_round_trip_is_stale_chain_tip_before_the_node_is_asked() {
+        let complete = |tip_moves: bool| async move {
+            let mut state = fresh_session();
+            let _ = handle_setup_connection(&mut state, &jdp_setup());
+            state.full_template_mode = true;
+            let token = issue_token(&mut state, 1_000);
+            let validator = StubValidator::answering(vec![
+                JobVerdict::NeedsTransactions,
+                JobVerdict::Rejected("bad-cb-height".to_string()),
+            ]);
+            let tip = Arc::new(MovableTip(std::sync::Mutex::new(Some([0xAA; 32]))));
+            let mut hooks = JdpServerHooks::no_op();
+            hooks.job_validator = Some(validator.clone() as Arc<dyn DeclaredJobValidator>);
+            hooks.chain_tip = tip.clone();
+            let bridge = fresh_bridge();
+
+            let first = declare_with(&mut state, &hooks, &bridge, token, 1_100).await;
+            assert!(
+                matches!(
+                    first.outbound.first(),
+                    Some(JdpOutboundFrame::ProvideMissingTransactions { .. })
+                ),
+                "precondition: a round-trip must be in flight, got {:?}",
+                first.outbound
+            );
+            if tip_moves {
+                *tip.0.lock().unwrap() = Some([0xBB; 32]);
+            }
+            let second = dispatch_jdp_inbound(
+                &mut state,
+                InboundJdpFrame::ProvideMissingTransactionsSuccess(
+                    crate::jdp::client::ProvideMissingTransactionsSuccessInput {
+                        request_id: 11,
+                        transaction_list: vec![vec![0xAB; 32]],
+                    },
+                ),
+                &hooks,
+                &bridge,
+                1,
+                1_200,
+            )
+            .await;
+            (declare_error_code(&second).to_string(), validator.calls())
+        };
+
+        let (code, calls) = complete(true).await;
+        assert_eq!(code, crate::jdp::client::ERR_STALE_CHAIN_TIP);
+        assert_eq!(
+            calls, 1,
+            "the node must not judge a job on a tip that moved"
+        );
+
+        let (code, calls) = complete(false).await;
+        assert_eq!(code, "bad-cb-height", "control: the node's verdict stands");
+        assert_eq!(calls, 2, "control: the second leg reached the node");
     }
 
     /// `NeedsTransactions` on the second leg is refused `missing-txs`; the
