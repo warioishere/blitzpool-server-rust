@@ -1215,8 +1215,6 @@ pub fn handle_update_channel<C: Clock>(
         });
     };
 
-    channel.declared_max_target = input.maximum_target;
-
     // A translator re-sends the same claim on a timer; a proxy whose workers
     // just attached sends a DIFFERENT number. Silence can refute only the
     // re-assertion of an old claim, never a new one.
@@ -1235,9 +1233,11 @@ pub fn handle_update_channel<C: Clock>(
     }
     let clamped = clamp_difficulty_to_max_target(raw, &Target::from_le_bytes(input.maximum_target));
     let new_diff = if clamped.as_f64() > MAX_REASONABLE_DIFFICULTY {
-        // Keep the existing difficulty rather than accept an unreasonable one.
+        // Keep the existing difficulty and target rather than accept an
+        // unreasonable one: vardiff clamps to the kept target.
         return HandlerOutcome::default();
     } else {
+        channel.declared_max_target = input.maximum_target;
         // Power of two as on open, the floor included, so a translating proxy
         // has nothing to round; rounding up keeps it above the floor.
         power_of_two_difficulty(if clamped < min_difficulty {
@@ -3324,6 +3324,40 @@ pub(crate) mod tests {
     }
 
     // ── UpdateChannel ──────────────────────────────────────────────
+
+    /// An update whose `maximum_target` implies an unreasonable difficulty is
+    /// ignored, its target included: kept, vardiff would clamp the channel up
+    /// to it on its next tick. A reasonable target is kept (the control).
+    #[test]
+    fn an_ignored_update_does_not_keep_its_maximum_target() {
+        let mut s = session_with_standard_channel();
+        let cid = s.primary_channel.unwrap();
+        let kept = s.channels[&cid].declared_max_target;
+        let mut unreasonable = [0u8; 32];
+        unreasonable[0] = 1;
+        let update = |s: &mut MiningSessionState<Arc<TestClock>>, maximum_target| {
+            handle_update_channel(
+                s,
+                &UpdateChannelInput {
+                    channel_id: cid,
+                    nominal_hash_rate: 1.0,
+                    maximum_target,
+                },
+            )
+        };
+
+        let out = update(&mut s, unreasonable);
+        assert!(
+            out.outbound.is_empty(),
+            "precondition: the update is ignored"
+        );
+        assert_eq!(s.channels[&cid].declared_max_target, kept);
+
+        let mut reasonable = [0xFF; 32];
+        reasonable[31] = 0x00;
+        let _ = update(&mut s, reasonable);
+        assert_eq!(s.channels[&cid].declared_max_target, reasonable);
+    }
 
     #[test]
     fn update_channel_unknown_id_returns_error() {
