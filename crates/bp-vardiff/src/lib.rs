@@ -315,12 +315,13 @@ impl<C: Clock> VarDiffEngine<C> {
         self.record_display(now, credited_difficulty);
     }
 
-    /// A share refused as stale, before it was hashed, after the duplicate
-    /// check: the miner sent it as meeting the target on a job it was given,
-    /// so it is an arrival at the difficulty in force, credited nowhere. An
-    /// unknown-job share must NOT come here, since SV2 rejects it before any
-    /// duplicate check and a resent one would inflate the rate; nor a
-    /// duplicate or a below-target reject.
+    /// A share refused as stale: the miner sent it as meeting the target on a
+    /// job it was given, so it is an arrival at the difficulty in force,
+    /// credited nowhere. Stale is decided before the share is hashed or
+    /// checked for duplicates, so a resent stale share counts again; that only
+    /// raises the sender's own difficulty. An unknown-job share, a duplicate
+    /// or a below-target reject says nothing about the rate and must NOT come
+    /// here.
     pub fn note_stale_share(&mut self) {
         let now = self.clock.now_ms();
         self.record_arrival(now, self.difficulty);
