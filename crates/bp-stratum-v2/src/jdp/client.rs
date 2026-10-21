@@ -20,7 +20,6 @@ use crate::bridge::DistributionAcceptance;
 
 use super::declarations::{DeclaredJob, DeclaredJobStore};
 use super::dynamic_outputs::{declared_coinbase_tx, CandidateBacking, PayoutBooking};
-use super::payout_distribution::validate_coinbase_outputs_against_distribution;
 use super::tx_validation::DeclaredTxs;
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -53,7 +52,9 @@ pub const ERR_INVALID_MINING_JOB_TOKEN: &str = "invalid-mining-job-token";
 pub const ERR_INVALID_JOB_PARAM_COINBASE: &str = "invalid-job-param-value-coinbase_tx_outputs";
 
 /// `distribution_id` outside the ext 0x0003/Grace Window, settlement-invalidated,
-/// or never published; the JDC SHOULD re-declare against the latest.
+/// never published, or built for another accounting or miner
+/// ([`crate::bridge::DistributionRefusal`]); the JDC SHOULD re-declare against
+/// the latest.
 pub const ERR_STALE_PAYOUT_DISTRIBUTION: &str =
     crate::extensions::payout_distribution_error_codes::STALE_PAYOUT_DISTRIBUTION;
 
@@ -731,78 +732,17 @@ fn accept_declaration(
                 b"missing distribution_id TLV (ext 0x0003 is negotiated)",
             );
         }
-        let entry = match ctx.distribution {
-            Some(DistributionAcceptance::Accepted(entry)) => entry,
-            Some(DistributionAcceptance::Stale) | Some(DistributionAcceptance::Unknown) => {
-                // ext 0x0003/Grace Window: the JDC re-declares against the latest.
-                tracing::warn!(
-                    request_id = input.request_id,
-                    distribution_id = input.distribution_id,
-                    "jdp: declared distribution_id outside the acceptance window — rejecting"
-                );
-                return JdpHandlerOutcome::declare_error(
-                    input.request_id,
-                    ERR_STALE_PAYOUT_DISTRIBUTION,
-                    b"distribution_id not accepted (superseded or unknown)",
-                );
-            }
-            None => {
-                // IO-layer contract breach; fail closed.
-                tracing::warn!(
-                    request_id = input.request_id,
-                    "jdp: negotiated declare arrived without a resolved distribution acceptance — rejecting"
-                );
-                return JdpHandlerOutcome::declare_error(
-                    input.request_id,
-                    ERR_STALE_PAYOUT_DISTRIBUTION,
-                    b"distribution_id not accepted (superseded or unknown)",
-                );
-            }
-        };
-        // The plan must fit the address's accounting NOW: a `PushSolution` block
-        // books from the declaration alone, and a stale Solo plan would pay the
-        // finder a block the group earned (Group-Solo has no ledger to repair it).
-        if !crate::bridge::accounting_fits_mode(&entry.accounting, ctx.current_mode) {
-            tracing::warn!(
-                request_id = input.request_id,
-                distribution_id = entry.distribution_id,
-                accounting = ?entry.accounting,
-                current_mode = ?ctx.current_mode,
-                "jdp: declared against a distribution built for a different accounting than \
-                 this address is on now — its mode moved mid-session; rejecting rather than \
-                 blessing a coinbase that pays the wrong set of miners"
-            );
-            return JdpHandlerOutcome::declare_error(
-                input.request_id,
-                ERR_STALE_PAYOUT_DISTRIBUTION,
-                b"distribution was built for a different payout mode",
-            );
-        }
-        // A `PushSolution` block is booked for the token's address, so the
-        // plan must pay that address: a session can hold tokens for several.
-        if !crate::bridge::accounting_owned_by(&entry.accounting, miner_address.as_str()) {
-            tracing::warn!(
-                request_id = input.request_id,
-                distribution_id = entry.distribution_id,
-                accounting = ?entry.accounting,
-                "jdp: declared against a distribution tailored to another address than \
-                 this token's; rejecting rather than booking a block whose coinbase pays \
-                 someone else"
-            );
-            return JdpHandlerOutcome::declare_error(
-                input.request_id,
-                ERR_STALE_PAYOUT_DISTRIBUTION,
-                b"distribution was built for a different miner",
-            );
-        }
-        match validate_coinbase_outputs_against_distribution(
+        // Judged against the address's mode NOW and the token's miner: a
+        // `PushSolution` block books from the declaration alone, so a plan of
+        // another accounting or another address would book the block to the
+        // wrong miners (Group-Solo has no ledger to repair it).
+        match crate::bridge::verify_against_distribution(
+            ctx.distribution.as_ref(),
+            ctx.current_mode,
+            miner_address.as_str(),
             &declared_coinbase.tx.output,
-            &entry.built.pool_payout,
-            &entry.built.payouts,
-            &entry.built.dust_limits,
-            &entry.built.additional_outputs,
         ) {
-            Ok(_declared_revenue) => {
+            Ok(entry) => {
                 declared_distribution_id = Some(entry.distribution_id);
                 // Book only when the settlement snapshot actually landed.
                 if entry.built.bookable {
@@ -820,17 +760,18 @@ fn accept_declaration(
                     );
                 }
             }
-            Err(violation) => {
+            Err(refusal) => {
                 tracing::warn!(
                     request_id = input.request_id,
-                    distribution_id = entry.distribution_id,
-                    ?violation,
-                    "jdp: declared coinbase violates ext 0x0003/Payout Computation against the referenced distribution — rejecting"
+                    distribution_id = input.distribution_id,
+                    current_mode = ?ctx.current_mode,
+                    ?refusal,
+                    "jdp: declared coinbase refused against its ext 0x0003 distribution"
                 );
                 return JdpHandlerOutcome::declare_error(
                     input.request_id,
-                    ERR_INVALID_PAYOUT_DISTRIBUTION,
-                    b"declared coinbase does not match the referenced distribution",
+                    refusal.error_code(),
+                    refusal.details(),
                 );
             }
         }

@@ -181,9 +181,9 @@ impl DistributionAccounting {
 }
 
 /// Does a distribution built for `accounting` belong to a miner on `stream`?
-/// Shared by `SetCustomMiningJob`, the JDP declare (a Full-Template block is
-/// booked from its declaration alone) and the JDP connection loop. Every pair
-/// is spelled out so a new kind fails to compile.
+/// Custom jobs are judged by it through [`verify_against_distribution`], the
+/// JDP connection loop through [`accounting_fits_mode`]. Every pair is spelled
+/// out so a new kind fails to compile.
 pub fn accounting_matches_stream(
     accounting: &DistributionAccounting,
     stream: bp_common::StreamKind,
@@ -208,11 +208,11 @@ pub fn accounting_matches_stream(
 
 /// May a plan built for `accounting` back work for `miner`? A tailored plan
 /// pays its owner (or the owner's group), so only the owner may use it;
-/// pool-wide names nobody. Shared by `SetCustomMiningJob` and the JDP
-/// declare, where a session can hold tokens for several addresses. A `match`,
-/// not `owner().is_some()`, which would read like a mode test while
-/// answering a different question.
-pub fn accounting_owned_by(accounting: &DistributionAccounting, miner: &str) -> bool {
+/// pool-wide names nobody. Part of [`verify_against_distribution`]: a JDP
+/// session can hold tokens for several addresses. A `match`, not
+/// `owner().is_some()`, which would read like a mode test while answering a
+/// different question.
+fn accounting_owned_by(accounting: &DistributionAccounting, miner: &str) -> bool {
     match accounting {
         DistributionAccounting::Solo(owner) | DistributionAccounting::GroupSolo(owner) => {
             owner.as_str() == miner
@@ -231,6 +231,79 @@ pub fn accounting_fits_mode(
         None => true,
         Some(stream) => accounting_matches_stream(accounting, stream),
     }
+}
+
+/// Why a coinbase is refused against the distribution it references.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DistributionRefusal {
+    /// Superseded, settled, never published, or no reference resolved.
+    NotAccepted,
+    /// Built for another accounting than the miner is on.
+    OtherAccounting,
+    /// Tailored to another miner.
+    OtherMiner,
+    /// The coinbase does not pay the distribution.
+    OutputsViolate(crate::jdp::payout_distribution::DistributionViolation),
+}
+
+impl DistributionRefusal {
+    /// The ext 0x0003/Error Codes answer, on `DeclareMiningJob.Error` and
+    /// `SetCustomMiningJob.Error` alike: every refusal but the outputs one is
+    /// cured by the latest distribution, which a JDC retries on.
+    pub fn error_code(&self) -> &'static str {
+        use crate::extensions::payout_distribution_error_codes as codes;
+        match self {
+            Self::NotAccepted | Self::OtherAccounting | Self::OtherMiner => {
+                codes::STALE_PAYOUT_DISTRIBUTION
+            }
+            Self::OutputsViolate(_) => codes::INVALID_PAYOUT_DISTRIBUTION,
+        }
+    }
+
+    /// The `error_details` a `DeclareMiningJob.Error` carries.
+    pub fn details(&self) -> &'static [u8] {
+        match self {
+            Self::NotAccepted => b"distribution_id not accepted (superseded or unknown)",
+            Self::OtherAccounting => b"distribution was built for a different payout mode",
+            Self::OtherMiner => b"distribution was built for a different miner",
+            Self::OutputsViolate(_) => {
+                b"declared coinbase does not match the referenced distribution"
+            }
+        }
+    }
+}
+
+/// ext 0x0003/Output Verification of a coinbase mined by `miner` on `stream`
+/// against the distribution it references: in the acceptance window, built
+/// for that accounting and, when tailored, for that miner, and paid exactly.
+/// The JDP declare path and `SetCustomMiningJob` both judge through it, so
+/// they refuse the same coinbase for the same reason with the same code.
+/// `stream` is `None` when the miner's mode is not known yet, which no
+/// accounting fails ([`accounting_fits_mode`]).
+pub fn verify_against_distribution<'a>(
+    acceptance: Option<&'a DistributionAcceptance>,
+    stream: Option<bp_common::StreamKind>,
+    miner: &str,
+    outputs: &[bitcoin::TxOut],
+) -> Result<&'a Arc<PayoutDistributionEntry>, DistributionRefusal> {
+    let Some(DistributionAcceptance::Accepted(entry)) = acceptance else {
+        return Err(DistributionRefusal::NotAccepted);
+    };
+    if !accounting_fits_mode(&entry.accounting, stream) {
+        return Err(DistributionRefusal::OtherAccounting);
+    }
+    if !accounting_owned_by(&entry.accounting, miner) {
+        return Err(DistributionRefusal::OtherMiner);
+    }
+    crate::jdp::payout_distribution::validate_coinbase_outputs_against_distribution(
+        outputs,
+        &entry.built.pool_payout,
+        &entry.built.payouts,
+        &entry.built.dust_limits,
+        &entry.built.additional_outputs,
+    )
+    .map_err(DistributionRefusal::OutputsViolate)?;
+    Ok(entry)
 }
 
 /// A built payout distribution, ready to publish as
@@ -1179,5 +1252,130 @@ mod tests {
         assert!(reg.current_tailored(7).is_none());
         let scope = DistributionScope::JdpSession(7);
         assert_eq!(accepted_id(&reg.distribution_acceptance(3, scope)), Some(3));
+    }
+
+    // ── verify_against_distribution ─────────────────────────────────
+
+    /// The verdict both custom-job paths share: acceptance, then accounting,
+    /// then owner, then outputs, each refusal with its ext 0x0003 code. The
+    /// pool-wide plan a Solo miner holds before its own arrives is stale,
+    /// which a JDC retries; an unknown mode fails no accounting.
+    #[test]
+    fn a_coinbase_is_judged_against_its_distribution_in_one_order() {
+        use crate::extensions::payout_distribution_error_codes as codes;
+        use bp_common::StreamKind as Sk;
+        use DistributionAccounting as Acct;
+        use DistributionRefusal as R;
+
+        let pays = |entry: &PayoutDistributionEntry| {
+            crate::jdp::payout_distribution::compute_payout_vector(
+                &entry.built.pool_payout,
+                &entry.built.payouts,
+                &entry.built.dust_limits,
+                &entry.built.additional_outputs,
+                312_500_000,
+            )
+            .unwrap()
+        };
+        let solo = distribution(1, Acct::Solo(addr()), Some(1));
+        let pool_wide = distribution(2, Acct::PoolWide, None);
+        let (solo_outputs, pool_wide_outputs) = (pays(&solo), pays(&pool_wide));
+        let solo = DistributionAcceptance::Accepted(Arc::new(solo));
+        let pool_wide = DistributionAcceptance::Accepted(Arc::new(pool_wide));
+        let (stale, unknown) = (
+            DistributionAcceptance::Stale,
+            DistributionAcceptance::Unknown,
+        );
+        let other_miner = "bcrt1q-another-miner";
+        let unpaid: Vec<bitcoin::TxOut> = Vec::new();
+
+        let cases = [
+            (Some(&solo), Some(Sk::Solo), ADDR, &solo_outputs, Ok(1)),
+            (Some(&solo), None, ADDR, &solo_outputs, Ok(1)),
+            (
+                Some(&pool_wide),
+                Some(Sk::Pplns),
+                ADDR,
+                &pool_wide_outputs,
+                Ok(2),
+            ),
+            (
+                None,
+                Some(Sk::Solo),
+                ADDR,
+                &solo_outputs,
+                Err(R::NotAccepted),
+            ),
+            (
+                Some(&stale),
+                Some(Sk::Solo),
+                ADDR,
+                &solo_outputs,
+                Err(R::NotAccepted),
+            ),
+            (
+                Some(&unknown),
+                Some(Sk::Solo),
+                ADDR,
+                &solo_outputs,
+                Err(R::NotAccepted),
+            ),
+            (
+                Some(&pool_wide),
+                Some(Sk::Solo),
+                ADDR,
+                &pool_wide_outputs,
+                Err(R::OtherAccounting),
+            ),
+            (
+                Some(&solo),
+                Some(Sk::Solo),
+                other_miner,
+                &solo_outputs,
+                Err(R::OtherMiner),
+            ),
+            // Earlier refusals win over later ones.
+            (
+                Some(&solo),
+                Some(Sk::GroupSolo),
+                other_miner,
+                &solo_outputs,
+                Err(R::OtherAccounting),
+            ),
+            (
+                Some(&stale),
+                Some(Sk::Pplns),
+                other_miner,
+                &unpaid,
+                Err(R::NotAccepted),
+            ),
+            (
+                Some(&pool_wide),
+                Some(Sk::Solo),
+                other_miner,
+                &unpaid,
+                Err(R::OtherAccounting),
+            ),
+            (
+                Some(&solo),
+                Some(Sk::Solo),
+                other_miner,
+                &unpaid,
+                Err(R::OtherMiner),
+            ),
+        ];
+        for (acceptance, stream, miner, outputs, want) in cases {
+            let got = verify_against_distribution(acceptance, stream, miner, outputs)
+                .map(|entry| entry.distribution_id);
+            assert_eq!(got, want, "{stream:?} {miner}");
+            if let Err(refusal) = got {
+                assert_eq!(refusal.error_code(), codes::STALE_PAYOUT_DISTRIBUTION);
+            }
+        }
+
+        let refusal = verify_against_distribution(Some(&solo), Some(Sk::Solo), ADDR, &unpaid)
+            .expect_err("a coinbase paying nothing is refused");
+        assert!(matches!(refusal, R::OutputsViolate(_)), "{refusal:?}");
+        assert_eq!(refusal.error_code(), codes::INVALID_PAYOUT_DISTRIBUTION);
     }
 }

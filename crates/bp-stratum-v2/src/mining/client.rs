@@ -170,10 +170,10 @@ pub const ERR_INVALID_JOB_PARAM_DECLARATION_MISMATCH: &str =
 /// `stale-payout-distribution` — the `distribution_id` referenced by this
 /// `SetCustomMiningJob` is outside the acceptance window
 /// (ext 0x0003/Grace Window + Implementation Notes), or was built for another
-/// accounting or another miner than this channel's, as the JDP declare path
-/// answers too. The JDC re-declares against the latest distribution: a
-/// session's first push is the pool-wide one, and a Solo or Group-Solo miner's
-/// own plan follows once its mode is known.
+/// accounting or miner than this channel's
+/// ([`crate::bridge::DistributionRefusal`]). The JDC re-declares against the
+/// latest distribution: a session's first push is the pool-wide one, and a
+/// Solo or Group-Solo miner's own plan follows once its mode is known.
 pub const ERR_STALE_PAYOUT_DISTRIBUTION: &str =
     crate::extensions::payout_distribution_error_codes::STALE_PAYOUT_DISTRIBUTION;
 
@@ -2201,46 +2201,32 @@ pub fn handle_set_custom_mining_job<C: Clock>(
                 // negotiated (`resolve_distribution_reference` guarantees it).
                 crate::bridge::DistributionReference::FromDeclaration { .. } => {}
             }
-            let entry = match distribution {
-                Some(crate::bridge::DistributionAcceptance::Accepted(entry)) => entry.clone(),
-                _ => return reject(ERR_STALE_PAYOUT_DISTRIBUTION),
-            };
-            // The distribution must match the accounting THIS connection's
-            // shares enter, decided over the pair (shared with the JDP declare
-            // path) against `accounting_stream`: the template stream frozen at
-            // OpenChannel would reject the correct plan after a mode change.
-            if !crate::bridge::accounting_matches_stream(&entry.accounting, state.accounting_stream)
-            {
-                tracing::warn!(
-                    channel_id = input.channel_id,
-                    stream = ?state.accounting_stream,
-                    accounting = ?entry.accounting,
-                    "sv2: custom job references a distribution built for different \
-                     accounting than this connection's — published against a stale or \
-                     unresolved mode; rejecting rather than paying the wrong set of miners"
-                );
-                return reject(ERR_STALE_PAYOUT_DISTRIBUTION);
-            }
-            // The one cross-account guard in Coinbase-only mode.
-            if !crate::bridge::accounting_owned_by(&entry.accounting, channel_addr) {
-                return reject(ERR_STALE_PAYOUT_DISTRIBUTION);
-            }
             let declared: Vec<bitcoin::TxOut> =
                 match bitcoin::consensus::deserialize(&input.coinbase_tx_outputs) {
                     Ok(v) => v,
                     Err(_) => return reject(ERR_INVALID_JOB_PARAM_COINBASE_OUTPUTS),
                 };
-            if crate::jdp::payout_distribution::validate_coinbase_outputs_against_distribution(
+            // Judged against the accounting THIS connection's shares enter,
+            // `accounting_stream`: the template stream frozen at OpenChannel
+            // would reject the correct plan after a mode change. The owner
+            // check is the one cross-account guard in Coinbase-only mode.
+            let entry = match crate::bridge::verify_against_distribution(
+                distribution,
+                Some(state.accounting_stream),
+                channel_addr,
                 &declared,
-                &entry.built.pool_payout,
-                &entry.built.payouts,
-                &entry.built.dust_limits,
-                &entry.built.additional_outputs,
-            )
-            .is_err()
-            {
-                return reject(ERR_INVALID_PAYOUT_DISTRIBUTION);
-            }
+            ) {
+                Ok(entry) => entry,
+                Err(refusal) => {
+                    tracing::warn!(
+                        channel_id = input.channel_id,
+                        stream = ?state.accounting_stream,
+                        ?refusal,
+                        "sv2: custom job refused against its ext 0x0003 distribution"
+                    );
+                    return reject(refusal.error_code());
+                }
+            };
             // Only past ext 0x0003/Output Verification: earlier it would name
             // a distribution this coinbase was never proven to pay.
             entry.built.payouts_fingerprint
