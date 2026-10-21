@@ -169,8 +169,11 @@ pub const ERR_INVALID_JOB_PARAM_DECLARATION_MISMATCH: &str =
 
 /// `stale-payout-distribution` — the `distribution_id` referenced by this
 /// `SetCustomMiningJob` is outside the acceptance window
-/// (ext 0x0003/Grace Window + Implementation Notes). The JDC re-declares
-/// against the latest distribution.
+/// (ext 0x0003/Grace Window + Implementation Notes), or was built for another
+/// accounting or another miner than this channel's, as the JDP declare path
+/// answers too. The JDC re-declares against the latest distribution: a
+/// session's first push is the pool-wide one, and a Solo or Group-Solo miner's
+/// own plan follows once its mode is known.
 pub const ERR_STALE_PAYOUT_DISTRIBUTION: &str =
     crate::extensions::payout_distribution_error_codes::STALE_PAYOUT_DISTRIBUTION;
 
@@ -2216,11 +2219,11 @@ pub fn handle_set_custom_mining_job<C: Clock>(
                      accounting than this connection's — published against a stale or \
                      unresolved mode; rejecting rather than paying the wrong set of miners"
                 );
-                return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
+                return reject(ERR_STALE_PAYOUT_DISTRIBUTION);
             }
             // The one cross-account guard in Coinbase-only mode.
             if !crate::bridge::accounting_owned_by(&entry.accounting, channel_addr) {
-                return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
+                return reject(ERR_STALE_PAYOUT_DISTRIBUTION);
             }
             let declared: Vec<bitcoin::TxOut> =
                 match bitcoin::consensus::deserialize(&input.coinbase_tx_outputs) {
@@ -6765,7 +6768,7 @@ pub(crate) mod tests {
         );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
-                assert_eq!(error_code, ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
+                assert_eq!(error_code, ERR_STALE_PAYOUT_DISTRIBUTION);
             }
             other => panic!("expected token-mismatch error, got {other:?}"),
         }
@@ -6844,7 +6847,7 @@ pub(crate) mod tests {
                 (OutboundFrame::SetCustomMiningJobSuccess { .. }, true) => {}
                 (OutboundFrame::SetCustomMiningJobError { error_code, .. }, false) => {
                     assert_eq!(
-                        error_code, ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH,
+                        error_code, ERR_STALE_PAYOUT_DISTRIBUTION,
                         "{accounting:?} on {stream:?}"
                     );
                     assert!(
@@ -6886,7 +6889,7 @@ pub(crate) mod tests {
         );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
-                assert_eq!(error_code, ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
+                assert_eq!(error_code, ERR_STALE_PAYOUT_DISTRIBUTION);
             }
             other => panic!("another miner's Solo plan must be refused, got {other:?}"),
         }
@@ -6923,7 +6926,7 @@ pub(crate) mod tests {
             match (&out.outbound[0], accept) {
                 (OutboundFrame::SetCustomMiningJobSuccess { .. }, true) => {}
                 (OutboundFrame::SetCustomMiningJobError { error_code, .. }, false) => {
-                    assert_eq!(error_code, ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
+                    assert_eq!(error_code, ERR_STALE_PAYOUT_DISTRIBUTION);
                 }
                 (other, want) => {
                     panic!("{accounting:?} after the flip: wanted {want}, got {other:?}")
@@ -7378,15 +7381,9 @@ pub(crate) mod tests {
                 1_000,
             );
             match &out.outbound[0] {
-                OutboundFrame::SetCustomMiningJobError { error_code, .. } => assert_eq!(
-                    error_code,
-                    if live {
-                        ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH
-                    } else {
-                        ERR_STALE_PAYOUT_DISTRIBUTION
-                    },
-                    "live={live}"
-                ),
+                OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
+                    assert_eq!(error_code, ERR_STALE_PAYOUT_DISTRIBUTION, "live={live}")
+                }
                 other => panic!(
                     "live={live}: a coinbase paying the PPLNS window must not be mined by a \
                      Solo accounting, got {other:?}"
@@ -7454,11 +7451,11 @@ pub(crate) mod tests {
             match &out.outbound[0] {
                 OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                     assert_eq!(
-                        error_code, ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH,
+                        error_code, ERR_STALE_PAYOUT_DISTRIBUTION,
                         "{stream:?} must not reference the pool-wide distribution"
                     );
                 }
-                other => panic!("expected token-mismatch on {stream:?}, got {other:?}"),
+                other => panic!("expected stale-payout-distribution on {stream:?}, got {other:?}"),
             }
         }
     }
