@@ -135,10 +135,22 @@ pub struct ConfigureRequest {
 }
 
 impl ConfigureRequest {
+    /// The extension codes in `params[0]`, in request order, each once; a
+    /// missing or non-list `params[0]` lists none.
+    pub fn requested_extensions(&self) -> Vec<&str> {
+        let mut codes: Vec<&str> = Vec::new();
+        let listed = self.params.get(0).and_then(|p| p.as_array());
+        for code in listed.into_iter().flatten().filter_map(|c| c.as_str()) {
+            if !codes.contains(&code) {
+                codes.push(code);
+            }
+        }
+        codes
+    }
+
     /// The `version-rolling.mask` the miner asked for. BIP-310 defaults an
-    /// absent field to `ffffffff` (everything), but a present-and-unreadable
-    /// one is `Malformed` and must never be upgraded to that default, or the
-    /// miner gets bits it never asked for.
+    /// absent field to `ffffffff` (everything); a present-and-unreadable one
+    /// is `Malformed`, so the caller can tell the two apart.
     pub fn requested_version_rolling_mask(&self) -> RequestedMask {
         let Some(field) = self
             .params
@@ -569,12 +581,24 @@ struct NotificationFrame<'a, P: Serialize> {
     params: P,
 }
 
-#[derive(Serialize)]
+/// BIP-310 `mining.configure` result: `version-rolling` and its mask, then
+/// `false` for each other requested code.
 struct ConfigureResult<'a> {
-    #[serde(rename = "version-rolling")]
-    version_rolling: bool,
-    #[serde(rename = "version-rolling.mask")]
-    version_rolling_mask: &'a str,
+    version_rolling_mask: String,
+    unsupported: &'a [&'a str],
+}
+
+impl Serialize for ConfigureResult<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(2 + self.unsupported.len()))?;
+        map.serialize_entry("version-rolling", &true)?;
+        map.serialize_entry("version-rolling.mask", &self.version_rolling_mask)?;
+        for code in self.unsupported {
+            map.serialize_entry(code, &false)?;
+        }
+        map.end()
+    }
 }
 
 /// Emit a `mining.subscribe` response.
@@ -602,14 +626,17 @@ pub(crate) fn write_subscribe_response(
 
 /// Emit a `mining.configure` response: always `version-rolling: true` with
 /// the mask as 8-digit lowercase hex, whatever extensions were requested.
-pub(crate) fn write_configure_response(id: &RpcId, version_rolling_mask: u32) -> Vec<u8> {
-    let mask = format!("{:08x}", version_rolling_mask);
+pub(crate) fn write_configure_response(
+    id: &RpcId,
+    version_rolling_mask: u32,
+    unsupported: &[&str],
+) -> Vec<u8> {
     let frame = SuccessFrame {
         id,
         error: (),
         result: ConfigureResult {
-            version_rolling: true,
-            version_rolling_mask: &mask,
+            version_rolling_mask: format!("{version_rolling_mask:08x}"),
+            unsupported,
         },
     };
     finalize(&frame)
@@ -1169,7 +1196,7 @@ mod tests {
 
     #[test]
     fn write_configure_response_byte_exact() {
-        let bytes = write_configure_response(&RpcId::from(2), 0x1fffe000);
+        let bytes = write_configure_response(&RpcId::from(2), 0x1fffe000, &[]);
         // Lowercase, 8-padded hex.
         assert_eq!(
             s(&bytes),
@@ -1182,7 +1209,7 @@ mod tests {
     #[test]
     fn write_configure_response_pads_short_mask() {
         // A short numeric mask (e.g. 0x00000001) must still emit 8 hex chars.
-        let bytes = write_configure_response(&RpcId::from(2), 1);
+        let bytes = write_configure_response(&RpcId::from(2), 1, &[]);
         assert_eq!(
             s(&bytes),
             r#"{"id":2,"error":null,"result":{"version-rolling":true,"version-rolling.mask":"00000001"}}"#

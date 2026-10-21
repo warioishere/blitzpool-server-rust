@@ -309,7 +309,16 @@ pub(crate) fn handle_configure<C: Clock>(
     state: &mut SessionState<C>,
     request: ConfigureRequest,
 ) -> HandlerOutcome {
-    // BIP-310: response = server_mask & miner_mask. An absent mask counts as
+    // BIP-310: every requested code MUST get a value. `version-rolling`, the
+    // one the pool supports, is answered whether listed or not, as SV1 pools
+    // have long done and firmware relies on; every other code gets `false`.
+    let unsupported: Vec<&str> = request
+        .requested_extensions()
+        .into_iter()
+        .filter(|code| *code != "version-rolling")
+        .collect();
+
+    // Response = server_mask & miner_mask. An absent mask counts as
     // `ffffffff` per BIP-310; an unreadable one is treated the same (and
     // logged) rather than costing the miner version rolling entirely.
     let requested = match request.requested_version_rolling_mask() {
@@ -329,7 +338,11 @@ pub(crate) fn handle_configure<C: Clock>(
     // Assigned, not narrowed: a repeated configure is a fresh negotiation,
     // and the miner acts on the mask just sent.
     state.version_rolling_mask = negotiated;
-    HandlerOutcome::with_frame(write_configure_response(&request.id, negotiated))
+    HandlerOutcome::with_frame(write_configure_response(
+        &request.id,
+        negotiated,
+        &unsupported,
+    ))
 }
 
 // ── Authorize ────────────────────────────────────────────────────────
@@ -1045,6 +1058,50 @@ mod tests {
                 {"version-rolling.mask": "00c00000"}
             ])),
             "00c00000"
+        );
+    }
+
+    /// BIP-310: every requested extension code gets a return value, each
+    /// once. The pool supports `version-rolling` and answers it even when
+    /// unlisted; anything else requested is `false`.
+    #[test]
+    fn configure_answers_every_requested_extension() {
+        let (frame, mask) = configure(serde_json::json!([
+            ["version-rolling", "minimum-difficulty", "subscribe-extranonce", "version-rolling"],
+            {"version-rolling.mask": "ffffffff", "minimum-difficulty.value": 2048}
+        ]));
+        assert_eq!(
+            frame,
+            r#"{"id":7,"error":null,"result":{"version-rolling":true,"version-rolling.mask":"1fffe000","minimum-difficulty":false,"subscribe-extranonce":false}}"#
+                .to_string()
+                + "\n"
+        );
+        assert_eq!(mask, VERSION_ROLLING_MASK);
+
+        let (frame, _) = configure(serde_json::json!([
+            ["minimum-difficulty"],
+            {"minimum-difficulty.value": 2048}
+        ]));
+        assert_eq!(
+            frame,
+            r#"{"id":7,"error":null,"result":{"version-rolling":true,"version-rolling.mask":"1fffe000","minimum-difficulty":false}}"#
+                .to_string()
+                + "\n"
+        );
+    }
+
+    /// The request firmware actually sends is answered as before, byte for byte.
+    #[test]
+    fn a_plain_version_rolling_configure_is_answered_unchanged() {
+        let (frame, _) = configure(serde_json::json!([
+            ["version-rolling"],
+            {"version-rolling.mask": "ffffffff", "version-rolling.min-bit-count": 16}
+        ]));
+        assert_eq!(
+            frame,
+            r#"{"id":7,"error":null,"result":{"version-rolling":true,"version-rolling.mask":"1fffe000"}}"#
+                .to_string()
+                + "\n"
         );
     }
 
