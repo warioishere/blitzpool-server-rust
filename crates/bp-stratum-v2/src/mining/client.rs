@@ -2213,18 +2213,9 @@ pub fn handle_set_custom_mining_job<C: Clock>(
                 );
                 return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
             }
-            // Only a tailored plan names an owner, the one cross-account guard
-            // in Coinbase-only mode. A `match`, not `is_some()`, which would
-            // read like a mode test while answering a different question.
-            match &entry.accounting {
-                crate::bridge::DistributionAccounting::Solo(owner)
-                | crate::bridge::DistributionAccounting::GroupSolo(owner) => {
-                    if channel_addr != owner.as_str() {
-                        return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
-                    }
-                }
-                // Pool-wide names nobody — every PPLNS connection shares it.
-                crate::bridge::DistributionAccounting::PoolWide => {}
+            // The one cross-account guard in Coinbase-only mode.
+            if !crate::bridge::accounting_owned_by(&entry.accounting, channel_addr) {
+                return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
             }
             let declared: Vec<bitcoin::TxOut> =
                 match bitcoin::consensus::deserialize(&input.coinbase_tx_outputs) {

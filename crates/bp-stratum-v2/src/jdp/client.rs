@@ -752,6 +752,23 @@ fn accept_declaration(
                 b"distribution was built for a different payout mode",
             );
         }
+        // A `PushSolution` block is booked for the token's address, so the
+        // plan must pay that address: a session can hold tokens for several.
+        if !crate::bridge::accounting_owned_by(&entry.accounting, miner_address.as_str()) {
+            tracing::warn!(
+                request_id = input.request_id,
+                distribution_id = entry.distribution_id,
+                accounting = ?entry.accounting,
+                "jdp: declared against a distribution tailored to another address than \
+                 this token's; rejecting rather than booking a block whose coinbase pays \
+                 someone else"
+            );
+            return JdpHandlerOutcome::declare_error(
+                input.request_id,
+                ERR_STALE_PAYOUT_DISTRIBUTION,
+                b"distribution was built for a different miner",
+            );
+        }
         match validate_coinbase_outputs_against_distribution(
             &declared_coinbase.tx.output,
             &entry.built.pool_payout,
@@ -1830,6 +1847,76 @@ mod tests {
                     );
                 }
                 (other, want) => panic!("{mode:?}: wanted accept={want}, got {other:?}"),
+            }
+        }
+    }
+
+    /// A tailored plan pays only its owner: a session holding tokens for two
+    /// addresses must not declare on one address's token against the other's
+    /// plan, or a `PushSolution` block is booked for the token's address while
+    /// its coinbase pays the plan owner. The token's own plan is the control.
+    #[test]
+    fn a_declare_against_another_addresss_tailored_plan_is_refused() {
+        use crate::bridge::DistributionAccounting as Acct;
+        use bp_common::StreamKind as Sk;
+        let other_script = bitcoin::ScriptBuf::new_p2wpkh(
+            &<bitcoin::WPubkeyHash as bitcoin::hashes::Hash>::from_byte_array([0x11; 20]),
+        );
+        let other = AddressId::new(
+            bitcoin::Address::from_script(&other_script, bitcoin::Network::Regtest)
+                .unwrap()
+                .to_string(),
+        )
+        .unwrap();
+        assert_ne!(other, addr(), "precondition: two distinct addresses");
+
+        for (accounting, mode, accept) in [
+            (Acct::Solo(addr()), Sk::Solo, true),
+            (Acct::GroupSolo(addr()), Sk::GroupSolo, true),
+            (Acct::Solo(other.clone()), Sk::Solo, false),
+            (Acct::GroupSolo(other.clone()), Sk::GroupSolo, false),
+        ] {
+            let entry = crate::bridge::PayoutDistributionEntry {
+                accounting: accounting.clone(),
+                ..distribution_entry(7)
+            };
+            let outputs = compute_payout_vector(
+                &entry.built.pool_payout,
+                &entry.built.payouts,
+                &entry.built.dust_limits,
+                &entry.built.additional_outputs,
+                312_500_000,
+            )
+            .unwrap();
+            let mut s = fresh();
+            let token = complete_setup_and_allocate(&mut s);
+            negotiate_0x0003(&mut s);
+            let mut input = declare(3, token, vec![]);
+            input.distribution_id = Some(7);
+            input.coinbase_tx_suffix = coinbase_suffix(&bitcoin::consensus::serialize(&outputs));
+            let out = declared(
+                &mut s,
+                &input,
+                &HashMap::new(),
+                DeclarationContext {
+                    distribution: accepted(entry),
+                    current_mode: Some(mode),
+                    ..ctx(3_000)
+                },
+            );
+            match (&out.outbound[0], accept) {
+                (JdpOutboundFrame::DeclareMiningJobSuccess { .. }, true) => {
+                    assert_eq!(s.declared_jobs.len(), 1, "{accounting:?}");
+                }
+                (JdpOutboundFrame::DeclareMiningJobError { error_code, .. }, false) => {
+                    assert_eq!(error_code, ERR_STALE_PAYOUT_DISTRIBUTION, "{accounting:?}");
+                    assert_eq!(
+                        s.declared_jobs.len(),
+                        0,
+                        "{accounting:?}: a refused declaration must leave nothing bookable"
+                    );
+                }
+                (other, want) => panic!("{accounting:?}: wanted accept={want}, got {other:?}"),
             }
         }
     }

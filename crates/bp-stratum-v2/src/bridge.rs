@@ -206,6 +206,21 @@ pub fn accounting_matches_stream(
     }
 }
 
+/// May a plan built for `accounting` back work for `miner`? A tailored plan
+/// pays its owner (or the owner's group), so only the owner may use it;
+/// pool-wide names nobody. Shared by `SetCustomMiningJob` and the JDP
+/// declare, where a session can hold tokens for several addresses. A `match`,
+/// not `owner().is_some()`, which would read like a mode test while
+/// answering a different question.
+pub fn accounting_owned_by(accounting: &DistributionAccounting, miner: &str) -> bool {
+    match accounting {
+        DistributionAccounting::Solo(owner) | DistributionAccounting::GroupSolo(owner) => {
+            owner.as_str() == miner
+        }
+        DistributionAccounting::PoolWide => true,
+    }
+}
+
 /// Is a plan built for `accounting` still right for the address's current mode?
 /// `None` (no live mining session, e.g. after a reconnect) is no answer, so the plan stands.
 pub fn accounting_fits_mode(
