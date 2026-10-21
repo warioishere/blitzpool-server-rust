@@ -5,6 +5,7 @@
 //! ext 0x0001 `RequestExtensions`), [`CodecError`] and the frame writers, so
 //! each exists once.
 
+use stratum_core::binary_sv2::GetSize;
 use stratum_core::codec_sv2::MessageFrame;
 use stratum_core::common_messages_sv2::{
     SetupConnection, SetupConnectionErrorOwned, SetupConnectionSuccessOwned,
@@ -14,8 +15,10 @@ use stratum_core::extensions_sv2::extensions_negotiation::{
     RequestExtensionsSuccessOwned,
 };
 use stratum_core::framing_sv2::framing::SerializedFrame;
+use stratum_core::framing_sv2::header::Header;
 use stratum_core::parsers_sv2::{
-    AnyMessageOwned, CommonMessagesOwned, ExtensionsNegotiationOwned, ExtensionsOwned, ParserError,
+    AnyMessage, AnyMessageOwned, CommonMessagesOwned, ExtensionsNegotiationOwned, ExtensionsOwned,
+    ParserError, Tlv, TlvList,
 };
 
 use crate::extensions::RequestExtensions;
@@ -62,6 +65,48 @@ pub enum WriteError {
     Codec(#[from] CodecError),
     #[error("noise io: {0:?}")]
     Io(NoiseError),
+}
+
+// ── Inbound frames ──────────────────────────────────────────────────
+
+/// Bytes of TLV fields an inbound frame may carry after its message. The
+/// TLVs the pool reads take at most 50 (ext 0x0002 Worker-ID 5+32, ext 0x0003
+/// distribution_id 5+8); the rest is room for other extensions' TLVs, which
+/// are skipped. Every TLV of a listed extension becomes its own heap value
+/// from as little as 5 wire bytes, so without this bound one 16 MiB frame
+/// costs over 100 MiB before any state is checked.
+pub const MAX_INBOUND_TLV_BYTES: usize = 4096;
+
+#[derive(Debug, thiserror::Error)]
+pub enum InboundParseError {
+    #[error("parse: {0:?}")]
+    Parser(ParserError),
+    #[error(
+        "{tlv_bytes} bytes of TLV fields after the message, more than {MAX_INBOUND_TLV_BYTES}"
+    )]
+    TlvAreaTooLarge { tlv_bytes: usize },
+}
+
+/// Decode an inbound frame and the TLVs of `extensions` that follow its
+/// message, refusing a TLV area over [`MAX_INBOUND_TLV_BYTES`]. Shared by the
+/// mining and the JDP server; the same steps as
+/// `parsers_sv2::parse_message_frame_with_tlvs`, plus that bound.
+pub fn parse_inbound_frame<'a>(
+    header: Header,
+    payload: &'a mut [u8],
+    extensions: &[u16],
+) -> Result<(AnyMessage<'a>, Option<Vec<Tlv>>), InboundParseError> {
+    // The message borrows `payload`, so the TLV area is read from a copy.
+    let raw = payload.to_vec();
+    let message = AnyMessage::try_from((header, payload)).map_err(InboundParseError::Parser)?;
+    let tlv_area = raw.get(message.get_size()..).unwrap_or_default();
+    if tlv_area.len() > MAX_INBOUND_TLV_BYTES {
+        return Err(InboundParseError::TlvAreaTooLarge {
+            tlv_bytes: tlv_area.len(),
+        });
+    }
+    let tlvs = TlvList::from_bytes(tlv_area).for_extensions(extensions);
+    Ok((message, (!tlvs.is_empty()).then_some(tlvs)))
 }
 
 // ── Frame writers ───────────────────────────────────────────────────
@@ -250,4 +295,77 @@ pub(crate) fn request_extensions_error(
             },
         )),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extensions::SV2_EXTENSION_TYPE_WORKER_ID;
+    use stratum_core::codec_sv2::EncodableFrame;
+    use stratum_core::mining_sv2::SubmitSharesStandard;
+    use stratum_core::parsers_sv2::MiningOwned;
+
+    /// A `SubmitSharesStandard` frame followed by `tlv_area`, split into the
+    /// header and the payload the reader hands over.
+    fn share_frame_with(tlv_area: &[u8]) -> (Header, Vec<u8>) {
+        let msg =
+            AnyMessageOwned::Mining(MiningOwned::SubmitSharesStandard(SubmitSharesStandard {
+                channel_id: 1,
+                sequence_number: 2,
+                job_id: 3,
+                nonce: 4,
+                ntime: 5,
+                version: 0x2000_0000,
+            }));
+        let frame: MessageFrame<AnyMessageOwned> = msg.try_into().unwrap();
+        let mut bytes = vec![0u8; frame.encoded_length()];
+        frame.encode_into(&mut bytes).unwrap();
+        bytes.extend_from_slice(tlv_area);
+        let payload_len = (bytes.len() - Header::SIZE) as u32;
+        bytes[3..6].copy_from_slice(&payload_len.to_le_bytes()[..3]);
+        let header = Header::from_bytes(&bytes[..Header::SIZE]).unwrap();
+        (header, bytes.split_off(Header::SIZE))
+    }
+
+    /// `n` empty Worker-ID TLVs, the cheapest kept TLV on the wire.
+    fn empty_worker_tlvs(n: usize) -> Vec<u8> {
+        let one = Tlv::new(SV2_EXTENSION_TYPE_WORKER_ID, 0x01, Vec::new())
+            .encode()
+            .unwrap();
+        one.repeat(n)
+    }
+
+    /// An oversized TLV area is refused before any TLV is built, where the
+    /// library parser builds every one; at the bound it still parses.
+    #[test]
+    fn an_inbound_tlv_area_is_bounded() {
+        let per_tlv = empty_worker_tlvs(1).len();
+        let over = MAX_INBOUND_TLV_BYTES / per_tlv + 1;
+        let extensions = [SV2_EXTENSION_TYPE_WORKER_ID];
+
+        let (header, mut payload) = share_frame_with(&empty_worker_tlvs(over));
+        let (_, unbounded) = stratum_core::parsers_sv2::parse_message_frame_with_tlvs(
+            header,
+            &mut payload.clone(),
+            &extensions,
+        )
+        .unwrap();
+        assert_eq!(
+            unbounded.map(|t| t.len()),
+            Some(over),
+            "control: the library keeps every TLV"
+        );
+        match parse_inbound_frame(header, &mut payload, &extensions) {
+            Err(InboundParseError::TlvAreaTooLarge { tlv_bytes }) => {
+                assert_eq!(tlv_bytes, over * per_tlv);
+            }
+            other => panic!("expected TlvAreaTooLarge, got {other:?}"),
+        }
+
+        let at_bound = MAX_INBOUND_TLV_BYTES / per_tlv;
+        let (header, mut payload) = share_frame_with(&empty_worker_tlvs(at_bound));
+        let (message, tlvs) = parse_inbound_frame(header, &mut payload, &extensions).unwrap();
+        assert!(matches!(message, AnyMessage::Mining(_)));
+        assert_eq!(tlvs.map(|t| t.len()), Some(at_bound));
+    }
 }
