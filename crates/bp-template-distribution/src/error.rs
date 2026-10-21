@@ -9,10 +9,6 @@ pub enum TdpError {
     #[error("bitcoin-core IPC socket path does not exist: {0}")]
     SocketPathNotFound(PathBuf),
 
-    /// A found block would be dropped: see `spawn_worker`.
-    #[error("cannot create the solutions directory {path} beside the IPC socket: {reason}")]
-    SolutionsDir { path: PathBuf, reason: String },
-
     #[error("failed to spawn TDP worker thread: {0}")]
     WorkerSpawn(String),
 

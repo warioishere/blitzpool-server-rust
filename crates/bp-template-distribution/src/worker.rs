@@ -35,14 +35,6 @@ pub(crate) fn spawn_worker(
     if !config.socket_path.exists() {
         return Err(TdpError::SocketPathNotFound(config.socket_path.clone()));
     }
-    // bitcoin_core_sv2 creates `solutions` beside the socket the first time a
-    // block is submitted, and drops the block when that fails. Created here, a
-    // directory the pool cannot write stops the boot instead.
-    let solutions_dir = config.socket_path.with_file_name("solutions");
-    std::fs::create_dir_all(&solutions_dir).map_err(|e| TdpError::SolutionsDir {
-        path: solutions_dir.clone(),
-        reason: e.to_string(),
-    })?;
 
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
 
@@ -366,49 +358,6 @@ mod tests {
         let err = spawn_worker(cfg, cancel, submit_rx, templates_tx)
             .expect_err("non-existent socket should fail fast");
         assert!(matches!(err, TdpError::SocketPathNotFound(_)));
-    }
-
-    /// A `solutions` directory that cannot be created stops the spawn before
-    /// any IPC; where it can be, it is created and the spawn goes on to the
-    /// socket (the control), which here is no real node.
-    #[test]
-    fn worker_creates_the_solutions_directory_or_refuses_to_start() {
-        let spawn = |socket: &std::path::Path| {
-            let (_submit_tx, submit_rx) = mpsc::channel(1);
-            let (templates_tx, _) = broadcast::channel::<TemplateUpdate>(4);
-            spawn_worker(
-                TdpConfig::new(socket),
-                CancellationToken::new(),
-                submit_rx,
-                templates_tx,
-            )
-        };
-        let dir = std::env::temp_dir().join(format!(
-            "bp-tdp-solutions-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let socket = dir.join("node.sock");
-        std::fs::write(&socket, b"").unwrap();
-
-        // A file where the directory belongs: creating it fails for any user.
-        std::fs::write(dir.join("solutions"), b"").unwrap();
-        let err = spawn(&socket).expect_err("a blocked solutions directory must refuse");
-        assert!(matches!(err, TdpError::SolutionsDir { .. }), "got {err:?}");
-
-        std::fs::remove_file(dir.join("solutions")).unwrap();
-        let err = spawn(&socket).expect_err("a plain file is no bitcoin-core socket");
-        assert!(
-            !matches!(err, TdpError::SolutionsDir { .. }),
-            "control: got past the directory, got {err:?}"
-        );
-        assert!(dir.join("solutions").is_dir());
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
