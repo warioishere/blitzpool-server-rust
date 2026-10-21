@@ -66,6 +66,8 @@ tokio-util = { version = "0.7", features = ["codec", "io"] }
 # Low-level socket options (TCP keepalive and user timeout on accepted
 # stratum sockets; the user timeout needs the `all` feature)
 socket2 = { version = "0.6", features = ["all"] }
+# errno values an accept loop backs off on (EMFILE and kin)
+libc = "0.2"
 futures = "0.3"
 async-trait = "0.1"
 # Lock-free copy-on-write for read-mostly shared state (the accepted-share

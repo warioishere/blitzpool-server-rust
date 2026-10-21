@@ -182,6 +182,8 @@ async fn jdp_accept_loop(
     server: StratumV2JdpServer,
     cancel: CancellationToken,
 ) {
+    // The wait after the last failed accept; see `accept_error_pause`.
+    let mut pause: Option<Duration> = None;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -194,9 +196,18 @@ async fn jdp_accept_loop(
                     server.accept_connection(socket);
                 }
                 Err(err) => {
-                    warn!(%err, "jdp: accept failed");
+                    pause = crate::stratum::accept_error_pause(&err, pause);
+                    warn!(%err, ?pause, "jdp: accept failed");
+                    if let Some(pause) = pause {
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            _ = tokio::time::sleep(pause) => {}
+                        }
+                    }
+                    continue;
                 }
             }
         }
+        pause = None;
     }
 }

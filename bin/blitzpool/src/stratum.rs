@@ -6,6 +6,7 @@
 //! server; HTTP is closed with a `WARN`, TLS probes silently.
 
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use bp_config::AppConfig;
 use bp_notifications::dispatcher::NotificationDispatcher;
@@ -254,6 +255,8 @@ struct PortDispatch {
 /// TCP accept-loop with protocol-detect dispatch.
 async fn accept_loop(listener: TcpListener, dispatch: PortDispatch, cancel: CancellationToken) {
     let port = dispatch.sv1_port_config.port;
+    // The wait after the last failed accept; see `accept_error_pause`.
+    let mut pause: Option<Duration> = None;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -270,10 +273,43 @@ async fn accept_loop(listener: TcpListener, dispatch: PortDispatch, cancel: Canc
                     });
                 }
                 Err(err) => {
-                    warn!(%err, port, "stratum: accept failed");
+                    pause = accept_error_pause(&err, pause);
+                    warn!(%err, port, ?pause, "stratum: accept failed");
+                    if let Some(pause) = pause {
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            _ = tokio::time::sleep(pause) => {}
+                        }
+                    }
+                    continue;
                 }
             }
         }
+        pause = None;
+    }
+}
+
+/// First and longest wait of [`accept_error_pause`].
+const ACCEPT_PAUSE_MIN: Duration = Duration::from_millis(5);
+const ACCEPT_PAUSE_MAX: Duration = Duration::from_secs(1);
+
+/// How long an accept loop waits after `err` before calling `accept()` again,
+/// given the wait after the previous consecutive failure. Out of file
+/// descriptors or kernel buffers, the pending connection stays queued and an
+/// immediate retry fails the same way, spinning a core and the log; those
+/// wait, doubling from [`ACCEPT_PAUSE_MIN`] to [`ACCEPT_PAUSE_MAX`]. Any other
+/// error belongs to one connection and is retried at once (`None`).
+pub(crate) fn accept_error_pause(
+    err: &std::io::Error,
+    previous: Option<Duration>,
+) -> Option<Duration> {
+    match err.raw_os_error() {
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => Some(
+            previous
+                .map_or(ACCEPT_PAUSE_MIN, |p| p.saturating_mul(2))
+                .min(ACCEPT_PAUSE_MAX),
+        ),
+        _ => None,
     }
 }
 
@@ -510,6 +546,34 @@ impl PortTemplates {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── accept backoff ──────────────────────────────────────────────
+
+    /// Running out of descriptors or buffers waits, doubling up to the cap;
+    /// an error that belongs to one connection is retried at once.
+    #[test]
+    fn accept_backs_off_only_on_resource_exhaustion() {
+        let os = std::io::Error::from_raw_os_error;
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            let mut pause = None;
+            let mut seen = Vec::new();
+            for _ in 0..12 {
+                pause = accept_error_pause(&os(errno), pause);
+                seen.push(pause.expect("resource exhaustion must wait"));
+            }
+            assert_eq!(seen[0], ACCEPT_PAUSE_MIN, "errno {errno}");
+            assert_eq!(seen[1], ACCEPT_PAUSE_MIN * 2, "errno {errno}");
+            assert!(seen.windows(2).all(|w| w[0] <= w[1]), "errno {errno}");
+            assert_eq!(*seen.last().unwrap(), ACCEPT_PAUSE_MAX, "errno {errno}");
+        }
+        for errno in [libc::ECONNABORTED, libc::EPROTO, libc::EPERM] {
+            assert_eq!(
+                accept_error_pause(&os(errno), Some(ACCEPT_PAUSE_MAX)),
+                None,
+                "errno {errno} is per-connection"
+            );
+        }
+    }
 
     // ── socket options ──────────────────────────────────────────────
 

@@ -570,6 +570,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "jd_server_sv2",
+ "libc",
  "redis",
  "serde",
  "serde_json",
