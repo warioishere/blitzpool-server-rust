@@ -16,7 +16,9 @@ use bp_template_distribution::TemplateUpdate;
 use bp_vardiff::{Clock, SystemClock};
 use stratum_core::binary_sv2::GetSize;
 use stratum_core::mining_sv2::MESSAGE_TYPE_SET_CUSTOM_MINING_JOB;
-use stratum_core::parsers_sv2::{message_type_to_name, IsSv2Message};
+use stratum_core::parsers_sv2::{
+    message_type_to_name, parse_message_frame_with_tlvs, IsSv2Message,
+};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -24,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::bridge::JdpDeclaredJobRegistry;
-use crate::codec_common::{parse_inbound_frame, write_message, WriteError};
+use crate::codec_common::{write_message, WriteError};
 use crate::extensions::SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS;
 use crate::extranonce::{ConnectionExtranonce, SharedExtranonceAllocator};
 use crate::hooks::MiningServerHooks;
@@ -494,14 +496,14 @@ async fn run_mining_connection(
                 {
                     tlv_extensions.push(SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS);
                 }
-                let (any_message, mut tlvs) = match parse_inbound_frame(
+                let (any_message, mut tlvs) = match parse_message_frame_with_tlvs(
                     header,
                     sv2_frame.payload(),
                     &tlv_extensions,
                 ) {
                     Ok(parsed) => parsed,
                     Err(err) => {
-                        warn!("sv2 connection {session_id_hex} {err}");
+                        warn!("sv2 connection {session_id_hex} parse: {err:?}");
                         continue;
                     }
                 };

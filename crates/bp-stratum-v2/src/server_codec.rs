@@ -170,7 +170,7 @@ fn decode_submit_shares_extended(
         extranonce: m.extranonce.as_bytes().into(),
         // Trailing TLVs (ext 0x0002 Worker-ID etc.) are not in the
         // `AnyMessage`; the IO layer extracts them via
-        // `parse_inbound_frame` and fills this field.
+        // `parse_message_frame_with_tlvs` and fills this field.
         tlvs: Vec::new(),
     })
 }

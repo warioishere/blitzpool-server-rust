@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use bp_common::AddressId;
 use bp_vardiff::{Clock, SystemClock};
 use stratum_core::job_declaration_sv2::MESSAGE_TYPE_DECLARE_MINING_JOB;
+use stratum_core::parsers_sv2::parse_message_frame_with_tlvs;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -517,14 +518,14 @@ async fn run_jdp_connection(
                 ) else {
                     continue;
                 };
-                let (any_message, tlvs) = match crate::codec_common::parse_inbound_frame(
+                let (any_message, tlvs) = match parse_message_frame_with_tlvs(
                     header,
                     sv2_frame.payload(),
                     &tlv_extensions,
                 ) {
                     Ok(parsed) => parsed,
                     Err(err) => {
-                        warn!("jdp {session_id_hex} {err}");
+                        warn!("jdp {session_id_hex} parse: {err:?}");
                         continue;
                     }
                 };
