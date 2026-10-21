@@ -11,6 +11,7 @@ pub use runner::{ConsumerLoopConfig, EnsureMode, StreamConsumerHandle, StreamEnt
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bp_share_hook::{
@@ -101,9 +102,17 @@ const PUBLISH_BUFFER: usize = 8192;
 /// round trip per share.
 const PUBLISH_BATCH: usize = 256;
 
+/// First and longest wait before a refused batch is sent again.
+const PUBLISH_RETRY_MIN: Duration = Duration::from_millis(50);
+const PUBLISH_RETRY_MAX: Duration = Duration::from_secs(5);
+
 /// Bounded channel plus a drain task owning the `XADD`s, so the stratum read
-/// loop never blocks on Redis. Overflow drops are logged on power-of-two
-/// counts to surface a sustained stall without flooding.
+/// loop never blocks on Redis. A batch Redis refuses is sent again, doubling
+/// the wait from [`PUBLISH_RETRY_MIN`] to [`PUBLISH_RETRY_MAX`], until it
+/// lands, so a stall fills the buffer instead of losing shares; a retried
+/// pipeline that partly landed adds duplicates, which at-least-once delivery
+/// allows. Overflow drops are logged on power-of-two counts to surface a
+/// sustained stall without flooding.
 struct BufferedPublisher<T> {
     tx: mpsc::Sender<T>,
     dropped: Arc<AtomicU64>,
@@ -116,15 +125,35 @@ impl<T: Serialize + Send + Sync + 'static> BufferedPublisher<T> {
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(PUBLISH_BATCH);
             while rx.recv_many(&mut batch, PUBLISH_BATCH).await > 0 {
-                if let Err(e) = producer.publish_batch(&batch).await {
+                let encoded: Result<Vec<String>, _> =
+                    batch.iter().map(serde_json::to_string).collect();
+                let count = batch.len();
+                batch.clear();
+                let encoded = match encoded {
+                    Ok(encoded) => encoded,
+                    // The same values encode the same way: nothing to retry.
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            what,
+                            count,
+                            "share-stream: batch not encodable — dropped"
+                        );
+                        continue;
+                    }
+                };
+                let mut pause = PUBLISH_RETRY_MIN;
+                while let Err(e) = producer.publish_encoded(&encoded).await {
                     tracing::warn!(
                         error = %e,
                         what,
-                        count = batch.len(),
-                        "share-stream: stream publish failed (accounting deferred)"
+                        count,
+                        retry_in = ?pause,
+                        "share-stream: stream publish failed — retrying the batch"
                     );
+                    tokio::time::sleep(pause).await;
+                    pause = pause.saturating_mul(2).min(PUBLISH_RETRY_MAX);
                 }
-                batch.clear();
             }
         });
         Self {
@@ -263,12 +292,11 @@ impl<T: Serialize> StreamProducer<T> {
         Ok(id)
     }
 
-    /// [`Self::publish`] for several values in one round trip: one pipeline
-    /// of `XADD`s, applied in order.
-    pub async fn publish_batch(&self, values: &[T]) -> Result<(), StreamError> {
+    /// [`Self::publish`] for several JSON-encoded values in one round trip:
+    /// one pipeline of `XADD`s, applied in order.
+    async fn publish_encoded(&self, encoded: &[String]) -> Result<(), RedisError> {
         let mut pipe = redis::pipe();
-        for value in values {
-            let json = serde_json::to_string(value)?;
+        for json in encoded {
             pipe.xadd_maxlen(
                 &self.stream_key,
                 StreamMaxlen::Approx(self.maxlen),
@@ -278,8 +306,7 @@ impl<T: Serialize> StreamProducer<T> {
             .ignore();
         }
         let mut conn = self.conn.clone();
-        pipe.query_async::<()>(&mut conn).await?;
-        Ok(())
+        pipe.query_async::<()>(&mut conn).await
     }
 }
 
@@ -987,6 +1014,53 @@ mod tests {
                 break;
             }
         }
+        let ids: Vec<String> = got.into_iter().map(|c| c.value.share_id).collect();
+        let want: Vec<String> = (0..n).map(|i| format!("ep1:{i}")).collect();
+        assert_eq!(ids, want);
+    }
+
+    /// Shares whose publish Redis refuses are published once it accepts
+    /// again, complete and in order. The key holding a string makes every
+    /// `XADD` fail until it is deleted.
+    #[tokio::test]
+    async fn a_refused_publish_is_retried_until_redis_accepts_it() {
+        let Some(mut conn) = connect_or_skip(17).await else {
+            return;
+        };
+        let key = "bp:test:shares:accepted-refused";
+        redis::cmd("SET")
+            .arg(key)
+            .arg("not a stream")
+            .query_async::<()>(&mut conn)
+            .await
+            .expect("SET");
+
+        let sink = ProducingSink::new(StreamProducer::new(conn.clone(), key));
+        let n = PUBLISH_BATCH + 7;
+        for i in 0..n {
+            sink.record_accepted(sample(&format!("ep1:{i}"), MiningMode::Pplns, None).as_view())
+                .await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let kind: String = redis::cmd("TYPE")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .expect("TYPE");
+        assert_eq!(kind, "string", "precondition: nothing published yet");
+
+        let _: () = conn.del(key).await.expect("DEL");
+        let consumer = StreamConsumer::accepted(conn.clone(), key, "money", "c1");
+        let mut got = Vec::new();
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let len: usize = conn.xlen(key).await.expect("XLEN");
+            if len >= n {
+                break;
+            }
+        }
+        consumer.ensure_group().await.expect("ensure_group");
+        got.extend(consumer.read_new(n * 2, 1000).await.expect("read_new"));
         let ids: Vec<String> = got.into_iter().map(|c| c.value.share_id).collect();
         let want: Vec<String> = (0..n).map(|i| format!("ep1:{i}")).collect();
         assert_eq!(ids, want);
