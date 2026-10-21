@@ -66,6 +66,9 @@ pub const ERR_INVALID_PAYOUT_DISTRIBUTION: &str =
 /// JDCs retry `stale-chain-tip` and treat every other declaration error as fatal.
 pub const ERR_STALE_CHAIN_TIP: &str = "stale-chain-tip";
 
+/// The same wtxid listed twice: no block can carry a transaction twice.
+pub const ERR_INVALID_JOB_PARAM_WTXID_LIST: &str = "invalid-job-param-value-wtxid_list";
+
 /// After `ProvideMissingTransactions.Success` the node still cannot resolve
 /// every declared wtxid; an unseen declaration is never validated.
 pub const ERR_MISSING_TXS: &str = "missing-txs";
@@ -536,9 +539,11 @@ pub struct DeclarationContext {
     pub now_ms: u64,
 }
 
-/// Refusals from the session alone, checked before the token is spent so the
-/// JDC sees the real reason: a `distribution_id` TLV without negotiated ext
-/// 0x0003, or Coinbase-only mode.
+/// Refusals from the session and the declaration alone, checked before the
+/// token is spent so the JDC sees the real reason: a `distribution_id` TLV
+/// without negotiated ext 0x0003, Coinbase-only mode, or a wtxid listed twice.
+/// The last also bounds [`DeclaredTxs::against_template`], which clones the
+/// template's copy of every listed wtxid.
 pub fn declare_refused_by_session(
     state: &JdpSessionState,
     input: &DeclareMiningJobInput,
@@ -559,6 +564,14 @@ pub fn declare_refused_by_session(
             input.request_id,
             ERR_UNSUPPORTED_FEATURE_FLAGS,
             b"DeclareMiningJob requires Full-Template mode (DECLARE_TX_DATA flag)",
+        ));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(input.wtxid_list.len());
+    if !input.wtxid_list.iter().all(|wtxid| seen.insert(wtxid)) {
+        return Some(JdpHandlerOutcome::declare_error(
+            input.request_id,
+            ERR_INVALID_JOB_PARAM_WTXID_LIST,
+            b"a wtxid is listed more than once",
         ));
     }
     None
@@ -2161,6 +2174,43 @@ mod tests {
             out.outbound[0],
             JdpOutboundFrame::DeclareMiningJobSuccess { .. }
         ));
+    }
+
+    /// A block cannot carry a transaction twice, and each repeat of a template
+    /// wtxid would clone that transaction again. Refused before the token is
+    /// spent: the same token then declares the list without the repeat.
+    #[test]
+    fn a_declaration_listing_a_wtxid_twice_is_refused_without_spending_the_token() {
+        let mut s = fresh();
+        let token = complete_setup_and_allocate(&mut s);
+        let wtxid_a = [0x01; 32];
+        let mut tpl = HashMap::new();
+        tpl.insert(wtxid_a, vec![0xCA; 16]);
+
+        let out = declared(
+            &mut s,
+            &declare(4, token, vec![wtxid_a, wtxid_a]),
+            &tpl,
+            ctx(3_000),
+        );
+        match &out.outbound[0] {
+            JdpOutboundFrame::DeclareMiningJobError { error_code, .. } => {
+                assert_eq!(error_code, ERR_INVALID_JOB_PARAM_WTXID_LIST);
+            }
+            f => panic!("expected DeclareMiningJobError, got {f:?}"),
+        }
+        assert!(s.pending_declarations.is_empty());
+        assert_eq!(s.declared_jobs.len(), 0);
+
+        let out = declared(&mut s, &declare(5, token, vec![wtxid_a]), &tpl, ctx(3_000));
+        assert!(
+            matches!(
+                out.outbound[0],
+                JdpOutboundFrame::DeclareMiningJobSuccess { .. }
+            ),
+            "control: the token survives the refusal, got {:?}",
+            out.outbound[0]
+        );
     }
 
     #[test]

@@ -32,6 +32,9 @@ pub enum MergeError {
 }
 
 impl DeclaredTxs {
+    /// Clones the template's copy of each listed wtxid; the caller refuses a
+    /// list with repeats first (`declare_refused_by_session`), so no template
+    /// transaction is copied twice.
     pub fn against_template(
         wtxid_list: &[[u8; 32]],
         template_txs: &HashMap<[u8; 32], Vec<u8>>,
@@ -157,14 +160,6 @@ mod tests {
         assert_eq!(txs.missing_positions(), vec![0, 2, 3]);
         assert_eq!(txs.known(), vec![&[0xBB][..]]);
         assert!(txs.into_complete().is_err());
-    }
-
-    #[test]
-    fn a_duplicate_wtxid_fills_both_positions() {
-        let mut template = HashMap::new();
-        template.insert(wtxid(0x01), vec![0xAA]);
-        let txs = DeclaredTxs::against_template(&[wtxid(0x01), wtxid(0x01)], &template);
-        assert_eq!(txs.into_complete(), Ok(vec![vec![0xAA], vec![0xAA]]));
     }
 
     // ── completing ─────────────────────────────────────────────────
