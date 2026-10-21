@@ -109,8 +109,8 @@ pub struct PortConfig {
     /// Payout mode for shares on this port. The PPLNS port overrides any
     /// group membership: choosing the port is the session's opt-out.
     pub payout_mode: MiningMode,
-    /// Vardiff floor when `> 0`, also clamping suggest_difficulty. Keeps
-    /// sub-dust devices off the ledger on payout-mode ports.
+    /// Vardiff floor when `> 0`. Keeps sub-dust devices off the ledger on
+    /// payout-mode ports. See [`Self::effective_minimum_difficulty`].
     pub minimum_difficulty: f64,
 }
 
@@ -141,6 +141,17 @@ impl PortConfig {
             raw.max(self.minimum_difficulty)
         } else {
             raw
+        }
+    }
+
+    /// The floor no difficulty on this port goes below, a miner's suggestion
+    /// included: `minimum_difficulty` when set, else vardiff's own floor.
+    /// SV2 channels on the same port open against it too.
+    pub fn effective_minimum_difficulty(&self) -> f64 {
+        if self.minimum_difficulty > 0.0 {
+            self.minimum_difficulty
+        } else {
+            bp_vardiff::VARDIFF_DEFAULT_MIN_DIFFICULTY
         }
     }
 

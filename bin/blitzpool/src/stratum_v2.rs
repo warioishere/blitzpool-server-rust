@@ -185,14 +185,8 @@ pub(crate) fn build_per_port_servers(
             job_cache.clone(),
         );
         // The same per-port config drives SV1 and SV2. start_difficulty is
-        // the first SetTarget; min_difficulty is the vardiff floor, which
-        // only [pplns] sets. Without a floor, 0.00001 (bp-vardiff's
-        // default minimum) keeps vardiff from marching down to zero.
-        let min_diff = if sv1_port_config.minimum_difficulty > 0.0 {
-            sv1_port_config.minimum_difficulty
-        } else {
-            0.00001
-        };
+        // the first SetTarget; the floor is the one SV1 applies too.
+        let min_diff = sv1_port_config.effective_minimum_difficulty();
         let initial_diff = sv1_port_config.effective_initial_difficulty();
         let sv2_port_config = Sv2PortConfig {
             network,

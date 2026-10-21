@@ -433,14 +433,10 @@ pub(crate) fn handle_suggest_difficulty<C: Clock>(
     }
     state.suggested_difficulty = Some(request.clone());
 
-    // Floor: a port with `minimum_difficulty > 0` must clamp UP.
-    let new_diff = if port_config.minimum_difficulty > 0.0 {
-        request
-            .suggested_difficulty
-            .max(port_config.minimum_difficulty)
-    } else {
-        request.suggested_difficulty
-    };
+    // Below the floor every hash would be a share.
+    let new_diff = request
+        .suggested_difficulty
+        .max(port_config.effective_minimum_difficulty());
 
     // Shares on jobs sent before the suggest keep their send-time difficulty
     // as the bar (see `validate_submit`).
@@ -1272,6 +1268,28 @@ mod tests {
         assert_eq!(state.session_difficulty, 1000.0);
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert!(s.contains("\"params\":[1000]"));
+    }
+
+    /// A port without a minimum still has the vardiff floor, the same one an
+    /// SV2 channel opens against: a suggestion below it would make every hash
+    /// a share. One above it is taken as is (the control).
+    #[test]
+    fn suggest_difficulty_never_goes_below_the_vardiff_floor() {
+        let port = solo_port(16384.0);
+        assert_eq!(
+            port.minimum_difficulty, 0.0,
+            "precondition: no port minimum"
+        );
+        let floor = bp_vardiff::VARDIFF_DEFAULT_MIN_DIFFICULTY;
+        for (suggested, expected) in [(1e-9, floor), (floor * 4.0, floor * 4.0)] {
+            let mut state = fresh_state(TestClock::new(0), &port);
+            let req = SuggestDifficultyRequest {
+                id: RpcId::from(3),
+                suggested_difficulty: suggested,
+            };
+            let _ = handle_suggest_difficulty(&mut state, &port, req, 0);
+            assert_eq!(state.session_difficulty, expected, "suggested {suggested}");
+        }
     }
 
     // ── Submit precondition rejects ───────────────────────────────────
