@@ -41,6 +41,7 @@ mod live_mode_marker;
 mod live_sessions;
 mod membership;
 mod network_difficulty;
+mod one_line_log;
 mod payout_resolver;
 mod pending_blocks;
 mod redis_backup;
@@ -1493,12 +1494,13 @@ fn print_config_error_help(err: &ConfigError) {
 }
 
 /// Standard tracing setup: `RUST_LOG` env-filter (default `info`),
-/// line-oriented formatter to stdout.
+/// line-oriented formatter to stdout, one line per event (see
+/// [`one_line_log`]).
 fn init_tracing() {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer())
+        .with(fmt::layer().with_writer(one_line_log::OneLinePerEvent(std::io::stdout)))
         .init();
 }
