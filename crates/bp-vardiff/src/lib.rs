@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Per-session VarDiff engine and race-window clamp, shared by SV1 and SV2.
+//! Per-session VarDiff engine, shared by SV1 and SV2.
 //!
 //! One estimator drives every retarget. Arrivals are counted against the
 //! window's *exposure* `S = ∫dt/D(t)`, the share count a miner producing one
@@ -129,8 +129,6 @@ impl<T: Clock + ?Sized> Clock for std::sync::Arc<T> {
     }
 }
 
-// ── effective_job_difficulty ─────────────────────────────────────────
-
 /// Round a positive, finite difficulty UP to a power of two (callers guard
 /// the rest). Powers of two because a translating proxy rounds to one for
 /// SV1, so any other value books less than the miner works; upward because
@@ -142,29 +140,6 @@ pub fn round_up_to_power_of_two(val: f64) -> f64 {
         lower
     } else {
         lower * 2.0
-    }
-}
-
-/// Per-job difficulty clamp: firmware applies a raised target only on the
-/// next job, so in-flight shares are validated at the old one. The result
-/// drives BOTH validation and all accounting, so a share is never credited
-/// above the difficulty it was mined at.
-pub fn effective_job_difficulty(
-    job_id_int: Option<u64>,
-    current_diff: f64,
-    old_diff: f64,
-    diff_change_job_id: Option<u64>,
-) -> f64 {
-    match (job_id_int, diff_change_job_id) {
-        (None, _) => current_diff,
-        (Some(_), None) => current_diff,
-        (Some(jid), Some(boundary)) => {
-            if jid < boundary {
-                current_diff.min(old_diff)
-            } else {
-                current_diff
-            }
-        }
     }
 }
 
@@ -332,7 +307,7 @@ impl<C: Clock> VarDiffEngine<C> {
         }
     }
 
-    /// Record an accepted share at its credited (post-clamp) difficulty.
+    /// Record an accepted share at its credited difficulty.
     pub fn note_share_accepted(&mut self, credited_difficulty: f64) {
         let now = self.clock.now_ms();
         self.accepted_any = true;
@@ -588,54 +563,6 @@ fn slot_hashrate(work: f64, span_ms: u64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── effective_job_difficulty ─────────────────────────────────────────
-
-    #[test]
-    fn effective_diff_returns_current_when_no_ratchet_has_happened() {
-        assert_eq!(
-            effective_job_difficulty(Some(42), 100.0, 100.0, None),
-            100.0
-        );
-    }
-
-    #[test]
-    fn effective_diff_clamps_for_jobs_issued_before_an_upward_ratchet() {
-        // Ratchet from 100 → 200 at jobId 50. Job 49 = pre-ratchet → 100.
-        assert_eq!(
-            effective_job_difficulty(Some(49), 200.0, 100.0, Some(50)),
-            100.0
-        );
-    }
-
-    #[test]
-    fn effective_diff_uses_current_at_or_after_boundary() {
-        assert_eq!(
-            effective_job_difficulty(Some(50), 200.0, 100.0, Some(50)),
-            200.0
-        );
-        assert_eq!(
-            effective_job_difficulty(Some(51), 200.0, 100.0, Some(50)),
-            200.0
-        );
-    }
-
-    #[test]
-    fn effective_diff_also_clamps_on_downward_ratchet_symmetry() {
-        // Both directions use MIN.
-        assert_eq!(
-            effective_job_difficulty(Some(49), 100.0, 200.0, Some(50)),
-            100.0
-        );
-    }
-
-    #[test]
-    fn effective_diff_falls_back_to_current_for_unparseable_job_id() {
-        assert_eq!(
-            effective_job_difficulty(None, 200.0, 100.0, Some(50)),
-            200.0
-        );
-    }
 
     // ── helpers ──────────────────────────────────────────────────────────
 

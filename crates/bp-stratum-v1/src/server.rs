@@ -919,6 +919,7 @@ fn trim_trailing_newline(frame: &[u8]) -> std::borrow::Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::JobOwner;
 
     /// Pins that an over-cap line errors while a normal one decodes.
     #[tokio::test]
@@ -1173,7 +1174,7 @@ mod tests {
         let jid1 = registry.add_job(dummy_mining_job(), tid1, SystemClock.now_ms());
         assert_eq!(
             registry
-                .classify(&jid1, SystemClock.now_ms())
+                .classify(&jid1, JobOwner::TEST, SystemClock.now_ms())
                 .unwrap()
                 .classification,
             JobClassification::Active
@@ -1190,7 +1191,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             registry
-                .classify(&jid1, SystemClock.now_ms())
+                .classify(&jid1, JobOwner::TEST, SystemClock.now_ms())
                 .unwrap()
                 .classification,
             JobClassification::StaleCreditable,
@@ -1203,7 +1204,7 @@ mod tests {
         registry.cleanup_for_tip(&payload2.template.prev_hash, SystemClock.now_ms());
         assert_eq!(
             registry
-                .classify(&jid2, SystemClock.now_ms())
+                .classify(&jid2, JobOwner::TEST, SystemClock.now_ms())
                 .unwrap()
                 .classification,
             JobClassification::Active,

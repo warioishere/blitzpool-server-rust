@@ -38,6 +38,8 @@ pub(crate) const REJECT_NTIME: &str = "Ntime out of range";
 pub(crate) const REJECT_SUGGEST_DISABLED: &str =
     "Suggest difficulty is disabled for this connection";
 pub(crate) const REJECT_INVALID_ADDR: &str = "Invalid Bitcoin address";
+/// A second `mining.authorize` named a different address than the first.
+pub(crate) const REJECT_ADDRESS_LOCKED: &str = "Address locked to this connection";
 
 /// Validation-failure messages — emitted when `parse_request` returns
 /// [`FrameParseError::Validation`].

@@ -18,10 +18,9 @@ use crate::frame::{
     ERR_OTHER_UNKNOWN, REJECT_DUPLICATE, REJECT_JOB_NOT_FOUND, REJECT_LOW_DIFF, REJECT_NTIME,
     REJECT_STALE, REJECT_VERSION_ROLLING,
 };
-use crate::jobs::{JobClassification, JobRegistry};
+use crate::jobs::{JobClassification, JobOwner, JobRegistry};
 use crate::notify::ActiveSV1Template;
 use bp_mining_job::MiningJob;
-use bp_vardiff::effective_job_difficulty;
 
 // ── Reject classification ────────────────────────────────────────────
 
@@ -76,8 +75,8 @@ impl RejectReason {
 pub struct ShareAccept {
     /// `Active` or `StaleCreditable`; both are credited.
     pub classification: JobClassification,
-    /// Difficulty the share is credited at: the ratchet-clamped value, which can be
-    /// below the current session diff for work issued before a vardiff ratchet.
+    /// Difficulty the share is credited at: the lower of the job's send-time
+    /// difficulty and the session's current one, as `validate_submit` judges it.
     pub effective_difficulty: f64,
     /// Difficulty the hash actually reached; drives best-diff.
     pub submission_difficulty: f64,
@@ -122,11 +121,9 @@ pub(crate) enum ShareValidation {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SessionContext<'a> {
     pub extranonce1: &'a [u8; 4],
+    /// Only this session's jobs are found.
+    pub job_owner: JobOwner,
     pub session_difficulty: f64,
-    /// Difficulty before the last vardiff ratchet.
-    pub old_session_difficulty: f64,
-    /// Jobs allocated before this id were issued at `old_session_difficulty`.
-    pub diff_change_job_id: Option<u64>,
     /// Gates the per-share debug traces; rejections always log.
     pub share_logs: bool,
     /// BIP-310 `last_mask`: the pool's advertised mask until `mining.configure`
@@ -142,8 +139,8 @@ pub(crate) struct SessionShareCache {
     /// Header hashes of accepted shares; [`SeenShares::on_tip`] is driven by
     /// every new template, so a tip's hashes outlive its creditable jobs.
     pub(crate) seen: SeenShares,
-    /// Effective difficulty takes at most two values per session (current vs
-    /// ratchet-clamped), so memoizing the target pays off.
+    /// Effective difficulty is the session's current one for every share on a
+    /// job sent since the last retarget, so memoizing the target pays off.
     target_memo: TargetMemo,
 }
 
@@ -157,7 +154,10 @@ impl SessionShareCache {
 
 /// Checks run cheapest first: job lookup, stale, field parse, version mask,
 /// ntime window, the duplicate guard on the header hash, then that hash against the
-/// [`effective_job_difficulty`] target. Only an accepted share is recorded.
+/// effective difficulty: the LOWER of the job's send-time difficulty and the
+/// session's current one, so a share in flight across a retarget in either
+/// direction is not lost and is never credited above what the job asked for.
+/// Only an accepted share is recorded.
 /// Malformed fields reject as `LowDifficulty`, the same end state as a garbled header.
 pub(crate) fn validate_submit(
     submit: &SubmitRequest,
@@ -167,7 +167,7 @@ pub(crate) fn validate_submit(
     now_ms: u64,
 ) -> ShareValidation {
     // Registry classify.
-    let Some(lookup) = registry.classify(submit.job_id, now_ms) else {
+    let Some(lookup) = registry.classify(submit.job_id, session.job_owner, now_ms) else {
         tracing::warn!(
             worker = %submit.worker,
             job_id = %submit.job_id,
@@ -266,13 +266,7 @@ pub(crate) fn validate_submit(
         return ShareValidation::Rejected(RejectReason::DuplicateShare.into());
     }
 
-    let job_id_int = u64::from_str_radix(submit.job_id, 16).ok();
-    let effective_diff = effective_job_difficulty(
-        job_id_int,
-        session.session_difficulty,
-        session.old_session_difficulty,
-        session.diff_change_job_id,
-    );
+    let effective_diff = lookup.difficulty.min(session.session_difficulty);
     let effective_target = dedup.target_memo.target_for(Difficulty(effective_diff));
 
     // DEBUG level, so it also needs `RUST_LOG=...,bp_stratum_v1=debug`.
@@ -303,7 +297,7 @@ pub(crate) fn validate_submit(
 
     dedup.seen.record(lookup.template.prev_hash, hash);
 
-    // Against the network target, independent of the clamped share diff: a
+    // Against the network target, independent of the credited share diff: a
     // stale-creditable hit during a reorg can still find a valid alternative tip.
     let is_block_candidate = meets_network_target(&hash, lookup.template.n_bits);
     if is_block_candidate {
@@ -460,9 +454,8 @@ mod tests {
         // session diff 0 → effective target = Target::MAX → any hash passes.
         SessionContext {
             extranonce1: &[0x12, 0x34, 0x56, 0x78],
+            job_owner: JobOwner::TEST,
             session_difficulty: 0.0,
-            old_session_difficulty: 0.0,
-            diff_change_job_id: None,
             share_logs: false,
             version_rolling_mask: crate::config::VERSION_ROLLING_MASK,
         }
@@ -472,9 +465,8 @@ mod tests {
         // session diff 1e30 → target near zero → no hash passes.
         SessionContext {
             extranonce1: &[0x12, 0x34, 0x56, 0x78],
+            job_owner: JobOwner::TEST,
             session_difficulty: 1.0e30,
-            old_session_difficulty: 1.0e30,
-            diff_change_job_id: None,
             share_logs: false,
             version_rolling_mask: crate::config::VERSION_ROLLING_MASK,
         }
@@ -722,7 +714,11 @@ mod tests {
         let first = validate_submit(&s, &session, &mut cache, &reg, 1_500);
         assert!(matches!(first, ShareValidation::Accepted(_)));
 
-        let mut new_tip = reg.classify(&jid, 1_500).unwrap().template.prev_hash;
+        let mut new_tip = reg
+            .classify(&jid, JobOwner::TEST, 1_500)
+            .unwrap()
+            .template
+            .prev_hash;
         new_tip[0] ^= 0xFF;
         reg.cleanup_for_tip(&new_tip, 10_000);
         cache.seen.on_tip(&new_tip, 10_000, &reg.config());
@@ -747,7 +743,11 @@ mod tests {
     fn ntime_outside_the_template_window_is_rejected() {
         let (reg, jid) = populated_registry(DIFF_ONE_N_BITS);
         let session = easy_session();
-        let start = reg.classify(&jid, 1_500).unwrap().template.header_timestamp;
+        let start = reg
+            .classify(&jid, JobOwner::TEST, 1_500)
+            .unwrap()
+            .template
+            .header_timestamp;
         for (ntime, accepted) in [
             (start, true),
             (start + MAX_FUTURE_BLOCK_TIME, true),
@@ -875,49 +875,76 @@ mod tests {
         }
     }
 
-    // ── Effective-difficulty clamp at validation time ─────────────────
+    // ── Effective difficulty: the job's send-time one vs the session's ──
 
+    /// A job registered under [`JobOwner::TEST`] at `difficulty`.
+    fn registry_with_job_at(difficulty: f64) -> (JobRegistry, String) {
+        let reg = JobRegistry::from_server_config(&server_config());
+        let active = template_with_n_bits(DIFF_ONE_N_BITS);
+        let tid = reg.add_template(active.clone(), 1_000);
+        let jid = reg.add_job_shared(
+            Arc::new(mining_job_from(&active)),
+            tid,
+            JobOwner::TEST,
+            difficulty,
+            1_000,
+        );
+        (reg, jid)
+    }
+
+    /// The session went up since the job was sent, however many retargets
+    /// ago: the share was mined at the job's difficulty and is judged there.
     #[test]
-    fn pre_ratchet_share_validates_against_clamped_diff() {
-        // Job 1 predates the ratchet at id 2, so it is clamped to the old diff 0;
-        // without the clamp this would be a LowDifficulty reject.
-        let (reg, jid) = populated_registry(DIFF_ONE_N_BITS);
-        let session = SessionContext {
-            extranonce1: &[0x12, 0x34, 0x56, 0x78],
-            session_difficulty: 1.0e30,
-            old_session_difficulty: 0.0,
-            version_rolling_mask: crate::config::VERSION_ROLLING_MASK,
-            diff_change_job_id: Some(2),
-            share_logs: false,
-        };
+    fn a_job_sent_below_the_session_difficulty_is_judged_at_its_own() {
+        let (reg, jid) = registry_with_job_at(0.0);
         let mut cache = SessionShareCache::new();
-        let v = validate_submit(&submit(&jid, "deadbeef"), &session, &mut cache, &reg, 1_500);
+        let v = validate_submit(
+            &submit(&jid, "deadbeef"),
+            &impossible_session(),
+            &mut cache,
+            &reg,
+            1_500,
+        );
         match v {
-            ShareValidation::Accepted(a) => {
-                // Clamp activated: effective=MIN(1e30, 0)=0.
-                assert_eq!(a.effective_difficulty, 0.0);
-            }
-            _ => panic!("expected Accepted via clamp; the pre-ratchet share was real work"),
+            ShareValidation::Accepted(a) => assert_eq!(a.effective_difficulty, 0.0),
+            _ => panic!("expected Accepted at the job's difficulty; the share was real work"),
         }
     }
 
+    /// The session went down since the job was sent: the lower current
+    /// difficulty applies, so the share is not lost to the retarget.
     #[test]
-    fn post_ratchet_share_validates_against_current_diff() {
-        // Job 1 is at the ratchet boundary, so the impossible current diff applies.
-        let (reg, jid) = populated_registry(DIFF_ONE_N_BITS);
-        let session = SessionContext {
-            extranonce1: &[0x12, 0x34, 0x56, 0x78],
-            session_difficulty: 1.0e30,
-            old_session_difficulty: 0.0,
-            version_rolling_mask: crate::config::VERSION_ROLLING_MASK,
-            diff_change_job_id: Some(1),
-            share_logs: false,
-        };
+    fn a_job_sent_above_the_session_difficulty_is_judged_at_the_session_s() {
+        let (reg, jid) = registry_with_job_at(1.0e30);
         let mut cache = SessionShareCache::new();
-        let v = validate_submit(&submit(&jid, "deadbeef"), &session, &mut cache, &reg, 1_500);
+        let v = validate_submit(
+            &submit(&jid, "deadbeef"),
+            &easy_session(),
+            &mut cache,
+            &reg,
+            1_500,
+        );
+        match v {
+            ShareValidation::Accepted(a) => assert_eq!(a.effective_difficulty, 0.0),
+            _ => panic!("expected Accepted at the session's lower difficulty"),
+        }
+    }
+
+    /// Both at the impossible difficulty: nothing lowers the bar.
+    #[test]
+    fn a_job_at_the_session_difficulty_is_judged_at_it() {
+        let (reg, jid) = registry_with_job_at(1.0e30);
+        let mut cache = SessionShareCache::new();
+        let v = validate_submit(
+            &submit(&jid, "deadbeef"),
+            &impossible_session(),
+            &mut cache,
+            &reg,
+            1_500,
+        );
         match v {
             ShareValidation::Rejected(r) => assert_eq!(r.reason, RejectReason::LowDifficulty),
-            _ => panic!("expected LowDifficulty (no clamp, hit impossible target)"),
+            _ => panic!("expected LowDifficulty at the impossible target"),
         }
     }
 }

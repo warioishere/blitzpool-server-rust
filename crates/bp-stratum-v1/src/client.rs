@@ -21,10 +21,11 @@ use crate::frame::{
     write_extranonce_subscribe_response, write_set_difficulty, write_submit_success,
     write_subscribe_response, AuthorizeRequest, ConfigureRequest, FrameParseError, RequestedMask,
     RpcId, SV1Request, SubmitRequest, SubscribeRequest, SuggestDifficultyRequest,
-    ERR_OTHER_UNKNOWN, ERR_UNAUTHORIZED_WORKER, REJECT_INVALID_ADDR, REJECT_NOT_SUBSCRIBED,
-    REJECT_SUGGEST_DISABLED, REJECT_UNAUTHORIZED, VALIDATION_INVALID_AUTHORIZE,
+    ERR_OTHER_UNKNOWN, ERR_UNAUTHORIZED_WORKER, REJECT_ADDRESS_LOCKED, REJECT_INVALID_ADDR,
+    REJECT_NOT_SUBSCRIBED, REJECT_SUGGEST_DISABLED, REJECT_UNAUTHORIZED,
+    VALIDATION_INVALID_AUTHORIZE,
 };
-use crate::jobs::JobRegistry;
+use crate::jobs::{JobOwner, JobRegistry};
 use crate::notify::{build_notify_frame, ActiveSV1Template};
 use crate::submit::{
     validate_submit, RejectReason, SessionContext, SessionShareCache, ShareAccept, ShareValidation,
@@ -46,6 +47,8 @@ pub(crate) struct SessionState<C: Clock> {
     pub session_id_hex: String,
     pub extranonce1: [u8; 4],
     pub network: Network,
+    /// Every job sent here is registered under it; see [`JobOwner`].
+    pub job_owner: JobOwner,
 
     // Handshake messages — populated as they arrive
     pub subscription: Option<SubscribeRequest>,
@@ -56,11 +59,9 @@ pub(crate) struct SessionState<C: Clock> {
     pub stratum_initialized: bool,
     pub used_suggested_difficulty: bool,
 
-    // Difficulty + ckpool race clamp
+    // Difficulty; each job also keeps the one it was sent at
     pub initial_difficulty: f64,
     pub session_difficulty: f64,
-    pub old_session_difficulty: f64,
-    pub diff_change_job_id: Option<u64>,
 
     // VarDiff + dedup
     pub vardiff: VarDiffEngine<C>,
@@ -106,6 +107,7 @@ impl<C: Clock> SessionState<C> {
             session_id_hex,
             extranonce1,
             network: server_config.network,
+            job_owner: JobOwner::next(),
 
             subscription: None,
             authorization: None,
@@ -116,8 +118,6 @@ impl<C: Clock> SessionState<C> {
 
             initial_difficulty: initial,
             session_difficulty: initial,
-            old_session_difficulty: initial,
-            diff_change_job_id: None,
 
             vardiff,
             last_difficulty_check_ms: 0,
@@ -216,7 +216,7 @@ pub(crate) fn dispatch<C: Clock>(
     };
     match request {
         SV1Request::Subscribe(req) => {
-            handle_subscribe(state, port_config, registry, current_template, req, now_ms)
+            handle_subscribe(state, port_config, current_template, req, now_ms)
         }
         SV1Request::Configure(req) => handle_configure(state, req),
         SV1Request::Authorize(req) => handle_authorize(
@@ -229,7 +229,7 @@ pub(crate) fn dispatch<C: Clock>(
             now_ms,
         ),
         SV1Request::SuggestDifficulty(req) => {
-            handle_suggest_difficulty(state, port_config, registry, req, now_ms)
+            handle_suggest_difficulty(state, port_config, req, now_ms)
         }
         SV1Request::Submit(req) => handle_submit(state, registry, req, now_ms),
         SV1Request::ExtranonceSubscribe(id) => handle_extranonce_subscribe(id),
@@ -248,7 +248,6 @@ pub(crate) fn handle_extranonce_subscribe(id: RpcId) -> HandlerOutcome {
 pub(crate) fn handle_subscribe<C: Clock>(
     state: &mut SessionState<C>,
     port_config: &PortConfig,
-    registry: &Arc<JobRegistry>,
     current_template: Option<&ActiveSV1Template>,
     request: SubscribeRequest,
     now_ms: u64,
@@ -272,14 +271,7 @@ pub(crate) fn handle_subscribe<C: Clock>(
     // Init right after subscribe, as ckpool does, not gated on
     // mining.extranonce.subscribe. A re-subscribe skips it.
     if !state.stratum_initialized && !already_subscribed {
-        flush_init(
-            state,
-            port_config,
-            registry,
-            current_template,
-            now_ms,
-            &mut out,
-        );
+        flush_init(state, port_config, current_template, now_ms, &mut out);
     }
     out
 }
@@ -287,7 +279,6 @@ pub(crate) fn handle_subscribe<C: Clock>(
 fn flush_init<C: Clock>(
     state: &mut SessionState<C>,
     _port_config: &PortConfig,
-    registry: &Arc<JobRegistry>,
     current_template: Option<&ActiveSV1Template>,
     _now_ms: u64,
     out: &mut HandlerOutcome,
@@ -297,9 +288,6 @@ fn flush_init<C: Clock>(
     if let Some(sub) = &state.subscription {
         if sub.user_agent == "cpuminer" && state.initial_difficulty < CPUMINER_HIGH_DIFF_THRESHOLD {
             let new_diff = CPUMINER_FALLBACK_DIFFICULTY;
-            // Boundary for the ckpool race-clamp.
-            state.old_session_difficulty = state.session_difficulty;
-            state.diff_change_job_id = Some(registry.peek_next_job_id());
             state.session_difficulty = new_diff;
             state.vardiff.note_difficulty_assigned(new_diff);
             out.push_event(SessionEvent::DifficultyChanged);
@@ -390,6 +378,29 @@ pub(crate) fn handle_authorize<C: Clock>(
         return out;
     }
 
+    // The session stays on its first address, as an SV2 connection does: its
+    // template stream and registered session were chosen for that address.
+    // A repeat for the same address changes nothing, so the session is not
+    // registered twice.
+    if let Some(existing) = &state.authorization {
+        if existing.address == request.address {
+            out.push_frame(write_authorize_response(&id));
+        } else {
+            tracing::warn!(
+                session_id_hex = %state.session_id_hex,
+                username = ?request.raw_username,
+                reason = REJECT_ADDRESS_LOCKED,
+                "sv1 authorize refused"
+            );
+            out.push_frame(write_error(
+                &id,
+                ERR_UNAUTHORIZED_WORKER,
+                REJECT_ADDRESS_LOCKED,
+            ));
+        }
+        return out;
+    }
+
     state.authorization = Some(request.clone());
     out.push_frame(write_authorize_response(&id));
     out.push_event(SessionEvent::Authorized {
@@ -407,7 +418,6 @@ pub(crate) fn handle_authorize<C: Clock>(
 pub(crate) fn handle_suggest_difficulty<C: Clock>(
     state: &mut SessionState<C>,
     port_config: &PortConfig,
-    registry: &Arc<JobRegistry>,
     request: SuggestDifficultyRequest,
     _now_ms: u64,
 ) -> HandlerOutcome {
@@ -432,11 +442,9 @@ pub(crate) fn handle_suggest_difficulty<C: Clock>(
         request.suggested_difficulty
     };
 
-    // Snapshot the ckpool race-clamp boundary on every difficulty change,
-    // so shares in flight from before the suggest keep a fallback.
+    // Shares on jobs sent before the suggest keep their send-time difficulty
+    // as the bar (see `validate_submit`).
     if new_diff != state.session_difficulty {
-        state.old_session_difficulty = state.session_difficulty;
-        state.diff_change_job_id = Some(registry.peek_next_job_id());
         out.push_event(SessionEvent::DifficultyChanged);
     }
     state.session_difficulty = new_diff;
@@ -478,9 +486,8 @@ pub(crate) fn handle_submit<C: Clock>(
     let extranonce1 = state.extranonce1;
     let session_ctx = SessionContext {
         extranonce1: &extranonce1,
+        job_owner: state.job_owner,
         session_difficulty: state.session_difficulty,
-        old_session_difficulty: state.old_session_difficulty,
-        diff_change_job_id: state.diff_change_job_id,
         share_logs: state.share_logs,
         version_rolling_mask: state.version_rolling_mask,
     };
@@ -531,9 +538,10 @@ pub(crate) fn handle_submit<C: Clock>(
 
 /// Vardiff retarget, polled on the timer and after each accepted current-diff
 /// share. A retarget sends `mining.set_difficulty` plus a notify with
-/// `clean_jobs=false`: in-flight shares at the old difficulty are covered by
-/// the ckpool-style clamp, not by a job flush. A session never sent a notify
-/// is not judged (see [`VarDiffEngine::note_work_available`]).
+/// `clean_jobs=false`: in-flight shares on older jobs are judged at those
+/// jobs' send-time difficulty (see `validate_submit`), not lost to a job
+/// flush. A session never sent a notify is not judged (see
+/// [`VarDiffEngine::note_work_available`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_vardiff_check<C: Clock>(
     state: &mut SessionState<C>,
@@ -555,10 +563,7 @@ pub(crate) fn apply_vardiff_check<C: Clock>(
         return out;
     }
 
-    // Snapshot the boundary BEFORE the ratchet: any job id below the next
-    // id was issued under the old diff.
-    state.old_session_difficulty = state.session_difficulty;
-    state.diff_change_job_id = Some(registry.peek_next_job_id());
+    // Before the notify below, so the new job is registered at `target`.
     state.session_difficulty = target;
     state.vardiff.note_difficulty_assigned(target);
     out.push_event(SessionEvent::DifficultyChanged);
@@ -676,7 +681,13 @@ fn build_and_register_notify<C: Clock>(
         .ok()?;
 
     let template_id_hex = registry.add_template_shared(template.clone(), now_ms);
-    let job_id_hex = registry.add_job_shared(mining_job.clone(), template_id_hex, now_ms);
+    let job_id_hex = registry.add_job_shared(
+        mining_job.clone(),
+        template_id_hex,
+        state.job_owner,
+        state.session_difficulty,
+        now_ms,
+    );
     Some(build_notify_frame(
         template,
         &mining_job,
@@ -860,9 +871,8 @@ mod tests {
         let port = solo_port(16384.0);
         let mut state = fresh_state(TestClock::new(0), &port);
         state.subscription = Some(subscribe_req(Some("cpuminer/2.5")));
-        let reg = empty_registry();
         let mut out = HandlerOutcome::default();
-        flush_init(&mut state, &port, &reg, None, 0, &mut out);
+        flush_init(&mut state, &port, None, 0, &mut out);
 
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert!(s.contains("\"params\":[0.1]"));
@@ -875,9 +885,8 @@ mod tests {
         let port = solo_port(1_000_000.0);
         let mut state = fresh_state(TestClock::new(0), &port);
         state.subscription = Some(subscribe_req(Some("cpuminer/2.5")));
-        let reg = empty_registry();
         let mut out = HandlerOutcome::default();
-        flush_init(&mut state, &port, &reg, None, 0, &mut out);
+        flush_init(&mut state, &port, None, 0, &mut out);
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert!(s.contains("\"params\":[1000000]"));
         assert_eq!(state.session_difficulty, 1_000_000.0);
@@ -892,12 +901,11 @@ mod tests {
             ..solo_port(1_000_000.0)
         };
         let mut state = fresh_state(TestClock::new(0), &port);
-        let reg = empty_registry();
         let req = SuggestDifficultyRequest {
             id: RpcId::from(42),
             suggested_difficulty: 500_000.0,
         };
-        let out = handle_suggest_difficulty(&mut state, &port, &reg, req, 0);
+        let out = handle_suggest_difficulty(&mut state, &port, req, 0);
         assert_eq!(out.outbound_frames.len(), 1);
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert!(s.contains("Suggest difficulty is disabled for this connection"));
@@ -911,11 +919,9 @@ mod tests {
     fn subscribe_emits_response_with_session_extranonce_and_size() {
         let port = solo_port(16384.0);
         let mut state = fresh_state(TestClock::new(0), &port);
-        let reg = empty_registry();
         let out = handle_subscribe(
             &mut state,
             &port,
-            &reg,
             None,
             subscribe_req(Some("cgminer/4.11.1")),
             0,
@@ -936,11 +942,9 @@ mod tests {
         let port = solo_port(16384.0);
         let mut state = fresh_state(TestClock::new(0), &port); // session id "abcd1234"
         state.extranonce1 = [0x01, 0x00, 0x00, 0x2a];
-        let reg = empty_registry();
         let out = handle_subscribe(
             &mut state,
             &port,
-            &reg,
             None,
             subscribe_req(Some("cgminer/4.11.1")),
             0,
@@ -968,7 +972,6 @@ mod tests {
         let out = handle_subscribe(
             &mut state,
             &port,
-            &reg,
             Some(&template),
             subscribe_req(Some("cgminer/4.11.1")),
             0,
@@ -1152,6 +1155,59 @@ mod tests {
         assert!(state.authorization.is_some());
     }
 
+    /// The first authorize fixes the session's address, as the first channel
+    /// does on SV2: a later one for another address is refused and changes
+    /// nothing, a repeat for the same address is answered without registering
+    /// the session again. The fresh-session authorize of the second address
+    /// is the control that it is a valid one.
+    #[test]
+    fn a_later_authorize_cannot_move_the_session_to_another_address() {
+        let other_addr =
+            bitcoin::Address::p2wsh(&bitcoin::ScriptBuf::new(), bitcoin::KnownHrp::Regtest)
+                .to_string();
+        let port = solo_port(16384.0);
+        let reg = empty_registry();
+        let authorize = |state: &mut SessionState<Arc<TestClock>>, addr: &str| {
+            handle_authorize(
+                state,
+                &server_config(),
+                &port,
+                &reg,
+                None,
+                authorize_req(addr),
+                0,
+            )
+        };
+        let registered = |out: &HandlerOutcome| {
+            out.events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Authorized { .. }))
+        };
+
+        let mut control = fresh_state(TestClock::new(0), &port);
+        assert!(
+            registered(&authorize(&mut control, &other_addr)),
+            "precondition: the second address authorizes a fresh session"
+        );
+
+        let mut state = fresh_state(TestClock::new(0), &port);
+        assert!(registered(&authorize(&mut state, REGTEST_ADDR)));
+
+        let out = authorize(&mut state, &other_addr);
+        let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
+        assert!(s.contains(REJECT_ADDRESS_LOCKED), "got {s}");
+        assert!(!registered(&out));
+        assert_eq!(state.authorization.as_ref().unwrap().address, REGTEST_ADDR);
+
+        let out = authorize(&mut state, REGTEST_ADDR);
+        let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
+        assert!(s.contains("\"result\":true"), "got {s}");
+        assert!(
+            !registered(&out),
+            "a repeat for the same address must not register the session again"
+        );
+    }
+
     #[test]
     fn authorize_rejects_invalid_address_and_signals_disconnect() {
         let port = solo_port(16384.0);
@@ -1183,18 +1239,19 @@ mod tests {
     // ── Suggest_difficulty: accept path ───────────────────────────────
 
     #[test]
-    fn suggest_difficulty_updates_session_and_snapshots_ratchet_boundary() {
+    fn suggest_difficulty_updates_session_difficulty() {
         let port = solo_port(16384.0);
         let mut state = fresh_state(TestClock::new(0), &port);
-        let reg = empty_registry();
         let req = SuggestDifficultyRequest {
             id: RpcId::from(3),
             suggested_difficulty: 2048.0,
         };
-        let out = handle_suggest_difficulty(&mut state, &port, &reg, req, 0);
+        let out = handle_suggest_difficulty(&mut state, &port, req, 0);
         assert_eq!(state.session_difficulty, 2048.0);
-        assert_eq!(state.old_session_difficulty, 16384.0);
-        assert!(state.diff_change_job_id.is_some());
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::DifficultyChanged)));
         assert!(state.used_suggested_difficulty);
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert!(s.contains("\"params\":[2048]"));
@@ -1207,12 +1264,11 @@ mod tests {
             ..solo_port(16384.0)
         };
         let mut state = fresh_state(TestClock::new(0), &port);
-        let reg = empty_registry();
         let req = SuggestDifficultyRequest {
             id: RpcId::from(3),
             suggested_difficulty: 64.0,
         };
-        let out = handle_suggest_difficulty(&mut state, &port, &reg, req, 0);
+        let out = handle_suggest_difficulty(&mut state, &port, req, 0);
         assert_eq!(state.session_difficulty, 1000.0);
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert!(s.contains("\"params\":[1000]"));
@@ -1384,7 +1440,7 @@ mod tests {
         let (mut state, sc, port) = measured_session(&clock);
         state.authorization = Some(authorize_req(REGTEST_ADDR));
         let reg = empty_registry();
-        let _ = apply_new_template(
+        let out = apply_new_template(
             &mut state,
             &sc,
             &port,
@@ -1395,7 +1451,7 @@ mod tests {
             false,
             clock.now_ms(),
         );
-        let job_id = format!("{:x}", reg.peek_next_job_id() - 1);
+        let job_id = notify_job_id(&out.outbound_frames[0]);
         reg.cleanup(true, clock.now_ms()); // the job retires: a new block
         let nonces: Vec<String> = (0..40u32).map(|i| format!("{i:08x}")).collect();
         for nonce in &nonces {
@@ -1450,7 +1506,7 @@ mod tests {
         let (mut state, sc, port) = measured_session(&clock);
         state.authorization = Some(authorize_req(REGTEST_ADDR));
         let reg = empty_registry();
-        let _ = apply_new_template(
+        let out = apply_new_template(
             &mut state,
             &sc,
             &port,
@@ -1461,7 +1517,7 @@ mod tests {
             false,
             clock.now_ms(),
         );
-        let job_id = format!("{:x}", reg.peek_next_job_id() - 1);
+        let job_id = notify_job_id(&out.outbound_frames[0]);
         // The template's own timestamp, so the share is inside its ntime window.
         let ntime_hex = format!("{:08x}", template_for_regtest().header_timestamp);
         let share = SubmitRequest {
@@ -1473,9 +1529,8 @@ mod tests {
         let extranonce1 = state.extranonce1;
         let easy = SessionContext {
             extranonce1: &extranonce1,
+            job_owner: state.job_owner,
             session_difficulty: 0.0,
-            old_session_difficulty: 0.0,
-            diff_change_job_id: None,
             share_logs: false,
             version_rolling_mask: state.version_rolling_mask,
         };
@@ -1593,6 +1648,75 @@ mod tests {
             0,
         );
         assert!(out.outbound_frames.is_empty());
+    }
+
+    // ── Job ownership ─────────────────────────────────────────────────
+
+    /// `mining.notify[0]` of a notify frame.
+    fn notify_job_id(frame: &[u8]) -> String {
+        let v: serde_json::Value =
+            serde_json::from_slice(&frame[..frame.len() - 1]).expect("notify is JSON");
+        v["params"][0].as_str().expect("job id").to_string()
+    }
+
+    /// MONEY: the registry is shared by every stream on a port, so a job found
+    /// by id alone would let one session be credited for hashing a coinbase
+    /// that pays another session's address. Only the session that was sent a
+    /// job may submit on it; the owner's own submit is the control.
+    #[test]
+    fn a_session_cannot_submit_on_a_job_another_session_was_sent() {
+        let clock = Arc::new(TestClock::new(0));
+        let sc = server_config();
+        let port = solo_port(16384.0);
+        let reg = empty_registry();
+        let mut owner = SessionState::new(clock.clone(), &sc, &port, "aaaa0001".to_string());
+        let mut other = SessionState::new(clock.clone(), &sc, &port, "bbbb0002".to_string());
+        for state in [&mut owner, &mut other] {
+            state.stratum_initialized = true;
+            state.authorization = Some(authorize_req(REGTEST_ADDR));
+        }
+        let out = apply_new_template(
+            &mut owner,
+            &sc,
+            &port,
+            &reg,
+            &MiningJobCache::new(),
+            &Arc::new(template_for_regtest()),
+            &solo_payouts_fixture(REGTEST_ADDR),
+            false,
+            clock.now_ms(),
+        );
+        let job_id = notify_job_id(&out.outbound_frames[0]);
+        // Difficulty 0 lets any hash through, so only ownership can refuse.
+        owner.session_difficulty = 0.0;
+        other.session_difficulty = 0.0;
+        let ntime_hex = format!("{:08x}", template_for_regtest().header_timestamp);
+        let share = SubmitRequest {
+            ntime_hex: &ntime_hex,
+            ..submit_req(&job_id)
+        };
+
+        let out = handle_submit(&mut other, &reg, share.clone(), clock.now_ms());
+        let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
+        assert!(
+            s.contains("Job not found"),
+            "a job sent to another session must be unknown here, got {s}"
+        );
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::ShareAccepted(_))),
+            "a share on another session's job must not be credited"
+        );
+
+        let out = handle_submit(&mut owner, &reg, share, clock.now_ms());
+        assert!(
+            out.events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::ShareAccepted(_))),
+            "control: the session that was sent the job is credited, got {}",
+            std::str::from_utf8(&out.outbound_frames[0]).unwrap()
+        );
     }
 
     // ── Random session id ─────────────────────────────────────────────

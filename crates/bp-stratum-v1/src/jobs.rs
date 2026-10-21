@@ -6,6 +6,7 @@
 //! in lock-step; SV1 has no stale code, so a rejected stale share goes out as code 21.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bp_jobs_lifecycle::{age_entries, classify, LifecycleConfig};
@@ -15,6 +16,28 @@ use crate::config::ServerConfig;
 use crate::notify::ActiveSV1Template;
 
 pub(crate) use bp_jobs_lifecycle::JobClassification;
+
+/// The session a job was sent to. The registry is shared by every stream on a
+/// port, so a job is looked up by id AND owner: its coinbase pays the owner's
+/// payout set, and another session submitting on it would be credited for
+/// work on someone else's coinbase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobOwner(u64);
+
+/// Process-wide, so an owner is never reused while an old job is still held.
+static NEXT_JOB_OWNER: AtomicU64 = AtomicU64::new(1);
+
+impl JobOwner {
+    /// A fresh owner, distinct from every other one in the process.
+    pub fn next() -> Self {
+        Self(NEXT_JOB_OWNER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// The owner [`JobRegistry::add_job`] registers under; never handed out by
+    /// [`Self::next`], which starts at 1.
+    #[cfg(test)]
+    pub(crate) const TEST: Self = Self(0);
+}
 
 /// Result of [`JobRegistry::classify`]. Holds `Arc` handles so the caller can
 /// drop the registry lock before building a block coinbase.
@@ -26,6 +49,8 @@ pub struct JobLookup {
     /// Numeric id; the hex form exists only on the wire, which keeps allocation
     /// and string hashing out of the registry's critical section.
     pub template_id: u64,
+    /// The session difficulty when the job was sent.
+    pub difficulty: f64,
 }
 
 // ── Internal entries ─────────────────────────────────────────────────
@@ -35,6 +60,9 @@ struct JobEntry {
     mining_job: Arc<MiningJob>,
     /// See [`JobLookup::template_id`].
     template_id: u64,
+    owner: JobOwner,
+    /// See [`JobLookup::difficulty`].
+    difficulty: f64,
     creation_ms: u64,
     retired_at_ms: Option<u64>,
 }
@@ -82,15 +110,6 @@ impl JobRegistry {
         self.config
     }
 
-    /// Next job id without bumping the counter; the vardiff race-clamp uses it
-    /// as its ratchet boundary.
-    pub fn peek_next_job_id(&self) -> u64 {
-        self.inner
-            .lock()
-            .expect("job-registry mutex poisoned")
-            .next_job_id
-    }
-
     /// Test convenience over [`Self::add_template_shared`].
     pub fn add_template(&self, template: ActiveSV1Template, now_ms: u64) -> u64 {
         self.add_template_shared(Arc::new(template), now_ms)
@@ -114,9 +133,18 @@ impl JobRegistry {
         id
     }
 
-    /// Test convenience over [`Self::add_job_shared`].
-    pub fn add_job(&self, mining_job: MiningJob, template_id: u64, now_ms: u64) -> String {
-        self.add_job_shared(Arc::new(mining_job), template_id, now_ms)
+    /// Test convenience over [`Self::add_job_shared`]: owned by
+    /// [`JobOwner::TEST`], with no difficulty of its own, so a share on it is
+    /// judged at the session's.
+    #[cfg(test)]
+    pub(crate) fn add_job(&self, mining_job: MiningJob, template_id: u64, now_ms: u64) -> String {
+        self.add_job_shared(
+            Arc::new(mining_job),
+            template_id,
+            JobOwner::TEST,
+            f64::INFINITY,
+            now_ms,
+        )
     }
 
     /// Returns the hex id for `mining.notify[0]`. Takes a shared `Arc` because
@@ -125,6 +153,8 @@ impl JobRegistry {
         &self,
         mining_job: Arc<MiningJob>,
         template_id: u64,
+        owner: JobOwner,
+        difficulty: f64,
         now_ms: u64,
     ) -> String {
         let id = {
@@ -136,6 +166,8 @@ impl JobRegistry {
                 JobEntry {
                     mining_job,
                     template_id,
+                    owner,
+                    difficulty,
                     creation_ms: now_ms,
                     retired_at_ms: None,
                 },
@@ -145,9 +177,9 @@ impl JobRegistry {
         format!("{id:x}")
     }
 
-    /// `None` means `JobNotFound` (unknown, malformed, or its template is gone;
-    /// such an orphan job self-prunes here).
-    pub fn classify(&self, job_id_hex: &str, now_ms: u64) -> Option<JobLookup> {
+    /// `None` means `JobNotFound` (unknown, malformed, sent to another session,
+    /// or its template is gone; such an orphan job self-prunes here).
+    pub fn classify(&self, job_id_hex: &str, owner: JobOwner, now_ms: u64) -> Option<JobLookup> {
         // `from_str_radix` accepts a leading `+`, so without the digit check
         // `"+1"` would alias job `1`.
         if job_id_hex.is_empty() || !job_id_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -157,6 +189,9 @@ impl JobRegistry {
 
         let mut inner = self.inner.lock().expect("job-registry mutex poisoned");
         let job_entry = inner.jobs.get(&job_id)?.clone();
+        if job_entry.owner != owner {
+            return None;
+        }
 
         let template_entry = match inner.templates.get(&job_entry.template_id) {
             Some(t) => t.clone(),
@@ -174,6 +209,7 @@ impl JobRegistry {
             mining_job: job_entry.mining_job,
             template: template_entry.template,
             template_id: job_entry.template_id,
+            difficulty: job_entry.difficulty,
         })
     }
 
@@ -360,17 +396,23 @@ mod tests {
         assert_eq!(j2, "2");
     }
 
-    #[test]
-    fn peek_next_job_id_does_not_advance_the_counter() {
-        let reg = JobRegistry::new(cfg());
-        assert_eq!(reg.peek_next_job_id(), 1);
-        assert_eq!(reg.peek_next_job_id(), 1);
-        reg.add_template(dummy_active_template(), 1_000);
-        reg.add_job(dummy_mining_job(), 1, 1_000);
-        assert_eq!(reg.peek_next_job_id(), 2);
-    }
-
     // ── classify: 3 outcomes + None ────────────────────────────────────
+
+    /// A job is found only under the owner it was registered for, with the
+    /// difficulty it was sent at; another owner's lookup leaves it in place.
+    #[test]
+    fn a_job_is_found_only_by_its_owner() {
+        let reg = JobRegistry::new(cfg());
+        let tid = reg.add_template(dummy_active_template(), 1_000);
+        let owner = JobOwner::next();
+        let jid = reg.add_job_shared(Arc::new(dummy_mining_job()), tid, owner, 512.0, 1_000);
+
+        assert!(reg.classify(&jid, JobOwner::next(), 1_500).is_none());
+        let lookup = reg
+            .classify(&jid, owner, 1_500)
+            .expect("the owner still finds it");
+        assert_eq!(lookup.difficulty, 512.0);
+    }
 
     /// Pins that `classify` reports the template id `add_template` handed out.
     #[test]
@@ -379,7 +421,9 @@ mod tests {
         let tid = reg.add_template(dummy_active_template(), 1_000);
         let jid = reg.add_job(dummy_mining_job(), tid, 1_000);
 
-        let lookup = reg.classify(&jid, 1_500).expect("must be found");
+        let lookup = reg
+            .classify(&jid, JobOwner::TEST, 1_500)
+            .expect("must be found");
         assert_eq!(lookup.template_id, tid);
     }
 
@@ -396,7 +440,7 @@ mod tests {
         let jid = reg.add_job(dummy_mining_job(), tid, 1_000);
         assert_eq!(jid, "b", "wire id must be lowercase hex");
         assert!(
-            reg.classify(&jid, 1_500).is_some(),
+            reg.classify(&jid, JobOwner::TEST, 1_500).is_some(),
             "classify must accept the hex id it just issued"
         );
     }
@@ -408,16 +452,16 @@ mod tests {
         let tid = reg.add_template(dummy_active_template(), 1_000);
         let _ = reg.add_job(dummy_mining_job(), tid, 1_000);
 
-        assert!(reg.classify("not-hex", 1_500).is_none());
-        assert!(reg.classify("", 1_500).is_none());
-        assert!(reg.classify("zzzz", 1_500).is_none());
+        assert!(reg.classify("not-hex", JobOwner::TEST, 1_500).is_none());
+        assert!(reg.classify("", JobOwner::TEST, 1_500).is_none());
+        assert!(reg.classify("zzzz", JobOwner::TEST, 1_500).is_none());
         // `from_str_radix` alone would resolve `"+1"` to job 1.
         assert!(
-            reg.classify("1", 1_500).is_some(),
+            reg.classify("1", JobOwner::TEST, 1_500).is_some(),
             "sanity: job 1 exists, so the +1 assertion below is meaningful"
         );
         assert!(
-            reg.classify("+1", 1_500).is_none(),
+            reg.classify("+1", JobOwner::TEST, 1_500).is_none(),
             "a non-canonical id must not alias a real job"
         );
     }
@@ -428,7 +472,9 @@ mod tests {
         let tid = reg.add_template(dummy_active_template(), 1_000);
         let jid = reg.add_job(dummy_mining_job(), tid, 1_000);
 
-        let lookup = reg.classify(&jid, 1_500).expect("must be found");
+        let lookup = reg
+            .classify(&jid, JobOwner::TEST, 1_500)
+            .expect("must be found");
         assert_eq!(lookup.classification, JobClassification::Active);
         assert_eq!(lookup.template_id, tid);
     }
@@ -436,7 +482,7 @@ mod tests {
     #[test]
     fn classify_returns_none_for_unknown_job_id() {
         let reg = JobRegistry::new(cfg());
-        assert!(reg.classify("deadbeef", 1_000).is_none());
+        assert!(reg.classify("deadbeef", JobOwner::TEST, 1_000).is_none());
     }
 
     #[test]
@@ -448,19 +494,21 @@ mod tests {
 
         // 0 ms past retirement
         assert_eq!(
-            reg.classify(&jid, 10_000).unwrap().classification,
+            reg.classify(&jid, JobOwner::TEST, 10_000)
+                .unwrap()
+                .classification,
             JobClassification::StaleCreditable
         );
         // Just before grace expires
         assert_eq!(
-            reg.classify(&jid, 10_000 + cfg().grace_ms - 1)
+            reg.classify(&jid, JobOwner::TEST, 10_000 + cfg().grace_ms - 1)
                 .unwrap()
                 .classification,
             JobClassification::StaleCreditable
         );
         // Exact grace boundary — still creditable (≤)
         assert_eq!(
-            reg.classify(&jid, 10_000 + cfg().grace_ms)
+            reg.classify(&jid, JobOwner::TEST, 10_000 + cfg().grace_ms)
                 .unwrap()
                 .classification,
             JobClassification::StaleCreditable
@@ -476,7 +524,7 @@ mod tests {
 
         // 1 ms past grace
         assert_eq!(
-            reg.classify(&jid, 10_000 + cfg().grace_ms + 1)
+            reg.classify(&jid, JobOwner::TEST, 10_000 + cfg().grace_ms + 1)
                 .unwrap()
                 .classification,
             JobClassification::StaleRejected
@@ -506,7 +554,7 @@ mod tests {
 
         // classify on the orphan job → None and self-prune.
         let before = reg.job_count();
-        assert!(reg.classify(&jid, 21_000_000).is_none());
+        assert!(reg.classify(&jid, JobOwner::TEST, 21_000_000).is_none());
         // The orphan job entry was removed.
         assert_eq!(reg.job_count(), before - 1);
     }
@@ -527,7 +575,7 @@ mod tests {
         assert_eq!(reg.job_count(), 2);
 
         // All entries classified as stale-creditable (still within grace).
-        let lookup = reg.classify("1", 10_000).unwrap();
+        let lookup = reg.classify("1", JobOwner::TEST, 10_000).unwrap();
         assert_eq!(lookup.classification, JobClassification::StaleCreditable);
     }
 
@@ -543,7 +591,10 @@ mod tests {
         reg.cleanup(true, 20_000);
 
         // Rejected at 17_000 only if retired_at stayed at 10_000.
-        let cls = reg.classify(&jid, 17_000).unwrap().classification;
+        let cls = reg
+            .classify(&jid, JobOwner::TEST, 17_000)
+            .unwrap()
+            .classification;
         assert_eq!(cls, JobClassification::StaleRejected);
     }
 
@@ -568,12 +619,16 @@ mod tests {
         reg.cleanup_for_tip(&[0xCD; 32], 10_000);
 
         assert_eq!(
-            reg.classify(&j_old, 10_000).unwrap().classification,
+            reg.classify(&j_old, JobOwner::TEST, 10_000)
+                .unwrap()
+                .classification,
             JobClassification::StaleCreditable,
             "old-tip job must be retired"
         );
         assert_eq!(
-            reg.classify(&j_new, 10_000).unwrap().classification,
+            reg.classify(&j_new, JobOwner::TEST, 10_000)
+                .unwrap()
+                .classification,
             JobClassification::Active,
             "new-tip job must stay active"
         );
@@ -596,13 +651,17 @@ mod tests {
 
         // The fresh job survives the late second pass.
         assert_eq!(
-            reg.classify(&j_new, 12_500).unwrap().classification,
+            reg.classify(&j_new, JobOwner::TEST, 12_500)
+                .unwrap()
+                .classification,
             JobClassification::Active,
             "a later same-tip pass must never retire fresh new-tip jobs"
         );
         // Rejected at 17_000 only if retired_at stayed at 10_000.
         assert_eq!(
-            reg.classify(&j_old, 17_000).unwrap().classification,
+            reg.classify(&j_old, JobOwner::TEST, 17_000)
+                .unwrap()
+                .classification,
             JobClassification::StaleRejected
         );
     }
@@ -617,7 +676,9 @@ mod tests {
         reg.cleanup_for_tip(&[0xAB; 32], 50_000);
 
         assert_eq!(
-            reg.classify(&jid, 50_000).unwrap().classification,
+            reg.classify(&jid, JobOwner::TEST, 50_000)
+                .unwrap()
+                .classification,
             JobClassification::Active
         );
     }
@@ -632,7 +693,7 @@ mod tests {
         reg.cleanup_for_tip(&[0xAB; 32], 10_000);
 
         assert_eq!(reg.job_count(), 1);
-        assert!(reg.classify(&jid, 10_000).is_none());
+        assert!(reg.classify(&jid, JobOwner::TEST, 10_000).is_none());
         assert_eq!(reg.job_count(), 0);
     }
 
@@ -656,7 +717,7 @@ mod tests {
         reg.cleanup_for_tip(&[0xCD; 32], 10_000 + cfg().retention_ms + 1);
 
         assert!(
-            reg.classify(&j_old, 10_000 + cfg().retention_ms + 100)
+            reg.classify(&j_old, JobOwner::TEST, 10_000 + cfg().retention_ms + 100)
                 .is_none(),
             "old-tip job must be GC'd past retention"
         );
@@ -737,7 +798,9 @@ mod tests {
 
         // Phase 1: active.
         assert_eq!(
-            reg.classify(&jid, t0).unwrap().classification,
+            reg.classify(&jid, JobOwner::TEST, t0)
+                .unwrap()
+                .classification,
             JobClassification::Active
         );
 
@@ -747,13 +810,17 @@ mod tests {
 
         // Phase 3: share within grace → still creditable.
         assert_eq!(
-            reg.classify(&jid, t0 + 1_000).unwrap().classification,
+            reg.classify(&jid, JobOwner::TEST, t0 + 1_000)
+                .unwrap()
+                .classification,
             JobClassification::StaleCreditable
         );
 
         // Phase 4: share well past grace → rejected stale (NOT JobNotFound).
         assert_eq!(
-            reg.classify(&jid, t0 + 30_000).unwrap().classification,
+            reg.classify(&jid, JobOwner::TEST, t0 + 30_000)
+                .unwrap()
+                .classification,
             JobClassification::StaleRejected
         );
         // Entry still in the map for accurate classification.
@@ -768,7 +835,8 @@ mod tests {
         // Aging at t0 + retention + 1 → original job GC'd.
         reg.cleanup(false, t0 + cfg().retention_ms + 1);
         assert!(
-            reg.classify(&jid, t0 + cfg().retention_ms + 100).is_none(),
+            reg.classify(&jid, JobOwner::TEST, t0 + cfg().retention_ms + 100)
+                .is_none(),
             "original job must be GC'd past retention"
         );
     }
