@@ -63,7 +63,7 @@ async fn apply_budget(
     if new_budget == current {
         return;
     }
-    let c = crate::boot::tdp_constraint_for_budget(new_budget);
+    let c = bp_mining_job::coinbase_constraints_for_budget(new_budget);
 
     let applied = if new_budget > current {
         // INCREASE: bitcoin-core reservation first.

@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 bp-share = { workspace = true }
+bp-template-distribution = { workspace = true }
 tracing = { workspace = true }
 bitcoin = { workspace = true }
 thiserror = { workspace = true }
@@ -22,4 +23,3 @@ bp-test-support = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true }
 bp-regtest-harness = { workspace = true }
-bp-template-distribution = { workspace = true }

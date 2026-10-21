@@ -42,29 +42,30 @@ const SRI_TEST_PRV: &str = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n";
 struct ModeCase {
     /// The stream the connection must be routed onto.
     stream: StreamKind,
-    /// `max_additional_size` advertised on that stream's TDP handle.
-    reservation_bytes: u32,
+    /// Coinbase weight budget the stream's TDP reservation is derived from,
+    /// as boot derives it.
+    budget_wu: u32,
     /// Log prefix + skip-message label.
     label: &'static str,
 }
 
 const SOLO: ModeCase = ModeCase {
     stream: StreamKind::Solo,
-    reservation_bytes: 1_000,
+    budget_wu: 3_000,
     label: "solo",
 };
 
-/// The production Group-Solo reservation, `tdp_constraint_for_budget(10_000 WU)`.
+/// The production Group-Solo budget.
 const GROUP_SOLO: ModeCase = ModeCase {
     stream: StreamKind::GroupSolo,
-    reservation_bytes: 2_756,
+    budget_wu: 10_000,
     label: "group-solo",
 };
 
-/// The production Blockparty reservation, `tdp_constraint_for_budget(8_000 WU)`.
+/// The production Blockparty budget.
 const BLOCKPARTY: ModeCase = ModeCase {
     stream: StreamKind::Blockparty,
-    reservation_bytes: 2_256,
+    budget_wu: 8_000,
     label: "blockparty",
 };
 
@@ -291,10 +292,9 @@ async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>
         TdpConfig::new(node.ipc_socket_path())
             .with_fee_threshold(1)
             .with_min_interval_secs(1)
-            .with_coinbase_constraints(TdpCoinbaseConstraints {
-                max_additional_size: case.reservation_bytes,
-                max_additional_sigops: 0,
-            }),
+            .with_coinbase_constraints(bp_mining_job::coinbase_constraints_for_budget(
+                case.budget_wu,
+            )),
     )
     .expect("spawn per-mode TDP");
 

@@ -13,7 +13,7 @@
 
 # mainnet | testnet | testnet4 | regtest. Must match the node.
 network = "mainnet"
-# Written into every coinbase scriptSig.
+# Written into every coinbase scriptSig. Printable ASCII only.
 pool_identifier = "blitzpool"
 
 # JSON-RPC to Bitcoin Core: submitblock fallback, chain reads.

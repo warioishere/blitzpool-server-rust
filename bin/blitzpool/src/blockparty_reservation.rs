@@ -16,7 +16,7 @@ use bp_pplns::{
 use bp_template_distribution::TdpHandle;
 use tracing::{info, warn};
 
-use crate::boot::tdp_constraint_for_budget;
+use bp_mining_job::coinbase_constraints_for_budget;
 
 /// Hard cap on the Blockparty coinbase reservation (weight units), bounding
 /// the block space a party can claim: ~289 P2TR members, far beyond any
@@ -47,7 +47,7 @@ impl TdpCoinbaseReservation {
 /// Total coinbase weight budget (WU) needed for `member_count` member outputs
 /// plus one pool-fee output, using the worst-case P2TR output weight. Same WU
 /// units as `[blockparty].coinbase_weight_budget` and the PPLNS budget, so it
-/// feeds [`tdp_constraint_for_budget`] directly.
+/// feeds [`coinbase_constraints_for_budget`] directly.
 fn budget_for_members(member_count: usize) -> u32 {
     let outputs = (member_count as u32).saturating_add(1); // members + pool fee
     COINBASE_BASE_WEIGHT
@@ -74,7 +74,7 @@ impl CoinbaseReservation for TdpCoinbaseReservation {
             // Floor already covers this party — no raise, no template lag.
             return;
         };
-        let c = tdp_constraint_for_budget(target);
+        let c = coinbase_constraints_for_budget(target);
         match self
             .tdp
             .set_coinbase_constraints(c.max_additional_size, c.max_additional_sigops)

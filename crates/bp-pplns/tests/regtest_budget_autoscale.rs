@@ -19,9 +19,7 @@ use bp_pplns::{
 };
 use bp_regtest_harness::{RegtestConfig, RegtestNode};
 use bp_share::Target;
-use bp_template_distribution::{
-    NewTemplate, SetNewPrevHash, TdpCoinbaseConstraints, TdpConfig, TdpHandle, TemplateUpdate,
-};
+use bp_template_distribution::{NewTemplate, SetNewPrevHash, TdpConfig, TdpHandle, TemplateUpdate};
 use bp_test_support::wait_for_any_paired_template as wait_for_paired_template;
 use bp_test_support::{brute_force_nonce, poll_for_height};
 use serde_json::json;
@@ -45,14 +43,6 @@ const DIST_BUDGET: u32 = 350_000;
 const MINER_COUNT: usize = 2_000;
 /// Mempool fill target, above core's `B0` tx-selection cap so it binds.
 const MEMPOOL_TARGET_VBYTES: u64 = 990_000;
-
-/// Must match `boot::tdp_constraint_for_budget` in `bin/blitzpool`.
-fn tdp_constraint_for_budget(weight_budget: u32) -> TdpCoinbaseConstraints {
-    TdpCoinbaseConstraints {
-        max_additional_size: weight_budget.div_ceil(4).saturating_add(256),
-        max_additional_sigops: 0,
-    }
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::print_stderr)]
@@ -144,7 +134,7 @@ async fn autoscale_reservation_raise_turns_rejected_block_into_accepted() {
         TdpConfig::new(node.ipc_socket_path())
             .with_fee_threshold(1)
             .with_min_interval_secs(1)
-            .with_coinbase_constraints(tdp_constraint_for_budget(B0_BUDGET)),
+            .with_coinbase_constraints(bp_mining_job::coinbase_constraints_for_budget(B0_BUDGET)),
     )
     .expect("TdpHandle::spawn");
 
@@ -190,7 +180,7 @@ async fn autoscale_reservation_raise_turns_rejected_block_into_accepted() {
 
     // ── Autoscaler INCREASE: raise core's reservation to B1 ─────────────
     // Raise first, then subscribe + nudge so the template is built under B1.
-    let c1 = tdp_constraint_for_budget(B1_BUDGET);
+    let c1 = bp_mining_job::coinbase_constraints_for_budget(B1_BUDGET);
     tdp.set_coinbase_constraints(c1.max_additional_size, c1.max_additional_sigops)
         .await
         .expect("set_coinbase_constraints (raise to B1)");
@@ -248,7 +238,7 @@ fn build_distribution(
 
 /// core's `block_reserved_weight` for a given budget: `f(N).size * 4`.
 fn reserved_weight(budget: u32) -> u32 {
-    tdp_constraint_for_budget(budget)
+    bp_mining_job::coinbase_constraints_for_budget(budget)
         .max_additional_size
         .saturating_mul(4)
 }

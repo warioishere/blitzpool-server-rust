@@ -130,7 +130,11 @@ pub(crate) async fn boot(
         for (kind, budget) in alt_specs {
             alt_tdp.insert(
                 kind,
-                spawn_tdp_stream(&cfg.tdp, tdp_constraint_for_budget(budget), kind.as_label())?,
+                spawn_tdp_stream(
+                    &cfg.tdp,
+                    bp_mining_job::coinbase_constraints_for_budget(budget),
+                    kind.as_label(),
+                )?,
             );
         }
         (Some(tdp), alt_tdp)
@@ -285,12 +289,6 @@ async fn spawn_bitcoin_rpc(
 
 // ─── TDP ──────────────────────────────────────────────────────────
 
-/// Headroom over the byte-equivalent of `coinbase_weight_budget` (BIP-141
-/// weight units; `bytes ≈ weight / 4` for non-witness outputs), so a
-/// mismatch between the pre-trim weight estimate and the serialised size
-/// never yields a coinbase larger than bitcoin-core reserved.
-const TDP_COINBASE_SIZE_HEADROOM_BYTES: u32 = 256;
-
 /// The `bitcoin` network a configured [`bp_config::Network`] parses and
 /// builds addresses for. testnet4 shares the `tb` HRP and address bytes with
 /// testnet3, and rust-bitcoin 0.32 has no Testnet4 variant, so both map to
@@ -303,23 +301,6 @@ pub(crate) fn bitcoin_network(n: bp_config::Network) -> bitcoin::Network {
     }
 }
 
-/// Derive the bitcoin-core `CoinbaseOutputConstraints` for a coinbase weight
-/// budget. Boot and [`crate::coinbase_autoscaler`] both call it, so core's
-/// reservation never drifts from what the trimmer fits: a coinbase larger
-/// than core reserved makes core reject the block.
-pub(crate) fn tdp_constraint_for_budget(weight_budget: u32) -> TdpCoinbaseConstraints {
-    // Non-witness outputs weigh ~4 × bytes; ceil errs on the side of more
-    // headroom.
-    let bytes_strict = weight_budget.div_ceil(4);
-    let max_additional_size = bytes_strict.saturating_add(TDP_COINBASE_SIZE_HEADROOM_BYTES);
-    TdpCoinbaseConstraints {
-        max_additional_size,
-        // Pay-to-address scripts and the witness commitment OP_RETURN
-        // count no sigops.
-        max_additional_sigops: 0,
-    }
-}
-
 /// The default stream's reservation, coupled to `pplns.coinbase_weight_budget`
 /// so a TOML edit cannot move the trimmer's budget without core's reservation.
 fn coinbase_constraints_from_pplns_budget(
@@ -328,7 +309,7 @@ fn coinbase_constraints_from_pplns_budget(
     let weight_budget = pplns
         .map(|p| p.coinbase_weight_budget)
         .unwrap_or(bp_pplns::DEFAULT_COINBASE_WEIGHT_BUDGET);
-    tdp_constraint_for_budget(weight_budget)
+    bp_mining_job::coinbase_constraints_for_budget(weight_budget)
 }
 
 /// Spawn one TDP worker with a given coinbase reservation. Each reservation
@@ -539,7 +520,9 @@ mod tests {
         let c = coinbase_constraints_from_pplns_budget(None);
         // 50 000 WU / 4 = 12 500 bytes; + 256 byte headroom.
         assert_eq!(c.max_additional_size, 12_500 + 256);
-        assert_eq!(c.max_additional_sigops, 0);
+        // P2PKH payouts and the unpushed extranonce carry sigops; the bound
+        // itself is pinned in bp-mining-job.
+        assert!(c.max_additional_sigops > 0);
     }
 
     #[test]

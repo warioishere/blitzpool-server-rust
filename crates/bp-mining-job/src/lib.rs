@@ -10,6 +10,7 @@ mod cache;
 mod coinbase;
 mod header;
 mod merkle;
+mod reservation;
 
 pub use address::{address_to_script, AddressError};
 pub use bip54::{
@@ -27,3 +28,4 @@ pub use header::{
     BIP323_VERSION_ROLLING_MASK, MAX_FUTURE_BLOCK_TIME,
 };
 pub use merkle::{coinbase_merkle_branch, merkle_root_from_coinbase};
+pub use reservation::{coinbase_constraints_for_budget, COINBASE_SIZE_HEADROOM_BYTES};

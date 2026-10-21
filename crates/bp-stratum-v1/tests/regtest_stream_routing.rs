@@ -32,8 +32,9 @@ const REGTEST_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 struct ModeCase {
     /// The stream the connection must be routed onto.
     stream: StreamKind,
-    /// `max_additional_size` advertised on that stream's TDP handle.
-    reservation_bytes: u32,
+    /// Coinbase weight budget the stream's TDP reservation is derived from,
+    /// as boot derives it.
+    budget_wu: u32,
     /// Log prefix + skip-message label.
     label: &'static str,
 }
@@ -41,23 +42,21 @@ struct ModeCase {
 /// Solo pays a single output, so a tiny reservation is all it needs.
 const SOLO: ModeCase = ModeCase {
     stream: StreamKind::Solo,
-    reservation_bytes: 1_000,
+    budget_wu: 3_000,
     label: "solo",
 };
 
-/// ≈ `tdp_constraint_for_budget(10_000 WU)`: 10_000/4 + 256. The production
-/// Group-Solo reservation. Holds ~50 P2TR member outputs (50 × 43 B = 2150 B).
+/// The production Group-Solo budget. Holds ~50 P2TR member outputs (50 × 43 B = 2150 B).
 const GROUP_SOLO: ModeCase = ModeCase {
     stream: StreamKind::GroupSolo,
-    reservation_bytes: 2_756,
+    budget_wu: 10_000,
     label: "group-solo",
 };
 
-/// ≈ `tdp_constraint_for_budget(8_000 WU)`: 8_000/4 + 256. The production
-/// Blockparty reservation. Holds ~40 P2TR member outputs (40 × 43 B = 1720 B).
+/// The production Blockparty budget. Holds ~40 P2TR member outputs (40 × 43 B = 1720 B).
 const BLOCKPARTY: ModeCase = ModeCase {
     stream: StreamKind::Blockparty,
-    reservation_bytes: 2_256,
+    budget_wu: 8_000,
     label: "blockparty",
 };
 
@@ -312,10 +311,9 @@ async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>
         TdpConfig::new(node.ipc_socket_path())
             .with_fee_threshold(1)
             .with_min_interval_secs(1)
-            .with_coinbase_constraints(TdpCoinbaseConstraints {
-                max_additional_size: case.reservation_bytes,
-                max_additional_sigops: 0,
-            }),
+            .with_coinbase_constraints(bp_mining_job::coinbase_constraints_for_budget(
+                case.budget_wu,
+            )),
     )
     .expect("spawn per-mode TDP");
 
