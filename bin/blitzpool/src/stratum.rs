@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Unified SV1+SV2 listeners: one TCP listener per `[stratum]` port serves
-//! both protocols. Each port's [`accept_loop`] peeks the opening bytes,
-//! classifies them via [`detect`] and hands the socket to the SV1 or SV2
+//! both protocols. Each accepted connection's opening bytes are peeked,
+//! classified via [`detect`] and the socket handed to the SV1 or SV2
 //! server; HTTP is closed with a `WARN`, TLS probes silently.
 
 use std::sync::{Arc, RwLock};
@@ -225,7 +225,19 @@ pub(crate) async fn spawn(
             sv2_server: sv2.server.clone(),
             sv2_port_config: sv2.port_config,
         };
-        let task = tokio::spawn(accept_loop(listener, dispatch, cancel.clone()));
+        let task = tokio::spawn(accept_loop(
+            listener,
+            "stratum",
+            sv1.port_config.port,
+            cancel.clone(),
+            move |socket, peer| {
+                // Peeking and dispatching must not block subsequent accepts.
+                let dispatch = dispatch.clone();
+                tokio::spawn(async move {
+                    dispatch_connection(socket, peer, dispatch).await;
+                });
+            },
+        ));
         listener_tasks.push(task);
         ports.push(sv1.port_config.port);
         sv1_server_handles.push(sv1.server);
@@ -252,29 +264,33 @@ struct PortDispatch {
     sv2_port_config: bp_stratum_v2::mining::client::PortConfig,
 }
 
-/// TCP accept-loop with protocol-detect dispatch.
-async fn accept_loop(listener: TcpListener, dispatch: PortDispatch, cancel: CancellationToken) {
-    let port = dispatch.sv1_port_config.port;
+/// The accept loop of every pool listener, stratum ports and JDP alike:
+/// accepts until `cancel`, sets each socket's options with
+/// [`tune_accepted_socket`] and hands it to `on_accept`, which must not block.
+pub(crate) async fn accept_loop(
+    listener: TcpListener,
+    label: &'static str,
+    port: u16,
+    cancel: CancellationToken,
+    mut on_accept: impl FnMut(TcpStream, std::net::SocketAddr),
+) {
     // The wait after the last failed accept; see `accept_error_pause`.
     let mut pause: Option<Duration> = None;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
-                debug!(port, "stratum: accept-loop cancelled");
+                debug!(label, port, "accept-loop cancelled");
                 break;
             }
             res = listener.accept() => match res {
                 Ok((socket, peer)) => {
-                    // Each connection spawns its own task — peeking +
-                    // dispatching MUST NOT block subsequent accepts.
-                    let dispatch = dispatch.clone();
-                    tokio::spawn(async move {
-                        dispatch_connection(socket, peer, dispatch).await;
-                    });
+                    debug!(label, ?peer, port, "accepted");
+                    tune_accepted_socket(&socket, peer, port);
+                    on_accept(socket, peer);
                 }
                 Err(err) => {
                     pause = accept_error_pause(&err, pause);
-                    warn!(%err, port, ?pause, "stratum: accept failed");
+                    warn!(%err, label, port, ?pause, "accept failed");
                     if let Some(pause) = pause {
                         tokio::select! {
                             _ = cancel.cancelled() => break,
@@ -299,10 +315,7 @@ const ACCEPT_PAUSE_MAX: Duration = Duration::from_secs(1);
 /// immediate retry fails the same way, spinning a core and the log; those
 /// wait, doubling from [`ACCEPT_PAUSE_MIN`] to [`ACCEPT_PAUSE_MAX`]. Any other
 /// error belongs to one connection and is retried at once (`None`).
-pub(crate) fn accept_error_pause(
-    err: &std::io::Error,
-    previous: Option<Duration>,
-) -> Option<Duration> {
+fn accept_error_pause(err: &std::io::Error, previous: Option<Duration>) -> Option<Duration> {
     match err.raw_os_error() {
         Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => Some(
             previous
@@ -314,19 +327,19 @@ pub(crate) fn accept_error_pause(
 }
 
 /// How long sent data may stay unacknowledged before the kernel drops the
-/// connection. A miner that vanished without closing still gets jobs, so
-/// keepalive never runs, and without this Linux retransmits for
-/// `tcp_retries2` rounds before giving up.
+/// connection. A peer that vanished without closing still gets jobs or
+/// distributions, so keepalive never runs, and without this Linux
+/// retransmits for `tcp_retries2` rounds before giving up.
 #[cfg(target_os = "linux")]
-const STRATUM_USER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(150);
+const ACCEPTED_SOCKET_USER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(150);
 
-/// Socket options every accepted stratum connection gets, SV1 and SV2
-/// alike. Failures are logged and the connection is served anyway.
-fn tune_stratum_socket(socket: &TcpStream, peer: std::net::SocketAddr, port: u16) {
+/// Socket options every accepted connection gets, SV1, SV2 and JDP alike.
+/// Failures are logged and the connection is served anyway.
+fn tune_accepted_socket(socket: &TcpStream, peer: std::net::SocketAddr, port: u16) {
     // No Nagle: small latency-sensitive frames, and Nagle plus delayed ACK
     // adds ~40 ms per round-trip.
     if let Err(err) = socket.set_nodelay(true) {
-        warn!(%err, ?peer, port, "stratum: set_nodelay(true) failed (continuing)");
+        warn!(%err, ?peer, port, "set_nodelay(true) failed (continuing)");
     }
     // Keepalive keeps quiet connections in NAT/firewall tables and detects a
     // dead idle peer; it only probes a connection with nothing in flight, the
@@ -337,13 +350,14 @@ fn tune_stratum_socket(socket: &TcpStream, peer: std::net::SocketAddr, port: u16
         .with_interval(std::time::Duration::from_secs(20))
         .with_retries(4);
     if let Err(err) = SockRef::from(socket).set_tcp_keepalive(&keepalive) {
-        warn!(%err, ?peer, port, "stratum: set_tcp_keepalive(60s) failed (continuing)");
+        warn!(%err, ?peer, port, "set_tcp_keepalive(60s) failed (continuing)");
     }
     // Linux only (TCP_USER_TIMEOUT). With it set, the kernel also uses it
     // to close a connection whose keepalive probes go unanswered.
     #[cfg(target_os = "linux")]
-    if let Err(err) = SockRef::from(socket).set_tcp_user_timeout(Some(STRATUM_USER_TIMEOUT)) {
-        warn!(%err, ?peer, port, "stratum: set_tcp_user_timeout failed (continuing)");
+    if let Err(err) = SockRef::from(socket).set_tcp_user_timeout(Some(ACCEPTED_SOCKET_USER_TIMEOUT))
+    {
+        warn!(%err, ?peer, port, "set_tcp_user_timeout failed (continuing)");
     }
 }
 
@@ -357,7 +371,6 @@ async fn dispatch_connection(
     dispatch: PortDispatch,
 ) {
     let port = dispatch.sv1_port_config.port;
-    tune_stratum_socket(&socket, peer, port);
     let detected = match timeout(std::time::Duration::from_secs(30), peek_protocol(&socket)).await {
         Err(_) => {
             debug!(?peer, port, "stratum: detection timeout; closing");
@@ -577,26 +590,49 @@ mod tests {
 
     // ── socket options ──────────────────────────────────────────────
 
-    /// An accepted stratum socket gives up on a peer that stops
-    /// acknowledging after 150 s, and keeps its keepalive and no-delay.
+    /// A socket out of [`accept_loop`], the loop every listener runs, gives
+    /// up on a peer that stops acknowledging after 150 s and has keepalive
+    /// and no-delay. A socket accepted without it has none of them.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn accepted_sockets_get_the_user_timeout_keepalive_and_nodelay() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let _raw_client = TcpStream::connect(addr).await.unwrap();
+        let (raw, _) = listener.accept().await.unwrap();
+        let raw = SockRef::from(&raw);
+        assert_eq!(
+            raw.tcp_user_timeout().unwrap(),
+            None,
+            "control: unset by default"
+        );
+        assert!(!raw.keepalive().unwrap(), "control: unset by default");
+
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(accept_loop(
+            listener,
+            "test",
+            addr.port(),
+            cancel.clone(),
+            move |socket, _| {
+                let _ = tx.send(socket);
+            },
+        ));
         let _client = TcpStream::connect(addr).await.unwrap();
-        let (socket, peer) = listener.accept().await.unwrap();
+        let socket = rx.recv().await.unwrap();
+        cancel.cancel();
+        task.await.unwrap();
 
         let sock = SockRef::from(&socket);
         assert_eq!(
             sock.tcp_user_timeout().unwrap(),
-            None,
-            "precondition: unset by default"
+            Some(ACCEPTED_SOCKET_USER_TIMEOUT)
         );
-
-        tune_stratum_socket(&socket, peer, addr.port());
-        assert_eq!(sock.tcp_user_timeout().unwrap(), Some(STRATUM_USER_TIMEOUT));
-        assert_eq!(STRATUM_USER_TIMEOUT, std::time::Duration::from_secs(150));
+        assert_eq!(
+            ACCEPTED_SOCKET_USER_TIMEOUT,
+            std::time::Duration::from_secs(150)
+        );
         assert!(sock.keepalive().unwrap());
         assert_eq!(
             sock.tcp_keepalive_time().unwrap(),

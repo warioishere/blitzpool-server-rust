@@ -18,7 +18,7 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::info;
 
 use crate::jdp_hooks::build_jdp_hooks;
 use crate::payout_resolver::{ProductionDistributionSource, ProductionPayoutResolver};
@@ -166,7 +166,18 @@ pub(crate) async fn spawn(
     info!(port, "jdp: listening");
 
     let cancel = CancellationToken::new();
-    let listener_task = tokio::spawn(jdp_accept_loop(listener, server.clone(), cancel.clone()));
+    let listener_task = tokio::spawn(crate::stratum::accept_loop(
+        listener,
+        "jdp",
+        port,
+        cancel.clone(),
+        {
+            let server = server.clone();
+            move |socket, _| {
+                server.accept_connection(socket);
+            }
+        },
+    ));
 
     Ok(JdpHandles {
         port: Some(port),
@@ -174,40 +185,4 @@ pub(crate) async fn spawn(
         server: Some(server),
         cancel,
     })
-}
-
-/// Like the stratum accept loop, without protocol detection.
-async fn jdp_accept_loop(
-    listener: TcpListener,
-    server: StratumV2JdpServer,
-    cancel: CancellationToken,
-) {
-    // The wait after the last failed accept; see `accept_error_pause`.
-    let mut pause: Option<Duration> = None;
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                debug!("jdp: accept-loop cancelled");
-                break;
-            }
-            res = listener.accept() => match res {
-                Ok((socket, peer)) => {
-                    debug!(?peer, "jdp: accepted");
-                    server.accept_connection(socket);
-                }
-                Err(err) => {
-                    pause = crate::stratum::accept_error_pause(&err, pause);
-                    warn!(%err, ?pause, "jdp: accept failed");
-                    if let Some(pause) = pause {
-                        tokio::select! {
-                            _ = cancel.cancelled() => break,
-                            _ = tokio::time::sleep(pause) => {}
-                        }
-                    }
-                    continue;
-                }
-            }
-        }
-        pause = None;
-    }
 }
