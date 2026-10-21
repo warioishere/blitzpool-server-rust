@@ -28,11 +28,11 @@ use crate::extensions::{
     parse_distribution_id_tlv, SetPayoutDistribution, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
 };
 use crate::jdp::client::{
-    declare_refused_by_session, handle_allocate_token, handle_declare_mining_job,
-    handle_provide_missing_transactions_success, handle_push_solution, handle_request_extensions,
-    handle_setup_connection, parse_user_identifier_as_address, AllocateTokenContext,
-    DeclarationContext, DeclarationRef, JdpHandlerOutcome, JdpOutboundFrame, JdpSessionEvent,
-    JdpSessionState, SolutionHeader,
+    completion_refused, declare_refused_by_session, handle_allocate_token,
+    handle_declare_mining_job, handle_provide_missing_transactions_success, handle_push_solution,
+    handle_request_extensions, handle_setup_connection, parse_user_identifier_as_address,
+    AllocateTokenContext, DeclarationContext, DeclarationRef, JdpHandlerOutcome, JdpOutboundFrame,
+    JdpSessionEvent, JdpSessionState, SolutionHeader,
 };
 use crate::jdp::dynamic_outputs::CandidateBacking;
 use crate::jdp::tx_validation::DeclaredTxs;
@@ -723,19 +723,15 @@ async fn dispatch_jdp_inbound(
             )
         }
         InboundJdpFrame::ProvideMissingTransactionsSuccess(input) => {
-            // Second leg: re-ask the node with the full set, or an invalid tx
-            // could hide among the ones the pool was missing. An unknown
-            // `request_id` gets no merge and no node call; the handler refuses it.
-            // Nor does a tip that moved since the declare: the handler answers
-            // that `stale-chain-tip`, which a JDC retries, while the node would
-            // refuse a job on the old tip with its own code, which a JDC treats
-            // as fatal.
+            // Second leg: refused first on what needs no node, then the node is
+            // re-asked with the full set, or an invalid tx could hide among the
+            // ones the pool was missing.
             let tip_before_node = hooks.chain_tip.current_prev_hash().await;
+            if let Some(refusal) = completion_refused(state, input.request_id, tip_before_node) {
+                return refusal;
+            }
             let completed = hooks.job_validator.as_ref().and_then(|validator| {
                 let pending = state.pending_declarations.get(input.request_id)?;
-                if pending.prev_hash_at_declare != tip_before_node {
-                    return None;
-                }
                 let txs = pending.txs.completed_with(&input.transaction_list).ok()?;
                 Some((validator, &pending.input, txs))
             });

@@ -611,6 +611,31 @@ pub fn handle_declare_mining_job(
 
 // ── Handler: ProvideMissingTransactions.Success ─────────────────────
 
+/// `ProvideMissingTransactions.Success` refused before any merge: an unknown
+/// `request_id` is dropped, and a tip that moved since the declare drops the
+/// pending declaration with `stale-chain-tip`, the one code a JDC retries.
+/// Asked before the node call, so the node never judges a job on an old tip
+/// and its own code never reaches the JDC, and by the handler again, for a tip
+/// that moved during that call.
+pub fn completion_refused(
+    state: &mut JdpSessionState,
+    request_id: u32,
+    current_prev_hash: Option<[u8; 32]>,
+) -> Option<JdpHandlerOutcome> {
+    let Some(pending) = state.pending_declarations.get(request_id) else {
+        return Some(JdpHandlerOutcome::default());
+    };
+    if pending.prev_hash_at_declare == current_prev_hash {
+        return None;
+    }
+    state.pending_declarations.take(request_id);
+    Some(JdpHandlerOutcome::declare_error(
+        request_id,
+        ERR_STALE_CHAIN_TIP,
+        b"chain tip advanced during the missing-transactions round-trip",
+    ))
+}
+
 /// Handle `ProvideMissingTransactions.Success`: unknown `request_id` dropped,
 /// a list that does not fill the gaps ([`DeclaredTxs::complete_with`]) →
 /// `missing-txs`, else accept under a freshly resolved [`DeclarationContext`].
@@ -619,17 +644,13 @@ pub fn handle_provide_missing_transactions_success(
     input: ProvideMissingTransactionsSuccessInput,
     ctx: DeclarationContext,
 ) -> JdpHandlerOutcome {
-    let Some(pending) = state.pending_declarations.take(input.request_id) else {
-        return JdpHandlerOutcome::default();
-    };
-    // Tip moved during the round-trip: the JDC retries `stale-chain-tip`.
-    if pending.prev_hash_at_declare != ctx.current_prev_hash {
-        return JdpHandlerOutcome::declare_error(
-            input.request_id,
-            ERR_STALE_CHAIN_TIP,
-            b"chain tip advanced during the missing-transactions round-trip",
-        );
+    if let Some(refusal) = completion_refused(state, input.request_id, ctx.current_prev_hash) {
+        return refusal;
     }
+    let pending = state
+        .pending_declarations
+        .take(input.request_id)
+        .expect("completion_refused passes only a held declaration");
     let merged = match pending.txs.complete_with(input.transaction_list) {
         Ok(m) => m,
         Err(err) => {
