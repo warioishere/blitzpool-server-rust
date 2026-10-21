@@ -615,6 +615,16 @@ async fn dispatch_jdp_inbound(
     session_id: u32,
     now_ms: u64,
 ) -> JdpHandlerOutcome {
+    let is_setup = matches!(inbound, InboundJdpFrame::SetupConnection(_));
+    if let Some(reason) = crate::codec_common::setup_order_violation(is_setup, state.setup_complete)
+    {
+        return JdpHandlerOutcome {
+            outbound: Vec::new(),
+            events: vec![JdpSessionEvent::Disconnect {
+                reason: reason.to_string(),
+            }],
+        };
+    }
     match inbound {
         InboundJdpFrame::SetupConnection(input) => handle_setup_connection(state, &input),
         InboundJdpFrame::RequestExtensions(input) => {
@@ -1633,6 +1643,40 @@ mod tests {
             crate::jdp::client::ERR_INVALID_MINING_JOB_TOKEN
         );
         assert_eq!(validator.calls(), 0, "the node must not be asked at all");
+    }
+
+    /// SetupConnection opens a JDP connection, once, as on the mining port: a
+    /// message before its Success or a second SetupConnection closes it. The
+    /// first setup is the control.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_message_before_setup_or_a_second_setup_closes_the_connection() {
+        let hooks = JdpServerHooks::no_op();
+        let bridge = fresh_bridge();
+        let allocate = || {
+            InboundJdpFrame::AllocateMiningJobToken(AllocateMiningJobTokenInput {
+                request_id: 7,
+                user_identifier: ADDR.to_string(),
+            })
+        };
+        let closes = |out: &JdpHandlerOutcome| {
+            out.outbound.is_empty()
+                && out
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, JdpSessionEvent::Disconnect { .. }))
+        };
+
+        let mut state = fresh_session();
+        let out = dispatch_jdp_inbound(&mut state, allocate(), &hooks, &bridge, 1, 0).await;
+        assert!(closes(&out), "an allocate before setup closes, got {out:?}");
+        assert!(state.tokens.is_empty(), "no token before setup");
+
+        let mut state = fresh_session();
+        let setup = || InboundJdpFrame::SetupConnection(jdp_setup());
+        let out = dispatch_jdp_inbound(&mut state, setup(), &hooks, &bridge, 1, 0).await;
+        assert!(!closes(&out), "control: the first setup is served");
+        let out = dispatch_jdp_inbound(&mut state, setup(), &hooks, &bridge, 1, 0).await;
+        assert!(closes(&out), "a second setup closes, got {out:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]

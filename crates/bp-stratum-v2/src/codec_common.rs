@@ -109,6 +109,18 @@ pub fn parse_inbound_frame<'a>(
     Ok((message, (!tlvs.is_empty()).then_some(tlvs)))
 }
 
+/// SV2 Common/SetupConnection opens a connection, once. The reason to close
+/// when a frame breaks that: anything before the setup succeeded, or a second
+/// SetupConnection, which would re-decide flags channels were opened under.
+/// Shared by the mining and the JDP server.
+pub fn setup_order_violation(is_setup: bool, setup_complete: bool) -> Option<&'static str> {
+    match (is_setup, setup_complete) {
+        (true, true) => Some("a second SetupConnection"),
+        (false, false) => Some("a message before SetupConnection.Success"),
+        (true, false) | (false, true) => None,
+    }
+}
+
 // ── Frame writers ───────────────────────────────────────────────────
 
 /// Put a base-protocol message into its SV2 frame and write it.

@@ -142,6 +142,11 @@ pub const ERR_STALE_CHAIN_TIP: &str = "stale-chain-tip";
 /// ext 0x0003/Output Verification check enforces the split, so non-Solo is fine.
 pub const ERR_CUSTOM_JOB_REQUIRES_SOLO: &str = "custom-jobs-require-solo";
 
+/// `work-selection-not-declared` — a custom job on a connection whose
+/// `SetupConnection.flags` lack `REQUIRES_WORK_SELECTION`, which SV2
+/// Mining/SetCustomMiningJob makes a MUST.
+pub const ERR_WORK_SELECTION_NOT_DECLARED: &str = "work-selection-not-declared";
+
 /// `invalid-nbits` — a custom job on the pool's own tip whose `n_bits` is not
 /// what the pool served. The block-candidate threshold derives from it, so a
 /// trivial `n_bits` would record every share as a found block. Across a tip
@@ -672,17 +677,12 @@ pub fn handle_setup_connection<C: Clock>(
 // ── Handler: RequestExtensions (ext 0x0001) ─────────────────────────
 
 /// Handle `RequestExtensions` (ext 0x0001) against [`SUPPORTED_MINING_EXTENSIONS`].
-/// A pre-setup request is silently dropped: ext 0x0001/Implementation Notes
-/// requires it after `SetupConnection.Success`, and answering would let a client
-/// skip the handshake.
+/// Only reached after `SetupConnection.Success`, as ext 0x0001/Implementation
+/// Notes requires: the dispatcher closes a connection that sends it earlier.
 pub fn handle_request_extensions<C: Clock>(
     state: &mut MiningSessionState<C>,
     input: &RequestExtensions,
 ) -> HandlerOutcome {
-    if !state.setup_complete {
-        return HandlerOutcome::default();
-    }
-
     let mut supported = Vec::new();
     let mut unsupported = Vec::new();
     for &ext in &input.requested_extensions {
@@ -1972,6 +1972,11 @@ pub fn handle_set_custom_mining_job<C: Clock>(
         })
     };
 
+    // Also keeps custom jobs off grouped channels: only a connection without
+    // work selection is grouped, and a group's job ids are its own counter.
+    if !state.work_selection {
+        return reject(ERR_WORK_SELECTION_NOT_DECLARED);
+    }
     let Some(channel) = state.channels.get_mut(&input.channel_id) else {
         return reject(ERR_INVALID_CHANNEL_ID);
     };
@@ -3658,17 +3663,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Pre-SetupConnection RequestExtensions → silent drop.
-    #[test]
-    fn request_extensions_pre_setup_is_silent() {
-        let mut s = fresh_session();
-        let out = handle_request_extensions(&mut s, &req_ext(1, vec![0x0002]));
-        assert!(out.outbound.is_empty());
-        assert!(out.events.is_empty());
-        // negotiated_extensions stays empty.
-        assert!(s.negotiated_extensions.is_empty());
-    }
-
     /// All requested extensions supported → Success + state-update.
     #[test]
     fn request_extensions_all_supported_emits_success() {
@@ -4390,8 +4384,23 @@ pub(crate) mod tests {
     /// and BIP-34 height (`02 C8 00`, height 200) match the custom-job
     /// fixtures. Cold-start tests clear it explicitly.
     fn session_with_extended_channel() -> MiningSessionState<Arc<TestClock>> {
+        session_with_extended_channel_after(&good_setup())
+    }
+
+    /// What a JDC opens: a work-selection connection with one extended
+    /// channel, the only shape `SetCustomMiningJob` is served on.
+    fn jdc_session_with_extended_channel() -> MiningSessionState<Arc<TestClock>> {
+        session_with_extended_channel_after(&SetupConnectionInput {
+            flags: FLAG_REQUIRES_VERSION_ROLLING | FLAG_REQUIRES_WORK_SELECTION,
+            ..good_setup()
+        })
+    }
+
+    fn session_with_extended_channel_after(
+        setup: &SetupConnectionInput,
+    ) -> MiningSessionState<Arc<TestClock>> {
         let mut s = fresh_session();
-        handle_setup_connection(&mut s, &good_setup());
+        handle_setup_connection(&mut s, setup);
         let _ = handle_open_extended_mining_channel(
             &mut s,
             &open_ext(1, &format!("{}.w", REGTEST_ADDR)),
@@ -4435,6 +4444,31 @@ pub(crate) mod tests {
             "TDP client must not receive any frames"
         );
         assert!(out.events.is_empty());
+    }
+
+    /// SV2 Mining/SetCustomMiningJob: `SetupConnection.flags` MUST contain
+    /// `REQUIRES_WORK_SELECTION`. Without it the job is refused; the same job
+    /// on a work-selection connection is the control.
+    #[test]
+    fn a_custom_job_without_work_selection_is_refused() {
+        let alloc = base_allocation(REGTEST_ADDR, 42);
+        let outputs = [txout(312_500_000, designated_script(REGTEST_ADDR))];
+        for (work_selection, accept) in [(false, false), (true, true)] {
+            let mut s = solo_session_with_extended_channel();
+            s.work_selection = work_selection;
+            let cid = s.primary_channel.unwrap();
+            let input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
+            let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+            match (&out.outbound[0], accept) {
+                (OutboundFrame::SetCustomMiningJobSuccess { .. }, true) => {}
+                (OutboundFrame::SetCustomMiningJobError { error_code, .. }, false) => {
+                    assert_eq!(error_code, ERR_WORK_SELECTION_NOT_DECLARED);
+                }
+                (other, want) => {
+                    panic!("work_selection={work_selection}: accept={want}, got {other:?}")
+                }
+            }
+        }
     }
 
     /// A work-selection connection gets nothing from a template change, and a
@@ -5501,6 +5535,7 @@ pub(crate) mod tests {
     #[test]
     fn set_custom_mining_job_unknown_channel_emits_invalid_channel_id() {
         let mut s = fresh_session();
+        s.work_selection = true;
         let token = Token([1u8; 16]);
         let input = custom_job_input(99, token);
         let out = handle_set_custom_mining_job(&mut s, &input, None, None, None, 1_000);
@@ -5515,6 +5550,7 @@ pub(crate) mod tests {
     #[test]
     fn set_custom_mining_job_standard_channel_emits_invalid_job_id() {
         let mut s = session_with_standard_channel();
+        s.work_selection = true;
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
         let input = custom_job_input(cid, token);
@@ -5632,7 +5668,7 @@ pub(crate) mod tests {
     /// Extended-channel session on the Solo stream, the only one where a
     /// base-protocol custom job is accepted.
     pub(crate) fn solo_session_with_extended_channel() -> MiningSessionState<Arc<TestClock>> {
-        let mut s = session_with_extended_channel();
+        let mut s = jdc_session_with_extended_channel();
         s.set_stream(StreamKind::Solo);
         s
     }
@@ -5700,7 +5736,7 @@ pub(crate) mod tests {
     /// One miner cannot claim another's declared job.
     #[test]
     fn set_custom_mining_job_bridge_entry_mismatching_address_rejects() {
-        let mut s = session_with_extended_channel();
+        let mut s = jdc_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
         let other_addr = "bcrt1qvs8k07ggszru23v9p42vpg4jxts9y2k8kkujja";
@@ -5728,7 +5764,7 @@ pub(crate) mod tests {
     /// A token backing nothing is rejected, never accepted as an unvalidated job.
     #[test]
     fn set_custom_mining_job_unknown_token_rejects() {
-        let mut s = session_with_extended_channel();
+        let mut s = jdc_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         let input = custom_job_input(cid, Token([0xEEu8; 16]));
         let out = handle_set_custom_mining_job(&mut s, &input, None, None, None, 1_000);
@@ -6087,7 +6123,7 @@ pub(crate) mod tests {
     /// An allocation does not make a shared-payout stream mineable on the base protocol.
     #[test]
     fn a_coinbase_only_job_off_solo_is_still_refused() {
-        let mut s = session_with_extended_channel();
+        let mut s = jdc_session_with_extended_channel();
         assert_ne!(
             s.accounting_stream,
             StreamKind::Solo,
@@ -6113,7 +6149,7 @@ pub(crate) mod tests {
     /// A declared job off its declaration's tip gets `stale-chain-tip`.
     #[test]
     fn set_custom_mining_job_declared_tip_mismatch_rejects_stale_chain_tip() {
-        let mut s = session_with_extended_channel();
+        let mut s = jdc_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
         let mut entry = bridge_entry_for(token, REGTEST_ADDR, 42);
@@ -6142,7 +6178,7 @@ pub(crate) mod tests {
     #[test]
     fn set_custom_mining_job_without_distribution_rejected_off_solo() {
         // Default-stream session = PPLNS.
-        let mut s = session_with_extended_channel();
+        let mut s = jdc_session_with_extended_channel();
         assert_ne!(
             s.accounting_stream,
             StreamKind::Solo,
@@ -6223,7 +6259,7 @@ pub(crate) mod tests {
 
     /// Extended-channel session with ext 0x0003 negotiated, on the default PPLNS stream.
     fn negotiated_session_with_extended_channel() -> MiningSessionState<Arc<TestClock>> {
-        let mut s = session_with_extended_channel();
+        let mut s = jdc_session_with_extended_channel();
         s.negotiated_extensions
             .push(SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS);
         s
@@ -6631,7 +6667,7 @@ pub(crate) mod tests {
     /// A `distribution_id` TLV without negotiated 0x0003 is rejected even if it resolves.
     #[test]
     fn set_custom_mining_job_distribution_tlv_without_negotiation_rejects() {
-        let mut s = session_with_extended_channel(); // 0x0003 NOT negotiated
+        let mut s = jdc_session_with_extended_channel(); // 0x0003 NOT negotiated
         let cid = s.primary_channel.unwrap();
         let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
         let blob = conformant_outputs(&entry, 312_500_000);
@@ -7198,7 +7234,7 @@ pub(crate) mod tests {
     /// 0x0003 negotiated on the JDP side only gets `custom-jobs-require-solo` on the mining side.
     #[test]
     fn inherited_distribution_needs_the_extension_on_the_mining_connection() {
-        let mut s = session_with_extended_channel(); // 0x0003 NOT negotiated here
+        let mut s = jdc_session_with_extended_channel(); // 0x0003 NOT negotiated here
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
         let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);

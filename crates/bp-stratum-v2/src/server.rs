@@ -1089,6 +1089,16 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
     bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
     now_ms: u64,
 ) -> HandlerOutcome {
+    let is_setup = matches!(inbound, InboundMiningFrame::SetupConnection(_));
+    if let Some(reason) = crate::codec_common::setup_order_violation(is_setup, state.setup_complete)
+    {
+        return HandlerOutcome {
+            outbound: Vec::new(),
+            events: vec![SessionEvent::Disconnect {
+                reason: reason.to_string(),
+            }],
+        };
+    }
     match inbound {
         InboundMiningFrame::SetupConnection(input) => handle_setup_connection(state, &input),
         InboundMiningFrame::RequestExtensions(input) => handle_request_extensions(state, &input),
@@ -2332,9 +2342,30 @@ mod tests {
 
     use crate::codec_common::SetupConnectionInput;
     use crate::extranonce::SV2_WORKER_ID;
-    use crate::mining::client::{FLAG_REQUIRES_VERSION_ROLLING, PROTOCOL_MINING};
+    use crate::mining::client::{
+        FLAG_REQUIRES_VERSION_ROLLING, FLAG_REQUIRES_WORK_SELECTION, PROTOCOL_MINING,
+    };
     use crate::mining::submit::SubmitSharesStandardInput;
     use crate::server_codec::InboundMiningFrame;
+
+    /// A session past a plain mining SetupConnection, which every frame after
+    /// it requires.
+    fn set_up_test_session(
+        alloc: &ConnectionExtranonce,
+        bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
+    ) -> MiningSessionState<Arc<TestClock>> {
+        let mut s = fresh_test_session();
+        let setup = InboundMiningFrame::SetupConnection(SetupConnectionInput {
+            protocol: PROTOCOL_MINING,
+            min_version: 2,
+            max_version: 2,
+            flags: FLAG_REQUIRES_VERSION_ROLLING,
+            vendor: "t".to_string(),
+        });
+        let _ = dispatch_inbound_frame(&mut s, setup, alloc, bridge, 0);
+        assert!(s.setup_complete, "precondition: setup succeeded");
+        s
+    }
 
     fn fresh_test_session() -> MiningSessionState<Arc<TestClock>> {
         MiningSessionState::new(Arc::new(TestClock::new(0)), 1, _port_cfg())
@@ -2376,9 +2407,9 @@ mod tests {
     /// `SubmitSharesStandard` on an unknown channel emits `invalid-channel-id`.
     #[test]
     fn dispatch_submit_standard_unknown_channel_emits_invalid_channel_id() {
-        let mut s = fresh_test_session();
         let alloc = fresh_extranonce();
         let bridge = fresh_bridge();
+        let mut s = set_up_test_session(&alloc, &bridge);
         let inbound = InboundMiningFrame::SubmitSharesStandard(SubmitSharesStandardInput {
             channel_id: 99,
             sequence_number: 1,
@@ -2397,6 +2428,65 @@ mod tests {
     }
 
     /// `CloseChannel` returns the closed channel's prefix to the allocator.
+    /// SetupConnection opens a connection, once: a message before its Success
+    /// or a second SetupConnection closes the connection instead of being
+    /// served. The open after the one setup is the control.
+    #[test]
+    fn a_message_before_setup_or_a_second_setup_closes_the_connection() {
+        let alloc = fresh_extranonce();
+        let bridge = fresh_bridge();
+        let setup = || {
+            InboundMiningFrame::SetupConnection(SetupConnectionInput {
+                protocol: PROTOCOL_MINING,
+                min_version: 2,
+                max_version: 2,
+                flags: FLAG_REQUIRES_VERSION_ROLLING,
+                vendor: "t".to_string(),
+            })
+        };
+        let open = || {
+            InboundMiningFrame::OpenStandardMiningChannel(
+                crate::mining::client::OpenStandardMiningChannelInput {
+                    request_id: 1,
+                    user_identity: format!("{ADDR}.w"),
+                    nominal_hash_rate: 1_000.0,
+                    max_target: [0xFF; 32],
+                },
+            )
+        };
+        let closes = |out: &HandlerOutcome| {
+            out.outbound.is_empty()
+                && out
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, SessionEvent::Disconnect { .. }))
+        };
+
+        let mut s = fresh_test_session();
+        assert!(closes(&dispatch_inbound_frame(
+            &mut s,
+            open(),
+            &alloc,
+            &bridge,
+            0
+        )));
+        assert!(s.channels.is_empty(), "nothing opened before setup");
+
+        let mut s = fresh_test_session();
+        let out = dispatch_inbound_frame(&mut s, setup(), &alloc, &bridge, 0);
+        assert!(!closes(&out), "the first setup is served");
+        let out = dispatch_inbound_frame(&mut s, open(), &alloc, &bridge, 0);
+        assert!(!closes(&out), "control: an open after setup is served");
+        assert_eq!(s.channels.len(), 1);
+        assert!(closes(&dispatch_inbound_frame(
+            &mut s,
+            setup(),
+            &alloc,
+            &bridge,
+            0
+        )));
+    }
+
     #[test]
     fn dispatch_close_channel_releases_extranonce_prefix() {
         let mut s = fresh_test_session();
@@ -2632,7 +2722,7 @@ mod tests {
             protocol: PROTOCOL_MINING,
             min_version: 2,
             max_version: 2,
-            flags: FLAG_REQUIRES_VERSION_ROLLING,
+            flags: FLAG_REQUIRES_VERSION_ROLLING | FLAG_REQUIRES_WORK_SELECTION,
             vendor: "t".to_string(),
         });
         let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, 0);
@@ -2894,7 +2984,7 @@ mod tests {
                 protocol: PROTOCOL_MINING,
                 min_version: 2,
                 max_version: 2,
-                flags: FLAG_REQUIRES_VERSION_ROLLING,
+                flags: FLAG_REQUIRES_VERSION_ROLLING | FLAG_REQUIRES_WORK_SELECTION,
                 vendor: "t".to_string(),
             }),
             &alloc,
@@ -3092,9 +3182,9 @@ mod tests {
     /// test keeps a hidden await from creeping in.
     #[test]
     fn dispatch_is_synchronous_to_handlers() {
-        let mut s = fresh_test_session();
         let alloc = fresh_extranonce();
         let bridge = fresh_bridge();
+        let mut s = set_up_test_session(&alloc, &bridge);
         let inbound =
             InboundMiningFrame::UpdateChannel(crate::mining::client::UpdateChannelInput {
                 channel_id: 99,

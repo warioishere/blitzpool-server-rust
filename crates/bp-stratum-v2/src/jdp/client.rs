@@ -408,7 +408,7 @@ pub fn handle_setup_connection(
 
 // ── Handler: RequestExtensions (ext 0x0001) ─────────────────────────
 
-/// Dropped before setup; `Error` only when a non-empty request has nothing
+/// `Error` only when a non-empty request has nothing
 /// supported. 0x0003 is offered only if `distribution_available`: ext
 /// 0x0003/SetPayoutDistribution must be the FIRST message after this exchange.
 pub fn handle_request_extensions(
@@ -416,10 +416,6 @@ pub fn handle_request_extensions(
     input: &RequestExtensions,
     distribution_available: bool,
 ) -> JdpHandlerOutcome {
-    if !state.setup_complete {
-        return JdpHandlerOutcome::default();
-    }
-
     let mut supported: Vec<u16> = Vec::new();
     let mut unsupported: Vec<u16> = Vec::new();
     for ext in &input.requested_extensions {
@@ -449,18 +445,14 @@ pub fn handle_request_extensions(
 
 // ── Handler: AllocateMiningJobToken ─────────────────────────────────
 
-/// Handle `AllocateMiningJobToken`. Pre-setup, rate-limited and pool-side
-/// allocation failures go unanswered (SV2 defines no error); only the last is logged.
+/// Handle `AllocateMiningJobToken`. Rate-limited and pool-side allocation
+/// failures go unanswered (SV2 defines no error); only the latter is logged.
 pub fn handle_allocate_token(
     state: &mut JdpSessionState,
     input: &AllocateMiningJobTokenInput,
     context: AllocateTokenContext,
     now_ms: u64,
 ) -> JdpHandlerOutcome {
-    if !state.setup_complete {
-        return JdpHandlerOutcome::default();
-    }
-
     let alloc = match state.tokens.allocate(
         now_ms,
         context.miner_address.clone(),
@@ -1265,19 +1257,6 @@ mod tests {
     // ── RequestExtensions ──────────────────────────────────────────
 
     #[test]
-    fn request_extensions_pre_setup_is_silently_dropped() {
-        let mut s = fresh();
-        let req = RequestExtensions {
-            request_id: 1,
-            requested_extensions: vec![SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS],
-        };
-        let out = handle_request_extensions(&mut s, &req, true);
-        assert!(out.outbound.is_empty());
-        assert!(out.events.is_empty());
-        assert!(s.negotiated_extensions.is_empty());
-    }
-
-    #[test]
     fn request_extensions_supported_ext_0x0003_returns_success() {
         let mut s = fresh();
         handle_setup_connection(&mut s, &good_setup());
@@ -1377,14 +1356,6 @@ mod tests {
     }
 
     // ── AllocateMiningJobToken ─────────────────────────────────────
-
-    #[test]
-    fn allocate_pre_setup_is_silently_dropped() {
-        let mut s = fresh();
-        let out = handle_allocate_token(&mut s, &good_alloc(1), alloc_ctx(), 0);
-        assert!(out.outbound.is_empty());
-        assert!(s.tokens.is_empty());
-    }
 
     #[test]
     fn allocate_success_emits_token_and_event() {
