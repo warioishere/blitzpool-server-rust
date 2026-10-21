@@ -24,6 +24,18 @@ use bp_common::HASHES_PER_DIFFICULTY_1;
 /// `min_difficulty`.
 pub const VARDIFF_DEFAULT_MIN_DIFFICULTY: f64 = 0.00001;
 
+/// The floor no difficulty goes below for a configured `min_difficulty`: the
+/// value itself when finite and positive, else
+/// [`VARDIFF_DEFAULT_MIN_DIFFICULTY`]. Every engine and every port takes its
+/// floor from here.
+pub fn effective_min_difficulty(min_difficulty: f64) -> f64 {
+    if min_difficulty.is_finite() && min_difficulty > 0.0 {
+        min_difficulty
+    } else {
+        VARDIFF_DEFAULT_MIN_DIFFICULTY
+    }
+}
+
 /// Display-hashrate slot length (10 minutes).
 pub const VARDIFF_SLOT_DURATION_MS: u64 = 600_000;
 
@@ -234,11 +246,7 @@ impl<C: Clock> VarDiffEngine<C> {
         } else {
             VARDIFF_DEFAULT_TARGET_SHARES_PER_MIN
         };
-        let min_difficulty = if min_difficulty.is_finite() && min_difficulty > 0.0 {
-            min_difficulty
-        } else {
-            VARDIFF_DEFAULT_MIN_DIFFICULTY
-        };
+        let min_difficulty = effective_min_difficulty(min_difficulty);
         let difficulty = if initial_difficulty.is_finite() && initial_difficulty > 0.0 {
             initial_difficulty
         } else {

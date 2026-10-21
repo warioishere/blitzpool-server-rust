@@ -148,11 +148,7 @@ impl PortConfig {
     /// included: `minimum_difficulty` when set, else vardiff's own floor.
     /// SV2 channels on the same port open against it too.
     pub fn effective_minimum_difficulty(&self) -> f64 {
-        if self.minimum_difficulty > 0.0 {
-            self.minimum_difficulty
-        } else {
-            bp_vardiff::VARDIFF_DEFAULT_MIN_DIFFICULTY
-        }
+        bp_vardiff::effective_min_difficulty(self.minimum_difficulty)
     }
 
     /// Validate per-port invariants.
