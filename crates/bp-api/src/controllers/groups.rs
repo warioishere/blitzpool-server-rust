@@ -35,7 +35,10 @@ pub(crate) fn routes(state: SharedState) -> Router<SharedState> {
     let admin_routes = Router::new()
         // ─── admin writers ───────────────────────────────────────
         .route("/api/pplns/groups/{id}/transfer", post(transfer))
-        .route("/api/pplns/groups/{id}/settings", patch(update_settings))
+        .route(
+            "/api/pplns/groups/{id}/settings",
+            patch(update_settings).layer(rate_limit::per_minute_layer(10)),
+        )
         .route("/api/pplns/groups/{id}", delete(dissolve))
         .route(
             "/api/pplns/groups/{id}/invitations/open",
@@ -254,23 +257,34 @@ async fn transfer(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateSettingsBody {
     /// Absent = untouched, a value = set, JSON `null` = clear.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_clear")]
     preset: Option<Option<String>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_clear")]
     interval_days: Option<Option<u32>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_clear")]
     timezone: Option<Option<String>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_clear")]
     finder_bonus_ppm: Option<Option<i32>>,
     #[serde(default)]
     is_public: Option<bool>,
     #[serde(default)]
     reset_round_on_block: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_clear")]
     max_members: Option<Option<i64>>,
     /// An empty string clears it, as `null` does.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_clear")]
     coinbase_tag: Option<Option<String>>,
+}
+
+/// A present field, `null` included, as `Some`: serde reads a bare
+/// `Option<Option<T>>` `null` as absent, which would leave the column alone
+/// instead of clearing it.
+fn null_as_clear<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 fn lift_patch<T: Clone, R>(field: &Option<Option<T>>, map: impl Fn(&T) -> R) -> PatchField<R> {
@@ -1984,6 +1998,54 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use uuid::Uuid;
+
+    /// Every nullable setting reads absent as untouched, `null` as clear and
+    /// a value as set.
+    #[test]
+    fn a_settings_null_clears_and_an_absent_field_stays() {
+        let body = |json: &str| -> UpdateSettingsBody { serde_json::from_str(json).unwrap() };
+        let absent = body("{}");
+        let null = body(
+            r#"{"preset":null,"intervalDays":null,"timezone":null,
+                "finderBonusPpm":null,"maxMembers":null,"coinbaseTag":null}"#,
+        );
+        let set = body(
+            r#"{"preset":"daily","intervalDays":3,"timezone":"UTC",
+                "finderBonusPpm":5,"maxMembers":7,"coinbaseTag":"CH"}"#,
+        );
+        assert_eq!(
+            (absent.preset, absent.interval_days, absent.timezone),
+            (None, None, None)
+        );
+        assert_eq!(
+            (
+                absent.finder_bonus_ppm,
+                absent.max_members,
+                absent.coinbase_tag
+            ),
+            (None, None, None)
+        );
+        assert_eq!(
+            (null.preset, null.interval_days, null.timezone),
+            (Some(None), Some(None), Some(None))
+        );
+        assert_eq!(
+            (null.finder_bonus_ppm, null.max_members, null.coinbase_tag),
+            (Some(None), Some(None), Some(None))
+        );
+        assert_eq!(
+            (set.preset, set.interval_days, set.timezone),
+            (
+                Some(Some("daily".into())),
+                Some(Some(3)),
+                Some(Some("UTC".into()))
+            )
+        );
+        assert_eq!(
+            (set.finder_bonus_ppm, set.max_members, set.coinbase_tag),
+            (Some(Some(5)), Some(Some(7)), Some(Some("CH".into())))
+        );
+    }
 
     fn parse_include_decided(s: Option<&str>) -> bool {
         s.map(|v| v == "1" || v == "true").unwrap_or(false)

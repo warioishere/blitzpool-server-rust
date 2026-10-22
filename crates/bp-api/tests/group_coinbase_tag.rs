@@ -42,17 +42,40 @@ async fn connect_or_skip() -> Option<PgPool> {
     }
 }
 
+/// Each call from its own client IP, so the per-IP limit stays out of the
+/// way; [`patch_from`] pins one.
 async fn patch(
     app: &axum::Router,
     uri: &str,
     header: (&str, &str),
     body: Value,
 ) -> (StatusCode, Value) {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    patch_from(
+        app,
+        uri,
+        header,
+        body,
+        &format!("198.51.{}.{}", n / 250, n % 250),
+    )
+    .await
+}
+
+async fn patch_from(
+    app: &axum::Router,
+    uri: &str,
+    header: (&str, &str),
+    body: Value,
+    ip: &str,
+) -> (StatusCode, Value) {
     let resp = app
         .clone()
         .oneshot(
             Request::patch(uri)
                 .header(header.0, header.1)
+                // The routes are rate-limited per client IP.
+                .header("x-forwarded-for", ip)
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from(body.to_string()))
                 .unwrap(),
@@ -92,7 +115,11 @@ where
     assert_eq!(status, StatusCode::OK, "25 characters is the limit");
     assert_eq!(tag.map(|t| t.len()), Some(25));
 
+    // Each clear right after a set, so it is the clear that empties it.
     for clear in [json!(""), json!(null)] {
+        let (status, tag) = set(json!("Before clear"), true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(tag.as_deref(), Some("Before clear"), "precondition");
         let (status, tag) = set(clear.clone(), true).await;
         assert_eq!(status, StatusCode::OK, "{clear}");
         assert_eq!(tag, None, "{clear} clears the tag");
@@ -139,6 +166,25 @@ async fn a_team_admin_sets_and_clears_the_coinbase_tag() {
             (status, body["coinbaseTag"].as_str().map(str::to_string))
         }
     })
+    .await;
+
+    // `null` clears every nullable setting, as it does the tag: here the
+    // member cap, set first so the clear is what lifts it.
+    for (body, want) in [
+        (json!({ "maxMembers": 10 }), json!(10)),
+        (json!({ "maxMembers": null }), Value::Null),
+    ] {
+        let (status, summary) =
+            patch(&app, &uri, ("x-admin-token", &created.admin_token), body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(summary["maxMembers"], want);
+    }
+    assert_rate_limited(
+        &app,
+        &uri,
+        ("x-admin-token", &created.admin_token),
+        json!({ "coinbaseTag": "Spam" }),
+    )
     .await;
 
     let _ = sqlx::query("DELETE FROM pplns_group WHERE id = $1")
@@ -199,9 +245,26 @@ async fn a_blockparty_admin_sets_and_clears_the_coinbase_tag() {
         }
     })
     .await;
+    assert_rate_limited(
+        &app,
+        &uri,
+        ("x-blockparty-admin-token", &created.admin_token),
+        json!({ "tag": "Spam" }),
+    )
+    .await;
 
     let _ = sqlx::query("DELETE FROM blockparty_group WHERE id = $1")
         .bind(id)
         .execute(&pool)
         .await;
+}
+
+/// Ten changes a minute from one client IP pass, the eleventh is refused.
+async fn assert_rate_limited(app: &axum::Router, uri: &str, header: (&str, &str), body: Value) {
+    for i in 0..10 {
+        let (status, _) = patch_from(app, uri, header, body.clone(), "203.0.113.7").await;
+        assert_eq!(status, StatusCode::OK, "change {i} of the burst");
+    }
+    let (status, _) = patch_from(app, uri, header, body, "203.0.113.7").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 }

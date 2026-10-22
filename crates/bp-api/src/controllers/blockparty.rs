@@ -271,7 +271,7 @@ pub(crate) fn routes() -> Router<SharedState> {
         )
         .route(
             "/api/blockparty/{id}/coinbase-tag",
-            patch(update_coinbase_tag),
+            patch(update_coinbase_tag).layer(rate_limit::per_minute_layer(10)),
         )
         .route(
             "/api/blockparty/{id}/join-link",
