@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id!\", \"coinbaseTag\" AS \"tag!\"\n             FROM pplns_group\n            WHERE \"coinbaseTag\" IS NOT NULL AND \"dissolvedAt\" IS NULL\n           UNION ALL\n           SELECT id AS \"id!\", \"coinbaseTag\" AS \"tag!\"\n             FROM blockparty_group\n            WHERE \"coinbaseTag\" IS NOT NULL AND \"dissolvedAt\" IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "tag!",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "eca6cbb2cb86cb4047c879da603cd5c4f0d17dcac47b6f38ce54a78ed07008c0"
+}

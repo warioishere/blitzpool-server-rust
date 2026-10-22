@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE blockparty_group\n           SET \"coinbaseTag\" = $2, \"updatedAt\" = $3\n           WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7b7023fc25fdfe635c77cd5bfb21ad2795ad5acc2a1b38db1dc31e7933cbe806"
+}

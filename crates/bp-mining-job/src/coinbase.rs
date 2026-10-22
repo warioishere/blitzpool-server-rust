@@ -49,6 +49,9 @@ impl PayoutEntry {
 pub struct ResolvedPayouts {
     pub entries: Vec<PayoutEntry>,
     pub payouts_fingerprint: [u8; 32],
+    /// The Team's or Blockparty's own tag for these payouts' coinbase; see
+    /// [`Self::coinbase_identifier`].
+    pub coinbase_tag: Option<bp_common::CoinbaseTag>,
 }
 
 impl ResolvedPayouts {
@@ -58,6 +61,23 @@ impl ResolvedPayouts {
         Self {
             entries,
             payouts_fingerprint: [0u8; 32],
+            coinbase_tag: None,
+        }
+    }
+
+    /// These payouts with the coinbase tag of the group they pay.
+    pub fn with_coinbase_tag(mut self, tag: Option<bp_common::CoinbaseTag>) -> Self {
+        self.coinbase_tag = tag;
+        self
+    }
+
+    /// The identifier written into this coinbase's scriptSig: the pool's,
+    /// followed by `/<tag>` when the group set one. SV1 and SV2 both build
+    /// their jobs with it.
+    pub fn coinbase_identifier(&self, pool_identifier: &str) -> String {
+        match &self.coinbase_tag {
+            Some(tag) => format!("{pool_identifier}/{}", tag.as_str()),
+            None => pool_identifier.to_string(),
         }
     }
 
@@ -1344,6 +1364,61 @@ mod tests {
         assert_eq!(ss[4] as usize, EXTRANONCE_SLOT_LEN, "the slot is pushed");
         // No 'x' bytes anywhere.
         assert!(!ss.contains(&b'x'));
+    }
+
+    /// A group's tag follows the pool identifier in one push, and the longest
+    /// tag still fits beside the largest template prefix (8 bytes) and
+    /// extranonce (32 bytes) SV2 allows, where an identifier that does not fit
+    /// would be dropped whole. Without a tag the identifier stands alone.
+    #[test]
+    fn a_group_tag_follows_the_pool_identifier_within_the_worst_case_scriptsig() {
+        let tag = bp_common::CoinbaseTag::parse(&"T".repeat(bp_common::MAX_COINBASE_TAG_CHARS))
+            .unwrap()
+            .unwrap();
+        let payouts = ResolvedPayouts::unsnapshotted(single_payout(
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+        ));
+        assert_eq!(payouts.coinbase_identifier("blitzpool"), "blitzpool");
+        let tagged = payouts.with_coinbase_tag(Some(tag.clone()));
+        let identifier = tagged.coinbase_identifier("blitzpool");
+        assert_eq!(identifier, format!("blitzpool/{}", tag.as_str()));
+
+        let (_, outputs) = tdp_template_for([0u8; 32]);
+        let prefix = [0x07, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA];
+        let slot = 32;
+        let template = TdpCoinbaseTemplate {
+            coinbase_prefix: &prefix,
+            coinbase_tx_version: 2,
+            coinbase_tx_input_sequence: 0xFFFFFFFF,
+            coinbase_tx_value_remaining: 5_000_000_000,
+            coinbase_tx_outputs: &outputs,
+            coinbase_tx_outputs_count: 1,
+            coinbase_tx_locktime: 0,
+        };
+        let job = build_mining_job_from_tdp(
+            Network::Bitcoin,
+            &tagged.entries,
+            &template,
+            &identifier,
+            slot,
+            [0u8; 32],
+        )
+        .unwrap();
+        let mut full = Vec::new();
+        full.extend_from_slice(job.coinbase_prefix());
+        full.extend_from_slice(&[0u8; 32]);
+        full.extend_from_slice(job.coinbase_suffix());
+        let tx = bitcoin::Transaction::consensus_decode(&mut full.as_slice()).unwrap();
+        let ss = tx.input[0].script_sig.to_bytes();
+        assert!(ss.len() <= MAX_SCRIPT_SIZE, "{} bytes", ss.len());
+        let pushes: Vec<Vec<u8>> = bitcoin::Script::from_bytes(&ss[prefix.len()..])
+            .instructions()
+            .map(|i| match i.unwrap() {
+                bitcoin::script::Instruction::PushBytes(b) => b.as_bytes().to_vec(),
+                op => panic!("unpushed opcode {op:?}"),
+            })
+            .collect();
+        assert_eq!(pushes, vec![identifier.into_bytes(), vec![0u8; slot]]);
     }
 
     #[test]

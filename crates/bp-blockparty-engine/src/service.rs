@@ -900,6 +900,26 @@ impl BlockpartyService {
         Ok(cleaned)
     }
 
+    /// Set or clear (`None`) the coinbase tag of the party's blocks. The front
+    /// serves it from its own cache, so the change is announced.
+    pub async fn update_coinbase_tag(
+        &self,
+        group_id: Uuid,
+        tag: Option<bp_common::CoinbaseTag>,
+        token: Option<&str>,
+    ) -> Result<Option<bp_common::CoinbaseTag>, BlockpartyServiceError> {
+        self.require_admin_token(group_id, token).await?;
+        bp_db::update_blockparty_group_coinbase_tag(
+            &self.payouts.pool,
+            group_id,
+            tag.as_ref().map(bp_common::CoinbaseTag::as_str),
+            now_ms(),
+        )
+        .await?;
+        self.notify_changed().await;
+        Ok(tag)
+    }
+
     // ─── Share / block hooks ───────────────────────────────────────
 
     /// Refreshes `lastShareAt` and promotes ready to active. Only from

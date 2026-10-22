@@ -676,7 +676,7 @@ fn build_and_register_notify<C: Clock>(
             state.network,
             &payouts.entries,
             &tdp_template,
-            &server_config.pool_identifier,
+            &payouts.coinbase_identifier(&server_config.pool_identifier),
             EXTRANONCE_SLOT_LEN,
             payouts.payouts_fingerprint,
         )

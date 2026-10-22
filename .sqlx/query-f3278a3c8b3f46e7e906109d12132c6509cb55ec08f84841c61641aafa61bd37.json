@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO blockparty_group\n            (id, name, \"adminAddress\", \"adminTokenHash\", status, \"createdAt\", \"updatedAt\")\n           VALUES ($1, $2, $3, $4, $5, $6, $6)\n           RETURNING\n            id AS \"id!\",\n            name AS \"name!\",\n            \"adminAddress\" AS \"admin_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            status AS \"status!\",\n            \"lastShareAt\" AS \"last_share_at?\",\n            \"rentalProviderHint\" AS \"rental_provider_hint?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"confirmationRequestedAt\" AS \"confirmation_requested_at?\"",
+  "query": "SELECT\n            id AS \"id!\",\n            name AS \"name!\",\n            \"adminAddress\" AS \"admin_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            status AS \"status!\",\n            \"lastShareAt\" AS \"last_share_at?\",\n            \"rentalProviderHint\" AS \"rental_provider_hint?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"confirmationRequestedAt\" AS \"confirmation_requested_at?\",\n            \"coinbaseTag\" AS \"coinbase_tag?\"\n           FROM blockparty_group WHERE name = $1 LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -57,16 +57,16 @@
         "ordinal": 10,
         "name": "confirmation_requested_at?",
         "type_info": "Int8"
+      },
+      {
+        "ordinal": 11,
+        "name": "coinbase_tag?",
+        "type_info": "Varchar"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Varchar",
-        "Varchar",
-        "Varchar",
-        "Varchar",
-        "Int8"
+        "Text"
       ]
     },
     "nullable": [
@@ -80,8 +80,9 @@
       false,
       false,
       true,
+      true,
       true
     ]
   },
-  "hash": "4c6d6bcd11a7dc45d91d1c649d9ea7ebe475489670b956467bab09c4cc49bcd8"
+  "hash": "f3278a3c8b3f46e7e906109d12132c6509cb55ec08f84841c61641aafa61bd37"
 }

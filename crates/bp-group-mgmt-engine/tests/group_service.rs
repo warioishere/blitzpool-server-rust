@@ -625,6 +625,7 @@ async fn update_round_reset_config_applies_and_fires_hook() {
                 is_public: PatchField::Set(true),
                 reset_round_on_block: PatchField::Untouched,
                 max_members: PatchField::Untouched,
+                coinbase_tag: PatchField::Untouched,
             },
             Some(&g.admin_token),
         )

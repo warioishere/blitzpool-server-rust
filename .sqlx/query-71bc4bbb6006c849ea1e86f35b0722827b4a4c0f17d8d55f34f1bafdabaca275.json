@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            id AS \"id!\",\n            name AS \"name!\",\n            \"adminAddress\" AS \"admin_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            status AS \"status!\",\n            \"lastShareAt\" AS \"last_share_at?\",\n            \"rentalProviderHint\" AS \"rental_provider_hint?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"confirmationRequestedAt\" AS \"confirmation_requested_at?\"\n           FROM blockparty_group\n           WHERE \"adminAddress\" = $1 AND status <> 'dissolved'\n           LIMIT 1",
+  "query": "SELECT\n            id AS \"id!\",\n            name AS \"name!\",\n            \"adminAddress\" AS \"admin_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            status AS \"status!\",\n            \"lastShareAt\" AS \"last_share_at?\",\n            \"rentalProviderHint\" AS \"rental_provider_hint?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"confirmationRequestedAt\" AS \"confirmation_requested_at?\",\n            \"coinbaseTag\" AS \"coinbase_tag?\"\n           FROM blockparty_group WHERE status <> 'dissolved' ORDER BY \"createdAt\" ASC",
   "describe": {
     "columns": [
       {
@@ -57,12 +57,15 @@
         "ordinal": 10,
         "name": "confirmation_requested_at?",
         "type_info": "Int8"
+      },
+      {
+        "ordinal": 11,
+        "name": "coinbase_tag?",
+        "type_info": "Varchar"
       }
     ],
     "parameters": {
-      "Left": [
-        "Text"
-      ]
+      "Left": []
     },
     "nullable": [
       false,
@@ -75,8 +78,9 @@
       false,
       false,
       true,
+      true,
       true
     ]
   },
-  "hash": "c78a895e727d84e7cc38982824a95a98087ee7a1436173899d37925e6781fea4"
+  "hash": "71bc4bbb6006c849ea1e86f35b0722827b4a4c0f17d8d55f34f1bafdabaca275"
 }

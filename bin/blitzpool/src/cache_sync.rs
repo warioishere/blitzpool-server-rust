@@ -15,6 +15,7 @@ use bp_share_stream::{
     cache_kind, CacheInvalidation, StreamConsumer, StreamProducer, CACHE_INVALIDATION_STREAM_KEY,
 };
 use redis::aio::ConnectionManager;
+use sqlx::PgPool;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -22,6 +23,7 @@ use tracing::{debug, info, warn};
 use bp_common::AddressId;
 use bp_mining_mode::MiningModeResult;
 
+use crate::coinbase_tags::CoinbaseTagCache;
 use crate::engines::BlitzpoolModeGate;
 use crate::group_service::SharedGroupService;
 
@@ -89,6 +91,8 @@ pub(crate) fn spawn(
     redis: ConnectionManager,
     group: SharedGroupService,
     blockparty: Option<Arc<BlockpartyService>>,
+    coinbase_tags: Arc<CoinbaseTagCache>,
+    pool: PgPool,
     gate: Arc<BlitzpoolModeGate>,
     // The Front's JDP payout registry, once `jdp::spawn` has attached it.
     // Empty on a Front without JDP enabled — a settlement then has nothing
@@ -119,6 +123,7 @@ pub(crate) fn spawn(
                 _ = backstop.tick() => {
                     rebuild_group(&group, &gate).await;
                     rebuild_blockparty(blockparty.as_ref()).await;
+                    rebuild_coinbase_tags(&coinbase_tags, &pool).await;
                 }
                 result = consumer.read_new(BATCH, BLOCK_MS) => match result {
                     Ok(batch) => {
@@ -144,6 +149,10 @@ pub(crate) fn spawn(
                         }
                         if want_blockparty {
                             rebuild_blockparty(blockparty.as_ref()).await;
+                        }
+                        // Teams and Blockpartys both set a tag.
+                        if want_group || want_blockparty {
+                            rebuild_coinbase_tags(&coinbase_tags, &pool).await;
                         }
                         if want_settlement {
                             invalidate_payout_distributions(&settle_registry);
@@ -225,6 +234,13 @@ async fn reconcile_gate_modes(group: &SharedGroupService, gate: &Arc<BlitzpoolMo
             upgraded,
             downgraded, "cache-sync: reconciled live mode gate to group membership"
         );
+    }
+}
+
+async fn rebuild_coinbase_tags(tags: &CoinbaseTagCache, pool: &PgPool) {
+    match tags.rebuild(pool).await {
+        Ok(()) => debug!("cache-sync: coinbase tags rebuilt"),
+        Err(err) => warn!(%err, "cache-sync: coinbase tag rebuild failed"),
     }
 }
 

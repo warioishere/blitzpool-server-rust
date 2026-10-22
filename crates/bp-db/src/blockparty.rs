@@ -36,6 +36,10 @@ pub struct BlockpartyGroupRow {
     /// prompt so a freshly-joined member isn't nagged pre-assignment.
     #[sqlx(rename = "confirmationRequestedAt")]
     pub confirmation_requested_at: Option<i64>,
+    /// The admin's own coinbase tag, written after the pool identifier
+    /// (`bp_common::CoinbaseTag`); NULL for none.
+    #[sqlx(rename = "coinbaseTag")]
+    pub coinbase_tag: Option<String>,
 }
 
 pub async fn find_blockparty_group<'e, E>(
@@ -58,7 +62,8 @@ where
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
             "dissolvedAt" AS "dissolved_at?",
-            "confirmationRequestedAt" AS "confirmation_requested_at?"
+            "confirmationRequestedAt" AS "confirmation_requested_at?",
+            "coinbaseTag" AS "coinbase_tag?"
            FROM blockparty_group WHERE id = $1 LIMIT 1"#,
         id,
     )
@@ -84,7 +89,8 @@ pub async fn find_blockparty_group_by_name(
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
             "dissolvedAt" AS "dissolved_at?",
-            "confirmationRequestedAt" AS "confirmation_requested_at?"
+            "confirmationRequestedAt" AS "confirmation_requested_at?",
+            "coinbaseTag" AS "coinbase_tag?"
            FROM blockparty_group WHERE name = $1 LIMIT 1"#,
         name,
     )
@@ -112,7 +118,8 @@ pub async fn find_blockparty_group_by_admin_address(
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
             "dissolvedAt" AS "dissolved_at?",
-            "confirmationRequestedAt" AS "confirmation_requested_at?"
+            "confirmationRequestedAt" AS "confirmation_requested_at?",
+            "coinbaseTag" AS "coinbase_tag?"
            FROM blockparty_group
            WHERE "adminAddress" = $1 AND status <> 'dissolved'
            LIMIT 1"#,
@@ -139,7 +146,8 @@ pub async fn list_blockparty_groups_non_dissolved(
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
             "dissolvedAt" AS "dissolved_at?",
-            "confirmationRequestedAt" AS "confirmation_requested_at?"
+            "confirmationRequestedAt" AS "confirmation_requested_at?",
+            "coinbaseTag" AS "coinbase_tag?"
            FROM blockparty_group WHERE status <> 'dissolved' ORDER BY "createdAt" ASC"#,
     )
     .fetch_all(pool)
@@ -173,7 +181,8 @@ pub async fn insert_blockparty_group(
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
             "dissolvedAt" AS "dissolved_at?",
-            "confirmationRequestedAt" AS "confirmation_requested_at?""#,
+            "confirmationRequestedAt" AS "confirmation_requested_at?",
+            "coinbaseTag" AS "coinbase_tag?""#,
         id,
         name,
         admin_address.as_str(),
@@ -272,6 +281,46 @@ pub async fn update_blockparty_group_rental_hint(
     .await
     .map(|_| ())
     .map_err(DbError::from)
+}
+
+/// Set or clear (`None`) the admin's coinbase tag.
+pub async fn update_blockparty_group_coinbase_tag(
+    pool: &PgPool,
+    id: Uuid,
+    tag: Option<&str>,
+    updated_at: i64,
+) -> Result<(), DbError> {
+    sqlx::query!(
+        r#"UPDATE blockparty_group
+           SET "coinbaseTag" = $2, "updatedAt" = $3
+           WHERE id = $1"#,
+        id,
+        tag,
+        updated_at,
+    )
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(DbError::from)
+}
+
+/// Every tagged Team and Blockparty that is not dissolved, by group id: what
+/// the Front's coinbase tag cache serves. Group ids are UUIDs, so the two
+/// tables never collide.
+pub async fn list_group_coinbase_tags(pool: &PgPool) -> Result<Vec<(Uuid, String)>, DbError> {
+    let rows = sqlx::query!(
+        r#"SELECT id AS "id!", "coinbaseTag" AS "tag!"
+             FROM pplns_group
+            WHERE "coinbaseTag" IS NOT NULL AND "dissolvedAt" IS NULL
+           UNION ALL
+           SELECT id AS "id!", "coinbaseTag" AS "tag!"
+             FROM blockparty_group
+            WHERE "coinbaseTag" IS NOT NULL AND "dissolvedAt" IS NULL"#
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(rows.into_iter().map(|r| (r.id, r.tag)).collect())
 }
 
 /// Stamp the admin's "members may now confirm their split" request. Idempotent

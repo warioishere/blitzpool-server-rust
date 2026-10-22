@@ -25,6 +25,7 @@ mod blockparty_service;
 mod boot;
 mod cache_sync;
 mod coinbase_autoscaler;
+mod coinbase_tags;
 mod crons;
 mod custom_extranonce;
 mod device_status;
@@ -449,7 +450,20 @@ async fn main() -> ExitCode {
                 .service
                 .set_blockparty_reader(bp.membership_reader.clone());
         }
-        Some(membership::Membership { group, blockparty })
+        let coinbase_tags =
+            match crate::coinbase_tags::CoinbaseTagCache::load(handles.db.pool()).await {
+                Ok(cache) => Arc::new(cache),
+                Err(err) => {
+                    tracing::error!(%err, "coinbase tag cache load failed");
+                    eprintln!("blitzpool: {err}");
+                    return ExitCode::from(7);
+                }
+            };
+        Some(membership::Membership {
+            group,
+            blockparty,
+            coinbase_tags,
+        })
     } else {
         None
     };
@@ -791,6 +805,8 @@ async fn main() -> ExitCode {
                 cache_conn,
                 m.group.clone(),
                 m.blockparty_service(),
+                m.coinbase_tags.clone(),
+                handles.db.pool().clone(),
                 engines.mode_gate.clone(),
                 settle_signal.registry_slot(),
             ))
@@ -837,6 +853,7 @@ async fn main() -> ExitCode {
                         membership
                             .as_ref()
                             .and_then(membership::Membership::blockparty_service),
+                        membership.as_ref().map(|m| m.coinbase_tags.clone()),
                     ));
                 // Needed to rebuild a full block for `submitblock`. Spawned
                 // before jdp::spawn so it subscribes before the first NewTemplate.

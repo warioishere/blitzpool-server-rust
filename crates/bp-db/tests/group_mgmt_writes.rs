@@ -341,6 +341,7 @@ async fn round_reset_config_patch_applies_per_field() {
         is_public: PatchField::Set(true),
         reset_round_on_block: PatchField::Set(true),
         max_members: PatchField::Set(10),
+        coinbase_tag: PatchField::Set("Dezentralschweiz".into()),
     };
     let row1 = update_pplns_group_round_reset_config(&pool, gid, &p1, 100)
         .await
@@ -353,6 +354,7 @@ async fn round_reset_config_patch_applies_per_field() {
     assert!(row1.is_public);
     assert!(row1.reset_round_on_block);
     assert_eq!(row1.max_members, Some(10));
+    assert_eq!(row1.coinbase_tag.as_deref(), Some("Dezentralschweiz"));
 
     // Second patch — Clear preset + finder bonus, leave timezone alone.
     let p2 = RoundResetConfigPatch {
@@ -364,6 +366,7 @@ async fn round_reset_config_patch_applies_per_field() {
         is_public: PatchField::Untouched,
         reset_round_on_block: PatchField::Untouched,
         max_members: PatchField::Untouched,
+        coinbase_tag: PatchField::Untouched,
     };
     let row2 = update_pplns_group_round_reset_config(&pool, gid, &p2, 200)
         .await
@@ -379,6 +382,30 @@ async fn round_reset_config_patch_applies_per_field() {
     assert!(row2.reset_round_on_block);
     // max_members untouched by p2 → still 10 from p1.
     assert_eq!(row2.max_members, Some(10));
+    assert_eq!(row2.coinbase_tag.as_deref(), Some("Dezentralschweiz"));
+
+    // Third patch — Clear the tag; the database refuses one outside the rule.
+    let p3 = RoundResetConfigPatch {
+        coinbase_tag: PatchField::Clear,
+        ..RoundResetConfigPatch::default()
+    };
+    let row3 = update_pplns_group_round_reset_config(&pool, gid, &p3, 300)
+        .await
+        .expect("p3")
+        .expect("present");
+    assert!(row3.coinbase_tag.is_none());
+    for bad in ["Zürich", &"x".repeat(26)] {
+        let p = RoundResetConfigPatch {
+            coinbase_tag: PatchField::Set(bad.to_string()),
+            ..RoundResetConfigPatch::default()
+        };
+        assert!(
+            update_pplns_group_round_reset_config(&pool, gid, &p, 400)
+                .await
+                .is_err(),
+            "{bad:?} must not pass the column's CHECK"
+        );
+    }
 
     sqlx::query("DELETE FROM pplns_group WHERE id = $1")
         .bind(gid)

@@ -74,6 +74,23 @@ pub(crate) fn build_member_labels(
     out
 }
 
+/// A Team's or Blockparty's coinbase tag from an admin request, `None` for an
+/// empty one. Both admin endpoints parse through it, so they refuse the same
+/// input with the same answer.
+pub(crate) fn coinbase_tag_from_request(
+    raw: &str,
+) -> Result<Option<bp_common::CoinbaseTag>, crate::error::ApiError> {
+    use bp_common::CoinbaseTagError;
+    bp_common::CoinbaseTag::parse(raw).map_err(|err| {
+        crate::error::ApiError::BadRequest(match err {
+            CoinbaseTagError::NotPrintableAscii => {
+                "the coinbase tag may only contain printable ASCII characters"
+            }
+            CoinbaseTagError::TooLong => "the coinbase tag is longer than 25 characters",
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

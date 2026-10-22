@@ -944,6 +944,7 @@ fn reset_row(
         reset_round_on_block: false,
         max_members: None,
         payout_mode: "prop".to_string(),
+        coinbase_tag: None,
     }
 }
 

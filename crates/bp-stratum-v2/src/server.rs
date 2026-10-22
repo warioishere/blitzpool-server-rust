@@ -1281,9 +1281,9 @@ async fn resolve_template_mining_job_inputs(
     }
     Ok(Some(MiningJobInputs {
         network: server_config.network,
+        pool_identifier: resolved.coinbase_identifier(&server_config.pool_identifier),
         payouts: resolved.entries,
         payouts_fingerprint: resolved.payouts_fingerprint,
-        pool_identifier: server_config.pool_identifier.clone(),
         coinbase_prefix: template.coinbase_prefix.clone(),
         coinbase_tx_version: template.coinbase_tx_version,
         coinbase_tx_input_sequence: template.coinbase_tx_input_sequence,

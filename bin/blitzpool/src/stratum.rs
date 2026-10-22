@@ -123,6 +123,7 @@ pub(crate) async fn spawn(
         engines.group_solo.clone(),
         crate::payout_resolver::solo_fee_config(cfg),
         membership.blockparty_service(),
+        Some(membership.coinbase_tags.clone()),
     ));
     let sv1_resolver: Arc<dyn bp_stratum_v1::PayoutResolver> = production_resolver.clone();
     let sv2_resolver: Arc<dyn bp_stratum_v2::hooks::PayoutResolver> = production_resolver;

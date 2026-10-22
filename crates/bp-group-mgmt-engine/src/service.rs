@@ -51,6 +51,7 @@ pub struct UpdateRoundResetSettings {
     pub is_public: PatchField<bool>,
     pub reset_round_on_block: PatchField<bool>,
     pub max_members: PatchField<i32>,
+    pub coinbase_tag: PatchField<bp_common::CoinbaseTag>,
 }
 
 /// Top-level group-management service.
@@ -536,6 +537,7 @@ impl GroupService {
         let resolved = resolve_after_patch(&group, &settings);
         validate_resolved_round_reset(&resolved)?;
 
+        let tag_changed = settings.coinbase_tag != PatchField::Untouched;
         let patch = settings_to_db_patch(settings);
         let now = now_ms();
         let updated =
@@ -545,6 +547,12 @@ impl GroupService {
 
         // Re-arm the cron job. Idempotent.
         self.hooks.apply_round_reset_config(&updated).await;
+        // The front serves the tag from its own cache.
+        if tag_changed {
+            if let Some(n) = self.change_notifier.get() {
+                n.membership_changed("group").await;
+            }
+        }
 
         Ok(updated)
     }
@@ -648,5 +656,6 @@ fn settings_to_db_patch(s: UpdateRoundResetSettings) -> RoundResetConfigPatch {
         is_public: s.is_public,
         reset_round_on_block: s.reset_round_on_block,
         max_members: s.max_members,
+        coinbase_tag: s.coinbase_tag.map_set(|tag| tag.as_str().to_string()),
     }
 }

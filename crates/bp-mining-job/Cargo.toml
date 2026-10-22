@@ -11,6 +11,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+bp-common = { workspace = true }
 bp-share = { workspace = true }
 bp-template-distribution = { workspace = true }
 tracing = { workspace = true }

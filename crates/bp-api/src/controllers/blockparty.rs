@@ -46,6 +46,8 @@ struct GroupPublicView {
     /// When the admin requested member confirmation (button next to Save
     /// Splits). `null` → the member dashboard suppresses the confirm prompt.
     confirmation_requested_at: Option<i64>,
+    /// The admin's coinbase tag; `null` when unset.
+    coinbase_tag: Option<String>,
 }
 
 impl GroupPublicView {
@@ -60,6 +62,7 @@ impl GroupPublicView {
             dissolved_at: r.dissolved_at,
             rental_provider_hint: r.rental_provider_hint.clone(),
             confirmation_requested_at: r.confirmation_requested_at,
+            coinbase_tag: r.coinbase_tag.clone(),
         }
     }
 }
@@ -265,6 +268,10 @@ pub(crate) fn routes() -> Router<SharedState> {
         .route(
             "/api/blockparty/{id}/rental-hint",
             patch(update_rental_hint),
+        )
+        .route(
+            "/api/blockparty/{id}/coinbase-tag",
+            patch(update_coinbase_tag),
         )
         .route(
             "/api/blockparty/{id}/join-link",
@@ -532,6 +539,35 @@ async fn update_rental_hint(
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CoinbaseTagBody {
+    /// `null` or empty clears it.
+    tag: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CoinbaseTagResponse {
+    coinbase_tag: Option<bp_common::CoinbaseTag>,
+}
+
+/// `PATCH /:id/coinbase-tag` — admin sets or clears the tag written after
+/// the pool identifier into the party's blocks.
+async fn update_coinbase_tag(
+    State(state): State<SharedState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<CoinbaseTagBody>,
+) -> Result<Json<CoinbaseTagResponse>, ApiError> {
+    let svc = require_blockparty(&state)?;
+    let tag = crate::utils::coinbase_tag_from_request(body.tag.as_deref().unwrap_or(""))?;
+    let coinbase_tag = svc
+        .update_coinbase_tag(id, tag, admin_token(&headers).as_deref())
+        .await?;
+    Ok(Json(CoinbaseTagResponse { coinbase_tag }))
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdateSplitsBody {
     splits: Vec<SplitUpdate>,
@@ -763,6 +799,7 @@ mod tests {
             updated_at: 0, // never surfaced
             dissolved_at: None,
             confirmation_requested_at: None,
+            coinbase_tag: Some("Party CH".to_owned()),
         };
         let dto = GroupPublicView::from_row(&row);
         let json = serde_json::to_value(&dto).expect("serialize");
@@ -776,7 +813,8 @@ mod tests {
                 "createdAt": 1779464858619,
                 "dissolvedAt": null,
                 "rentalProviderHint": null,
-                "confirmationRequestedAt": null
+                "confirmationRequestedAt": null,
+                "coinbaseTag": "Party CH"
             }"#,
         )
         .unwrap();

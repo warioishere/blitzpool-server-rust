@@ -227,6 +227,48 @@ fn is_invisible_format(c: char) -> bool {
     )
 }
 
+/// Longest coinbase tag a Team or Blockparty admin may set, in characters.
+/// Within the 100-byte coinbase scriptSig it leaves room for the largest
+/// template prefix and extranonce SV2 allows.
+pub const MAX_COINBASE_TAG_CHARS: usize = 25;
+
+/// A Team's or Blockparty's own text in the coinbase of the blocks it mines,
+/// after the pool identifier. Printable ASCII only: it stays in the block for
+/// good and block explorers show it as text.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(transparent)]
+pub struct CoinbaseTag(String);
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CoinbaseTagError {
+    #[error("the coinbase tag may only contain printable ASCII characters")]
+    NotPrintableAscii,
+    #[error("the coinbase tag is longer than {MAX_COINBASE_TAG_CHARS} characters")]
+    TooLong,
+}
+
+impl CoinbaseTag {
+    /// The tag an admin entered, trimmed; an empty one is no tag (`Ok(None)`).
+    pub fn parse(raw: &str) -> Result<Option<Self>, CoinbaseTagError> {
+        let tag = raw.trim();
+        if tag.is_empty() {
+            return Ok(None);
+        }
+        if !tag.bytes().all(|b| (b' '..=b'~').contains(&b)) {
+            return Err(CoinbaseTagError::NotPrintableAscii);
+        }
+        // ASCII: one byte per character.
+        if tag.len() > MAX_COINBASE_TAG_CHARS {
+            return Err(CoinbaseTagError::TooLong);
+        }
+        Ok(Some(Self(tag.to_string())))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 fn validate_address_shape(s: &str) -> Result<(), InvalidAddressError> {
     if s.is_empty() {
         return Err(InvalidAddressError::Empty);
@@ -544,6 +586,27 @@ mod tests {
     /// Device names as miners send them pass unchanged, a leading space and
     /// `+` included; control and invisible formatting characters go, and the
     /// cut counts characters, not bytes, as the `varchar(64)` column does.
+    /// A tag is trimmed, empty means none, and only printable ASCII up to
+    /// 25 characters passes; 25 exactly is the boundary.
+    #[test]
+    fn a_coinbase_tag_is_printable_ascii_up_to_25_characters() {
+        let tag = |s: &str| CoinbaseTag::parse(s).map(|t| t.map(|t| t.as_str().to_string()));
+        assert_eq!(tag("Dezentralschweiz"), Ok(Some("Dezentralschweiz".into())));
+        assert_eq!(tag("  Team #1 / CH  "), Ok(Some("Team #1 / CH".into())));
+        assert_eq!(tag(""), Ok(None));
+        assert_eq!(tag("   "), Ok(None));
+        let at_limit = "x".repeat(MAX_COINBASE_TAG_CHARS);
+        assert_eq!(tag(&at_limit), Ok(Some(at_limit.clone())));
+        assert_eq!(tag(&format!("{at_limit}x")), Err(CoinbaseTagError::TooLong));
+        for bad in ["Zürich", "rig\n1", "a\tb", "tag\u{7f}", "\u{202E}abc"] {
+            assert_eq!(
+                tag(bad),
+                Err(CoinbaseTagError::NotPrintableAscii),
+                "{bad:?}"
+            );
+        }
+    }
+
     #[test]
     fn clean_worker_name_keeps_names_and_drops_what_breaks_text() {
         for name in [

@@ -63,6 +63,10 @@ pub struct PplnsGroupRow {
     /// Parsed via `bp_group_mgmt::group::PayoutMode::parse_or_default`.
     #[sqlx(rename = "payoutMode")]
     pub payout_mode: String,
+    /// The admin's own coinbase tag, written after the pool identifier
+    /// (`bp_common::CoinbaseTag`); NULL for none.
+    #[sqlx(rename = "coinbaseTag")]
+    pub coinbase_tag: Option<String>,
 }
 
 pub async fn find_group(pool: &PgPool, id: Uuid) -> Result<Option<PplnsGroupRow>, DbError> {
@@ -87,7 +91,8 @@ pub async fn find_group(pool: &PgPool, id: Uuid) -> Result<Option<PplnsGroupRow>
             "isPublic" AS "is_public!",
             "resetRoundOnBlock" AS "reset_round_on_block!",
             "maxMembers" AS "max_members?",
-            "payoutMode" AS "payout_mode!"
+            "payoutMode" AS "payout_mode!",
+            "coinbaseTag" AS "coinbase_tag?"
            FROM pplns_group WHERE id = $1 LIMIT 1"#,
         id
     )
@@ -465,7 +470,8 @@ where
             "isPublic" AS "is_public!",
             "resetRoundOnBlock" AS "reset_round_on_block!",
             "maxMembers" AS "max_members?",
-            "payoutMode" AS "payout_mode!""#,
+            "payoutMode" AS "payout_mode!",
+            "coinbaseTag" AS "coinbase_tag?""#,
         id,
         name,
         creator_address.as_str(),
@@ -509,7 +515,8 @@ pub async fn find_pplns_group_by_name_not_dissolved(
             "isPublic" AS "is_public!",
             "resetRoundOnBlock" AS "reset_round_on_block!",
             "maxMembers" AS "max_members?",
-            "payoutMode" AS "payout_mode!"
+            "payoutMode" AS "payout_mode!",
+            "coinbaseTag" AS "coinbase_tag?"
            FROM pplns_group
            WHERE name = $1 AND "dissolvedAt" IS NULL
            LIMIT 1"#,
@@ -544,7 +551,8 @@ pub async fn list_active_pplns_groups(pool: &PgPool) -> Result<Vec<PplnsGroupRow
             "isPublic" AS "is_public!",
             "resetRoundOnBlock" AS "reset_round_on_block!",
             "maxMembers" AS "max_members?",
-            "payoutMode" AS "payout_mode!"
+            "payoutMode" AS "payout_mode!",
+            "coinbaseTag" AS "coinbase_tag?"
            FROM pplns_group
            WHERE "dissolvedAt" IS NULL
            ORDER BY "createdAt" ASC"#,
@@ -641,6 +649,7 @@ pub struct RoundResetConfigPatch {
     pub is_public: PatchField<bool>,
     pub reset_round_on_block: PatchField<bool>,
     pub max_members: PatchField<i32>,
+    pub coinbase_tag: PatchField<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -651,8 +660,8 @@ pub enum PatchField<T> {
     Set(T),
 }
 
-/// Apply the round-reset patch + `isPublic` toggle as one UPDATE and return
-/// the row read back.
+/// Apply the group settings patch (round reset, `isPublic`, member cap,
+/// coinbase tag) as one UPDATE and return the row read back.
 #[allow(clippy::too_many_arguments)]
 pub async fn update_pplns_group_round_reset_config(
     pool: &PgPool,
@@ -671,6 +680,7 @@ pub async fn update_pplns_group_round_reset_config(
     let (reset_on_block_write, _reset_on_block_clear, reset_on_block_value) =
         patch_triple_bool(&patch.reset_round_on_block);
     let (max_write, max_clear, max_value) = patch_triple_i32(&patch.max_members);
+    let (tag_write, tag_clear, tag_value) = patch_triple_str(&patch.coinbase_tag);
 
     sqlx::query_as!(
         PplnsGroupRow,
@@ -684,6 +694,7 @@ pub async fn update_pplns_group_round_reset_config(
              "isPublic"               = CASE WHEN $17 THEN $18 ELSE "isPublic" END,
              "resetRoundOnBlock"      = CASE WHEN $19 THEN $20 ELSE "resetRoundOnBlock" END,
              "maxMembers"             = CASE WHEN $21 THEN (CASE WHEN $22 THEN NULL::int ELSE $23::int END) ELSE "maxMembers" END,
+             "coinbaseTag"            = CASE WHEN $25 THEN (CASE WHEN $26 THEN NULL::varchar ELSE $27::varchar END) ELSE "coinbaseTag" END,
              "updatedAt"              = $24
            WHERE id = $1
            RETURNING
@@ -705,7 +716,8 @@ pub async fn update_pplns_group_round_reset_config(
             "isPublic" AS "is_public!",
             "resetRoundOnBlock" AS "reset_round_on_block!",
             "maxMembers" AS "max_members?",
-            "payoutMode" AS "payout_mode!""#,
+            "payoutMode" AS "payout_mode!",
+            "coinbaseTag" AS "coinbase_tag?""#,
         group_id,
         preset_write,
         preset_clear,
@@ -730,6 +742,9 @@ pub async fn update_pplns_group_round_reset_config(
         max_clear,
         max_value,
         now_ms,
+        tag_write,
+        tag_clear,
+        tag_value,
     )
     .fetch_optional(pool)
     .await

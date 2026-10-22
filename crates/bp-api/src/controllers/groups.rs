@@ -268,6 +268,9 @@ struct UpdateSettingsBody {
     reset_round_on_block: Option<bool>,
     #[serde(default)]
     max_members: Option<Option<i64>>,
+    /// An empty string clears it, as `null` does.
+    #[serde(default)]
+    coinbase_tag: Option<Option<String>>,
 }
 
 fn lift_patch<T: Clone, R>(field: &Option<Option<T>>, map: impl Fn(&T) -> R) -> PatchField<R> {
@@ -311,6 +314,15 @@ async fn update_settings(
             Some(v) => PatchField::Set(v),
         },
         max_members: lift_patch(&body.max_members, |v| *v as i32),
+        coinbase_tag: match &body.coinbase_tag {
+            None => PatchField::Untouched,
+            Some(raw) => {
+                match crate::utils::coinbase_tag_from_request(raw.as_deref().unwrap_or(""))? {
+                    Some(tag) => PatchField::Set(tag),
+                    None => PatchField::Clear,
+                }
+            }
+        },
     };
     let row = svc
         .update_round_reset_config(id, settings, Some(&auth.admin_token))
@@ -632,6 +644,8 @@ struct GroupSummary {
     max_members: Option<i64>,
     /// `"prop"` or `"window"`; immutable.
     mode: String,
+    /// The admin's coinbase tag; null when unset.
+    coinbase_tag: Option<String>,
 }
 
 impl From<bp_db::PplnsGroupRow> for GroupSummary {
@@ -658,6 +672,7 @@ impl From<bp_db::PplnsGroupRow> for GroupSummary {
             reset_round_on_block: r.reset_round_on_block,
             max_members: r.max_members.map(|v| v as i64),
             mode: r.payout_mode,
+            coinbase_tag: r.coinbase_tag,
         }
     }
 }
@@ -2209,6 +2224,7 @@ mod tests {
             reset_round_on_block: false,
             max_members: None,
             mode: "prop".into(),
+            coinbase_tag: None,
         };
         let r = CreateGroupResponse {
             summary: g,
@@ -2243,6 +2259,7 @@ mod tests {
             reset_round_on_block: false,
             max_members: None,
             mode: "prop".into(),
+            coinbase_tag: None,
         };
         let authed: Value = serde_json::to_value(&summary).unwrap();
         assert_eq!(authed["creatorAddress"], "bc1qcreator");
@@ -2342,6 +2359,7 @@ mod tests {
                 reset_round_on_block: false,
                 max_members: None,
                 mode: "prop".into(),
+                coinbase_tag: None,
             }
         }
         let non_admin = GroupDetailResponse {

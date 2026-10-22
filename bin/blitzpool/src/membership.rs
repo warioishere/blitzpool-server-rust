@@ -9,12 +9,15 @@ use std::sync::Arc;
 use bp_blockparty_engine::BlockpartyService;
 
 use crate::blockparty_service::SharedBlockparty;
+use crate::coinbase_tags::CoinbaseTagCache;
 use crate::group_service::SharedGroupService;
 
 pub(crate) struct Membership {
     pub(crate) group: SharedGroupService,
     /// `None` unless Blockparty is configured.
     pub(crate) blockparty: Option<SharedBlockparty>,
+    /// Kept current by `cache_sync` on the front.
+    pub(crate) coinbase_tags: Arc<CoinbaseTagCache>,
 }
 
 impl Membership {

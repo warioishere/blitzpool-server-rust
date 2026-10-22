@@ -43,6 +43,8 @@ pub(crate) struct ProductionPayoutResolver {
     /// When `None`, the Blockparty arm serves no job and the pending-fee guard
     /// falls through to Solo.
     blockparty: Option<Arc<BlockpartyService>>,
+    /// Team and Blockparty coinbase tags; `None` adds none.
+    coinbase_tags: Option<Arc<crate::coinbase_tags::CoinbaseTagCache>>,
 }
 
 impl ProductionPayoutResolver {
@@ -52,6 +54,7 @@ impl ProductionPayoutResolver {
         group_solo: Option<GroupSoloEngine>,
         solo_fee: SoloFeeConfig,
         blockparty: Option<Arc<BlockpartyService>>,
+        coinbase_tags: Option<Arc<crate::coinbase_tags::CoinbaseTagCache>>,
     ) -> Self {
         Self {
             mode_gate,
@@ -59,7 +62,13 @@ impl ProductionPayoutResolver {
             group_solo,
             solo_fee,
             blockparty,
+            coinbase_tags,
         }
+    }
+
+    /// The tag a Team or Blockparty set for its coinbase.
+    fn coinbase_tag(&self, group_id: Uuid) -> Option<bp_common::CoinbaseTag> {
+        self.coinbase_tags.as_ref()?.get(group_id)
     }
 
     /// Resolution core for SV1 and SV2.
@@ -82,19 +91,20 @@ impl ProductionPayoutResolver {
                 ))
             }
             MiningModeResult::Pplns => self.pplns_payouts(miner_address, reward_sats).await,
-            MiningModeResult::Blockparty(group_id) => {
-                blockparty_payouts(
-                    self.blockparty.as_deref().map(BlockpartyService::payouts),
-                    miner_address,
-                    reward_sats,
-                    group_id,
-                )
+            // A Team or Blockparty mines its own coinbase, so it may tag it;
+            // Solo and the pool-wide PPLNS coinbase carry the pool's alone.
+            MiningModeResult::Blockparty(group_id) => blockparty_payouts(
+                self.blockparty.as_deref().map(BlockpartyService::payouts),
+                miner_address,
+                reward_sats,
+                group_id,
+            )
+            .await
+            .with_coinbase_tag(self.coinbase_tag(group_id)),
+            MiningModeResult::GroupSolo(group_id) => self
+                .group_solo_payouts(miner_address, reward_sats, group_id)
                 .await
-            }
-            MiningModeResult::GroupSolo(group_id) => {
-                self.group_solo_payouts(miner_address, reward_sats, group_id)
-                    .await
-            }
+                .with_coinbase_tag(self.coinbase_tag(group_id)),
         }
     }
 }
@@ -130,6 +140,7 @@ fn lower_built(
                 })
                 .collect(),
             payouts_fingerprint: built.payouts_fingerprint(),
+            coinbase_tag: None,
         },
         Err(err) => {
             error!(
@@ -702,6 +713,65 @@ mod tests {
     use super::*;
 
     const TEST_REWARD: u64 = 5_000_000_000;
+
+    /// Only a Team's and a Blockparty's coinbase carries a group tag: the same
+    /// address and the same cached tag give Solo and PPLNS none. Without the
+    /// engines wired, the two group arms serve no job, which still carries
+    /// the tag they added.
+    #[tokio::test]
+    async fn only_the_team_and_blockparty_arms_add_their_tag() {
+        let address = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+        let group = Uuid::new_v4();
+        let tag = bp_common::CoinbaseTag::parse("Dezentralschweiz")
+            .unwrap()
+            .unwrap();
+        let gate = Arc::new(BlitzpoolModeGate::new());
+        let resolver = ProductionPayoutResolver::new(
+            gate.clone(),
+            None,
+            None,
+            SoloFeeConfig {
+                dev_fee_address: None,
+                dev_fee_percent: 0.0,
+            },
+            None,
+            Some(Arc::new(crate::coinbase_tags::CoinbaseTagCache::from_tags(
+                [(group, tag.clone())],
+            ))),
+        );
+        for (mode, tagged) in [
+            (MiningModeResult::Solo, false),
+            (MiningModeResult::Pplns, false),
+            (MiningModeResult::GroupSolo(group), true),
+            (MiningModeResult::Blockparty(group), true),
+        ] {
+            gate.set_mode(address, mode);
+            let resolved = resolver.resolve_internal(address, TEST_REWARD).await;
+            assert_eq!(
+                resolved.coinbase_tag,
+                tagged.then(|| tag.clone()),
+                "{mode:?}"
+            );
+        }
+        assert!(
+            ProductionPayoutResolver::new(
+                gate,
+                None,
+                None,
+                SoloFeeConfig {
+                    dev_fee_address: None,
+                    dev_fee_percent: 0.0,
+                },
+                None,
+                None,
+            )
+            .resolve_internal(address, TEST_REWARD)
+            .await
+            .coinbase_tag
+            .is_none(),
+            "control: no cache, no tag"
+        );
+    }
 
     /// Pins the full mode → JDP distribution map, every mode named.
     #[test]

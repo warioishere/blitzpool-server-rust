@@ -886,6 +886,7 @@ name = "bp-mining-job"
 version = "2.4.1"
 dependencies = [
  "bitcoin",
+ "bp-common",
  "bp-regtest-harness",
  "bp-share",
  "bp-template-distribution",
