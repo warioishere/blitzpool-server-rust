@@ -45,8 +45,49 @@ pub struct PushPayload {
 }
 
 impl PushPayload {
-    /// `"title|body|tag"` — wire shape for UnifiedPush / plain POST.
+    /// `"title|body|tag"` — wire shape for UnifiedPush / plain POST. A `|`
+    /// inside a field (free text such as a Team or worker name) becomes `¦`,
+    /// so the receiver's split still yields exactly these three fields.
     pub fn pipe_joined(&self) -> String {
-        format!("{}|{}|{}", self.title, self.body, self.tag)
+        let field = |s: &str| s.replace('|', "\u{a6}");
+        format!(
+            "{}|{}|{}",
+            field(&self.title),
+            field(&self.body),
+            field(&self.tag)
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payload(title: &str, body: &str, tag: &str) -> PushPayload {
+        PushPayload {
+            kind: PushKind::DeviceStatus,
+            title: title.to_string(),
+            body: body.to_string(),
+            tag: tag.to_string(),
+            extras: Vec::new(),
+        }
+    }
+
+    /// Free text holding a `|` (a Team name, a worker name) stays inside its
+    /// field, so the receiver still splits into title, body and tag.
+    #[test]
+    fn a_pipe_in_free_text_does_not_add_a_field() {
+        let wire = payload("New join request", "New join request in A|B", "").pipe_joined();
+        assert_eq!(wire.split('|').count(), 3, "wire was: {wire}");
+        assert_eq!(wire, "New join request|New join request in A\u{a6}B|");
+    }
+
+    /// Text without a `|` goes out unchanged.
+    #[test]
+    fn plain_text_is_joined_unchanged() {
+        assert_eq!(
+            payload("Device Online", "cpuminer (rig1) at 10/22/26, 8:00 PM", "").pipe_joined(),
+            "Device Online|cpuminer (rig1) at 10/22/26, 8:00 PM|"
+        );
     }
 }

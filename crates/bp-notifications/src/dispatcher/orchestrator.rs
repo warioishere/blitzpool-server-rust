@@ -230,6 +230,7 @@ impl NotificationDispatcher {
                 Arc::clone(adapter),
                 self.chat_languages.clone(),
                 route.telegram,
+                notice.group_name.clone(),
                 admin_url.clone(),
             )) as TaskFuture);
         }
@@ -237,6 +238,7 @@ impl NotificationDispatcher {
             tasks.push(Box::pin(send_ntfy_join_request(
                 Arc::clone(adapter),
                 sub,
+                notice.group_name.clone(),
                 admin_url.clone(),
             )) as TaskFuture);
         }
@@ -246,7 +248,7 @@ impl NotificationDispatcher {
                 self.pool.clone(),
                 notice.admin_address.clone(),
                 route.push,
-                join_request_push_payload(),
+                join_request_push_payload(&notice.group_name),
             )) as TaskFuture);
         }
         if route.mail {
@@ -980,25 +982,24 @@ fn device_status_unified_payload(event: &DeviceStatusEvent) -> PushPayload {
     }
 }
 
-/// The app shows the notice as it comes: no requester and no Team name, so
-/// no user-chosen text reaches the `title|body|` wire shape.
-fn join_request_push_payload() -> PushPayload {
+/// Names the Team, not the requester; the admin panel shows who asked.
+fn join_request_push_payload(group_name: &str) -> PushPayload {
     PushPayload {
         kind: PushKind::GroupJoinRequest,
         title: "New join request".to_string(),
-        body: "Someone asked to join your Team.".to_string(),
+        body: format!("New join request in {group_name}"),
         tag: String::new(),
         extras: Vec::new(),
     }
 }
 
-fn join_request_text(lang: Language, admin_url: Option<&str>) -> String {
+fn join_request_text(lang: Language, group_name: &str, admin_url: Option<&str>) -> String {
     let head = match lang {
-        Language::De => "\u{1f44b} Neue Beitrittsanfrage für dein Team.",
-        Language::En => "\u{1f44b} New request to join your Team.",
+        Language::De => format!("\u{1f44b} Neue Beitrittsanfrage in {group_name}"),
+        Language::En => format!("\u{1f44b} New join request in {group_name}"),
     };
     match (lang, admin_url) {
-        (_, None) => head.to_string(),
+        (_, None) => head,
         (Language::De, Some(url)) => format!("{head}\nAdmin-Panel: {url}"),
         (Language::En, Some(url)) => format!("{head}\nAdmin panel: {url}"),
     }
@@ -1008,15 +1009,17 @@ async fn send_telegram_join_request(
     adapter: Arc<TelegramAdapter>,
     chat_languages: ChatLanguageMap,
     subs: Vec<TelegramSubscriptionRow>,
+    group_name: String,
     admin_url: Option<String>,
 ) {
     let tasks = subs.into_iter().map(|sub| {
         let adapter = Arc::clone(&adapter);
         let chat_languages = chat_languages.clone();
+        let group_name = group_name.clone();
         let admin_url = admin_url.clone();
         async move {
             let lang = chat_language(&chat_languages, sub.telegram_chat_id).await;
-            let text = join_request_text(lang, admin_url.as_deref());
+            let text = join_request_text(lang, &group_name, admin_url.as_deref());
             log_adapter_send(
                 "telegram-join-request",
                 adapter.send_text(sub.telegram_chat_id, &text).await,
@@ -1029,9 +1032,14 @@ async fn send_telegram_join_request(
 async fn send_ntfy_join_request(
     adapter: Arc<NtfyAdapter>,
     sub: NtfySubscriptionRow,
+    group_name: String,
     admin_url: Option<String>,
 ) {
-    let body = join_request_text(Language::parse(&sub.language), admin_url.as_deref());
+    let body = join_request_text(
+        Language::parse(&sub.language),
+        &group_name,
+        admin_url.as_deref(),
+    );
     log_adapter_send(
         "ntfy-join-request",
         adapter.publish(sub.address.as_str(), &body).await,
@@ -1520,25 +1528,27 @@ mod tests {
     }
 
     /// The app reads `title|body|` as title and body; a third non-empty part
-    /// would be shown as a difficulty.
+    /// would be shown as a difficulty, also for a Team name holding a `|`.
     #[test]
-    fn the_join_request_push_keeps_the_two_part_wire_shape() {
+    fn the_join_request_push_names_the_team_in_the_two_part_wire_shape() {
         assert_eq!(
-            join_request_push_payload().pipe_joined(),
-            "New join request|Someone asked to join your Team.|"
+            join_request_push_payload("PoolPals").pipe_joined(),
+            "New join request|New join request in PoolPals|"
         );
+        let wire = join_request_push_payload("A|B").pipe_joined();
+        assert_eq!(wire.split('|').filter(|p| !p.is_empty()).count(), 2);
     }
 
     #[test]
-    fn join_request_text_links_the_admin_panel_when_known() {
+    fn join_request_text_names_the_team_and_links_the_admin_panel_when_known() {
         let url = "https://blitzpool.example/#/app/x/payout-group/admin";
         assert_eq!(
-            join_request_text(Language::En, Some(url)),
-            format!("\u{1f44b} New request to join your Team.\nAdmin panel: {url}")
+            join_request_text(Language::En, "PoolPals", Some(url)),
+            format!("\u{1f44b} New join request in PoolPals\nAdmin panel: {url}")
         );
         assert_eq!(
-            join_request_text(Language::De, None),
-            "\u{1f44b} Neue Beitrittsanfrage für dein Team."
+            join_request_text(Language::De, "PoolPals", None),
+            "\u{1f44b} Neue Beitrittsanfrage in PoolPals"
         );
     }
 }
