@@ -37,6 +37,7 @@ mod group_service;
 mod hooks;
 mod jdp;
 mod jdp_hooks;
+mod join_request_notify;
 mod listeners;
 mod live_mode_marker;
 mod live_sessions;
@@ -380,7 +381,7 @@ async fn main() -> ExitCode {
 
     // `None` when no transport is wired, so the `notify_*` calls are no-ops.
     let dispatcher = if is_notify {
-        dispatcher::build(&handles, &production_hooks, &listeners)
+        dispatcher::build(&handles, &production_hooks, &listeners, &cfg)
     } else {
         None
     };
@@ -758,6 +759,18 @@ async fn main() -> ExitCode {
         None
     };
 
+    // Join requests come from the API process whatever this process's other
+    // roles, so wherever the dispatcher runs, it drains them.
+    let join_request_consumer = match dispatcher.clone() {
+        Some(d) => {
+            let jr_redis = handles
+                .dedicated_redis(&cfg.redis, "group-join-request")
+                .await;
+            Some(crate::join_request_notify::spawn(jr_redis, d))
+        }
+        None => None,
+    };
+
     // The gate only sends from its sweeper, so a process holding the gate
     // must run one or debounced transitions are never released.
     let device_status_sweeper = match (device_status_gate.clone(), dispatcher.clone()) {
@@ -942,6 +955,7 @@ async fn main() -> ExitCode {
         rejected_consumer,
         device_status_consumer,
         device_status_sweeper,
+        join_request_consumer,
         stream_monitor,
         cache_sync,
         autoscaler,
@@ -979,6 +993,7 @@ async fn wait_for_shutdown(
     rejected_consumer: Option<bp_share_stream::StreamConsumerHandle>,
     device_status_consumer: Option<bp_share_stream::StreamConsumerHandle>,
     device_status_sweeper: Option<crate::device_status_gate::DeviceStatusGateHandle>,
+    join_request_consumer: Option<bp_share_stream::StreamConsumerHandle>,
     stream_monitor: Option<stream_monitor::StreamMonitorHandle>,
     cache_sync: Option<cache_sync::CacheSyncHandle>,
     autoscaler: Option<coinbase_autoscaler::AutoscalerHandle>,
@@ -1041,6 +1056,9 @@ async fn wait_for_shutdown(
     }
     if let Some(dsg) = device_status_sweeper {
         dsg.shutdown().await;
+    }
+    if let Some(jrc) = join_request_consumer {
+        jrc.shutdown().await;
     }
     if let Some(sm) = stream_monitor {
         sm.shutdown().await;

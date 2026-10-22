@@ -93,6 +93,7 @@ async fn wrong_token_after_warm_admin(name: &str, path: &str) -> Option<(StatusC
         pool.clone(),
         group_svc.clone(),
         Arc::new(NoopEmailHooks),
+        Arc::new(NoopHooks),
         JoinRequestServiceConfig {
             pool_base_url: None,
             limits: JoinRequestLimits::default(),

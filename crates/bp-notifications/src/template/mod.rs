@@ -7,9 +7,11 @@ mod binding_change;
 mod content;
 mod helpers;
 mod join_decision;
+mod join_request_admin;
 mod verification;
 
 pub use binding_change::{render_binding_change, BindingChangeContext};
 pub use content::EmailContent;
 pub use join_decision::{render_join_decision, JoinDecision, JoinDecisionContext};
+pub use join_request_admin::{render_join_request_admin, JoinRequestAdminContext};
 pub use verification::{render_verification, VerificationContext};

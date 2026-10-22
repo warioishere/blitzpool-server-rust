@@ -25,7 +25,8 @@ pub use email_hooks::{
 };
 pub use error::{GroupServiceError, InvitationServiceError, JoinRequestServiceError};
 pub use hooks::{
-    BlockpartyMembershipReader, GroupServiceHooks, MembershipChangeNotifier, NoopHooks,
+    BlockpartyMembershipReader, CapturingJoinRequestNotifier, GroupServiceHooks,
+    JoinRequestCreated, JoinRequestNotifier, MembershipChangeNotifier, NoopHooks,
 };
 pub use invitation::{
     InvitationService, OpenInviteActive, OpenInviteCreated, OpenInvitePublicView, OpenInviteTtl,

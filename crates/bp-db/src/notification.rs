@@ -31,6 +31,8 @@ pub struct TelegramSubscriptionRow {
     pub hourly_stats_enabled: bool,
     #[sqlx(rename = "hourlyWorkersEnabled")]
     pub hourly_workers_enabled: bool,
+    #[sqlx(rename = "groupAdminNotificationsEnabled")]
+    pub group_admin_notifications_enabled: bool,
 }
 
 /// All non-soft-deleted Telegram subscriptions for `address`. Multiple
@@ -54,7 +56,8 @@ pub async fn find_telegram_subscriptions_by_address(
             "isDefault" AS "is_default!",
             "deviceNotificationsEnabled" AS "device_notifications_enabled!",
             "hourlyStatsEnabled" AS "hourly_stats_enabled!",
-            "hourlyWorkersEnabled" AS "hourly_workers_enabled!"
+            "hourlyWorkersEnabled" AS "hourly_workers_enabled!",
+            "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!"
            FROM telegram_subscriptions_entity
            WHERE address = $1 AND "deletedAt" IS NULL"#,
         address.as_str(),
@@ -82,7 +85,8 @@ pub async fn find_telegram_subscriptions_with_hourly_enabled(
             "isDefault" AS "is_default!",
             "deviceNotificationsEnabled" AS "device_notifications_enabled!",
             "hourlyStatsEnabled" AS "hourly_stats_enabled!",
-            "hourlyWorkersEnabled" AS "hourly_workers_enabled!"
+            "hourlyWorkersEnabled" AS "hourly_workers_enabled!",
+            "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!"
            FROM telegram_subscriptions_entity
            WHERE "deletedAt" IS NULL
              AND ("hourlyStatsEnabled" = true OR "hourlyWorkersEnabled" = true)"#,
@@ -112,7 +116,8 @@ pub async fn find_telegram_subscriptions_by_chat(
             "isDefault" AS "is_default!",
             "deviceNotificationsEnabled" AS "device_notifications_enabled!",
             "hourlyStatsEnabled" AS "hourly_stats_enabled!",
-            "hourlyWorkersEnabled" AS "hourly_workers_enabled!"
+            "hourlyWorkersEnabled" AS "hourly_workers_enabled!",
+            "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!"
            FROM telegram_subscriptions_entity
            WHERE "telegramChatId" = $1 AND "deletedAt" IS NULL"#,
         telegram_chat_id,
@@ -141,6 +146,8 @@ pub struct NtfySubscriptionRow {
     pub hourly_stats_enabled: bool,
     #[sqlx(rename = "hourlyWorkersEnabled")]
     pub hourly_workers_enabled: bool,
+    #[sqlx(rename = "groupAdminNotificationsEnabled")]
+    pub group_admin_notifications_enabled: bool,
 }
 
 /// All ntfy subscriptions where the hourly cron should fire — either
@@ -160,7 +167,8 @@ pub async fn find_ntfy_subscriptions_with_hourly_enabled(
             "bestDiffNotificationsEnabled" AS "best_diff_notifications_enabled!",
             "deviceNotificationsEnabled" AS "device_notifications_enabled!",
             "hourlyStatsEnabled" AS "hourly_stats_enabled!",
-            "hourlyWorkersEnabled" AS "hourly_workers_enabled!"
+            "hourlyWorkersEnabled" AS "hourly_workers_enabled!",
+            "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!"
            FROM ntfy_subscriptions_entity
            WHERE "deletedAt" IS NULL
              AND ("hourlyStatsEnabled" = true OR "hourlyWorkersEnabled" = true)"#,
@@ -189,7 +197,8 @@ pub async fn find_ntfy_subscription_by_address(
             "bestDiffNotificationsEnabled" AS "best_diff_notifications_enabled!",
             "deviceNotificationsEnabled" AS "device_notifications_enabled!",
             "hourlyStatsEnabled" AS "hourly_stats_enabled!",
-            "hourlyWorkersEnabled" AS "hourly_workers_enabled!"
+            "hourlyWorkersEnabled" AS "hourly_workers_enabled!",
+            "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!"
            FROM ntfy_subscriptions_entity
            WHERE address = $1 AND "deletedAt" IS NULL
            LIMIT 1"#,
@@ -228,6 +237,8 @@ pub struct PushSubscriptionRow {
     pub subscription_type: String,
     #[sqlx(rename = "networkDiffNotificationsEnabled")]
     pub network_diff_notifications_enabled: bool,
+    #[sqlx(rename = "groupAdminNotificationsEnabled")]
+    pub group_admin_notifications_enabled: bool,
 }
 
 /// All non-soft-deleted push subscriptions for `address`. Returns
@@ -252,7 +263,8 @@ pub async fn find_push_subscriptions_by_address(
             "deviceNotificationsEnabled" AS "device_notifications_enabled!",
             "blockNotificationsEnabled" AS "block_notifications_enabled!",
             "subscriptionType" AS "subscription_type!",
-            "networkDiffNotificationsEnabled" AS "network_diff_notifications_enabled!"
+            "networkDiffNotificationsEnabled" AS "network_diff_notifications_enabled!",
+            "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!"
            FROM push_subscription_entity
            WHERE address = $1 AND "deletedAt" IS NULL"#,
         address.as_str(),
@@ -311,7 +323,7 @@ pub async fn update_push_subscription_last_notification(
 
 /// Idempotent upsert keyed by the `(address, endpoint, subscriptionType)`
 /// UNIQUE index. A conflict keeps the caller's flags and reactivates a
-/// soft-deleted row; a new row starts with all four flags `true`.
+/// soft-deleted row; a new row starts with every flag `true`.
 pub async fn upsert_push_subscription(
     pool: &PgPool,
     address: &AddressId,
@@ -346,7 +358,8 @@ pub async fn upsert_push_subscription(
                 "deviceNotificationsEnabled" AS "device_notifications_enabled!",
                 "blockNotificationsEnabled" AS "block_notifications_enabled!",
                 "subscriptionType" AS "subscription_type!",
-                "networkDiffNotificationsEnabled" AS "network_diff_notifications_enabled!""#,
+                "networkDiffNotificationsEnabled" AS "network_diff_notifications_enabled!",
+                "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!""#,
         address.as_str(),
         endpoint,
         platform,
@@ -433,17 +446,25 @@ pub async fn delete_push_subscriptions_by_address_and_type(
     Ok(result.rows_affected())
 }
 
-/// Update the four notification-preference flags for the row keyed by
-/// `(address, endpoint)`; `None` leaves a flag as-is. Returns the rows
-/// affected, 0 when no matching active row exists.
+/// The notification-preference flags of one push subscription; `None`
+/// leaves a flag as-is.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PushPreferenceUpdate {
+    pub best_diff: Option<bool>,
+    pub device: Option<bool>,
+    pub block: Option<bool>,
+    pub network_diff: Option<bool>,
+    pub group_admin: Option<bool>,
+}
+
+/// Update the notification-preference flags for the row keyed by
+/// `(address, endpoint)`. Returns the rows affected, 0 when no matching
+/// active row exists.
 pub async fn update_push_subscription_preferences(
     pool: &PgPool,
     address: &AddressId,
     endpoint: &str,
-    best_diff: Option<bool>,
-    device: Option<bool>,
-    block: Option<bool>,
-    network_diff: Option<bool>,
+    update: PushPreferenceUpdate,
 ) -> Result<u64, DbError> {
     let now_ms: i64 = chrono::Utc::now().timestamp_millis();
     let result = sqlx::query!(
@@ -456,16 +477,19 @@ pub async fn update_push_subscription_preferences(
                    COALESCE($5, "blockNotificationsEnabled"),
                "networkDiffNotificationsEnabled" =
                    COALESCE($6, "networkDiffNotificationsEnabled"),
-               "updatedAt" = $7
+               "groupAdminNotificationsEnabled" =
+                   COALESCE($7, "groupAdminNotificationsEnabled"),
+               "updatedAt" = $8
            WHERE address = $1
              AND endpoint = $2
              AND "deletedAt" IS NULL"#,
         address.as_str(),
         endpoint,
-        best_diff,
-        device,
-        block,
-        network_diff,
+        update.best_diff,
+        update.device,
+        update.block,
+        update.network_diff,
+        update.group_admin,
         now_ms,
     )
     .execute(pool)
@@ -656,6 +680,31 @@ pub async fn update_telegram_sub_device_flag(
     Ok(result.rows_affected())
 }
 
+/// Toggle the per-subscription `groupAdminNotificationsEnabled` flag.
+pub async fn update_telegram_sub_group_admin_flag(
+    pool: &PgPool,
+    telegram_chat_id: i64,
+    address: &AddressId,
+    value: bool,
+) -> Result<u64, DbError> {
+    let now_ms: i64 = chrono::Utc::now().timestamp_millis();
+    let result = sqlx::query!(
+        r#"UPDATE telegram_subscriptions_entity
+           SET "groupAdminNotificationsEnabled" = $3, "updatedAt" = $4
+           WHERE "telegramChatId" = $1
+             AND address = $2
+             AND "deletedAt" IS NULL"#,
+        telegram_chat_id,
+        address.as_str(),
+        value,
+        now_ms,
+    )
+    .execute(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(result.rows_affected())
+}
+
 /// Set `hourlyStatsEnabled` and `hourlyWorkersEnabled` independently —
 /// backs the `hr:stats` / `hr:workers` inline-menu toggles, which flip
 /// one flag at a time. Returns the number of rows affected.
@@ -761,6 +810,27 @@ pub async fn update_ntfy_sub_device_flag(
     let result = sqlx::query!(
         r#"UPDATE ntfy_subscriptions_entity
            SET "deviceNotificationsEnabled" = $2, "updatedAt" = $3
+           WHERE address = $1 AND "deletedAt" IS NULL"#,
+        address.as_str(),
+        value,
+        now_ms,
+    )
+    .execute(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(result.rows_affected())
+}
+
+/// Toggle `groupAdminNotificationsEnabled` on the ntfy sub.
+pub async fn update_ntfy_sub_group_admin_flag(
+    pool: &PgPool,
+    address: &AddressId,
+    value: bool,
+) -> Result<u64, DbError> {
+    let now_ms: i64 = chrono::Utc::now().timestamp_millis();
+    let result = sqlx::query!(
+        r#"UPDATE ntfy_subscriptions_entity
+           SET "groupAdminNotificationsEnabled" = $2, "updatedAt" = $3
            WHERE address = $1 AND "deletedAt" IS NULL"#,
         address.as_str(),
         value,

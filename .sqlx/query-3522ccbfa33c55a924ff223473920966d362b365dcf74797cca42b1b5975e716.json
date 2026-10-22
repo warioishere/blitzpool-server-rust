@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE push_subscription_entity\n           SET \"bestDiffNotificationsEnabled\" =\n                   COALESCE($3, \"bestDiffNotificationsEnabled\"),\n               \"deviceNotificationsEnabled\" =\n                   COALESCE($4, \"deviceNotificationsEnabled\"),\n               \"blockNotificationsEnabled\" =\n                   COALESCE($5, \"blockNotificationsEnabled\"),\n               \"networkDiffNotificationsEnabled\" =\n                   COALESCE($6, \"networkDiffNotificationsEnabled\"),\n               \"groupAdminNotificationsEnabled\" =\n                   COALESCE($7, \"groupAdminNotificationsEnabled\"),\n               \"updatedAt\" = $8\n           WHERE address = $1\n             AND endpoint = $2\n             AND \"deletedAt\" IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Bool",
+        "Bool",
+        "Bool",
+        "Bool",
+        "Bool",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3522ccbfa33c55a924ff223473920966d362b365dcf74797cca42b1b5975e716"
+}

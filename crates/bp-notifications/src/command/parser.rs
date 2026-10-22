@@ -20,6 +20,8 @@ pub enum Command {
     BestDiffToggle(FlagToggle),
     /// `/device_notifications on|off` — device-status push toggle.
     DeviceToggle(FlagToggle),
+    /// `/team_requests on|off` — a Team admin's join-request notice.
+    TeamRequestsToggle(FlagToggle),
     /// `/send_hourly on|off` — hourly stats + workers push toggle (both).
     HourlyToggle(FlagToggle),
     /// `/send_hourly` with no on|off arg — open the inline toggle menu.
@@ -163,6 +165,9 @@ pub fn parse_command(text: &str) -> Command {
         "/device_notifications" => parse_toggle(arg)
             .map(Command::DeviceToggle)
             .unwrap_or(Command::Unknown),
+        "/team_requests" => parse_toggle(arg)
+            .map(Command::TeamRequestsToggle)
+            .unwrap_or(Command::Unknown),
         // `/send_hourly on|off` flips both flags; bare `/send_hourly`
         // (or any non-on|off arg) opens the inline toggle menu.
         "/send_hourly" => parse_toggle(arg)
@@ -257,12 +262,21 @@ mod tests {
             parse_command("/send_hourly aus"),
             Command::HourlyToggle(FlagToggle::Off)
         );
+        assert_eq!(
+            parse_command("/team_requests off"),
+            Command::TeamRequestsToggle(FlagToggle::Off)
+        );
+        assert_eq!(
+            parse_command("/team_requests on"),
+            Command::TeamRequestsToggle(FlagToggle::On)
+        );
     }
 
     #[test]
     fn toggle_without_arg_is_unknown() {
         assert_eq!(parse_command("/subscribe_bestdiff"), Command::Unknown);
         assert_eq!(parse_command("/subscribe_bestdiff maybe"), Command::Unknown);
+        assert_eq!(parse_command("/team_requests"), Command::Unknown);
     }
 
     #[test]

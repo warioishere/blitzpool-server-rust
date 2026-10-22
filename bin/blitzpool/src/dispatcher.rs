@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use bp_config::AppConfig;
 use bp_notifications::command::ChatLanguageMap;
 use bp_notifications::dispatcher::NotificationDispatcher;
 use tokio::sync::Mutex;
@@ -21,6 +22,7 @@ pub(crate) fn build(
     foundation: &FoundationHandles,
     hooks: &ProductionHooks,
     listeners: &ListenerHandles,
+    cfg: &AppConfig,
 ) -> Option<Arc<NotificationDispatcher>> {
     let fcm = hooks.fcm.clone();
     let web_push = hooks.web_push.clone();
@@ -49,12 +51,15 @@ pub(crate) fn build(
         ntfy = ntfy.is_some(),
         "dispatcher: built (Europe/Zurich timezone)"
     );
-    Some(Arc::new(NotificationDispatcher::new(
-        foundation.db.pool().clone(),
-        telegram,
-        ntfy,
-        fcm,
-        web_push,
-        chat_languages,
-    )))
+    Some(Arc::new(
+        NotificationDispatcher::new(
+            foundation.db.pool().clone(),
+            telegram,
+            ntfy,
+            fcm,
+            web_push,
+            chat_languages,
+        )
+        .with_join_request_mail(hooks.smtp.clone(), cfg.pool_base_url.clone()),
+    ))
 }

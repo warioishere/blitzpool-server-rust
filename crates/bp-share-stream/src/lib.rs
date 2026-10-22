@@ -59,6 +59,11 @@ pub const REJECTED_STREAM_KEY: &str = "shares:rejected";
 /// duplicate from at-least-once delivery is cosmetic.
 pub const DEVICE_STATUS_STREAM_KEY: &str = "device:status";
 
+/// New Team join requests (API → notify), so the notify process can tell
+/// the Team's admin. Notify-only, so a duplicate from at-least-once delivery
+/// costs one extra notice.
+pub const GROUP_JOIN_REQUEST_STREAM_KEY: &str = "group:join-request";
+
 /// Tells the Front to rebuild its in-memory routing caches when membership
 /// changes in another process, which would otherwise only route after a
 /// Front restart. Consumed from the tail: the Front warms from the DB at boot.

@@ -40,6 +40,11 @@ const MENU: &[MenuEntry] = &[
         en: "Device notifications (on/off)",
     },
     MenuEntry {
+        command: "/team_requests",
+        de: "Team-Beitrittsanfragen als Admin (on/off)",
+        en: "Team join requests as admin (on/off)",
+    },
+    MenuEntry {
         command: "/difficulty",
         de: "Zeigt aktuelle Netzwerk-Difficulty",
         en: "Show current network difficulty",

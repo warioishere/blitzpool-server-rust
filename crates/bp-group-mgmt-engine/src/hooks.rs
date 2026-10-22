@@ -57,6 +57,46 @@ pub trait MembershipChangeNotifier: Send + Sync {
     async fn membership_changed(&self, kind: &str);
 }
 
+/// A request to join a Team was stored; the Team's admin is told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinRequestCreated {
+    pub group_id: Uuid,
+    pub group_name: String,
+    /// The Team's admin at the time of the request.
+    pub admin_address: AddressId,
+    pub requester_address: AddressId,
+}
+
+/// Fired after a join request is stored, so the process that sends
+/// notifications can tell the Team's admin. Must swallow its own failures:
+/// the request stands whether or not the admin hears of it.
+#[async_trait]
+pub trait JoinRequestNotifier: Send + Sync {
+    async fn join_request_created(&self, event: JoinRequestCreated);
+}
+
+/// Test sink that records every [`JoinRequestCreated`] in order.
+#[derive(Debug, Default, Clone)]
+pub struct CapturingJoinRequestNotifier {
+    pub events: std::sync::Arc<std::sync::Mutex<Vec<JoinRequestCreated>>>,
+}
+
+impl CapturingJoinRequestNotifier {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn events_snapshot(&self) -> Vec<JoinRequestCreated> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl JoinRequestNotifier for CapturingJoinRequestNotifier {
+    async fn join_request_created(&self, event: JoinRequestCreated) {
+        self.events.lock().unwrap().push(event);
+    }
+}
+
 /// Sentinel for tests + early wiring: every hook does nothing.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopHooks;
@@ -78,4 +118,9 @@ impl GroupServiceHooks for NoopHooks {
     async fn on_group_dissolved(&self, _group_id: Uuid) {}
 
     async fn apply_round_reset_config(&self, _group: &PplnsGroupRow) {}
+}
+
+#[async_trait]
+impl JoinRequestNotifier for NoopHooks {
+    async fn join_request_created(&self, _event: JoinRequestCreated) {}
 }

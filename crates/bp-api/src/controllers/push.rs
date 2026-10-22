@@ -281,6 +281,7 @@ struct StatusSubscription {
     best_diff_notifications_enabled: bool,
     device_notifications_enabled: bool,
     block_notifications_enabled: bool,
+    group_admin_notifications_enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -313,6 +314,7 @@ async fn status(
             best_diff_notifications_enabled: s.best_diff_notifications_enabled,
             device_notifications_enabled: s.device_notifications_enabled,
             block_notifications_enabled: s.block_notifications_enabled,
+            group_admin_notifications_enabled: s.group_admin_notifications_enabled,
         })
         .collect::<Vec<_>>();
     Ok(Json(StatusResponse {
@@ -337,6 +339,7 @@ struct ConfigureBody {
     device_notifications: Option<bool>,
     block_notifications: Option<bool>,
     network_diff_notifications: Option<bool>,
+    group_admin_notifications: Option<bool>,
 }
 
 async fn configure(
@@ -348,10 +351,13 @@ async fn configure(
         &state.pool,
         &address,
         endpoint.as_str(),
-        body.best_diff_notifications,
-        body.device_notifications,
-        body.block_notifications,
-        body.network_diff_notifications,
+        bp_db::PushPreferenceUpdate {
+            best_diff: body.best_diff_notifications,
+            device: body.device_notifications,
+            block: body.block_notifications,
+            network_diff: body.network_diff_notifications,
+            group_admin: body.group_admin_notifications,
+        },
     )
     .await
     .map_err(|_| push_error("configure-failed", StatusCode::BAD_REQUEST))?;

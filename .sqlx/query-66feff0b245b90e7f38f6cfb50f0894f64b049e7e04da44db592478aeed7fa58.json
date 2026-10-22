@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            \"telegramChatId\" AS \"telegram_chat_id!\",\n            \"bestDiffNotificationsEnabled\" AS \"best_diff_notifications_enabled!\",\n            \"isDefault\" AS \"is_default!\",\n            \"deviceNotificationsEnabled\" AS \"device_notifications_enabled!\",\n            \"hourlyStatsEnabled\" AS \"hourly_stats_enabled!\",\n            \"hourlyWorkersEnabled\" AS \"hourly_workers_enabled!\"\n           FROM telegram_subscriptions_entity\n           WHERE address = $1 AND \"deletedAt\" IS NULL",
+  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            \"telegramChatId\" AS \"telegram_chat_id!\",\n            \"bestDiffNotificationsEnabled\" AS \"best_diff_notifications_enabled!\",\n            \"isDefault\" AS \"is_default!\",\n            \"deviceNotificationsEnabled\" AS \"device_notifications_enabled!\",\n            \"hourlyStatsEnabled\" AS \"hourly_stats_enabled!\",\n            \"hourlyWorkersEnabled\" AS \"hourly_workers_enabled!\",\n            \"groupAdminNotificationsEnabled\" AS \"group_admin_notifications_enabled!\"\n           FROM telegram_subscriptions_entity\n           WHERE \"deletedAt\" IS NULL\n             AND (\"hourlyStatsEnabled\" = true OR \"hourlyWorkersEnabled\" = true)",
   "describe": {
     "columns": [
       {
@@ -57,12 +57,15 @@
         "ordinal": 10,
         "name": "hourly_workers_enabled!",
         "type_info": "Bool"
+      },
+      {
+        "ordinal": 11,
+        "name": "group_admin_notifications_enabled!",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
-      "Left": [
-        "Text"
-      ]
+      "Left": []
     },
     "nullable": [
       true,
@@ -75,8 +78,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "c1ceba6216a7c5d2c6ea85f086cea8c2d044d507d1038870094094465e36a2de"
+  "hash": "66feff0b245b90e7f38f6cfb50f0894f64b049e7e04da44db592478aeed7fa58"
 }

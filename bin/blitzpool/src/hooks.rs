@@ -49,6 +49,9 @@ pub(crate) struct ProductionHooks {
     /// Web-Push adapter for the `NotificationDispatcher`. `None` when
     /// `[notifications.web_push]` is not configured.
     pub(crate) web_push: Option<Arc<WebPushAdapter>>,
+    /// SMTP adapter for the `NotificationDispatcher`'s join-request mail.
+    /// `None` without `[smtp]`.
+    pub(crate) smtp: Option<Arc<SmtpAdapter>>,
 }
 
 #[derive(Debug, Error)]
@@ -100,6 +103,7 @@ pub(crate) async fn spawn(
         group_service,
         fcm,
         web_push,
+        smtp,
     })
 }
 

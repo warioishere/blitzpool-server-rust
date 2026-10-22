@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 use bp_db::PatchField;
 use bp_group_mgmt_engine::{
-    expire_join_requests_once, CapturingEmailHooks, GroupService, JoinDecisionOutcome,
-    JoinRequestLimits, JoinRequestService, JoinRequestServiceConfig, JoinRequestServiceError,
-    NoopHooks, UpdateRoundResetSettings,
+    expire_join_requests_once, CapturingEmailHooks, CapturingJoinRequestNotifier, GroupService,
+    JoinDecisionOutcome, JoinRequestLimits, JoinRequestService, JoinRequestServiceConfig,
+    JoinRequestServiceError, NoopHooks, UpdateRoundResetSettings,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use uuid::Uuid;
@@ -87,22 +87,37 @@ async fn build_services(
     pool: PgPool,
     limits: JoinRequestLimits,
 ) -> (Arc<GroupService>, JoinRequestService, CapturingEmailHooks) {
+    let (group, svc, email, _notifier) = build_services_with_notifier(pool, limits).await;
+    (group, svc, email)
+}
+
+async fn build_services_with_notifier(
+    pool: PgPool,
+    limits: JoinRequestLimits,
+) -> (
+    Arc<GroupService>,
+    JoinRequestService,
+    CapturingEmailHooks,
+    CapturingJoinRequestNotifier,
+) {
     let group = Arc::new(
         GroupService::load(pool.clone(), Arc::new(NoopHooks), 14, TEST_COINBASE_CAP)
             .await
             .expect("load group service"),
     );
     let email = CapturingEmailHooks::new();
+    let notifier = CapturingJoinRequestNotifier::new();
     let svc = JoinRequestService::new(
         pool,
         group.clone(),
         Arc::new(email.clone()),
+        Arc::new(notifier.clone()),
         JoinRequestServiceConfig {
             pool_base_url: Some("https://blitzpool.example".into()),
             limits,
         },
     );
-    (group, svc, email)
+    (group, svc, email, notifier)
 }
 
 async fn create_public_group(
@@ -157,6 +172,76 @@ async fn create_join_request_happy_path() {
 
     cleanup_group(&pool, group_id).await;
     delete_email_for(&pool, &requester).await;
+}
+
+/// A stored request tells the Team's current admin: the creator first, the
+/// new admin after a transfer (never the former one). A refused request tells
+/// nobody.
+#[tokio::test]
+async fn a_stored_join_request_notifies_the_current_admin() {
+    let pool = match connect_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    let (group_svc, svc, _email, notifier) =
+        build_services_with_notifier(pool.clone(), JoinRequestLimits::default()).await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let (group_id, admin_token) = create_public_group(&group_svc, &pool, &suffix).await;
+    let creator = format!("bc1qcr{suffix}");
+    let first = format!("bc1qreqa{suffix}");
+    let second = format!("bc1qreqb{suffix}");
+    let heir = format!("bc1qheir{suffix}");
+    for a in [&first, &second] {
+        seed_verified_email(&pool, a, "req@example.com").await;
+    }
+
+    svc.create_join_request(group_id, &first, None)
+        .await
+        .expect("first request");
+    let events = notifier.events_snapshot();
+    assert_eq!(events.len(), 1, "one stored request, one notice");
+    assert_eq!(events[0].group_id, group_id);
+    assert_eq!(events[0].group_name, format!("g-{suffix}"));
+    assert_eq!(events[0].admin_address.as_str(), creator);
+    assert_eq!(events[0].requester_address.as_str(), first);
+
+    // A refused request (already pending) is not stored and tells nobody.
+    let dup = svc.create_join_request(group_id, &first, None).await;
+    assert!(matches!(dup, Err(JoinRequestServiceError::RequestPending)));
+    assert_eq!(
+        notifier.events_snapshot().len(),
+        1,
+        "a refused request sends no notice"
+    );
+
+    group_svc
+        .add_member(group_id, &heir, Some(&admin_token))
+        .await
+        .expect("heir joins");
+    group_svc
+        .transfer_creator(group_id, &heir, Some(&admin_token))
+        .await
+        .expect("transfer");
+    svc.create_join_request(group_id, &second, None)
+        .await
+        .expect("second request");
+    let events = notifier.events_snapshot();
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events[1].admin_address.as_str(),
+        heir,
+        "the new admin hears of it"
+    );
+    assert_ne!(
+        events[1].admin_address.as_str(),
+        creator,
+        "the former admin does not"
+    );
+
+    cleanup_group(&pool, group_id).await;
+    for a in [&first, &second] {
+        delete_email_for(&pool, a).await;
+    }
 }
 
 #[tokio::test]

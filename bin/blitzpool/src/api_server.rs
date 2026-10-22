@@ -80,6 +80,9 @@ fn build_app_state(
         pool.clone(),
         group_service.clone(),
         production_hooks.join_decision_email.clone(),
+        Arc::new(crate::join_request_notify::StreamJoinRequestNotifier::new(
+            foundation.redis.clone(),
+        )),
         JoinRequestServiceConfig {
             pool_base_url: cfg.pool_base_url.clone(),
             ..JoinRequestServiceConfig::default()

@@ -14,9 +14,10 @@ use bp_db::{
     find_ntfy_subscription_by_address, find_telegram_subscriptions_by_chat,
     promote_telegram_default_if_none, reset_address_settings_best_difficulty,
     set_telegram_default_subscription, set_telegram_hourly_flags, update_ntfy_sub_best_diff_flag,
-    update_ntfy_sub_device_flag, update_ntfy_sub_hourly_flags, update_ntfy_sub_language,
-    update_telegram_sub_best_diff_flag, update_telegram_sub_device_flag, upsert_ntfy_subscription,
-    upsert_telegram_subscription, TelegramSubscriptionRow,
+    update_ntfy_sub_device_flag, update_ntfy_sub_group_admin_flag, update_ntfy_sub_hourly_flags,
+    update_ntfy_sub_language, update_telegram_sub_best_diff_flag, update_telegram_sub_device_flag,
+    update_telegram_sub_group_admin_flag, upsert_ntfy_subscription, upsert_telegram_subscription,
+    TelegramSubscriptionRow,
 };
 use sqlx::PgPool;
 use tokio::sync::{Mutex, Notify};
@@ -214,6 +215,10 @@ impl CommandHandler {
             }
             Command::DeviceToggle(toggle) => {
                 self.handle_flag_toggle(transport, lang, FlagKind::Device, *toggle)
+                    .await
+            }
+            Command::TeamRequestsToggle(toggle) => {
+                self.handle_flag_toggle(transport, lang, FlagKind::GroupAdmin, *toggle)
                     .await
             }
             Command::HourlyToggle(toggle) => {
@@ -880,6 +885,15 @@ impl CommandHandler {
                             )
                             .await
                         }
+                        FlagKind::GroupAdmin => {
+                            update_telegram_sub_group_admin_flag(
+                                &self.pool,
+                                *chat_id,
+                                &sub.address,
+                                value,
+                            )
+                            .await
+                        }
                         FlagKind::Hourly => {
                             set_telegram_hourly_flags(
                                 &self.pool,
@@ -907,6 +921,9 @@ impl CommandHandler {
                 }
                 FlagKind::Device => update_ntfy_sub_device_flag(&self.pool, address, value).await,
                 FlagKind::Hourly => update_ntfy_sub_hourly_flags(&self.pool, address, value).await,
+                FlagKind::GroupAdmin => {
+                    update_ntfy_sub_group_admin_flag(&self.pool, address, value).await
+                }
             },
         };
         match affected {
@@ -1114,6 +1131,7 @@ enum FlagKind {
     BestDiff,
     Device,
     Hourly,
+    GroupAdmin,
 }
 
 fn parse_address(raw: &str) -> Option<AddressId> {
@@ -1132,6 +1150,7 @@ fn help_text(lang: Language) -> &'static str {
             /show_addresses — abonnierte Adressen anzeigen\n\
             /subscribe_bestdiff on|off — Best-Diff-Benachrichtigungen\n\
             /device_notifications on|off — Geräte-Status\n\
+            /team_requests on|off — Beitrittsanfragen für dein Team (als Admin)\n\
             /send_hourly on|off — Stündliche Updates\n\
             /bestdiff_reset [<Adresse>] — Best-Diff zurücksetzen\n\
             /deutsch | /english — Sprache umschalten\n\
@@ -1145,6 +1164,7 @@ fn help_text(lang: Language) -> &'static str {
             /show_addresses — list subscribed addresses\n\
             /subscribe_bestdiff on|off — best-difficulty notifications\n\
             /device_notifications on|off — device status\n\
+            /team_requests on|off — join requests for your Team (as its admin)\n\
             /send_hourly on|off — hourly updates\n\
             /bestdiff_reset [<address>] — reset stored best-difficulty\n\
             /deutsch | /english — switch language\n\
@@ -1236,6 +1256,12 @@ fn flag_toggle_ok_text(lang: Language, flag: FlagKind, value: bool) -> String {
         (Language::De, FlagKind::Device, false) => "Geräte-Benachrichtigungen deaktiviert.".into(),
         (Language::De, FlagKind::Hourly, true) => "Stündliche Updates aktiviert.".into(),
         (Language::De, FlagKind::Hourly, false) => "Stündliche Updates deaktiviert.".into(),
+        (Language::De, FlagKind::GroupAdmin, true) => {
+            "Benachrichtigungen über Team-Beitrittsanfragen aktiviert.".into()
+        }
+        (Language::De, FlagKind::GroupAdmin, false) => {
+            "Benachrichtigungen über Team-Beitrittsanfragen deaktiviert.".into()
+        }
         (Language::En, FlagKind::BestDiff, true) => "Best-difficulty notifications enabled.".into(),
         (Language::En, FlagKind::BestDiff, false) => {
             "Best-difficulty notifications disabled.".into()
@@ -1244,6 +1270,12 @@ fn flag_toggle_ok_text(lang: Language, flag: FlagKind, value: bool) -> String {
         (Language::En, FlagKind::Device, false) => "Device notifications disabled.".into(),
         (Language::En, FlagKind::Hourly, true) => "Hourly updates enabled.".into(),
         (Language::En, FlagKind::Hourly, false) => "Hourly updates disabled.".into(),
+        (Language::En, FlagKind::GroupAdmin, true) => {
+            "Team join-request notifications enabled.".into()
+        }
+        (Language::En, FlagKind::GroupAdmin, false) => {
+            "Team join-request notifications disabled.".into()
+        }
     }
 }
 
@@ -1339,6 +1371,7 @@ mod tests {
             device_notifications_enabled: false,
             hourly_stats_enabled: false,
             hourly_workers_enabled: false,
+            group_admin_notifications_enabled: false,
         }
     }
 

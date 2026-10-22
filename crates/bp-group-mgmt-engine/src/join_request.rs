@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::email_hooks::{EmailHooks, JoinDecisionEmailContext, JoinDecisionOutcome};
 use crate::error::JoinRequestServiceError;
+use crate::hooks::{JoinRequestCreated, JoinRequestNotifier};
 use crate::service::GroupService;
 use crate::util::normalize_address;
 use bp_common::now_ms;
@@ -61,6 +62,7 @@ pub struct JoinRequestService {
     pool: PgPool,
     group_service: Arc<GroupService>,
     email: Arc<dyn EmailHooks>,
+    notifier: Arc<dyn JoinRequestNotifier>,
     config: JoinRequestServiceConfig,
 }
 
@@ -69,12 +71,14 @@ impl JoinRequestService {
         pool: PgPool,
         group_service: Arc<GroupService>,
         email: Arc<dyn EmailHooks>,
+        notifier: Arc<dyn JoinRequestNotifier>,
         config: JoinRequestServiceConfig,
     ) -> Self {
         Self {
             pool,
             group_service,
             email,
+            notifier,
             config,
         }
     }
@@ -174,7 +178,17 @@ impl JoinRequestService {
         )
         .await
         {
-            Ok(row) => Ok(row),
+            Ok(row) => {
+                self.notifier
+                    .join_request_created(JoinRequestCreated {
+                        group_id: group.id,
+                        group_name: group.name,
+                        admin_address: group.creator_address,
+                        requester_address: normalized,
+                    })
+                    .await;
+                Ok(row)
+            }
             Err(e) => {
                 if is_unique_violation(&e) {
                     Err(JoinRequestServiceError::RequestPending)

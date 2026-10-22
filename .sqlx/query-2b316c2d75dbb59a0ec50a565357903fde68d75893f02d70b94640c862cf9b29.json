@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO push_subscription_entity (\n                address, endpoint, platform, \"subscriptionType\",\n                \"bestDiffNotificationsEnabled\", \"deviceNotificationsEnabled\",\n                \"blockNotificationsEnabled\", \"networkDiffNotificationsEnabled\",\n                \"createdAt\", \"updatedAt\"\n            )\n            VALUES ($1, $2, $3, $4, TRUE, TRUE, TRUE, TRUE, $5, $5)\n            ON CONFLICT (address, endpoint, \"subscriptionType\") DO UPDATE\n            SET platform = EXCLUDED.platform,\n                \"deletedAt\" = NULL,\n                \"updatedAt\" = $5\n            RETURNING\n                \"deletedAt\" AS \"deleted_at?\",\n                \"createdAt\" AS \"created_at!\",\n                \"updatedAt\" AS \"updated_at!\",\n                id AS \"id!\",\n                address AS \"address!: AddressId\",\n                endpoint AS \"endpoint!\",\n                platform AS \"platform!\",\n                \"lastNotificationAt\" AS \"last_notification_at?\",\n                \"bestDiffNotificationsEnabled\" AS \"best_diff_notifications_enabled!\",\n                \"deviceNotificationsEnabled\" AS \"device_notifications_enabled!\",\n                \"blockNotificationsEnabled\" AS \"block_notifications_enabled!\",\n                \"subscriptionType\" AS \"subscription_type!\",\n                \"networkDiffNotificationsEnabled\" AS \"network_diff_notifications_enabled!\"",
+  "query": "INSERT INTO push_subscription_entity (\n                address, endpoint, platform, \"subscriptionType\",\n                \"bestDiffNotificationsEnabled\", \"deviceNotificationsEnabled\",\n                \"blockNotificationsEnabled\", \"networkDiffNotificationsEnabled\",\n                \"createdAt\", \"updatedAt\"\n            )\n            VALUES ($1, $2, $3, $4, TRUE, TRUE, TRUE, TRUE, $5, $5)\n            ON CONFLICT (address, endpoint, \"subscriptionType\") DO UPDATE\n            SET platform = EXCLUDED.platform,\n                \"deletedAt\" = NULL,\n                \"updatedAt\" = $5\n            RETURNING\n                \"deletedAt\" AS \"deleted_at?\",\n                \"createdAt\" AS \"created_at!\",\n                \"updatedAt\" AS \"updated_at!\",\n                id AS \"id!\",\n                address AS \"address!: AddressId\",\n                endpoint AS \"endpoint!\",\n                platform AS \"platform!\",\n                \"lastNotificationAt\" AS \"last_notification_at?\",\n                \"bestDiffNotificationsEnabled\" AS \"best_diff_notifications_enabled!\",\n                \"deviceNotificationsEnabled\" AS \"device_notifications_enabled!\",\n                \"blockNotificationsEnabled\" AS \"block_notifications_enabled!\",\n                \"subscriptionType\" AS \"subscription_type!\",\n                \"networkDiffNotificationsEnabled\" AS \"network_diff_notifications_enabled!\",\n                \"groupAdminNotificationsEnabled\" AS \"group_admin_notifications_enabled!\"",
   "describe": {
     "columns": [
       {
@@ -67,6 +67,11 @@
         "ordinal": 12,
         "name": "network_diff_notifications_enabled!",
         "type_info": "Bool"
+      },
+      {
+        "ordinal": 13,
+        "name": "group_admin_notifications_enabled!",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -91,8 +96,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "e5b080c9b6443018c891c0144b8a084e7990401c146e3674e75f411d670d621f"
+  "hash": "2b316c2d75dbb59a0ec50a565357903fde68d75893f02d70b94640c862cf9b29"
 }

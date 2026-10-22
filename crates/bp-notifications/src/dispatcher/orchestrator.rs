@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use bp_common::{short_address, AddressId};
 use bp_db::{
-    delete_push_subscription_by_endpoint, find_ntfy_subscription_by_address,
+    delete_push_subscription_by_endpoint, find_address_email, find_ntfy_subscription_by_address,
     find_push_subscriptions_by_address, find_telegram_subscriptions_by_address,
     find_telegram_subscriptions_by_chat, update_push_subscription_last_notification, DbError,
     NtfySubscriptionRow, PushSubscriptionRow, TelegramSubscriptionRow,
@@ -17,12 +17,14 @@ use tracing::{debug, warn};
 use crate::command::ChatLanguageMap;
 
 use crate::adapter::{
-    AdapterError, FcmAdapter, NtfyAdapter, PushKind, PushPayload, TelegramAdapter, WebPushAdapter,
+    AdapterError, FcmAdapter, NtfyAdapter, PushKind, PushPayload, SmtpAdapter, TelegramAdapter,
+    WebPushAdapter,
 };
 use crate::format::{
     format_device_time, format_number_suffix, DeviceAggregateArgs, DeviceAggregateText,
     DevicePartialArgs, DevicePartialText, DeviceStatusArgs, DeviceStatusText, Language,
 };
+use crate::template::{render_join_request_admin, JoinRequestAdminContext};
 
 use super::device_gate::{DeviceAggregate, DeviceNotice, DevicePartial};
 
@@ -48,6 +50,14 @@ pub struct DeviceStatusEvent {
     pub timestamp: DateTime<Utc>,
 }
 
+/// Someone asked to join a Team; the notice goes to the Team's admin.
+#[derive(Debug, Clone)]
+pub struct JoinRequestNotice {
+    pub admin_address: AddressId,
+    pub requester_address: AddressId,
+    pub group_name: String,
+}
+
 /// Holds the four push-style adapters + the pool for subscription
 /// lookups. Each adapter is optional so the dispatcher can be built
 /// even when some transports are disabled (no FCM service account, no
@@ -59,6 +69,11 @@ pub struct NotificationDispatcher {
     fcm: Option<Arc<FcmAdapter>>,
     web_push: Option<Arc<WebPushAdapter>>,
     chat_languages: ChatLanguageMap,
+    /// Mails a Team admin who follows the Team on no push channel.
+    smtp: Option<Arc<SmtpAdapter>>,
+    /// Base of the links in a join-request notice; without it the notice
+    /// carries no link and no mail goes out.
+    pool_base_url: Option<String>,
 }
 
 impl NotificationDispatcher {
@@ -77,7 +92,21 @@ impl NotificationDispatcher {
             fcm,
             web_push,
             chat_languages,
+            smtp: None,
+            pool_base_url: None,
         }
+    }
+
+    /// Lets a join-request notice reach an admin by mail and link the
+    /// Team's admin panel.
+    pub fn with_join_request_mail(
+        mut self,
+        smtp: Option<Arc<SmtpAdapter>>,
+        pool_base_url: Option<String>,
+    ) -> Self {
+        self.smtp = smtp;
+        self.pool_base_url = pool_base_url;
+        self
     }
 
     // ── Public engine entry points ──────────────────────────────────
@@ -176,6 +205,59 @@ impl NotificationDispatcher {
                 difficulty,
                 formatted,
             )) as TaskFuture);
+        }
+
+        join_all(tasks).await;
+    }
+
+    /// Someone asked to join a Team. Every channel the admin follows the
+    /// Team on, with its join-request switch on, gets a short notice; an
+    /// admin on no channel at all gets a mail to their verified address.
+    pub async fn notify_join_request(&self, notice: &JoinRequestNotice) {
+        let (telegram_subs, ntfy_sub, push_subs) = self.load_subs(&notice.admin_address).await;
+        let route = route_join_request(telegram_subs, ntfy_sub, push_subs, self.transports());
+        let admin_url = self.pool_base_url.as_deref().map(|base| {
+            format!(
+                "{}/#/app/{}/payout-group/admin",
+                base.trim_end_matches('/'),
+                notice.admin_address.as_str()
+            )
+        });
+
+        let mut tasks = Vec::new();
+        if let (false, Some(adapter)) = (route.telegram.is_empty(), &self.telegram) {
+            tasks.push(Box::pin(send_telegram_join_request(
+                Arc::clone(adapter),
+                self.chat_languages.clone(),
+                route.telegram,
+                admin_url.clone(),
+            )) as TaskFuture);
+        }
+        if let (Some(sub), Some(adapter)) = (route.ntfy, &self.ntfy) {
+            tasks.push(Box::pin(send_ntfy_join_request(
+                Arc::clone(adapter),
+                sub,
+                admin_url.clone(),
+            )) as TaskFuture);
+        }
+        if !route.push.is_empty() {
+            tasks.push(Box::pin(fan_push(
+                self.clone_push_handles(),
+                self.pool.clone(),
+                notice.admin_address.clone(),
+                route.push,
+                join_request_push_payload(),
+            )) as TaskFuture);
+        }
+        if route.mail {
+            if let (Some(smtp), Some(admin_url)) = (&self.smtp, admin_url) {
+                tasks.push(Box::pin(send_mail_join_request(
+                    Arc::clone(smtp),
+                    self.pool.clone(),
+                    notice.clone(),
+                    admin_url,
+                )) as TaskFuture);
+            }
         }
 
         join_all(tasks).await;
@@ -352,6 +434,15 @@ impl NotificationDispatcher {
         (telegram, ntfy, push)
     }
 
+    fn transports(&self) -> Transports {
+        Transports {
+            telegram: self.telegram.is_some(),
+            ntfy: self.ntfy.is_some(),
+            fcm: self.fcm.is_some(),
+            web_push: self.web_push.is_some(),
+        }
+    }
+
     fn clone_push_handles(&self) -> PushHandles {
         PushHandles {
             web_push: self.web_push.as_ref().map(Arc::clone),
@@ -367,6 +458,63 @@ struct PushHandles {
 }
 
 type TaskFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// Which transports this dispatcher can send on.
+#[derive(Debug, Clone, Copy)]
+struct Transports {
+    telegram: bool,
+    ntfy: bool,
+    fcm: bool,
+    web_push: bool,
+}
+
+/// Where a join-request notice goes.
+#[derive(Debug)]
+struct JoinRequestRoute {
+    telegram: Vec<TelegramSubscriptionRow>,
+    ntfy: Option<NtfySubscriptionRow>,
+    push: Vec<PushSubscriptionRow>,
+    mail: bool,
+}
+
+/// An admin who follows the Team on a channel this dispatcher can send on
+/// gets the notice there, where that subscription's switch is on; a switch
+/// turned off is a choice, not a reason to mail instead. Only an admin on no
+/// such channel at all gets the mail.
+fn route_join_request(
+    telegram: Vec<TelegramSubscriptionRow>,
+    ntfy: Option<NtfySubscriptionRow>,
+    push: Vec<PushSubscriptionRow>,
+    transports: Transports,
+) -> JoinRequestRoute {
+    let telegram: Vec<_> = if transports.telegram {
+        telegram
+    } else {
+        Vec::new()
+    };
+    let ntfy = ntfy.filter(|_| transports.ntfy);
+    let push: Vec<_> = push
+        .into_iter()
+        .filter(|sub| {
+            let kind = sub.subscription_type.as_str();
+            (kind.eq_ignore_ascii_case(PUSH_TYPE_FCM) && transports.fcm)
+                || (kind.eq_ignore_ascii_case(PUSH_TYPE_UNIFIED) && transports.web_push)
+        })
+        .collect();
+    let mail = telegram.is_empty() && ntfy.is_none() && push.is_empty();
+    JoinRequestRoute {
+        telegram: telegram
+            .into_iter()
+            .filter(|s| s.group_admin_notifications_enabled)
+            .collect(),
+        ntfy: ntfy.filter(|s| s.group_admin_notifications_enabled),
+        push: push
+            .into_iter()
+            .filter(|s| s.group_admin_notifications_enabled)
+            .collect(),
+        mail,
+    }
+}
 
 // ── Send functions per (transport, event-kind) ──────────────────────
 // Errors are logged and absorbed so one failed subscriber does not take
@@ -832,6 +980,89 @@ fn device_status_unified_payload(event: &DeviceStatusEvent) -> PushPayload {
     }
 }
 
+/// The app shows the notice as it comes: no requester and no Team name, so
+/// no user-chosen text reaches the `title|body|` wire shape.
+fn join_request_push_payload() -> PushPayload {
+    PushPayload {
+        kind: PushKind::GroupJoinRequest,
+        title: "New join request".to_string(),
+        body: "Someone asked to join your Team.".to_string(),
+        tag: String::new(),
+        extras: Vec::new(),
+    }
+}
+
+fn join_request_text(lang: Language, admin_url: Option<&str>) -> String {
+    let head = match lang {
+        Language::De => "\u{1f44b} Neue Beitrittsanfrage für dein Team.",
+        Language::En => "\u{1f44b} New request to join your Team.",
+    };
+    match (lang, admin_url) {
+        (_, None) => head.to_string(),
+        (Language::De, Some(url)) => format!("{head}\nAdmin-Panel: {url}"),
+        (Language::En, Some(url)) => format!("{head}\nAdmin panel: {url}"),
+    }
+}
+
+async fn send_telegram_join_request(
+    adapter: Arc<TelegramAdapter>,
+    chat_languages: ChatLanguageMap,
+    subs: Vec<TelegramSubscriptionRow>,
+    admin_url: Option<String>,
+) {
+    let tasks = subs.into_iter().map(|sub| {
+        let adapter = Arc::clone(&adapter);
+        let chat_languages = chat_languages.clone();
+        let admin_url = admin_url.clone();
+        async move {
+            let lang = chat_language(&chat_languages, sub.telegram_chat_id).await;
+            let text = join_request_text(lang, admin_url.as_deref());
+            log_adapter_send(
+                "telegram-join-request",
+                adapter.send_text(sub.telegram_chat_id, &text).await,
+            );
+        }
+    });
+    join_all(tasks).await;
+}
+
+async fn send_ntfy_join_request(
+    adapter: Arc<NtfyAdapter>,
+    sub: NtfySubscriptionRow,
+    admin_url: Option<String>,
+) {
+    let body = join_request_text(Language::parse(&sub.language), admin_url.as_deref());
+    log_adapter_send(
+        "ntfy-join-request",
+        adapter.publish(sub.address.as_str(), &body).await,
+    );
+}
+
+async fn send_mail_join_request(
+    smtp: Arc<SmtpAdapter>,
+    pool: PgPool,
+    notice: JoinRequestNotice,
+    admin_url: String,
+) {
+    let email = match find_address_email(&pool, &notice.admin_address).await {
+        Ok(Some(row)) if row.verified_at.is_some() => row.email,
+        Ok(_) => {
+            debug!(target: "bp_notifications::dispatcher", "join request: admin has no verified email");
+            return;
+        }
+        Err(e) => {
+            warn!(target: "bp_notifications::dispatcher", error = %e, "join request: email lookup");
+            return;
+        }
+    };
+    let content = render_join_request_admin(&JoinRequestAdminContext {
+        requester_address: notice.requester_address.as_str().to_string(),
+        group_name: notice.group_name,
+        admin_url,
+    });
+    log_adapter_send("mail-join-request", smtp.send_email(&email, &content).await);
+}
+
 async fn fan_push(
     handles: PushHandles,
     pool: PgPool,
@@ -1137,6 +1368,177 @@ mod tests {
         assert!(
             body.starts_with("Unknown (Unknown) at "),
             "body was: {body}"
+        );
+    }
+
+    const ADMIN: &str = "bcrt1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l";
+
+    const ALL: Transports = Transports {
+        telegram: true,
+        ntfy: true,
+        fcm: true,
+        web_push: true,
+    };
+
+    fn telegram_sub(group_admin: bool) -> TelegramSubscriptionRow {
+        TelegramSubscriptionRow {
+            deleted_at: None,
+            created_at: 0,
+            updated_at: 0,
+            id: 1,
+            address: AddressId::new(ADMIN).unwrap(),
+            telegram_chat_id: 7,
+            best_diff_notifications_enabled: true,
+            is_default: true,
+            device_notifications_enabled: false,
+            hourly_stats_enabled: false,
+            hourly_workers_enabled: false,
+            group_admin_notifications_enabled: group_admin,
+        }
+    }
+
+    fn ntfy_sub(group_admin: bool) -> NtfySubscriptionRow {
+        NtfySubscriptionRow {
+            deleted_at: None,
+            created_at: 0,
+            updated_at: 0,
+            id: 2,
+            address: AddressId::new(ADMIN).unwrap(),
+            language: "de".to_string(),
+            best_diff_notifications_enabled: true,
+            device_notifications_enabled: false,
+            hourly_stats_enabled: false,
+            hourly_workers_enabled: false,
+            group_admin_notifications_enabled: group_admin,
+        }
+    }
+
+    fn push_sub(kind: &str, group_admin: bool) -> PushSubscriptionRow {
+        PushSubscriptionRow {
+            deleted_at: None,
+            created_at: 0,
+            updated_at: 0,
+            id: 3,
+            address: AddressId::new(ADMIN).unwrap(),
+            endpoint: "endpoint".to_string(),
+            platform: "android".to_string(),
+            last_notification_at: None,
+            best_diff_notifications_enabled: true,
+            device_notifications_enabled: true,
+            block_notifications_enabled: true,
+            subscription_type: kind.to_string(),
+            network_diff_notifications_enabled: true,
+            group_admin_notifications_enabled: group_admin,
+        }
+    }
+
+    /// An admin on no channel gets the mail and nothing else.
+    #[test]
+    fn an_admin_on_no_channel_is_mailed() {
+        let route = route_join_request(Vec::new(), None, Vec::new(), ALL);
+        assert!(route.mail);
+        assert!(route.telegram.is_empty() && route.ntfy.is_none() && route.push.is_empty());
+    }
+
+    /// Every channel with its switch on carries the notice, and no mail goes
+    /// out next to it.
+    #[test]
+    fn every_switched_on_channel_carries_the_notice_without_a_mail() {
+        let route = route_join_request(
+            vec![telegram_sub(true)],
+            Some(ntfy_sub(true)),
+            vec![
+                push_sub(PUSH_TYPE_FCM, true),
+                push_sub(PUSH_TYPE_UNIFIED, true),
+            ],
+            ALL,
+        );
+        assert!(!route.mail);
+        assert_eq!(route.telegram.len(), 1);
+        assert!(route.ntfy.is_some());
+        assert_eq!(route.push.len(), 2);
+    }
+
+    /// A switch turned off silences that channel and does not turn into a
+    /// mail; the channel still on carries the notice.
+    #[test]
+    fn a_switched_off_channel_is_silent_and_sends_no_mail_instead() {
+        let all_off = route_join_request(
+            vec![telegram_sub(false)],
+            Some(ntfy_sub(false)),
+            vec![push_sub(PUSH_TYPE_FCM, false)],
+            ALL,
+        );
+        assert!(
+            !all_off.mail,
+            "switching off is a choice, not a reason to mail"
+        );
+        assert!(all_off.telegram.is_empty() && all_off.ntfy.is_none() && all_off.push.is_empty());
+
+        let one_on = route_join_request(
+            vec![telegram_sub(false)],
+            None,
+            vec![push_sub(PUSH_TYPE_UNIFIED, true)],
+            ALL,
+        );
+        assert!(one_on.telegram.is_empty());
+        assert_eq!(one_on.push.len(), 1);
+    }
+
+    /// A subscription on a transport this process cannot send on does not
+    /// count as a channel, so the admin is mailed instead of told nowhere.
+    #[test]
+    fn a_subscription_on_an_unconfigured_transport_falls_back_to_mail() {
+        let none = Transports {
+            telegram: false,
+            ntfy: false,
+            fcm: false,
+            web_push: false,
+        };
+        let route = route_join_request(
+            vec![telegram_sub(true)],
+            Some(ntfy_sub(true)),
+            vec![push_sub(PUSH_TYPE_FCM, true)],
+            none,
+        );
+        assert!(route.mail);
+        assert!(route.telegram.is_empty() && route.ntfy.is_none() && route.push.is_empty());
+
+        let fcm_only = Transports { fcm: true, ..none };
+        let route = route_join_request(
+            Vec::new(),
+            None,
+            vec![
+                push_sub(PUSH_TYPE_UNIFIED, true),
+                push_sub(PUSH_TYPE_FCM, true),
+            ],
+            fcm_only,
+        );
+        assert!(!route.mail);
+        assert_eq!(route.push.len(), 1);
+        assert_eq!(route.push[0].subscription_type, PUSH_TYPE_FCM);
+    }
+
+    /// The app reads `title|body|` as title and body; a third non-empty part
+    /// would be shown as a difficulty.
+    #[test]
+    fn the_join_request_push_keeps_the_two_part_wire_shape() {
+        assert_eq!(
+            join_request_push_payload().pipe_joined(),
+            "New join request|Someone asked to join your Team.|"
+        );
+    }
+
+    #[test]
+    fn join_request_text_links_the_admin_panel_when_known() {
+        let url = "https://blitzpool.example/#/app/x/payout-group/admin";
+        assert_eq!(
+            join_request_text(Language::En, Some(url)),
+            format!("\u{1f44b} New request to join your Team.\nAdmin panel: {url}")
+        );
+        assert_eq!(
+            join_request_text(Language::De, None),
+            "\u{1f44b} Neue Beitrittsanfrage für dein Team."
         );
     }
 }

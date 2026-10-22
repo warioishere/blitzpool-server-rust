@@ -191,18 +191,18 @@ impl FcmAdapter {
         );
         // tag carries the per-event extra (formatted difficulty,
         // block-height, status); name it after the kind so the
-        // receiver code reads naturally.
+        // receiver code reads naturally. A join request has none.
         let tag_field = match payload.kind {
             super::payload::PushKind::BestDifficulty | super::payload::PushKind::BlockFound => {
-                "difficulty"
+                Some("difficulty")
             }
-            super::payload::PushKind::DeviceStatus => "status",
-            super::payload::PushKind::NetworkDifficulty => "difficulty",
+            super::payload::PushKind::DeviceStatus => Some("status"),
+            super::payload::PushKind::NetworkDifficulty => Some("difficulty"),
+            super::payload::PushKind::GroupJoinRequest => None,
         };
-        data.insert(
-            tag_field.into(),
-            serde_json::Value::from(payload.tag.clone()),
-        );
+        if let Some(field) = tag_field {
+            data.insert(field.into(), serde_json::Value::from(payload.tag.clone()));
+        }
         for (k, v) in &payload.extras {
             data.insert(k.clone(), serde_json::Value::from(v.clone()));
         }

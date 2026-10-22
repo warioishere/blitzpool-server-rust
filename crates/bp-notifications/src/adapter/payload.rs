@@ -3,14 +3,16 @@
 //! Push-style payload shared by FCM + Web-Push.
 
 /// Event-kind tag for FCM `data.type` (`"best_difficulty"`,
-/// `"block_found"`, `"device_status"`, `"network_difficulty"`). The
-/// mobile / browser receiver routes the notification based on this.
+/// `"block_found"`, `"device_status"`, `"network_difficulty"`,
+/// `"group_join_request"`). The mobile / browser receiver routes the
+/// notification based on this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushKind {
     BestDifficulty,
     BlockFound,
     DeviceStatus,
     NetworkDifficulty,
+    GroupJoinRequest,
 }
 
 impl PushKind {
@@ -20,6 +22,7 @@ impl PushKind {
             PushKind::BlockFound => "block_found",
             PushKind::DeviceStatus => "device_status",
             PushKind::NetworkDifficulty => "network_difficulty",
+            PushKind::GroupJoinRequest => "group_join_request",
         }
     }
 }
