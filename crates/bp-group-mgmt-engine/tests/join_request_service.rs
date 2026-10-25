@@ -60,29 +60,6 @@ async fn cleanup_group(pool: &PgPool, group_id: Uuid) {
         .await;
 }
 
-async fn seed_verified_email(pool: &PgPool, address: &str, email: &str) {
-    let now = 1_700_000_000_000_i64;
-    sqlx::query(
-        r#"INSERT INTO pplns_address_email (address, email, "verifiedAt", "createdAt", "updatedAt")
-           VALUES ($1, $2, $3, $4, $4)
-           ON CONFLICT (address) DO UPDATE SET email = EXCLUDED.email, "verifiedAt" = EXCLUDED."verifiedAt""#,
-    )
-    .bind(address)
-    .bind(email)
-    .bind(now)
-    .bind(now)
-    .execute(pool)
-    .await
-    .expect("seed email");
-}
-
-async fn delete_email_for(pool: &PgPool, address: &str) {
-    let _ = sqlx::query("DELETE FROM pplns_address_email WHERE address = $1")
-        .bind(address)
-        .execute(pool)
-        .await;
-}
-
 async fn build_services(
     pool: PgPool,
     limits: JoinRequestLimits,
@@ -127,6 +104,7 @@ async fn create_public_group(
 ) -> (Uuid, String) {
     let creator = format!("bc1qcr{suffix}");
     // Name must stay ≤64 chars (`MAX_GROUP_NAME_LEN`).
+    bp_test_support::seed_signature_ownership(pool, &creator).await;
     let g = group_svc
         .create_group(&format!("g-{suffix}"), &creator)
         .await
@@ -159,7 +137,7 @@ async fn create_join_request_happy_path() {
     let suffix = Uuid::new_v4().simple().to_string();
     let (group_id, _admin) = create_public_group(&group_svc, &pool, &suffix).await;
     let requester = format!("bc1qreq{suffix}");
-    seed_verified_email(&pool, &requester, "req@example.com").await;
+    bp_test_support::seed_verified_email(&pool, &requester, "req@example.com").await;
 
     let row = svc
         .create_join_request(group_id, &requester, Some("hi please"))
@@ -171,7 +149,7 @@ async fn create_join_request_happy_path() {
     assert_eq!(row.message.as_deref(), Some("hi please"));
 
     cleanup_group(&pool, group_id).await;
-    delete_email_for(&pool, &requester).await;
+    bp_test_support::delete_email_binding(&pool, &requester).await;
 }
 
 /// A stored request tells the Team's current admin: the creator first, the
@@ -192,7 +170,7 @@ async fn a_stored_join_request_notifies_the_current_admin() {
     let second = format!("bc1qreqb{suffix}");
     let heir = format!("bc1qheir{suffix}");
     for a in [&first, &second] {
-        seed_verified_email(&pool, a, "req@example.com").await;
+        bp_test_support::seed_verified_email(&pool, a, "req@example.com").await;
     }
 
     svc.create_join_request(group_id, &first, None)
@@ -240,7 +218,7 @@ async fn a_stored_join_request_notifies_the_current_admin() {
 
     cleanup_group(&pool, group_id).await;
     for a in [&first, &second] {
-        delete_email_for(&pool, a).await;
+        bp_test_support::delete_email_binding(&pool, a).await;
     }
 }
 
@@ -253,19 +231,20 @@ async fn create_join_request_rejects_private_group_as_not_found() {
     let (group_svc, svc, _email) = build_services(pool.clone(), JoinRequestLimits::default()).await;
     let suffix = Uuid::new_v4().simple().to_string();
     let creator = format!("bc1qpr{suffix}");
+    bp_test_support::seed_signature_ownership(&pool, &creator).await;
     let g = group_svc
         .create_group(&format!("private-{suffix}"), &creator)
         .await
         .expect("g");
     let requester = format!("bc1qreq{suffix}");
-    seed_verified_email(&pool, &requester, "x@x").await;
+    bp_test_support::seed_verified_email(&pool, &requester, "x@x").await;
     let err = svc
         .create_join_request(g.group.id, &requester, None)
         .await
         .expect_err("private");
     assert!(matches!(err, JoinRequestServiceError::NotFound));
     cleanup_group(&pool, g.group.id).await;
-    delete_email_for(&pool, &requester).await;
+    bp_test_support::delete_email_binding(&pool, &requester).await;
 }
 
 #[tokio::test]
@@ -296,7 +275,7 @@ async fn create_join_request_dup_pending_surfaces_clean_error() {
     let suffix = Uuid::new_v4().simple().to_string();
     let (group_id, _admin) = create_public_group(&group_svc, &pool, &suffix).await;
     let requester = format!("bc1qreq{suffix}");
-    seed_verified_email(&pool, &requester, "r@x").await;
+    bp_test_support::seed_verified_email(&pool, &requester, "r@x").await;
     svc.create_join_request(group_id, &requester, None)
         .await
         .expect("first");
@@ -306,7 +285,7 @@ async fn create_join_request_dup_pending_surfaces_clean_error() {
         .expect_err("dup");
     assert!(matches!(err, JoinRequestServiceError::RequestPending));
     cleanup_group(&pool, group_id).await;
-    delete_email_for(&pool, &requester).await;
+    bp_test_support::delete_email_binding(&pool, &requester).await;
 }
 
 // ─── approve / reject ────────────────────────────────────────────────────
@@ -321,7 +300,7 @@ async fn approve_request_adds_member_and_sends_email() {
     let suffix = Uuid::new_v4().simple().to_string();
     let (group_id, admin_token) = create_public_group(&group_svc, &pool, &suffix).await;
     let requester = format!("bc1qreq{suffix}");
-    seed_verified_email(&pool, &requester, "r@example.com").await;
+    bp_test_support::seed_verified_email(&pool, &requester, "r@example.com").await;
     let req = svc
         .create_join_request(group_id, &requester, None)
         .await
@@ -341,7 +320,7 @@ async fn approve_request_adds_member_and_sends_email() {
         JoinDecisionOutcome::Approved(_)
     ));
     cleanup_group(&pool, group_id).await;
-    delete_email_for(&pool, &requester).await;
+    bp_test_support::delete_email_binding(&pool, &requester).await;
 }
 
 #[tokio::test]
@@ -354,7 +333,7 @@ async fn reject_request_marks_row_and_sends_email() {
     let suffix = Uuid::new_v4().simple().to_string();
     let (group_id, admin_token) = create_public_group(&group_svc, &pool, &suffix).await;
     let requester = format!("bc1qreq{suffix}");
-    seed_verified_email(&pool, &requester, "r@example.com").await;
+    bp_test_support::seed_verified_email(&pool, &requester, "r@example.com").await;
     let req = svc
         .create_join_request(group_id, &requester, None)
         .await
@@ -370,7 +349,7 @@ async fn reject_request_marks_row_and_sends_email() {
         JoinDecisionOutcome::Rejected
     ));
     cleanup_group(&pool, group_id).await;
-    delete_email_for(&pool, &requester).await;
+    bp_test_support::delete_email_binding(&pool, &requester).await;
 }
 
 #[tokio::test]
@@ -384,8 +363,8 @@ async fn list_for_group_filters_by_decided() {
     let (group_id, admin_token) = create_public_group(&group_svc, &pool, &suffix).await;
     let r1 = format!("bc1qreqa{suffix}");
     let r2 = format!("bc1qreqb{suffix}");
-    seed_verified_email(&pool, &r1, "a@x").await;
-    seed_verified_email(&pool, &r2, "b@x").await;
+    bp_test_support::seed_verified_email(&pool, &r1, "a@x").await;
+    bp_test_support::seed_verified_email(&pool, &r2, "b@x").await;
     let req1 = svc.create_join_request(group_id, &r1, None).await.unwrap();
     let _req2 = svc.create_join_request(group_id, &r2, None).await.unwrap();
     svc.reject_request(group_id, req1.id, Some(&admin_token))
@@ -403,8 +382,8 @@ async fn list_for_group_filters_by_decided() {
         .expect("all");
     assert_eq!(all.len(), 2);
     cleanup_group(&pool, group_id).await;
-    delete_email_for(&pool, &r1).await;
-    delete_email_for(&pool, &r2).await;
+    bp_test_support::delete_email_binding(&pool, &r1).await;
+    bp_test_support::delete_email_binding(&pool, &r2).await;
 }
 
 #[tokio::test]
@@ -417,7 +396,7 @@ async fn expire_join_requests_once_flips_stale_pending() {
     let suffix = Uuid::new_v4().simple().to_string();
     let (group_id, _admin) = create_public_group(&group_svc, &pool, &suffix).await;
     let requester = format!("bc1qreq{suffix}");
-    seed_verified_email(&pool, &requester, "r@x").await;
+    bp_test_support::seed_verified_email(&pool, &requester, "r@x").await;
     let row = svc
         .create_join_request(group_id, &requester, None)
         .await
@@ -441,5 +420,5 @@ async fn expire_join_requests_once_flips_stale_pending() {
             .expect("present");
     assert_eq!(status, "expired");
     cleanup_group(&pool, group_id).await;
-    delete_email_for(&pool, &requester).await;
+    bp_test_support::delete_email_binding(&pool, &requester).await;
 }

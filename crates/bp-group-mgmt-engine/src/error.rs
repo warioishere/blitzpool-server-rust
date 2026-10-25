@@ -26,6 +26,8 @@ pub enum GroupServiceError {
     AddressInGroup,
     #[error("address is already a member of a Blockparty — leave that party first")]
     AddressInBlockparty,
+    #[error("address has no verified email binding or signature proof")]
+    EmailNotVerified,
     #[error("address is already a member of this group")]
     AlreadyMember,
     #[error("address is not a member of this group")]
@@ -74,6 +76,7 @@ impl GroupServiceError {
             Self::NameTaken => "name-taken",
             Self::AddressInGroup => "address-in-group",
             Self::AddressInBlockparty => "address-in-blockparty",
+            Self::EmailNotVerified => "email-not-verified",
             Self::AlreadyMember => "already-member",
             Self::NotMember => "not-member",
             Self::CreatorCannotBeRemoved => "creator-cannot-be-removed",

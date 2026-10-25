@@ -288,6 +288,57 @@ pub async fn cleanup_blockparty_rows(pool: &PgPool, addrs: &[&str]) {
     }
 }
 
+/// Records a signature ownership proof for `address`, which must already be in
+/// its normalized form. It verifies the address without an email binding, as
+/// creating a Team or joining a group requires.
+pub async fn seed_signature_ownership(pool: &PgPool, address: &str) {
+    let now = 1_700_000_000_000_i64;
+    sqlx::query(
+        r#"INSERT INTO pplns_address_ownership
+             (address, method, "scriptType", "verifiedAt", "createdAt", "updatedAt")
+           VALUES ($1, 'bip322', 'p2wpkh', $2, $2, $2)
+           ON CONFLICT (address) DO UPDATE SET "verifiedAt" = EXCLUDED."verifiedAt""#,
+    )
+    .bind(address)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("seed signature ownership");
+}
+
+/// Removes the signature ownership proof [`seed_signature_ownership`] recorded.
+pub async fn delete_signature_ownership(pool: &PgPool, address: &str) {
+    let _ = sqlx::query("DELETE FROM pplns_address_ownership WHERE address = $1")
+        .bind(address)
+        .execute(pool)
+        .await;
+}
+
+/// Binds a confirmed email to `address`, which must already be in its
+/// normalized form.
+pub async fn seed_verified_email(pool: &PgPool, address: &str, email: &str) {
+    let now = 1_700_000_000_000_i64;
+    sqlx::query(
+        r#"INSERT INTO pplns_address_email (address, email, "verifiedAt", "createdAt", "updatedAt")
+           VALUES ($1, $2, $3, $3, $3)
+           ON CONFLICT (address) DO UPDATE SET email = EXCLUDED.email, "verifiedAt" = EXCLUDED."verifiedAt""#,
+    )
+    .bind(address)
+    .bind(email)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("seed verified email");
+}
+
+/// Removes the email binding [`seed_verified_email`] recorded.
+pub async fn delete_email_binding(pool: &PgPool, address: &str) {
+    let _ = sqlx::query("DELETE FROM pplns_address_email WHERE address = $1")
+        .bind(address)
+        .execute(pool)
+        .await;
+}
+
 /// Per-test-binary logical-DB ranges: connecting flushes the DB, so tests
 /// sharing one wipe each other. A binary needs its own base here; a test needs
 /// a number no sibling in the same binary uses.

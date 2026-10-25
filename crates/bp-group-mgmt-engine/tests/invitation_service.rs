@@ -57,52 +57,6 @@ async fn cleanup_group(pool: &PgPool, group_id: Uuid) {
         .await;
 }
 
-async fn seed_verified_email(pool: &PgPool, address: &str, email: &str) {
-    let now = 1_700_000_000_000_i64;
-    sqlx::query(
-        r#"INSERT INTO pplns_address_email (address, email, "verifiedAt", "createdAt", "updatedAt")
-           VALUES ($1, $2, $3, $4, $4)
-           ON CONFLICT (address) DO UPDATE SET email = EXCLUDED.email, "verifiedAt" = EXCLUDED."verifiedAt""#,
-    )
-    .bind(address)
-    .bind(email)
-    .bind(now)
-    .bind(now)
-    .execute(pool)
-    .await
-    .expect("seed email");
-}
-
-/// Seed a verified signature ownership proof without an email.
-async fn seed_signature_verified(pool: &PgPool, address: &str) {
-    let now = 1_700_000_000_000_i64;
-    sqlx::query(
-        r#"INSERT INTO pplns_address_ownership
-             (address, method, "scriptType", "verifiedAt", "createdAt", "updatedAt")
-           VALUES ($1, 'bip322', 'p2wpkh', $2, $2, $2)
-           ON CONFLICT (address) DO UPDATE SET "verifiedAt" = EXCLUDED."verifiedAt""#,
-    )
-    .bind(address)
-    .bind(now)
-    .execute(pool)
-    .await
-    .expect("seed signature");
-}
-
-async fn delete_signature_for(pool: &PgPool, address: &str) {
-    let _ = sqlx::query("DELETE FROM pplns_address_ownership WHERE address = $1")
-        .bind(address)
-        .execute(pool)
-        .await;
-}
-
-async fn delete_email_for(pool: &PgPool, address: &str) {
-    let _ = sqlx::query("DELETE FROM pplns_address_email WHERE address = $1")
-        .bind(address)
-        .execute(pool)
-        .await;
-}
-
 async fn build_services(pool: PgPool) -> (Arc<GroupService>, InvitationService) {
     let group = Arc::new(
         GroupService::load(pool.clone(), Arc::new(NoopHooks), 14, TEST_COINBASE_CAP)
@@ -123,6 +77,7 @@ async fn open_invite_create_revoke_and_replace_atomic() {
     };
     let (group_svc, inv_svc) = build_services(pool.clone()).await;
     let creator = format!("bc1qcr{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &creator).await;
     let g = group_svc
         .create_group(&format!("oi-{}", Uuid::new_v4()), &creator)
         .await
@@ -183,7 +138,8 @@ async fn accept_open_invite_creates_member() {
     let (group_svc, inv_svc) = build_services(pool.clone()).await;
     let creator = format!("bc1qcr{}", Uuid::new_v4().simple());
     let joiner = format!("bc1qjoin{}", Uuid::new_v4().simple());
-    seed_verified_email(&pool, &joiner, "joiner@example.com").await;
+    bp_test_support::seed_verified_email(&pool, &joiner, "joiner@example.com").await;
+    bp_test_support::seed_signature_ownership(&pool, &creator).await;
     let g = group_svc
         .create_group(&format!("oja-{}", Uuid::new_v4()), &creator)
         .await
@@ -209,7 +165,7 @@ async fn accept_open_invite_creates_member() {
         .expect("present");
     assert_eq!(row.status, "pending");
     cleanup_group(&pool, g.group.id).await;
-    delete_email_for(&pool, &joiner).await;
+    bp_test_support::delete_email_binding(&pool, &joiner).await;
 }
 
 #[tokio::test]
@@ -222,7 +178,8 @@ async fn accept_open_invite_creates_member_via_signature() {
     let creator = format!("bc1qcr{}", Uuid::new_v4().simple());
     let joiner = format!("bc1qjoin{}", Uuid::new_v4().simple());
     // No verified email, only a signature proof: must still be admitted.
-    seed_signature_verified(&pool, &joiner).await;
+    bp_test_support::seed_signature_ownership(&pool, &joiner).await;
+    bp_test_support::seed_signature_ownership(&pool, &creator).await;
     let g = group_svc
         .create_group(&format!("ojs-{}", Uuid::new_v4()), &creator)
         .await
@@ -242,7 +199,7 @@ async fn accept_open_invite_creates_member_via_signature() {
         .expect("join via signature");
     assert_eq!(member.address.as_str(), joiner.to_lowercase());
     cleanup_group(&pool, g.group.id).await;
-    delete_signature_for(&pool, &joiner).await;
+    bp_test_support::delete_signature_ownership(&pool, &joiner).await;
 }
 
 #[tokio::test]
@@ -254,7 +211,8 @@ async fn accept_open_invite_blocks_approval_required() {
     let (group_svc, inv_svc) = build_services(pool.clone()).await;
     let creator = format!("bc1qcr{}", Uuid::new_v4().simple());
     let joiner = format!("bc1qjoin{}", Uuid::new_v4().simple());
-    seed_verified_email(&pool, &joiner, "j@x").await;
+    bp_test_support::seed_verified_email(&pool, &joiner, "j@x").await;
+    bp_test_support::seed_signature_ownership(&pool, &creator).await;
     let g = group_svc
         .create_group(&format!("oja-{}", Uuid::new_v4()), &creator)
         .await
@@ -274,7 +232,7 @@ async fn accept_open_invite_blocks_approval_required() {
         .expect_err("blocked");
     assert!(matches!(err, InvitationServiceError::ApprovalRequired));
     cleanup_group(&pool, g.group.id).await;
-    delete_email_for(&pool, &joiner).await;
+    bp_test_support::delete_email_binding(&pool, &joiner).await;
 }
 
 #[tokio::test]
@@ -285,6 +243,7 @@ async fn get_open_invite_public_omits_admin_data() {
     };
     let (group_svc, inv_svc) = build_services(pool.clone()).await;
     let creator = format!("bc1qcr{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &creator).await;
     let g = group_svc
         .create_group(&format!("pub-{}", Uuid::new_v4()), &creator)
         .await

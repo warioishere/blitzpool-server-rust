@@ -106,29 +106,6 @@ async fn svc_no_email(pool: &PgPool) -> BlockpartyService {
     .expect("load blockparty service")
 }
 
-/// Seeds a signature-ownership proof stored verbatim (case-preserved), as the
-/// ownership-verify endpoint writes it.
-async fn seed_signature(pool: &PgPool, address: &str) {
-    let now = 1_700_000_000_000_i64;
-    let _ = sqlx::query(
-        r#"INSERT INTO pplns_address_ownership
-             (address, method, "scriptType", "verifiedAt", "createdAt", "updatedAt")
-           VALUES ($1, 'bip137', 'p2pkh', $2, $2, $2)
-           ON CONFLICT (address) DO UPDATE SET "verifiedAt" = EXCLUDED."verifiedAt""#,
-    )
-    .bind(address)
-    .bind(now)
-    .execute(pool)
-    .await;
-}
-
-async fn delete_signature(pool: &PgPool, address: &str) {
-    let _ = sqlx::query(r#"DELETE FROM pplns_address_ownership WHERE address = $1"#)
-        .bind(address)
-        .execute(pool)
-        .await;
-}
-
 /// Best-effort cleanup; addresses and names are unique per test.
 async fn cleanup(pool: &PgPool, name: &str, admin_addr: &str) {
     let _ = sqlx::query(r#"DELETE FROM blockparty_group WHERE name = $1"#)
@@ -285,11 +262,11 @@ async fn join_via_link_admits_signature_verified_email_less_base58_address() {
         .bind(carol)
         .execute(&pool)
         .await;
-    delete_signature(&pool, carol).await;
-    seed_signature(&pool, carol).await;
+    bp_test_support::delete_signature_ownership(&pool, carol).await;
+    bp_test_support::seed_signature_ownership(&pool, carol).await;
     // The admin must clear the create gate too.
-    delete_signature(&pool, admin).await;
-    seed_signature(&pool, admin).await;
+    bp_test_support::delete_signature_ownership(&pool, admin).await;
+    bp_test_support::seed_signature_ownership(&pool, admin).await;
 
     let svc = svc_no_email(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
@@ -318,8 +295,8 @@ async fn join_via_link_admits_signature_verified_email_less_base58_address() {
         .bind(carol)
         .execute(&pool)
         .await;
-    delete_signature(&pool, carol).await;
-    delete_signature(&pool, admin).await;
+    bp_test_support::delete_signature_ownership(&pool, carol).await;
+    bp_test_support::delete_signature_ownership(&pool, admin).await;
     let _ = sqlx::query("DELETE FROM blockparty_join_link WHERE \"groupId\" = $1")
         .bind(create.group.id)
         .execute(&pool)
@@ -339,10 +316,10 @@ async fn join_via_link_rejects_unverified_address() {
         .bind(dave)
         .execute(&pool)
         .await;
-    delete_signature(&pool, dave).await;
+    bp_test_support::delete_signature_ownership(&pool, dave).await;
     // Only dave is unverified, so the join, not the create, is rejected.
-    delete_signature(&pool, admin).await;
-    seed_signature(&pool, admin).await;
+    bp_test_support::delete_signature_ownership(&pool, admin).await;
+    bp_test_support::seed_signature_ownership(&pool, admin).await;
 
     let svc = svc_no_email(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
@@ -366,7 +343,7 @@ async fn join_via_link_rejects_unverified_address() {
     assert!(svc.member_group_id(&addr(dave)).await.is_none());
 
     cleanup(&pool, name, admin).await;
-    delete_signature(&pool, admin).await;
+    bp_test_support::delete_signature_ownership(&pool, admin).await;
     let _ = sqlx::query("DELETE FROM blockparty_join_link WHERE \"groupId\" = $1")
         .bind(create.group.id)
         .execute(&pool)
@@ -382,8 +359,8 @@ async fn create_group_admits_signature_verified_email_less_admin() {
     let name = "bp-test-sigcreate-1";
     let admin = "bc1qadminsigcreate1";
     cleanup(&pool, name, admin).await;
-    delete_signature(&pool, admin).await;
-    seed_signature(&pool, admin).await;
+    bp_test_support::delete_signature_ownership(&pool, admin).await;
+    bp_test_support::seed_signature_ownership(&pool, admin).await;
 
     let svc = svc_no_email(&pool).await;
     let create = svc
@@ -398,7 +375,7 @@ async fn create_group_admits_signature_verified_email_less_admin() {
     );
 
     cleanup(&pool, name, admin).await;
-    delete_signature(&pool, admin).await;
+    bp_test_support::delete_signature_ownership(&pool, admin).await;
 }
 
 /// An admin with neither email nor signature proof cannot create a party.
@@ -410,7 +387,7 @@ async fn create_group_rejects_unverified_admin() {
     let name = "bp-test-unvercreate-1";
     let admin = "bc1qadminunvercreate1";
     cleanup(&pool, name, admin).await;
-    delete_signature(&pool, admin).await;
+    bp_test_support::delete_signature_ownership(&pool, admin).await;
 
     let svc = svc_no_email(&pool).await;
     let err = svc

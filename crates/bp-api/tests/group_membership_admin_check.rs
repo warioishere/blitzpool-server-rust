@@ -78,6 +78,7 @@ async fn group_solo_membership_and_admin_check() {
             .await
             .expect("load group service"),
     );
+    bp_test_support::seed_signature_ownership(&pool, creator).await;
     let created = svc.create_group(name, creator).await.expect("create group");
     let id = created.group.id;
 

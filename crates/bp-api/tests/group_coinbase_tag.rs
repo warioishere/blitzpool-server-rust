@@ -141,8 +141,10 @@ async fn a_team_admin_sets_and_clears_the_coinbase_tag() {
             .await
             .expect("load group service"),
     );
+    let creator_addr = "bc1qteamcoinbasetag".to_string();
+    bp_test_support::seed_signature_ownership(&pool, &creator_addr).await;
     let created = svc
-        .create_group(name, "bc1qteamcoinbasetag")
+        .create_group(name, &creator_addr)
         .await
         .expect("create group");
     let id = created.group.id;

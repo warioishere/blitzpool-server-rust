@@ -100,6 +100,7 @@ async fn wrong_token_after_warm_admin(name: &str, path: &str) -> Option<(StatusC
         },
     ));
     let creator = format!("bc1q{}", name.replace('-', ""));
+    bp_test_support::seed_signature_ownership(&pool, &creator).await;
     let created = group_svc
         .create_group(name, &creator)
         .await

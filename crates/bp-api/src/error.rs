@@ -153,6 +153,7 @@ impl From<bp_group_mgmt_engine::GroupServiceError> for ApiError {
         let code = e.code();
         let status = match e {
             G::MissingToken | G::InvalidToken => StatusCode::UNAUTHORIZED,
+            G::EmailNotVerified => StatusCode::FORBIDDEN,
             G::NotFound | G::NotMember => StatusCode::NOT_FOUND,
             G::CreatorCannotBeRemoved
             | G::MemberStillActive { .. }

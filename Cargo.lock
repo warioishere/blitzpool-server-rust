@@ -807,6 +807,7 @@ dependencies = [
  "bp-cron-utils",
  "bp-db",
  "bp-group-mgmt",
+ "bp-test-support",
  "chrono-tz",
  "sqlx",
  "thiserror 2.0.21",

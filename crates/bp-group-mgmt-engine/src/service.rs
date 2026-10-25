@@ -272,6 +272,12 @@ impl GroupService {
             return Err(GroupServiceError::AddressInGroup);
         }
         self.assert_not_in_blockparty(&normalized_address).await?;
+        // The creator's address routes into the group the moment it exists,
+        // so creating one is held to the same proof a joining member gives:
+        // a confirmed email or a signature.
+        if !bp_db::is_address_verified(&self.pool, &normalized_address).await? {
+            return Err(GroupServiceError::EmailNotVerified);
+        }
 
         let admin = AdminToken::generate()?;
         let admin_hash = admin.hash();

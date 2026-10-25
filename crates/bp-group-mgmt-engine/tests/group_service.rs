@@ -122,6 +122,7 @@ async fn create_group_happy_path_returns_token_and_seeds_creator() {
         .expect("load group service");
     let name = format!("test-create-{}", Uuid::new_v4());
     let creator = format!("bc1qcreator{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &creator).await;
     let result = svc.create_group(&name, &creator).await.expect("create");
     assert!(result.admin_token.starts_with("GRP-"));
     assert_eq!(result.group.name, name);
@@ -147,6 +148,7 @@ async fn create_group_defaults_to_prop_mode() {
         .expect("load group service");
     let name = format!("test-mode-default-{}", Uuid::new_v4());
     let creator = format!("bc1qpropdef{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &creator).await;
     let result = svc.create_group(&name, &creator).await.expect("create");
     assert_eq!(result.group.payout_mode, "prop", "default is PROP");
 
@@ -165,6 +167,7 @@ async fn create_group_with_window_mode_persists_window() {
         .expect("load group service");
     let name = format!("test-mode-window-{}", Uuid::new_v4());
     let creator = format!("bc1qwindow{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &creator).await;
     let result = svc
         .create_group_with_mode(&name, &creator, PayoutMode::Window)
         .await
@@ -180,6 +183,66 @@ async fn create_group_with_window_mode_persists_window() {
     assert_eq!(row.payout_mode, "window");
 
     cleanup_group(&pool, result.group.id).await;
+}
+
+/// The creator needs a confirmed email or a signature proof, as a joining
+/// member does. The same address is refused before it has either, so the
+/// accepted creations cannot pass on a proof that was there all along.
+#[tokio::test]
+async fn create_group_requires_a_verified_creator() {
+    let pool = match connect_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    let svc = GroupService::load(
+        pool.clone(),
+        Arc::new(TestHooks::new(None)),
+        14,
+        TEST_COINBASE_CAP,
+    )
+    .await
+    .expect("load group service");
+
+    let by_signature = format!("bc1qverifsig{}", Uuid::new_v4().simple());
+    let err = svc
+        .create_group(&format!("unverified-{}", Uuid::new_v4()), &by_signature)
+        .await
+        .expect_err("an unverified creator is refused");
+    assert!(
+        matches!(err, GroupServiceError::EmailNotVerified),
+        "{err:?}"
+    );
+    assert!(
+        svc.get_group_for_address(&AddressId::new(by_signature.clone()).unwrap())
+            .await
+            .is_none(),
+        "the refused address routes into no group"
+    );
+    bp_test_support::seed_signature_ownership(&pool, &by_signature).await;
+    let g1 = svc
+        .create_group(&format!("verif-sig-{}", Uuid::new_v4()), &by_signature)
+        .await
+        .expect("a signature proof admits the creator");
+
+    let by_email = format!("bc1qverifmail{}", Uuid::new_v4().simple());
+    let err = svc
+        .create_group(&format!("unverified-{}", Uuid::new_v4()), &by_email)
+        .await
+        .expect_err("an unverified creator is refused");
+    assert!(
+        matches!(err, GroupServiceError::EmailNotVerified),
+        "{err:?}"
+    );
+    bp_test_support::seed_verified_email(&pool, &by_email, "creator@example.com").await;
+    let g2 = svc
+        .create_group(&format!("verif-mail-{}", Uuid::new_v4()), &by_email)
+        .await
+        .expect("a confirmed email admits the creator");
+
+    cleanup_group(&pool, g1.group.id).await;
+    cleanup_group(&pool, g2.group.id).await;
+    bp_test_support::delete_signature_ownership(&pool, &by_signature).await;
+    bp_test_support::delete_email_binding(&pool, &by_email).await;
 }
 
 #[tokio::test]
@@ -224,10 +287,9 @@ async fn create_group_rejects_duplicate_name() {
     .await
     .expect("load group service");
     let name = format!("dup-{}", Uuid::new_v4());
-    let first = svc
-        .create_group(&name, &format!("bc1qfirst{}", Uuid::new_v4().simple()))
-        .await
-        .expect("first");
+    let creator_addr = format!("bc1qfirst{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &creator_addr).await;
+    let first = svc.create_group(&name, &creator_addr).await.expect("first");
     let err = svc
         .create_group(&name, &format!("bc1qsecond{}", Uuid::new_v4().simple()))
         .await
@@ -251,6 +313,7 @@ async fn create_group_rejects_address_already_in_group() {
     .await
     .expect("load group service");
     let shared_addr = format!("bc1qshared{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &shared_addr).await;
     let g1 = svc
         .create_group(&format!("a-{}", Uuid::new_v4()), &shared_addr)
         .await
@@ -281,6 +344,7 @@ async fn group_active_from_creation_and_stays_after_add() {
     .expect("load group service");
     let creator = format!("bc1qcr{}", Uuid::new_v4().simple());
     let new_member = format!("bc1qnew{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &creator).await;
     let g = svc
         .create_group(&format!("a-{}", Uuid::new_v4()), &creator)
         .await
@@ -317,10 +381,12 @@ async fn add_member_rejects_address_in_other_group() {
     let g1_creator = format!("bc1qg1cr{}", Uuid::new_v4().simple());
     let g2_creator = format!("bc1qg2cr{}", Uuid::new_v4().simple());
     let shared = format!("bc1qshared{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &g1_creator).await;
     let g1 = svc
         .create_group(&format!("g1-{}", Uuid::new_v4()), &g1_creator)
         .await
         .expect("g1");
+    bp_test_support::seed_signature_ownership(&pool, &g2_creator).await;
     let g2 = svc
         .create_group(&format!("g2-{}", Uuid::new_v4()), &g2_creator)
         .await
@@ -353,11 +419,10 @@ async fn require_admin_token_rejects_invalid() {
     )
     .await
     .expect("load group service");
+    let creator_addr = format!("bc1qauth{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &creator_addr).await;
     let g = svc
-        .create_group(
-            &format!("auth-{}", Uuid::new_v4()),
-            &format!("bc1qauth{}", Uuid::new_v4().simple()),
-        )
+        .create_group(&format!("auth-{}", Uuid::new_v4()), &creator_addr)
         .await
         .expect("g");
 
@@ -396,6 +461,7 @@ async fn remove_member_creator_rejected() {
     .await
     .expect("load group service");
     let creator = format!("bc1qrmc{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &creator).await;
     let g = svc
         .create_group(&format!("rm-{}", Uuid::new_v4()), &creator)
         .await
@@ -426,6 +492,7 @@ async fn remove_member_inactivity_guard_then_kick_succeeds() {
     .expect("load group service");
     let creator = format!("bc1qrmkc{}", Uuid::new_v4().simple());
     let target = format!("bc1qrmkt{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &creator).await;
     let g = svc_active
         .create_group(&format!("rmk-{}", Uuid::new_v4()), &creator)
         .await
@@ -478,6 +545,7 @@ async fn remove_member_keeps_group_active_down_to_creator() {
         .expect("load group service");
     let creator = format!("bc1qrmact_c{}", Uuid::new_v4().simple());
     let member = format!("bc1qrmact_m{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &creator).await;
     let g = svc
         .create_group(&format!("rmact-{}", Uuid::new_v4()), &creator)
         .await
@@ -517,6 +585,7 @@ async fn transfer_creator_rotates_role_and_token() {
     .expect("load group service");
     let old_creator = format!("bc1qtcold{}", Uuid::new_v4().simple());
     let new_creator = format!("bc1qtcnew{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &old_creator).await;
     let g = svc
         .create_group(&format!("tc-{}", Uuid::new_v4()), &old_creator)
         .await
@@ -578,11 +647,10 @@ async fn transfer_creator_rejects_non_member() {
     )
     .await
     .expect("load group service");
+    let creator_addr = format!("bc1qtcnm{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &creator_addr).await;
     let g = svc
-        .create_group(
-            &format!("tcnm-{}", Uuid::new_v4()),
-            &format!("bc1qtcnm{}", Uuid::new_v4().simple()),
-        )
+        .create_group(&format!("tcnm-{}", Uuid::new_v4()), &creator_addr)
         .await
         .expect("g");
     let outsider = format!("bc1qoutsider{}", Uuid::new_v4().simple());
@@ -606,11 +674,10 @@ async fn update_round_reset_config_applies_and_fires_hook() {
     let svc = GroupService::load(pool.clone(), Arc::new(hooks.clone()), 14, TEST_COINBASE_CAP)
         .await
         .expect("load group service");
+    let creator_addr = format!("bc1qrr{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &creator_addr).await;
     let g = svc
-        .create_group(
-            &format!("rr-{}", Uuid::new_v4()),
-            &format!("bc1qrr{}", Uuid::new_v4().simple()),
-        )
+        .create_group(&format!("rr-{}", Uuid::new_v4()), &creator_addr)
         .await
         .expect("g");
 
@@ -654,11 +721,10 @@ async fn update_round_reset_rejects_invalid_timezone() {
     )
     .await
     .expect("load group service");
+    let creator_addr = format!("bc1qrrbad{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &creator_addr).await;
     let g = svc
-        .create_group(
-            &format!("rrbad-{}", Uuid::new_v4()),
-            &format!("bc1qrrbad{}", Uuid::new_v4().simple()),
-        )
+        .create_group(&format!("rrbad-{}", Uuid::new_v4()), &creator_addr)
         .await
         .expect("g");
     let err = svc
@@ -691,11 +757,10 @@ async fn update_round_reset_rejects_a_bonus_past_the_ppm_cap() {
     )
     .await
     .expect("load group service");
+    let creator_addr = format!("bc1qrrlow{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &creator_addr).await;
     let g = svc
-        .create_group(
-            &format!("rrlow-{}", Uuid::new_v4()),
-            &format!("bc1qrrlow{}", Uuid::new_v4().simple()),
-        )
+        .create_group(&format!("rrlow-{}", Uuid::new_v4()), &creator_addr)
         .await
         .expect("g");
     let err = svc
@@ -725,11 +790,10 @@ async fn dissolve_group_removes_members_and_marks_row() {
     let svc = GroupService::load(pool.clone(), Arc::new(hooks.clone()), 14, TEST_COINBASE_CAP)
         .await
         .expect("load group service");
+    let creator_addr = format!("bc1qdiss{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &creator_addr).await;
     let g = svc
-        .create_group(
-            &format!("diss-{}", Uuid::new_v4()),
-            &format!("bc1qdiss{}", Uuid::new_v4().simple()),
-        )
+        .create_group(&format!("diss-{}", Uuid::new_v4()), &creator_addr)
         .await
         .expect("g");
     svc.add_member(
@@ -774,6 +838,7 @@ async fn address_cache_reflects_membership_changes() {
     .expect("load group service");
     let creator = format!("bc1qcc{}", Uuid::new_v4().simple());
     let cache_addr = AddressId::new(creator.to_lowercase()).unwrap();
+    bp_test_support::seed_signature_ownership(&pool, &creator).await;
     let g = svc
         .create_group(&format!("cc-{}", Uuid::new_v4()), &creator)
         .await
@@ -821,6 +886,7 @@ async fn address_cache_rebuild_skips_invalid_address_member() {
     .expect("load group service");
     let creator = format!("bc1qok{}", Uuid::new_v4().simple());
     let good_addr = AddressId::new(creator.to_lowercase()).unwrap();
+    bp_test_support::seed_signature_ownership(&pool, &creator).await;
     let g = svc
         .create_group(&format!("ok-{}", Uuid::new_v4()), &creator)
         .await
@@ -878,11 +944,10 @@ async fn null_max_members_still_stops_at_the_coinbase_ceiling() {
     let svc = GroupService::load(pool.clone(), Arc::new(TestHooks::new(None)), 14, 2)
         .await
         .expect("load group service");
+    let creator_addr = format!("bc1qcapnull{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &creator_addr).await;
     let g = svc
-        .create_group(
-            &format!("cap-null-{}", Uuid::new_v4()),
-            &format!("bc1qcapnull{}", Uuid::new_v4().simple()),
-        )
+        .create_group(&format!("cap-null-{}", Uuid::new_v4()), &creator_addr)
         .await
         .expect("g");
     assert_eq!(
@@ -912,11 +977,10 @@ async fn operator_max_members_still_binds_below_the_ceiling() {
     let svc = GroupService::load(pool.clone(), Arc::new(TestHooks::new(None)), 14, 50)
         .await
         .expect("load group service");
+    let creator_addr = format!("bc1qcapop{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &creator_addr).await;
     let g = svc
-        .create_group(
-            &format!("cap-op-{}", Uuid::new_v4()),
-            &format!("bc1qcapop{}", Uuid::new_v4().simple()),
-        )
+        .create_group(&format!("cap-op-{}", Uuid::new_v4()), &creator_addr)
         .await
         .expect("g");
     svc.update_round_reset_config(
@@ -952,11 +1016,10 @@ async fn max_members_above_the_coinbase_ceiling_is_refused() {
     let svc = GroupService::load(pool.clone(), Arc::new(TestHooks::new(None)), 14, 52)
         .await
         .expect("load group service");
+    let creator_addr = format!("bc1qcappatch{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &creator_addr).await;
     let g = svc
-        .create_group(
-            &format!("cap-patch-{}", Uuid::new_v4()),
-            &format!("bc1qcappatch{}", Uuid::new_v4().simple()),
-        )
+        .create_group(&format!("cap-patch-{}", Uuid::new_v4()), &creator_addr)
         .await
         .expect("g");
 
