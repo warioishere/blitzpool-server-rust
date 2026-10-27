@@ -17,7 +17,11 @@ pub const TOKEN_LEN: usize = 16;
 
 pub const TOKEN_COUNTER_LEN: usize = 4;
 
-pub const DEFAULT_TOKEN_TTL_MS: u64 = 3_600_000;
+/// 24 h: a JDC may keep allocated tokens with no age limit and spend the first
+/// ones when its upstream channel opens, which can be long after it allocated
+/// them. With the rate limit this also bounds how many tokens one connection
+/// holds.
+pub const DEFAULT_TOKEN_TTL_MS: u64 = 86_400_000;
 
 /// SV2 JDP/AllocateMiningJobToken: "rate limited to a rather slow rate".
 pub const DEFAULT_RATE_LIMIT_MS: u64 = 1_000;
