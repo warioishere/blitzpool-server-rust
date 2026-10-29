@@ -7,10 +7,15 @@
 //!
 //! The format is the sidecar's and must stay byte-compatible with it:
 //! `Authorization: Bearer <payload>.<sig>`, where `payload` is unpadded
-//! base64url of the UTF-8 JSON `{"a": <address key>, "e": <expiry, epoch ms>}`
-//! and `sig` is unpadded base64url of HMAC-SHA256 keyed with the secret over
-//! the payload *string*. Account tokens (`acct` instead of `a`) prove no
-//! address here.
+//! base64url of the UTF-8 JSON `{"a": <address key>, "e": <expiry, epoch ms>,
+//! "i": <issued, epoch ms>}` and `sig` is unpadded base64url of HMAC-SHA256
+//! keyed with the secret over the payload *string*. Account tokens (`acct`
+//! instead of `a`) prove no address here.
+//!
+//! A token is void once the sidecar has revoked its address key from a
+//! moment after the token's issue. The sidecar pushes that moment as a
+//! revocation, signed the same way over `{"rv": <address key>, "b": <revoked
+//! before, epoch ms>, "e": <expiry, epoch ms>}`.
 //!
 //! The check is on only with `[api.address_auth] enabled = true`, so a pool
 //! without the sidecar keeps these routes open; enabled, the api does not
@@ -37,6 +42,11 @@ use crate::state::{AppState, SharedState};
 /// How long a token this api issues stays valid.
 pub const ISSUED_TOKEN_TTL_MS: i64 = 60 * 60 * 1000;
 
+/// A token without an issue time counts as issued this long before it
+/// expires: the sidecar's token lifetime, early on purpose so that a
+/// revocation covers it.
+const UNSTAMPED_TOKEN_AGE_MS: f64 = 7.0 * 24.0 * 60.0 * 60.0 * 1000.0;
+
 /// The HMAC key the sidecar signs address tokens with.
 #[derive(Clone)]
 pub struct AddressTokenSecret(String);
@@ -48,11 +58,11 @@ impl AddressTokenSecret {
         (!trimmed.is_empty()).then(|| Self(trimmed.to_string()))
     }
 
-    /// An address token for `address`, valid until `expires_at_ms`, the same
-    /// string the sidecar issues for it.
-    pub fn issue(&self, address: &str, expires_at_ms: i64) -> String {
+    /// An address token for `address`, issued at `issued_at_ms` and valid
+    /// until `expires_at_ms`, the same string the sidecar issues for it.
+    pub fn issue(&self, address: &str, issued_at_ms: i64, expires_at_ms: i64) -> String {
         let key = serde_json::Value::from(address_key(address)).to_string();
-        let claims = format!(r#"{{"a":{key},"e":{expires_at_ms}}}"#);
+        let claims = format!(r#"{{"a":{key},"e":{expires_at_ms},"i":{issued_at_ms}}}"#);
         let payload = URL_SAFE_NO_PAD.encode(claims);
         let sig = self.sign(&payload);
         format!("{payload}.{sig}")
@@ -65,9 +75,9 @@ impl AddressTokenSecret {
         URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
     }
 
-    /// The address key `token` is bound to, if its signature holds and it
-    /// has not expired at `now_ms`.
-    fn token_address_key(&self, token: &str, now_ms: i64) -> Option<String> {
+    /// The claims of `token`, if its signature holds and it has not expired
+    /// at `now_ms`.
+    fn claims(&self, token: &str, now_ms: i64) -> Option<serde_json::Value> {
         let (payload, sig) = token.split_once('.')?;
         if payload.is_empty() {
             return None;
@@ -78,10 +88,27 @@ impl AddressTokenSecret {
         let json: serde_json::Value =
             serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
         let expires_at = json.get("e")?.as_f64()?;
-        if expires_at < now_ms as f64 {
-            return None;
-        }
-        json.get("a")?.as_str().map(str::to_string)
+        (expires_at >= now_ms as f64).then_some(json)
+    }
+
+    /// The address key `token` is bound to and when it was issued.
+    fn token_address_key(&self, token: &str, now_ms: i64) -> Option<(String, i64)> {
+        let json = self.claims(token, now_ms)?;
+        let key = json.get("a")?.as_str()?.to_string();
+        let issued_at = match json.get("i") {
+            Some(i) => i.as_f64()?,
+            None => json.get("e")?.as_f64()? - UNSTAMPED_TOKEN_AGE_MS,
+        };
+        Some((key, issued_at as i64))
+    }
+
+    /// The address key a revocation names and the moment before which its
+    /// tokens are void.
+    fn revocation(&self, token: &str, now_ms: i64) -> Option<(String, i64)> {
+        let json = self.claims(token, now_ms)?;
+        let key = json.get("rv")?.as_str()?;
+        let revoked_before = json.get("b")?.as_f64()?;
+        (!key.is_empty()).then(|| (key.to_string(), revoked_before as i64))
     }
 }
 
@@ -92,13 +119,29 @@ impl fmt::Debug for AddressTokenSecret {
 }
 
 /// Whether the routes that act for one address require its token.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub enum AddressAuth {
-    /// Every request is let through.
-    #[default]
-    Off,
+    /// Every request is let through. A configured secret still verifies the
+    /// sidecar's revocations, so they hold once the check is turned on.
+    Off(Option<AddressTokenSecret>),
     /// Only a request carrying the address's token signed with this secret.
     Required(AddressTokenSecret),
+}
+
+impl Default for AddressAuth {
+    fn default() -> Self {
+        Self::Off(None)
+    }
+}
+
+impl AddressAuth {
+    /// The sidecar's secret, whether or not the check is on.
+    pub fn secret(&self) -> Option<&AddressTokenSecret> {
+        match self {
+            Self::Off(secret) => secret.as_ref(),
+            Self::Required(secret) => Some(secret),
+        }
+    }
 }
 
 /// The key a token names its address by, as the sidecar's `ownerOf` builds
@@ -123,41 +166,59 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     (!token.is_empty()).then_some(token)
 }
 
-/// Pass only a request whose bearer token is bound to `target`.
+/// The issue time of the request's bearer token, if it is bound to `target`.
+/// Revocation is the caller's part: see [`require_address_token`].
 pub fn authorize(
     secret: &AddressTokenSecret,
     headers: &HeaderMap,
     target: &str,
     now_ms: i64,
-) -> Result<(), ApiError> {
+) -> Result<i64, ApiError> {
     let bound = bearer(headers).and_then(|token| secret.token_address_key(token, now_ms));
     match bound {
-        Some(key) if key == address_key(target) => Ok(()),
+        Some((key, issued_at)) if key == address_key(target) => Ok(issued_at),
         _ => Err(ApiError::LoginRequired),
     }
+}
+
+/// The address key and revocation moment the request's bearer revocation
+/// carries, if `secret` signed it and it has not expired.
+pub fn revocation(
+    secret: &AddressTokenSecret,
+    headers: &HeaderMap,
+    now_ms: i64,
+) -> Option<(String, i64)> {
+    bearer(headers).and_then(|token| secret.revocation(token, now_ms))
 }
 
 /// A token for `address` from the check's secret, valid for
 /// [`ISSUED_TOKEN_TTL_MS`]; `None` while the check is off.
 pub fn issue_address_token(state: &AppState, address: &str) -> Option<String> {
     match &state.address_auth {
-        AddressAuth::Off => None,
+        AddressAuth::Off(_) => None,
         AddressAuth::Required(secret) => {
-            Some(secret.issue(address, bp_common::now_ms() + ISSUED_TOKEN_TTL_MS))
+            let now = bp_common::now_ms();
+            Some(secret.issue(address, now, now + ISSUED_TOKEN_TTL_MS))
         }
     }
 }
 
-/// [`authorize`] when the check is on, for a handler whose address comes in
-/// the request body.
-pub fn require_address_token(
+/// When the check is on: [`authorize`], then the token must not predate its
+/// address key's revocation. An unreadable revocation list refuses.
+pub async fn require_address_token(
     state: &AppState,
     headers: &HeaderMap,
     address: &str,
 ) -> Result<(), ApiError> {
-    match &state.address_auth {
-        AddressAuth::Off => Ok(()),
-        AddressAuth::Required(secret) => authorize(secret, headers, address, bp_common::now_ms()),
+    let AddressAuth::Required(secret) = &state.address_auth else {
+        return Ok(());
+    };
+    let issued_at = authorize(secret, headers, address, bp_common::now_ms())?;
+    let revoked_before =
+        bp_db::find_token_revoked_before(&state.pool, &address_key(address)).await?;
+    match revoked_before {
+        Some(revoked_before) if issued_at < revoked_before => Err(ApiError::LoginRequired),
+        _ => Ok(()),
     }
 }
 
@@ -169,7 +230,7 @@ pub async fn require_address(
     next: Next,
 ) -> Result<Response, ApiError> {
     let target = params.get("address").ok_or(ApiError::LoginRequired)?;
-    require_address_token(&state, request.headers(), target)?;
+    require_address_token(&state, request.headers(), target).await?;
     Ok(next.run(request).await)
 }
 
@@ -184,6 +245,12 @@ mod tests {
     const VALID_BASE58: &str = "eyJhIjoiMWJ2Ym1zZXlzdHdldHF0Zm41YXU0bTRnZmc3eGphbnZuMiIsImUiOjQxMDI0NDQ4MDAwMDB9.ZCOb5F4HvrtHwXDIJ6mLdvSMw-AlXQlrNPKLfr9kmss";
     const EXPIRED: &str = "eyJhIjoiYmMxcXRva2VudmVjdG9yYWRkcmVzcyIsImUiOjEwMDB9.7xQ1LDXx9V6e61DJIJ8v3RVwEgG221JRRJbzk2yDHwc";
     const ACCOUNT: &str = "eyJhY2N0IjoiMDJhYmMiLCJlIjo0MTAyNDQ0ODAwMDAwfQ.9RvDIeR-pfWTnaK1-gQv_gQdL-5Ou7qotLbNk-KDzBM";
+    // {"a":ADDRESS,"e":4102444800000,"i":4101840000000}
+    const STAMPED: &str = "eyJhIjoiYmMxcXRva2VudmVjdG9yYWRkcmVzcyIsImUiOjQxMDI0NDQ4MDAwMDAsImkiOjQxMDE4NDAwMDAwMDB9.zau-gB8Tz65HFZ6IbRjbckZ11OAoahcjFUsbWd9729I";
+    // {"rv":ADDRESS,"b":4101840000000,"e":4102444800000}
+    const REVOCATION: &str = "eyJydiI6ImJjMXF0b2tlbnZlY3RvcmFkZHJlc3MiLCJiIjo0MTAxODQwMDAwMDAwLCJlIjo0MTAyNDQ0ODAwMDAwfQ.1rcSopEwNuQXGxIOLh6OjL-44ZXHyXDxPLgxCXdU_Ic";
+    const EXPIRES: i64 = 4_102_444_800_000;
+    const ISSUED: i64 = 4_101_840_000_000;
     const ADDRESS: &str = "bc1qtokenvectoraddress";
     const NOW: i64 = 1_800_000_000_000;
 
@@ -203,20 +270,37 @@ mod tests {
 
     #[test]
     fn an_issued_token_is_the_sidecars_string() {
-        assert_eq!(secret().issue(ADDRESS, 4_102_444_800_000), VALID);
+        assert_eq!(secret().issue(ADDRESS, ISSUED, EXPIRES), STAMPED);
+    }
+
+    #[test]
+    fn a_token_carries_its_issue_time_or_counts_as_a_week_older_than_its_expiry() {
+        let issued = |t: &str| authorize(&secret(), &headers(&format!("Bearer {t}")), ADDRESS, NOW);
+        assert_eq!(issued(STAMPED).unwrap(), ISSUED);
+        assert_eq!(issued(VALID).unwrap(), EXPIRES - 7 * 24 * 60 * 60 * 1000);
+    }
+
+    #[test]
+    fn a_revocation_names_its_key_and_moment_and_is_no_address_token() {
+        let h = headers(&format!("Bearer {REVOCATION}"));
         assert_eq!(
-            secret().issue("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2", 4_102_444_800_000),
-            VALID_BASE58
+            revocation(&secret(), &h, NOW),
+            Some((ADDRESS.to_string(), ISSUED))
         );
-        assert_eq!(secret().issue(ADDRESS, 1000), EXPIRED);
+        assert_eq!(revocation(&secret(), &h, EXPIRES + 1), None, "expired");
+        let other = AddressTokenSecret::new("another-secret").unwrap();
+        assert_eq!(revocation(&other, &h, NOW), None, "another secret");
+        assert!(!passes(&format!("Bearer {REVOCATION}"), ADDRESS));
+        let h = headers(&format!("Bearer {STAMPED}"));
+        assert_eq!(revocation(&secret(), &h, NOW), None);
     }
 
     #[test]
     fn an_issued_token_passes_for_its_address_until_it_expires() {
-        let token = secret().issue("BC1QTOKENVECTORADDRESS.rig", NOW + 1);
+        let token = secret().issue("BC1QTOKENVECTORADDRESS.rig", NOW, NOW + 1);
         assert!(passes(&format!("Bearer {token}"), ADDRESS));
         assert!(!passes(&format!("Bearer {token}"), "bc1qsomeoneelse"));
-        let stale = secret().issue(ADDRESS, NOW - 1);
+        let stale = secret().issue(ADDRESS, NOW - 2, NOW - 1);
         assert!(!passes(&format!("Bearer {stale}"), ADDRESS));
     }
 

@@ -166,11 +166,14 @@ fn wire_change_notifier(
 
 /// `[api.address_auth] enabled = true` turns the address-token check on, and
 /// then the sidecar's secret is required: without it every such route would
-/// refuse every request, so the api does not start.
+/// refuse every request, so the api does not start. Off, a configured secret
+/// still verifies the sidecar's revocations.
 fn address_auth(cfg: &AddressAuthConfig) -> Result<AddressAuth, ApiServerError> {
     if !cfg.enabled {
         info!("bp-api: address-token check off");
-        return Ok(AddressAuth::Off);
+        return Ok(AddressAuth::Off(AddressTokenSecret::new(
+            &cfg.session_secret,
+        )));
     }
     let secret = AddressTokenSecret::new(&cfg.session_secret)
         .ok_or(ApiServerError::AddressAuthSecretMissing)?;
@@ -193,11 +196,11 @@ mod tests {
     fn the_check_is_off_unless_enabled_even_with_a_secret() {
         assert!(matches!(
             address_auth(&cfg(false, "s")),
-            Ok(AddressAuth::Off)
+            Ok(AddressAuth::Off(Some(_)))
         ));
         assert!(matches!(
             address_auth(&cfg(false, "")),
-            Ok(AddressAuth::Off)
+            Ok(AddressAuth::Off(None))
         ));
     }
 

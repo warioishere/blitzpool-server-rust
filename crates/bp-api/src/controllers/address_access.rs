@@ -5,10 +5,19 @@
 //! set the address's first password in the UI sidecar. The answer is the
 //! same whether or not the address has such an email, so the endpoint does
 //! not reveal the binding.
+//!
+//! `POST /api/address/token-revocations`: the sidecar's signed revocation of
+//! an address key's tokens, stored whether or not the check is on.
 
 use std::time::Duration;
 
-use axum::{extract::State, http::StatusCode, response::Json, routing::post, Router};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::Json,
+    routing::post,
+    Router,
+};
 use moka::sync::Cache;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -17,7 +26,7 @@ use crate::controllers::address_ownership::parse_supported_address;
 use crate::controllers::email::email_error;
 use crate::email_hooks::AddressAccessContext;
 use crate::error::ApiError;
-use crate::middleware::address_auth::ISSUED_TOKEN_TTL_MS;
+use crate::middleware::address_auth::{revocation, ISSUED_TOKEN_TTL_MS};
 use crate::middleware::{rate_limit, AddressAuth};
 use crate::state::SharedState;
 
@@ -33,11 +42,13 @@ static RECENTLY_SENT: Lazy<Cache<String, ()>> = Lazy::new(|| {
 });
 
 pub(crate) fn routes() -> Router<SharedState> {
-    Router::new().route(
-        // Rate-limited: 5 requests per minute per client IP.
-        "/api/address/password-link",
-        post(password_link).layer(rate_limit::per_minute_layer(5)),
-    )
+    Router::new()
+        .route(
+            // Rate-limited: 5 requests per minute per client IP.
+            "/api/address/password-link",
+            post(password_link).layer(rate_limit::per_minute_layer(5)),
+        )
+        .route("/api/address/token-revocations", post(token_revocation))
 }
 
 #[derive(Deserialize)]
@@ -83,8 +94,9 @@ async fn password_link(
     if let Some(binding) = bound {
         if !RECENTLY_SENT.contains_key(address.as_str()) {
             RECENTLY_SENT.insert(address.as_str().to_string(), ());
-            let expires_at = bp_common::now_ms() + ISSUED_TOKEN_TTL_MS;
-            let token = secret.issue(address.as_str(), expires_at);
+            let now = bp_common::now_ms();
+            let expires_at = now + ISSUED_TOKEN_TTL_MS;
+            let token = secret.issue(address.as_str(), now, expires_at);
             state
                 .email_verification_hooks
                 .send_address_access(AddressAccessContext {
@@ -101,4 +113,29 @@ async fn password_link(
         }
     }
     Ok(Json(PasswordLinkResponse { sent: true }))
+}
+
+#[derive(Serialize)]
+struct RevocationResponse {
+    ok: bool,
+}
+
+/// Idempotent: the stored moment only moves forward. A moment in the future
+/// counts as now, so a token the sidecar issues right after stays valid.
+async fn token_revocation(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<RevocationResponse>, ApiError> {
+    let Some(secret) = state.address_auth.secret() else {
+        return Err(email_error(
+            "session-secret-missing",
+            StatusCode::SERVICE_UNAVAILABLE,
+        ));
+    };
+    let now = bp_common::now_ms();
+    let (address_key, revoked_before) = revocation(secret, &headers, now)
+        .ok_or_else(|| email_error("invalid-revocation", StatusCode::UNAUTHORIZED))?;
+    bp_db::raise_token_revoked_before(&state.pool, &address_key, revoked_before.min(now), now)
+        .await?;
+    Ok(Json(RevocationResponse { ok: true }))
 }

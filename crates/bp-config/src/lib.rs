@@ -221,8 +221,9 @@ pub struct AddressAuthConfig {
     /// Off by default: the routes take any request.
     #[serde(default)]
     pub enabled: bool,
-    /// The sidecar's `SESSION_TOKEN_SECRET`, which it signs the tokens with.
-    /// Required when `enabled`; the api does not start without it.
+    /// The sidecar's `SESSION_TOKEN_SECRET`, which it signs the tokens and
+    /// their revocations with. Required when `enabled`; the api does not
+    /// start without it. Set while off, it still takes the revocations.
     #[serde(default)]
     pub session_secret: String,
 }

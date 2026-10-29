@@ -107,7 +107,7 @@ impl AppState {
             pool_identifier: String::new(),
             solo_fee: bp_mining_job::SoloFeeConfig::default(),
             cache: ResponseCache::new(bp_config::ApiCacheConfig::default()),
-            address_auth: AddressAuth::Off,
+            address_auth: AddressAuth::default(),
         }
     }
 }

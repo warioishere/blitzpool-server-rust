@@ -59,7 +59,7 @@ async fn register(
 ) -> Result<Json<RegisterResponse>, ApiError> {
     // A verified binding proves the address for Team creation, invitations
     // and join requests, so only the address's holder may bind an email.
-    require_address_token(&state, &headers, &body.address)?;
+    require_address_token(&state, &headers, &body.address).await?;
     // Canonicalise (lowercase bech32, preserve Base58) so the binding is keyed
     // identically to what every verification gate looks up — otherwise a
     // mixed-case Base58 / upper-case bech32 email binding would never match.

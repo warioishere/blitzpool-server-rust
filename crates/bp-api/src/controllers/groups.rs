@@ -185,7 +185,7 @@ async fn create(
     headers: HeaderMap,
     Json(body): Json<CreateGroupBody>,
 ) -> Result<(StatusCode, Json<CreateGroupResponse>), ApiError> {
-    require_address_token(&state, &headers, &body.creator_address)?;
+    require_address_token(&state, &headers, &body.creator_address).await?;
     // A group created here would route its members to a mode this pool
     // does not run.
     if state.group_solo.is_none() {
@@ -567,7 +567,7 @@ async fn create_join_request(
     headers: HeaderMap,
     Json(body): Json<CreateJoinRequestBody>,
 ) -> Result<(StatusCode, Json<CreateJoinRequestResponse>), ApiError> {
-    require_address_token(&state, &headers, &body.address)?;
+    require_address_token(&state, &headers, &body.address).await?;
     let svc = require_join_request_service(&state)?;
     let row = svc
         .create_join_request(id, &body.address, body.message.as_deref())

@@ -473,7 +473,7 @@ async fn create(
     headers: HeaderMap,
     Json(body): Json<CreateBody>,
 ) -> Result<Json<CreateResponse>, ApiError> {
-    require_address_token(&state, &headers, &body.admin_address)?;
+    require_address_token(&state, &headers, &body.admin_address).await?;
     let svc = require_blockparty(&state)?;
     let res = svc
         .create_group(&body.name, &body.admin_address, body.admin_percent_bp)
@@ -723,7 +723,7 @@ async fn join_via_link(
     headers: HeaderMap,
     Json(body): Json<JoinBody>,
 ) -> Result<Json<JoinResponse>, ApiError> {
-    require_address_token(&state, &headers, &body.address)?;
+    require_address_token(&state, &headers, &body.address).await?;
     let svc = require_blockparty(&state)?;
     let (member_token, group_id) = svc.join_via_link(&token, &body.address).await?;
     Ok(Json(JoinResponse {

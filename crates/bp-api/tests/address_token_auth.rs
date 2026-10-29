@@ -192,7 +192,7 @@ async fn a_token_for_another_address_is_refused() {
 
 #[tokio::test]
 async fn with_the_check_off_a_request_without_a_token_goes_through() {
-    let app = app(unconnected_pool(), AddressAuth::Off);
+    let app = app(unconnected_pool(), AddressAuth::Off(None));
     for route in body_routes() {
         let (status, body) = post(&app, &route.uri, None, (route.body)(ADDRESS)).await;
         assert_eq!(
@@ -214,7 +214,10 @@ async fn with_the_check_off_a_request_without_a_token_goes_through() {
 /// service is wired and email is off, so each answers that, not 401.
 #[tokio::test]
 async fn the_matching_token_reaches_the_handlers_own_checks() {
-    let app = app(unconnected_pool(), required());
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let app = app(pool, required());
     for route in body_routes() {
         let (status, body) = post(&app, &route.uri, Some(TOKEN), (route.body)(ADDRESS)).await;
         assert_eq!(
@@ -255,4 +258,25 @@ async fn a_base58_route_takes_the_lowercased_token() {
     let (code, body) = post(&app, &uri, Some(BASE58_TOKEN), json!({})).await;
     assert_eq!(code, StatusCode::OK, "{body}");
     assert_eq!(body["status"], "reset");
+}
+
+/// The revocation list is read for every matching token: without it the
+/// request is refused, never let through.
+#[tokio::test]
+async fn an_unreadable_revocation_list_refuses_the_matching_token() {
+    let app = app(unconnected_pool(), required());
+    for route in body_routes() {
+        let (status, body) = post(&app, &route.uri, Some(TOKEN), (route.body)(ADDRESS)).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{}: {body}",
+            route.name
+        );
+    }
+    for write in CLIENT_WRITES {
+        let uri = format!("/api/client/{ADDRESS}/{write}");
+        let (status, body) = post(&app, &uri, Some(TOKEN), json!({})).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{write}: {body}");
+    }
 }

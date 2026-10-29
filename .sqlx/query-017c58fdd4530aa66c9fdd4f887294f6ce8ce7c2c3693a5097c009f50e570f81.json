@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO address_token_revocation (\"addressKey\", \"revokedBefore\", \"updatedAt\")\n           VALUES ($1, $2, $3)\n           ON CONFLICT (\"addressKey\") DO UPDATE SET\n             \"revokedBefore\" = GREATEST(\n               address_token_revocation.\"revokedBefore\", EXCLUDED.\"revokedBefore\"\n             ),\n             \"updatedAt\" = EXCLUDED.\"updatedAt\"",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "017c58fdd4530aa66c9fdd4f887294f6ce8ce7c2c3693a5097c009f50e570f81"
+}

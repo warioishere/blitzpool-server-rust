@@ -7,6 +7,7 @@
 
 mod address;
 mod address_ownership;
+mod address_token;
 mod block;
 mod blockparty;
 mod client;
@@ -41,6 +42,7 @@ pub use address_ownership::{
     upsert_address_ownership_verified, upsert_ownership_challenge, AddressOwnershipRow,
     OwnershipChallengeRow,
 };
+pub use address_token::{find_token_revoked_before, raise_token_revoked_before};
 pub use block::{
     find_found_blocks, found_block_miner_at_height, insert_found_block, payout_recorded_at_height,
     FoundBlockRow,

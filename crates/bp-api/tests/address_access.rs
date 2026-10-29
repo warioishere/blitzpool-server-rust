@@ -174,7 +174,7 @@ async fn with_the_check_off_no_link_goes_out() {
     let verified = address(0x35, "p2wpkh");
     bp_test_support::seed_verified_email(&pool, &verified, "off@example.com").await;
     let hooks = Arc::new(CapturingHooks::default());
-    let app = app(pool.clone(), AddressAuth::Off, hooks.clone());
+    let app = app(pool.clone(), AddressAuth::Off(None), hooks.clone());
 
     let (status, body) = request_link(&app, &verified).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
@@ -239,7 +239,7 @@ async fn a_verified_signature_answers_with_the_addresss_token() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.get("addressToken").is_none(), "{body}");
 
-    let off = app(pool.clone(), AddressAuth::Off, hooks);
+    let off = app(pool.clone(), AddressAuth::Off(None), hooks);
     let (status, body) = prove(&off, &address, &sk, true).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.get("addressToken").is_none(), "{body}");

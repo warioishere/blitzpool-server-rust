@@ -49,7 +49,7 @@ async fn accept_open(
     headers: HeaderMap,
     Json(body): Json<AcceptOpenBody>,
 ) -> Result<Json<MemberCreatedResponse>, ApiError> {
-    require_address_token(&state, &headers, &body.address)?;
+    require_address_token(&state, &headers, &body.address).await?;
     let svc = require_invitation(&state)?;
     let member = svc
         .accept_open_invite(&token, &body.address)
