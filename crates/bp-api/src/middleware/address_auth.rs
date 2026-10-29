@@ -145,13 +145,17 @@ impl AddressAuth {
 }
 
 /// The key a token names its address by, as the sidecar's `ownerOf` builds
-/// it: the part before the first `.`, lowercased whole. Base58 is lowercased
-/// too, so it is a lookup key and not an address.
+/// it: the part before the first `.`, trimmed around both cuts and lowercased
+/// whole. Base58 is lowercased too, so it is a lookup key and not an address.
+/// Trimmed like the handlers' normalization, so a padded address cannot pass
+/// under one key and then be written under another.
 pub fn address_key(address_or_worker: &str) -> String {
     address_or_worker
+        .trim()
         .split('.')
         .next()
         .unwrap_or_default()
+        .trim()
         .to_lowercase()
 }
 
@@ -354,6 +358,28 @@ mod tests {
         assert!(!passes(VALID, ADDRESS));
         assert!(!passes(&format!("Basic {VALID}"), ADDRESS));
         assert!(!passes(&format!("Bearer{VALID}"), ADDRESS));
+    }
+
+    #[test]
+    fn the_key_is_trimmed_around_both_cuts_like_the_sidecar() {
+        assert_eq!(address_key("  BC1QTOKENVECTORADDRESS.rig "), ADDRESS);
+        assert_eq!(address_key(" bc1qtokenvectoraddress .rig"), ADDRESS);
+        assert!(passes(
+            &format!("Bearer {VALID}"),
+            " BC1QTOKENVECTORADDRESS "
+        ));
+    }
+
+    /// A token whose key carries whitespace, as an untrimmed `ownerOf` could
+    /// issue, opens nothing: no target keys to it.
+    #[test]
+    fn a_token_for_a_padded_key_passes_for_no_address() {
+        let claims = format!(r#"{{"a":" {ADDRESS}","e":{EXPIRES},"i":{ISSUED}}}"#);
+        let payload = URL_SAFE_NO_PAD.encode(claims);
+        let token = format!("{payload}.{}", secret().sign(&payload));
+        for target in [ADDRESS, &format!(" {ADDRESS}"), &format!(" {ADDRESS} ")] {
+            assert!(!passes(&format!("Bearer {token}"), target), "{target:?}");
+        }
     }
 
     #[test]
