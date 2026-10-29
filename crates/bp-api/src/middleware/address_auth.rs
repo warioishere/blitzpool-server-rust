@@ -34,6 +34,9 @@ use subtle::ConstantTimeEq;
 use crate::error::ApiError;
 use crate::state::{AppState, SharedState};
 
+/// How long a token this api issues stays valid.
+pub const ISSUED_TOKEN_TTL_MS: i64 = 60 * 60 * 1000;
+
 /// The HMAC key the sidecar signs address tokens with.
 #[derive(Clone)]
 pub struct AddressTokenSecret(String);
@@ -43,6 +46,16 @@ impl AddressTokenSecret {
     pub fn new(raw: &str) -> Option<Self> {
         let trimmed = raw.trim();
         (!trimmed.is_empty()).then(|| Self(trimmed.to_string()))
+    }
+
+    /// An address token for `address`, valid until `expires_at_ms`, the same
+    /// string the sidecar issues for it.
+    pub fn issue(&self, address: &str, expires_at_ms: i64) -> String {
+        let key = serde_json::Value::from(address_key(address)).to_string();
+        let claims = format!(r#"{{"a":{key},"e":{expires_at_ms}}}"#);
+        let payload = URL_SAFE_NO_PAD.encode(claims);
+        let sig = self.sign(&payload);
+        format!("{payload}.{sig}")
     }
 
     fn sign(&self, payload: &str) -> String {
@@ -124,6 +137,17 @@ pub fn authorize(
     }
 }
 
+/// A token for `address` from the check's secret, valid for
+/// [`ISSUED_TOKEN_TTL_MS`]; `None` while the check is off.
+pub fn issue_address_token(state: &AppState, address: &str) -> Option<String> {
+    match &state.address_auth {
+        AddressAuth::Off => None,
+        AddressAuth::Required(secret) => {
+            Some(secret.issue(address, bp_common::now_ms() + ISSUED_TOKEN_TTL_MS))
+        }
+    }
+}
+
 /// [`authorize`] when the check is on, for a handler whose address comes in
 /// the request body.
 pub fn require_address_token(
@@ -175,6 +199,25 @@ mod tests {
 
     fn passes(value: &str, target: &str) -> bool {
         authorize(&secret(), &headers(value), target, NOW).is_ok()
+    }
+
+    #[test]
+    fn an_issued_token_is_the_sidecars_string() {
+        assert_eq!(secret().issue(ADDRESS, 4_102_444_800_000), VALID);
+        assert_eq!(
+            secret().issue("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2", 4_102_444_800_000),
+            VALID_BASE58
+        );
+        assert_eq!(secret().issue(ADDRESS, 1000), EXPIRED);
+    }
+
+    #[test]
+    fn an_issued_token_passes_for_its_address_until_it_expires() {
+        let token = secret().issue("BC1QTOKENVECTORADDRESS.rig", NOW + 1);
+        assert!(passes(&format!("Bearer {token}"), ADDRESS));
+        assert!(!passes(&format!("Bearer {token}"), "bc1qsomeoneelse"));
+        let stale = secret().issue(ADDRESS, NOW - 1);
+        assert!(!passes(&format!("Bearer {stale}"), ADDRESS));
     }
 
     #[test]

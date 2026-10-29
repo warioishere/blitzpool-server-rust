@@ -16,7 +16,8 @@ pub mod time_range;
 pub mod utils;
 
 pub use email_hooks::{
-    BindingChangeContext, EmailVerificationHooks, NoopVerificationHooks, VerificationContext,
+    AddressAccessContext, BindingChangeContext, EmailVerificationHooks, NoopVerificationHooks,
+    VerificationContext,
 };
 pub use error::ApiError;
 pub use mode::ModeCacheNotifier;
@@ -33,6 +34,7 @@ pub fn build_router(state: SharedState) -> Router {
         .merge(controllers::info::routes())
         .merge(controllers::pplns::routes())
         .merge(controllers::groups::routes(state.clone()))
+        .merge(controllers::address_access::routes())
         .merge(controllers::address_ownership::routes())
         .merge(controllers::custom_extranonce::routes())
         .merge(controllers::blockparty::routes())

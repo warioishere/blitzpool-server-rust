@@ -2,8 +2,9 @@
 
 //! `/api/address/ownership/*` — prove control of a BTC address by signing a
 //! server-issued challenge. An alternative to a verified email for group
-//! eligibility. BIP-322 and BIP-137 recoverable signatures are both tried, so
-//! the wallet's format does not matter.
+//! eligibility, and while the address-token check is on it also answers with
+//! the address's token. BIP-322 and BIP-137 recoverable signatures are both
+//! tried, so the wallet's format does not matter.
 
 use std::str::FromStr;
 
@@ -25,7 +26,7 @@ use bp_common::AddressId;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
-use crate::middleware::rate_limit;
+use crate::middleware::{issue_address_token, rate_limit};
 use crate::state::SharedState;
 
 const CHALLENGE_TTL_MINUTES: i64 = 15;
@@ -105,6 +106,10 @@ struct VerifyResponse {
     method: String,
     script_type: String,
     verified_at: i64,
+    /// The address's token: the signature proves control of it. Only while
+    /// the address-token check is on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address_token: Option<String>,
 }
 
 async fn verify(
@@ -145,6 +150,7 @@ async fn verify(
     // Consume the challenge.
     bp_db::delete_ownership_challenge(&state.pool, &address).await?;
     Ok(Json(VerifyResponse {
+        address_token: issue_address_token(&state, saved.address.as_str()),
         address: saved.address.as_str().to_string(),
         method: saved.method,
         script_type: saved.script_type,

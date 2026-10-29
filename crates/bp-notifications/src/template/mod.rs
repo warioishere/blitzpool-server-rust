@@ -3,6 +3,7 @@
 //! Email-template rendering: pure functions producing [`EmailContent`].
 //! The recipient is not part of any context; the SMTP adapter supplies `to:`.
 
+mod address_access;
 mod binding_change;
 mod content;
 mod helpers;
@@ -10,6 +11,7 @@ mod join_decision;
 mod join_request_admin;
 mod verification;
 
+pub use address_access::{render_address_access, AddressAccessContext};
 pub use binding_change::{render_binding_change, BindingChangeContext};
 pub use content::EmailContent;
 pub use join_decision::{render_join_decision, JoinDecision, JoinDecisionContext};

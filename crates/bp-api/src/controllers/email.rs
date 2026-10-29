@@ -208,7 +208,7 @@ async fn by_address(
 
 // ─── helpers ────────────────────────────────────────────────────
 
-fn email_error(code: &'static str, status: StatusCode) -> ApiError {
+pub(crate) fn email_error(code: &'static str, status: StatusCode) -> ApiError {
     // Reuse the GroupService error variant as a generic "wire-coded"
     // ApiError carrier. Status + code travel through to the JSON
     // envelope intact.

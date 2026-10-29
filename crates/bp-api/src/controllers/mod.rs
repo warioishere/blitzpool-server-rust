@@ -4,6 +4,7 @@
 //! return an axum `Router<SharedState>` so `crate::lib` can
 //! merge them into the public root router.
 
+pub(crate) mod address_access;
 pub(crate) mod address_ownership;
 pub(crate) mod blockparty;
 pub(crate) mod client;

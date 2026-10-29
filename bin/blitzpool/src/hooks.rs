@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Production impls of the Noop-by-default hook traits of bp-api and the
-//! group-mgmt engine: verification and join-decision emails, and
+//! group-mgmt engine: verification, address-access and join-decision emails, and
 //! the Group-Solo last-active lookup plus kick / dissolve Redis cleanup.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bp_api::email_hooks::{
+    AddressAccessContext as ApiAddressAccessContext,
     BindingChangeContext as ApiBindingChangeContext, EmailVerificationHooks,
     VerificationContext as ApiVerificationContext,
 };
@@ -24,7 +25,8 @@ use bp_notifications::adapter::{
     SmtpConfig as NotifSmtpConfig, VapidConfig, WebPushAdapter,
 };
 use bp_notifications::template::{
-    render_binding_change, render_join_decision, render_verification,
+    render_address_access, render_binding_change, render_join_decision, render_verification,
+    AddressAccessContext as TplAddressAccessContext,
     BindingChangeContext as TplBindingChangeContext, JoinDecision as TplJoinDecision,
     JoinDecisionContext as TplJoinDecisionContext, VerificationContext as TplVerificationContext,
 };
@@ -210,6 +212,26 @@ impl EmailVerificationHooks for SmtpEmailVerificationHooks {
                 to = %ctx.to_email,
                 address = %ctx.address,
                 "smtp: send_binding_change failed (best-effort)"
+            );
+        }
+    }
+
+    async fn send_address_access(&self, ctx: ApiAddressAccessContext) {
+        let Some(smtp) = self.smtp.as_ref() else {
+            return;
+        };
+        let tpl_ctx = TplAddressAccessContext {
+            address: ctx.address.clone(),
+            access_url: ctx.access_url.clone(),
+            expires_at: epoch_ms_to_utc(ctx.expires_at_ms),
+        };
+        let content = render_address_access(&tpl_ctx);
+        if let Err(err) = smtp.send_email(&ctx.to_email, &content).await {
+            warn!(
+                %err,
+                to = %ctx.to_email,
+                address = %ctx.address,
+                "smtp: send_address_access failed (best-effort)"
             );
         }
     }

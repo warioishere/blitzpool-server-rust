@@ -8,5 +8,7 @@ pub mod address_auth;
 pub mod admin_auth;
 pub mod rate_limit;
 
-pub use address_auth::{require_address, require_address_token, AddressAuth, AddressTokenSecret};
+pub use address_auth::{
+    issue_address_token, require_address, require_address_token, AddressAuth, AddressTokenSecret,
+};
 pub use admin_auth::{require_admin, AdminAuth};
