@@ -226,7 +226,7 @@ async fn mode(
     Path(address): Path<String>,
 ) -> Result<JsonBytes, ApiError> {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
-    let key = format!("PPLNS_MODE_{}", addr.as_str());
+    let key = crate::mode::mode_cache_key(&addr);
     let s = state.clone();
     let bytes = state
         .cache

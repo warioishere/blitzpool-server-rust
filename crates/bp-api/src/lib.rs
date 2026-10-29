@@ -19,6 +19,7 @@ pub use email_hooks::{
     BindingChangeContext, EmailVerificationHooks, NoopVerificationHooks, VerificationContext,
 };
 pub use error::ApiError;
+pub use mode::ModeCacheNotifier;
 pub use state::{AppState, SharedState};
 
 use axum::Router;

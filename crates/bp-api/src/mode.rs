@@ -5,12 +5,52 @@
 //! goes first (a group one only while the group resolves); the state fallback
 //! lags by hours after a port switch, since window shares outlive it.
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use bp_common::{AddressId, MiningMode};
+use bp_group_mgmt_engine::MembershipChangeNotifier;
 use bp_mining_mode::MiningModeResult;
 use redis::AsyncCommands;
 
 use crate::error::ApiError;
+use crate::response_cache::ResponseCache;
 use crate::state::AppState;
+
+const MODE_CACHE_PREFIX: &str = "PPLNS_MODE_";
+
+/// Response-cache key of `/api/pplns/mode/:address`.
+pub(crate) fn mode_cache_key(address: &AddressId) -> String {
+    format!("{MODE_CACHE_PREFIX}{}", address.as_str())
+}
+
+/// Drop every cached `/api/pplns/mode` answer. All of them, because a
+/// dissolve has deleted the members it moved by the time it reports.
+async fn forget_cached_modes(cache: &ResponseCache) {
+    cache.invalidate_prefix(MODE_CACHE_PREFIX).await;
+}
+
+/// Hooked into the Team and Blockparty services, which report every change
+/// that moves an address between modes: drops the cached modes, then passes
+/// the change on to `next`.
+pub struct ModeCacheNotifier {
+    cache: ResponseCache,
+    next: Arc<dyn MembershipChangeNotifier>,
+}
+
+impl ModeCacheNotifier {
+    pub fn new(cache: ResponseCache, next: Arc<dyn MembershipChangeNotifier>) -> Self {
+        Self { cache, next }
+    }
+}
+
+#[async_trait]
+impl MembershipChangeNotifier for ModeCacheNotifier {
+    async fn membership_changed(&self, kind: &str) {
+        forget_cached_modes(&self.cache).await;
+        self.next.membership_changed(kind).await;
+    }
+}
 
 pub(crate) async fn resolve_address_mode(
     s: &AppState,

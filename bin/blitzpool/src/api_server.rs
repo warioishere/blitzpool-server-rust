@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bp_api::middleware::{AddressAuth, AddressTokenSecret};
-use bp_api::{build_router, response_cache::ResponseCache, AppState};
+use bp_api::{build_router, response_cache::ResponseCache, AppState, ModeCacheNotifier};
 use bp_config::{AddressAuthConfig, AppConfig};
 use bp_group_mgmt_engine::{InvitationService, JoinRequestService, JoinRequestServiceConfig};
 use thiserror::Error;
@@ -48,6 +48,8 @@ pub(crate) async fn spawn(
     membership: &Membership,
 ) -> Result<ApiServerHandle, ApiServerError> {
     let address_auth = address_auth(&cfg.api.address_auth)?;
+    let cache = ResponseCache::new(cfg.api.cache.clone());
+    wire_change_notifier(foundation, membership, &cache);
     let state = build_app_state(
         cfg,
         foundation,
@@ -55,6 +57,7 @@ pub(crate) async fn spawn(
         production_hooks,
         membership,
         address_auth,
+        cache,
     );
     let router = build_router(state);
 
@@ -84,6 +87,7 @@ fn build_app_state(
     production_hooks: &ProductionHooks,
     membership: &Membership,
     address_auth: AddressAuth,
+    cache: ResponseCache,
 ) -> Arc<AppState> {
     let pool = foundation.db.pool().clone();
     let group_service = membership.group.service.clone();
@@ -133,10 +137,31 @@ fn build_app_state(
         network: crate::boot::bitcoin_network(cfg.network),
         pool_identifier: cfg.pool_identifier.clone(),
         solo_fee: crate::payout_resolver::solo_fee_config(cfg),
-        cache: ResponseCache::new(cfg.api.cache.clone()),
+        cache,
         address_auth,
     };
     Arc::new(state)
+}
+
+/// The api writes memberships: each Team or Blockparty change drops the
+/// cached modes it may have made wrong and goes onto `cache:invalidate`, from
+/// which the front rebuilds its routing without a restart.
+fn wire_change_notifier(
+    foundation: &FoundationHandles,
+    membership: &Membership,
+    cache: &ResponseCache,
+) {
+    let stream = Arc::new(crate::cache_sync::StreamCacheNotifier::new(
+        foundation.redis.clone(),
+    ));
+    let notifier = Arc::new(ModeCacheNotifier::new(cache.clone(), stream));
+    membership
+        .group
+        .service
+        .set_change_notifier(notifier.clone());
+    if let Some(blockparty) = membership.blockparty_service() {
+        blockparty.set_change_notifier(notifier);
+    }
 }
 
 /// `[api.address_auth] enabled = true` turns the address-token check on, and

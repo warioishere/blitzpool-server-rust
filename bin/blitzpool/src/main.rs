@@ -469,28 +469,16 @@ async fn main() -> ExitCode {
         None
     };
 
-    // The API writes memberships, so it publishes every group/party change to
-    // `cache:invalidate`; the front rebuilds its routing from it without a
-    // restart.
     let api = match membership.as_ref().filter(|_| is_api) {
-        Some(m) => {
-            let notifier = Arc::new(crate::cache_sync::StreamCacheNotifier::new(
-                handles.redis.clone(),
-            ));
-            m.group.service.set_change_notifier(notifier.clone());
-            if let Some(bp) = m.blockparty.as_ref() {
-                bp.service.set_change_notifier(notifier);
+        Some(m) => match api_server::spawn(&cfg, &handles, &engines, &production_hooks, m).await {
+            Ok(h) => Some(h),
+            Err(err) => {
+                tracing::error!(%err, "api server failed to start");
+                eprintln!("blitzpool: {err}");
+                print_api_error_help(&err);
+                return ExitCode::from(6);
             }
-            match api_server::spawn(&cfg, &handles, &engines, &production_hooks, m).await {
-                Ok(h) => Some(h),
-                Err(err) => {
-                    tracing::error!(%err, "api server failed to start");
-                    eprintln!("blitzpool: {err}");
-                    print_api_error_help(&err);
-                    return ExitCode::from(6);
-                }
-            }
-        }
+        },
         None => None,
     };
     log_api_summary(api.as_ref(), is_api);
