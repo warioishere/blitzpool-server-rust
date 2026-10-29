@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::middleware::admin_auth::{require_admin, AdminAuth};
-use crate::middleware::rate_limit;
+use crate::middleware::{rate_limit, require_address_token};
 use crate::response_cache::{JsonBytes, TtlKind};
 use crate::state::SharedState;
 use crate::utils::{build_member_labels, member_id};
@@ -182,8 +182,10 @@ struct CreateGroupResponse {
 
 async fn create(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(body): Json<CreateGroupBody>,
 ) -> Result<(StatusCode, Json<CreateGroupResponse>), ApiError> {
+    require_address_token(&state, &headers, &body.creator_address)?;
     // A group created here would route its members to a mode this pool
     // does not run.
     if state.group_solo.is_none() {
@@ -562,8 +564,10 @@ struct CreateJoinRequestResponse {
 async fn create_join_request(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<CreateJoinRequestBody>,
 ) -> Result<(StatusCode, Json<CreateJoinRequestResponse>), ApiError> {
+    require_address_token(&state, &headers, &body.address)?;
     let svc = require_join_request_service(&state)?;
     let row = svc
         .create_join_request(id, &body.address, body.message.as_deref())
@@ -2068,7 +2072,7 @@ mod tests {
             creator_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".into(),
             mode: None,
         };
-        let Err(err) = create(State(state), Json(body)).await else {
+        let Err(err) = create(State(state), HeaderMap::new(), Json(body)).await else {
             panic!("a group was created while Group-Solo is disabled");
         };
         assert!(

@@ -7,7 +7,7 @@
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::Json,
     routing::{get, post},
     Router,
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::email_hooks::{BindingChangeContext, VerificationContext};
 use crate::error::ApiError;
-use crate::middleware::rate_limit;
+use crate::middleware::{rate_limit, require_address_token};
 use crate::state::SharedState;
 
 const VERIFICATION_TTL_HOURS: i64 = 24;
@@ -36,7 +36,8 @@ pub(crate) fn routes() -> Router<SharedState> {
 
 // ─── POST /api/email/register ────────────────────────────────────
 
-/// Request: `{address, email}`. Response: `{ok, verificationSent}`.
+/// Request: `{address, email}`, behind the address-token check on `address`.
+/// Response: `{ok, verificationSent}`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RegisterBody {
@@ -53,8 +54,12 @@ struct RegisterResponse {
 
 async fn register(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(body): Json<RegisterBody>,
 ) -> Result<Json<RegisterResponse>, ApiError> {
+    // A verified binding proves the address for Team creation, invitations
+    // and join requests, so only the address's holder may bind an email.
+    require_address_token(&state, &headers, &body.address)?;
     // Canonicalise (lowercase bech32, preserve Base58) so the binding is keyed
     // identically to what every verification gate looks up — otherwise a
     // mixed-case Base58 / upper-case bech32 email binding would never match.

@@ -8,8 +8,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use bp_api::middleware::{AddressAuth, AddressTokenSecret};
 use bp_api::{build_router, response_cache::ResponseCache, AppState};
-use bp_config::AppConfig;
+use bp_config::{AddressAuthConfig, AppConfig};
 use bp_group_mgmt_engine::{InvitationService, JoinRequestService, JoinRequestServiceConfig};
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -29,6 +30,8 @@ pub(crate) enum ApiServerError {
         #[source]
         source: std::io::Error,
     },
+    #[error("[api.address_auth] is enabled but its session_secret is empty")]
+    AddressAuthSecretMissing,
 }
 
 pub(crate) struct ApiServerHandle {
@@ -44,7 +47,15 @@ pub(crate) async fn spawn(
     production_hooks: &ProductionHooks,
     membership: &Membership,
 ) -> Result<ApiServerHandle, ApiServerError> {
-    let state = build_app_state(cfg, foundation, engines, production_hooks, membership);
+    let address_auth = address_auth(&cfg.api.address_auth)?;
+    let state = build_app_state(
+        cfg,
+        foundation,
+        engines,
+        production_hooks,
+        membership,
+        address_auth,
+    );
     let router = build_router(state);
 
     let addr: SocketAddr = ([0, 0, 0, 0], cfg.api.port).into();
@@ -72,6 +83,7 @@ fn build_app_state(
     engines: &EngineHandles,
     production_hooks: &ProductionHooks,
     membership: &Membership,
+    address_auth: AddressAuth,
 ) -> Arc<AppState> {
     let pool = foundation.db.pool().clone();
     let group_service = membership.group.service.clone();
@@ -122,6 +134,59 @@ fn build_app_state(
         pool_identifier: cfg.pool_identifier.clone(),
         solo_fee: crate::payout_resolver::solo_fee_config(cfg),
         cache: ResponseCache::new(cfg.api.cache.clone()),
+        address_auth,
     };
     Arc::new(state)
+}
+
+/// `[api.address_auth] enabled = true` turns the address-token check on, and
+/// then the sidecar's secret is required: without it every such route would
+/// refuse every request, so the api does not start.
+fn address_auth(cfg: &AddressAuthConfig) -> Result<AddressAuth, ApiServerError> {
+    if !cfg.enabled {
+        info!("bp-api: address-token check off");
+        return Ok(AddressAuth::Off);
+    }
+    let secret = AddressTokenSecret::new(&cfg.session_secret)
+        .ok_or(ApiServerError::AddressAuthSecretMissing)?;
+    info!("bp-api: address-token check on");
+    Ok(AddressAuth::Required(secret))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(enabled: bool, session_secret: &str) -> AddressAuthConfig {
+        AddressAuthConfig {
+            enabled,
+            session_secret: session_secret.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_check_is_off_unless_enabled_even_with_a_secret() {
+        assert!(matches!(
+            address_auth(&cfg(false, "s")),
+            Ok(AddressAuth::Off)
+        ));
+        assert!(matches!(
+            address_auth(&cfg(false, "")),
+            Ok(AddressAuth::Off)
+        ));
+    }
+
+    #[test]
+    fn enabled_the_check_needs_the_secret() {
+        assert!(matches!(
+            address_auth(&cfg(true, "s")),
+            Ok(AddressAuth::Required(_))
+        ));
+        for blank in ["", "  \n"] {
+            assert!(matches!(
+                address_auth(&cfg(true, blank)),
+                Err(ApiServerError::AddressAuthSecretMissing)
+            ));
+        }
+    }
 }

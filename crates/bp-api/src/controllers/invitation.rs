@@ -4,6 +4,7 @@
 
 use axum::{
     extract::{Path, State},
+    http::HeaderMap,
     response::Json,
     routing::{get, post},
     Router,
@@ -12,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::middleware::rate_limit;
+use crate::middleware::{rate_limit, require_address_token};
 use crate::state::SharedState;
 
 pub(crate) fn routes() -> Router<SharedState> {
@@ -45,8 +46,10 @@ struct AcceptOpenBody {
 async fn accept_open(
     State(state): State<SharedState>,
     Path(token): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<AcceptOpenBody>,
 ) -> Result<Json<MemberCreatedResponse>, ApiError> {
+    require_address_token(&state, &headers, &body.address)?;
     let svc = require_invitation(&state)?;
     let member = svc
         .accept_open_invite(&token, &body.address)

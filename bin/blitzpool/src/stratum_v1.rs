@@ -457,6 +457,7 @@ mod tests {
             api: ApiConfig {
                 port: 3334,
                 cache: Default::default(),
+                address_auth: Default::default(),
             },
             stratum: StratumConfig {
                 solo_port: 3333,

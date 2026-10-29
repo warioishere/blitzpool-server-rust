@@ -39,6 +39,15 @@ host = "redis"
 [api]
 port = 3334
 
+# Require the UI sidecar's address token on the routes that act for one
+# address (deleting its stats, binding its email, joining or creating a Team
+# or Blockparty). Only for a pool running the blitzpool-ui sidecar.
+# session_secret is the sidecar's SESSION_TOKEN_SECRET; with enabled = true
+# the api does not start without it.
+# [api.address_auth]
+# enabled = false
+# session_secret = ""
+
 # Optional: per-endpoint response-cache TTLs in seconds. Every key has a
 # default; set only the ones you want to change.
 # [api.cache]

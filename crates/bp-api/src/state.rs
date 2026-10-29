@@ -19,6 +19,7 @@ use redis::aio::ConnectionManager as RedisConn;
 use sqlx::PgPool;
 
 use crate::email_hooks::EmailVerificationHooks;
+use crate::middleware::AddressAuth;
 use crate::response_cache::ResponseCache;
 
 /// Inner appstate fields. Wrapped in an `Arc` for cheap cloning into
@@ -75,6 +76,8 @@ pub struct AppState {
     /// `cache.get_or_fetch(...)` to skip DB / RPC work on repeat
     /// reads inside the configured TTL window.
     pub cache: ResponseCache,
+    /// Whether the routes that act for one address require its token.
+    pub address_auth: AddressAuth,
 }
 
 impl AppState {
@@ -104,6 +107,7 @@ impl AppState {
             pool_identifier: String::new(),
             solo_fee: bp_mining_job::SoloFeeConfig::default(),
             cache: ResponseCache::new(bp_config::ApiCacheConfig::default()),
+            address_auth: AddressAuth::Off,
         }
     }
 }

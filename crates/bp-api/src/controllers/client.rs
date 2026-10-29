@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `/api/client/:address/*` reader endpoints.
+//! `/api/client/:address/*` reader endpoints, and the three writes that
+//! reset or delete an address's statistics, behind the address-token check.
 
 use axum::{
     extract::{Path, State},
@@ -22,7 +23,17 @@ use crate::error::ApiError;
 use crate::response_cache::{JsonBytes, TtlKind};
 use crate::state::SharedState;
 
-pub(crate) fn routes() -> Router<SharedState> {
+pub(crate) fn routes(state: SharedState) -> Router<SharedState> {
+    // `route_layer` applies only to the routes registered before it.
+    let address_writes = Router::new()
+        .route("/api/client/{address}/reset", post(reset_address))
+        .route("/api/client/{address}/delete-stats", post(delete_stats))
+        .route("/api/client/{address}/delete-all", post(delete_all))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state,
+            crate::middleware::require_address,
+        ));
+
     Router::new()
         .route("/api/client/{address}", get(by_address))
         .route("/api/client/{address}/worker-shares", get(worker_shares))
@@ -36,14 +47,12 @@ pub(crate) fn routes() -> Router<SharedState> {
             "/api/client/{address}/best-difficulty/today",
             get(best_difficulty_today),
         )
-        .route("/api/client/{address}/reset", post(reset_address))
-        .route("/api/client/{address}/delete-stats", post(delete_stats))
-        .route("/api/client/{address}/delete-all", post(delete_all))
         // The triple-segment routes must come AFTER the specific
         // chart/accepted/workers/rejected paths so axum picks the
         // specific match first.
         .route("/api/client/{address}/{worker}", get(by_worker))
         .route("/api/client/{address}/{worker}/{session}", get(by_session))
+        .merge(address_writes)
 }
 
 // ─── time-range chart endpoints ──────────────────────────────────

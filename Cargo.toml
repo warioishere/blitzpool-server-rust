@@ -140,6 +140,8 @@ bs58 = { version = "0.5", features = ["check"] }
 
 # Hashing + big integer arithmetic (pure math, no Bitcoin-crate dep needed)
 sha2 = { version = "0.10", features = ["asm"] }
+# HMAC-SHA256 over sha2 for the address tokens the UI sidecar issues.
+hmac = "0.12"
 num-bigint = "0.5"
 num-traits = "0.2"
 

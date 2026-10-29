@@ -35,7 +35,7 @@ pub fn build_router(state: SharedState) -> Router {
         .merge(controllers::address_ownership::routes())
         .merge(controllers::custom_extranonce::routes())
         .merge(controllers::blockparty::routes())
-        .merge(controllers::client::routes())
+        .merge(controllers::client::routes(state.clone()))
         .merge(controllers::invitation::routes())
         .merge(controllers::downstream_report::routes())
         .merge(controllers::email::routes())

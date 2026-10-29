@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::middleware::rate_limit;
+use crate::middleware::{rate_limit, require_address_token};
 use crate::state::SharedState;
 use crate::utils::{build_member_labels, member_id};
 use bp_group_mgmt_engine::OpenInviteTtl;
@@ -470,8 +470,10 @@ struct CreateResponse {
 
 async fn create(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(body): Json<CreateBody>,
 ) -> Result<Json<CreateResponse>, ApiError> {
+    require_address_token(&state, &headers, &body.admin_address)?;
     let svc = require_blockparty(&state)?;
     let res = svc
         .create_group(&body.name, &body.admin_address, body.admin_percent_bp)
@@ -718,8 +720,10 @@ struct JoinResponse {
 async fn join_via_link(
     State(state): State<SharedState>,
     Path(token): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<JoinBody>,
 ) -> Result<Json<JoinResponse>, ApiError> {
+    require_address_token(&state, &headers, &body.address)?;
     let svc = require_blockparty(&state)?;
     let (member_token, group_id) = svc.join_via_link(&token, &body.address).await?;
     Ok(Json(JoinResponse {

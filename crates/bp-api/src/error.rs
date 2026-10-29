@@ -2,6 +2,8 @@
 
 //! Uniform JSON error body `{"code", "message"}` for every endpoint. The UI
 //! maps `code` to localised text, so the code strings must stay stable.
+//! [`ApiError::LoginRequired`] alone answers `{"error": "login required"}`,
+//! the body the UI's session sidecar sends and the UI's login prompt keys on.
 
 use axum::{
     http::StatusCode,
@@ -55,6 +57,9 @@ pub enum ApiError {
     Rpc(#[from] bp_bitcoin::RpcError),
     #[error("upstream service unavailable: {0}")]
     Unavailable(&'static str),
+    /// No address token for the address the request acts on.
+    #[error("login required")]
+    LoginRequired,
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -77,6 +82,7 @@ impl ApiError {
             | Self::GroupSoloEngine(_)
             | Self::Internal(_) => "internal-error",
             Self::Rpc(_) | Self::Unavailable(_) => "upstream-unavailable",
+            Self::LoginRequired => "login-required",
         }
     }
 
@@ -96,6 +102,7 @@ impl ApiError {
             | Self::GroupSoloEngine(_)
             | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Rpc(_) | Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::LoginRequired => StatusCode::UNAUTHORIZED,
         }
     }
 }
@@ -131,6 +138,10 @@ struct ErrorBody<'a> {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let Self::LoginRequired = self {
+            let body = serde_json::json!({ "error": "login required" });
+            return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+        }
         let status = self.status();
         let body = ErrorBody {
             code: self.code(),

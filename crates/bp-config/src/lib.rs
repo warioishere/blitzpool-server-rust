@@ -209,6 +209,22 @@ pub struct ApiConfig {
     /// Per-endpoint response-cache TTLs (seconds).
     #[serde(default)]
     pub cache: ApiCacheConfig,
+    #[serde(default)]
+    pub address_auth: AddressAuthConfig,
+}
+
+/// `[api.address_auth]`: whether the routes that act for one address require
+/// that address's token from the UI sidecar.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddressAuthConfig {
+    /// Off by default: the routes take any request.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The sidecar's `SESSION_TOKEN_SECRET`, which it signs the tokens with.
+    /// Required when `enabled`; the api does not start without it.
+    #[serde(default)]
+    pub session_secret: String,
 }
 
 /// Response-cache TTLs for the read-only API surface. Each field is
@@ -959,6 +975,22 @@ mod tests {
         high_diff_target_shares_per_minute = 6
         difficulty_check_interval_ms = 60000
     "#;
+
+    /// The address-token check is off unless `enabled` says otherwise.
+    #[test]
+    fn address_auth_is_off_by_default() {
+        let absent: AppConfig = toml::from_str(MINIMAL_CFG).expect("parse");
+        assert!(!absent.api.address_auth.enabled);
+        let empty: AppConfig = toml::from_str(&format!("{MINIMAL_CFG}\n[api.address_auth]\n"))
+            .expect("parse an empty [api.address_auth]");
+        assert!(!empty.api.address_auth.enabled);
+        let on: AppConfig = toml::from_str(&format!(
+            "{MINIMAL_CFG}\n[api.address_auth]\nenabled = true\nsession_secret = \"s\"\n"
+        ))
+        .expect("parse an enabled [api.address_auth]");
+        assert!(on.api.address_auth.enabled);
+        assert_eq!(on.api.address_auth.session_secret, "s");
+    }
 
     /// Missing or partial `device_status` keys fall back to the defaults.
     #[test]

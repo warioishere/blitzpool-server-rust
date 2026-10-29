@@ -484,7 +484,7 @@ async fn main() -> ExitCode {
             match api_server::spawn(&cfg, &handles, &engines, &production_hooks, m).await {
                 Ok(h) => Some(h),
                 Err(err) => {
-                    tracing::error!(%err, "api server bind failed");
+                    tracing::error!(%err, "api server failed to start");
                     eprintln!("blitzpool: {err}");
                     print_api_error_help(&err);
                     return ExitCode::from(6);
@@ -1302,6 +1302,13 @@ fn print_api_error_help(err: &ApiServerError) {
                  find the conflicting process.",
                 addr.port(),
                 addr.port(),
+            );
+        }
+        ApiServerError::AddressAuthSecretMissing => {
+            eprintln!(
+                "hint: set [api.address_auth] session_secret to the UI \
+                 sidecar's SESSION_TOKEN_SECRET, or set enabled = false to \
+                 keep the address routes open."
             );
         }
     }
