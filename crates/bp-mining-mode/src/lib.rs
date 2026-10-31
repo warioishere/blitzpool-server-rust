@@ -9,3 +9,9 @@ mod result;
 
 pub use debouncer::{MarkDebouncer, DEFAULT_REFRESH_INTERVAL};
 pub use result::MiningModeResult;
+
+/// Redis key of an address's live mode marker: the mode its last accepted
+/// share was mined in, kept for a few minutes.
+pub fn live_mode_marker_key(address: &str) -> String {
+    format!("miner:{address}:mode")
+}

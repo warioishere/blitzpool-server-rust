@@ -28,7 +28,8 @@ pub struct NtfyListenerConfig {
     /// [`crate::adapter::NtfyAdapter`] uses (must match exactly so
     /// outbound + inbound topics align).
     pub topic_prefix: String,
-    /// Backoff (seconds) after a stream interrupt before reconnecting.
+    /// Wait (seconds) before reconnecting after a stream that was connected;
+    /// each refused connect doubles the wait, up to five minutes.
     pub reconnect_backoff_seconds: u64,
 }
 
@@ -63,6 +64,7 @@ pub fn spawn_ntfy_listener(
             }
         };
 
+        let mut backoff = Backoff::new(Duration::from_secs(config.reconnect_backoff_seconds));
         loop {
             if *shutdown_rx.borrow() {
                 break;
@@ -108,9 +110,15 @@ pub fn spawn_ntfy_listener(
                     // backoff; this is an intentional, immediate refresh).
                     info!(target: "bp_notifications::listener::ntfy", "reconnect signal — refreshing topics");
                 }
-                _ = stream_all_chunks(&client, &config, &topics, &handler) => {
-                    warn!(target: "bp_notifications::listener::ntfy", "SSE stream ended, reconnecting");
-                    tokio::time::sleep(Duration::from_secs(config.reconnect_backoff_seconds)).await;
+                connected = stream_all_chunks(&client, &config, &topics, &handler) => {
+                    let wait = backoff.after(connected);
+                    warn!(
+                        target: "bp_notifications::listener::ntfy",
+                        connected,
+                        wait_secs = wait.as_secs(),
+                        "SSE stream ended, reconnecting"
+                    );
+                    tokio::time::sleep(wait).await;
                 }
             }
         }
@@ -158,29 +166,59 @@ fn chunk_topics(topics: &[String], max_path_len: usize) -> Vec<Vec<String>> {
 
 /// Hold one SSE connection per chunk and return as soon as ANY of them ends,
 /// so the caller's loop is the one place that refreshes the topic set.
+/// `true` when the stream that ended had been connected.
 async fn stream_all_chunks(
     client: &Client,
     config: &NtfyListenerConfig,
     topics: &[String],
     handler: &CommandHandler,
-) {
+) -> bool {
     let chunks = chunk_topics(topics, MAX_TOPIC_PATH_LEN);
     let streams: Vec<_> = chunks
         .iter()
         .map(|chunk| Box::pin(stream_until_break(client, config, chunk, handler)))
         .collect();
     if streams.is_empty() {
-        return;
+        return false;
     }
-    let (_, _, _remaining) = futures::future::select_all(streams).await;
+    let (connected, _, _remaining) = futures::future::select_all(streams).await;
+    connected
 }
 
+/// The wait before the next connect: the base after a stream that was
+/// connected, doubling after each one that was refused (an HTTP 429 from a
+/// rate-limited server lifts only when the requests stop), up to
+/// [`MAX_RECONNECT_WAIT`].
+struct Backoff {
+    base: Duration,
+    next: Duration,
+}
+
+const MAX_RECONNECT_WAIT: Duration = Duration::from_secs(300);
+
+impl Backoff {
+    fn new(base: Duration) -> Self {
+        Self { base, next: base }
+    }
+
+    fn after(&mut self, connected: bool) -> Duration {
+        if connected {
+            self.next = self.base;
+            return self.base;
+        }
+        let wait = self.next;
+        self.next = (self.next * 2).min(MAX_RECONNECT_WAIT);
+        wait
+    }
+}
+
+/// `true` when the stream was connected before it ended.
 async fn stream_until_break(
     client: &Client,
     config: &NtfyListenerConfig,
     topics: &[String],
     handler: &CommandHandler,
-) {
+) -> bool {
     let joined = topics.join(",");
     let url = format!("{}/{}/sse", config.server_url.trim_end_matches('/'), joined);
     let mut req = client.get(&url);
@@ -191,11 +229,11 @@ async fn stream_until_break(
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             warn!(target: "bp_notifications::listener::ntfy", code = r.status().as_u16(), "SSE non-2xx");
-            return;
+            return false;
         }
         Err(e) => {
             warn!(target: "bp_notifications::listener::ntfy", error = %e, "SSE request");
-            return;
+            return false;
         }
     };
     let mut stream = response.bytes_stream();
@@ -222,6 +260,7 @@ async fn stream_until_break(
             }
         }
     }
+    true
 }
 
 /// Extract the JSON payload from an SSE `data:` line, or `None` for any other
@@ -278,7 +317,17 @@ struct NtfyEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::{chunk_topics, sse_data_field, MAX_TOPIC_PATH_LEN};
+    use super::{chunk_topics, sse_data_field, Backoff, MAX_TOPIC_PATH_LEN};
+    use std::time::Duration;
+
+    #[test]
+    fn refused_connects_wait_longer_until_one_holds() {
+        let mut b = Backoff::new(Duration::from_secs(10));
+        let waits: Vec<u64> = (0..7).map(|_| b.after(false).as_secs()).collect();
+        assert_eq!(waits, [10, 20, 40, 80, 160, 300, 300]);
+        assert_eq!(b.after(true).as_secs(), 10);
+        assert_eq!(b.after(false).as_secs(), 10);
+    }
 
     /// Only `data:` lines yield a payload, with one optional space stripped.
     #[test]

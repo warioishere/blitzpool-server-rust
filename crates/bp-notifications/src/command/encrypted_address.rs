@@ -23,6 +23,9 @@ pub struct MessageKey(OaepPrivateDecryptingKey);
 pub(super) enum EncryptedAddressError {
     /// This pool has no key to open it.
     NoKey,
+    /// It is shorter or longer than the key's ciphertext: copied in part.
+    /// Carries the length it must have.
+    Incomplete { expected_len: usize },
     /// The key does not open it, or it holds no text.
     Unreadable,
 }
@@ -45,6 +48,11 @@ impl MessageKey {
             .map_err(|e| e.to_string())
     }
 
+    /// Length of a whole encrypted address in base64: the key's size.
+    fn encoded_len(&self) -> usize {
+        self.0.key_size_bytes().div_ceil(3) * 4
+    }
+
     fn decrypt(&self, encoded: &str) -> Option<String> {
         let ciphertext = STANDARD.decode(encoded).ok()?;
         let mut plaintext = vec![0u8; self.0.min_output_size()];
@@ -56,11 +64,11 @@ impl MessageKey {
     }
 }
 
-/// Base64 at least [`MIN_ENCRYPTED_LEN`] long: what an encrypted address
-/// looks like and no plain one does.
+/// Base64 characters, at least [`MIN_ENCRYPTED_LEN`] of them: what an
+/// encrypted address looks like, whole or copied in part, and no plain one
+/// does.
 pub(super) fn looks_encrypted(arg: &str) -> bool {
     arg.len() >= MIN_ENCRYPTED_LEN
-        && arg.len().is_multiple_of(4)
         && arg
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
@@ -73,6 +81,10 @@ pub(super) fn open_encrypted_address(
     arg: &str,
 ) -> Result<String, EncryptedAddressError> {
     let key = key.ok_or(EncryptedAddressError::NoKey)?;
+    let expected_len = key.encoded_len();
+    if arg.len() != expected_len {
+        return Err(EncryptedAddressError::Incomplete { expected_len });
+    }
     let plain = key.decrypt(arg).ok_or(EncryptedAddressError::Unreadable)?;
     let mut tokens = plain.split_whitespace().peekable();
     if tokens.peek().is_some_and(|t| t.starts_with('/')) {
@@ -234,13 +246,21 @@ mod tests {
             open_encrypted_address(Some(&key), &encrypt("   ")),
             Err(EncryptedAddressError::Unreadable)
         );
+        // Copied in part: the ciphertext of a 2048 bit key is 344 characters.
+        let whole = encrypt(ADDRESS);
+        assert_eq!(whole.len(), 344);
+        let part = &whole[..300];
+        assert!(looks_encrypted(part));
+        assert_eq!(
+            open_encrypted_address(Some(&key), part),
+            Err(EncryptedAddressError::Incomplete { expected_len: 344 })
+        );
     }
 
     #[test]
     fn plain_addresses_do_not_look_encrypted() {
         assert!(!looks_encrypted(ADDRESS));
         assert!(!looks_encrypted("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"));
-        assert!(!looks_encrypted(&"a".repeat(101)), "not a multiple of 4");
         assert!(!looks_encrypted(&"a-".repeat(60)));
         assert!(looks_encrypted(&"QUJD".repeat(25)));
     }

@@ -951,6 +951,7 @@ dependencies = [
  "bp-group-solo-engine",
  "bp-http",
  "bp-mining-job",
+ "bp-mining-mode",
  "bp-pplns-engine",
  "bp-test-support",
  "chrono",

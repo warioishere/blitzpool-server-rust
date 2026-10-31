@@ -1140,7 +1140,7 @@ impl CommandHandler {
             return Ok(raw.to_string());
         }
         open_encrypted_address(self.message_key.as_deref(), raw)
-            .map_err(|e| encrypted_address_text(lang, e).to_string())
+            .map_err(|e| encrypted_address_text(lang, e))
     }
 
     /// An address argument as an address of the pool's network.
@@ -1328,8 +1328,20 @@ fn encryption_hint(lang: Language) -> String {
     }
 }
 
-fn encrypted_address_text(lang: Language, error: EncryptedAddressError) -> &'static str {
-    match (lang, error) {
+fn encrypted_address_text(lang: Language, error: EncryptedAddressError) -> String {
+    let text = match (lang, error) {
+        (Language::De, EncryptedAddressError::Incomplete { expected_len }) => {
+            return format!(
+                "Der verschlüsselte Text ist unvollständig angekommen. Kopier ihn ganz, er \
+                 ist {expected_len} Zeichen lang und endet auf =."
+            );
+        }
+        (Language::En, EncryptedAddressError::Incomplete { expected_len }) => {
+            return format!(
+                "The encrypted text arrived incomplete. Copy all of it: it is \
+                 {expected_len} characters long and ends in =."
+            );
+        }
         (Language::De, EncryptedAddressError::NoKey) => {
             "Verschlüsselte Adressen kann dieser Pool gerade nicht lesen. Schick die \
              Adresse bitte unverschlüsselt."
@@ -1346,7 +1358,8 @@ fn encrypted_address_text(lang: Language, error: EncryptedAddressError) -> &'sta
             "The encrypted address cannot be opened. Encrypt it again in the \
              dashboard under “Telegram Bot” and send the whole text."
         }
-    }
+    };
+    text.to_string()
 }
 
 fn no_team_admin_text(lang: Language) -> &'static str {
@@ -1552,8 +1565,12 @@ mod tests {
                 subscribe_usage_text(lang).to_string(),
                 remove_usage_text(lang).to_string(),
                 encryption_hint(lang),
-                encrypted_address_text(lang, EncryptedAddressError::NoKey).to_string(),
-                encrypted_address_text(lang, EncryptedAddressError::Unreadable).to_string(),
+                encrypted_address_text(lang, EncryptedAddressError::NoKey),
+                encrypted_address_text(lang, EncryptedAddressError::Unreadable),
+                encrypted_address_text(
+                    lang,
+                    EncryptedAddressError::Incomplete { expected_len: 684 },
+                ),
                 no_default_text(lang).to_string(),
                 db_error_text(lang).to_string(),
                 subscribe_ok_text(lang, &address),

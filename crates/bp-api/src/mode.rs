@@ -65,7 +65,7 @@ pub(crate) async fn resolve_address_mode(
 async fn read_live_marker(s: &AppState, address: &AddressId) -> Option<MiningMode> {
     let mut redis = s.redis.clone()?;
     let raw: Option<String> = redis
-        .get(format!("miner:{}:mode", address.as_str()))
+        .get(bp_mining_mode::live_mode_marker_key(address.as_str()))
         .await
         .ok()?;
     raw?.parse().ok()

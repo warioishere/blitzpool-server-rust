@@ -30,7 +30,7 @@ impl LiveModeMarkerSink {
     }
 
     fn marker_key(address: &str) -> String {
-        format!("miner:{address}:mode")
+        bp_mining_mode::live_mode_marker_key(address)
     }
 }
 
@@ -116,7 +116,7 @@ mod tests {
         let sink = LiveModeMarkerSink::new(redis.clone(), Arc::new(MarkDebouncer::new()));
 
         let _: () = redis::cmd("DEL")
-            .arg(format!("miner:{address}:mode"))
+            .arg(bp_mining_mode::live_mode_marker_key(address))
             .query_async(&mut redis)
             .await
             .unwrap_or(());
@@ -125,13 +125,13 @@ mod tests {
             .await;
 
         let raw: Option<String> = redis
-            .get(format!("miner:{address}:mode"))
+            .get(bp_mining_mode::live_mode_marker_key(address))
             .await
             .expect("redis get");
         assert_eq!(raw.as_deref(), Some("pplns"));
 
         let ttl: i64 = redis::cmd("TTL")
-            .arg(format!("miner:{address}:mode"))
+            .arg(bp_mining_mode::live_mode_marker_key(address))
             .query_async(&mut redis)
             .await
             .expect("redis ttl");
@@ -141,7 +141,7 @@ mod tests {
         );
 
         let _: () = redis::cmd("DEL")
-            .arg(format!("miner:{address}:mode"))
+            .arg(bp_mining_mode::live_mode_marker_key(address))
             .query_async(&mut redis)
             .await
             .unwrap_or(());
@@ -158,7 +158,7 @@ mod tests {
         let sink = LiveModeMarkerSink::new(redis.clone(), Arc::new(MarkDebouncer::new()));
 
         let _: () = redis::cmd("DEL")
-            .arg(format!("miner:{address}:mode"))
+            .arg(bp_mining_mode::live_mode_marker_key(address))
             .query_async(&mut redis)
             .await
             .unwrap_or(());
@@ -167,7 +167,7 @@ mod tests {
         sink.record_accepted(share(address, "wkr", "sessL02", MiningMode::Pplns))
             .await;
         let v1: Option<String> = redis
-            .get(format!("miner:{address}:mode"))
+            .get(bp_mining_mode::live_mode_marker_key(address))
             .await
             .expect("get v1");
         assert_eq!(v1.as_deref(), Some("pplns"));
@@ -176,7 +176,7 @@ mod tests {
         sink.record_accepted(share(address, "wkr", "sessL02", MiningMode::Pplns))
             .await;
         let v2: Option<String> = redis
-            .get(format!("miner:{address}:mode"))
+            .get(bp_mining_mode::live_mode_marker_key(address))
             .await
             .expect("get v2");
         assert_eq!(v2.as_deref(), Some("pplns"));
@@ -185,13 +185,13 @@ mod tests {
         sink.record_accepted(share(address, "wkr", "sessL02", MiningMode::Solo))
             .await;
         let v3: Option<String> = redis
-            .get(format!("miner:{address}:mode"))
+            .get(bp_mining_mode::live_mode_marker_key(address))
             .await
             .expect("get v3");
         assert_eq!(v3.as_deref(), Some("solo"));
 
         let _: () = redis::cmd("DEL")
-            .arg(format!("miner:{address}:mode"))
+            .arg(bp_mining_mode::live_mode_marker_key(address))
             .query_async(&mut redis)
             .await
             .unwrap_or(());

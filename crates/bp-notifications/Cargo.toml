@@ -22,6 +22,8 @@ bp-pplns-engine = { workspace = true }
 bp-group-solo-engine = { workspace = true }
 # `parse_pool_address`: a subscribed address must be one of the pool's network.
 bp-mining-job = { workspace = true }
+# `live_mode_marker_key`: which mode an address mines in right now.
+bp-mining-mode = { workspace = true }
 bitcoin = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }

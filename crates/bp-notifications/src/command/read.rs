@@ -4,12 +4,13 @@
 //! [`build_group_status`], ...) take optional engine handles and answer
 //! "not configured" when that engine was not wired in at startup.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bp_blockparty::BlockpartyStatus;
 use bp_client_live::{hashrate_for_addresses, pool_hashrate};
-use bp_common::{short_address, AddressId};
+use bp_common::{short_address, AddressId, MiningMode};
 use bp_db::{
     find_address_settings, find_address_settings_for_addresses, find_blockparty_group,
     find_blockparty_member_by_address, find_clients_by_address, find_group,
@@ -169,7 +170,10 @@ fn format_next_adjustment(lang: Language, adj: &NextDifficultyAdjustment) -> Str
         .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap());
     // dd.MM.yyyy HH:mm UTC — seconds dropped for tighter bot output;
     // the UTC suffix makes the timezone unambiguous.
-    let when = dt.format("%d.%m.%Y, %H:%M UTC").to_string();
+    let when = match lang {
+        Language::De => dt.format("%d.%m.%Y, %H:%M UTC").to_string(),
+        Language::En => dt.format("%Y-%m-%d %H:%M UTC").to_string(),
+    };
     let progress = format!("{:.2} %", adj.progress_percent);
     match lang {
         Language::De => [
@@ -256,7 +260,10 @@ pub(crate) async fn build_stats(
             title_for(None, "Stats", &short),
             row("Hashrate", &total_th),
             row("Shares", &shares),
-            row("Letzter Share", &format!("vor {last_seen_seconds} s")),
+            row(
+                "Letzter Share",
+                &format!("vor {}", format_ago(last_seen_seconds)),
+            ),
             row("Beste Difficulty", &best),
         ]
         .join("\n"),
@@ -264,7 +271,10 @@ pub(crate) async fn build_stats(
             title_for(None, "Stats", &short),
             row("Hashrate", &total_th),
             row("Shares", &shares),
-            row("Last share", &format!("{last_seen_seconds} s ago")),
+            row(
+                "Last share",
+                &format!("{} ago", format_ago(last_seen_seconds)),
+            ),
             row("Best difficulty", &best),
         ]
         .join("\n"),
@@ -439,10 +449,24 @@ pub(super) async fn build_pplns_status(
         0.0
     });
 
-    let pplns_addresses: Vec<AddressId> = distribution
+    // Window shares outlive a switch to another mode by hours, so the
+    // hashrate counted for PPLNS is that of the addresses mining on it now.
+    let window_addresses: Vec<AddressId> = distribution
         .iter()
         .filter_map(|d| AddressId::new(d.address.clone()).ok())
+        .chain(std::iter::once(address.clone()))
         .collect();
+    let mining_pplns = mining_pplns_now(redis, &window_addresses).await;
+    let pplns_addresses: Vec<AddressId> = window_addresses
+        .into_iter()
+        .filter(|a| a != address && mining_pplns.contains(a))
+        .chain(mining_pplns.contains(address).then(|| address.clone()))
+        .collect();
+    let my_hashrate = if mining_pplns.contains(address) {
+        my_hashrate
+    } else {
+        0.0
+    };
     let total_pplns_hashrate = if pplns_addresses.is_empty() {
         0.0
     } else {
@@ -479,8 +503,46 @@ pub(super) async fn build_pplns_status(
         }
         (_, std::cmp::Ordering::Equal) => "",
     };
+    // An address takes part in PPLNS while it has shares in the window, the
+    // same test the API's mode resolution falls back on. Without any, its
+    // hashrate is mined elsewhere and only a balance or past payouts are
+    // PPLNS facts about it.
+    if my_shares <= 0.0 {
+        let head = match lang {
+            Language::De => format!("{} ist nicht im PPLNS-Window.", addr(&trimmed)),
+            Language::En => format!("{} has no shares in the PPLNS window.", addr(&trimmed)),
+        };
+        if balance == 0 && total_paid == 0 {
+            return head;
+        }
+        return match lang {
+            Language::De => [
+                head,
+                format!("{}{ledger_note}", row("Saldo", &sats(balance))),
+                row("Insgesamt ausbezahlt", &sats(total_paid)),
+            ]
+            .join("\n"),
+            Language::En => [
+                head,
+                format!("{}{ledger_note}", row("Balance", &sats(balance))),
+                row("Paid in total", &sats(total_paid)),
+            ]
+            .join("\n"),
+        };
+    }
     let my_h = format_hashrate_th(my_hashrate);
     let pool_h = format_hashrate_th(total_pplns_hashrate);
+    let elsewhere = match (lang, mining_pplns.contains(address)) {
+        (_, true) => None,
+        (Language::De, false) => Some(
+            "Die Adresse mint gerade nicht im PPLNS, ihre Shares im Window zählen weiter."
+                .to_string(),
+        ),
+        (Language::En, false) => Some(
+            "The address is not mining in PPLNS right now; its shares in the window still count."
+                .to_string(),
+        ),
+    };
     let my_sh = format_number_suffix(my_shares);
     let total_sh = format_number_suffix(total_shares);
     let pct = format!("{percent:.2} %");
@@ -490,7 +552,7 @@ pub(super) async fn build_pplns_status(
         Language::De => [
             title_for(None, "PPLNS", &trimmed),
             row("Window-Anteil", &pct),
-            row("Deine Hashrate", &my_h),
+            row("PPLNS-Hashrate der Adresse", &my_h),
             row("PPLNS-Hashrate gesamt", &pool_h),
             row("Deine Shares", &my_sh),
             row("Shares im Window", &total_sh),
@@ -498,11 +560,14 @@ pub(super) async fn build_pplns_status(
             format!("{}{ledger_note}", row("Saldo", &sats(balance))),
             row("Insgesamt ausbezahlt", &sats(total_paid)),
         ]
+        .into_iter()
+        .chain(elsewhere.clone().map(|e| format!("\n{}", esc(&e))))
+        .collect::<Vec<_>>()
         .join("\n"),
         Language::En => [
             title_for(None, "PPLNS", &trimmed),
             row("Window share", &pct),
-            row("Your hashrate", &my_h),
+            row("Address PPLNS hashrate", &my_h),
             row("PPLNS hashrate total", &pool_h),
             row("Your shares", &my_sh),
             row("Shares in the window", &total_sh),
@@ -510,8 +575,56 @@ pub(super) async fn build_pplns_status(
             format!("{}{ledger_note}", row("Balance", &sats(balance))),
             row("Paid in total", &sats(total_paid)),
         ]
+        .into_iter()
+        .chain(elsewhere.map(|e| format!("\n{}", esc(&e))))
+        .collect::<Vec<_>>()
         .join("\n"),
     }
+}
+
+/// The addresses whose live mode marker says PPLNS: the mode their last
+/// accepted share was mined in, as the API's mode resolution reads it. A
+/// Redis error reads as none.
+async fn mining_pplns_now(
+    redis: Option<&ConnectionManager>,
+    addresses: &[AddressId],
+) -> HashSet<AddressId> {
+    let Some(redis) = redis else {
+        return HashSet::new();
+    };
+    if addresses.is_empty() {
+        return HashSet::new();
+    }
+    let keys: Vec<String> = addresses
+        .iter()
+        .map(|a| bp_mining_mode::live_mode_marker_key(a.as_str()))
+        .collect();
+    let mut conn = redis.clone();
+    let markers: Vec<Option<String>> = match redis::cmd("MGET")
+        .arg(&keys)
+        .query_async(&mut conn)
+        .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(target: "bp_notifications::command::read", error = %e, "pplns_status: mode markers");
+            return HashSet::new();
+        }
+    };
+    marked_pplns(addresses, &markers)
+}
+
+/// The addresses whose marker (same order) names PPLNS; a missing or unknown
+/// marker is not PPLNS.
+fn marked_pplns(addresses: &[AddressId], markers: &[Option<String>]) -> HashSet<AddressId> {
+    addresses
+        .iter()
+        .zip(markers)
+        .filter(|(_, m)| {
+            m.as_deref().and_then(|m| m.parse::<MiningMode>().ok()) == Some(MiningMode::Pplns)
+        })
+        .map(|(a, _)| a.clone())
+        .collect()
 }
 
 // ── /pplns_top ───────────────────────────────────────────────────────
@@ -1001,6 +1114,16 @@ pub(crate) async fn build_show_workers(
     blocks.join("\n\n")
 }
 
+/// A past span in its largest whole unit: `42 s`, `5 min`, `3 h`, `2 d`.
+fn format_ago(seconds: i64) -> String {
+    match seconds {
+        s if s < 60 => format!("{s} s"),
+        s if s < 3600 => format!("{} min", s / 60),
+        s if s < 86_400 => format!("{} h", s / 3600),
+        s => format!("{} d", s / 86_400),
+    }
+}
+
 fn no_workers_text(lang: Language, address: &AddressId) -> String {
     let short = addr(&short_address(address.as_str()));
     match lang {
@@ -1081,6 +1204,31 @@ mod tests {
         let out = plain(&format_next_adjustment(Language::En, &adj));
         assert!(out.contains("Progress: 12.00 %"), "{out}");
         assert!(out.contains("Expected change: -2.00 %"), "{out}");
+    }
+
+    #[test]
+    fn only_a_pplns_marker_counts_as_mining_pplns() {
+        let a = |s: &str| AddressId::new(s).unwrap();
+        let addresses = [a("bc1qpplns"), a("bc1qsolo"), a("bc1qnone"), a("bc1qjunk")];
+        let markers = [
+            Some(MiningMode::Pplns.as_str().to_string()),
+            Some(MiningMode::Solo.as_str().to_string()),
+            None,
+            Some("garbage".to_string()),
+        ];
+        assert_eq!(
+            marked_pplns(&addresses, &markers),
+            HashSet::from([a("bc1qpplns")])
+        );
+    }
+
+    #[test]
+    fn format_ago_uses_the_largest_whole_unit() {
+        assert_eq!(format_ago(0), "0 s");
+        assert_eq!(format_ago(59), "59 s");
+        assert_eq!(format_ago(60), "1 min");
+        assert_eq!(format_ago(7200), "2 h");
+        assert_eq!(format_ago(200_000), "2 d");
     }
 
     #[test]
