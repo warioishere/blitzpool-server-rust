@@ -12,7 +12,7 @@ use bp_notifications::adapter::{
     AdapterError, NtfyAdapter, NtfyConfig as AdapterNtfyConfig, TelegramAdapter,
     TelegramConfig as AdapterTelegramConfig,
 };
-use bp_notifications::command::{register_command_menu, ChatLanguages, CommandHandler};
+use bp_notifications::command::{register_command_menu, ChatLanguages, CommandHandler, MessageKey};
 use bp_notifications::listener::{
     spawn_ntfy_listener, spawn_telegram_listener, NtfyListenerConfig, TelegramListenerConfig,
 };
@@ -134,6 +134,7 @@ pub(crate) fn spawn(
         )
         .with_redis(Some(foundation.redis.clone()))
         .with_pool_base_url(cfg.pool_base_url.clone())
+        .with_message_key(load_message_key())
         .with_engines(
             engines.pplns.clone().map(Arc::new),
             engines.group_solo.clone().map(Arc::new),
@@ -195,6 +196,35 @@ pub(crate) fn spawn(
             chat_languages,
         }),
     })
+}
+
+/// Where the private key for encrypted addresses lives in the container, next
+/// to the other keys mounted at `/app/keys`.
+const MESSAGE_KEY_PATH: &str = "/app/keys/private.pem";
+
+/// The key that opens addresses sent encrypted; without it the bot refuses
+/// them and says so.
+fn load_message_key() -> Option<MessageKey> {
+    let pem = match std::fs::read(MESSAGE_KEY_PATH) {
+        Ok(pem) => pem,
+        Err(e) => {
+            info!(path = MESSAGE_KEY_PATH, error = %e, "listeners: no message key, encrypted addresses refused");
+            return None;
+        }
+    };
+    match MessageKey::from_pem(&pem) {
+        Ok(key) => {
+            info!(
+                path = MESSAGE_KEY_PATH,
+                "listeners: message key loaded, encrypted addresses accepted"
+            );
+            Some(key)
+        }
+        Err(e) => {
+            warn!(path = MESSAGE_KEY_PATH, error = %e, "listeners: message key unreadable, encrypted addresses refused");
+            None
+        }
+    }
 }
 
 fn build_telegram_adapter(cfg: &AppConfig) -> Result<Option<Arc<TelegramAdapter>>, AdapterError> {

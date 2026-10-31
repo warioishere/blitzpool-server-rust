@@ -43,6 +43,9 @@ lettre = { workspace = true }
 
 # JWT signing for FCM (RS256) + VAPID (ES256).
 ring = { workspace = true }
+# RSA-OAEP decryption of addresses sent encrypted with the pool's public
+# key; constant-time, unlike the `rsa` crate.
+aws-lc-rs = { workspace = true }
 rustls-pki-types = { workspace = true }
 
 # Base64-url encoding for VAPID `k=` header.

@@ -12,7 +12,7 @@ use serde::Deserialize;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::command::{parse_command, CommandHandler, Transport};
+use crate::command::{parse_command, CommandHandler, PlainMessage, Transport};
 
 #[derive(Debug, Clone)]
 pub struct TelegramListenerConfig {
@@ -137,11 +137,13 @@ async fn process_update(handler: &CommandHandler, update: Update) -> Option<i64>
                     .await;
             }
             // An answer to the bot's own question, not a command.
-            if let (false, Some(question)) = (text.starts_with('/'), &message.reply_to_message) {
-                if handler
-                    .answer_telegram_question(chat_id, question.message_id, &text)
-                    .await
-                {
+            if !text.starts_with('/') {
+                let plain = PlainMessage {
+                    chat_id,
+                    private: message.chat.kind == "private",
+                    reply_to: message.reply_to_message.as_ref().map(|m| m.message_id),
+                };
+                if handler.answer_telegram_question(plain, &text).await {
                     return Some(next_offset);
                 }
             }
@@ -221,6 +223,9 @@ struct User {
 #[derive(Debug, Deserialize)]
 struct Chat {
     id: i64,
+    /// `private`, `group`, `supergroup` or `channel`.
+    #[serde(rename = "type", default)]
+    kind: String,
 }
 
 #[derive(Debug, Deserialize)]

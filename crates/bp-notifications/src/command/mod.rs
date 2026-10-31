@@ -5,13 +5,15 @@
 //! arrived on.
 
 mod chat_language;
+mod encrypted_address;
 mod handler;
 mod menu;
 mod parser;
 pub(crate) mod read;
 
 pub use chat_language::ChatLanguages;
-pub use handler::{CommandHandler, Transport};
+pub use encrypted_address::MessageKey;
+pub use handler::{CommandHandler, PlainMessage, Transport};
 pub(crate) use menu::help_text;
 pub use menu::register_command_menu;
 pub use parser::{

@@ -22,6 +22,9 @@ use tokio::sync::{Mutex, Notify};
 use tracing::warn;
 
 use super::chat_language::ChatLanguages;
+use super::encrypted_address::{
+    looks_encrypted, open_encrypted_address, EncryptedAddressError, MessageKey,
+};
 use super::parser::{
     parse_address_callback, parse_settings_callback, AddressCallback, Command, FlagToggle,
     LanguageSwitch, ReadCommand, SettingsCallback, SettingsField, Switch,
@@ -43,6 +46,23 @@ pub enum Transport {
 /// How long a `/subscribe` question takes an answer.
 const QUESTION_TTL_MS: i64 = 10 * 60 * 1000;
 
+#[derive(Debug, Clone, Copy)]
+struct OpenQuestion {
+    message_id: i64,
+    expires_at_ms: i64,
+}
+
+/// Where a plain Telegram message came from, for telling an answer to the
+/// bot's question from ordinary chat.
+#[derive(Debug, Clone, Copy)]
+pub struct PlainMessage {
+    pub chat_id: i64,
+    /// A one-to-one chat with the bot.
+    pub private: bool,
+    /// The message this one replies to.
+    pub reply_to: Option<i64>,
+}
+
 pub struct CommandHandler {
     pool: PgPool,
     /// Redis handle for the `client:live:*` hashrate reads
@@ -59,8 +79,11 @@ pub struct CommandHandler {
     chat_languages: ChatLanguages,
     /// The UI's base URL, for links into an address's dashboard.
     pool_base_url: Option<String>,
-    /// Open `/subscribe` questions, `(chat_id, message_id)` → expiry in ms.
-    subscribe_questions: Arc<Mutex<HashMap<(i64, i64), i64>>>,
+    /// Opens addresses sent encrypted; `None` refuses them.
+    message_key: Option<Arc<MessageKey>>,
+    /// The open `/subscribe` question of each chat: its message id and
+    /// expiry in ms. A new question replaces the chat's old one.
+    subscribe_questions: Arc<Mutex<HashMap<i64, OpenQuestion>>>,
     /// Signalled when an ntfy `/subscribe` or `/remove` changes the
     /// subscription set, so the SSE listener reconnects with the new
     /// topic list at once. `None` when no ntfy listener is wired.
@@ -88,6 +111,7 @@ impl CommandHandler {
             group_solo_engine: None,
             network,
             pool_base_url: None,
+            message_key: None,
             subscribe_questions: Arc::new(Mutex::new(HashMap::new())),
             ntfy_reconnect: None,
         }
@@ -97,6 +121,12 @@ impl CommandHandler {
     /// dashboard.
     pub fn with_pool_base_url(mut self, pool_base_url: Option<String>) -> Self {
         self.pool_base_url = pool_base_url;
+        self
+    }
+
+    /// Attach the key that opens encrypted addresses.
+    pub fn with_message_key(mut self, key: Option<MessageKey>) -> Self {
+        self.message_key = key.map(Arc::new);
         self
     }
 
@@ -323,8 +353,14 @@ impl CommandHandler {
             Ok(message_id) => {
                 let now = chrono::Utc::now().timestamp_millis();
                 let mut open = self.subscribe_questions.lock().await;
-                open.retain(|_, expires| *expires > now);
-                open.insert((chat_id, message_id), now + QUESTION_TTL_MS);
+                open.retain(|_, q| q.expires_at_ms > now);
+                open.insert(
+                    chat_id,
+                    OpenQuestion {
+                        message_id,
+                        expires_at_ms: now + QUESTION_TTL_MS,
+                    },
+                );
             }
             Err(e) => {
                 warn!(target: "bp_notifications::command", error = %e, "subscribe question: send")
@@ -332,28 +368,35 @@ impl CommandHandler {
         }
     }
 
-    /// A plain message that replies to an open `/subscribe` question is
-    /// its answer: subscribe that address. `false` when the message
-    /// answers no open question.
-    pub async fn answer_telegram_question(
-        &self,
-        chat_id: i64,
-        reply_to_message_id: i64,
-        text: &str,
-    ) -> bool {
+    /// A plain message that answers the chat's open `/subscribe` question
+    /// subscribes the address it carries. In a private chat that is the
+    /// next plain message, a reply or not; in a group only a reply to the
+    /// question, so ordinary chat is not taken for an address. `false` when
+    /// the message answers no open question.
+    pub async fn answer_telegram_question(&self, message: PlainMessage, text: &str) -> bool {
         let now = chrono::Utc::now().timestamp_millis();
-        let open = self
-            .subscribe_questions
-            .lock()
-            .await
-            .remove(&(chat_id, reply_to_message_id));
-        if !matches!(open, Some(expires) if expires > now) {
+        let mut open = self.subscribe_questions.lock().await;
+        let Some(question) = open.get(&message.chat_id).copied() else {
+            return false;
+        };
+        let answers = match message.reply_to {
+            Some(id) => id == question.message_id,
+            None => message.private,
+        };
+        if !answers || question.expires_at_ms <= now {
             return false;
         }
+        open.remove(&message.chat_id);
+        drop(open);
         let address = text.split_whitespace().next().map(str::to_string);
         let command = Command::Subscribe { address };
-        self.dispatch(&Transport::Telegram { chat_id }, &command)
-            .await;
+        self.dispatch(
+            &Transport::Telegram {
+                chat_id: message.chat_id,
+            },
+            &command,
+        )
+        .await;
         true
     }
 
@@ -701,6 +744,9 @@ impl CommandHandler {
                  command."
             }
         });
+        if self.message_key.is_some() {
+            text.push_str(&encryption_hint(lang));
+        }
         if !subscribed.is_empty() {
             text.push_str("\n\n");
             text.push_str(&list_addresses(
@@ -717,8 +763,9 @@ impl CommandHandler {
         lang: Language,
         address_str: &str,
     ) -> String {
-        let Some(address) = self.pool_address(address_str) else {
-            return invalid_address_text(lang).to_string();
+        let address = match self.pool_address(lang, address_str) {
+            Ok(a) => a,
+            Err(reply) => return reply,
         };
         match transport {
             Transport::Telegram { chat_id } => {
@@ -757,8 +804,15 @@ impl CommandHandler {
     ) -> String {
         // Normalized like a stored row but not checked against the network,
         // so a stored row that is no address of it can still be removed.
-        let Ok(address) = AddressId::normalized(address_str) else {
-            return invalid_address_text(lang).to_string();
+        let address = match self.address_arg(lang, address_str) {
+            Ok(raw) => {
+                AddressId::normalized(&raw).map_err(|_| invalid_address_text(lang).to_string())
+            }
+            Err(reply) => Err(reply),
+        };
+        let address = match address {
+            Ok(a) => a,
+            Err(reply) => return reply,
         };
         let affected = match transport {
             Transport::Telegram { chat_id } => {
@@ -979,9 +1033,21 @@ impl CommandHandler {
         result.unwrap_or_else(|reply| reply)
     }
 
-    /// `raw` as an address of the pool's network, or `None`.
-    fn pool_address(&self, raw: &str) -> Option<AddressId> {
-        bp_mining_job::parse_pool_address(self.network, raw)
+    /// An address argument as typed, or opened when it came encrypted.
+    /// `Err` carries the reply that says what is wrong.
+    fn address_arg(&self, lang: Language, raw: &str) -> Result<String, String> {
+        if !looks_encrypted(raw) {
+            return Ok(raw.to_string());
+        }
+        open_encrypted_address(self.message_key.as_deref(), raw)
+            .map_err(|e| encrypted_address_text(lang, e).to_string())
+    }
+
+    /// An address argument as an address of the pool's network.
+    fn pool_address(&self, lang: Language, raw: &str) -> Result<AddressId, String> {
+        let raw = self.address_arg(lang, raw)?;
+        bp_mining_job::parse_pool_address(self.network, &raw)
+            .ok_or_else(|| invalid_address_text(lang).to_string())
     }
 
     /// The address a command acts on: the one it was given, else the
@@ -993,9 +1059,7 @@ impl CommandHandler {
         arg: Option<&str>,
     ) -> Result<AddressId, String> {
         if let Some(raw) = arg {
-            return self
-                .pool_address(raw)
-                .ok_or_else(|| invalid_address_text(lang).to_string());
+            return self.pool_address(lang, raw);
         }
         let chat_id = match transport {
             Transport::Ntfy { address } => return Ok(address.clone()),
@@ -1141,6 +1205,45 @@ fn remove_usage_text(lang: Language) -> &'static str {
     match lang {
         Language::De => "Schick /remove mit der Adresse, z.B. /remove bc1q...",
         Language::En => "Send /remove with the address, e.g. /remove bc1q...",
+    }
+}
+
+/// Where to encrypt an address for the bot.
+const ENCRYPTOR_URL: &str = "https://github.com/warioishere/blitzpool-message-encryptor-for-TG";
+
+fn encryption_hint(lang: Language) -> String {
+    match lang {
+        Language::De => format!(
+            "\n\nDeine Adresse soll nicht im Klartext im Chat stehen? Verschlüssel sie im \
+             Dashboard unter „Telegram Bot“ oder mit dem Tool {ENCRYPTOR_URL} und schick den \
+             Text statt der Adresse, z.B. nach /subscribe."
+        ),
+        Language::En => format!(
+            "\n\nRather not have your address in the chat in plain text? Encrypt it in the \
+             dashboard under \"Telegram Bot\" or with the tool {ENCRYPTOR_URL} and send the \
+             text in place of the address, e.g. after /subscribe."
+        ),
+    }
+}
+
+fn encrypted_address_text(lang: Language, error: EncryptedAddressError) -> &'static str {
+    match (lang, error) {
+        (Language::De, EncryptedAddressError::NoKey) => {
+            "Verschlüsselte Adressen kann dieser Pool gerade nicht lesen. Schick die \
+             Adresse bitte unverschlüsselt."
+        }
+        (Language::De, EncryptedAddressError::Unreadable) => {
+            "Die verschlüsselte Adresse lässt sich nicht öffnen. Verschlüssel sie neu \
+             im Dashboard unter „Telegram Bot“ und schick den ganzen Text."
+        }
+        (Language::En, EncryptedAddressError::NoKey) => {
+            "This pool cannot read encrypted addresses right now. Please send the \
+             address unencrypted."
+        }
+        (Language::En, EncryptedAddressError::Unreadable) => {
+            "The encrypted address cannot be opened. Encrypt it again in the \
+             dashboard under \"Telegram Bot\" and send the whole text."
+        }
     }
 }
 
@@ -1446,6 +1549,55 @@ mod tests {
         assert_eq!(origin, Err(no_address_text(Language::En).to_string()));
     }
 
+    /// An address sent encrypted is subscribed once the key opens it;
+    /// without the key the bot says it cannot read it. The welcome text
+    /// mentions encryption only when the key is there.
+    #[tokio::test]
+    async fn an_encrypted_address_is_subscribed_with_the_key() {
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let chat_id = -7_700_401;
+        let transport = Transport::Telegram { chat_id };
+        let address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        let (key, encrypt) = super::super::encrypted_address::test_key();
+        let sent = encrypt(address);
+        subscribed_chat(&pool, chat_id, &[]).await;
+
+        let without = CommandHandler::new(pool.clone(), Network::Bitcoin, None, None);
+        assert_eq!(
+            without
+                .handle_subscribe(&transport, Language::En, &sent)
+                .await,
+            encrypted_address_text(Language::En, EncryptedAddressError::NoKey)
+        );
+        assert!(!without
+            .handle_start(&transport, Language::De)
+            .await
+            .contains(ENCRYPTOR_URL));
+
+        let with = CommandHandler::new(pool.clone(), Network::Bitcoin, None, None)
+            .with_message_key(Some(key));
+        let reply = with.handle_subscribe(&transport, Language::En, &sent).await;
+        assert!(
+            reply.contains("bc1q...8f3t4") && !reply.contains(address),
+            "{reply}"
+        );
+        let stored: Vec<String> = find_telegram_subscriptions_by_chat(&pool, chat_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.address.into_inner())
+            .collect();
+        assert_eq!(stored, vec![address.to_string()]);
+        assert!(with
+            .handle_start(&transport, Language::De)
+            .await
+            .contains(ENCRYPTOR_URL));
+
+        subscribed_chat(&pool, chat_id, &[]).await;
+    }
+
     /// A chat without an address is told to subscribe; one with addresses
     /// sees them instead.
     #[tokio::test]
@@ -1469,43 +1621,98 @@ mod tests {
         subscribed_chat(&pool, chat_id, &[]).await;
     }
 
-    /// Only a reply to an open, unexpired question subscribes, and only once.
+    /// A private chat answers with its next plain message; a group only by
+    /// replying to the question. An expired question takes no answer, and an
+    /// answer is taken once.
     #[tokio::test]
     async fn an_answer_to_the_subscribe_question_subscribes() {
         let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
             return;
         };
-        let chat_id = -7_700_201;
+        let (private_chat, group_chat) = (7_700_201, -7_700_202);
         let address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
-        subscribed_chat(&pool, chat_id, &[]).await;
         let handler = CommandHandler::new(pool.clone(), Network::Bitcoin, None, None);
-        let now = chrono::Utc::now().timestamp_millis();
-        {
-            let mut open = handler.subscribe_questions.lock().await;
-            open.insert((chat_id, 10), now + QUESTION_TTL_MS);
-            open.insert((chat_id, 11), now - 1);
-        }
-        let subscribed = || async {
-            find_telegram_subscriptions_by_chat(&pool, chat_id)
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|s| s.address.into_inner())
-                .collect::<Vec<_>>()
+        let subscribed = |chat_id: i64| {
+            let pool = pool.clone();
+            async move {
+                find_telegram_subscriptions_by_chat(&pool, chat_id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|s| s.address.into_inner())
+                    .collect::<Vec<_>>()
+            }
         };
+        let ask = |chat_id: i64, expires_in: i64| {
+            let handler = &handler;
+            async move {
+                let now = chrono::Utc::now().timestamp_millis();
+                handler.subscribe_questions.lock().await.insert(
+                    chat_id,
+                    OpenQuestion {
+                        message_id: 10,
+                        expires_at_ms: now + expires_in,
+                    },
+                );
+            }
+        };
+        let msg = |chat_id: i64, private: bool, reply_to: Option<i64>| PlainMessage {
+            chat_id,
+            private,
+            reply_to,
+        };
+        for chat in [private_chat, group_chat] {
+            subscribed_chat(&pool, chat, &[]).await;
+        }
 
-        assert!(!handler.answer_telegram_question(chat_id, 99, address).await);
-        assert!(!handler.answer_telegram_question(chat_id, 11, address).await);
-        assert!(subscribed().await.is_empty());
+        // Private: no reply needed, a reply to another message is not it.
+        ask(private_chat, QUESTION_TTL_MS).await;
         assert!(
-            handler
-                .answer_telegram_question(chat_id, 10, &format!("{address} thanks"))
+            !handler
+                .answer_telegram_question(msg(private_chat, true, Some(99)), address)
                 .await
         );
-        assert_eq!(subscribed().await, vec![address.to_string()]);
-        assert!(!handler.answer_telegram_question(chat_id, 10, address).await);
+        assert!(
+            handler
+                .answer_telegram_question(msg(private_chat, true, None), &format!("{address} x"))
+                .await
+        );
+        assert_eq!(subscribed(private_chat).await, vec![address.to_string()]);
+        assert!(
+            !handler
+                .answer_telegram_question(msg(private_chat, true, None), address)
+                .await,
+            "taken once"
+        );
 
-        subscribed_chat(&pool, chat_id, &[]).await;
+        // Group: only a reply to the question.
+        ask(group_chat, QUESTION_TTL_MS).await;
+        assert!(
+            !handler
+                .answer_telegram_question(msg(group_chat, false, None), address)
+                .await
+        );
+        assert!(subscribed(group_chat).await.is_empty());
+        assert!(
+            handler
+                .answer_telegram_question(msg(group_chat, false, Some(10)), address)
+                .await
+        );
+        assert_eq!(subscribed(group_chat).await, vec![address.to_string()]);
+
+        // Expired.
+        subscribed_chat(&pool, private_chat, &[]).await;
+        ask(private_chat, -1).await;
+        assert!(
+            !handler
+                .answer_telegram_question(msg(private_chat, true, None), address)
+                .await
+        );
+        assert!(subscribed(private_chat).await.is_empty());
+
+        for chat in [private_chat, group_chat] {
+            subscribed_chat(&pool, chat, &[]).await;
+        }
     }
 
     #[test]

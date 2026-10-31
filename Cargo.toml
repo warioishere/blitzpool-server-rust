@@ -231,6 +231,7 @@ lettre = { version = "0.11", default-features = false, features = [
 # (ES256 with the pool's P-256 key), with ring, the TLS provider already in
 # the tree.
 ring = "0.17"
+aws-lc-rs = "1.19"
 rustls-pki-types = "1"
 
 # Base64 + base64url encoding for VAPID `k=` header + general use.
