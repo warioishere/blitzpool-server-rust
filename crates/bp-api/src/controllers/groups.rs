@@ -16,7 +16,7 @@ use axum::{
 };
 use bp_common::AddressId;
 use bp_db::PatchField;
-use bp_group_mgmt::group::{PayoutMode, RoundResetPreset};
+use bp_group_mgmt::group::RoundResetPreset;
 use bp_group_mgmt_engine::{GroupService, OpenInviteTtl, UpdateRoundResetSettings};
 use bp_group_solo_engine::reader::WindowTimeline;
 use serde::{Deserialize, Serialize};
@@ -668,12 +668,7 @@ struct GroupSummary {
 
 impl From<bp_db::PplnsGroupRow> for GroupSummary {
     fn from(r: bp_db::PplnsGroupRow) -> Self {
-        // Window-mode groups never calendar-reset: their preset is the
-        // sliding-window length, so there is no `nextResetAt` to advertise.
-        let next_reset_at = match PayoutMode::parse_or_default(&r.payout_mode) {
-            PayoutMode::Window => None,
-            PayoutMode::Prop => next_reset_at(&r).map(crate::time_range::format_iso_ms),
-        };
+        let next_reset_at = next_reset_at(&r).map(crate::time_range::format_iso_ms);
         Self {
             id: r.id,
             name: r.name,
@@ -695,19 +690,14 @@ impl From<bp_db::PplnsGroupRow> for GroupSummary {
     }
 }
 
-/// Computed by the reset cron's own
+/// From the schedule a reset cron runs for the group
+/// ([`scheduled_reset`](bp_group_solo_engine::reset::scheduled_reset)) and the
+/// cron's own
 /// [`compute_next_fire`](bp_group_solo_engine::reset::compute_next_fire), so
-/// the advertised instant is the one it fires at.
+/// the advertised instant is the one it fires at; `None` where no cron runs.
 fn next_reset_at(r: &bp_db::PplnsGroupRow) -> Option<i64> {
-    use bp_group_solo_engine::reset::{compute_next_fire, ResetSchedule};
-    let schedule = ResetSchedule::from_row_fields(
-        r.id,
-        r.round_reset_preset.as_deref(),
-        r.round_reset_timezone.as_deref(),
-        r.round_reset_interval_days
-            .and_then(|d| u32::try_from(d).ok()),
-    )
-    .ok()??;
+    use bp_group_solo_engine::reset::{compute_next_fire, scheduled_reset};
+    let schedule = scheduled_reset(r).ok()??;
     Some(compute_next_fire(&schedule, r.last_round_reset_at, chrono::Utc::now()).timestamp_millis())
 }
 
@@ -2002,6 +1992,37 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use uuid::Uuid;
+
+    /// A reset time only where a reset cron runs: an active Prop group with
+    /// a schedule; never a Window group, never a dissolved one.
+    #[test]
+    fn next_reset_at_only_where_a_reset_cron_runs() {
+        let row = |mode: &str, dissolved_at: Option<i64>| bp_db::PplnsGroupRow {
+            id: Uuid::nil(),
+            name: "t".to_string(),
+            creator_address: AddressId::new("bc1qcreator").unwrap(),
+            admin_token_hash: String::new(),
+            active: dissolved_at.is_none(),
+            created_at: 0,
+            updated_at: 0,
+            dissolved_at,
+            round_reset_interval_days: None,
+            round_reset_hour_local: None,
+            round_reset_timezone: Some("Europe/Zurich".to_string()),
+            last_round_reset_at: None,
+            finder_bonus_sats: None,
+            finder_bonus_ppm: None,
+            round_reset_preset: Some("weekly".to_string()),
+            is_public: false,
+            reset_round_on_block: false,
+            max_members: None,
+            payout_mode: mode.to_string(),
+            coinbase_tag: None,
+        };
+        assert!(next_reset_at(&row("prop", None)).is_some());
+        assert_eq!(next_reset_at(&row("window", None)), None);
+        assert_eq!(next_reset_at(&row("prop", Some(1))), None);
+    }
 
     /// Every nullable setting reads absent as untouched, `null` as clear and
     /// a value as set.

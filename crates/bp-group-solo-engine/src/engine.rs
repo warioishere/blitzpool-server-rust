@@ -25,7 +25,9 @@ use crate::distribution::{
     BuiltDistribution, DistributionBuilder, DistributionConfig, DistributionError,
 };
 use crate::history::{apply_distribution, ApplyDistributionResult, AuditRow, LedgerError};
-use crate::reset::{spawn_per_group_task, GroupResetRunner, ResetError, ResetSchedule};
+use crate::reset::{
+    scheduled_reset, spawn_per_group_task, GroupResetRunner, ResetError, ResetSchedule,
+};
 
 use crate::round::{GroupRoundStore, RoundError, WINDOW_BUCKET_MS};
 
@@ -243,27 +245,7 @@ impl GroupSoloEngine {
         if let Some(old) = tasks.remove(&group.id) {
             let _ = old.cancel.send(true);
         }
-        if group.dissolved_at.is_some() || !group.active {
-            info!(group_id = %group.id, "round-reset cron unscheduled (group dissolved/inactive)");
-            return;
-        }
-        // A Window group's reset config is its window length, never a cron.
-        match PayoutMode::parse_or_default(&group.payout_mode) {
-            PayoutMode::Window => {
-                info!(group_id = %group.id, "round-reset cron unscheduled (window payout mode)");
-                return;
-            }
-            PayoutMode::Prop => {}
-        }
-        let interval = group
-            .round_reset_interval_days
-            .and_then(|i| u32::try_from(i).ok());
-        match ResetSchedule::from_row_fields(
-            group.id,
-            group.round_reset_preset.as_deref(),
-            group.round_reset_timezone.as_deref(),
-            interval,
-        ) {
+        match scheduled_reset(group) {
             Ok(Some(schedule)) => {
                 tasks.insert(
                     group.id,
@@ -277,7 +259,8 @@ impl GroupSoloEngine {
                 );
             }
             Ok(None) => {
-                info!(group_id = %group.id, "round-reset cron unscheduled (no preset)");
+                info!(group_id = %group.id,
+                    "round-reset cron unscheduled (dissolved, inactive, window mode or no preset)");
             }
             Err(e) => warn!(
                 group_id = %group.id,

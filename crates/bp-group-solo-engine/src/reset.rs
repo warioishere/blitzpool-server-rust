@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bp_cron_utils::Clock;
-use bp_db::{find_group, update_pplns_group_last_reset_at, DbError};
+use bp_db::{find_group, update_pplns_group_last_reset_at, DbError, PplnsGroupRow};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
 use chrono_tz::Tz;
 use sqlx::PgPool;
@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use bp_group_mgmt::group::RoundResetPreset;
+use bp_group_mgmt::group::{PayoutMode, RoundResetPreset};
 
 use crate::round::{GroupRoundStore, RoundError};
 
@@ -90,6 +90,26 @@ impl ResetSchedule {
             timezone: tz,
             interval_days,
         }))
+    }
+}
+
+/// The calendar schedule a reset cron runs for `group`: only for an active,
+/// not dissolved Prop group (a Window group's preset is its window length).
+/// `Ok(None)` when its preset, timezone or interval make no schedule.
+pub fn scheduled_reset(group: &PplnsGroupRow) -> Result<Option<ResetSchedule>, ResetError> {
+    if group.dissolved_at.is_some() || !group.active {
+        return Ok(None);
+    }
+    match PayoutMode::parse_or_default(&group.payout_mode) {
+        PayoutMode::Window => Ok(None),
+        PayoutMode::Prop => ResetSchedule::from_row_fields(
+            group.id,
+            group.round_reset_preset.as_deref(),
+            group.round_reset_timezone.as_deref(),
+            group
+                .round_reset_interval_days
+                .and_then(|i| u32::try_from(i).ok()),
+        ),
     }
 }
 
