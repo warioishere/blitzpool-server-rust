@@ -41,8 +41,15 @@ use bp_common::short_address;
 /// reply-sink: handler dispatches reply text to the matching adapter.
 #[derive(Debug, Clone)]
 pub enum Transport {
-    Telegram { chat_id: i64 },
-    Ntfy { address: AddressId },
+    /// A Telegram chat, and the forum topic the command came from
+    /// (`None`: the main topic), where the answer goes.
+    Telegram {
+        chat_id: i64,
+        thread_id: Option<i64>,
+    },
+    Ntfy {
+        address: AddressId,
+    },
 }
 
 /// How long a `/subscribe` question takes an answer.
@@ -59,6 +66,8 @@ struct OpenQuestion {
 #[derive(Debug, Clone, Copy)]
 pub struct PlainMessage {
     pub chat_id: i64,
+    /// The forum topic it was sent in; `None` is the main topic.
+    pub thread_id: Option<i64>,
     /// A one-to-one chat with the bot.
     pub private: bool,
     /// The message this one replies to.
@@ -176,7 +185,7 @@ impl CommandHandler {
     /// language for Telegram, `ntfy_subscriptions_entity.language` for ntfy.
     async fn language(&self, transport: &Transport) -> Language {
         match transport {
-            Transport::Telegram { chat_id } => self.chat_languages.get(*chat_id).await,
+            Transport::Telegram { chat_id, .. } => self.chat_languages.get(*chat_id).await,
             Transport::Ntfy { address } => {
                 match find_ntfy_subscription_by_address(&self.pool, address).await {
                     Ok(Some(row)) => Language::parse(&row.language),
@@ -188,8 +197,8 @@ impl CommandHandler {
 
     async fn reply(&self, transport: &Transport, text: &str) -> AdapterResult<()> {
         match transport {
-            Transport::Telegram { chat_id } => match &self.telegram {
-                Some(adapter) => adapter.send_html(*chat_id, text).await,
+            Transport::Telegram { chat_id, thread_id } => match &self.telegram {
+                Some(adapter) => adapter.send_html(*chat_id, *thread_id, text).await,
                 None => Err(AdapterError::Config(
                     "telegram adapter not configured".into(),
                 )),
@@ -208,18 +217,19 @@ impl CommandHandler {
         let lang = self.language(transport).await;
         // Telegram inline-keyboard commands send their own message (with a
         // `reply_markup`) instead of a plain-text reply.
-        if let Transport::Telegram { chat_id } = transport {
+        if let Transport::Telegram { chat_id, thread_id } = transport {
             match command {
                 Command::ShowAddresses | Command::Remove { address: None } => {
-                    self.send_address_keyboard(*chat_id, lang).await;
+                    self.send_address_keyboard(*chat_id, *thread_id, lang).await;
                     return;
                 }
                 Command::Settings(switch) => {
-                    self.send_settings(*chat_id, lang, *switch).await;
+                    self.send_settings(*chat_id, *thread_id, lang, *switch)
+                        .await;
                     return;
                 }
                 Command::Subscribe { address: None } => {
-                    self.ask_for_address(*chat_id, lang).await;
+                    self.ask_for_address(*chat_id, *thread_id, lang).await;
                     return;
                 }
                 _ => {}
@@ -319,7 +329,7 @@ impl CommandHandler {
 
     /// Send the `/show_addresses` keyboard to a Telegram chat (or a
     /// "no addresses" note when the chat has none).
-    async fn send_address_keyboard(&self, chat_id: i64, lang: Language) {
+    async fn send_address_keyboard(&self, chat_id: i64, thread_id: Option<i64>, lang: Language) {
         let Some(adapter) = self.telegram.as_ref() else {
             return;
         };
@@ -327,17 +337,21 @@ impl CommandHandler {
             Ok(v) => v,
             Err(e) => {
                 warn!(target: "bp_notifications::command", error = %e, "show_addresses keyboard: read subs");
-                let _ = adapter.send_html(chat_id, db_error_text(lang)).await;
+                let _ = adapter
+                    .send_html(chat_id, thread_id, db_error_text(lang))
+                    .await;
                 return;
             }
         };
         if subs.is_empty() {
-            let _ = adapter.send_html(chat_id, no_address_text(lang)).await;
+            let _ = adapter
+                .send_html(chat_id, thread_id, no_address_text(lang))
+                .await;
             return;
         }
         let (text, keyboard) = Self::build_address_keyboard(&subs, lang);
         if let Err(e) = adapter
-            .send_message_with_keyboard(chat_id, &text, &keyboard)
+            .send_message_with_keyboard(chat_id, thread_id, &text, &keyboard)
             .await
         {
             warn!(target: "bp_notifications::command", error = %e, "show_addresses keyboard: send");
@@ -346,7 +360,7 @@ impl CommandHandler {
 
     /// Ask which address to subscribe; the answer comes back through
     /// [`Self::answer_telegram_question`].
-    async fn ask_for_address(&self, chat_id: i64, lang: Language) {
+    async fn ask_for_address(&self, chat_id: i64, thread_id: Option<i64>, lang: Language) {
         let Some(adapter) = self.telegram.as_ref() else {
             return;
         };
@@ -356,7 +370,10 @@ impl CommandHandler {
             }
             Language::En => "Which address should I follow? Reply with your mining address.",
         };
-        match adapter.send_question(chat_id, question, "bc1q...").await {
+        match adapter
+            .send_question(chat_id, thread_id, question, "bc1q...")
+            .await
+        {
             Ok(message_id) => {
                 let now = chrono::Utc::now().timestamp_millis();
                 let mut open = self.subscribe_questions.lock().await;
@@ -400,6 +417,7 @@ impl CommandHandler {
         self.dispatch(
             &Transport::Telegram {
                 chat_id: message.chat_id,
+                thread_id: message.thread_id,
             },
             &command,
         )
@@ -449,7 +467,7 @@ impl CommandHandler {
         message_id: i64,
         cb: AddressCallback,
     ) {
-        let lang = self.language(&Transport::Telegram { chat_id }).await;
+        let lang = self.chat_languages.get(chat_id).await;
         let de = matches!(lang, Language::De);
         let id = match cb {
             AddressCallback::SetDefault(id) | AddressCallback::Remove(id) => id,
@@ -594,7 +612,13 @@ impl CommandHandler {
 
     /// Send the `/settings` keyboard (or a "no addresses" note). Opened by a
     /// Team switch it first says so when no address can get that notice.
-    async fn send_settings(&self, chat_id: i64, lang: Language, switch: Option<Switch>) {
+    async fn send_settings(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        lang: Language,
+        switch: Option<Switch>,
+    ) {
         let Some(adapter) = self.telegram.as_ref() else {
             return;
         };
@@ -602,12 +626,16 @@ impl CommandHandler {
             Ok(v) => v,
             Err(e) => {
                 warn!(target: "bp_notifications::command", error = %e, "settings: read subs");
-                let _ = adapter.send_html(chat_id, db_error_text(lang)).await;
+                let _ = adapter
+                    .send_html(chat_id, thread_id, db_error_text(lang))
+                    .await;
                 return;
             }
         };
         if subs.is_empty() {
-            let _ = adapter.send_html(chat_id, no_address_text(lang)).await;
+            let _ = adapter
+                .send_html(chat_id, thread_id, no_address_text(lang))
+                .await;
             return;
         }
         let addresses: Vec<AddressId> = subs.iter().map(|s| s.address.clone()).collect();
@@ -615,17 +643,19 @@ impl CommandHandler {
             Ok(r) => r,
             Err(e) => {
                 warn!(target: "bp_notifications::command", error = %e, "settings: team roles");
-                let _ = adapter.send_html(chat_id, db_error_text(lang)).await;
+                let _ = adapter
+                    .send_html(chat_id, thread_id, db_error_text(lang))
+                    .await;
                 return;
             }
         };
         if let Some(refusal) = switch.and_then(|s| roles.refusal(s, lang)) {
-            let _ = adapter.send_html(chat_id, refusal).await;
+            let _ = adapter.send_html(chat_id, thread_id, refusal).await;
             return;
         }
         let (text, keyboard) = Self::build_settings_keyboard(&subs, lang, &roles);
         if let Err(e) = adapter
-            .send_message_with_keyboard(chat_id, &text, &keyboard)
+            .send_message_with_keyboard(chat_id, thread_id, &text, &keyboard)
             .await
         {
             warn!(target: "bp_notifications::command", error = %e, "settings: send");
@@ -768,7 +798,7 @@ impl CommandHandler {
     /// ntfy topic already is its address.
     async fn handle_start(&self, transport: &Transport, lang: Language) -> String {
         let subscribed: Vec<AddressId> = match transport {
-            Transport::Telegram { chat_id } => {
+            Transport::Telegram { chat_id, .. } => {
                 find_telegram_subscriptions_by_chat(&self.pool, *chat_id)
                     .await
                     .map(|subs| subs.into_iter().map(|s| s.address).collect())
@@ -830,8 +860,9 @@ impl CommandHandler {
             Err(reply) => return reply,
         };
         match transport {
-            Transport::Telegram { chat_id } => {
-                match upsert_telegram_subscription(&self.pool, *chat_id, &address).await {
+            Transport::Telegram { chat_id, thread_id } => {
+                match upsert_telegram_subscription(&self.pool, *chat_id, *thread_id, &address).await
+                {
                     Ok(_) => subscribe_ok_text(lang, &address).to_string(),
                     Err(e) => {
                         warn!(target: "bp_notifications::command", error = %e, "telegram subscribe");
@@ -877,7 +908,7 @@ impl CommandHandler {
             Err(reply) => return reply,
         };
         let affected = match transport {
-            Transport::Telegram { chat_id } => {
+            Transport::Telegram { chat_id, .. } => {
                 self.remove_telegram_subscription(*chat_id, &address).await
             }
             Transport::Ntfy { .. } => {
@@ -915,7 +946,7 @@ impl CommandHandler {
 
     async fn handle_show_addresses(&self, transport: &Transport, lang: Language) -> String {
         match transport {
-            Transport::Telegram { chat_id } => {
+            Transport::Telegram { chat_id, .. } => {
                 match find_telegram_subscriptions_by_chat(&self.pool, *chat_id).await {
                     Ok(subs) if !subs.is_empty() => {
                         list_addresses(lang, subs.iter().map(|s| s.address.as_str()))
@@ -951,7 +982,7 @@ impl CommandHandler {
         if matches!(switch, Switch::TeamRequests | Switch::TeamBest) {
             let addresses = match transport {
                 Transport::Ntfy { address } => vec![address.clone()],
-                Transport::Telegram { chat_id } => {
+                Transport::Telegram { chat_id, .. } => {
                     match find_telegram_subscriptions_by_chat(&self.pool, *chat_id).await {
                         Ok(subs) => subs.into_iter().map(|s| s.address).collect(),
                         Err(e) => {
@@ -975,7 +1006,7 @@ impl CommandHandler {
             }
         }
         let affected = match transport {
-            Transport::Telegram { chat_id } => {
+            Transport::Telegram { chat_id, .. } => {
                 // A switch command covers every subscription of the chat;
                 // /settings switches one address.
                 let subs = match find_telegram_subscriptions_by_chat(&self.pool, *chat_id).await {
@@ -1041,7 +1072,7 @@ impl CommandHandler {
             LanguageSwitch::En => Language::En,
         };
         match transport {
-            Transport::Telegram { chat_id } => {
+            Transport::Telegram { chat_id, .. } => {
                 if let Err(e) = self.chat_languages.set(*chat_id, new_lang).await {
                     warn!(target: "bp_notifications::command", error = %e, "telegram language switch");
                     return db_error_text(new_lang).to_string();
@@ -1177,7 +1208,7 @@ impl CommandHandler {
         }
         let chat_id = match transport {
             Transport::Ntfy { address } => return Ok(address.clone()),
-            Transport::Telegram { chat_id } => *chat_id,
+            Transport::Telegram { chat_id, .. } => *chat_id,
         };
         let subs = match find_telegram_subscriptions_by_chat(&self.pool, chat_id).await {
             Ok(subs) => subs,
@@ -1733,6 +1764,7 @@ mod tests {
             group_admin_notifications_enabled: false,
             block_notifications_enabled: false,
             team_best_notifications_enabled: false,
+            message_thread_id: None,
         }
     }
 
@@ -1803,7 +1835,7 @@ mod tests {
             .await
             .unwrap();
         for a in addresses {
-            upsert_telegram_subscription(pool, chat_id, &AddressId::new(*a).unwrap())
+            upsert_telegram_subscription(pool, chat_id, None, &AddressId::new(*a).unwrap())
                 .await
                 .unwrap();
         }
@@ -1817,7 +1849,10 @@ mod tests {
             return;
         };
         let chat_id = -7_700_101;
-        let transport = Transport::Telegram { chat_id };
+        let transport = Transport::Telegram {
+            chat_id,
+            thread_id: None,
+        };
         let handler = CommandHandler::new(pool.clone(), Network::Bitcoin, None, None);
         let (a, b, c) = ("bc1qremovetesta", "bc1qremovetestb", "bc1qremovetestc");
         // The last subscribed address is the default.
@@ -2025,7 +2060,10 @@ mod tests {
             return;
         };
         let chat_id = -7_700_401;
-        let transport = Transport::Telegram { chat_id };
+        let transport = Transport::Telegram {
+            chat_id,
+            thread_id: None,
+        };
         let address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
         let (key, encrypt) = super::super::encrypted_address::test_key();
         let sent = encrypt(address);
@@ -2073,7 +2111,10 @@ mod tests {
             return;
         };
         let chat_id = -7_700_301;
-        let transport = Transport::Telegram { chat_id };
+        let transport = Transport::Telegram {
+            chat_id,
+            thread_id: None,
+        };
         let handler = CommandHandler::new(pool.clone(), Network::Bitcoin, None, None);
         subscribed_chat(&pool, chat_id, &[]).await;
         let fresh = handler.handle_start(&transport, Language::De).await;
@@ -2128,6 +2169,7 @@ mod tests {
             }
         };
         let msg = |chat_id: i64, private: bool, reply_to: Option<i64>| PlainMessage {
+            thread_id: None,
             chat_id,
             private,
             reply_to,

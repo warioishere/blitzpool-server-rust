@@ -37,6 +37,10 @@ pub struct TelegramSubscriptionRow {
     pub block_notifications_enabled: bool,
     #[sqlx(rename = "teamBestNotificationsEnabled")]
     pub team_best_notifications_enabled: bool,
+    /// The forum topic the subscription was made in, where its notices go;
+    /// `None` is the chat's main topic.
+    #[sqlx(rename = "messageThreadId")]
+    pub message_thread_id: Option<i64>,
 }
 
 /// All non-soft-deleted Telegram subscriptions for `address`. Multiple
@@ -63,7 +67,8 @@ pub async fn find_telegram_subscriptions_by_address(
             "hourlyWorkersEnabled" AS "hourly_workers_enabled!",
             "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!",
             "blockNotificationsEnabled" AS "block_notifications_enabled!",
-            "teamBestNotificationsEnabled" AS "team_best_notifications_enabled!"
+            "teamBestNotificationsEnabled" AS "team_best_notifications_enabled!",
+            "messageThreadId" AS "message_thread_id?"
            FROM telegram_subscriptions_entity
            WHERE address = $1 AND "deletedAt" IS NULL"#,
         address.as_str(),
@@ -94,7 +99,8 @@ pub async fn find_telegram_subscriptions_with_hourly_enabled(
             "hourlyWorkersEnabled" AS "hourly_workers_enabled!",
             "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!",
             "blockNotificationsEnabled" AS "block_notifications_enabled!",
-            "teamBestNotificationsEnabled" AS "team_best_notifications_enabled!"
+            "teamBestNotificationsEnabled" AS "team_best_notifications_enabled!",
+            "messageThreadId" AS "message_thread_id?"
            FROM telegram_subscriptions_entity
            WHERE "deletedAt" IS NULL
              AND ("hourlyStatsEnabled" = true OR "hourlyWorkersEnabled" = true)"#,
@@ -127,7 +133,8 @@ pub async fn find_telegram_subscriptions_by_chat(
             "hourlyWorkersEnabled" AS "hourly_workers_enabled!",
             "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!",
             "blockNotificationsEnabled" AS "block_notifications_enabled!",
-            "teamBestNotificationsEnabled" AS "team_best_notifications_enabled!"
+            "teamBestNotificationsEnabled" AS "team_best_notifications_enabled!",
+            "messageThreadId" AS "message_thread_id?"
            FROM telegram_subscriptions_entity
            WHERE "telegramChatId" = $1 AND "deletedAt" IS NULL"#,
         telegram_chat_id,
@@ -514,13 +521,15 @@ pub async fn update_push_subscription_preferences(
 
 // ── Telegram subscription writes (bot command path) ──────────────────
 
-/// Subscribe a Telegram `chat_id` to mining `address`. Idempotent:
-/// re-subscribing un-soft-deletes an existing row instead of creating
-/// a duplicate (the table has no UNIQUE on `(chat_id, address)` —
-/// dedup lives in the service layer).
+/// Subscribe a Telegram `chat_id` to mining `address`, in the forum topic
+/// `message_thread_id` (`None`: the main topic). Idempotent: re-subscribing
+/// un-soft-deletes an existing row instead of creating a duplicate (the
+/// table has no UNIQUE on `(chat_id, address)` — dedup lives in the service
+/// layer), and moves it to the topic it is sent from.
 pub async fn upsert_telegram_subscription(
     pool: &PgPool,
     telegram_chat_id: i64,
+    message_thread_id: Option<i64>,
     address: &AddressId,
 ) -> Result<i32, DbError> {
     let now_ms: i64 = chrono::Utc::now().timestamp_millis();
@@ -539,12 +548,14 @@ pub async fn upsert_telegram_subscription(
     // Re-activate any soft-deleted row first; if no such row, INSERT.
     let revived = sqlx::query!(
         r#"UPDATE telegram_subscriptions_entity
-           SET "deletedAt" = NULL, "isDefault" = true, "updatedAt" = $3
+           SET "deletedAt" = NULL, "isDefault" = true, "updatedAt" = $3,
+               "messageThreadId" = $4
            WHERE "telegramChatId" = $1 AND address = $2
            RETURNING id"#,
         telegram_chat_id,
         address.as_str(),
         now_ms,
+        message_thread_id,
     )
     .fetch_optional(pool)
     .await
@@ -554,12 +565,14 @@ pub async fn upsert_telegram_subscription(
     }
     let inserted = sqlx::query!(
         r#"INSERT INTO telegram_subscriptions_entity
-           ("telegramChatId", address, "isDefault", "createdAt", "updatedAt")
-           VALUES ($1, $2, true, $3, $3)
+           ("telegramChatId", address, "isDefault", "createdAt", "updatedAt",
+            "messageThreadId")
+           VALUES ($1, $2, true, $3, $3, $4)
            RETURNING id"#,
         telegram_chat_id,
         address.as_str(),
         now_ms,
+        message_thread_id,
     )
     .fetch_one(pool)
     .await
@@ -1147,12 +1160,14 @@ pub async fn find_device_notification_addresses(pool: &PgPool) -> Result<Vec<Add
 
 // ── Team round best ──────────────────────────────────────────────────
 
-/// A Telegram chat that follows a Team's round best through one of its
-/// addresses.
+/// A Telegram chat, in a forum topic, that follows a Team's round best
+/// through one of its addresses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TeamBestTelegramRecipient {
     pub group_id: uuid::Uuid,
     pub telegram_chat_id: i64,
+    /// The topic the address was subscribed in; `None` is the main topic.
+    pub message_thread_id: Option<i64>,
 }
 
 /// An ntfy topic (its address) that follows a Team's round best.
@@ -1164,12 +1179,13 @@ pub struct TeamBestNtfyRecipient {
 }
 
 /// Every Telegram chat with the team-best switch on for an address that is
-/// a member of a Team that is not dissolved, once per chat and Team.
+/// a member of a Team that is not dissolved, once per chat, topic and Team.
 pub async fn find_team_best_telegram_recipients(
     pool: &PgPool,
 ) -> Result<Vec<TeamBestTelegramRecipient>, DbError> {
     let rows = sqlx::query!(
-        r#"SELECT DISTINCT m."groupId" AS "group_id!", s."telegramChatId" AS "chat_id!"
+        r#"SELECT DISTINCT m."groupId" AS "group_id!", s."telegramChatId" AS "chat_id!",
+                  s."messageThreadId" AS "thread_id?"
            FROM telegram_subscriptions_entity s
            JOIN pplns_group_member m ON m.address = s.address
            JOIN pplns_group g ON g.id = m."groupId"
@@ -1185,6 +1201,7 @@ pub async fn find_team_best_telegram_recipients(
         .map(|r| TeamBestTelegramRecipient {
             group_id: r.group_id,
             telegram_chat_id: r.chat_id,
+            message_thread_id: r.thread_id,
         })
         .collect())
 }

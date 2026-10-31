@@ -329,24 +329,25 @@ impl NotificationDispatcher {
         join_all(tasks).await;
     }
 
-    /// A Team's round has a new best: one notice to each chat and each ntfy
-    /// topic that follows it. Chats go one after another, as block notices
-    /// do, to stay under Telegram's send rate.
+    /// A Team's round has a new best: one notice to each chat, in each forum
+    /// topic it follows the Team from, and to each ntfy topic. Chats go one
+    /// after another, as block notices do, to stay under Telegram's send
+    /// rate.
     pub async fn notify_team_best(
         &self,
         notice: &TeamBestNotice,
-        telegram_chats: &[i64],
+        telegram_chats: &[(i64, Option<i64>)],
         ntfy_topics: &[(AddressId, Language)],
     ) {
         if let Some(adapter) = &self.telegram {
-            for &chat_id in telegram_chats {
+            for &(chat_id, thread_id) in telegram_chats {
                 let lang = self.chat_languages.get(chat_id).await;
                 let text = team_best_text(lang, notice);
                 settle_telegram_push(
                     &self.pool,
                     chat_id,
                     "telegram-team-best",
-                    adapter.send_html(chat_id, &text).await,
+                    adapter.send_html(chat_id, thread_id, &text).await,
                 )
                 .await;
             }
@@ -692,7 +693,9 @@ async fn send_telegram_block_found(
             pool,
             sub.telegram_chat_id,
             "telegram-block",
-            adapter.send_html(sub.telegram_chat_id, &text).await,
+            adapter
+                .send_html(sub.telegram_chat_id, sub.message_thread_id, &text)
+                .await,
         )
         .await;
     });
@@ -890,7 +893,9 @@ async fn send_telegram_best_diff(
                 &pool,
                 sub.telegram_chat_id,
                 "telegram-best-diff",
-                adapter.send_html(sub.telegram_chat_id, &text).await,
+                adapter
+                    .send_html(sub.telegram_chat_id, sub.message_thread_id, &text)
+                    .await,
             )
             .await;
         }
@@ -960,7 +965,9 @@ async fn send_telegram_device(
             pool,
             sub.telegram_chat_id,
             label,
-            adapter.send_html(sub.telegram_chat_id, &text).await,
+            adapter
+                .send_html(sub.telegram_chat_id, sub.message_thread_id, &text)
+                .await,
         )
         .await;
     });
@@ -1345,7 +1352,9 @@ async fn send_telegram_join_request(
                 &pool,
                 sub.telegram_chat_id,
                 "telegram-join-request",
-                adapter.send_html(sub.telegram_chat_id, &text).await,
+                adapter
+                    .send_html(sub.telegram_chat_id, sub.message_thread_id, &text)
+                    .await,
             )
             .await;
         }
@@ -2007,6 +2016,7 @@ mod tests {
             group_admin_notifications_enabled: group_admin,
             block_notifications_enabled: true,
             team_best_notifications_enabled: true,
+            message_thread_id: None,
         }
     }
 

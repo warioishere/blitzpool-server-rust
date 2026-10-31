@@ -105,13 +105,13 @@ async fn team(pool: &PgPool, members: &[&str]) -> Uuid {
     id
 }
 
-async fn telegram_recipients(pool: &PgPool, groups: &[Uuid]) -> Vec<(Uuid, i64)> {
-    let mut out: Vec<(Uuid, i64)> = find_team_best_telegram_recipients(pool)
+async fn telegram_recipients(pool: &PgPool, groups: &[Uuid]) -> Vec<(Uuid, i64, Option<i64>)> {
+    let mut out: Vec<(Uuid, i64, Option<i64>)> = find_team_best_telegram_recipients(pool)
         .await
         .expect("telegram recipients")
         .into_iter()
         .filter(|r| groups.contains(&r.group_id))
-        .map(|r| (r.group_id, r.telegram_chat_id))
+        .map(|r| (r.group_id, r.telegram_chat_id, r.message_thread_id))
         .collect();
     out.sort();
     out
@@ -128,7 +128,7 @@ async fn ntfy_recipients(pool: &PgPool, groups: &[Uuid]) -> Vec<(Uuid, String)> 
 }
 
 #[tokio::test]
-async fn a_teams_round_best_goes_to_each_following_chat_once() {
+async fn a_teams_round_best_goes_to_each_following_chat_and_topic_once() {
     let Some(pool) = connect_or_skip().await else {
         return;
     };
@@ -144,7 +144,7 @@ async fn a_teams_round_best_goes_to_each_following_chat_once() {
         (CHAT_DISSOLVED, vec![DISSOLVED_MEMBER]),
     ] {
         for a in addresses {
-            upsert_telegram_subscription(&pool, chat, &addr(a))
+            upsert_telegram_subscription(&pool, chat, None, &addr(a))
                 .await
                 .expect("subscribe");
         }
@@ -187,7 +187,15 @@ async fn a_teams_round_best_goes_to_each_following_chat_once() {
     // in no Team and the dissolved Team: none.
     assert_eq!(
         telegram_recipients(&pool, &groups).await,
-        vec![(active, CHAT_BOTH)]
+        vec![(active, CHAT_BOTH, None)]
+    );
+    // One member followed from a forum topic: the notice goes to both.
+    upsert_telegram_subscription(&pool, CHAT_BOTH, Some(5), &addr(MEMBER_B))
+        .await
+        .expect("subscribe in topic");
+    assert_eq!(
+        telegram_recipients(&pool, &groups).await,
+        vec![(active, CHAT_BOTH, None), (active, CHAT_BOTH, Some(5))]
     );
 
     // The address in no Team and the dissolved Team's topic: none.

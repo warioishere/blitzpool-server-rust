@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO telegram_subscriptions_entity\n           (\"telegramChatId\", address, \"isDefault\", \"createdAt\", \"updatedAt\",\n            \"messageThreadId\")\n           VALUES ($1, $2, true, $3, $3, $4)\n           RETURNING id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6697740bc43e700fab658f4c104d807d6364d2b5f54ca78288756c8223fa503c"
+}

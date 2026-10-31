@@ -82,10 +82,10 @@ async fn best_diff_scan_covers_every_transport() {
     };
     hard_cleanup(&pool).await;
 
-    upsert_telegram_subscription(&pool, TEST_CHAT_ID, &addr(TELEGRAM_ONLY))
+    upsert_telegram_subscription(&pool, TEST_CHAT_ID, None, &addr(TELEGRAM_ONLY))
         .await
         .expect("telegram sub");
-    upsert_telegram_subscription(&pool, TEST_CHAT_ID, &addr(TELEGRAM_FLAG_OFF))
+    upsert_telegram_subscription(&pool, TEST_CHAT_ID, None, &addr(TELEGRAM_FLAG_OFF))
         .await
         .expect("telegram sub (flag off)");
     update_telegram_sub_best_diff_flag(&pool, TEST_CHAT_ID, &addr(TELEGRAM_FLAG_OFF), false)

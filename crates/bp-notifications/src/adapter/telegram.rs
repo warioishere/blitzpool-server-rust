@@ -6,6 +6,7 @@
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use super::error::{AdapterError, AdapterResult};
 
@@ -64,6 +65,20 @@ pub struct TelegramAdapter {
     api_root: String,
 }
 
+/// The `sendMessage` request. `message_thread_id` only for a forum topic:
+/// Telegram takes it for forum supergroups and private chats with topics.
+#[derive(Serialize)]
+struct SendMessageBody<'a, M: Serialize> {
+    chat_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_thread_id: Option<i64>,
+    text: &'a str,
+    parse_mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_markup: Option<&'a M>,
+    link_preview_options: LinkPreviewOptions,
+}
+
 impl TelegramAdapter {
     pub fn new(config: TelegramConfig) -> AdapterResult<Self> {
         if config.bot_token.trim().is_empty() {
@@ -80,22 +95,17 @@ impl TelegramAdapter {
     }
 
     /// `sendMessage` of a bot message, Telegram HTML
-    /// ([`crate::format::html`]).
-    pub async fn send_html(&self, chat_id: i64, html: &str) -> AdapterResult<()> {
-        #[derive(Serialize)]
-        struct SendMessageBody<'a> {
-            chat_id: i64,
-            text: &'a str,
-            parse_mode: &'static str,
-            link_preview_options: LinkPreviewOptions,
-        }
-        let body = SendMessageBody {
-            chat_id,
-            text: html,
-            parse_mode: PARSE_MODE,
-            link_preview_options: NO_PREVIEW,
-        };
-        self.post("sendMessage", &body).await.map(|_| ())
+    /// ([`crate::format::html`]), into the forum topic `thread_id`
+    /// (`None`: the chat's main topic).
+    pub async fn send_html(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        html: &str,
+    ) -> AdapterResult<()> {
+        self.send_message(chat_id, thread_id, html, None::<&()>)
+            .await
+            .map(|_| ())
     }
 
     /// `sendMessage` carrying an inline keyboard. Returns the new
@@ -104,13 +114,15 @@ impl TelegramAdapter {
     pub async fn send_message_with_keyboard(
         &self,
         chat_id: i64,
+        thread_id: Option<i64>,
         text: &str,
         keyboard: &InlineKeyboard,
     ) -> AdapterResult<i64> {
         let markup = ReplyMarkup {
             inline_keyboard: keyboard,
         };
-        self.send_message_with_markup(chat_id, text, &markup).await
+        self.send_message(chat_id, thread_id, text, Some(&markup))
+            .await
     }
 
     /// A question the user answers in the reply field, `placeholder`
@@ -119,6 +131,7 @@ impl TelegramAdapter {
     pub async fn send_question(
         &self,
         chat_id: i64,
+        thread_id: Option<i64>,
         text: &str,
         placeholder: &str,
     ) -> AdapterResult<i64> {
@@ -126,25 +139,54 @@ impl TelegramAdapter {
             force_reply: true,
             input_field_placeholder: placeholder,
         };
-        self.send_message_with_markup(chat_id, text, &markup).await
+        self.send_message(chat_id, thread_id, text, Some(&markup))
+            .await
     }
 
-    async fn send_message_with_markup(
+    /// Send into the topic, else once more into the chat's main topic. What
+    /// Telegram answers for a closed or deleted topic is not documented, so
+    /// any refusal of a message sent into a topic gets the retry: a refusal
+    /// that is about the chat, not the topic, fails the retry the same way
+    /// and reaches the caller as before.
+    async fn send_message<M: Serialize>(
         &self,
         chat_id: i64,
+        thread_id: Option<i64>,
         text: &str,
-        reply_markup: &impl Serialize,
+        reply_markup: Option<&M>,
     ) -> AdapterResult<i64> {
-        #[derive(Serialize)]
-        struct Body<'a, M: Serialize> {
-            chat_id: i64,
-            text: &'a str,
-            parse_mode: &'static str,
-            reply_markup: &'a M,
-            link_preview_options: LinkPreviewOptions,
+        match self
+            .send_message_once(chat_id, thread_id, text, reply_markup)
+            .await
+        {
+            Err(AdapterError::Server(e) | AdapterError::InvalidRecipient(e))
+                if thread_id.is_some()
+                    && (e.starts_with("telegram 400") || e.starts_with("telegram 403")) =>
+            {
+                warn!(
+                    target: "bp_notifications::adapter::telegram",
+                    chat_id,
+                    thread_id,
+                    error = %e,
+                    "refused with a topic set; retrying in the main topic"
+                );
+                self.send_message_once(chat_id, None, text, reply_markup)
+                    .await
+            }
+            other => other,
         }
-        let body = Body {
+    }
+
+    async fn send_message_once<M: Serialize>(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        text: &str,
+        reply_markup: Option<&M>,
+    ) -> AdapterResult<i64> {
+        let body = SendMessageBody {
             chat_id,
+            message_thread_id: thread_id,
             text,
             parse_mode: PARSE_MODE,
             reply_markup,
@@ -289,5 +331,132 @@ impl TelegramAdapter {
             )),
             _ => Err(AdapterError::Server(format!("telegram {code}: {snippet}"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// A Bot API stand-in on localhost: answers each request with the next
+    /// of `replies` (status, body) and hands back every request body.
+    async fn fake_bot_api(
+        replies: Vec<(u16, &'static str)>,
+    ) -> (
+        TelegramAdapter,
+        tokio::task::JoinHandle<Vec<serde_json::Value>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for (status, reply) in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                let body = loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0, "connection closed before the request was read");
+                    raw.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&raw).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len: usize = text
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if raw.len() >= end + 4 + len {
+                            break raw[end + 4..end + 4 + len].to_vec();
+                        }
+                    }
+                };
+                bodies.push(serde_json::from_slice(&body).unwrap());
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            bodies
+        });
+        let adapter = TelegramAdapter {
+            client: bp_http::client_builder().build().unwrap(),
+            api_root: format!("http://127.0.0.1:{port}/bottest"),
+        };
+        (adapter, server)
+    }
+
+    const SENT: &str = r#"{"ok":true,"result":{"message_id":7}}"#;
+
+    /// A topic message carries the topic; the main topic carries none.
+    #[tokio::test]
+    async fn a_message_goes_to_its_topic() {
+        let (adapter, server) = fake_bot_api(vec![(200, SENT), (200, SENT)]).await;
+        adapter.send_html(-100, Some(42), "a").await.unwrap();
+        adapter.send_html(-100, None, "b").await.unwrap();
+        let bodies = server.await.unwrap();
+        assert_eq!(bodies[0]["message_thread_id"], 42);
+        assert!(
+            bodies[1].get("message_thread_id").is_none(),
+            "{}",
+            bodies[1]
+        );
+    }
+
+    /// A topic that refuses the message (closed or deleted) leaves it to the
+    /// main topic; without a topic a 400 stays an error.
+    #[tokio::test]
+    async fn a_refused_topic_falls_back_to_the_main_topic() {
+        const CLOSED: &str =
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: TOPIC_CLOSED"}"#;
+        let (adapter, server) = fake_bot_api(vec![(400, CLOSED), (200, SENT)]).await;
+        assert_eq!(
+            adapter
+                .send_question(-100, Some(42), "q", "bc1q...")
+                .await
+                .unwrap(),
+            7
+        );
+        let bodies = server.await.unwrap();
+        assert_eq!(bodies[0]["message_thread_id"], 42);
+        assert!(
+            bodies[1].get("message_thread_id").is_none(),
+            "{}",
+            bodies[1]
+        );
+        assert_eq!(bodies[1]["reply_markup"]["force_reply"], true);
+
+        let (adapter, server) = fake_bot_api(vec![(400, CLOSED)]).await;
+        assert!(matches!(
+            adapter.send_html(-100, None, "a").await,
+            Err(AdapterError::Server(_))
+        ));
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    /// A chat that is gone refuses the main topic too: the retry fails the
+    /// same way and the caller still sees the dead chat, after two tries.
+    #[tokio::test]
+    async fn a_gone_chat_is_still_reported_after_the_retry() {
+        const KICKED: &str =
+            r#"{"ok":false,"error_code":403,"description":"Forbidden: bot was kicked"}"#;
+        let (adapter, server) = fake_bot_api(vec![(403, KICKED), (403, KICKED)]).await;
+        assert!(matches!(
+            adapter.send_html(-100, Some(42), "a").await,
+            Err(AdapterError::InvalidRecipient(_))
+        ));
+        let bodies = server.await.unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert!(
+            bodies[1].get("message_thread_id").is_none(),
+            "{}",
+            bodies[1]
+        );
     }
 }

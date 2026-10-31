@@ -71,7 +71,7 @@ async fn the_group_admin_switch_starts_on_and_flips_alone() {
     let a = AddressId::new(ADDR.to_string()).unwrap();
 
     // Telegram.
-    upsert_telegram_subscription(&pool, TEST_CHAT_ID, &a)
+    upsert_telegram_subscription(&pool, TEST_CHAT_ID, None, &a)
         .await
         .expect("telegram upsert");
     let tg = || async {

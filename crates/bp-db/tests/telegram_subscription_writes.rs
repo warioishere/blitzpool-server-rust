@@ -19,6 +19,7 @@ const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_p
 // the harness runs them concurrently against the shared local PG.
 const TEST_CHAT_ID: i64 = 990_000_777;
 const TEST_CHAT_ID_HOURLY: i64 = 990_000_778;
+const TEST_CHAT_ID_TOPIC: i64 = 990_000_790;
 
 async fn connect_or_skip() -> Option<PgPool> {
     let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
@@ -78,7 +79,7 @@ async fn telegram_default_management_set_and_promote() {
     let c = addr("tg_default_addr_c");
 
     // First subscribe → A becomes default.
-    let id_a = upsert_telegram_subscription(&pool, chat_id, &a)
+    let id_a = upsert_telegram_subscription(&pool, chat_id, None, &a)
         .await
         .expect("upsert a");
     assert!(
@@ -87,7 +88,7 @@ async fn telegram_default_management_set_and_promote() {
     );
 
     // Second subscribe → B becomes default, A no longer.
-    let id_b = upsert_telegram_subscription(&pool, chat_id, &b)
+    let id_b = upsert_telegram_subscription(&pool, chat_id, None, &b)
         .await
         .expect("upsert b");
     assert!(
@@ -108,7 +109,7 @@ async fn telegram_default_management_set_and_promote() {
     assert!(!is_default_of(&pool, chat_id, id_b).await);
 
     // Add C → becomes default.
-    let id_c = upsert_telegram_subscription(&pool, chat_id, &c)
+    let id_c = upsert_telegram_subscription(&pool, chat_id, None, &c)
         .await
         .expect("upsert c");
     assert!(is_default_of(&pool, chat_id, id_c).await);
@@ -149,7 +150,7 @@ async fn telegram_hourly_flags_toggle_independently() {
     hard_cleanup(&pool, chat_id).await;
 
     let a = addr("tg_hourly_addr_a");
-    upsert_telegram_subscription(&pool, chat_id, &a)
+    upsert_telegram_subscription(&pool, chat_id, None, &a)
         .await
         .expect("upsert");
 
@@ -179,6 +180,39 @@ async fn telegram_hourly_flags_toggle_independently() {
         .expect("row");
     assert!(!row.hourly_stats_enabled);
     assert!(row.hourly_workers_enabled);
+
+    hard_cleanup(&pool, chat_id).await;
+}
+
+/// A subscription keeps the forum topic it was made in; subscribing again
+/// moves it to the topic it is sent from, the main topic included.
+#[tokio::test]
+async fn a_subscription_follows_the_topic_it_is_made_in() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let chat_id = TEST_CHAT_ID_TOPIC;
+    hard_cleanup(&pool, chat_id).await;
+    let a = addr("tg_topic_addr_a");
+    let thread = |pool: PgPool| async move {
+        find_telegram_subscriptions_by_chat(&pool, chat_id)
+            .await
+            .expect("read")[0]
+            .message_thread_id
+    };
+
+    upsert_telegram_subscription(&pool, chat_id, Some(42), &a)
+        .await
+        .expect("in topic 42");
+    assert_eq!(thread(pool.clone()).await, Some(42));
+    upsert_telegram_subscription(&pool, chat_id, Some(7), &a)
+        .await
+        .expect("in topic 7");
+    assert_eq!(thread(pool.clone()).await, Some(7));
+    upsert_telegram_subscription(&pool, chat_id, None, &a)
+        .await
+        .expect("in the main topic");
+    assert_eq!(thread(pool.clone()).await, None);
 
     hard_cleanup(&pool, chat_id).await;
 }

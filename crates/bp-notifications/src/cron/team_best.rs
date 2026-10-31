@@ -46,7 +46,8 @@ impl Default for TeamBestCronConfig {
 /// Who follows one Team's round best.
 #[derive(Default)]
 struct Followers {
-    telegram_chats: Vec<i64>,
+    /// Chat and forum topic.
+    telegram_chats: Vec<(i64, Option<i64>)>,
     ntfy_topics: Vec<(AddressId, Language)>,
 }
 
@@ -95,7 +96,7 @@ async fn run_once(
             .entry(r.group_id)
             .or_default()
             .telegram_chats
-            .push(r.telegram_chat_id);
+            .push((r.telegram_chat_id, r.message_thread_id));
     }
     for r in find_team_best_ntfy_recipients(pool)
         .await

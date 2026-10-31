@@ -128,8 +128,9 @@ async fn poll_once(
 async fn process_update(handler: &CommandHandler, update: Update) -> Option<i64> {
     let next_offset = update.update_id + 1;
     if let Some(message) = update.message {
-        if let Some(text) = message.text {
+        if let Some(text) = message.text.as_deref() {
             let chat_id = message.chat.id;
+            let thread_id = message.topic();
             if let Some(code) = message.from.and_then(|u| u.language_code) {
                 handler
                     .chat_languages()
@@ -140,23 +141,22 @@ async fn process_update(handler: &CommandHandler, update: Update) -> Option<i64>
             if !text.starts_with('/') {
                 let plain = PlainMessage {
                     chat_id,
+                    thread_id,
                     private: message.chat.kind == "private",
                     reply_to: message.reply_to_message.as_ref().map(|m| m.message_id),
                 };
-                if handler.answer_telegram_question(plain, &text).await {
+                if handler.answer_telegram_question(plain, text).await {
                     return Some(next_offset);
                 }
             }
-            let command = parse_command(&text);
+            let command = parse_command(text);
             debug!(
                 target: "bp_notifications::listener::telegram",
                 chat_id = message.chat.id,
                 ?command,
                 "incoming command"
             );
-            let transport = Transport::Telegram {
-                chat_id: message.chat.id,
-            };
+            let transport = Transport::Telegram { chat_id, thread_id };
             handler.dispatch(&transport, &command).await;
         }
     }
@@ -207,6 +207,23 @@ struct Message {
     /// The message this one answers.
     #[serde(default)]
     reply_to_message: Option<RepliedTo>,
+    /// A thread or forum topic; a forum topic only with `is_topic_message`.
+    #[serde(default)]
+    message_thread_id: Option<i64>,
+    #[serde(default)]
+    is_topic_message: bool,
+}
+
+impl Message {
+    /// The forum topic the message was sent in. `message_thread_id` can also
+    /// name a reply thread, which `sendMessage` does not take as a target.
+    fn topic(&self) -> Option<i64> {
+        if self.is_topic_message {
+            self.message_thread_id
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,4 +260,26 @@ struct CallbackQuery {
 struct CallbackMessage {
     chat: Chat,
     message_id: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(json: &str) -> Message {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// A forum topic is the reply target; a reply thread in a plain
+    /// supergroup also carries `message_thread_id` and is not.
+    #[test]
+    fn only_a_forum_topic_is_a_reply_target() {
+        let chat = r#""chat":{"id":-100,"type":"supergroup"},"text":"/stats""#;
+        let in_topic = format!(r#"{{{chat},"message_thread_id":42,"is_topic_message":true}}"#);
+        let reply_thread = format!(r#"{{{chat},"message_thread_id":42}}"#);
+        let main = format!("{{{chat}}}");
+        assert_eq!(message(&in_topic).topic(), Some(42));
+        assert_eq!(message(&reply_thread).topic(), None);
+        assert_eq!(message(&main).topic(), None);
+    }
 }
