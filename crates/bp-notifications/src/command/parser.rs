@@ -1,43 +1,67 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Parse the leading bot-command from a raw user message. Read commands
-//! (`/stats`, `/pplns_status`, ...) come out as [`Command::ReadDeferred`]
-//! carrying their name, so the handler alone decides how to answer them.
+//! (`/stats`, `/pplns_status`, ...) come out as [`Command::Read`], so the
+//! handler alone decides how to answer them.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Start,
-    /// `/subscribe <address>` — add a mining-address subscription.
+    /// `/subscribe [<address>]`: add a mining-address subscription; bare,
+    /// explain how.
     Subscribe {
-        address: String,
+        address: Option<String>,
     },
-    /// `/remove <address>` — soft-delete a mining-address subscription.
+    /// `/remove [<address>]`: soft-delete a mining-address subscription;
+    /// bare, offer the stored addresses.
     Remove {
-        address: String,
+        address: Option<String>,
     },
     ShowAddresses,
-    /// `/subscribe_bestdiff on|off` — best-diff push toggle.
-    BestDiffToggle(FlagToggle),
-    /// `/device_notifications on|off` — device-status push toggle.
-    DeviceToggle(FlagToggle),
-    /// `/team_requests on|off` — a Team admin's join-request notice.
-    TeamRequestsToggle(FlagToggle),
-    /// `/send_hourly on|off` — hourly stats + workers push toggle (both).
-    HourlyToggle(FlagToggle),
-    /// `/send_hourly` with no on|off arg — open the inline toggle menu.
-    HourlyMenu,
-    /// `/bestdiff_reset [<address>]` — set persisted best back to 0.
+    /// `/settings`, or a switch command without on|off: every switch of
+    /// every subscribed address.
+    Settings,
+    /// A switch command with on|off, applied to every subscribed address.
+    Toggle(Switch, FlagToggle),
+    /// `/bestdiff_reset [<address>]`: a link to where that happens.
     BestDiffReset {
         address: Option<String>,
     },
     /// `/deutsch` or `/english` — switch reply language.
     LanguageSwitch(LanguageSwitch),
-    /// `/help` or any unknown command — handler replies with usage.
     Help,
-    /// Recognised read command, carrying its name for the handler's
-    /// read dispatch.
-    ReadDeferred(&'static str),
+    /// A command that answers with data about the pool or an address,
+    /// with the address it was given, if any.
+    Read(ReadCommand, Option<String>),
     Unknown,
+}
+
+/// What a switch command turns on or off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Switch {
+    /// `/subscribe_bestdiff`
+    BestDiff,
+    /// `/device_notifications`
+    Device,
+    /// `/team_requests`: a Team admin's join-request notice.
+    TeamRequests,
+    /// `/send_hourly`: hourly stats and workers together.
+    Hourly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadCommand {
+    Stats,
+    ShowWorkers,
+    PoolHashrate,
+    Difficulty,
+    NextDifficulty,
+    PplnsStatus,
+    TeamStatus,
+    PplnsTop,
+    TeamMembers,
+    TeamHistory,
+    BlockpartyStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,47 +105,74 @@ pub fn parse_address_callback(data: &str) -> Option<AddressCallback> {
     }
 }
 
-/// Which flag an `hr:` hourly-menu button toggles.
+/// One switch of one subscription in the `/settings` keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HourlyTarget {
-    Stats,
-    Workers,
+pub enum SettingsField {
+    Blocks,
+    BestDiff,
+    Device,
+    TeamRequests,
+    HourlyStats,
+    HourlyWorkers,
 }
 
-/// Parse an `hr:stats` / `hr:workers` hourly-menu callback payload.
-pub fn parse_hourly_callback(data: &str) -> Option<HourlyTarget> {
-    match data {
-        "hr:stats" => Some(HourlyTarget::Stats),
-        "hr:workers" => Some(HourlyTarget::Workers),
-        _ => None,
+impl SettingsField {
+    pub const ALL: [SettingsField; 6] = [
+        SettingsField::Blocks,
+        SettingsField::BestDiff,
+        SettingsField::Device,
+        SettingsField::TeamRequests,
+        SettingsField::HourlyStats,
+        SettingsField::HourlyWorkers,
+    ];
+
+    fn code(self) -> &'static str {
+        match self {
+            SettingsField::Blocks => "bk",
+            SettingsField::BestDiff => "bd",
+            SettingsField::Device => "dv",
+            SettingsField::TeamRequests => "tr",
+            SettingsField::HourlyStats => "hs",
+            SettingsField::HourlyWorkers => "hw",
+        }
     }
 }
 
-/// Parse a `bdr:yes` / `bdr:no` best-difficulty-reset confirmation tap.
-/// `Some(true)` = confirm, `Some(false)` = cancel.
-pub fn parse_bestdiff_callback(data: &str) -> Option<bool> {
-    match data {
-        "bdr:yes" => Some(true),
-        "bdr:no" => Some(false),
-        _ => None,
+/// A `/settings` keyboard tap: `st:<id>` names subscription `id`,
+/// `st:<id>:<field>` flips one of its switches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsCallback {
+    Address(i32),
+    Flip(i32, SettingsField),
+}
+
+impl SettingsCallback {
+    pub fn data(self) -> String {
+        match self {
+            SettingsCallback::Address(id) => format!("st:{id}"),
+            SettingsCallback::Flip(id, field) => format!("st:{id}:{}", field.code()),
+        }
     }
 }
 
-const READ_COMMANDS: &[&str] = &[
-    "/stats",
-    "/show_workers",
-    "/poolhashrate",
-    "/difficulty",
-    "/next_difficulty",
-    "/pplns_status",
-    "/team_status",
-    "/pplns_top",
-    "/team_members",
-    "/team_history",
-];
+pub fn parse_settings_callback(data: &str) -> Option<SettingsCallback> {
+    let rest = data.strip_prefix("st:")?;
+    let (id, field) = match rest.split_once(':') {
+        Some((id, code)) => (
+            id,
+            Some(SettingsField::ALL.into_iter().find(|f| f.code() == code)?),
+        ),
+        None => (rest, None),
+    };
+    let id: i32 = id.parse().ok()?;
+    Some(match field {
+        Some(field) => SettingsCallback::Flip(id, field),
+        None => SettingsCallback::Address(id),
+    })
+}
 
 /// Parse the *first whitespace-delimited token* of `text` (case-insensitive)
-/// as a command, and the remainder as its arguments. Returns
+/// as a command, and the next token as its argument. Returns
 /// [`Command::Unknown`] when the first token doesn't start with `/`.
 pub fn parse_command(text: &str) -> Command {
     let trimmed = text.trim();
@@ -135,60 +186,52 @@ pub fn parse_command(text: &str) -> Command {
     }
     // Strip any `@BotName` suffix Telegram tacks onto commands in groups.
     let cmd = head.split('@').next().unwrap_or(head).to_ascii_lowercase();
-    let arg = iter.next().unwrap_or("").trim();
+    let arg = iter.next().map(str::to_string);
+    let read = |command| Command::Read(command, arg.clone());
 
     match cmd.as_str() {
         "/start" => Command::Start,
         "/help" => Command::Help,
-        "/subscribe" => {
-            if arg.is_empty() {
-                Command::Unknown
-            } else {
-                Command::Subscribe {
-                    address: arg.to_string(),
-                }
-            }
-        }
-        "/remove" => {
-            if arg.is_empty() {
-                Command::Unknown
-            } else {
-                Command::Remove {
-                    address: arg.to_string(),
-                }
-            }
-        }
+        "/subscribe" => Command::Subscribe {
+            address: arg.clone(),
+        },
+        "/remove" => Command::Remove {
+            address: arg.clone(),
+        },
         "/show_addresses" => Command::ShowAddresses,
-        "/subscribe_bestdiff" => parse_toggle(arg)
-            .map(Command::BestDiffToggle)
-            .unwrap_or(Command::Unknown),
-        "/device_notifications" => parse_toggle(arg)
-            .map(Command::DeviceToggle)
-            .unwrap_or(Command::Unknown),
-        "/team_requests" => parse_toggle(arg)
-            .map(Command::TeamRequestsToggle)
-            .unwrap_or(Command::Unknown),
-        // `/send_hourly on|off` flips both flags; bare `/send_hourly`
-        // (or any non-on|off arg) opens the inline toggle menu.
-        "/send_hourly" => parse_toggle(arg)
-            .map(Command::HourlyToggle)
-            .unwrap_or(Command::HourlyMenu),
+        "/settings" => Command::Settings,
+        "/subscribe_bestdiff" => switch_command(Switch::BestDiff, arg.as_deref()),
+        "/device_notifications" => switch_command(Switch::Device, arg.as_deref()),
+        "/team_requests" => switch_command(Switch::TeamRequests, arg.as_deref()),
+        "/send_hourly" => switch_command(Switch::Hourly, arg.as_deref()),
         "/bestdiff_reset" => Command::BestDiffReset {
-            address: if arg.is_empty() {
-                None
-            } else {
-                Some(arg.to_string())
-            },
+            address: arg.clone(),
         },
         "/deutsch" => Command::LanguageSwitch(LanguageSwitch::De),
         "/english" => Command::LanguageSwitch(LanguageSwitch::En),
-        other => {
-            if let Some(name) = READ_COMMANDS.iter().find(|c| **c == other) {
-                Command::ReadDeferred(name)
-            } else {
-                Command::Unknown
-            }
-        }
+        "/stats" => read(ReadCommand::Stats),
+        "/show_workers" => read(ReadCommand::ShowWorkers),
+        "/poolhashrate" => read(ReadCommand::PoolHashrate),
+        "/difficulty" => read(ReadCommand::Difficulty),
+        "/next_difficulty" => read(ReadCommand::NextDifficulty),
+        "/pplns_status" => read(ReadCommand::PplnsStatus),
+        "/team_status" => read(ReadCommand::TeamStatus),
+        "/pplns_top" => read(ReadCommand::PplnsTop),
+        "/team_members" => read(ReadCommand::TeamMembers),
+        "/team_history" => read(ReadCommand::TeamHistory),
+        "/blockparty_status" => read(ReadCommand::BlockpartyStatus),
+        _ => Command::Unknown,
+    }
+}
+
+/// A switch command: on|off flips it, no argument opens the settings, and
+/// anything else is not understood.
+fn switch_command(switch: Switch, arg: Option<&str>) -> Command {
+    match arg {
+        None => Command::Settings,
+        Some(arg) => parse_toggle(arg)
+            .map(|toggle| Command::Toggle(switch, toggle))
+            .unwrap_or(Command::Unknown),
     }
 }
 
@@ -223,23 +266,22 @@ mod tests {
     }
 
     #[test]
-    fn subscribe_needs_argument() {
-        assert_eq!(parse_command("/subscribe"), Command::Unknown);
+    fn subscribe_and_remove_take_an_optional_address() {
+        assert_eq!(
+            parse_command("/subscribe"),
+            Command::Subscribe { address: None }
+        );
         assert_eq!(
             parse_command("/subscribe bc1qxyz"),
             Command::Subscribe {
-                address: "bc1qxyz".to_string()
+                address: Some("bc1qxyz".to_string())
             }
         );
-    }
-
-    #[test]
-    fn remove_needs_argument() {
-        assert_eq!(parse_command("/remove"), Command::Unknown);
+        assert_eq!(parse_command("/remove"), Command::Remove { address: None });
         assert_eq!(
             parse_command("/remove bc1qxyz"),
             Command::Remove {
-                address: "bc1qxyz".to_string()
+                address: Some("bc1qxyz".to_string())
             }
         );
     }
@@ -248,35 +290,43 @@ mod tests {
     fn toggles_recognise_variants() {
         assert_eq!(
             parse_command("/subscribe_bestdiff on"),
-            Command::BestDiffToggle(FlagToggle::On)
+            Command::Toggle(Switch::BestDiff, FlagToggle::On)
         );
         assert_eq!(
             parse_command("/subscribe_bestdiff OFF"),
-            Command::BestDiffToggle(FlagToggle::Off)
+            Command::Toggle(Switch::BestDiff, FlagToggle::Off)
         );
         assert_eq!(
             parse_command("/device_notifications an"),
-            Command::DeviceToggle(FlagToggle::On)
+            Command::Toggle(Switch::Device, FlagToggle::On)
         );
         assert_eq!(
             parse_command("/send_hourly aus"),
-            Command::HourlyToggle(FlagToggle::Off)
+            Command::Toggle(Switch::Hourly, FlagToggle::Off)
         );
         assert_eq!(
             parse_command("/team_requests off"),
-            Command::TeamRequestsToggle(FlagToggle::Off)
+            Command::Toggle(Switch::TeamRequests, FlagToggle::Off)
         );
         assert_eq!(
             parse_command("/team_requests on"),
-            Command::TeamRequestsToggle(FlagToggle::On)
+            Command::Toggle(Switch::TeamRequests, FlagToggle::On)
         );
     }
 
     #[test]
-    fn toggle_without_arg_is_unknown() {
-        assert_eq!(parse_command("/subscribe_bestdiff"), Command::Unknown);
+    fn a_switch_without_argument_opens_the_settings() {
+        for cmd in [
+            "/settings",
+            "/subscribe_bestdiff",
+            "/device_notifications",
+            "/team_requests",
+            "/send_hourly",
+        ] {
+            assert_eq!(parse_command(cmd), Command::Settings, "{cmd}");
+        }
         assert_eq!(parse_command("/subscribe_bestdiff maybe"), Command::Unknown);
-        assert_eq!(parse_command("/team_requests"), Command::Unknown);
+        assert_eq!(parse_command("/send_hourly foo"), Command::Unknown);
     }
 
     #[test]
@@ -306,11 +356,18 @@ mod tests {
     }
 
     #[test]
-    fn read_commands_are_marked_deferred() {
-        assert_eq!(parse_command("/stats"), Command::ReadDeferred("/stats"));
+    fn read_commands_parse_as_read() {
         assert_eq!(
-            parse_command("/poolhashrate"),
-            Command::ReadDeferred("/poolhashrate")
+            parse_command("/stats"),
+            Command::Read(ReadCommand::Stats, None)
+        );
+        assert_eq!(
+            parse_command("/stats bc1qxyz"),
+            Command::Read(ReadCommand::Stats, Some("bc1qxyz".to_string()))
+        );
+        assert_eq!(
+            parse_command("/blockparty_status"),
+            Command::Read(ReadCommand::BlockpartyStatus, None)
         );
     }
 
@@ -330,41 +387,23 @@ mod tests {
             Some(AddressCallback::Remove(42))
         );
         // Wrong prefix, unknown action, non-numeric id → None.
-        assert_eq!(parse_address_callback("hr:stats"), None);
+        assert_eq!(parse_address_callback("st:1"), None);
+        assert_eq!(parse_address_callback("bdr:yes"), None);
         assert_eq!(parse_address_callback("addr:flip:1"), None);
         assert_eq!(parse_address_callback("addr:set:abc"), None);
     }
 
     #[test]
-    fn send_hourly_arg_toggles_else_opens_menu() {
-        assert_eq!(
-            parse_command("/send_hourly on"),
-            Command::HourlyToggle(FlagToggle::On)
-        );
-        assert_eq!(
-            parse_command("/send_hourly off"),
-            Command::HourlyToggle(FlagToggle::Off)
-        );
-        assert_eq!(parse_command("/send_hourly"), Command::HourlyMenu);
-        assert_eq!(parse_command("/send_hourly foo"), Command::HourlyMenu);
-    }
-
-    #[test]
-    fn parses_hourly_callbacks() {
-        assert_eq!(parse_hourly_callback("hr:stats"), Some(HourlyTarget::Stats));
-        assert_eq!(
-            parse_hourly_callback("hr:workers"),
-            Some(HourlyTarget::Workers)
-        );
-        assert_eq!(parse_hourly_callback("hr:other"), None);
-        assert_eq!(parse_hourly_callback("addr:set:1"), None);
-    }
-
-    #[test]
-    fn parses_bestdiff_callbacks() {
-        assert_eq!(parse_bestdiff_callback("bdr:yes"), Some(true));
-        assert_eq!(parse_bestdiff_callback("bdr:no"), Some(false));
-        assert_eq!(parse_bestdiff_callback("bdr:maybe"), None);
-        assert_eq!(parse_bestdiff_callback("hr:stats"), None);
+    fn settings_callbacks_round_trip() {
+        for cb in [SettingsCallback::Address(7)]
+            .into_iter()
+            .chain(SettingsField::ALL.map(|f| SettingsCallback::Flip(42, f)))
+        {
+            assert_eq!(parse_settings_callback(&cb.data()), Some(cb));
+            assert!(cb.data().len() <= 64, "Telegram's callback_data limit");
+        }
+        assert_eq!(parse_settings_callback("st:1:xx"), None);
+        assert_eq!(parse_settings_callback("st:abc"), None);
+        assert_eq!(parse_settings_callback("hr:stats"), None);
     }
 }

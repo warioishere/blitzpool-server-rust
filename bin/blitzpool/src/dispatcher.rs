@@ -5,13 +5,11 @@
 //! so each transport has one state; `None` when no transport is configured, so
 //! callers skip building payloads nobody receives.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use bp_config::AppConfig;
-use bp_notifications::command::ChatLanguageMap;
+use bp_notifications::command::ChatLanguages;
 use bp_notifications::dispatcher::NotificationDispatcher;
-use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::boot::FoundationHandles;
@@ -40,9 +38,9 @@ pub(crate) fn build(
 
     // Shared with the command handler so /deutsch and /english apply to
     // outbound Telegram notifications too.
-    let chat_languages: ChatLanguageMap = listeners
+    let chat_languages = listeners
         .chat_languages()
-        .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
+        .unwrap_or_else(|| ChatLanguages::new(foundation.db.pool().clone()));
 
     info!(
         fcm = fcm.is_some(),

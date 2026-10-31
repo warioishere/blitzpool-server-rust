@@ -4,14 +4,17 @@
 //! surface; [`CommandHandler`] replies through the [`Transport`] the command
 //! arrived on.
 
+mod chat_language;
 mod handler;
 mod menu;
 mod parser;
 pub(crate) mod read;
 
-pub use handler::{ChatLanguageMap, CommandHandler, Transport};
+pub use chat_language::ChatLanguages;
+pub use handler::{CommandHandler, Transport};
+pub(crate) use menu::help_text;
 pub use menu::register_command_menu;
 pub use parser::{
-    parse_address_callback, parse_bestdiff_callback, parse_command, parse_hourly_callback,
-    AddressCallback, Command, FlagToggle, HourlyTarget, LanguageSwitch,
+    parse_address_callback, parse_command, parse_settings_callback, AddressCallback, Command,
+    FlagToggle, LanguageSwitch, ReadCommand, SettingsCallback, SettingsField, Switch,
 };

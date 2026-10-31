@@ -309,16 +309,11 @@ fn script_type_label(t: AddressType) -> &'static str {
 // ─── helpers ─────────────────────────────────────────────────────
 
 /// Parse an address of the pool's network into a **canonical** `AddressId`
-/// via [`AddressId::normalized`], so the ownership row is keyed exactly as
-/// every verification gate looks it up.
+/// via [`bp_mining_job::parse_pool_address`], so the ownership row is keyed
+/// exactly as every verification gate looks it up.
 pub(crate) fn parse_supported_address(raw: &str, network: Network) -> Result<AddressId, ApiError> {
-    let trimmed = raw.trim();
-    Address::from_str(trimmed)
-        .ok()
-        .and_then(|a| a.require_network(network).ok())
-        .ok_or_else(|| ownership_error("invalid-address", StatusCode::BAD_REQUEST))?;
-    AddressId::normalized(trimmed)
-        .map_err(|_| ownership_error("invalid-address", StatusCode::BAD_REQUEST))
+    bp_mining_job::parse_pool_address(network, raw)
+        .ok_or_else(|| ownership_error("invalid-address", StatusCode::BAD_REQUEST))
 }
 
 fn ownership_error(code: &'static str, status: StatusCode) -> ApiError {

@@ -6,6 +6,7 @@
 mod device_status;
 mod language;
 mod number_suffix;
+mod sats;
 
 pub use device_status::{
     format_device_time, DeviceAggregateArgs, DeviceAggregateText, DevicePartialArgs,
@@ -13,3 +14,4 @@ pub use device_status::{
 };
 pub use language::Language;
 pub use number_suffix::format_number_suffix;
+pub use sats::format_sats;

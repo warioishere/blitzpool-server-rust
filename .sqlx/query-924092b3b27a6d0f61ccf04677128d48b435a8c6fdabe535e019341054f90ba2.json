@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE telegram_subscriptions_entity\n           SET \"deletedAt\" = $2, \"updatedAt\" = $2\n           WHERE \"telegramChatId\" = $1 AND \"deletedAt\" IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "924092b3b27a6d0f61ccf04677128d48b435a8c6fdabe535e019341054f90ba2"
+}

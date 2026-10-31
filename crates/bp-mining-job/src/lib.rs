@@ -12,7 +12,7 @@ mod header;
 mod merkle;
 mod reservation;
 
-pub use address::{address_to_script, AddressError};
+pub use address::{address_to_script, parse_pool_address, AddressError};
 pub use bip54::{
     bip34_height_element, check_coinbase as check_coinbase_bip54, decode_bip34_height,
     Bip54Violation,

@@ -33,6 +33,8 @@ pub struct TelegramSubscriptionRow {
     pub hourly_workers_enabled: bool,
     #[sqlx(rename = "groupAdminNotificationsEnabled")]
     pub group_admin_notifications_enabled: bool,
+    #[sqlx(rename = "blockNotificationsEnabled")]
+    pub block_notifications_enabled: bool,
 }
 
 /// All non-soft-deleted Telegram subscriptions for `address`. Multiple
@@ -57,7 +59,8 @@ pub async fn find_telegram_subscriptions_by_address(
             "deviceNotificationsEnabled" AS "device_notifications_enabled!",
             "hourlyStatsEnabled" AS "hourly_stats_enabled!",
             "hourlyWorkersEnabled" AS "hourly_workers_enabled!",
-            "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!"
+            "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!",
+            "blockNotificationsEnabled" AS "block_notifications_enabled!"
            FROM telegram_subscriptions_entity
            WHERE address = $1 AND "deletedAt" IS NULL"#,
         address.as_str(),
@@ -86,7 +89,8 @@ pub async fn find_telegram_subscriptions_with_hourly_enabled(
             "deviceNotificationsEnabled" AS "device_notifications_enabled!",
             "hourlyStatsEnabled" AS "hourly_stats_enabled!",
             "hourlyWorkersEnabled" AS "hourly_workers_enabled!",
-            "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!"
+            "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!",
+            "blockNotificationsEnabled" AS "block_notifications_enabled!"
            FROM telegram_subscriptions_entity
            WHERE "deletedAt" IS NULL
              AND ("hourlyStatsEnabled" = true OR "hourlyWorkersEnabled" = true)"#,
@@ -117,7 +121,8 @@ pub async fn find_telegram_subscriptions_by_chat(
             "deviceNotificationsEnabled" AS "device_notifications_enabled!",
             "hourlyStatsEnabled" AS "hourly_stats_enabled!",
             "hourlyWorkersEnabled" AS "hourly_workers_enabled!",
-            "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!"
+            "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!",
+            "blockNotificationsEnabled" AS "block_notifications_enabled!"
            FROM telegram_subscriptions_entity
            WHERE "telegramChatId" = $1 AND "deletedAt" IS NULL"#,
         telegram_chat_id,
@@ -630,6 +635,82 @@ pub async fn delete_telegram_subscription_by_chat_address(
     Ok(result.rows_affected())
 }
 
+/// Soft-delete every subscription of a chat Telegram reports as gone.
+pub async fn delete_telegram_subscriptions_by_chat(
+    pool: &PgPool,
+    telegram_chat_id: i64,
+) -> Result<u64, DbError> {
+    let now_ms: i64 = chrono::Utc::now().timestamp_millis();
+    let result = sqlx::query!(
+        r#"UPDATE telegram_subscriptions_entity
+           SET "deletedAt" = $2, "updatedAt" = $2
+           WHERE "telegramChatId" = $1 AND "deletedAt" IS NULL"#,
+        telegram_chat_id,
+        now_ms,
+    )
+    .execute(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(result.rows_affected())
+}
+
+/// The language a Telegram chat picked, `None` when it never picked one.
+pub async fn find_telegram_chat_language(
+    pool: &PgPool,
+    telegram_chat_id: i64,
+) -> Result<Option<String>, DbError> {
+    sqlx::query_scalar!(
+        r#"SELECT language FROM telegram_chat_language WHERE "telegramChatId" = $1"#,
+        telegram_chat_id,
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(DbError::from)
+}
+
+/// Store `language` for a chat that has none; a stored one stays. `true`
+/// when it stored.
+pub async fn insert_telegram_chat_language_if_absent(
+    pool: &PgPool,
+    telegram_chat_id: i64,
+    language: &str,
+) -> Result<bool, DbError> {
+    let now_ms: i64 = chrono::Utc::now().timestamp_millis();
+    let result = sqlx::query!(
+        r#"INSERT INTO telegram_chat_language ("telegramChatId", language, "updatedAt")
+           VALUES ($1, $2, $3)
+           ON CONFLICT ("telegramChatId") DO NOTHING"#,
+        telegram_chat_id,
+        language,
+        now_ms,
+    )
+    .execute(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn upsert_telegram_chat_language(
+    pool: &PgPool,
+    telegram_chat_id: i64,
+    language: &str,
+) -> Result<(), DbError> {
+    let now_ms: i64 = chrono::Utc::now().timestamp_millis();
+    sqlx::query!(
+        r#"INSERT INTO telegram_chat_language ("telegramChatId", language, "updatedAt")
+           VALUES ($1, $2, $3)
+           ON CONFLICT ("telegramChatId")
+           DO UPDATE SET language = EXCLUDED.language, "updatedAt" = EXCLUDED."updatedAt""#,
+        telegram_chat_id,
+        language,
+        now_ms,
+    )
+    .execute(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(())
+}
+
 /// Toggle the per-subscription `bestDiffNotificationsEnabled` flag.
 pub async fn update_telegram_sub_best_diff_flag(
     pool: &PgPool,
@@ -680,6 +761,31 @@ pub async fn update_telegram_sub_device_flag(
     Ok(result.rows_affected())
 }
 
+/// Toggle the per-subscription `blockNotificationsEnabled` flag.
+pub async fn update_telegram_sub_block_flag(
+    pool: &PgPool,
+    telegram_chat_id: i64,
+    address: &AddressId,
+    value: bool,
+) -> Result<u64, DbError> {
+    let now_ms: i64 = chrono::Utc::now().timestamp_millis();
+    let result = sqlx::query!(
+        r#"UPDATE telegram_subscriptions_entity
+           SET "blockNotificationsEnabled" = $3, "updatedAt" = $4
+           WHERE "telegramChatId" = $1
+             AND address = $2
+             AND "deletedAt" IS NULL"#,
+        telegram_chat_id,
+        address.as_str(),
+        value,
+        now_ms,
+    )
+    .execute(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(result.rows_affected())
+}
+
 /// Toggle the per-subscription `groupAdminNotificationsEnabled` flag.
 pub async fn update_telegram_sub_group_admin_flag(
     pool: &PgPool,
@@ -705,9 +811,9 @@ pub async fn update_telegram_sub_group_admin_flag(
     Ok(result.rows_affected())
 }
 
-/// Set `hourlyStatsEnabled` and `hourlyWorkersEnabled` independently —
-/// backs the `hr:stats` / `hr:workers` inline-menu toggles, which flip
-/// one flag at a time. Returns the number of rows affected.
+/// Set `hourlyStatsEnabled` and `hourlyWorkersEnabled` independently, so
+/// the `/settings` keyboard can flip one of them. Returns the number of
+/// rows affected.
 pub async fn set_telegram_hourly_flags(
     pool: &PgPool,
     telegram_chat_id: i64,

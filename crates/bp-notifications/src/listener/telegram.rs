@@ -129,6 +129,22 @@ async fn process_update(handler: &CommandHandler, update: Update) -> Option<i64>
     let next_offset = update.update_id + 1;
     if let Some(message) = update.message {
         if let Some(text) = message.text {
+            let chat_id = message.chat.id;
+            if let Some(code) = message.from.and_then(|u| u.language_code) {
+                handler
+                    .chat_languages()
+                    .adopt_client_language(chat_id, &code)
+                    .await;
+            }
+            // An answer to the bot's own question, not a command.
+            if let (false, Some(question)) = (text.starts_with('/'), &message.reply_to_message) {
+                if handler
+                    .answer_telegram_question(chat_id, question.message_id, &text)
+                    .await
+                {
+                    return Some(next_offset);
+                }
+            }
             let command = parse_command(&text);
             debug!(
                 target: "bp_notifications::listener::telegram",
@@ -183,6 +199,23 @@ struct Update {
 struct Message {
     chat: Chat,
     text: Option<String>,
+    /// The sender; its client language seeds the chat's.
+    #[serde(default)]
+    from: Option<User>,
+    /// The message this one answers.
+    #[serde(default)]
+    reply_to_message: Option<RepliedTo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepliedTo {
+    message_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct User {
+    #[serde(default)]
+    language_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

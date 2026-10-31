@@ -99,7 +99,7 @@ mod tests {
     use std::time::Duration;
 
     use bp_common::MiningMode;
-    use bp_notifications::command::ChatLanguageMap;
+    use bp_notifications::command::ChatLanguages;
     use bp_notifications::dispatcher::NotificationDispatcher;
     use bp_share_stream::{Consumed, StreamConsumer, StreamProducer, BLOCK_FOUND_STREAM_KEY};
     use sqlx::postgres::PgPoolOptions;
@@ -147,8 +147,7 @@ mod tests {
     }
 
     fn no_adapter_dispatcher(pool: PgPool) -> Arc<NotificationDispatcher> {
-        let chat: ChatLanguageMap =
-            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let chat = ChatLanguages::new(pool.clone());
         Arc::new(NotificationDispatcher::new(
             pool, None, None, None, None, chat,
         ))

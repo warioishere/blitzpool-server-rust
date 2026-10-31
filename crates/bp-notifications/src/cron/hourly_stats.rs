@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Hourly stats / workers digest for Telegram and ntfy subscribers, rendered
-//! by the same builders as the read commands. Telegram language comes from
-//! the in-memory map `/deutsch` / `/english` write, so a chat that has not
-//! picked one since the last restart gets the default.
+//! by the same builders as the read commands, in each chat's stored language.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,12 +10,14 @@ use bp_db::{
     find_ntfy_subscriptions_with_hourly_enabled, find_telegram_subscriptions_with_hourly_enabled,
 };
 use sqlx::PgPool;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
 use crate::adapter::{NtfyAdapter, TelegramAdapter};
 use crate::command::read::{build_show_workers, build_stats};
+use crate::command::ChatLanguages;
+use crate::dispatcher::settle_telegram_push;
 use crate::format::Language;
 
 #[derive(Debug, Clone)]
@@ -46,7 +45,7 @@ pub fn spawn_hourly_stats_cron(
     redis: Option<redis::aio::ConnectionManager>,
     telegram: Option<Arc<TelegramAdapter>>,
     ntfy: Option<Arc<NtfyAdapter>>,
-    chat_languages: Arc<Mutex<HashMap<i64, Language>>>,
+    chat_languages: ChatLanguages,
 ) -> watch::Sender<bool> {
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
@@ -74,7 +73,7 @@ async fn run_once(
     redis: Option<&redis::aio::ConnectionManager>,
     telegram: Option<&TelegramAdapter>,
     ntfy: Option<&NtfyAdapter>,
-    chat_languages: &Arc<Mutex<HashMap<i64, Language>>>,
+    chat_languages: &ChatLanguages,
 ) {
     if let Some(adapter) = telegram {
         match find_telegram_subscriptions_with_hourly_enabled(pool).await {
@@ -102,40 +101,23 @@ async fn run_once(
     }
 }
 
-/// Resolve a chat's language from the shared in-memory map (written by
-/// the `/deutsch` / `/english` command handler); chats that never set
-/// one fall back to the default.
-async fn resolve_telegram_language(
-    chat_languages: &Arc<Mutex<HashMap<i64, Language>>>,
-    chat_id: i64,
-) -> Language {
-    chat_languages
-        .lock()
-        .await
-        .get(&chat_id)
-        .copied()
-        .unwrap_or_default()
-}
-
 async fn process_telegram_row(
     pool: &PgPool,
     redis: Option<&redis::aio::ConnectionManager>,
     adapter: &TelegramAdapter,
     sub: bp_db::TelegramSubscriptionRow,
-    chat_languages: &Arc<Mutex<HashMap<i64, Language>>>,
+    chat_languages: &ChatLanguages,
 ) {
-    let lang = resolve_telegram_language(chat_languages, sub.telegram_chat_id).await;
+    let lang = chat_languages.get(sub.telegram_chat_id).await;
     if sub.hourly_stats_enabled {
         let text = build_stats(pool, redis, lang, &sub.address).await;
-        if let Err(e) = adapter.send_text(sub.telegram_chat_id, &text).await {
-            warn!(target: "bp_notifications::cron::hourly_stats", error = %e, chat = sub.telegram_chat_id, "telegram stats send");
-        }
+        let sent = adapter.send_text(sub.telegram_chat_id, &text).await;
+        settle_telegram_push(pool, sub.telegram_chat_id, "telegram-hourly-stats", sent).await;
     }
     if sub.hourly_workers_enabled {
         let text = build_show_workers(pool, redis, lang, &sub.address).await;
-        if let Err(e) = adapter.send_text(sub.telegram_chat_id, &text).await {
-            warn!(target: "bp_notifications::cron::hourly_stats", error = %e, chat = sub.telegram_chat_id, "telegram workers send");
-        }
+        let sent = adapter.send_text(sub.telegram_chat_id, &text).await;
+        settle_telegram_push(pool, sub.telegram_chat_id, "telegram-hourly-workers", sent).await;
     }
 }
 
@@ -158,24 +140,5 @@ async fn process_ntfy_row(
         if let Err(e) = adapter.publish(address, &text).await {
             warn!(target: "bp_notifications::cron::hourly_stats", error = %e, address, "ntfy workers publish");
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn resolve_language_reads_shared_map_else_defaults() {
-        let map: Arc<Mutex<HashMap<i64, Language>>> = Arc::new(Mutex::new(HashMap::new()));
-        // Chat that set German via /deutsch.
-        map.lock().await.insert(111, Language::De);
-
-        assert_eq!(resolve_telegram_language(&map, 111).await, Language::De);
-        // Chat that never set a language → default (English).
-        assert_eq!(
-            resolve_telegram_language(&map, 999).await,
-            Language::default()
-        );
     }
 }

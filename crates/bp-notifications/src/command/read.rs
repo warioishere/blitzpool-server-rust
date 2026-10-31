@@ -7,11 +7,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bp_blockparty::BlockpartyStatus;
 use bp_client_live::{hashrate_for_addresses, pool_hashrate};
 use bp_common::{short_address, AddressId};
 use bp_db::{
-    find_address_settings, find_clients_by_address, find_group, find_group_member_by_address,
-    find_pplns_group_members_for_group, find_recent_group_block_history, PplnsGroupBlockHistoryRow,
+    find_address_settings, find_blockparty_group, find_blockparty_member_by_address,
+    find_clients_by_address, find_group, find_group_member_by_address,
+    find_pplns_group_members_for_group, find_recent_group_block_history,
+    list_blockparty_block_history, list_blockparty_members_for_group, PplnsGroupBlockHistoryRow,
 };
 use bp_group_solo_engine::engine::GroupSoloEngine;
 use bp_pplns_engine::engine::PplnsEngine;
@@ -22,7 +25,7 @@ use serde::Deserialize;
 use sqlx::PgPool;
 use tracing::warn;
 
-use crate::format::{format_number_suffix, Language};
+use crate::format::{format_number_suffix, format_sats, Language};
 
 const MEMPOOL_CURRENT_DIFF: &str = "https://mempool.space/api/v1/mining/hashrate/3d";
 const MEMPOOL_NEXT_ADJUST: &str = "https://mempool.space/api/v1/difficulty-adjustment";
@@ -245,19 +248,21 @@ pub(crate) async fn build_stats(
 
     match lang {
         Language::De => format!(
-            "\u{1f4c8} Stats für deine Adresse:\n\
+            "\u{1f4c8} Stats für {short}:\n\
             - Aktuelle Hashrate: {total_th}\n\
             - Gesamt-Shares: {shares}\n\
             - Letzter Share: vor {last_seen_seconds} Sekunden\n\
             - Beste Difficulty: {best_g:.2} G",
+            short = short_address(address.as_str()),
             shares = format_number_suffix(total_shares),
         ),
         Language::En => format!(
-            "\u{1f4c8} Stats for your address:\n\
+            "\u{1f4c8} Stats for {short}:\n\
             - Current hashrate: {total_th}\n\
             - Total shares: {shares}\n\
             - Last share: {last_seen_seconds} seconds ago\n\
             - Best difficulty: {best_g:.2} G",
+            short = short_address(address.as_str()),
             shares = format_number_suffix(total_shares),
         ),
     }
@@ -351,27 +356,6 @@ pub(super) async fn build_group_history(
 }
 
 // ── Local helpers ─────────────────────────────────────────────────────────────────────
-
-fn format_sats(sats: i64) -> String {
-    // en-US thousand separators ("12,345").
-    let abs = sats.unsigned_abs();
-    let mut s = format!("{abs}");
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    let mut count = 0;
-    while let Some(c) = s.pop() {
-        if count > 0 && count % 3 == 0 {
-            out.push(',');
-        }
-        out.push(c);
-        count += 1;
-    }
-    let joined: String = out.chars().rev().collect();
-    if sats < 0 {
-        format!("-{joined}")
-    } else {
-        joined
-    }
-}
 
 fn db_error_text(lang: Language) -> String {
     match lang {
@@ -661,6 +645,7 @@ pub(super) async fn build_group_status(
     match lang {
         Language::De => format!(
             "Team: {name}\n\
+            Adresse: {short}\n\
             Aktive Miner (Round): {active_count}\n\
             Team-Hashrate: {group_h}\n\
             Dein Anteil: {pct:.2}% ({my_sh})\n\
@@ -668,6 +653,7 @@ pub(super) async fn build_group_status(
             Round-Rejected: {rej_sh}\n\
             Beste Round-Difficulty: {best_diff_str}",
             name = group.name,
+            short = short_address(address.as_str()),
             group_h = format_hashrate_th(group_hashrate),
             pct = my_percent,
             my_sh = format_number_suffix(my_shares),
@@ -676,6 +662,7 @@ pub(super) async fn build_group_status(
         ),
         Language::En => format!(
             "Team: {name}\n\
+            Address: {short}\n\
             Active miners (round): {active_count}\n\
             Team hashrate: {group_h}\n\
             Your share: {pct:.2}% ({my_sh})\n\
@@ -683,6 +670,7 @@ pub(super) async fn build_group_status(
             Round rejected: {rej_sh}\n\
             Best round difficulty: {best_diff_str}",
             name = group.name,
+            short = short_address(address.as_str()),
             group_h = format_hashrate_th(group_hashrate),
             pct = my_percent,
             my_sh = format_number_suffix(my_shares),
@@ -690,6 +678,119 @@ pub(super) async fn build_group_status(
             rej_sh = format_number_suffix(total_rejected),
         ),
     }
+}
+
+// ── /blockparty_status <address> ────────────────────────────────────
+
+pub(super) async fn build_blockparty_status(
+    pool: &PgPool,
+    redis: Option<&ConnectionManager>,
+    lang: Language,
+    address: &AddressId,
+) -> String {
+    let short = short_address(address.as_str());
+    let not_in_party = || match lang {
+        Language::De => format!("{short} ist in keiner Blockparty."),
+        Language::En => format!("{short} is not in any Blockparty."),
+    };
+    let member = match find_blockparty_member_by_address(pool, address).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return not_in_party(),
+        Err(e) => {
+            warn!(target: "bp_notifications::command::read", error = %e, "blockparty_status: member");
+            return db_error_text(lang);
+        }
+    };
+    let (group_res, members_res, history_res) = tokio::join!(
+        find_blockparty_group(pool, member.group_id),
+        list_blockparty_members_for_group(pool, member.group_id),
+        list_blockparty_block_history(pool, member.group_id),
+    );
+    let (group, members, history) = match (group_res, members_res, history_res) {
+        (Ok(Some(g)), Ok(m), Ok(h)) => (g, m, h),
+        (Ok(None), _, _) => return not_in_party(),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+            warn!(target: "bp_notifications::command::read", error = %e, "blockparty_status: group");
+            return db_error_text(lang);
+        }
+    };
+    let status = match group.status.parse::<BlockpartyStatus>() {
+        Ok(BlockpartyStatus::Dissolved) => return not_in_party(),
+        Ok(status) => blockparty_status_name(lang, status),
+        Err(_) => group.status.clone(),
+    };
+    let addresses: Vec<AddressId> = members.iter().map(|m| m.address.clone()).collect();
+    let hashrate = hashrate_for_addresses(redis, &addresses)
+        .await
+        .unwrap_or(0.0);
+    let pct = f64::from(member.percent_bp) / 100.0;
+    let confirmed = match (lang, member.confirmed_at.is_some()) {
+        (Language::De, true) => "bestätigt",
+        (Language::De, false) => "noch nicht bestätigt",
+        (Language::En, true) => "confirmed",
+        (Language::En, false) => "not confirmed yet",
+    };
+    let last_block = history.first().map(|block| {
+        let mine: i64 = block
+            .splits
+            .iter()
+            .filter(|s| s.address == address.as_str())
+            .map(|s| s.sats)
+            .sum();
+        (block.block_height, format_sats(mine))
+    });
+    match lang {
+        Language::De => {
+            let mut out = format!(
+                "\u{1f389} Blockparty: {name} ({status})\n\
+                Adresse: {short}, Anteil {pct:.2} % ({confirmed})\n\
+                Mitglieder: {count}\n\
+                Hashrate: {hashrate}\n\
+                Gefundene Blöcke: {found}",
+                name = group.name,
+                count = members.len(),
+                hashrate = format_hashrate_th(hashrate),
+                found = history.len(),
+            );
+            if let Some((height, sats)) = last_block {
+                out.push_str(&format!("\nLetzter Block: {height}, für dich {sats} sats"));
+            }
+            out
+        }
+        Language::En => {
+            let mut out = format!(
+                "\u{1f389} Blockparty: {name} ({status})\n\
+                Address: {short}, share {pct:.2} % ({confirmed})\n\
+                Members: {count}\n\
+                Hashrate: {hashrate}\n\
+                Blocks found: {found}",
+                name = group.name,
+                count = members.len(),
+                hashrate = format_hashrate_th(hashrate),
+                found = history.len(),
+            );
+            if let Some((height, sats)) = last_block {
+                out.push_str(&format!("\nLast block: {height}, {sats} sats for you"));
+            }
+            out
+        }
+    }
+}
+
+fn blockparty_status_name(lang: Language, status: BlockpartyStatus) -> String {
+    let name = match (lang, status) {
+        (Language::De, BlockpartyStatus::Draft) => "Entwurf",
+        (Language::De, BlockpartyStatus::Confirming) => "wartet auf Bestätigung",
+        (Language::De, BlockpartyStatus::Ready) => "bereit",
+        (Language::De, BlockpartyStatus::Active) => "aktiv",
+        (Language::De, BlockpartyStatus::Dissolved) => "aufgelöst",
+        (Language::En, BlockpartyStatus::Draft) => "draft",
+        (Language::En, BlockpartyStatus::Confirming) => "waiting for confirmation",
+        (Language::En, BlockpartyStatus::Ready) => "ready",
+        (Language::En, BlockpartyStatus::Active) => "active",
+        (Language::En, BlockpartyStatus::Dissolved) => "dissolved",
+    };
+    name.to_string()
 }
 
 // ── /team_members <address> ─────────────────────────────────────────
@@ -837,7 +938,10 @@ pub(crate) async fn build_show_workers(
     let shares_str = format_number_suffix(total_shares);
 
     let summary_de = [
-        "\u{1f477} Worker-Übersicht".to_string(),
+        format!(
+            "\u{1f477} Worker-Übersicht für {}",
+            short_address(address.as_str())
+        ),
         format!("Gesamtanzahl: {workers_count}"),
         format!("Gesamt-Hashrate: {hashrate_str}H/s"),
         format!("Gesamt-Shares: {shares_str}"),
@@ -845,7 +949,10 @@ pub(crate) async fn build_show_workers(
     ]
     .join("\n");
     let summary_en = [
-        "\u{1f477} Workers overview".to_string(),
+        format!(
+            "\u{1f477} Workers overview for {}",
+            short_address(address.as_str())
+        ),
         format!("Total workers: {workers_count}"),
         format!("Total hashrate: {hashrate_str}H/s"),
         format!("Total shares: {shares_str}"),
@@ -954,17 +1061,6 @@ mod tests {
         assert!(out.contains("Progress: 12.00%"));
         assert!(out.contains("\u{1f4c9} -2.00%"));
         assert!(out.contains("Expected change"));
-    }
-
-    #[test]
-    fn format_sats_en_us_separators() {
-        assert_eq!(format_sats(0), "0");
-        assert_eq!(format_sats(1), "1");
-        assert_eq!(format_sats(1_234), "1,234");
-        assert_eq!(format_sats(12_345), "12,345");
-        assert_eq!(format_sats(123_456), "123,456");
-        assert_eq!(format_sats(1_234_567), "1,234,567");
-        assert_eq!(format_sats(-1_234), "-1,234");
     }
 
     #[test]

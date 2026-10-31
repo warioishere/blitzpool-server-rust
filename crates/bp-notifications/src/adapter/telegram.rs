@@ -6,7 +6,6 @@
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 
 use super::error::{AdapterError, AdapterResult};
 
@@ -33,6 +32,13 @@ pub type InlineKeyboard = Vec<Vec<InlineButton>>;
 #[derive(Serialize)]
 struct ReplyMarkup<'a> {
     inline_keyboard: &'a InlineKeyboard,
+}
+
+/// Opens the reply field on the message, so the user answers it directly.
+#[derive(Serialize)]
+struct ForceReply<'a> {
+    force_reply: bool,
+    input_field_placeholder: &'a str,
 }
 
 #[derive(Debug, Clone)]
@@ -70,13 +76,9 @@ impl TelegramAdapter {
             chat_id: i64,
             text: &'a str,
         }
-        self.post(
-            "sendMessage",
-            &SendMessageBody { chat_id, text },
-            Some(chat_id),
-        )
-        .await
-        .map(|_| ())
+        self.post("sendMessage", &SendMessageBody { chat_id, text })
+            .await
+            .map(|_| ())
     }
 
     /// `sendMessage` carrying an inline keyboard. Returns the new
@@ -88,20 +90,46 @@ impl TelegramAdapter {
         text: &str,
         keyboard: &InlineKeyboard,
     ) -> AdapterResult<i64> {
+        let markup = ReplyMarkup {
+            inline_keyboard: keyboard,
+        };
+        self.send_message_with_markup(chat_id, text, &markup).await
+    }
+
+    /// A question the user answers in the reply field, `placeholder`
+    /// shown in it. Returns the question's `message_id`, which the answer
+    /// carries as `reply_to_message`.
+    pub async fn send_question(
+        &self,
+        chat_id: i64,
+        text: &str,
+        placeholder: &str,
+    ) -> AdapterResult<i64> {
+        let markup = ForceReply {
+            force_reply: true,
+            input_field_placeholder: placeholder,
+        };
+        self.send_message_with_markup(chat_id, text, &markup).await
+    }
+
+    async fn send_message_with_markup(
+        &self,
+        chat_id: i64,
+        text: &str,
+        reply_markup: &impl Serialize,
+    ) -> AdapterResult<i64> {
         #[derive(Serialize)]
-        struct Body<'a> {
+        struct Body<'a, M: Serialize> {
             chat_id: i64,
             text: &'a str,
-            reply_markup: ReplyMarkup<'a>,
+            reply_markup: &'a M,
         }
         let body = Body {
             chat_id,
             text,
-            reply_markup: ReplyMarkup {
-                inline_keyboard: keyboard,
-            },
+            reply_markup,
         };
-        let resp = self.post("sendMessage", &body, Some(chat_id)).await?;
+        let resp = self.post("sendMessage", &body).await?;
         #[derive(Deserialize)]
         struct SentResult {
             message_id: i64,
@@ -141,9 +169,7 @@ impl TelegramAdapter {
             text,
             reply_markup: keyboard.map(|inline_keyboard| ReplyMarkup { inline_keyboard }),
         };
-        self.post("editMessageText", &body, Some(chat_id))
-            .await
-            .map(|_| ())
+        self.post("editMessageText", &body).await.map(|_| ())
     }
 
     /// `answerCallbackQuery` — stops the button's loading spinner and
@@ -165,7 +191,6 @@ impl TelegramAdapter {
                 callback_query_id,
                 text,
             },
-            None,
         )
         .await
         .map(|_| ())
@@ -200,18 +225,13 @@ impl TelegramAdapter {
                 .collect(),
             language_code,
         };
-        self.post("setMyCommands", &body, None).await.map(|_| ())
+        self.post("setMyCommands", &body).await.map(|_| ())
     }
 
     /// POST a JSON body to a Bot API method, mapping HTTP status into
     /// the adapter's error taxonomy. Returns the raw success response
     /// so callers that need the result payload can decode it.
-    async fn post(
-        &self,
-        method: &str,
-        body: &impl Serialize,
-        chat_id: Option<i64>,
-    ) -> AdapterResult<reqwest::Response> {
+    async fn post(&self, method: &str, body: &impl Serialize) -> AdapterResult<reqwest::Response> {
         let url = format!("{}/{}", self.api_root, method);
         let response = self
             .client
@@ -226,8 +246,9 @@ impl TelegramAdapter {
             return Ok(response);
         }
 
-        // 403 (bot blocked) and 400 (usually "chat not found") mean the chat
-        // is permanently invalid; 401 is a bad token; anything else is transient.
+        // 403 (bot blocked or kicked, chat deleted) and 400 "chat not found"
+        // mean the chat is gone for good. Any other 400 is about the
+        // request, not the chat; 401 is a bad token.
         let code = status.as_u16();
         let snippet = response
             .text()
@@ -235,12 +256,12 @@ impl TelegramAdapter {
             .unwrap_or_else(|_| String::from("(body unreadable)"));
         match code {
             401 => Err(AdapterError::Auth(format!("telegram 401: {snippet}"))),
-            400 | 403 => {
-                warn!(target: "bp_notifications::telegram", ?chat_id, snippet = %snippet, "telegram permanent rejection");
-                Err(AdapterError::InvalidRecipient(format!(
-                    "telegram {code}: {snippet}"
-                )))
-            }
+            403 => Err(AdapterError::InvalidRecipient(format!(
+                "telegram {code}: {snippet}"
+            ))),
+            400 if snippet.contains("chat not found") => Err(AdapterError::InvalidRecipient(
+                format!("telegram {code}: {snippet}"),
+            )),
             _ => Err(AdapterError::Server(format!("telegram {code}: {snippet}"))),
         }
     }

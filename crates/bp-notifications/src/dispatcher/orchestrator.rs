@@ -2,27 +2,29 @@
 
 use std::sync::Arc;
 
-use bp_common::{short_address, AddressId};
+use bp_common::{short_address, AddressId, MiningMode};
 use bp_db::{
-    delete_push_subscription_by_endpoint, find_address_email, find_ntfy_subscription_by_address,
-    find_push_subscriptions_by_address, find_telegram_subscriptions_by_address,
-    find_telegram_subscriptions_by_chat, update_push_subscription_last_notification, DbError,
-    NtfySubscriptionRow, PushSubscriptionRow, TelegramSubscriptionRow,
+    delete_push_subscription_by_endpoint, delete_telegram_subscriptions_by_chat,
+    find_address_email, find_ntfy_subscription_by_address, find_push_subscriptions_by_address,
+    find_telegram_subscriptions_by_address, find_telegram_subscriptions_by_chat,
+    update_push_subscription_last_notification, DbError, NtfySubscriptionRow, PushSubscriptionRow,
+    TelegramSubscriptionRow,
 };
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
 use sqlx::PgPool;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-use crate::command::ChatLanguageMap;
+use crate::command::ChatLanguages;
 
 use crate::adapter::{
-    AdapterError, FcmAdapter, NtfyAdapter, PushKind, PushPayload, SmtpAdapter, TelegramAdapter,
-    WebPushAdapter,
+    AdapterError, AdapterResult, FcmAdapter, NtfyAdapter, PushKind, PushPayload, SmtpAdapter,
+    TelegramAdapter, WebPushAdapter,
 };
 use crate::format::{
-    format_device_time, format_number_suffix, DeviceAggregateArgs, DeviceAggregateText,
-    DevicePartialArgs, DevicePartialText, DeviceStatusArgs, DeviceStatusText, Language,
+    format_device_time, format_number_suffix, format_sats, DeviceAggregateArgs,
+    DeviceAggregateText, DevicePartialArgs, DevicePartialText, DeviceStatusArgs, DeviceStatusText,
+    Language,
 };
 use crate::template::{render_join_request_admin, JoinRequestAdminContext};
 
@@ -58,6 +60,54 @@ pub struct JoinRequestNotice {
     pub group_name: String,
 }
 
+/// A found block, for the notices it sends.
+#[derive(Debug, Clone)]
+pub struct BlockFoundNotice {
+    pub height: u64,
+    pub mode: MiningMode,
+    /// The address that mined the block.
+    pub finder: AddressId,
+    /// What the block's own coinbase pays each address; empty when the
+    /// coinbase was not decoded.
+    pub paid: Vec<(AddressId, u64)>,
+}
+
+/// One address a block notice goes to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlockRecipient {
+    address: AddressId,
+    is_finder: bool,
+    paid_sats: Option<u64>,
+}
+
+impl BlockFoundNotice {
+    /// The finder first, then every other paid address once.
+    fn recipients(&self) -> Vec<BlockRecipient> {
+        let paid_to = |address: &AddressId| {
+            self.paid
+                .iter()
+                .filter(|(a, _)| a == address)
+                .map(|(_, sats)| *sats)
+                .reduce(u64::saturating_add)
+        };
+        let mut out = vec![BlockRecipient {
+            address: self.finder.clone(),
+            is_finder: true,
+            paid_sats: paid_to(&self.finder),
+        }];
+        for (address, _) in &self.paid {
+            if out.iter().all(|r| &r.address != address) {
+                out.push(BlockRecipient {
+                    address: address.clone(),
+                    is_finder: false,
+                    paid_sats: paid_to(address),
+                });
+            }
+        }
+        out
+    }
+}
+
 /// Holds the four push-style adapters + the pool for subscription
 /// lookups. Each adapter is optional so the dispatcher can be built
 /// even when some transports are disabled (no FCM service account, no
@@ -68,7 +118,7 @@ pub struct NotificationDispatcher {
     ntfy: Option<Arc<NtfyAdapter>>,
     fcm: Option<Arc<FcmAdapter>>,
     web_push: Option<Arc<WebPushAdapter>>,
-    chat_languages: ChatLanguageMap,
+    chat_languages: ChatLanguages,
     /// Mails a Team admin who follows the Team on no push channel.
     smtp: Option<Arc<SmtpAdapter>>,
     /// Base of the links in a join-request notice; without it the notice
@@ -83,7 +133,7 @@ impl NotificationDispatcher {
         ntfy: Option<Arc<NtfyAdapter>>,
         fcm: Option<Arc<FcmAdapter>>,
         web_push: Option<Arc<WebPushAdapter>>,
-        chat_languages: ChatLanguageMap,
+        chat_languages: ChatLanguages,
     ) -> Self {
         Self {
             pool,
@@ -111,45 +161,55 @@ impl NotificationDispatcher {
 
     // ── Public engine entry points ──────────────────────────────────
 
-    /// `address` finds a block. Fans out short "Block found / Block
-    /// gefunden" notifications to all Telegram + ntfy + push
-    /// subscribers of that address.
-    pub async fn notify_block_found(&self, address: &AddressId, height: u64, message: &str) {
-        let (telegram_subs, ntfy_sub, push_subs) = self.load_subs(address).await;
+    /// A block was found. The finder and every address its coinbase pays
+    /// hear about it on each channel they follow, the paid ones with their
+    /// amount. Recipients go one after another, which keeps a large PPLNS
+    /// payout list under Telegram's send rate.
+    pub async fn notify_block_found(&self, notice: &BlockFoundNotice) {
+        for recipient in notice.recipients() {
+            self.notify_block_recipient(notice, &recipient).await;
+        }
+    }
+
+    async fn notify_block_recipient(&self, notice: &BlockFoundNotice, recipient: &BlockRecipient) {
+        let (telegram_subs, ntfy_sub, push_subs) = self.load_subs(&recipient.address).await;
 
         let mut tasks = Vec::new();
-        if !telegram_subs.is_empty() {
-            if let Some(adapter) = &self.telegram {
-                tasks.push(Box::pin(send_telegram_block_found(
-                    Arc::clone(adapter),
-                    self.chat_languages.clone(),
-                    telegram_subs,
-                    height,
-                    message.to_string(),
-                )) as TaskFuture);
-            }
-        }
-        if let (Some(sub), Some(adapter)) = (ntfy_sub.as_ref(), &self.ntfy) {
-            tasks.push(Box::pin(send_ntfy_block_found(
+        let telegram_subs: Vec<_> = telegram_subs
+            .into_iter()
+            .filter(|s| s.block_notifications_enabled)
+            .collect();
+        if let (false, Some(adapter)) = (telegram_subs.is_empty(), &self.telegram) {
+            tasks.push(Box::pin(send_telegram_block_found(
                 Arc::clone(adapter),
-                sub.address.as_str().to_string(),
-                height,
-                message.to_string(),
+                self.pool.clone(),
+                self.chat_languages.clone(),
+                telegram_subs,
+                notice.clone(),
+                recipient.clone(),
             )) as TaskFuture);
         }
+        if let (Some(sub), Some(adapter)) = (ntfy_sub, &self.ntfy) {
+            let body = block_found_text(Language::parse(&sub.language), notice, recipient);
+            let adapter = Arc::clone(adapter);
+            tasks.push(Box::pin(async move {
+                log_adapter_send(
+                    "ntfy-block",
+                    adapter.publish(sub.address.as_str(), &body).await,
+                );
+            }) as TaskFuture);
+        }
         let push_block: Vec<_> = push_subs
-            .iter()
+            .into_iter()
             .filter(|s| s.block_notifications_enabled)
-            .cloned()
             .collect();
         if !push_block.is_empty() {
-            tasks.push(Box::pin(send_push_block_found(
+            tasks.push(Box::pin(fan_push(
                 self.clone_push_handles(),
                 self.pool.clone(),
-                address.clone(),
+                recipient.address.clone(),
                 push_block,
-                height,
-                message.to_string(),
+                block_found_push_payload(notice, recipient),
             )) as TaskFuture);
         }
 
@@ -228,6 +288,7 @@ impl NotificationDispatcher {
         if let (false, Some(adapter)) = (route.telegram.is_empty(), &self.telegram) {
             tasks.push(Box::pin(send_telegram_join_request(
                 Arc::clone(adapter),
+                self.pool.clone(),
                 self.chat_languages.clone(),
                 route.telegram,
                 notice.group_name.clone(),
@@ -350,7 +411,7 @@ impl NotificationDispatcher {
         telegram: impl FnOnce(
             Arc<TelegramAdapter>,
             PgPool,
-            ChatLanguageMap,
+            ChatLanguages,
             Vec<TelegramSubscriptionRow>,
         ) -> TaskFuture,
         fcm_payload: impl FnOnce() -> PushPayload,
@@ -524,35 +585,72 @@ fn route_join_request(
 
 async fn send_telegram_block_found(
     adapter: Arc<TelegramAdapter>,
-    chat_languages: ChatLanguageMap,
+    pool: PgPool,
+    chat_languages: ChatLanguages,
     subs: Vec<TelegramSubscriptionRow>,
-    height: u64,
-    message: String,
+    notice: BlockFoundNotice,
+    recipient: BlockRecipient,
 ) {
-    let tasks = subs.into_iter().map(|sub| {
-        let adapter = Arc::clone(&adapter);
-        let chat_languages = chat_languages.clone();
-        let message = message.clone();
-        async move {
-            let lang = chat_language(&chat_languages, sub.telegram_chat_id).await;
-            let text = if matches!(lang, Language::De) {
-                format!("Block gefunden! Result: {message}, Höhe: {height}")
-            } else {
-                format!("Block found! Result: {message}, Height: {height}")
-            };
-            log_adapter_send(
-                "telegram-block",
-                adapter.send_text(sub.telegram_chat_id, &text).await,
-            );
-        }
+    let (adapter, pool, chat_languages, notice, recipient) =
+        (&adapter, &pool, &chat_languages, &notice, &recipient);
+    let tasks = subs.into_iter().map(|sub| async move {
+        let lang = chat_languages.get(sub.telegram_chat_id).await;
+        let text = block_found_text(lang, notice, recipient);
+        settle_telegram_push(
+            pool,
+            sub.telegram_chat_id,
+            "telegram-block",
+            adapter.send_text(sub.telegram_chat_id, &text).await,
+        )
+        .await;
     });
     join_all(tasks).await;
+}
+
+/// The block notice for one recipient: who found it, and what the coinbase
+/// pays this address.
+fn block_found_text(
+    lang: Language,
+    notice: &BlockFoundNotice,
+    recipient: &BlockRecipient,
+) -> String {
+    let height = notice.height;
+    let short = short_address(recipient.address.as_str());
+    let mode = match notice.mode {
+        MiningMode::Solo => "Solo",
+        MiningMode::Pplns => "PPLNS",
+        MiningMode::GroupSolo => "Team",
+        MiningMode::Blockparty => "Blockparty",
+    };
+    let head = match (lang, recipient.is_finder) {
+        (Language::De, true) => {
+            format!("\u{1f389} Block {height} gefunden, von deinem Miner! ({mode})")
+        }
+        (Language::De, false) => format!("\u{1f389} {mode}-Block {height} gefunden!"),
+        (Language::En, true) => format!("\u{1f389} Block {height} found by your miner! ({mode})"),
+        (Language::En, false) => format!("\u{1f389} {mode} block {height} found!"),
+    };
+    let detail = match (lang, recipient.paid_sats) {
+        (Language::De, Some(sats)) => format!(
+            "Die Coinbase zahlt {} sats an {short}, sofern der Block in der Chain \
+             bleibt; ausgeben lässt es sich nach 100 Bestätigungen.",
+            format_sats(sats as i64)
+        ),
+        (Language::De, None) => format!("Adresse: {short}"),
+        (Language::En, Some(sats)) => format!(
+            "The coinbase pays {} sats to {short} if the block stays in the chain; \
+             it is spendable after 100 confirmations.",
+            format_sats(sats as i64)
+        ),
+        (Language::En, None) => format!("Address: {short}"),
+    };
+    format!("{head}\n{detail}")
 }
 
 async fn send_telegram_best_diff(
     adapter: Arc<TelegramAdapter>,
     pool: PgPool,
-    chat_languages: ChatLanguageMap,
+    chat_languages: ChatLanguages,
     address: AddressId,
     subs: Vec<TelegramSubscriptionRow>,
     formatted: String,
@@ -564,7 +662,7 @@ async fn send_telegram_best_diff(
         let formatted = formatted.clone();
         let address = address.clone();
         async move {
-            let lang = chat_language(&chat_languages, sub.telegram_chat_id).await;
+            let lang = chat_languages.get(sub.telegram_chat_id).await;
             let chat_count = count_chat_subscriptions(&pool, sub.telegram_chat_id).await;
             let include_address = chat_count > 1;
             let fmt_addr = short_address(address.as_str());
@@ -582,10 +680,13 @@ async fn send_telegram_best_diff(
                     format!("\u{1f3c6} New best difficulty for your address!\nValue: {formatted}")
                 }
             };
-            log_adapter_send(
+            settle_telegram_push(
+                &pool,
+                sub.telegram_chat_id,
                 "telegram-best-diff",
                 adapter.send_text(sub.telegram_chat_id, &text).await,
-            );
+            )
+            .await;
         }
     });
     join_all(tasks).await;
@@ -594,7 +695,7 @@ async fn send_telegram_best_diff(
 async fn send_telegram_device_status(
     adapter: Arc<TelegramAdapter>,
     pool: PgPool,
-    chat_languages: ChatLanguageMap,
+    chat_languages: ChatLanguages,
     event: DeviceStatusEvent,
     subs: Vec<TelegramSubscriptionRow>,
 ) {
@@ -630,7 +731,7 @@ async fn send_telegram_device_status(
 async fn send_telegram_device(
     adapter: Arc<TelegramAdapter>,
     pool: PgPool,
-    chat_languages: ChatLanguageMap,
+    chat_languages: ChatLanguages,
     address: &AddressId,
     timestamp: DateTime<Utc>,
     subs: Vec<TelegramSubscriptionRow>,
@@ -641,7 +742,7 @@ async fn send_telegram_device(
     let (adapter, pool, chat_languages, fmt_addr, render) =
         (&adapter, &pool, &chat_languages, &fmt_addr, &render);
     let tasks = subs.into_iter().map(|sub| async move {
-        let lang = chat_language(chat_languages, sub.telegram_chat_id).await;
+        let lang = chat_languages.get(sub.telegram_chat_id).await;
         let chat_count = count_chat_subscriptions(pool, sub.telegram_chat_id).await;
         let time_str = format_device_time(DEVICE_TIMEZONE, timestamp, lang);
         let suffix = (chat_count > 1).then(|| match lang {
@@ -649,7 +750,13 @@ async fn send_telegram_device(
             Language::En => format!(" – address {fmt_addr}"),
         });
         let text = render(lang, &time_str, suffix.as_deref());
-        log_adapter_send(label, adapter.send_text(sub.telegram_chat_id, &text).await);
+        settle_telegram_push(
+            pool,
+            sub.telegram_chat_id,
+            label,
+            adapter.send_text(sub.telegram_chat_id, &text).await,
+        )
+        .await;
     });
     join_all(tasks).await;
 }
@@ -657,7 +764,7 @@ async fn send_telegram_device(
 async fn send_telegram_device_partial(
     adapter: Arc<TelegramAdapter>,
     pool: PgPool,
-    chat_languages: ChatLanguageMap,
+    chat_languages: ChatLanguages,
     partial: DevicePartial,
     subs: Vec<TelegramSubscriptionRow>,
 ) {
@@ -752,7 +859,7 @@ fn device_partial_unified_payload(partial: &DevicePartial) -> PushPayload {
 async fn send_telegram_device_aggregate(
     adapter: Arc<TelegramAdapter>,
     pool: PgPool,
-    chat_languages: ChatLanguageMap,
+    chat_languages: ChatLanguages,
     agg: DeviceAggregate,
     subs: Vec<TelegramSubscriptionRow>,
 ) {
@@ -853,16 +960,6 @@ fn device_aggregate_unified_payload(agg: &DeviceAggregate) -> PushPayload {
     }
 }
 
-async fn send_ntfy_block_found(
-    adapter: Arc<NtfyAdapter>,
-    address: String,
-    height: u64,
-    message: String,
-) {
-    let body = format!("Block found! Result: {message}, Height: {height}");
-    log_adapter_send("ntfy-block", adapter.publish(&address, &body).await);
-}
-
 async fn send_ntfy_best_diff(
     adapter: Arc<NtfyAdapter>,
     address: String,
@@ -876,23 +973,21 @@ async fn send_ntfy_best_diff(
     log_adapter_send("ntfy-best-diff", adapter.publish(&address, &body).await);
 }
 
-async fn send_push_block_found(
-    handles: PushHandles,
-    pool: PgPool,
-    address: AddressId,
-    subs: Vec<PushSubscriptionRow>,
-    height: u64,
-    message: String,
-) {
-    let difficulty = extract_difficulty_tag(&message);
-    let payload = PushPayload {
+/// Push payload for a block notice. Title, body and `tag` (FCM's
+/// `data.difficulty`) keep the shape shipped clients read; the amount rides
+/// in `paidSats`.
+fn block_found_push_payload(notice: &BlockFoundNotice, recipient: &BlockRecipient) -> PushPayload {
+    let mut extras = vec![("height".into(), notice.height.to_string())];
+    if let Some(sats) = recipient.paid_sats {
+        extras.push(("paidSats".into(), sats.to_string()));
+    }
+    PushPayload {
         kind: PushKind::BlockFound,
         title: "New Block Found!".to_string(),
-        body: format!("Block height {height}"),
-        tag: difficulty,
-        extras: vec![("height".into(), height.to_string())],
-    };
-    fan_push(handles, pool, address, subs, payload).await;
+        body: format!("Block height {}", notice.height),
+        tag: "Unknown".to_string(),
+        extras,
+    }
 }
 
 async fn send_push_best_diff(
@@ -1007,7 +1102,8 @@ fn join_request_text(lang: Language, group_name: &str, admin_url: Option<&str>) 
 
 async fn send_telegram_join_request(
     adapter: Arc<TelegramAdapter>,
-    chat_languages: ChatLanguageMap,
+    pool: PgPool,
+    chat_languages: ChatLanguages,
     subs: Vec<TelegramSubscriptionRow>,
     group_name: String,
     admin_url: Option<String>,
@@ -1017,13 +1113,17 @@ async fn send_telegram_join_request(
         let chat_languages = chat_languages.clone();
         let group_name = group_name.clone();
         let admin_url = admin_url.clone();
+        let pool = pool.clone();
         async move {
-            let lang = chat_language(&chat_languages, sub.telegram_chat_id).await;
+            let lang = chat_languages.get(sub.telegram_chat_id).await;
             let text = join_request_text(lang, &group_name, admin_url.as_deref());
-            log_adapter_send(
+            settle_telegram_push(
+                &pool,
+                sub.telegram_chat_id,
                 "telegram-join-request",
                 adapter.send_text(sub.telegram_chat_id, &text).await,
-            );
+            )
+            .await;
         }
     });
     join_all(tasks).await;
@@ -1140,10 +1240,6 @@ pub(crate) async fn push_web(
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-async fn chat_language(map: &ChatLanguageMap, chat_id: i64) -> Language {
-    map.lock().await.get(&chat_id).copied().unwrap_or_default()
-}
-
 async fn count_chat_subscriptions(pool: &PgPool, chat_id: i64) -> usize {
     match find_telegram_subscriptions_by_chat(pool, chat_id).await {
         Ok(rows) => rows.len(),
@@ -1152,30 +1248,6 @@ async fn count_chat_subscriptions(pool: &PgPool, chat_id: i64) -> usize {
             0
         }
     }
-}
-
-fn extract_difficulty_tag(message: &str) -> String {
-    // The BlockSubmitted hook formats its result message as `valid (158T)`
-    // etc. Pull the bracketed token out for the data.difficulty field.
-    let bytes = message.as_bytes();
-    let mut start: Option<usize> = None;
-    for (i, ch) in bytes.iter().enumerate() {
-        if *ch == b'(' {
-            start = Some(i + 1);
-        } else if *ch == b')' {
-            if let Some(s) = start {
-                let candidate = &message[s..i];
-                if candidate
-                    .chars()
-                    .all(|c| c.is_ascii_digit() || c == '.' || matches!(c, 'K' | 'M' | 'G' | 'T'))
-                {
-                    return candidate.to_string();
-                }
-                start = None;
-            }
-        }
-    }
-    "Unknown".to_string()
 }
 
 async fn soft_delete_push(pool: &PgPool, address: &AddressId, endpoint: &str) {
@@ -1191,6 +1263,34 @@ async fn bump_last_notification(pool: &PgPool, id: i32) {
     }
 }
 
+/// Log a failed Telegram push. A chat Telegram reports as gone loses its
+/// subscriptions, so nothing is sent to it again.
+pub(crate) async fn settle_telegram_push(
+    pool: &PgPool,
+    chat_id: i64,
+    kind: &'static str,
+    result: AdapterResult<()>,
+) {
+    match result {
+        Ok(()) => {}
+        Err(AdapterError::InvalidRecipient(reason)) => {
+            match delete_telegram_subscriptions_by_chat(pool, chat_id).await {
+                Ok(removed) => info!(
+                    target: "bp_notifications::dispatcher",
+                    chat_id, removed, %reason, "telegram chat gone, subscriptions removed"
+                ),
+                Err(e) => warn!(
+                    target: "bp_notifications::dispatcher",
+                    error = %e, chat_id, "telegram chat gone, removing subscriptions failed"
+                ),
+            }
+        }
+        Err(e) => {
+            warn!(target: "bp_notifications::dispatcher", adapter = kind, chat_id, error = %e, "send failed")
+        }
+    }
+}
+
 fn log_adapter_send(kind: &'static str, result: Result<(), AdapterError>) {
     if let Err(e) = result {
         warn!(target: "bp_notifications::dispatcher", adapter = kind, error = %e, "send failed");
@@ -1201,16 +1301,75 @@ fn log_adapter_send(kind: &'static str, result: Result<(), AdapterError>) {
 mod tests {
     use super::*;
 
+    fn addr(s: &str) -> AddressId {
+        AddressId::new(s).unwrap()
+    }
+
+    /// The finder comes first even when its coinbase pays it nothing, and a
+    /// script paid twice is one recipient with the sum.
     #[test]
-    fn extract_difficulty_picks_bracketed_token() {
-        assert_eq!(extract_difficulty_tag("valid (158T)"), "158T");
-        assert_eq!(extract_difficulty_tag("rejected (12.5G)"), "12.5G");
+    fn block_recipients_are_the_finder_and_every_paid_address() {
+        let notice = BlockFoundNotice {
+            height: 900_000,
+            mode: MiningMode::Pplns,
+            finder: addr("bc1qfinder"),
+            paid: vec![
+                (addr("bc1qalice"), 1_000),
+                (addr("bc1qbob"), 2_000),
+                (addr("bc1qalice"), 500),
+            ],
+        };
+        assert_eq!(
+            notice.recipients(),
+            vec![
+                BlockRecipient {
+                    address: addr("bc1qfinder"),
+                    is_finder: true,
+                    paid_sats: None,
+                },
+                BlockRecipient {
+                    address: addr("bc1qalice"),
+                    is_finder: false,
+                    paid_sats: Some(1_500),
+                },
+                BlockRecipient {
+                    address: addr("bc1qbob"),
+                    is_finder: false,
+                    paid_sats: Some(2_000),
+                },
+            ]
+        );
+        let solo = BlockFoundNotice {
+            mode: MiningMode::Solo,
+            paid: vec![(addr("bc1qfinder"), 312_500_000)],
+            ..notice
+        };
+        assert_eq!(
+            solo.recipients(),
+            vec![BlockRecipient {
+                address: addr("bc1qfinder"),
+                is_finder: true,
+                paid_sats: Some(312_500_000),
+            }]
+        );
     }
 
     #[test]
-    fn extract_difficulty_returns_unknown_if_no_bracketed_match() {
-        assert_eq!(extract_difficulty_tag("no parens here"), "Unknown");
-        assert_eq!(extract_difficulty_tag("(not a difficulty)"), "Unknown");
+    fn a_block_notice_names_the_finder_and_the_amount_in_one_language() {
+        let notice = BlockFoundNotice {
+            height: 973_944,
+            mode: MiningMode::GroupSolo,
+            finder: addr("bc1qfinderaddressxxxxxxxx"),
+            paid: vec![(addr("bc1qmemberaddressxxxxxxxx"), 1_234_567)],
+        };
+        let [finder, member] = <[BlockRecipient; 2]>::try_from(notice.recipients()).unwrap();
+        let de = block_found_text(Language::De, &notice, &member);
+        assert!(de.contains("Team-Block 973944 gefunden"), "{de}");
+        assert!(de.contains("1,234,567 sats"), "{de}");
+        assert!(!de.contains("found"), "no English in the German text: {de}");
+        let en = block_found_text(Language::En, &notice, &finder);
+        assert!(en.contains("Block 973944 found by your miner"), "{en}");
+        assert_eq!(en.matches("973944").count(), 1, "{en}");
     }
 
     /// Push routing matches the stored lowercase `subscriptionType` in any casing.
@@ -1402,6 +1561,7 @@ mod tests {
             hourly_stats_enabled: false,
             hourly_workers_enabled: false,
             group_admin_notifications_enabled: group_admin,
+            block_notifications_enabled: true,
         }
     }
 

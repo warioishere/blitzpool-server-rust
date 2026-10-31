@@ -12,7 +12,7 @@ use bp_notifications::adapter::{
     AdapterError, NtfyAdapter, NtfyConfig as AdapterNtfyConfig, TelegramAdapter,
     TelegramConfig as AdapterTelegramConfig,
 };
-use bp_notifications::command::{register_command_menu, ChatLanguageMap, CommandHandler};
+use bp_notifications::command::{register_command_menu, ChatLanguages, CommandHandler};
 use bp_notifications::listener::{
     spawn_ntfy_listener, spawn_telegram_listener, NtfyListenerConfig, TelegramListenerConfig,
 };
@@ -36,9 +36,9 @@ struct Inner {
     ntfy_adapter: Option<Arc<NtfyAdapter>>,
     telegram_shutdown: Option<watch::Sender<bool>>,
     ntfy_shutdown: Option<watch::Sender<bool>>,
-    /// The `CommandHandler`'s per-chat Telegram language map, shared so
-    /// the hourly-stats cron renders each chat's digest in its language.
-    chat_languages: ChatLanguageMap,
+    /// The `CommandHandler`'s Telegram chat languages, shared so every
+    /// sender reads the same cache the commands write.
+    chat_languages: ChatLanguages,
 }
 
 impl ListenerHandles {
@@ -58,9 +58,8 @@ impl ListenerHandles {
         self.inner.as_ref().and_then(|i| i.ntfy_adapter.clone())
     }
 
-    /// Shared per-chat language map, so the hourly digest honours each
-    /// chat's language.
-    pub(crate) fn chat_languages(&self) -> Option<ChatLanguageMap> {
+    /// The handler's Telegram chat languages, `None` without listeners.
+    pub(crate) fn chat_languages(&self) -> Option<ChatLanguages> {
         self.inner.as_ref().map(|i| i.chat_languages.clone())
     }
 
@@ -127,13 +126,19 @@ pub(crate) fn spawn(
     // One handler for both listeners; it replies over the transport the
     // command arrived on.
     let handler = Arc::new(
-        CommandHandler::new(pool.clone(), telegram_adapter.clone(), ntfy_adapter.clone())
-            .with_redis(Some(foundation.redis.clone()))
-            .with_engines(
-                engines.pplns.clone().map(Arc::new),
-                engines.group_solo.clone().map(Arc::new),
-            )
-            .with_ntfy_reconnect(ntfy_reconnect.clone()),
+        CommandHandler::new(
+            pool.clone(),
+            crate::boot::bitcoin_network(cfg.network),
+            telegram_adapter.clone(),
+            ntfy_adapter.clone(),
+        )
+        .with_redis(Some(foundation.redis.clone()))
+        .with_pool_base_url(cfg.pool_base_url.clone())
+        .with_engines(
+            engines.pplns.clone().map(Arc::new),
+            engines.group_solo.clone().map(Arc::new),
+        )
+        .with_ntfy_reconnect(ntfy_reconnect.clone()),
     );
 
     let telegram_shutdown = telegram_adapter.as_ref().map(|adapter| {

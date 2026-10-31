@@ -15,7 +15,7 @@ use bp_common::{AddressId, MiningMode, StreamKind};
 use bp_config::{AppConfig, Role};
 use bp_group_solo_engine::engine::GroupSoloEngine;
 use bp_mining_mode::MiningModeResult;
-use bp_notifications::dispatcher::NotificationDispatcher;
+use bp_notifications::dispatcher::{BlockFoundNotice, NotificationDispatcher};
 use bp_pplns_engine::engine::PplnsEngine;
 use bp_share_stream::{StreamProducer, BLOCK_FOUND_STREAM_KEY};
 use bp_stratum_v1::{BlockSubmissionSink as Sv1BlockSubmissionSink, ShareAccept as Sv1ShareAccept};
@@ -794,7 +794,7 @@ impl BlockFoundApplier {
             return;
         };
         let address_str = event.address.as_str();
-        let address = match AddressId::new(address_str.to_string()) {
+        let finder = match AddressId::new(address_str.to_string()) {
             Ok(a) => a,
             Err(err) => {
                 warn!(
@@ -806,13 +806,30 @@ impl BlockFoundApplier {
             }
         };
         let height = event.height;
-        let message = format!("Block {height} found");
-        dispatcher
-            .notify_block_found(&address, height as u64, &message)
-            .await;
+        // What the coinbase paid, so each payee hears its own amount.
+        let paid = event
+            .actual_coinbase
+            .as_ref()
+            .map(|actual| {
+                actual
+                    .paid_by_address
+                    .iter()
+                    .filter_map(|(a, sats)| Some((AddressId::new(a.clone()).ok()?, *sats)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let notice = BlockFoundNotice {
+            height: height as u64,
+            mode: event.mode,
+            finder,
+            paid,
+        };
+        dispatcher.notify_block_found(&notice).await;
         info!(
             address = address_str,
-            height, "block-found: notifications fanned out"
+            height,
+            payees = notice.paid.len(),
+            "block-found: notifications fanned out"
         );
     }
 }

@@ -1,21 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Dispatch a parsed [`Command`] against bp-db and reply on the transport it came in on.
-//!
-//! Telegram chat languages are not persisted; they live in a process-lifetime
-//! map shared with the hourly-stats cron.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use bitcoin::Network;
 use bp_common::AddressId;
 use bp_db::{
     delete_ntfy_subscription_by_address, delete_telegram_subscription_by_chat_address,
     find_ntfy_subscription_by_address, find_telegram_subscriptions_by_chat,
-    promote_telegram_default_if_none, reset_address_settings_best_difficulty,
-    set_telegram_default_subscription, set_telegram_hourly_flags, update_ntfy_sub_best_diff_flag,
-    update_ntfy_sub_device_flag, update_ntfy_sub_group_admin_flag, update_ntfy_sub_hourly_flags,
-    update_ntfy_sub_language, update_telegram_sub_best_diff_flag, update_telegram_sub_device_flag,
+    promote_telegram_default_if_none, set_telegram_default_subscription, set_telegram_hourly_flags,
+    update_ntfy_sub_best_diff_flag, update_ntfy_sub_device_flag, update_ntfy_sub_group_admin_flag,
+    update_ntfy_sub_hourly_flags, update_ntfy_sub_language, update_telegram_sub_best_diff_flag,
+    update_telegram_sub_block_flag, update_telegram_sub_device_flag,
     update_telegram_sub_group_admin_flag, upsert_ntfy_subscription, upsert_telegram_subscription,
     TelegramSubscriptionRow,
 };
@@ -23,20 +21,16 @@ use sqlx::PgPool;
 use tokio::sync::{Mutex, Notify};
 use tracing::warn;
 
+use super::chat_language::ChatLanguages;
 use super::parser::{
-    parse_address_callback, parse_bestdiff_callback, parse_hourly_callback, AddressCallback,
-    Command, FlagToggle, HourlyTarget, LanguageSwitch,
+    parse_address_callback, parse_settings_callback, AddressCallback, Command, FlagToggle,
+    LanguageSwitch, ReadCommand, SettingsCallback, SettingsField, Switch,
 };
 use crate::adapter::{
     AdapterError, AdapterResult, InlineButton, InlineKeyboard, NtfyAdapter, TelegramAdapter,
 };
 use crate::format::Language;
 use bp_common::short_address;
-
-/// Shared, process-lifetime map of Telegram `chat_id` → chosen
-/// [`Language`]. Owned by [`CommandHandler`] and handed to the
-/// hourly-stats cron so both render in the chat's chosen language.
-pub type ChatLanguageMap = Arc<Mutex<HashMap<i64, Language>>>;
 
 /// Which transport the incoming command was received on. Doubles as
 /// reply-sink: handler dispatches reply text to the matching adapter.
@@ -46,13 +40,8 @@ pub enum Transport {
     Ntfy { address: AddressId },
 }
 
-/// A `/bestdiff_reset` confirmation awaiting the user's yes/no tap,
-/// keyed by `"chat_id:message_id"`. Expires so a stale prompt can't
-/// reset much later.
-struct PendingBestdiffReset {
-    address: AddressId,
-    expires_at_ms: i64,
-}
+/// How long a `/subscribe` question takes an answer.
+const QUESTION_TTL_MS: i64 = 10 * 60 * 1000;
 
 pub struct CommandHandler {
     pool: PgPool,
@@ -64,9 +53,14 @@ pub struct CommandHandler {
     ntfy: Option<Arc<NtfyAdapter>>,
     pplns_engine: Option<Arc<bp_pplns_engine::engine::PplnsEngine>>,
     group_solo_engine: Option<Arc<bp_group_solo_engine::engine::GroupSoloEngine>>,
-    chat_languages: Arc<Mutex<HashMap<i64, Language>>>,
-    /// In-flight `/bestdiff_reset` confirmations, keyed `"chat:message"`.
-    pending_bestdiff_resets: Arc<Mutex<HashMap<String, PendingBestdiffReset>>>,
+    /// The network an address must belong to before the bot stores or
+    /// reads it.
+    network: Network,
+    chat_languages: ChatLanguages,
+    /// The UI's base URL, for links into an address's dashboard.
+    pool_base_url: Option<String>,
+    /// Open `/subscribe` questions, `(chat_id, message_id)` → expiry in ms.
+    subscribe_questions: Arc<Mutex<HashMap<(i64, i64), i64>>>,
     /// Signalled when an ntfy `/subscribe` or `/remove` changes the
     /// subscription set, so the SSE listener reconnects with the new
     /// topic list at once. `None` when no ntfy listener is wired.
@@ -80,20 +74,30 @@ impl CommandHandler {
     /// engine handles.
     pub fn new(
         pool: PgPool,
+        network: Network,
         telegram: Option<Arc<TelegramAdapter>>,
         ntfy: Option<Arc<NtfyAdapter>>,
     ) -> Self {
         Self {
+            chat_languages: ChatLanguages::new(pool.clone()),
             pool,
             redis: None,
             telegram,
             ntfy,
             pplns_engine: None,
             group_solo_engine: None,
-            chat_languages: Arc::new(Mutex::new(HashMap::new())),
-            pending_bestdiff_resets: Arc::new(Mutex::new(HashMap::new())),
+            network,
+            pool_base_url: None,
+            subscribe_questions: Arc::new(Mutex::new(HashMap::new())),
             ntfy_reconnect: None,
         }
+    }
+
+    /// Attach the UI's base URL, so `/bestdiff_reset` can link the
+    /// dashboard.
+    pub fn with_pool_base_url(mut self, pool_base_url: Option<String>) -> Self {
+        self.pool_base_url = pool_base_url;
+        self
     }
 
     /// Attach the Redis handle the live-hashrate read commands need.
@@ -130,26 +134,17 @@ impl CommandHandler {
         self
     }
 
-    /// Shared handle to the in-memory per-chat Telegram language map.
-    /// The hourly-stats cron clones this so it renders each chat's
-    /// digest in the language that chat picked via `/deutsch` /
-    /// `/english` (same process, same map this handler writes).
-    pub fn chat_languages(&self) -> ChatLanguageMap {
+    /// The Telegram chat languages this handler writes, for the senders
+    /// that reply in them.
+    pub fn chat_languages(&self) -> ChatLanguages {
         self.chat_languages.clone()
     }
 
-    /// Resolve language for the originating transport. Telegram is
-    /// in-memory only (defaults to English on first contact). ntfy
-    /// comes from `ntfy_subscriptions_entity.language`.
+    /// Resolve language for the originating transport: the chat's stored
+    /// language for Telegram, `ntfy_subscriptions_entity.language` for ntfy.
     async fn language(&self, transport: &Transport) -> Language {
         match transport {
-            Transport::Telegram { chat_id } => self
-                .chat_languages
-                .lock()
-                .await
-                .get(chat_id)
-                .copied()
-                .unwrap_or_default(),
+            Transport::Telegram { chat_id } => self.chat_languages.get(*chat_id).await,
             Transport::Ntfy { address } => {
                 match find_ntfy_subscription_by_address(&self.pool, address).await {
                     Ok(Some(row)) => Language::parse(&row.language),
@@ -157,10 +152,6 @@ impl CommandHandler {
                 }
             }
         }
-    }
-
-    async fn set_language_in_memory(&self, chat_id: i64, lang: Language) {
-        self.chat_languages.lock().await.insert(chat_id, lang);
     }
 
     async fn reply(&self, transport: &Transport, text: &str) -> AdapterResult<()> {
@@ -187,17 +178,16 @@ impl CommandHandler {
         // `reply_markup`) instead of a plain-text reply.
         if let Transport::Telegram { chat_id } = transport {
             match command {
-                Command::ShowAddresses => {
+                Command::ShowAddresses | Command::Remove { address: None } => {
                     self.send_address_keyboard(*chat_id, lang).await;
                     return;
                 }
-                Command::HourlyMenu => {
-                    self.send_hourly_menu(*chat_id, lang).await;
+                Command::Settings => {
+                    self.send_settings(*chat_id, lang).await;
                     return;
                 }
-                Command::BestDiffReset { address } => {
-                    self.send_bestdiff_confirm(*chat_id, lang, address.as_deref())
-                        .await;
+                Command::Subscribe { address: None } => {
+                    self.ask_for_address(*chat_id, lang).await;
                     return;
                 }
                 _ => {}
@@ -205,42 +195,47 @@ impl CommandHandler {
         }
         let reply = match command {
             Command::Start => self.handle_start(transport, lang).await,
-            Command::Help => help_text(lang).to_string(),
-            Command::Subscribe { address } => self.handle_subscribe(transport, lang, address).await,
-            Command::Remove { address } => self.handle_remove(transport, lang, address).await,
+            Command::Help => super::help_text(lang),
+            Command::Subscribe {
+                address: Some(address),
+            } => self.handle_subscribe(transport, lang, address).await,
+            // Telegram asks for the address above (early return).
+            Command::Subscribe { address: None } => subscribe_usage_text(lang).to_string(),
+            Command::Remove {
+                address: Some(address),
+            } => self.handle_remove(transport, lang, address).await,
+            // Telegram offers the address keyboard above (early return);
+            // an ntfy topic removes itself by name.
+            Command::Remove { address: None } => remove_usage_text(lang).to_string(),
             Command::ShowAddresses => self.handle_show_addresses(transport, lang).await,
-            Command::BestDiffToggle(toggle) => {
-                self.handle_flag_toggle(transport, lang, FlagKind::BestDiff, *toggle)
-                    .await
-            }
-            Command::DeviceToggle(toggle) => {
-                self.handle_flag_toggle(transport, lang, FlagKind::Device, *toggle)
-                    .await
-            }
-            Command::TeamRequestsToggle(toggle) => {
-                self.handle_flag_toggle(transport, lang, FlagKind::GroupAdmin, *toggle)
-                    .await
-            }
-            Command::HourlyToggle(toggle) => {
-                self.handle_flag_toggle(transport, lang, FlagKind::Hourly, *toggle)
-                    .await
-            }
-            // Telegram opens the inline menu above (early return). Other
-            // transports have no inline keyboard — point at the toggle.
-            Command::HourlyMenu => match lang {
-                Language::De => {
-                    "Nutze /send_hourly on|off, um stündliche Berichte zu schalten.".to_string()
+            Command::Settings => match transport {
+                Transport::Ntfy { address } => self.ntfy_settings_text(address, lang).await,
+                Transport::Telegram { .. } => {
+                    unreachable!("Telegram gets the settings keyboard above")
                 }
-                Language::En => "Use /send_hourly on|off to toggle hourly reports.".to_string(),
             },
-            Command::BestDiffReset { address } => {
-                self.handle_best_diff_reset(transport, lang, address.as_deref())
+            Command::Toggle(switch, toggle) => {
+                self.handle_flag_toggle(transport, lang, *switch, *toggle)
                     .await
+            }
+            Command::BestDiffReset { address } => {
+                match self
+                    .target_address(transport, lang, address.as_deref())
+                    .await
+                {
+                    Ok(address) => {
+                        best_diff_reset_text(lang, &address, self.pool_base_url.as_deref())
+                    }
+                    Err(reply) => reply,
+                }
             }
             Command::LanguageSwitch(switch) => {
                 self.handle_language_switch(transport, *switch).await
             }
-            Command::ReadDeferred(name) => self.handle_read_deferred(transport, lang, name).await,
+            Command::Read(read, address) => {
+                self.handle_read(transport, lang, *read, address.as_deref())
+                    .await
+            }
             Command::Unknown => unknown_text(lang).to_string(),
         };
 
@@ -300,7 +295,7 @@ impl CommandHandler {
             }
         };
         if subs.is_empty() {
-            let _ = adapter.send_text(chat_id, no_addresses_text(lang)).await;
+            let _ = adapter.send_text(chat_id, no_address_text(lang)).await;
             return;
         }
         let (text, keyboard) = Self::build_address_keyboard(&subs, lang);
@@ -312,9 +307,58 @@ impl CommandHandler {
         }
     }
 
-    /// Entry point for a Telegram `callback_query` (inline-button tap).
-    /// Dispatches `addr:` taps to the address-keyboard flow; any other
-    /// payload just stops the loading spinner. Always answers the query.
+    /// Ask which address to subscribe; the answer comes back through
+    /// [`Self::answer_telegram_question`].
+    async fn ask_for_address(&self, chat_id: i64, lang: Language) {
+        let Some(adapter) = self.telegram.as_ref() else {
+            return;
+        };
+        let question = match lang {
+            Language::De => {
+                "Welche Adresse soll ich abonnieren? Antworte mit deiner Mining-Adresse."
+            }
+            Language::En => "Which address should I follow? Reply with your mining address.",
+        };
+        match adapter.send_question(chat_id, question, "bc1q...").await {
+            Ok(message_id) => {
+                let now = chrono::Utc::now().timestamp_millis();
+                let mut open = self.subscribe_questions.lock().await;
+                open.retain(|_, expires| *expires > now);
+                open.insert((chat_id, message_id), now + QUESTION_TTL_MS);
+            }
+            Err(e) => {
+                warn!(target: "bp_notifications::command", error = %e, "subscribe question: send")
+            }
+        }
+    }
+
+    /// A plain message that replies to an open `/subscribe` question is
+    /// its answer: subscribe that address. `false` when the message
+    /// answers no open question.
+    pub async fn answer_telegram_question(
+        &self,
+        chat_id: i64,
+        reply_to_message_id: i64,
+        text: &str,
+    ) -> bool {
+        let now = chrono::Utc::now().timestamp_millis();
+        let open = self
+            .subscribe_questions
+            .lock()
+            .await
+            .remove(&(chat_id, reply_to_message_id));
+        if !matches!(open, Some(expires) if expires > now) {
+            return false;
+        }
+        let address = text.split_whitespace().next().map(str::to_string);
+        let command = Command::Subscribe { address };
+        self.dispatch(&Transport::Telegram { chat_id }, &command)
+            .await;
+        true
+    }
+
+    /// Entry point for a Telegram `callback_query` (inline-button tap),
+    /// dispatched by its prefix. Always answers the query.
     pub async fn handle_telegram_callback(
         &self,
         callback_id: &str,
@@ -331,25 +375,20 @@ impl CommandHandler {
                     .await;
                 return;
             }
-            if let Some(target) = parse_hourly_callback(data) {
-                self.handle_hourly_callback(adapter, callback_id, chat_id, message_id, target)
+            if let Some(cb) = parse_settings_callback(data) {
+                self.handle_settings_callback(adapter, callback_id, chat_id, message_id, cb)
                     .await;
                 return;
             }
-            if let Some(confirm) = parse_bestdiff_callback(data) {
-                self.handle_bestdiff_reset_callback(
-                    adapter,
-                    callback_id,
-                    chat_id,
-                    message_id,
-                    confirm,
-                )
-                .await;
-                return;
-            }
         }
-        // Unknown / unsupported callback → just stop the spinner.
-        let _ = adapter.answer_callback_query(callback_id, None).await;
+        // A tap on a button no flow above handles.
+        let lang = match chat_id {
+            Some(chat_id) => self.chat_languages.get(chat_id).await,
+            None => Language::default(),
+        };
+        let _ = adapter
+            .answer_callback_query(callback_id, Some(stale_button_text(lang)))
+            .await;
     }
 
     async fn handle_address_callback(
@@ -377,14 +416,7 @@ impl CommandHandler {
         };
         let Some(target) = subs.iter().find(|s| s.id == id) else {
             let _ = adapter
-                .answer_callback_query(
-                    callback_id,
-                    Some(if de {
-                        "Adresse nicht mehr vorhanden."
-                    } else {
-                        "Address no longer exists."
-                    }),
-                )
+                .answer_callback_query(callback_id, Some(address_gone_text(lang)))
                 .await;
             return;
         };
@@ -419,22 +451,15 @@ impl CommandHandler {
                     .await;
             }
             AddressCallback::Remove(_) => {
-                if let Err(e) = delete_telegram_subscription_by_chat_address(
-                    &self.pool,
-                    chat_id,
-                    &target.address,
-                )
-                .await
+                if let Err(e) = self
+                    .remove_telegram_subscription(chat_id, &target.address)
+                    .await
                 {
                     warn!(target: "bp_notifications::command", error = %e, "addr callback: remove");
                     let _ = adapter
                         .answer_callback_query(callback_id, Some(db_error_text(lang)))
                         .await;
                     return;
-                }
-                // Make sure the chat still has a default if rows remain.
-                if let Err(e) = promote_telegram_default_if_none(&self.pool, chat_id).await {
-                    warn!(target: "bp_notifications::command", error = %e, "addr callback: re-default");
                 }
                 let toast = if de {
                     format!("{trimmed} entfernt.")
@@ -452,7 +477,7 @@ impl CommandHandler {
             .unwrap_or_default();
         if fresh.is_empty() {
             let _ = adapter
-                .edit_message_text(chat_id, message_id, no_addresses_text(lang), None)
+                .edit_message_text(chat_id, message_id, no_address_text(lang), None)
                 .await;
             return;
         }
@@ -465,285 +490,226 @@ impl CommandHandler {
         }
     }
 
-    /// Build the hourly-reports toggle menu: one row with a stats and a
-    /// workers button, each label showing the current on/off state.
-    fn build_hourly_menu(stats: bool, workers: bool, lang: Language) -> (String, InlineKeyboard) {
-        let (on, off) = match lang {
-            Language::De => ("✅ AN", "❌ AUS"),
-            Language::En => ("✅ ON", "❌ OFF"),
-        };
-        let stats_label = format!("Stats: {}", if stats { on } else { off });
-        let workers_word = if matches!(lang, Language::De) {
-            "Worker"
-        } else {
-            "Workers"
-        };
-        let workers_label = format!("{workers_word}: {}", if workers { on } else { off });
+    /// The `/settings` keyboard: per subscription a row naming the address
+    /// (⭐ on the default), then its five switches with their state.
+    fn build_settings_keyboard(
+        subs: &[TelegramSubscriptionRow],
+        lang: Language,
+    ) -> (String, InlineKeyboard) {
+        let mut sorted: Vec<&TelegramSubscriptionRow> = subs.iter().collect();
+        sorted.sort_by_key(|s| s.id);
+        let mut keyboard: InlineKeyboard = Vec::new();
+        for sub in sorted {
+            let star = if sub.is_default { "⭐ " } else { "" };
+            keyboard.push(vec![InlineButton::new(
+                format!("{star}{}", short_address(sub.address.as_str())),
+                SettingsCallback::Address(sub.id).data(),
+            )]);
+            let button = |field| {
+                let mark = if settings_field_value(sub, field) {
+                    "✅"
+                } else {
+                    "❌"
+                };
+                InlineButton::new(
+                    format!("{mark} {}", settings_field_label(lang, field)),
+                    SettingsCallback::Flip(sub.id, field).data(),
+                )
+            };
+            for row in SettingsField::ALL.chunks(3) {
+                keyboard.push(row.iter().map(|field| button(*field)).collect());
+            }
+        }
         let text = match lang {
-            Language::De => "Stündliche Berichte — tippe zum Umschalten:".to_string(),
-            Language::En => "Hourly reports — tap to toggle:".to_string(),
+            Language::De => "Benachrichtigungen pro Adresse, tippe zum Umschalten. \
+                 ✅ = an, ❌ = aus, ⭐ = Standard-Adresse"
+                .to_string(),
+            Language::En => "Notifications per address, tap to toggle. \
+                 ✅ = on, ❌ = off, ⭐ = default address"
+                .to_string(),
         };
-        let keyboard = vec![vec![
-            InlineButton::new(stats_label, "hr:stats"),
-            InlineButton::new(workers_label, "hr:workers"),
-        ]];
         (text, keyboard)
     }
 
-    /// Send the hourly-reports menu to a Telegram chat, seeded from the
-    /// chat's first subscription's current flags.
-    async fn send_hourly_menu(&self, chat_id: i64, lang: Language) {
+    /// Send the `/settings` keyboard (or a "no addresses" note).
+    async fn send_settings(&self, chat_id: i64, lang: Language) {
         let Some(adapter) = self.telegram.as_ref() else {
             return;
         };
         let subs = match find_telegram_subscriptions_by_chat(&self.pool, chat_id).await {
             Ok(v) => v,
             Err(e) => {
-                warn!(target: "bp_notifications::command", error = %e, "hourly menu: read subs");
+                warn!(target: "bp_notifications::command", error = %e, "settings: read subs");
                 let _ = adapter.send_text(chat_id, db_error_text(lang)).await;
                 return;
             }
         };
-        let Some(current) = subs.first() else {
-            let _ = adapter.send_text(chat_id, no_addresses_text(lang)).await;
+        if subs.is_empty() {
+            let _ = adapter.send_text(chat_id, no_address_text(lang)).await;
             return;
-        };
-        let (text, keyboard) = Self::build_hourly_menu(
-            current.hourly_stats_enabled,
-            current.hourly_workers_enabled,
-            lang,
-        );
+        }
+        let (text, keyboard) = Self::build_settings_keyboard(&subs, lang);
         if let Err(e) = adapter
             .send_message_with_keyboard(chat_id, &text, &keyboard)
             .await
         {
-            warn!(target: "bp_notifications::command", error = %e, "hourly menu: send");
+            warn!(target: "bp_notifications::command", error = %e, "settings: send");
         }
     }
 
-    async fn handle_hourly_callback(
+    async fn handle_settings_callback(
         &self,
         adapter: &TelegramAdapter,
         callback_id: &str,
         chat_id: i64,
         message_id: i64,
-        target: HourlyTarget,
+        cb: SettingsCallback,
     ) {
-        let lang = self.language(&Transport::Telegram { chat_id }).await;
+        let lang = self.chat_languages.get(chat_id).await;
+        let id = match cb {
+            SettingsCallback::Address(id) | SettingsCallback::Flip(id, _) => id,
+        };
         let subs = match find_telegram_subscriptions_by_chat(&self.pool, chat_id).await {
             Ok(v) => v,
             Err(e) => {
-                warn!(target: "bp_notifications::command", error = %e, "hourly callback: read subs");
+                warn!(target: "bp_notifications::command", error = %e, "settings callback: read subs");
                 let _ = adapter
                     .answer_callback_query(callback_id, Some(db_error_text(lang)))
                     .await;
                 return;
             }
         };
-        let Some(current) = subs.first() else {
+        // Only a subscription of this chat: the id comes from the button.
+        let Some(sub) = subs.iter().find(|s| s.id == id) else {
             let _ = adapter
-                .answer_callback_query(
-                    callback_id,
-                    Some(if matches!(lang, Language::De) {
-                        "Keine Adresse gespeichert."
-                    } else {
-                        "No address stored."
-                    }),
-                )
+                .answer_callback_query(callback_id, Some(address_gone_text(lang)))
                 .await;
             return;
         };
-        let mut stats = current.hourly_stats_enabled;
-        let mut workers = current.hourly_workers_enabled;
-        match target {
-            HourlyTarget::Stats => stats = !stats,
-            HourlyTarget::Workers => workers = !workers,
-        }
-        if let Err(e) =
-            set_telegram_hourly_flags(&self.pool, chat_id, &current.address, stats, workers).await
-        {
-            warn!(target: "bp_notifications::command", error = %e, "hourly callback: update flags");
+        let field = match cb {
+            SettingsCallback::Address(_) => {
+                let _ = adapter
+                    .answer_callback_query(callback_id, Some(sub.address.as_str()))
+                    .await;
+                return;
+            }
+            SettingsCallback::Flip(_, field) => field,
+        };
+        let value = !settings_field_value(sub, field);
+        if let Err(e) = set_telegram_field(&self.pool, chat_id, sub, field, value).await {
+            warn!(target: "bp_notifications::command", error = %e, "settings callback: update");
             let _ = adapter
                 .answer_callback_query(callback_id, Some(db_error_text(lang)))
                 .await;
             return;
         }
         let _ = adapter.answer_callback_query(callback_id, None).await;
-        let (text, keyboard) = Self::build_hourly_menu(stats, workers, lang);
+        let fresh = find_telegram_subscriptions_by_chat(&self.pool, chat_id)
+            .await
+            .unwrap_or_default();
+        let (text, keyboard) = Self::build_settings_keyboard(&fresh, lang);
         if let Err(e) = adapter
             .edit_message_text(chat_id, message_id, &text, Some(&keyboard))
             .await
         {
-            warn!(target: "bp_notifications::command", error = %e, "hourly callback: edit message");
+            warn!(target: "bp_notifications::command", error = %e, "settings callback: edit message");
         }
     }
 
-    /// The yes/no confirmation keyboard for `/bestdiff_reset`.
-    fn build_bestdiff_confirm_keyboard(lang: Language) -> InlineKeyboard {
-        let de = matches!(lang, Language::De);
-        vec![vec![
-            InlineButton::new(
-                if de {
-                    "✅ Ja, zurücksetzen"
-                } else {
-                    "✅ Yes, reset"
-                },
-                "bdr:yes",
-            ),
-            InlineButton::new(if de { "❌ Abbrechen" } else { "❌ Cancel" }, "bdr:no"),
-        ]]
-    }
-
-    /// Resolve the target address (explicit arg or the chat's default),
-    /// then send a yes/no confirmation keyboard and record the pending
-    /// reset keyed by `chat:message_id` with a 5-minute expiry.
-    async fn send_bestdiff_confirm(&self, chat_id: i64, lang: Language, arg: Option<&str>) {
-        let Some(adapter) = self.telegram.as_ref() else {
-            return;
-        };
-        let address = match arg {
-            Some(raw) => match parse_address(raw) {
-                Some(a) => a,
-                None => {
-                    let _ = adapter.send_text(chat_id, invalid_address_text(lang)).await;
-                    return;
-                }
-            },
-            None => match self.origin_address(&Transport::Telegram { chat_id }).await {
-                Some(a) => a,
-                None => {
-                    let _ = adapter.send_text(chat_id, no_addresses_text(lang)).await;
-                    return;
-                }
-            },
-        };
-        let de = matches!(lang, Language::De);
-        let trimmed = short_address(address.as_str());
-        let text = if de {
-            format!("Best Difficulty für {trimmed} wirklich zurücksetzen?")
-        } else {
-            format!("Really reset best difficulty for {trimmed}?")
-        };
-        let keyboard = Self::build_bestdiff_confirm_keyboard(lang);
-        let message_id = match adapter
-            .send_message_with_keyboard(chat_id, &text, &keyboard)
-            .await
-        {
-            Ok(id) => id,
+    /// The switches of the ntfy topic, as text: ntfy has no keyboard.
+    async fn ntfy_settings_text(&self, address: &AddressId, lang: Language) -> String {
+        let row = match find_ntfy_subscription_by_address(&self.pool, address).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return no_address_text(lang).to_string(),
             Err(e) => {
-                warn!(target: "bp_notifications::command", error = %e, "bestdiff confirm: send");
-                return;
+                warn!(target: "bp_notifications::command", error = %e, "ntfy settings");
+                return db_error_text(lang).to_string();
             }
         };
-        let expires_at_ms = chrono::Utc::now().timestamp_millis() + 5 * 60 * 1000;
-        self.pending_bestdiff_resets.lock().await.insert(
-            format!("{chat_id}:{message_id}"),
-            PendingBestdiffReset {
-                address,
-                expires_at_ms,
-            },
-        );
-    }
-
-    async fn handle_bestdiff_reset_callback(
-        &self,
-        adapter: &TelegramAdapter,
-        callback_id: &str,
-        chat_id: i64,
-        message_id: i64,
-        confirm: bool,
-    ) {
-        let lang = self.language(&Transport::Telegram { chat_id }).await;
-        let de = matches!(lang, Language::De);
-        let key = format!("{chat_id}:{message_id}");
-        let pending = self.pending_bestdiff_resets.lock().await.remove(&key);
-
-        // Missing (already answered, or pool restarted) or past its TTL.
-        let pending = match pending {
-            Some(p) if p.expires_at_ms >= chrono::Utc::now().timestamp_millis() => p,
-            _ => {
-                let txt = if de {
-                    "Anfrage abgelaufen."
-                } else {
-                    "Request expired."
-                };
-                let _ = adapter.answer_callback_query(callback_id, Some(txt)).await;
-                let _ = adapter
-                    .edit_message_text(chat_id, message_id, txt, None)
-                    .await;
-                return;
-            }
+        let mark = |on: bool| if on { "✅" } else { "❌" };
+        let line =
+            |on: bool, field| format!("\n{} {}", mark(on), settings_field_label(lang, field));
+        let mut out = match lang {
+            Language::De => format!(
+                "Benachrichtigungen für {}, schalten mit /subscribe_bestdiff, \
+                 /device_notifications, /team_requests oder /send_hourly und on|off:",
+                short_address(address.as_str())
+            ),
+            Language::En => format!(
+                "Notifications for {}, toggle with /subscribe_bestdiff, \
+                 /device_notifications, /team_requests or /send_hourly and on|off:",
+                short_address(address.as_str())
+            ),
         };
-        let trimmed = short_address(pending.address.as_str());
-
-        if !confirm {
-            let _ = adapter
-                .answer_callback_query(
-                    callback_id,
-                    Some(if de { "Abgebrochen." } else { "Cancelled." }),
-                )
-                .await;
-            let txt = if de {
-                format!("Reset abgebrochen — {trimmed}")
-            } else {
-                format!("Reset cancelled — {trimmed}")
-            };
-            let _ = adapter
-                .edit_message_text(chat_id, message_id, &txt, None)
-                .await;
-            return;
-        }
-
-        if let Err(e) = reset_address_settings_best_difficulty(&self.pool, &pending.address).await {
-            warn!(target: "bp_notifications::command", error = %e, "bestdiff confirm: reset");
-            let _ = adapter
-                .answer_callback_query(callback_id, Some(db_error_text(lang)))
-                .await;
-            return;
-        }
-        let _ = adapter
-            .answer_callback_query(
-                callback_id,
-                Some(if de { "Zurückgesetzt." } else { "Reset." }),
-            )
-            .await;
-        let txt = if de {
-            format!("Best Difficulty zurückgesetzt — {trimmed}")
-        } else {
-            format!("Best difficulty reset — {trimmed}")
-        };
-        let _ = adapter
-            .edit_message_text(chat_id, message_id, &txt, None)
-            .await;
+        out.push_str(&line(
+            row.best_diff_notifications_enabled,
+            SettingsField::BestDiff,
+        ));
+        out.push_str(&line(
+            row.device_notifications_enabled,
+            SettingsField::Device,
+        ));
+        out.push_str(&line(
+            row.group_admin_notifications_enabled,
+            SettingsField::TeamRequests,
+        ));
+        out.push_str(&line(row.hourly_stats_enabled, SettingsField::HourlyStats));
+        out.push_str(&line(
+            row.hourly_workers_enabled,
+            SettingsField::HourlyWorkers,
+        ));
+        out
     }
 
     // ── Per-command handlers ────────────────────────────────────────
 
+    /// What the bot does, how to start, and the chat's addresses if it
+    /// has any. A Telegram chat without one is told to `/subscribe`; an
+    /// ntfy topic already is its address.
     async fn handle_start(&self, transport: &Transport, lang: Language) -> String {
-        let mut intro = match lang {
+        let subscribed: Vec<AddressId> = match transport {
+            Transport::Telegram { chat_id } => {
+                find_telegram_subscriptions_by_chat(&self.pool, *chat_id)
+                    .await
+                    .map(|subs| subs.into_iter().map(|s| s.address).collect())
+                    .unwrap_or_default()
+            }
+            Transport::Ntfy { address } => vec![address.clone()],
+        };
+        let mut text = match lang {
+            Language::De => "Willkommen bei Blitz Pool!\nIch melde dir, wenn ein Block gefunden \
+                 wird, der deine Adresse bezahlt, und neue Best-Diffs, auf Wunsch auch, wenn ein \
+                 Miner offline geht.\n"
+                .to_string(),
+            Language::En => "Welcome to Blitz Pool!\nI tell you when a block is found that pays \
+                 your address and when you reach a new best difficulty, and on request when a \
+                 miner goes offline.\n"
+                .to_string(),
+        };
+        if subscribed.is_empty() {
+            text.push_str(match lang {
+                Language::De => "Tipp /subscribe, dann frag ich nach deiner Mining-Adresse. ",
+                Language::En => "Tap /subscribe and I will ask for your mining address. ",
+            });
+        }
+        text.push_str(match lang {
             Language::De => {
-                "Willkommen bei Blitz Pool!\nMit /subscribe <Adresse> abonnierst du eine Mining-Adresse. \
-                 /help zeigt alle Befehle."
-                    .to_string()
+                "Mit /settings schaltest du die Meldungen pro Adresse, /help zeigt \
+                 alle Befehle."
             }
             Language::En => {
-                "Welcome to Blitz Pool!\nUse /subscribe <address> to follow a mining address. \
-                 /help lists every command."
-                    .to_string()
+                "/settings switches the notices per address, /help lists every \
+                 command."
             }
-        };
-        if let Transport::Telegram { chat_id } = transport {
-            if let Ok(subs) = find_telegram_subscriptions_by_chat(&self.pool, *chat_id).await {
-                if !subs.is_empty() {
-                    intro.push_str("\n\n");
-                    intro.push_str(&list_addresses(
-                        lang,
-                        subs.iter().map(|s| s.address.as_str()),
-                    ));
-                }
-            }
+        });
+        if !subscribed.is_empty() {
+            text.push_str("\n\n");
+            text.push_str(&list_addresses(
+                lang,
+                subscribed.iter().map(AddressId::as_str),
+            ));
         }
-        intro
+        text
     }
 
     async fn handle_subscribe(
@@ -752,7 +718,7 @@ impl CommandHandler {
         lang: Language,
         address_str: &str,
     ) -> String {
-        let Some(address) = parse_address(address_str) else {
+        let Some(address) = self.pool_address(address_str) else {
             return invalid_address_text(lang).to_string();
         };
         match transport {
@@ -790,12 +756,14 @@ impl CommandHandler {
         lang: Language,
         address_str: &str,
     ) -> String {
-        let Some(address) = parse_address(address_str) else {
+        // Normalized like a stored row but not checked against the network,
+        // so a stored row that is no address of it can still be removed.
+        let Ok(address) = AddressId::normalized(address_str) else {
             return invalid_address_text(lang).to_string();
         };
         let affected = match transport {
             Transport::Telegram { chat_id } => {
-                delete_telegram_subscription_by_chat_address(&self.pool, *chat_id, &address).await
+                self.remove_telegram_subscription(*chat_id, &address).await
             }
             Transport::Ntfy { .. } => {
                 delete_ntfy_subscription_by_address(&self.pool, &address).await
@@ -817,6 +785,19 @@ impl CommandHandler {
         }
     }
 
+    /// Soft-delete one subscription of the chat; when it was the default,
+    /// the lowest-id remaining one takes over.
+    async fn remove_telegram_subscription(
+        &self,
+        chat_id: i64,
+        address: &AddressId,
+    ) -> Result<u64, bp_db::DbError> {
+        let removed =
+            delete_telegram_subscription_by_chat_address(&self.pool, chat_id, address).await?;
+        promote_telegram_default_if_none(&self.pool, chat_id).await?;
+        Ok(removed)
+    }
+
     async fn handle_show_addresses(&self, transport: &Transport, lang: Language) -> String {
         match transport {
             Transport::Telegram { chat_id } => {
@@ -824,7 +805,7 @@ impl CommandHandler {
                     Ok(subs) if !subs.is_empty() => {
                         list_addresses(lang, subs.iter().map(|s| s.address.as_str()))
                     }
-                    Ok(_) => no_addresses_text(lang).to_string(),
+                    Ok(_) => no_address_text(lang).to_string(),
                     Err(e) => {
                         warn!(target: "bp_notifications::command", error = %e, "show_addresses");
                         db_error_text(lang).to_string()
@@ -834,7 +815,7 @@ impl CommandHandler {
             Transport::Ntfy { address } => {
                 match find_ntfy_subscription_by_address(&self.pool, address).await {
                     Ok(Some(_)) => list_addresses(lang, std::iter::once(address.as_str())),
-                    Ok(None) => no_addresses_text(lang).to_string(),
+                    Ok(None) => no_address_text(lang).to_string(),
                     Err(e) => {
                         warn!(target: "bp_notifications::command", error = %e, "ntfy show_addresses");
                         db_error_text(lang).to_string()
@@ -848,15 +829,14 @@ impl CommandHandler {
         &self,
         transport: &Transport,
         lang: Language,
-        flag: FlagKind,
+        switch: Switch,
         toggle: FlagToggle,
     ) -> String {
         let value = toggle.as_bool();
         let affected = match transport {
             Transport::Telegram { chat_id } => {
-                // The user toggles on EVERY subscription bound to this
-                // chat — the /subscribe_bestdiff command isn't
-                // address-scoped.
+                // A switch command covers every subscription of the chat;
+                // /settings switches one address.
                 let subs = match find_telegram_subscriptions_by_chat(&self.pool, *chat_id).await {
                     Ok(v) => v,
                     Err(e) => {
@@ -864,117 +844,46 @@ impl CommandHandler {
                         return db_error_text(lang).to_string();
                     }
                 };
+                let fields: &[SettingsField] = match switch {
+                    Switch::BestDiff => &[SettingsField::BestDiff],
+                    Switch::Device => &[SettingsField::Device],
+                    Switch::TeamRequests => &[SettingsField::TeamRequests],
+                    Switch::Hourly => &[SettingsField::HourlyStats, SettingsField::HourlyWorkers],
+                };
                 let mut total: u64 = 0;
-                for sub in subs {
-                    let res = match flag {
-                        FlagKind::BestDiff => {
-                            update_telegram_sub_best_diff_flag(
-                                &self.pool,
-                                *chat_id,
-                                &sub.address,
-                                value,
-                            )
-                            .await
+                for mut sub in subs {
+                    for field in fields {
+                        match set_telegram_field(&self.pool, *chat_id, &sub, *field, value).await {
+                            Ok(n) => total = total.saturating_add(n),
+                            Err(e) => {
+                                warn!(target: "bp_notifications::command", error = %e, "telegram flag toggle");
+                                return db_error_text(lang).to_string();
+                            }
                         }
-                        FlagKind::Device => {
-                            update_telegram_sub_device_flag(
-                                &self.pool,
-                                *chat_id,
-                                &sub.address,
-                                value,
-                            )
-                            .await
-                        }
-                        FlagKind::GroupAdmin => {
-                            update_telegram_sub_group_admin_flag(
-                                &self.pool,
-                                *chat_id,
-                                &sub.address,
-                                value,
-                            )
-                            .await
-                        }
-                        FlagKind::Hourly => {
-                            set_telegram_hourly_flags(
-                                &self.pool,
-                                *chat_id,
-                                &sub.address,
-                                value,
-                                value,
-                            )
-                            .await
-                        }
-                    };
-                    match res {
-                        Ok(n) => total = total.saturating_add(n),
-                        Err(e) => {
-                            warn!(target: "bp_notifications::command", error = %e, "telegram flag toggle");
-                            return db_error_text(lang).to_string();
-                        }
+                        set_settings_field_value(&mut sub, *field, value);
                     }
                 }
                 Ok(total)
             }
-            Transport::Ntfy { address } => match flag {
-                FlagKind::BestDiff => {
+            Transport::Ntfy { address } => match switch {
+                Switch::BestDiff => {
                     update_ntfy_sub_best_diff_flag(&self.pool, address, value).await
                 }
-                FlagKind::Device => update_ntfy_sub_device_flag(&self.pool, address, value).await,
-                FlagKind::Hourly => update_ntfy_sub_hourly_flags(&self.pool, address, value).await,
-                FlagKind::GroupAdmin => {
+                Switch::Device => update_ntfy_sub_device_flag(&self.pool, address, value).await,
+                Switch::Hourly => update_ntfy_sub_hourly_flags(&self.pool, address, value).await,
+                Switch::TeamRequests => {
                     update_ntfy_sub_group_admin_flag(&self.pool, address, value).await
                 }
             },
         };
         match affected {
-            Ok(n) if n > 0 => flag_toggle_ok_text(lang, flag, value).to_string(),
-            Ok(_) => no_addresses_text(lang).to_string(),
+            Ok(n) if n > 0 => flag_toggle_ok_text(lang, switch, value).to_string(),
+            Ok(_) => no_address_text(lang).to_string(),
             Err(e) => {
                 warn!(target: "bp_notifications::command", error = %e, "flag toggle");
                 db_error_text(lang).to_string()
             }
         }
-    }
-
-    async fn handle_best_diff_reset(
-        &self,
-        transport: &Transport,
-        lang: Language,
-        target: Option<&str>,
-    ) -> String {
-        // ntfy resets the origin address immediately. Telegram normally
-        // goes through the `send_bestdiff_confirm` yes/no keyboard; its
-        // arms below keep the match exhaustive.
-        let candidates: Vec<AddressId> = match (transport, target) {
-            (_, Some(addr)) => match parse_address(addr) {
-                Some(a) => vec![a],
-                None => return invalid_address_text(lang).to_string(),
-            },
-            (Transport::Telegram { chat_id }, None) => {
-                match find_telegram_subscriptions_by_chat(&self.pool, *chat_id).await {
-                    Ok(v) => v.into_iter().map(|s| s.address).collect(),
-                    Err(e) => {
-                        warn!(target: "bp_notifications::command", error = %e, "best_diff_reset: read subs");
-                        return db_error_text(lang).to_string();
-                    }
-                }
-            }
-            (Transport::Ntfy { address }, None) => vec![address.clone()],
-        };
-        if candidates.is_empty() {
-            return no_addresses_text(lang).to_string();
-        }
-        let mut count: u64 = 0;
-        for addr in &candidates {
-            match reset_address_settings_best_difficulty(&self.pool, addr).await {
-                Ok(n) => count += n,
-                Err(e) => {
-                    warn!(target: "bp_notifications::command", error = %e, "best_diff_reset");
-                    return db_error_text(lang).to_string();
-                }
-            }
-        }
-        best_diff_reset_text(lang, count).to_string()
     }
 
     async fn handle_language_switch(
@@ -988,7 +897,10 @@ impl CommandHandler {
         };
         match transport {
             Transport::Telegram { chat_id } => {
-                self.set_language_in_memory(*chat_id, new_lang).await;
+                if let Err(e) = self.chat_languages.set(*chat_id, new_lang).await {
+                    warn!(target: "bp_notifications::command", error = %e, "telegram language switch");
+                    return db_error_text(new_lang).to_string();
+                }
             }
             Transport::Ntfy { address } => {
                 if let Err(e) =
@@ -1002,105 +914,183 @@ impl CommandHandler {
         language_switch_ok_text(new_lang).to_string()
     }
 
-    /// Dispatch read-style commands recognised by the parser. Stateless
-    /// commands are handled directly; engine-reader commands fan out to
-    /// the optional engine readers, falling back to a "noch nicht
-    /// konfiguriert" reply when the engine isn't wired in.
-    async fn handle_read_deferred(
+    /// Dispatch read-style commands recognised by the parser. A command
+    /// about an address takes the one it was given, else the origin's; an
+    /// engine command answers "not configured" when its engine isn't wired.
+    async fn handle_read(
         &self,
         transport: &Transport,
         lang: Language,
-        name: &'static str,
+        read: ReadCommand,
+        arg: Option<&str>,
     ) -> String {
-        match name {
-            "/poolhashrate" => super::read::build_pool_hashrate(self.redis.as_ref(), lang).await,
-            "/difficulty" => super::read::build_current_difficulty(lang).await,
-            "/next_difficulty" => super::read::build_next_difficulty(lang).await,
-            "/stats" => match self.origin_address(transport).await {
-                Some(addr) => {
-                    super::read::build_stats(&self.pool, self.redis.as_ref(), lang, &addr).await
-                }
-                None => need_address_text(lang).to_string(),
+        let address = || self.target_address(transport, lang, arg);
+        let redis = self.redis.as_ref();
+        let result = match read {
+            ReadCommand::PoolHashrate => Ok(super::read::build_pool_hashrate(redis, lang).await),
+            ReadCommand::Difficulty => Ok(super::read::build_current_difficulty(lang).await),
+            ReadCommand::NextDifficulty => Ok(super::read::build_next_difficulty(lang).await),
+            ReadCommand::PplnsTop => match &self.pplns_engine {
+                Some(engine) => Ok(super::read::build_pplns_top(engine, lang).await),
+                None => Err(engine_unconfigured_text(lang, "PPLNS")),
             },
-            "/team_history" => match self.origin_address(transport).await {
-                Some(addr) => super::read::build_group_history(&self.pool, lang, &addr).await,
-                None => need_address_text(lang).to_string(),
+            ReadCommand::Stats => match address().await {
+                Ok(addr) => Ok(super::read::build_stats(&self.pool, redis, lang, &addr).await),
+                Err(reply) => Err(reply),
             },
-            "/pplns_status" => match (self.origin_address(transport).await, &self.pplns_engine) {
-                (Some(addr), Some(engine)) => {
-                    super::read::build_pplns_status(self.redis.as_ref(), engine, lang, &addr).await
+            ReadCommand::ShowWorkers => match address().await {
+                Ok(addr) => {
+                    Ok(super::read::build_show_workers(&self.pool, redis, lang, &addr).await)
                 }
-                (None, _) => need_address_text(lang).to_string(),
-                (_, None) => engine_unconfigured_text(lang, "PPLNS").to_string(),
+                Err(reply) => Err(reply),
             },
-            "/pplns_top" => match &self.pplns_engine {
-                Some(engine) => super::read::build_pplns_top(engine, lang).await,
-                None => engine_unconfigured_text(lang, "PPLNS").to_string(),
+            ReadCommand::TeamHistory => match address().await {
+                Ok(addr) => Ok(super::read::build_group_history(&self.pool, lang, &addr).await),
+                Err(reply) => Err(reply),
             },
-            "/team_status" => {
-                match (
-                    self.origin_address(transport).await,
-                    &self.group_solo_engine,
-                ) {
-                    (Some(addr), Some(engine)) => {
-                        super::read::build_group_status(
-                            &self.pool,
-                            self.redis.as_ref(),
-                            engine,
-                            lang,
-                            &addr,
-                        )
-                        .await
-                    }
-                    (None, _) => need_address_text(lang).to_string(),
-                    (_, None) => engine_unconfigured_text(lang, team_mining_name(lang)).to_string(),
+            ReadCommand::BlockpartyStatus => match address().await {
+                Ok(addr) => {
+                    Ok(super::read::build_blockparty_status(&self.pool, redis, lang, &addr).await)
                 }
-            }
-            "/team_members" => {
-                match (
-                    self.origin_address(transport).await,
-                    &self.group_solo_engine,
-                ) {
-                    (Some(addr), Some(engine)) => {
-                        super::read::build_group_members(&self.pool, engine, lang, &addr).await
-                    }
-                    (None, _) => need_address_text(lang).to_string(),
-                    (_, None) => engine_unconfigured_text(lang, team_mining_name(lang)).to_string(),
-                }
-            }
-            "/show_workers" => match self.origin_address(transport).await {
-                Some(addr) => {
-                    super::read::build_show_workers(&self.pool, self.redis.as_ref(), lang, &addr)
-                        .await
-                }
-                None => need_address_text(lang).to_string(),
+                Err(reply) => Err(reply),
             },
-            _ => deferred_text(lang, name),
-        }
+            ReadCommand::PplnsStatus => match (&self.pplns_engine, address().await) {
+                (None, _) => Err(engine_unconfigured_text(lang, "PPLNS")),
+                (Some(_), Err(reply)) => Err(reply),
+                (Some(engine), Ok(addr)) => {
+                    Ok(super::read::build_pplns_status(redis, engine, lang, &addr).await)
+                }
+            },
+            ReadCommand::TeamStatus => match (&self.group_solo_engine, address().await) {
+                (None, _) => Err(engine_unconfigured_text(lang, team_mining_name(lang))),
+                (Some(_), Err(reply)) => Err(reply),
+                (Some(engine), Ok(addr)) => Ok(super::read::build_group_status(
+                    &self.pool, redis, engine, lang, &addr,
+                )
+                .await),
+            },
+            ReadCommand::TeamMembers => match (&self.group_solo_engine, address().await) {
+                (None, _) => Err(engine_unconfigured_text(lang, team_mining_name(lang))),
+                (Some(_), Err(reply)) => Err(reply),
+                (Some(engine), Ok(addr)) => {
+                    Ok(super::read::build_group_members(&self.pool, engine, lang, &addr).await)
+                }
+            },
+        };
+        result.unwrap_or_else(|reply| reply)
     }
 
-    /// Resolve the contextual address for read commands. For ntfy the
-    /// topic IS the address. For Telegram it is the chat's
-    /// `is_default=true` subscription, or the only one if there is just
-    /// one. `None` lets the caller ask for an address.
-    async fn origin_address(&self, transport: &Transport) -> Option<AddressId> {
-        match transport {
-            Transport::Ntfy { address } => Some(address.clone()),
-            Transport::Telegram { chat_id } => {
-                let subs = find_telegram_subscriptions_by_chat(&self.pool, *chat_id)
-                    .await
-                    .ok()?;
-                if subs.is_empty() {
-                    return None;
-                }
-                if subs.len() == 1 {
-                    return Some(subs[0].address.clone());
-                }
-                subs.iter()
-                    .find(|s| s.is_default)
-                    .map(|s| s.address.clone())
-            }
+    /// `raw` as an address of the pool's network, or `None`.
+    fn pool_address(&self, raw: &str) -> Option<AddressId> {
+        bp_mining_job::parse_pool_address(self.network, raw)
+    }
+
+    /// The address a command acts on: the one it was given, else the
+    /// origin's. `Err` carries the reply that explains what is missing.
+    async fn target_address(
+        &self,
+        transport: &Transport,
+        lang: Language,
+        arg: Option<&str>,
+    ) -> Result<AddressId, String> {
+        if let Some(raw) = arg {
+            return self
+                .pool_address(raw)
+                .ok_or_else(|| invalid_address_text(lang).to_string());
         }
+        let chat_id = match transport {
+            Transport::Ntfy { address } => return Ok(address.clone()),
+            Transport::Telegram { chat_id } => *chat_id,
+        };
+        let subs = match find_telegram_subscriptions_by_chat(&self.pool, chat_id).await {
+            Ok(subs) => subs,
+            Err(e) => {
+                warn!(target: "bp_notifications::command", error = %e, "origin address: read subs");
+                return Err(db_error_text(lang).to_string());
+            }
+        };
+        // The only subscription, else the default one.
+        match subs.as_slice() {
+            [] => Err(no_address_text(lang).to_string()),
+            [only] => Ok(only.address.clone()),
+            many => many
+                .iter()
+                .find(|s| s.is_default)
+                .map(|s| s.address.clone())
+                .ok_or_else(|| no_default_text(lang).to_string()),
+        }
+    }
+}
+
+/// Write one switch of one Telegram subscription.
+async fn set_telegram_field(
+    pool: &PgPool,
+    chat_id: i64,
+    sub: &TelegramSubscriptionRow,
+    field: SettingsField,
+    value: bool,
+) -> Result<u64, bp_db::DbError> {
+    let address = &sub.address;
+    match field {
+        SettingsField::Blocks => {
+            update_telegram_sub_block_flag(pool, chat_id, address, value).await
+        }
+        SettingsField::BestDiff => {
+            update_telegram_sub_best_diff_flag(pool, chat_id, address, value).await
+        }
+        SettingsField::Device => {
+            update_telegram_sub_device_flag(pool, chat_id, address, value).await
+        }
+        SettingsField::TeamRequests => {
+            update_telegram_sub_group_admin_flag(pool, chat_id, address, value).await
+        }
+        SettingsField::HourlyStats => {
+            set_telegram_hourly_flags(pool, chat_id, address, value, sub.hourly_workers_enabled)
+                .await
+        }
+        SettingsField::HourlyWorkers => {
+            set_telegram_hourly_flags(pool, chat_id, address, sub.hourly_stats_enabled, value).await
+        }
+    }
+}
+
+fn settings_field_value(sub: &TelegramSubscriptionRow, field: SettingsField) -> bool {
+    match field {
+        SettingsField::Blocks => sub.block_notifications_enabled,
+        SettingsField::BestDiff => sub.best_diff_notifications_enabled,
+        SettingsField::Device => sub.device_notifications_enabled,
+        SettingsField::TeamRequests => sub.group_admin_notifications_enabled,
+        SettingsField::HourlyStats => sub.hourly_stats_enabled,
+        SettingsField::HourlyWorkers => sub.hourly_workers_enabled,
+    }
+}
+
+fn set_settings_field_value(sub: &mut TelegramSubscriptionRow, field: SettingsField, value: bool) {
+    let slot = match field {
+        SettingsField::Blocks => &mut sub.block_notifications_enabled,
+        SettingsField::BestDiff => &mut sub.best_diff_notifications_enabled,
+        SettingsField::Device => &mut sub.device_notifications_enabled,
+        SettingsField::TeamRequests => &mut sub.group_admin_notifications_enabled,
+        SettingsField::HourlyStats => &mut sub.hourly_stats_enabled,
+        SettingsField::HourlyWorkers => &mut sub.hourly_workers_enabled,
+    };
+    *slot = value;
+}
+
+fn settings_field_label(lang: Language, field: SettingsField) -> &'static str {
+    match (lang, field) {
+        (Language::De, SettingsField::Blocks) => "Blöcke",
+        (Language::De, SettingsField::BestDiff) => "Best-Diff",
+        (Language::De, SettingsField::Device) => "Geräte",
+        (Language::De, SettingsField::TeamRequests) => "Team-Anfragen",
+        (Language::De, SettingsField::HourlyStats) => "Stats stündl.",
+        (Language::De, SettingsField::HourlyWorkers) => "Worker stündl.",
+        (Language::En, SettingsField::Blocks) => "Blocks",
+        (Language::En, SettingsField::BestDiff) => "Best diff",
+        (Language::En, SettingsField::Device) => "Devices",
+        (Language::En, SettingsField::TeamRequests) => "Team requests",
+        (Language::En, SettingsField::HourlyStats) => "Hourly stats",
+        (Language::En, SettingsField::HourlyWorkers) => "Hourly workers",
     }
 }
 
@@ -1119,59 +1109,7 @@ fn team_mining_name(lang: Language) -> &'static str {
     }
 }
 
-fn need_address_text(lang: Language) -> &'static str {
-    match lang {
-        Language::De => "Bitte gib eine Adresse an oder benutze ntfy mit deinem Adress-Topic.",
-        Language::En => "Please supply an address, or use ntfy with your address topic.",
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum FlagKind {
-    BestDiff,
-    Device,
-    Hourly,
-    GroupAdmin,
-}
-
-fn parse_address(raw: &str) -> Option<AddressId> {
-    AddressId::new(raw.trim()).ok()
-}
-
 // ── Per-language reply strings ───────────────────────────────────────
-
-fn help_text(lang: Language) -> &'static str {
-    match lang {
-        Language::De => {
-            "Verfügbare Befehle:\n\
-            /start — Begrüssung + Status\n\
-            /subscribe <Adresse> — Adresse abonnieren\n\
-            /remove <Adresse> — Adresse entfernen\n\
-            /show_addresses — abonnierte Adressen anzeigen\n\
-            /subscribe_bestdiff on|off — Best-Diff-Benachrichtigungen\n\
-            /device_notifications on|off — Geräte-Status\n\
-            /team_requests on|off — Beitrittsanfragen für dein Team (als Admin)\n\
-            /send_hourly on|off — Stündliche Updates\n\
-            /bestdiff_reset [<Adresse>] — Best-Diff zurücksetzen\n\
-            /deutsch | /english — Sprache umschalten\n\
-            /help — diese Hilfe"
-        }
-        Language::En => {
-            "Available commands:\n\
-            /start — welcome + status\n\
-            /subscribe <address> — subscribe to mining address\n\
-            /remove <address> — remove address\n\
-            /show_addresses — list subscribed addresses\n\
-            /subscribe_bestdiff on|off — best-difficulty notifications\n\
-            /device_notifications on|off — device status\n\
-            /team_requests on|off — join requests for your Team (as its admin)\n\
-            /send_hourly on|off — hourly updates\n\
-            /bestdiff_reset [<address>] — reset stored best-difficulty\n\
-            /deutsch | /english — switch language\n\
-            /help — this help"
-        }
-    }
-}
 
 fn unknown_text(lang: Language) -> &'static str {
     match lang {
@@ -1180,19 +1118,58 @@ fn unknown_text(lang: Language) -> &'static str {
     }
 }
 
-fn deferred_text(lang: Language, name: &str) -> String {
+fn invalid_address_text(lang: Language) -> &'static str {
     match lang {
         Language::De => {
-            format!("{name}: noch nicht verfügbar — Engine-Reader-Wiring noch ausstehend.")
+            "Das ist keine Bitcoin-Adresse dieses Pools. Schick sie so, wie sie \
+             in deinem Miner steht, ohne Klammern, z.B. bc1q..."
         }
-        Language::En => format!("{name}: not yet available — engine reader wiring is pending."),
+        Language::En => {
+            "That is not a Bitcoin address of this pool. Send it as it stands \
+             in your miner, without brackets, e.g. bc1q..."
+        }
     }
 }
 
-fn invalid_address_text(lang: Language) -> &'static str {
+fn subscribe_usage_text(lang: Language) -> &'static str {
     match lang {
-        Language::De => "Ungültige Adresse. Bitte BTC-Adresse ohne Leerzeichen angeben.",
-        Language::En => "Invalid address. Please supply a BTC address without whitespace.",
+        Language::De => "Schick /subscribe mit deiner Mining-Adresse, z.B. /subscribe bc1q...",
+        Language::En => "Send /subscribe with your mining address, e.g. /subscribe bc1q...",
+    }
+}
+
+fn remove_usage_text(lang: Language) -> &'static str {
+    match lang {
+        Language::De => "Schick /remove mit der Adresse, z.B. /remove bc1q...",
+        Language::En => "Send /remove with the address, e.g. /remove bc1q...",
+    }
+}
+
+/// Several subscriptions and none of them the default.
+fn no_default_text(lang: Language) -> &'static str {
+    match lang {
+        Language::De => {
+            "Du hast mehrere Adressen abonniert. Tipp bei /show_addresses eine an, \
+             um sie zur Standard-Adresse zu machen, oder häng die Adresse an den Befehl an."
+        }
+        Language::En => {
+            "You follow several addresses. Tap one in /show_addresses to make it \
+             the default, or add the address to the command."
+        }
+    }
+}
+
+fn address_gone_text(lang: Language) -> &'static str {
+    match lang {
+        Language::De => "Adresse nicht mehr vorhanden.",
+        Language::En => "Address no longer exists.",
+    }
+}
+
+fn stale_button_text(lang: Language) -> &'static str {
+    match lang {
+        Language::De => "Dieses Menü gibt es nicht mehr, /settings zeigt die Einstellungen.",
+        Language::En => "This menu is gone, /settings shows the settings.",
     }
 }
 
@@ -1224,10 +1201,17 @@ fn remove_missing_text(lang: Language, address: &str) -> String {
     }
 }
 
-fn no_addresses_text(lang: Language) -> &'static str {
+/// No address given and none to fall back on.
+fn no_address_text(lang: Language) -> &'static str {
     match lang {
-        Language::De => "Keine Adressen abonniert.",
-        Language::En => "No addresses subscribed.",
+        Language::De => {
+            "Noch keine Adresse abonniert. /subscribe mit deiner Mining-Adresse abonniert \
+             sie, oder häng die Adresse an den Befehl an, z.B. /stats bc1q..."
+        }
+        Language::En => {
+            "No address subscribed yet. /subscribe with your mining address follows it, \
+             or add the address to the command, e.g. /stats bc1q..."
+        }
     }
 }
 
@@ -1243,46 +1227,63 @@ fn list_addresses<'a>(lang: Language, addrs: impl Iterator<Item = &'a str>) -> S
     out
 }
 
-fn flag_toggle_ok_text(lang: Language, flag: FlagKind, value: bool) -> String {
+fn flag_toggle_ok_text(lang: Language, flag: Switch, value: bool) -> String {
     let on = value;
     match (lang, flag, on) {
-        (Language::De, FlagKind::BestDiff, true) => {
-            "Best-Diff-Benachrichtigungen aktiviert.".into()
-        }
-        (Language::De, FlagKind::BestDiff, false) => {
+        (Language::De, Switch::BestDiff, true) => "Best-Diff-Benachrichtigungen aktiviert.".into(),
+        (Language::De, Switch::BestDiff, false) => {
             "Best-Diff-Benachrichtigungen deaktiviert.".into()
         }
-        (Language::De, FlagKind::Device, true) => "Geräte-Benachrichtigungen aktiviert.".into(),
-        (Language::De, FlagKind::Device, false) => "Geräte-Benachrichtigungen deaktiviert.".into(),
-        (Language::De, FlagKind::Hourly, true) => "Stündliche Updates aktiviert.".into(),
-        (Language::De, FlagKind::Hourly, false) => "Stündliche Updates deaktiviert.".into(),
-        (Language::De, FlagKind::GroupAdmin, true) => {
+        (Language::De, Switch::Device, true) => "Geräte-Benachrichtigungen aktiviert.".into(),
+        (Language::De, Switch::Device, false) => "Geräte-Benachrichtigungen deaktiviert.".into(),
+        (Language::De, Switch::Hourly, true) => "Stündliche Updates aktiviert.".into(),
+        (Language::De, Switch::Hourly, false) => "Stündliche Updates deaktiviert.".into(),
+        (Language::De, Switch::TeamRequests, true) => {
             "Benachrichtigungen über Team-Beitrittsanfragen aktiviert.".into()
         }
-        (Language::De, FlagKind::GroupAdmin, false) => {
+        (Language::De, Switch::TeamRequests, false) => {
             "Benachrichtigungen über Team-Beitrittsanfragen deaktiviert.".into()
         }
-        (Language::En, FlagKind::BestDiff, true) => "Best-difficulty notifications enabled.".into(),
-        (Language::En, FlagKind::BestDiff, false) => {
-            "Best-difficulty notifications disabled.".into()
-        }
-        (Language::En, FlagKind::Device, true) => "Device notifications enabled.".into(),
-        (Language::En, FlagKind::Device, false) => "Device notifications disabled.".into(),
-        (Language::En, FlagKind::Hourly, true) => "Hourly updates enabled.".into(),
-        (Language::En, FlagKind::Hourly, false) => "Hourly updates disabled.".into(),
-        (Language::En, FlagKind::GroupAdmin, true) => {
+        (Language::En, Switch::BestDiff, true) => "Best-difficulty notifications enabled.".into(),
+        (Language::En, Switch::BestDiff, false) => "Best-difficulty notifications disabled.".into(),
+        (Language::En, Switch::Device, true) => "Device notifications enabled.".into(),
+        (Language::En, Switch::Device, false) => "Device notifications disabled.".into(),
+        (Language::En, Switch::Hourly, true) => "Hourly updates enabled.".into(),
+        (Language::En, Switch::Hourly, false) => "Hourly updates disabled.".into(),
+        (Language::En, Switch::TeamRequests, true) => {
             "Team join-request notifications enabled.".into()
         }
-        (Language::En, FlagKind::GroupAdmin, false) => {
+        (Language::En, Switch::TeamRequests, false) => {
             "Team join-request notifications disabled.".into()
         }
     }
 }
 
-fn best_diff_reset_text(lang: Language, n: u64) -> String {
-    match lang {
-        Language::De => format!("Best-Diff für {n} Adresse(n) zurückgesetzt."),
-        Language::En => format!("Best-difficulty reset for {n} address(es)."),
+/// Resetting the best difficulty is a write for one address, so it happens
+/// in the dashboard, behind that address's login; the bot only links there.
+fn best_diff_reset_text(lang: Language, address: &AddressId, base_url: Option<&str>) -> String {
+    let short = short_address(address.as_str());
+    match (lang, base_url) {
+        (Language::De, Some(base)) => format!(
+            "Den Best-Diff von {short} setzt du im Dashboard zurück, nach dem Login \
+             unter Einstellungen:\n{}/#/app/{}/settings",
+            base.trim_end_matches('/'),
+            address.as_str()
+        ),
+        (Language::De, None) => format!(
+            "Den Best-Diff von {short} setzt du im Dashboard zurück, nach dem Login \
+             unter Einstellungen."
+        ),
+        (Language::En, Some(base)) => format!(
+            "Reset the best difficulty of {short} in the dashboard, after logging in, \
+             under Settings:\n{}/#/app/{}/settings",
+            base.trim_end_matches('/'),
+            address.as_str()
+        ),
+        (Language::En, None) => format!(
+            "Reset the best difficulty of {short} in the dashboard, after logging in, \
+             under Settings."
+        ),
     }
 }
 
@@ -1298,45 +1299,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_address_rejects_blank_or_oversized() {
-        assert!(parse_address("").is_none());
-        assert!(parse_address("   ").is_none());
-        assert!(parse_address(&"a".repeat(70)).is_none());
-        assert!(parse_address("with space").is_none());
-    }
-
-    #[test]
-    fn parse_address_accepts_basic_btc_address_shapes() {
-        assert!(parse_address("bc1qexampleaddress").is_some());
-        assert!(parse_address("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa").is_some());
-        assert!(parse_address("3FZbgi29cpjq2GjdwV8eyHuJJnkLtktZc5").is_some());
-    }
-
-    #[test]
-    fn help_text_includes_all_listed_commands_per_language() {
-        let de = help_text(Language::De);
-        let en = help_text(Language::En);
-        for cmd in [
-            "/start",
-            "/subscribe",
-            "/remove",
-            "/show_addresses",
-            "/subscribe_bestdiff",
-            "/device_notifications",
-            "/send_hourly",
-            "/bestdiff_reset",
-            "/deutsch",
-            "/english",
-            "/help",
+    fn flag_toggle_text_covers_every_switch() {
+        for flag in [
+            Switch::BestDiff,
+            Switch::Device,
+            Switch::Hourly,
+            Switch::TeamRequests,
         ] {
-            assert!(de.contains(cmd), "missing {cmd} in de help");
-            assert!(en.contains(cmd), "missing {cmd} in en help");
-        }
-    }
-
-    #[test]
-    fn flag_toggle_text_covers_all_six_combinations() {
-        for flag in [FlagKind::BestDiff, FlagKind::Device, FlagKind::Hourly] {
             for val in [true, false] {
                 for lang in [Language::De, Language::En] {
                     let s = flag_toggle_ok_text(lang, flag, val);
@@ -1372,6 +1341,7 @@ mod tests {
             hourly_stats_enabled: false,
             hourly_workers_enabled: false,
             group_admin_notifications_enabled: false,
+            block_notifications_enabled: false,
         }
     }
 
@@ -1395,32 +1365,141 @@ mod tests {
     }
 
     #[test]
-    fn hourly_menu_reflects_flags_and_carries_callbacks() {
-        let (_text, kb) = CommandHandler::build_hourly_menu(true, false, Language::En);
-        assert_eq!(kb.len(), 1);
-        assert_eq!(kb[0].len(), 2);
-        assert_eq!(kb[0][0].callback_data, "hr:stats");
-        assert_eq!(kb[0][1].callback_data, "hr:workers");
-        assert!(kb[0][0].text.contains("ON"), "stats on: {}", kb[0][0].text);
+    fn settings_keyboard_shows_each_switch_of_each_address() {
+        let mut first = sub_row(2, "bc1qsecondaddressxxxxxx", false);
+        first.hourly_workers_enabled = true;
+        let subs = vec![first, sub_row(1, "bc1qfirstaddressxxxxxxx", true)];
+        let (_text, kb) = CommandHandler::build_settings_keyboard(&subs, Language::En);
+        // Per address: the address row and two switch rows, ordered by id.
+        assert_eq!(kb.len(), 6);
+        assert!(kb[0][0].text.starts_with("⭐ "));
+        assert_eq!(kb[0][0].callback_data, "st:1");
+        let switches: Vec<&InlineButton> = kb[4].iter().chain(kb[5].iter()).collect();
+        assert_eq!((kb[4].len(), kb[5].len()), (3, 3));
+        assert_eq!(switches.len(), SettingsField::ALL.len());
+        for (button, field) in switches.iter().zip(SettingsField::ALL) {
+            assert_eq!(
+                button.callback_data,
+                SettingsCallback::Flip(2, field).data()
+            );
+            let on = field == SettingsField::HourlyWorkers;
+            assert_eq!(button.text.starts_with('✅'), on, "{}", button.text);
+        }
+    }
+
+    async fn subscribed_chat(pool: &PgPool, chat_id: i64, addresses: &[&str]) {
+        sqlx::query(r#"DELETE FROM telegram_subscriptions_entity WHERE "telegramChatId" = $1"#)
+            .bind(chat_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        for a in addresses {
+            upsert_telegram_subscription(pool, chat_id, &AddressId::new(*a).unwrap())
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Removing the default by command leaves another default, like the
+    /// 🗑 button does; a chat that still has none is told how to pick one.
+    #[tokio::test]
+    async fn removing_the_default_by_command_keeps_a_default() {
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let chat_id = -7_700_101;
+        let transport = Transport::Telegram { chat_id };
+        let handler = CommandHandler::new(pool.clone(), Network::Bitcoin, None, None);
+        let (a, b, c) = ("bc1qremovetesta", "bc1qremovetestb", "bc1qremovetestc");
+        // The last subscribed address is the default.
+        subscribed_chat(&pool, chat_id, &[a, b, c]).await;
+        handler.handle_remove(&transport, Language::En, c).await;
+        let origin = handler.target_address(&transport, Language::En, None).await;
+        assert_eq!(origin.map(AddressId::into_inner), Ok(a.to_string()));
+
+        sqlx::query(r#"UPDATE telegram_subscriptions_entity SET "isDefault" = false WHERE "telegramChatId" = $1"#)
+            .bind(chat_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let origin = handler.target_address(&transport, Language::En, None).await;
+        assert_eq!(origin, Err(no_default_text(Language::En).to_string()));
+
+        subscribed_chat(&pool, chat_id, &[]).await;
+        let origin = handler.target_address(&transport, Language::En, None).await;
+        assert_eq!(origin, Err(no_address_text(Language::En).to_string()));
+    }
+
+    /// A chat without an address is told to subscribe; one with addresses
+    /// sees them instead.
+    #[tokio::test]
+    async fn start_points_a_new_chat_at_subscribe() {
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let chat_id = -7_700_301;
+        let transport = Transport::Telegram { chat_id };
+        let handler = CommandHandler::new(pool.clone(), Network::Bitcoin, None, None);
+        subscribed_chat(&pool, chat_id, &[]).await;
+        let fresh = handler.handle_start(&transport, Language::De).await;
+        assert!(fresh.contains("Tipp /subscribe"), "{fresh}");
+        assert!(!fresh.contains("Abonnierte Adressen"), "{fresh}");
+
+        subscribed_chat(&pool, chat_id, &["bc1qstarttestaddress"]).await;
+        let known = handler.handle_start(&transport, Language::En).await;
+        assert!(!known.contains("/subscribe"), "{known}");
+        assert!(known.contains("\n• bc1qstarttestaddress"), "{known}");
+
+        subscribed_chat(&pool, chat_id, &[]).await;
+    }
+
+    /// Only a reply to an open, unexpired question subscribes, and only once.
+    #[tokio::test]
+    async fn an_answer_to_the_subscribe_question_subscribes() {
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let chat_id = -7_700_201;
+        let address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        subscribed_chat(&pool, chat_id, &[]).await;
+        let handler = CommandHandler::new(pool.clone(), Network::Bitcoin, None, None);
+        let now = chrono::Utc::now().timestamp_millis();
+        {
+            let mut open = handler.subscribe_questions.lock().await;
+            open.insert((chat_id, 10), now + QUESTION_TTL_MS);
+            open.insert((chat_id, 11), now - 1);
+        }
+        let subscribed = || async {
+            find_telegram_subscriptions_by_chat(&pool, chat_id)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|s| s.address.into_inner())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(!handler.answer_telegram_question(chat_id, 99, address).await);
+        assert!(!handler.answer_telegram_question(chat_id, 11, address).await);
+        assert!(subscribed().await.is_empty());
         assert!(
-            kb[0][1].text.contains("OFF"),
-            "workers off: {}",
-            kb[0][1].text
+            handler
+                .answer_telegram_question(chat_id, 10, &format!("{address} thanks"))
+                .await
         );
-        // German labels use AN/AUS + "Worker".
-        let (_t, kb_de) = CommandHandler::build_hourly_menu(false, true, Language::De);
-        assert!(kb_de[0][0].text.contains("AUS"));
-        assert!(kb_de[0][1].text.starts_with("Worker:"));
-        assert!(kb_de[0][1].text.contains("AN"));
+        assert_eq!(subscribed().await, vec![address.to_string()]);
+        assert!(!handler.answer_telegram_question(chat_id, 10, address).await);
+
+        subscribed_chat(&pool, chat_id, &[]).await;
     }
 
     #[test]
-    fn bestdiff_confirm_keyboard_carries_yes_no_callbacks() {
-        let kb = CommandHandler::build_bestdiff_confirm_keyboard(Language::En);
-        assert_eq!(kb.len(), 1);
-        assert_eq!(kb[0][0].callback_data, "bdr:yes");
-        assert_eq!(kb[0][1].callback_data, "bdr:no");
-        assert!(kb[0][0].text.contains("Yes"));
-        assert!(kb[0][1].text.contains("Cancel"));
+    fn bestdiff_reset_links_the_addresss_dashboard_settings() {
+        let address = AddressId::new("bc1qresetlinkaddress").unwrap();
+        let text = best_diff_reset_text(Language::En, &address, Some("https://pool.example/"));
+        assert!(
+            text.ends_with("\nhttps://pool.example/#/app/bc1qresetlinkaddress/settings"),
+            "{text}"
+        );
+        assert!(!best_diff_reset_text(Language::De, &address, None).contains("http"));
     }
 }

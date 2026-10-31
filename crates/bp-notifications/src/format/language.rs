@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-/// Two-language enum the dispatcher uses to render messages.
-/// Language preference is stored per-subscription in the database
-/// and per-chat in an in-memory map; both route through this enum.
+/// Two-language enum the dispatcher uses to render messages. An ntfy
+/// subscription and a Telegram chat each store theirs in the database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Language {
     De,

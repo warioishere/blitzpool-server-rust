@@ -5,15 +5,13 @@ use thiserror::Error;
 /// Outcome of a single adapter send-attempt.
 pub type AdapterResult<T> = Result<T, AdapterError>;
 
-/// Failure modes shared by every adapter. The dispatcher pattern-matches
-/// on `InvalidRecipient` to prune dead subscription rows; other
-/// variants get logged and the next subscriber is tried.
+/// Failure modes shared by every adapter. `InvalidRecipient` prunes the
+/// recipient's subscription rows; other variants get logged and the next
+/// subscriber is tried.
 #[derive(Debug, Error)]
 pub enum AdapterError {
-    /// Caller passed a recipient string that fails server-side
-    /// validation as a permanent condition (FCM `UNREGISTERED`,
-    /// Web-Push `410 Gone`, Telegram `Forbidden: bot was blocked`).
-    /// Dispatcher cleans up the underlying subscription row.
+    /// The recipient is gone for good: a Telegram chat that blocked the
+    /// bot or does not exist. The caller soft-deletes its subscriptions.
     #[error("invalid recipient: {0}")]
     InvalidRecipient(String),
 

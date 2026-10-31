@@ -11,6 +11,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+bp-blockparty = { workspace = true }
 bp-common = { workspace = true }
 bp-cron-utils = { workspace = true }
 bp-db = { workspace = true }
@@ -19,6 +20,9 @@ bp-client-live = { workspace = true }
 redis = { workspace = true }
 bp-pplns-engine = { workspace = true }
 bp-group-solo-engine = { workspace = true }
+# `parse_pool_address`: a subscribed address must be one of the pool's network.
+bp-mining-job = { workspace = true }
+bitcoin = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
 
@@ -45,4 +49,5 @@ rustls-pki-types = { workspace = true }
 base64 = { workspace = true }
 
 [dev-dependencies]
+bp-test-support = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

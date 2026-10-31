@@ -916,6 +916,8 @@ version = "2.4.2"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "bitcoin",
+ "bp-blockparty",
  "bp-client-live",
  "bp-common",
  "bp-cron-utils",
@@ -923,7 +925,9 @@ dependencies = [
  "bp-group-mgmt",
  "bp-group-solo-engine",
  "bp-http",
+ "bp-mining-job",
  "bp-pplns-engine",
+ "bp-test-support",
  "chrono",
  "chrono-tz",
  "futures",

@@ -258,8 +258,10 @@ pub(crate) async fn spawn(
     let ntfy_adapter: Option<Arc<NtfyAdapter>> = listeners.ntfy_adapter();
     let hourly_stats_telegram = telegram_adapter.is_some();
     let hourly_stats_ntfy = ntfy_adapter.is_some();
-    // Without an adapter the digest has nowhere to go; skip the DB scan.
-    let hourly_stats_shutdown = if run_notifications && (hourly_stats_telegram || hourly_stats_ntfy)
+    // Without an adapter the digest has nowhere to go; skip the DB scan. An
+    // adapter comes with the listeners, and so with their chat languages.
+    let hourly_stats_shutdown = if let (true, Some(chat_languages)) =
+        (run_notifications, listeners.chat_languages())
     {
         Some(spawn_hourly_stats_cron(
             HourlyStatsCronConfig {
@@ -270,7 +272,7 @@ pub(crate) async fn spawn(
             Some(foundation.redis.clone()),
             telegram_adapter,
             ntfy_adapter,
-            listeners.chat_languages().unwrap_or_default(),
+            chat_languages,
         ))
     } else {
         if run_notifications {

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            \"telegramChatId\" AS \"telegram_chat_id!\",\n            \"bestDiffNotificationsEnabled\" AS \"best_diff_notifications_enabled!\",\n            \"isDefault\" AS \"is_default!\",\n            \"deviceNotificationsEnabled\" AS \"device_notifications_enabled!\",\n            \"hourlyStatsEnabled\" AS \"hourly_stats_enabled!\",\n            \"hourlyWorkersEnabled\" AS \"hourly_workers_enabled!\",\n            \"groupAdminNotificationsEnabled\" AS \"group_admin_notifications_enabled!\"\n           FROM telegram_subscriptions_entity\n           WHERE address = $1 AND \"deletedAt\" IS NULL",
+  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            \"telegramChatId\" AS \"telegram_chat_id!\",\n            \"bestDiffNotificationsEnabled\" AS \"best_diff_notifications_enabled!\",\n            \"isDefault\" AS \"is_default!\",\n            \"deviceNotificationsEnabled\" AS \"device_notifications_enabled!\",\n            \"hourlyStatsEnabled\" AS \"hourly_stats_enabled!\",\n            \"hourlyWorkersEnabled\" AS \"hourly_workers_enabled!\",\n            \"groupAdminNotificationsEnabled\" AS \"group_admin_notifications_enabled!\",\n            \"blockNotificationsEnabled\" AS \"block_notifications_enabled!\"\n           FROM telegram_subscriptions_entity\n           WHERE \"telegramChatId\" = $1 AND \"deletedAt\" IS NULL",
   "describe": {
     "columns": [
       {
@@ -62,11 +62,16 @@
         "ordinal": 11,
         "name": "group_admin_notifications_enabled!",
         "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
+        "name": "block_notifications_enabled!",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Int8"
       ]
     },
     "nullable": [
@@ -81,8 +86,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "1148944d2af593a299d5dd1a301c598828273f7db1c3142fd0658efdac31266e"
+  "hash": "e6952cd9fae17da78b66f2b27cb01df1c3477f2d5b9f4d121c75e2e68c0830ae"
 }

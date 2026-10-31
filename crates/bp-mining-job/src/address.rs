@@ -6,6 +6,7 @@
 use std::str::FromStr;
 
 use bitcoin::{Address, Network, ScriptBuf};
+use bp_common::AddressId;
 
 /// Convert a BTC address to its `scriptPubKey`; an address for another network
 /// is rejected.
@@ -15,6 +16,17 @@ pub fn address_to_script(network: Network, address: &str) -> Result<ScriptBuf, A
         .require_network(network)
         .map_err(|e| AddressError::NetworkMismatch(e.to_string()))?;
     Ok(checked.script_pubkey())
+}
+
+/// `raw` as an address of `network`, keyed the way stored rows are
+/// ([`AddressId::normalized`]). `None` for anything else.
+pub fn parse_pool_address(network: Network, raw: &str) -> Option<AddressId> {
+    let trimmed = raw.trim();
+    Address::from_str(trimmed)
+        .ok()?
+        .require_network(network)
+        .ok()?;
+    AddressId::normalized(trimmed).ok()
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -28,6 +40,27 @@ pub enum AddressError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_pool_address_keys_a_real_address_of_the_network() {
+        let bech32 = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        let parsed = |raw: &str| parse_pool_address(Network::Bitcoin, raw).map(|a| a.into_inner());
+        assert_eq!(parsed(bech32).as_deref(), Some(bech32));
+        assert_eq!(
+            parsed(&format!(" {} ", bech32.to_uppercase())).as_deref(),
+            Some(bech32)
+        );
+        let base58 = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2";
+        assert_eq!(parsed(base58).as_deref(), Some(base58));
+        for wrong in [
+            &format!("<{bech32}>") as &str,
+            "bc1qnotarealaddress",
+            "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+            "",
+        ] {
+            assert_eq!(parsed(wrong), None, "{wrong:?}");
+        }
+    }
 
     #[test]
     fn address_to_script_p2wpkh_mainnet() {
