@@ -12,7 +12,7 @@ use serde::Deserialize;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::command::{parse_command, CommandHandler, PlainMessage, Transport};
+use crate::command::{parse_command, Command, CommandHandler, PlainMessage, Transport};
 
 #[derive(Debug, Clone)]
 pub struct TelegramListenerConfig {
@@ -58,10 +58,16 @@ pub fn spawn_telegram_listener(
         };
         let base = format!("https://api.telegram.org/bot{}", config.bot_token);
         let mut offset: i64 = 0;
+        // Asked until Telegram answers; until then a command naming any bot
+        // is taken as ours.
+        let mut bot_username: Option<String> = None;
         info!(target: "bp_notifications::listener::telegram", "polling started");
         loop {
             if *shutdown_rx.borrow() {
                 break;
+            }
+            if bot_username.is_none() {
+                bot_username = fetch_bot_username(&client, &base).await;
             }
             tokio::select! {
                 _ = shutdown_rx.changed() => {
@@ -71,7 +77,9 @@ pub fn spawn_telegram_listener(
                     match result {
                         Ok(updates) => {
                             for update in updates {
-                                if let Some(next) = process_update(&handler, update).await {
+                                if let Some(next) =
+                                    process_update(&handler, update, bot_username.as_deref()).await
+                                {
                                     if next > offset {
                                         offset = next;
                                     }
@@ -125,7 +133,60 @@ async fn poll_once(
     Ok(body.result)
 }
 
-async fn process_update(handler: &CommandHandler, update: Update) -> Option<i64> {
+/// The bot's own `@username`, from `getMe`.
+async fn fetch_bot_username(client: &Client, base: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Me {
+        username: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct GetMe {
+        result: Me,
+    }
+    let fetched = async {
+        client
+            .get(format!("{base}/getMe"))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?
+            .json::<GetMe>()
+            .await
+            .map_err(|e| e.to_string())
+    }
+    .await;
+    match fetched {
+        Ok(me) => me.result.username,
+        Err(e) => {
+            warn!(target: "bp_notifications::listener::telegram", error = %e, "getMe failed");
+            None
+        }
+    }
+}
+
+/// The command a text message gives this bot, if any. In a group the bot
+/// hears every message once it is an admin or its privacy mode is off, so
+/// there it takes only commands it knows and that name no other bot;
+/// a private chat also hears "unknown command".
+fn command_for_this_bot(text: &str, private: bool, bot_username: Option<&str>) -> Option<Command> {
+    let head = text.split_whitespace().next()?;
+    if let (Some((_, named)), Some(own)) = (head.split_once('@'), bot_username) {
+        if !named.eq_ignore_ascii_case(own) {
+            return None;
+        }
+    }
+    match parse_command(text) {
+        Command::Unknown if !private => None,
+        command => Some(command),
+    }
+}
+
+async fn process_update(
+    handler: &CommandHandler,
+    update: Update,
+    bot_username: Option<&str>,
+) -> Option<i64> {
     let next_offset = update.update_id + 1;
     if let Some(message) = update.message {
         if let Some(text) = message.text.as_deref() {
@@ -149,7 +210,11 @@ async fn process_update(handler: &CommandHandler, update: Update) -> Option<i64>
                     return Some(next_offset);
                 }
             }
-            let command = parse_command(text);
+            let Some(command) =
+                command_for_this_bot(text, message.chat.kind == "private", bot_username)
+            else {
+                return Some(next_offset);
+            };
             debug!(
                 target: "bp_notifications::listener::telegram",
                 chat_id = message.chat.id,
@@ -268,6 +333,30 @@ mod tests {
 
     fn message(json: &str) -> Message {
         serde_json::from_str(json).unwrap()
+    }
+
+    /// In a group only commands for this bot get an answer: chat, unknown
+    /// commands and commands naming another bot are left alone. A private
+    /// chat still hears "unknown command".
+    #[test]
+    fn a_group_hears_only_its_own_commands() {
+        let bot = Some("BlitzpoolBot");
+        let in_group = |text| command_for_this_bot(text, false, bot);
+        assert_eq!(in_group("hallo zusammen"), None);
+        assert_eq!(in_group("/irgendwas"), None);
+        assert_eq!(in_group("/start@OtherBot"), None);
+        assert_eq!(in_group("/start"), Some(Command::Start));
+        assert_eq!(in_group("/start@blitzpoolbot"), Some(Command::Start));
+        assert_eq!(
+            command_for_this_bot("hallo", true, bot),
+            Some(Command::Unknown)
+        );
+        assert_eq!(command_for_this_bot("/start@OtherBot", true, bot), None);
+        // Before getMe answered, a named command is taken as ours.
+        assert_eq!(
+            command_for_this_bot("/start@OtherBot", false, None),
+            Some(Command::Start)
+        );
     }
 
     /// A forum topic is the reply target; a reply thread in a plain
