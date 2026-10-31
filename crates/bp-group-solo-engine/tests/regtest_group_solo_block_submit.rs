@@ -76,15 +76,15 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
 
     let now_ms = chrono::Utc::now().timestamp_millis();
     engine
-        .record_share(None, group_id, &addr_alice, 100.0, now_ms)
+        .record_share(None, group_id, &addr_alice, 100.0, 100.0, now_ms)
         .await
         .expect("seed share Alice");
     engine
-        .record_share(None, group_id, &addr_bob, 200.0, now_ms)
+        .record_share(None, group_id, &addr_bob, 200.0, 200.0, now_ms)
         .await
         .expect("seed share Bob");
     engine
-        .record_share(None, group_id, &addr_charlie, 300.0, now_ms)
+        .record_share(None, group_id, &addr_charlie, 300.0, 300.0, now_ms)
         .await
         .expect("seed share Charlie");
 

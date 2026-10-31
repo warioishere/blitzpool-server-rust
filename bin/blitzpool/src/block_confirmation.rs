@@ -1334,7 +1334,7 @@ mod declared_block_booking_regtest {
                 (&members[2], 300.0),
             ] {
                 group_solo
-                    .record_share(None, group_id, addr, difficulty, now_ms)
+                    .record_share(None, group_id, addr, difficulty, difficulty, now_ms)
                     .await
                     .expect("seed group share");
             }

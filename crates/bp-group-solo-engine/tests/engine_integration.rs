@@ -184,6 +184,57 @@ fn actual_paying_exactly(
     }
 }
 
+/// The round counts a share at its credited difficulty, while the round's
+/// best share keeps the difficulty the hash reached: a share credited at
+/// 4096 that solved 50M is a 50M best.
+#[tokio::test]
+async fn the_best_share_keeps_the_solved_difficulty() {
+    let h = match spawn_or_skip(24, None).await {
+        Some(h) => h,
+        None => return,
+    };
+    h.engine
+        .record_share(
+            None,
+            h.group_id,
+            "test_best_a",
+            4096.0,
+            50_000_000.0,
+            1_700_000_000_001,
+        )
+        .await
+        .expect("ok");
+    h.engine
+        .record_share(
+            None,
+            h.group_id,
+            "test_best_b",
+            2_097_152.0,
+            3_000_000.0,
+            1_700_000_000_002,
+        )
+        .await
+        .expect("ok");
+
+    let reader = h.engine.reader();
+    let stats = reader.round_stats(h.group_id).await.expect("ok");
+    assert!(
+        (stats.total_shares - (4096.0 + 2_097_152.0)).abs() < 1e-6,
+        "{}",
+        stats.total_shares
+    );
+    let best = reader
+        .best_difficulty(h.group_id)
+        .await
+        .expect("ok")
+        .expect("a best share");
+    assert_eq!(
+        (best.address.as_str(), best.difficulty),
+        ("test_best_a", 50_000_000.0)
+    );
+    drop_harness(h).await;
+}
+
 // ── Test 1 — record_share appears in reader.round_stats ─────────────
 
 #[tokio::test]
@@ -193,7 +244,14 @@ async fn record_share_then_round_stats_sees_it() {
         None => return,
     };
     h.engine
-        .record_share(None, h.group_id, "test_eng_a", 75.0, 1_700_000_000_001)
+        .record_share(
+            None,
+            h.group_id,
+            "test_eng_a",
+            75.0,
+            75.0,
+            1_700_000_000_001,
+        )
         .await
         .expect("ok");
 
@@ -215,11 +273,11 @@ async fn build_distribution_returns_payouts_after_shares() {
     let a = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
     let b = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
     h.engine
-        .record_share(None, h.group_id, a.as_str(), 60.0, 1_700_000_000_001)
+        .record_share(None, h.group_id, a.as_str(), 60.0, 60.0, 1_700_000_000_001)
         .await
         .unwrap();
     h.engine
-        .record_share(None, h.group_id, b.as_str(), 40.0, 1_700_000_000_002)
+        .record_share(None, h.group_id, b.as_str(), 40.0, 40.0, 1_700_000_000_002)
         .await
         .unwrap();
 
@@ -254,7 +312,14 @@ async fn on_block_found_applies_distribution_and_resets_round() {
     };
     let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
     h.engine
-        .record_share(None, h.group_id, finder.as_str(), 100.0, 1_700_000_000_001)
+        .record_share(
+            None,
+            h.group_id,
+            finder.as_str(),
+            100.0,
+            100.0,
+            1_700_000_000_001,
+        )
         .await
         .unwrap();
     let result = h
@@ -305,11 +370,25 @@ async fn a_richer_block_leaves_nobody_owing() {
     const T_REF: u64 = 312_500_000;
     const T_ACTUAL: u64 = 375_000_000;
     h.engine
-        .record_share(None, h.group_id, finder.as_str(), 100.0, 1_700_000_000_001)
+        .record_share(
+            None,
+            h.group_id,
+            finder.as_str(),
+            100.0,
+            100.0,
+            1_700_000_000_001,
+        )
         .await
         .unwrap();
     h.engine
-        .record_share(None, h.group_id, other.as_str(), 100.0, 1_700_000_000_002)
+        .record_share(
+            None,
+            h.group_id,
+            other.as_str(),
+            100.0,
+            100.0,
+            1_700_000_000_002,
+        )
         .await
         .unwrap();
     let result = h
@@ -392,11 +471,11 @@ async fn block_found_books_the_job_coinbase_after_the_round_moved() {
     let reward = 312_500_000;
 
     h.engine
-        .record_share(None, h.group_id, a.as_str(), 300.0, 1)
+        .record_share(None, h.group_id, a.as_str(), 300.0, 300.0, 1)
         .await
         .unwrap();
     h.engine
-        .record_share(None, h.group_id, b.as_str(), 100.0, 2)
+        .record_share(None, h.group_id, b.as_str(), 100.0, 100.0, 2)
         .await
         .unwrap();
     let job = h
@@ -407,7 +486,7 @@ async fn block_found_books_the_job_coinbase_after_the_round_moved() {
 
     // One share lands between job issue and block-found: B overtakes A.
     h.engine
-        .record_share(None, h.group_id, b.as_str(), 900.0, 3)
+        .record_share(None, h.group_id, b.as_str(), 900.0, 900.0, 3)
         .await
         .unwrap();
     let rebuilt = h
@@ -452,7 +531,7 @@ async fn a_redelivered_apply_books_nothing() {
     let reward = 312_500_000;
 
     h.engine
-        .record_share(None, h.group_id, finder.as_str(), 100.0, 1)
+        .record_share(None, h.group_id, finder.as_str(), 100.0, 100.0, 1)
         .await
         .unwrap();
     let booked = h
@@ -487,7 +566,7 @@ async fn a_redelivered_apply_does_not_reset_the_round_again() {
     let reward = 312_500_000;
 
     h.engine
-        .record_share(None, h.group_id, finder.as_str(), 100.0, 1)
+        .record_share(None, h.group_id, finder.as_str(), 100.0, 100.0, 1)
         .await
         .unwrap();
     let booked = h
@@ -513,7 +592,7 @@ async fn a_redelivered_apply_does_not_reset_the_round_again() {
 
     // The next round has started when the same block arrives again.
     h.engine
-        .record_share(None, h.group_id, finder.as_str(), 40.0, 2)
+        .record_share(None, h.group_id, finder.as_str(), 40.0, 40.0, 2)
         .await
         .unwrap();
     h.engine
@@ -544,7 +623,7 @@ async fn a_retry_completes_a_reset_the_first_apply_did_not_reach() {
     let height = 9_995_041;
 
     h.engine
-        .record_share(None, h.group_id, finder.as_str(), 100.0, 1)
+        .record_share(None, h.group_id, finder.as_str(), 100.0, 100.0, 1)
         .await
         .unwrap();
     let booked = h
@@ -606,7 +685,7 @@ async fn on_block_found_keeps_round_when_reset_flag_false() {
 
     let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
     h.engine
-        .record_share(None, h.group_id, finder.as_str(), 100.0, 1)
+        .record_share(None, h.group_id, finder.as_str(), 100.0, 100.0, 1)
         .await
         .unwrap();
     let dist = h
@@ -655,7 +734,7 @@ async fn duplicate_block_found_does_not_double_the_history() {
     let height = 9_998_001;
 
     h.engine
-        .record_share(None, h.group_id, finder.as_str(), 100.0, 1)
+        .record_share(None, h.group_id, finder.as_str(), 100.0, 100.0, 1)
         .await
         .unwrap();
     let job = h
@@ -710,7 +789,7 @@ async fn concurrent_applies_of_one_block_book_it_once() {
     };
     let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
     h.engine
-        .record_share(None, h.group_id, finder.as_str(), 100.0, 1)
+        .record_share(None, h.group_id, finder.as_str(), 100.0, 100.0, 1)
         .await
         .unwrap();
     let dist = h
@@ -748,7 +827,7 @@ async fn manual_reset_wipes_group_state() {
         None => return,
     };
     h.engine
-        .record_share(None, h.group_id, "test_eng_reset_a", 50.0, 1)
+        .record_share(None, h.group_id, "test_eng_reset_a", 50.0, 50.0, 1)
         .await
         .unwrap();
 
@@ -795,11 +874,25 @@ async fn on_block_found_with_finder_bonus_merges_duplicate_outputs() {
     let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
     let other = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
     h.engine
-        .record_share(None, h.group_id, finder.as_str(), 70.0, 1_700_000_000_001)
+        .record_share(
+            None,
+            h.group_id,
+            finder.as_str(),
+            70.0,
+            70.0,
+            1_700_000_000_001,
+        )
         .await
         .unwrap();
     h.engine
-        .record_share(None, h.group_id, other.as_str(), 30.0, 1_700_000_000_002)
+        .record_share(
+            None,
+            h.group_id,
+            other.as_str(),
+            30.0,
+            30.0,
+            1_700_000_000_002,
+        )
         .await
         .unwrap();
 
@@ -892,11 +985,11 @@ async fn reader_best_difficulty_after_shares() {
         None => return,
     };
     h.engine
-        .record_share(None, h.group_id, "test_eng_best_a", 50.0, 1)
+        .record_share(None, h.group_id, "test_eng_best_a", 50.0, 50.0, 1)
         .await
         .unwrap();
     h.engine
-        .record_share(None, h.group_id, "test_eng_best_b", 200.0, 2)
+        .record_share(None, h.group_id, "test_eng_best_b", 200.0, 200.0, 2)
         .await
         .unwrap();
 
@@ -1059,9 +1152,16 @@ async fn spawn_core_skips_startup_reset_crons() {
 
     // The Core's read path still produces a distribution.
     let addr = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
-    core.record_share(None, group_id, addr.as_str(), 100.0, 1_700_000_000_000)
-        .await
-        .expect("record_share ok");
+    core.record_share(
+        None,
+        group_id,
+        addr.as_str(),
+        100.0,
+        100.0,
+        1_700_000_000_000,
+    )
+    .await
+    .expect("record_share ok");
     let result = core
         .build_distribution(group_id, 312_500_000, &addr)
         .await
@@ -1169,11 +1269,11 @@ async fn window_mode_record_path_trims_aged_buckets() {
     let t_new = now;
 
     h.engine
-        .record_share(None, h.group_id, "bc1qold", 40.0, t_old)
+        .record_share(None, h.group_id, "bc1qold", 40.0, 40.0, t_old)
         .await
         .expect("record old share");
     h.engine
-        .record_share(None, h.group_id, "bc1qnew", 60.0, t_new)
+        .record_share(None, h.group_id, "bc1qnew", 60.0, 60.0, t_new)
         .await
         .expect("record fresh share");
 
@@ -1215,7 +1315,7 @@ async fn window_mode_reject_is_windowed_not_tallied() {
         .unwrap()
         .as_millis() as i64;
     h.engine
-        .record_share(None, h.group_id, "bc1qwin", 60.0, now)
+        .record_share(None, h.group_id, "bc1qwin", 60.0, 60.0, now)
         .await
         .expect("record share");
     h.engine
@@ -1268,11 +1368,11 @@ async fn window_mode_kick_drops_the_member_from_the_payout_source() {
         .unwrap()
         .as_millis() as i64;
     h.engine
-        .record_share(None, h.group_id, "bc1qkicked", 30.0, now)
+        .record_share(None, h.group_id, "bc1qkicked", 30.0, 30.0, now)
         .await
         .expect("record share");
     h.engine
-        .record_share(None, h.group_id, "bc1qstays", 70.0, now)
+        .record_share(None, h.group_id, "bc1qstays", 70.0, 70.0, now)
         .await
         .expect("record share");
     let before = h.engine.reader().round_stats(h.group_id).await.expect("ok");
@@ -1323,7 +1423,7 @@ async fn window_grow_invalidates_mode_cache_keeps_in_window_bucket() {
 
     // Caches 1 day; its own trim runs at its own timestamp, so it survives.
     h.engine
-        .record_share(None, h.group_id, "bc1qmid", 40.0, t_mid)
+        .record_share(None, h.group_id, "bc1qmid", 40.0, 40.0, t_mid)
         .await
         .expect("record 25h-old share");
 
@@ -1338,7 +1438,7 @@ async fn window_grow_invalidates_mode_cache_keeps_in_window_bucket() {
 
     // Crosses a bucket boundary, so the record-path trim fires against 30 days.
     h.engine
-        .record_share(None, h.group_id, "bc1qnew", 60.0, now)
+        .record_share(None, h.group_id, "bc1qnew", 60.0, 60.0, now)
         .await
         .expect("record fresh share");
 
@@ -1383,11 +1483,25 @@ async fn a_group_block_far_off_the_reference_is_still_booked() {
     );
 
     h.engine
-        .record_share(None, h.group_id, finder.as_str(), 100.0, 1_700_000_000_001)
+        .record_share(
+            None,
+            h.group_id,
+            finder.as_str(),
+            100.0,
+            100.0,
+            1_700_000_000_001,
+        )
         .await
         .unwrap();
     h.engine
-        .record_share(None, h.group_id, other.as_str(), 100.0, 1_700_000_000_002)
+        .record_share(
+            None,
+            h.group_id,
+            other.as_str(),
+            100.0,
+            100.0,
+            1_700_000_000_002,
+        )
         .await
         .unwrap();
     let result = h
@@ -1441,7 +1555,14 @@ async fn a_group_coinbase_below_the_block_subsidy_is_refused() {
     assert_eq!(subsidy, 312_500_000, "fixture height must be in epoch 4");
 
     h.engine
-        .record_share(None, h.group_id, finder.as_str(), 100.0, 1_700_000_000_001)
+        .record_share(
+            None,
+            h.group_id,
+            finder.as_str(),
+            100.0,
+            100.0,
+            1_700_000_000_001,
+        )
         .await
         .unwrap();
     let result = h

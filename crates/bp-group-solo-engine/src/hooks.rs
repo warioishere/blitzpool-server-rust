@@ -53,6 +53,7 @@ impl SharedAcceptedShareSink for GroupSoloAcceptedShareSink {
                 group_id,
                 share.address,
                 share.effective_difficulty,
+                share.submission_difficulty,
                 ts_ms,
             )
             .await

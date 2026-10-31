@@ -373,13 +373,16 @@ impl GroupSoloEngine {
     }
 
     /// Hot path: an accepted Group-Solo share. Caller has resolved
-    /// `group_id` (via the mode-gate adapter in `hooks.rs`).
+    /// `group_id` (via the mode-gate adapter in `hooks.rs`). The round
+    /// credits `credited`, the difficulty the share counts at; the round's
+    /// best share compares `solved`, the difficulty the hash reached.
     pub async fn record_share(
         &self,
         share_id: Option<&str>,
         group_id: Uuid,
         address: &str,
-        difficulty: f64,
+        credited: f64,
+        solved: f64,
         timestamp_ms: i64,
     ) -> Result<(), EngineError> {
         let group_key = group_id.to_string();
@@ -388,14 +391,14 @@ impl GroupSoloEngine {
             PayoutMode::Prop => {
                 self.inner
                     .round
-                    .record_share(share_id, &group_key, address, difficulty, timestamp_ms)
+                    .record_share(share_id, &group_key, address, credited, timestamp_ms)
                     .await?
             }
             PayoutMode::Window => {
                 let applied = self
                     .inner
                     .round
-                    .record_share_windowed(share_id, &group_key, address, difficulty, timestamp_ms)
+                    .record_share_windowed(share_id, &group_key, address, credited, timestamp_ms)
                     .await?;
                 // Trim against the share's own accept time so an idle group
                 // still bounds its window.
@@ -414,7 +417,7 @@ impl GroupSoloEngine {
         if let Err(e) = self
             .inner
             .round
-            .update_best_share_if_better(&group_key, address, difficulty, timestamp_ms)
+            .update_best_share_if_better(&group_key, address, solved, timestamp_ms)
             .await
         {
             warn!(
