@@ -587,10 +587,9 @@ impl CommandHandler {
             return;
         };
         let field = match cb {
+            // The address row only labels the switches below it.
             SettingsCallback::Address(_) => {
-                let _ = adapter
-                    .answer_callback_query(callback_id, Some(sub.address.as_str()))
-                    .await;
+                let _ = adapter.answer_callback_query(callback_id, None).await;
                 return;
             }
             SettingsCallback::Flip(_, field) => field,
@@ -724,7 +723,7 @@ impl CommandHandler {
         match transport {
             Transport::Telegram { chat_id } => {
                 match upsert_telegram_subscription(&self.pool, *chat_id, &address).await {
-                    Ok(_) => subscribe_ok_text(lang, address.as_str()).to_string(),
+                    Ok(_) => subscribe_ok_text(lang, &address).to_string(),
                     Err(e) => {
                         warn!(target: "bp_notifications::command", error = %e, "telegram subscribe");
                         db_error_text(lang).to_string()
@@ -739,7 +738,7 @@ impl CommandHandler {
                     Ok(_) => {
                         // New topic — refresh the SSE listener now.
                         self.signal_ntfy_reconnect();
-                        subscribe_ok_text(lang, address.as_str()).to_string()
+                        subscribe_ok_text(lang, &address).to_string()
                     }
                     Err(e) => {
                         warn!(target: "bp_notifications::command", error = %e, "ntfy subscribe");
@@ -775,9 +774,9 @@ impl CommandHandler {
                 if matches!(transport, Transport::Ntfy { .. }) {
                     self.signal_ntfy_reconnect();
                 }
-                remove_ok_text(lang, address.as_str()).to_string()
+                remove_ok_text(lang, &address).to_string()
             }
-            Ok(_) => remove_missing_text(lang, address.as_str()).to_string(),
+            Ok(_) => remove_missing_text(lang, &address).to_string(),
             Err(e) => {
                 warn!(target: "bp_notifications::command", error = %e, "remove");
                 db_error_text(lang).to_string()
@@ -1180,21 +1179,24 @@ fn db_error_text(lang: Language) -> &'static str {
     }
 }
 
-fn subscribe_ok_text(lang: Language, address: &str) -> String {
+fn subscribe_ok_text(lang: Language, address: &AddressId) -> String {
+    let address = short_address(address.as_str());
     match lang {
         Language::De => format!("Adresse {address} abonniert. ✅"),
         Language::En => format!("Subscribed to address {address}. ✅"),
     }
 }
 
-fn remove_ok_text(lang: Language, address: &str) -> String {
+fn remove_ok_text(lang: Language, address: &AddressId) -> String {
+    let address = short_address(address.as_str());
     match lang {
         Language::De => format!("Adresse {address} entfernt."),
         Language::En => format!("Address {address} removed."),
     }
 }
 
-fn remove_missing_text(lang: Language, address: &str) -> String {
+fn remove_missing_text(lang: Language, address: &AddressId) -> String {
+    let address = short_address(address.as_str());
     match lang {
         Language::De => format!("Adresse {address} war nicht abonniert."),
         Language::En => format!("Address {address} was not subscribed."),
@@ -1215,6 +1217,7 @@ fn no_address_text(lang: Language) -> &'static str {
     }
 }
 
+/// The addresses, shortened like every address the bot shows.
 fn list_addresses<'a>(lang: Language, addrs: impl Iterator<Item = &'a str>) -> String {
     let mut out = match lang {
         Language::De => "Abonnierte Adressen:".to_string(),
@@ -1222,7 +1225,7 @@ fn list_addresses<'a>(lang: Language, addrs: impl Iterator<Item = &'a str>) -> S
     };
     for a in addrs {
         out.push_str("\n• ");
-        out.push_str(a);
+        out.push_str(&short_address(a));
     }
     out
 }
@@ -1260,31 +1263,25 @@ fn flag_toggle_ok_text(lang: Language, flag: Switch, value: bool) -> String {
 }
 
 /// Resetting the best difficulty is a write for one address, so it happens
-/// in the dashboard, behind that address's login; the bot only links there.
+/// in the dashboard, behind that address's login; the bot only points there.
+/// The link carries no address, so a group chat does not see it in full.
 fn best_diff_reset_text(lang: Language, address: &AddressId, base_url: Option<&str>) -> String {
     let short = short_address(address.as_str());
-    match (lang, base_url) {
-        (Language::De, Some(base)) => format!(
-            "Den Best-Diff von {short} setzt du im Dashboard zurück, nach dem Login \
-             unter Einstellungen:\n{}/#/app/{}/settings",
-            base.trim_end_matches('/'),
-            address.as_str()
+    let mut text = match lang {
+        Language::De => format!(
+            "Den Best-Diff von {short} setzt du im Dashboard zurück: Adresse öffnen, \
+             einloggen, dann unter Einstellungen."
         ),
-        (Language::De, None) => format!(
-            "Den Best-Diff von {short} setzt du im Dashboard zurück, nach dem Login \
-             unter Einstellungen."
+        Language::En => format!(
+            "Reset the best difficulty of {short} in the dashboard: open the address, \
+             log in, then go to Settings."
         ),
-        (Language::En, Some(base)) => format!(
-            "Reset the best difficulty of {short} in the dashboard, after logging in, \
-             under Settings:\n{}/#/app/{}/settings",
-            base.trim_end_matches('/'),
-            address.as_str()
-        ),
-        (Language::En, None) => format!(
-            "Reset the best difficulty of {short} in the dashboard, after logging in, \
-             under Settings."
-        ),
+    };
+    if let Some(base) = base_url {
+        text.push('\n');
+        text.push_str(base.trim_end_matches('/'));
     }
+    text
 }
 
 fn language_switch_ok_text(new_lang: Language) -> &'static str {
@@ -1319,12 +1316,31 @@ mod tests {
     }
 
     #[test]
-    fn list_addresses_renders_bullets() {
-        let s = list_addresses(Language::En, ["a", "b", "c"].into_iter());
+    fn subscribe_and_remove_replies_show_the_address_shortened() {
+        let full = "bc1qtpa45phz26kays4hk63hcmxf9sty454wqjwcy8";
+        let address = AddressId::new(full).unwrap();
+        for lang in [Language::De, Language::En] {
+            for text in [
+                subscribe_ok_text(lang, &address),
+                remove_ok_text(lang, &address),
+                remove_missing_text(lang, &address),
+            ] {
+                assert!(
+                    text.contains("bc1q...jwcy8") && !text.contains(full),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn list_addresses_shortens_each_address() {
+        let full = "bc1qtpa45phz26kays4hk63hcmxf9sty454wqjwcy8";
+        let s = list_addresses(Language::En, [full, "bc1qsecondaddressxxxxxx"].into_iter());
         assert!(s.starts_with("Subscribed addresses:"));
-        assert!(s.contains("\n• a"));
-        assert!(s.contains("\n• b"));
-        assert!(s.contains("\n• c"));
+        assert!(s.contains("\n• bc1q...jwcy8"), "{s}");
+        assert!(!s.contains(full), "{s}");
+        assert_eq!(s.lines().count(), 3);
     }
 
     fn sub_row(id: i32, address: &str, is_default: bool) -> TelegramSubscriptionRow {
@@ -1448,7 +1464,7 @@ mod tests {
         subscribed_chat(&pool, chat_id, &["bc1qstarttestaddress"]).await;
         let known = handler.handle_start(&transport, Language::En).await;
         assert!(!known.contains("/subscribe"), "{known}");
-        assert!(known.contains("\n• bc1qstarttestaddress"), "{known}");
+        assert!(known.contains("\n• bc1q...dress"), "{known}");
 
         subscribed_chat(&pool, chat_id, &[]).await;
     }
@@ -1493,13 +1509,11 @@ mod tests {
     }
 
     #[test]
-    fn bestdiff_reset_links_the_addresss_dashboard_settings() {
+    fn bestdiff_reset_points_at_the_dashboard_without_the_address() {
         let address = AddressId::new("bc1qresetlinkaddress").unwrap();
         let text = best_diff_reset_text(Language::En, &address, Some("https://pool.example/"));
-        assert!(
-            text.ends_with("\nhttps://pool.example/#/app/bc1qresetlinkaddress/settings"),
-            "{text}"
-        );
+        assert!(text.ends_with("\nhttps://pool.example"), "{text}");
+        assert!(!text.contains(address.as_str()), "{text}");
         assert!(!best_diff_reset_text(Language::De, &address, None).contains("http"));
     }
 }
