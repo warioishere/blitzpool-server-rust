@@ -407,7 +407,7 @@ impl GroupSoloEngine {
                 %group_id,
                 address,
                 error = %e,
-                "best-share update failed (cosmetic; round wipes on block-found)"
+                "best-share update failed (cosmetic)"
             );
         }
         // A new share changes the round for every cached (group, reward,
@@ -542,28 +542,28 @@ impl GroupSoloEngine {
         )
         .await?;
 
-        match mode {
-            PayoutMode::Window => {
-                info!(%group_id,
-                    "group-solo: window mode — no per-block round reset (window self-trims by age)");
-            }
-            PayoutMode::Prop if reset_on_block => {
+        match (mode, reset_on_block) {
+            (PayoutMode::Prop | PayoutMode::Window, true) => {
                 // An error leaves the block pending: the history is booked,
                 // and the retry finishes the reset.
                 if !self
                     .inner
                     .round
-                    .reset_for_block_found(&group_key, block_height)
+                    .reset_for_block_found(&group_key, block_height, mode)
                     .await?
                 {
                     info!(%group_id, block_height,
                         "group-solo: round already reset for this block — left as it stands");
                 }
             }
-            PayoutMode::Prop => {
+            (PayoutMode::Window, false) => {
+                info!(%group_id,
+                    "group-solo: window mode — no per-block round reset (window self-trims by age)");
+            }
+            (PayoutMode::Prop, false) => {
                 info!(%group_id,
                     "group-solo: per-block round reset disabled (resetRoundOnBlock=false) — \
-                     round accumulates until calendar/manual reset");
+                     round accumulates until its calendar reset");
             }
         }
 

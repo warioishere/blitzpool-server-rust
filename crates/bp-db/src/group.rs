@@ -49,9 +49,10 @@ pub struct PplnsGroupRow {
     pub round_reset_preset: Option<String>,
     #[sqlx(rename = "isPublic")]
     pub is_public: bool,
-    /// When true, the Group-Solo round is wiped on every block-found.
-    /// Default false: shares accumulate across blocks until a
-    /// calendar preset or manual reset fires.
+    /// When true, every block-found starts the Group-Solo round over: a Prop
+    /// group's whole round, a Window group's best share only (its window is
+    /// what it pays from). Default false: a Prop round runs across blocks
+    /// until its calendar preset fires.
     #[sqlx(rename = "resetRoundOnBlock")]
     pub reset_round_on_block: bool,
     /// Hard member cap. NULL = no limit. Enforced at the add-member chokepoint

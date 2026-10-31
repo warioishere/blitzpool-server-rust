@@ -1295,6 +1295,104 @@ async fn window_mode_record_path_trims_aged_buckets() {
     drop_harness(h).await;
 }
 
+/// Book a block that pays exactly the distribution built now.
+async fn book_block(h: &Harness, finder: &AddressId, height: i32) {
+    let dist = h
+        .engine
+        .build_distribution(h.group_id, 312_500_000, finder)
+        .await
+        .expect("distribution");
+    h.engine
+        .on_block_found(
+            h.group_id,
+            height,
+            &actual_paying_exactly(&dist, 312_500_000),
+        )
+        .await
+        .expect("block");
+}
+
+// ── Window mode — a block starts only the best share over ───────────
+// The window is what a Window group pays from, so `resetRoundOnBlock`
+// leaves it alone and clears the best share; with the switch off the best
+// share stays too.
+#[tokio::test]
+async fn a_window_block_resets_the_best_share_and_keeps_the_window() {
+    let h = match spawn_or_skip(25, None).await {
+        Some(h) => h,
+        None => return,
+    };
+    // Test-only flip before any share; the seed sets resetRoundOnBlock.
+    sqlx::query(r#"UPDATE pplns_group SET "payoutMode" = 'window' WHERE id = $1"#)
+        .bind(h.group_id)
+        .execute(&h.pool)
+        .await
+        .expect("set window mode");
+    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    h.engine
+        .record_share(None, h.group_id, finder.as_str(), 60.0, 900.0, now)
+        .await
+        .unwrap();
+    let reader = h.engine.reader();
+    assert!(reader.best_difficulty(h.group_id).await.unwrap().is_some());
+    book_block(&h, &finder, 9_997_101).await;
+    assert_eq!(
+        reader.best_difficulty(h.group_id).await.unwrap(),
+        None,
+        "the block starts the best share over"
+    );
+    let stats = reader.round_stats(h.group_id).await.unwrap();
+    assert!(
+        (stats
+            .per_address
+            .get(finder.as_str())
+            .copied()
+            .unwrap_or(0.0)
+            - 60.0)
+            .abs()
+            < 1e-9,
+        "the window it pays from stays: {stats:?}"
+    );
+
+    // A redelivery of the same block leaves a best set since then alone.
+    h.engine
+        .record_share(None, h.group_id, finder.as_str(), 60.0, 700.0, now + 1)
+        .await
+        .unwrap();
+    book_block(&h, &finder, 9_997_101).await;
+    assert_eq!(
+        reader
+            .best_difficulty(h.group_id)
+            .await
+            .unwrap()
+            .map(|b| b.difficulty),
+        Some(700.0)
+    );
+
+    // Negative control: with the switch off the best share outlives a block.
+    sqlx::query(r#"UPDATE pplns_group SET "resetRoundOnBlock" = false WHERE id = $1"#)
+        .bind(h.group_id)
+        .execute(&h.pool)
+        .await
+        .expect("flag off");
+    book_block(&h, &finder, 9_997_102).await;
+    assert_eq!(
+        reader
+            .best_difficulty(h.group_id)
+            .await
+            .unwrap()
+            .map(|b| b.difficulty),
+        Some(700.0)
+    );
+
+    drop_harness(h).await;
+}
+
 // ── Window mode — a reject is windowed like the share it stands next to ─
 // The PROP tally never shrinks, so against a windowed share total it would
 // not be a rate of anything.

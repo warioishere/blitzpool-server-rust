@@ -2,7 +2,8 @@
 
 //! Redis-backed per-group round state under `groupsolo:{groupId}:*`.
 //! A `Prop` group is a round wiped on block-found; a `Window` group is a
-//! time-bucketed sliding window trimmed by age that never block-resets.
+//! time-bucketed sliding window trimmed by age, of which a block-found
+//! resets only the best share.
 //! Both reset paths keep `applied` (see [`key_applied`]) so an un-ACKed batch is not reapplied.
 
 use std::collections::HashMap;
@@ -562,14 +563,17 @@ impl GroupRoundStore {
 
     // ── Round-reset paths ──────────────────────────────────────────
 
-    /// Block-found reset: wipe round state but keep
-    /// `last-accepted-share-at` (the inactivity clock survives). `false` when
-    /// the round was already reset for `block_height`. Compared for equality,
-    /// not order: heights start over on a fresh regtest chain.
+    /// Block-found reset. A `Prop` round is wiped but keeps
+    /// `last-accepted-share-at` (the inactivity clock survives). A `Window`
+    /// group keeps its window, which is what it pays from; only its best
+    /// share starts over. `false` when the round was already reset for
+    /// `block_height`. Compared for equality, not order: heights start over
+    /// on a fresh regtest chain.
     pub async fn reset_for_block_found(
         &self,
         group_id: &str,
         block_height: i32,
+        mode: PayoutMode,
     ) -> Result<bool, RoundError> {
         let mut conn = self.conn.clone();
         let marker = key_reset_height(group_id);
@@ -577,15 +581,22 @@ impl GroupRoundStore {
         if last == Some(block_height) {
             return Ok(false);
         }
-        let keys = vec![
-            key_by_address(group_id),
-            key_rejected_shares(group_id),
-            key_best_share(group_id),
-            // NOT `key_applied`: an un-ACKed satellite batch would otherwise be
-            // reapplied into the fresh round on redelivery.
-        ];
-        let _: i64 = conn.del(keys).await?;
-        self.delete_window_keys(&mut conn, group_id).await?;
+        match mode {
+            PayoutMode::Prop => {
+                let keys = vec![
+                    key_by_address(group_id),
+                    key_rejected_shares(group_id),
+                    key_best_share(group_id),
+                    // NOT `key_applied`: an un-ACKed satellite batch would
+                    // otherwise be reapplied into the fresh round on redelivery.
+                ];
+                let _: i64 = conn.del(keys).await?;
+                self.delete_window_keys(&mut conn, group_id).await?;
+            }
+            PayoutMode::Window => {
+                let _: i64 = conn.del(key_best_share(group_id)).await?;
+            }
+        }
         // Last, so an interrupted reset is redone by the retry.
         let _: () = conn.set(&marker, block_height).await?;
         Ok(true)
