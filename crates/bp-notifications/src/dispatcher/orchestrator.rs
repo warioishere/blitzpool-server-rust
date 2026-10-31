@@ -5,8 +5,10 @@ use std::sync::Arc;
 use bp_common::{short_address, AddressId, MiningMode};
 use bp_db::{
     delete_push_subscription_by_endpoint, delete_telegram_subscriptions_by_chat,
-    find_address_email, find_ntfy_subscription_by_address, find_push_subscriptions_by_address,
-    find_telegram_subscriptions_by_address, find_telegram_subscriptions_by_chat,
+    find_address_email, find_blockparty_member_by_address, find_group_member_by_address,
+    find_ntfy_subscription_by_address, find_pplns_group_members_for_group,
+    find_push_subscriptions_by_address, find_telegram_subscriptions_by_address,
+    find_telegram_subscriptions_by_chat, list_blockparty_members_for_group,
     update_push_subscription_last_notification, DbError, NtfySubscriptionRow, PushSubscriptionRow,
     TelegramSubscriptionRow,
 };
@@ -94,8 +96,10 @@ struct BlockRecipient {
 }
 
 impl BlockFoundNotice {
-    /// The finder first, then every other paid address once.
-    fn recipients(&self) -> Vec<BlockRecipient> {
+    /// The finder first, then every other paid address once, then the
+    /// finder's Team or Blockparty `members` the coinbase did not pay, without
+    /// an amount.
+    fn recipients(&self, members: &[AddressId]) -> Vec<BlockRecipient> {
         let paid_to = |address: &AddressId| {
             self.paid
                 .iter()
@@ -114,6 +118,15 @@ impl BlockFoundNotice {
                     address: address.clone(),
                     is_finder: false,
                     paid_sats: paid_to(address),
+                });
+            }
+        }
+        for address in members {
+            if out.iter().all(|r| &r.address != address) {
+                out.push(BlockRecipient {
+                    address: address.clone(),
+                    is_finder: false,
+                    paid_sats: None,
                 });
             }
         }
@@ -174,14 +187,47 @@ impl NotificationDispatcher {
 
     // ── Public engine entry points ──────────────────────────────────
 
-    /// A block was found. The finder and every address its coinbase pays
-    /// hear about it on each channel they follow, the paid ones with their
-    /// amount. Recipients go one after another, which keeps a large PPLNS
-    /// payout list under Telegram's send rate.
+    /// A block was found. The finder, every address its coinbase pays and,
+    /// for a Team or Blockparty block, every other member of it hear about it
+    /// on each channel they follow, the paid ones with their amount.
+    /// Recipients go one after another, which keeps a large PPLNS payout list
+    /// under Telegram's send rate.
     pub async fn notify_block_found(&self, notice: &BlockFoundNotice) {
-        for recipient in notice.recipients() {
+        let members = self.finder_group_members(notice).await;
+        for recipient in notice.recipients(&members) {
             self.notify_block_recipient(notice, &recipient).await;
         }
+    }
+
+    /// The members of the Team or Blockparty the finder mined the block in.
+    /// A failed read leaves them out: the paid addresses still hear of it.
+    async fn finder_group_members(&self, notice: &BlockFoundNotice) -> Vec<AddressId> {
+        let members = match notice.mode {
+            MiningMode::GroupSolo => {
+                match find_group_member_by_address(&self.pool, &notice.finder).await {
+                    Ok(Some(m)) => find_pplns_group_members_for_group(&self.pool, m.group_id)
+                        .await
+                        .map(|rows| rows.into_iter().map(|r| r.address).collect()),
+                    Ok(None) => Ok(Vec::new()),
+                    Err(e) => Err(e),
+                }
+            }
+            MiningMode::Blockparty => {
+                match find_blockparty_member_by_address(&self.pool, &notice.finder).await {
+                    Ok(Some(m)) => list_blockparty_members_for_group(&self.pool, m.group_id)
+                        .await
+                        .map(|rows| rows.into_iter().map(|r| r.address).collect()),
+                    Ok(None) => Ok(Vec::new()),
+                    Err(e) => Err(e),
+                }
+            }
+            MiningMode::Solo | MiningMode::Pplns => Ok(Vec::new()),
+        };
+        members.unwrap_or_else(|e| {
+            warn!(target: "bp_notifications::dispatcher", error = %e, height = notice.height,
+                "block-found: group members read failed; paid addresses only");
+            Vec::new()
+        })
     }
 
     async fn notify_block_recipient(&self, notice: &BlockFoundNotice, recipient: &BlockRecipient) {
@@ -1498,7 +1544,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            notice.recipients(),
+            notice.recipients(&[]),
             vec![
                 BlockRecipient {
                     address: addr("bc1qfinder"),
@@ -1523,13 +1569,160 @@ mod tests {
             ..notice
         };
         assert_eq!(
-            solo.recipients(),
+            solo.recipients(&[]),
             vec![BlockRecipient {
                 address: addr("bc1qfinder"),
                 is_finder: true,
                 paid_sats: Some(312_500_000),
             }]
         );
+    }
+
+    /// A Team block also reaches the members its coinbase did not pay, once
+    /// each and without an amount; the finder and the paid keep theirs.
+    #[test]
+    fn a_team_block_reaches_the_unpaid_members_too() {
+        let notice = BlockFoundNotice {
+            height: 900_001,
+            mode: MiningMode::GroupSolo,
+            finder: addr("bc1qfinder"),
+            paid: vec![(addr("bc1qfinder"), 9_000), (addr("bc1qpaid"), 1_000)],
+        };
+        let members = [addr("bc1qfinder"), addr("bc1qpaid"), addr("bc1qdummy")];
+        let got: Vec<(String, bool, Option<u64>)> = notice
+            .recipients(&members)
+            .into_iter()
+            .map(|r| (r.address.as_str().to_string(), r.is_finder, r.paid_sats))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("bc1qfinder".to_string(), true, Some(9_000)),
+                ("bc1qpaid".to_string(), false, Some(1_000)),
+                ("bc1qdummy".to_string(), false, None),
+            ]
+        );
+        let text = html::to_plain(&block_found_text(
+            Language::De,
+            &notice,
+            &notice.recipients(&members)[2],
+        ));
+        assert!(text.contains("Team-Block 900001 gefunden"), "{text}");
+        assert!(!text.contains("sats"), "{text}");
+    }
+
+    /// The members are read from the finder's Team or Blockparty; a Solo
+    /// block has none.
+    #[tokio::test]
+    async fn the_finders_team_or_blockparty_supplies_the_members() {
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let (team_finder, team_dummy, party_finder, party_dummy) = (
+            addr("bc1qblockmembersteamfinder"),
+            addr("bc1qblockmembersteamdummy"),
+            addr("bc1qblockmemberspartyfinder"),
+            addr("bc1qblockmemberspartydummy"),
+        );
+        let cleanup = || async {
+            sqlx::query("DELETE FROM pplns_group_member WHERE address = ANY($1)")
+                .bind(vec![team_finder.as_str(), team_dummy.as_str()])
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM pplns_group WHERE name LIKE 'bp-test-blockmembers-%'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM blockparty_member WHERE address = ANY($1)")
+                .bind(vec![party_finder.as_str(), party_dummy.as_str()])
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM blockparty_group WHERE name LIKE 'bp-test-blockmembers-%'")
+                .execute(&pool)
+                .await
+                .unwrap();
+        };
+        cleanup().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let team = uuid::Uuid::new_v4();
+        bp_db::insert_pplns_group(
+            &pool,
+            team,
+            &format!("bp-test-blockmembers-{team}"),
+            &team_finder,
+            "hash",
+            true,
+            false,
+            "prop",
+            now,
+        )
+        .await
+        .unwrap();
+        for (a, role) in [(&team_finder, "creator"), (&team_dummy, "member")] {
+            bp_db::insert_pplns_group_member(&pool, team, a, role, now)
+                .await
+                .unwrap();
+        }
+        let party = uuid::Uuid::new_v4();
+        bp_db::insert_blockparty_group(
+            &pool,
+            party,
+            &format!("bp-test-blockmembers-{party}"),
+            &party_finder,
+            "hash",
+            "active",
+            now,
+        )
+        .await
+        .unwrap();
+        for (a, bp) in [(&party_finder, 10_000), (&party_dummy, 0)] {
+            bp_db::insert_blockparty_member(&pool, party, a, "", bp, "member", Some(now), now)
+                .await
+                .unwrap();
+        }
+        let dispatcher = NotificationDispatcher::new(
+            pool.clone(),
+            None,
+            None,
+            None,
+            None,
+            ChatLanguages::new(pool.clone()),
+        );
+        let members = |mode, finder: &AddressId| {
+            let notice = BlockFoundNotice {
+                height: 1,
+                mode,
+                finder: finder.clone(),
+                paid: Vec::new(),
+            };
+            let dispatcher = &dispatcher;
+            async move {
+                dispatcher
+                    .finder_group_members(&notice)
+                    .await
+                    .into_iter()
+                    .collect::<std::collections::HashSet<_>>()
+            }
+        };
+
+        let team_members =
+            std::collections::HashSet::from([team_dummy.clone(), team_finder.clone()]);
+        assert_eq!(
+            members(MiningMode::GroupSolo, &team_finder).await,
+            team_members
+        );
+        let party_members =
+            std::collections::HashSet::from([party_dummy.clone(), party_finder.clone()]);
+        assert_eq!(
+            members(MiningMode::Blockparty, &party_finder).await,
+            party_members
+        );
+        assert!(members(MiningMode::Solo, &team_finder).await.is_empty());
+        assert!(members(MiningMode::Pplns, &party_finder).await.is_empty());
+
+        cleanup().await;
     }
 
     /// The team-best notice is valid Telegram HTML for every reset rule,
@@ -1607,7 +1800,7 @@ mod tests {
             finder: addr("bc1qfinderaddressxxxxxxxx"),
             paid: vec![(addr("bc1qmemberaddressxxxxxxxx"), 1_234_567)],
         };
-        let [finder, member] = <[BlockRecipient; 2]>::try_from(notice.recipients()).unwrap();
+        let [finder, member] = <[BlockRecipient; 2]>::try_from(notice.recipients(&[])).unwrap();
         for text in [
             block_found_text(Language::De, &notice, &member),
             block_found_text(Language::En, &notice, &finder),

@@ -779,14 +779,14 @@ impl CommandHandler {
         let mut text = match lang {
             Language::De => format!(
                 "{}\n\nIch melde dir, wenn ein Block gefunden wird, der deine Adresse \
-                 bezahlt, und neue Best-Diffs. Auf Wunsch auch, wenn ein Miner offline \
-                 geht.\n\n",
+                 bezahlt oder in deinem Team bzw. deiner Blockparty fällt, und neue \
+                 Best-Diffs. Auf Wunsch auch, wenn ein Miner offline geht.\n\n",
                 html::bold("Willkommen bei Blitz Pool")
             ),
             Language::En => format!(
-                "{}\n\nI tell you when a block is found that pays your address, and \
-                 when you reach a new best difficulty. On request also when a miner goes \
-                 offline.\n\n",
+                "{}\n\nI tell you when a block is found that pays your address or falls \
+                 to your Team or Blockparty, and when you reach a new best difficulty. On \
+                 request also when a miner goes offline.\n\n",
                 html::bold("Welcome to Blitz Pool")
             ),
         };
