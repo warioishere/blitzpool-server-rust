@@ -4,6 +4,7 @@
 //! bot-command surface, kept apart so they can be unit-tested.
 
 mod device_status;
+pub mod html;
 mod language;
 mod number_suffix;
 mod sats;

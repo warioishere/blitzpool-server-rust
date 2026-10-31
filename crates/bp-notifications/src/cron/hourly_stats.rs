@@ -111,12 +111,12 @@ async fn process_telegram_row(
     let lang = chat_languages.get(sub.telegram_chat_id).await;
     if sub.hourly_stats_enabled {
         let text = build_stats(pool, redis, lang, &sub.address).await;
-        let sent = adapter.send_text(sub.telegram_chat_id, &text).await;
+        let sent = adapter.send_html(sub.telegram_chat_id, &text).await;
         settle_telegram_push(pool, sub.telegram_chat_id, "telegram-hourly-stats", sent).await;
     }
     if sub.hourly_workers_enabled {
         let text = build_show_workers(pool, redis, lang, &sub.address).await;
-        let sent = adapter.send_text(sub.telegram_chat_id, &text).await;
+        let sent = adapter.send_html(sub.telegram_chat_id, &text).await;
         settle_telegram_push(pool, sub.telegram_chat_id, "telegram-hourly-workers", sent).await;
     }
 }

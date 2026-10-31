@@ -32,6 +32,7 @@ use super::parser::{
 use crate::adapter::{
     AdapterError, AdapterResult, InlineButton, InlineKeyboard, NtfyAdapter, TelegramAdapter,
 };
+use crate::format::html;
 use crate::format::Language;
 use bp_common::short_address;
 
@@ -187,7 +188,7 @@ impl CommandHandler {
     async fn reply(&self, transport: &Transport, text: &str) -> AdapterResult<()> {
         match transport {
             Transport::Telegram { chat_id } => match &self.telegram {
-                Some(adapter) => adapter.send_text(*chat_id, text).await,
+                Some(adapter) => adapter.send_html(*chat_id, text).await,
                 None => Err(AdapterError::Config(
                     "telegram adapter not configured".into(),
                 )),
@@ -300,12 +301,15 @@ impl CommandHandler {
             })
             .collect();
         let text = match lang {
-            Language::De => "Gespeicherte Adressen — tippe eine Adresse an, um sie als \
-                 Standard zu setzen, 🗑 zum Entfernen.\n⭐ = Standard"
-                .to_string(),
-            Language::En => "Stored addresses — tap an address to set it as default, \
-                 🗑 to remove.\n⭐ = default"
-                .to_string(),
+            Language::De => format!(
+                "{}\nTipp eine Adresse an, um sie zur Standard-Adresse (⭐) zu machen, \
+                 🗑 entfernt sie.",
+                html::bold("Deine Adressen")
+            ),
+            Language::En => format!(
+                "{}\nTap an address to make it the default (⭐), 🗑 removes it.",
+                html::bold("Your addresses")
+            ),
         };
         (text, keyboard)
     }
@@ -320,12 +324,12 @@ impl CommandHandler {
             Ok(v) => v,
             Err(e) => {
                 warn!(target: "bp_notifications::command", error = %e, "show_addresses keyboard: read subs");
-                let _ = adapter.send_text(chat_id, db_error_text(lang)).await;
+                let _ = adapter.send_html(chat_id, db_error_text(lang)).await;
                 return;
             }
         };
         if subs.is_empty() {
-            let _ = adapter.send_text(chat_id, no_address_text(lang)).await;
+            let _ = adapter.send_html(chat_id, no_address_text(lang)).await;
             return;
         }
         let (text, keyboard) = Self::build_address_keyboard(&subs, lang);
@@ -564,12 +568,16 @@ impl CommandHandler {
             }
         }
         let text = match lang {
-            Language::De => "Benachrichtigungen pro Adresse, tippe zum Umschalten. \
-                 ✅ = an, ❌ = aus, ⭐ = Standard-Adresse"
-                .to_string(),
-            Language::En => "Notifications per address, tap to toggle. \
-                 ✅ = on, ❌ = off, ⭐ = default address"
-                .to_string(),
+            Language::De => format!(
+                "{}\nPro Adresse, tippen schaltet um: ✅ an, ❌ aus. \
+                 ⭐ ist die Standard-Adresse.",
+                html::bold("Benachrichtigungen")
+            ),
+            Language::En => format!(
+                "{}\nPer address, a tap switches: ✅ on, ❌ off. \
+                 ⭐ is the default address.",
+                html::bold("Notifications")
+            ),
         };
         (text, keyboard)
     }
@@ -583,12 +591,12 @@ impl CommandHandler {
             Ok(v) => v,
             Err(e) => {
                 warn!(target: "bp_notifications::command", error = %e, "settings: read subs");
-                let _ = adapter.send_text(chat_id, db_error_text(lang)).await;
+                let _ = adapter.send_html(chat_id, db_error_text(lang)).await;
                 return;
             }
         };
         if subs.is_empty() {
-            let _ = adapter.send_text(chat_id, no_address_text(lang)).await;
+            let _ = adapter.send_html(chat_id, no_address_text(lang)).await;
             return;
         }
         let (text, keyboard) = Self::build_settings_keyboard(&subs, lang);
@@ -671,16 +679,17 @@ impl CommandHandler {
         let mark = |on: bool| if on { "✅" } else { "❌" };
         let line =
             |on: bool, field| format!("\n{} {}", mark(on), settings_field_label(lang, field));
+        let short = short_address(address.as_str());
         let mut out = match lang {
             Language::De => format!(
-                "Benachrichtigungen für {}, schalten mit /subscribe_bestdiff, \
-                 /device_notifications, /team_requests oder /send_hourly und on|off:",
-                short_address(address.as_str())
+                "{}\nSchalten mit /subscribe_bestdiff, /device_notifications, \
+                 /team_requests oder /send_hourly und on|off.\n",
+                html::title_for(None, "Benachrichtigungen", &short)
             ),
             Language::En => format!(
-                "Notifications for {}, toggle with /subscribe_bestdiff, \
-                 /device_notifications, /team_requests or /send_hourly and on|off:",
-                short_address(address.as_str())
+                "{}\nSwitch with /subscribe_bestdiff, /device_notifications, \
+                 /team_requests or /send_hourly and on|off.\n",
+                html::title_for(None, "Notifications", &short)
             ),
         };
         out.push_str(&line(
@@ -719,14 +728,18 @@ impl CommandHandler {
             Transport::Ntfy { address } => vec![address.clone()],
         };
         let mut text = match lang {
-            Language::De => "Willkommen bei Blitz Pool!\nIch melde dir, wenn ein Block gefunden \
-                 wird, der deine Adresse bezahlt, und neue Best-Diffs, auf Wunsch auch, wenn ein \
-                 Miner offline geht.\n"
-                .to_string(),
-            Language::En => "Welcome to Blitz Pool!\nI tell you when a block is found that pays \
-                 your address and when you reach a new best difficulty, and on request when a \
-                 miner goes offline.\n"
-                .to_string(),
+            Language::De => format!(
+                "{}\n\nIch melde dir, wenn ein Block gefunden wird, der deine Adresse \
+                 bezahlt, und neue Best-Diffs. Auf Wunsch auch, wenn ein Miner offline \
+                 geht.\n\n",
+                html::bold("Willkommen bei Blitz Pool")
+            ),
+            Language::En => format!(
+                "{}\n\nI tell you when a block is found that pays your address, and \
+                 when you reach a new best difficulty. On request also when a miner goes \
+                 offline.\n\n",
+                html::bold("Welcome to Blitz Pool")
+            ),
         };
         if subscribed.is_empty() {
             text.push_str(match lang {
@@ -1214,14 +1227,16 @@ const ENCRYPTOR_URL: &str = "https://github.com/warioishere/blitzpool-message-en
 fn encryption_hint(lang: Language) -> String {
     match lang {
         Language::De => format!(
-            "\n\nDeine Adresse soll nicht im Klartext im Chat stehen? Verschlüssel sie im \
-             Dashboard unter „Telegram Bot“ oder mit dem Tool {ENCRYPTOR_URL} und schick den \
-             Text statt der Adresse, z.B. nach /subscribe."
+            "\n\n{}\nVerschlüssel sie im Dashboard unter {} oder mit dem Tool \
+             {ENCRYPTOR_URL} und schick den Text statt der Adresse, z.B. nach /subscribe.",
+            html::bold("Adresse lieber nicht im Klartext?"),
+            html::bold("Telegram Bot")
         ),
         Language::En => format!(
-            "\n\nRather not have your address in the chat in plain text? Encrypt it in the \
-             dashboard under \"Telegram Bot\" or with the tool {ENCRYPTOR_URL} and send the \
-             text in place of the address, e.g. after /subscribe."
+            "\n\n{}\nEncrypt it in the dashboard under {} or with the tool \
+             {ENCRYPTOR_URL} and send the text in place of the address, e.g. after /subscribe.",
+            html::bold("Rather not show your address in plain text?"),
+            html::bold("Telegram Bot")
         ),
     }
 }
@@ -1242,7 +1257,7 @@ fn encrypted_address_text(lang: Language, error: EncryptedAddressError) -> &'sta
         }
         (Language::En, EncryptedAddressError::Unreadable) => {
             "The encrypted address cannot be opened. Encrypt it again in the \
-             dashboard under \"Telegram Bot\" and send the whole text."
+             dashboard under “Telegram Bot” and send the whole text."
         }
     }
 }
@@ -1283,26 +1298,30 @@ fn db_error_text(lang: Language) -> &'static str {
 }
 
 fn subscribe_ok_text(lang: Language, address: &AddressId) -> String {
-    let address = short_address(address.as_str());
+    let address = html::addr(&short_address(address.as_str()));
     match lang {
-        Language::De => format!("Adresse {address} abonniert. ✅"),
-        Language::En => format!("Subscribed to address {address}. ✅"),
+        Language::De => {
+            format!("✅ {address} abonniert.\nMit /settings schaltest du, was ich dir dazu melde.")
+        }
+        Language::En => {
+            format!("✅ Following {address}.\n/settings switches what I tell you about it.")
+        }
     }
 }
 
 fn remove_ok_text(lang: Language, address: &AddressId) -> String {
-    let address = short_address(address.as_str());
+    let address = html::addr(&short_address(address.as_str()));
     match lang {
-        Language::De => format!("Adresse {address} entfernt."),
-        Language::En => format!("Address {address} removed."),
+        Language::De => format!("{address} entfernt."),
+        Language::En => format!("{address} removed."),
     }
 }
 
 fn remove_missing_text(lang: Language, address: &AddressId) -> String {
-    let address = short_address(address.as_str());
+    let address = html::addr(&short_address(address.as_str()));
     match lang {
-        Language::De => format!("Adresse {address} war nicht abonniert."),
-        Language::En => format!("Address {address} was not subscribed."),
+        Language::De => format!("{address} war nicht abonniert."),
+        Language::En => format!("{address} was not followed."),
     }
 }
 
@@ -1323,12 +1342,12 @@ fn no_address_text(lang: Language) -> &'static str {
 /// The addresses, shortened like every address the bot shows.
 fn list_addresses<'a>(lang: Language, addrs: impl Iterator<Item = &'a str>) -> String {
     let mut out = match lang {
-        Language::De => "Abonnierte Adressen:".to_string(),
-        Language::En => "Subscribed addresses:".to_string(),
+        Language::De => html::bold("Abonnierte Adressen"),
+        Language::En => html::bold("Followed addresses"),
     };
     for a in addrs {
         out.push_str("\n• ");
-        out.push_str(&short_address(a));
+        out.push_str(&html::addr(&short_address(a)));
     }
     out
 }
@@ -1369,15 +1388,17 @@ fn flag_toggle_ok_text(lang: Language, flag: Switch, value: bool) -> String {
 /// in the dashboard, behind that address's login; the bot only points there.
 /// The link carries no address, so a group chat does not see it in full.
 fn best_diff_reset_text(lang: Language, address: &AddressId, base_url: Option<&str>) -> String {
-    let short = short_address(address.as_str());
+    let short = html::addr(&short_address(address.as_str()));
     let mut text = match lang {
         Language::De => format!(
             "Den Best-Diff von {short} setzt du im Dashboard zurück: Adresse öffnen, \
-             einloggen, dann unter Einstellungen."
+             einloggen, dann unter {}.",
+            html::bold("Einstellungen")
         ),
         Language::En => format!(
             "Reset the best difficulty of {short} in the dashboard: open the address, \
-             log in, then go to Settings."
+             log in, then go to {}.",
+            html::bold("Settings")
         ),
     };
     if let Some(base) = base_url {
@@ -1418,6 +1439,51 @@ mod tests {
         }
     }
 
+    /// Telegram refuses a message whose HTML it cannot parse, so every
+    /// reply the handler writes must be valid HTML, in both languages.
+    #[test]
+    fn every_reply_is_valid_telegram_html() {
+        let address = AddressId::new("bc1qtpa45phz26kays4hk63hcmxf9sty454wqjwcy8").unwrap();
+        let subs = vec![sub_row(1, "bc1q<bc1q<odd>&address>", true)];
+        for lang in [Language::De, Language::En] {
+            let mut texts = vec![
+                unknown_text(lang).to_string(),
+                invalid_address_text(lang).to_string(),
+                subscribe_usage_text(lang).to_string(),
+                remove_usage_text(lang).to_string(),
+                encryption_hint(lang),
+                encrypted_address_text(lang, EncryptedAddressError::NoKey).to_string(),
+                encrypted_address_text(lang, EncryptedAddressError::Unreadable).to_string(),
+                no_default_text(lang).to_string(),
+                db_error_text(lang).to_string(),
+                subscribe_ok_text(lang, &address),
+                remove_ok_text(lang, &address),
+                remove_missing_text(lang, &address),
+                no_address_text(lang).to_string(),
+                list_addresses(lang, ["bc1q<bc1q<odd>&address>"].into_iter()),
+                best_diff_reset_text(lang, &address, Some("https://pool.example")),
+                language_switch_ok_text(lang).to_string(),
+                engine_unconfigured_text(lang, "PPLNS"),
+                CommandHandler::build_address_keyboard(&subs, lang).0,
+                CommandHandler::build_settings_keyboard(&subs, lang).0,
+                super::super::help_text(lang),
+            ];
+            for switch in [
+                Switch::BestDiff,
+                Switch::Device,
+                Switch::TeamRequests,
+                Switch::Hourly,
+            ] {
+                for value in [true, false] {
+                    texts.push(flag_toggle_ok_text(lang, switch, value));
+                }
+            }
+            for text in texts {
+                assert!(html::is_valid_telegram_html(&text), "{lang:?}: {text}");
+            }
+        }
+    }
+
     #[test]
     fn subscribe_and_remove_replies_show_the_address_shortened() {
         let full = "bc1qtpa45phz26kays4hk63hcmxf9sty454wqjwcy8";
@@ -1440,7 +1506,9 @@ mod tests {
     fn list_addresses_shortens_each_address() {
         let full = "bc1qtpa45phz26kays4hk63hcmxf9sty454wqjwcy8";
         let s = list_addresses(Language::En, [full, "bc1qsecondaddressxxxxxx"].into_iter());
-        assert!(s.starts_with("Subscribed addresses:"));
+        assert!(html::is_valid_telegram_html(&s), "{s}");
+        let s = html::to_plain(&s);
+        assert!(s.starts_with("Followed addresses"), "{s}");
         assert!(s.contains("\n• bc1q...jwcy8"), "{s}");
         assert!(!s.contains(full), "{s}");
         assert_eq!(s.lines().count(), 3);
@@ -1610,11 +1678,15 @@ mod tests {
         let handler = CommandHandler::new(pool.clone(), Network::Bitcoin, None, None);
         subscribed_chat(&pool, chat_id, &[]).await;
         let fresh = handler.handle_start(&transport, Language::De).await;
+        assert!(html::is_valid_telegram_html(&fresh), "{fresh}");
+        let fresh = html::to_plain(&fresh);
         assert!(fresh.contains("Tipp /subscribe"), "{fresh}");
         assert!(!fresh.contains("Abonnierte Adressen"), "{fresh}");
 
         subscribed_chat(&pool, chat_id, &["bc1qstarttestaddress"]).await;
         let known = handler.handle_start(&transport, Language::En).await;
+        assert!(html::is_valid_telegram_html(&known), "{known}");
+        let known = html::to_plain(&known);
         assert!(!known.contains("/subscribe"), "{known}");
         assert!(known.contains("\n• bc1q...dress"), "{known}");
 

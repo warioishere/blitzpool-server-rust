@@ -7,6 +7,7 @@
 
 use chrono::{DateTime, Utc};
 
+use super::html::{bold, esc};
 use super::Language;
 
 /// Inputs for [`DeviceStatusText::build`].
@@ -21,9 +22,9 @@ pub struct DeviceStatusArgs<'a> {
     pub worker_name: Option<&'a str>,
     pub is_online: bool,
     pub is_returning: bool,
-    /// Trailing `" – Adresse <fmt>"` / `" – address <fmt>"` suffix used
-    /// in multi-address Telegram chats. `None` skips the suffix
-    /// (single-address chats / ntfy).
+    /// Trailing `" – Adresse <code>…</code>"` / `" – address …"` suffix,
+    /// Telegram HTML, used in multi-address Telegram chats. `None` skips the
+    /// suffix (single-address chats / ntfy).
     pub address_suffix: Option<&'a str>,
 }
 
@@ -41,10 +42,10 @@ impl DeviceStatusText {
         let ua_trim = args.user_agent.map(str::trim).filter(|s| !s.is_empty());
         let worker_trim = args.worker_name.map(str::trim).filter(|s| !s.is_empty());
 
-        let ua_de = ua_trim.unwrap_or("unbekannt");
-        let ua_en = ua_trim.unwrap_or("unknown");
-        let worker_de = worker_trim.unwrap_or("unbekannt");
-        let worker_en = worker_trim.unwrap_or("unknown");
+        let ua_de = esc(ua_trim.unwrap_or("unbekannt"));
+        let ua_en = esc(ua_trim.unwrap_or("unknown"));
+        let worker_de = bold(worker_trim.unwrap_or("unbekannt"));
+        let worker_en = bold(worker_trim.unwrap_or("unknown"));
         let suffix = args.address_suffix.unwrap_or("");
 
         let de = if args.is_online {
@@ -115,8 +116,8 @@ pub struct DevicePartialText {
 impl DevicePartialText {
     pub fn build(args: &DevicePartialArgs<'_>) -> Self {
         let worker_trim = args.worker_name.map(str::trim).filter(|s| !s.is_empty());
-        let worker_de = worker_trim.unwrap_or("unbekannt");
-        let worker_en = worker_trim.unwrap_or("unknown");
+        let worker_de = bold(worker_trim.unwrap_or("unbekannt"));
+        let worker_en = bold(worker_trim.unwrap_or("unknown"));
         let suffix = args.address_suffix.unwrap_or("");
         let gone = args.before.saturating_sub(args.remaining);
         DevicePartialText {
@@ -202,6 +203,7 @@ impl DeviceAggregateText {
         }
         if !args.reduced.is_empty() {
             for (worker, remaining, before) in args.reduced {
+                let worker = bold(worker);
                 let gone = before.saturating_sub(*remaining);
                 de_parts.push(format!(
                     "\u{26a0}\u{fe0f} {worker}: {gone} von {before} weg ({remaining} aktiv)"
@@ -258,19 +260,19 @@ fn plural_worker_en(n: usize) -> &'static str {
 
 /// Comma-join up to [`MAX_NAMES`] names, then summarise the remainder.
 fn join_names(names: &[String], language: Language) -> String {
-    let shown: Vec<&str> = names
+    let shown: Vec<String> = names
         .iter()
         .take(MAX_NAMES)
         .map(|s| {
             let t = s.trim();
-            if t.is_empty() {
+            bold(if t.is_empty() {
                 match language {
                     Language::De => "unbekannt",
                     Language::En => "unknown",
                 }
             } else {
                 t
-            }
+            })
         })
         .collect();
     let joined = shown.join(", ");
@@ -301,6 +303,13 @@ pub fn format_device_time(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::html::{is_valid_telegram_html, to_plain};
+
+    /// What push and ntfy show: the Telegram HTML without markup.
+    fn plain(html: &str) -> String {
+        assert!(is_valid_telegram_html(html), "{html}");
+        to_plain(html)
+    }
     use chrono::TimeZone;
 
     fn args_base<'a>(time: &'a str) -> DeviceStatusArgs<'a> {
@@ -319,7 +328,7 @@ mod tests {
     fn online_de_no_returning_no_suffix() {
         let text = DeviceStatusText::build(&args_base("01.05.26, 14:30"));
         assert_eq!(
-            text.de,
+            plain(&text.de),
             "\u{1f4f6} Gerät BitAxe-1.2.0 (Worker axe01) ist seit 01.05.26, 14:30 online."
         );
     }
@@ -331,7 +340,7 @@ mod tests {
         a.is_returning = true;
         let text = DeviceStatusText::build(&a);
         assert_eq!(
-            text.en,
+            plain(&text.en),
             "\u{1f4f6} Device with BitAxe-1.2.0 (worker axe01) back online at 5/1/26, 2:30 PM."
         );
     }
@@ -343,7 +352,7 @@ mod tests {
         a.address_suffix = Some(" – Adresse bc1q...xyz");
         let text = DeviceStatusText::build(&a);
         assert_eq!(
-            text.de,
+            plain(&text.de),
             "\u{1f4f4} Gerät BitAxe-1.2.0 (Worker axe01) ist seit 01.05.26, 14:30 offline – Adresse bc1q...xyz."
         );
     }
@@ -354,8 +363,8 @@ mod tests {
         a.user_agent = None;
         a.worker_name = None;
         let text = DeviceStatusText::build(&a);
-        assert!(text.de.contains("Gerät unbekannt (Worker unbekannt)"));
-        assert!(text.en.contains("Device with unknown (worker unknown)"));
+        assert!(plain(&text.de).contains("Gerät unbekannt (Worker unbekannt)"));
+        assert!(plain(&text.en).contains("Device with unknown (worker unknown)"));
     }
 
     #[test]
@@ -364,8 +373,8 @@ mod tests {
         a.user_agent = Some("");
         a.worker_name = Some("   ");
         let text = DeviceStatusText::build(&a);
-        assert!(text.de.contains("Gerät unbekannt"));
-        assert!(text.en.contains("worker unknown"));
+        assert!(plain(&text.de).contains("Gerät unbekannt"));
+        assert!(plain(&text.en).contains("worker unknown"));
     }
 
     #[test]
@@ -433,10 +442,26 @@ mod tests {
             reduced: &[],
             address_suffix: None,
         });
-        assert!(t.de.contains("1 Worker wieder online (old)"), "{}", t.de);
-        assert!(t.de.contains("2 Worker neu (new1, new2)"), "{}", t.de);
-        assert!(t.en.contains("1 worker back online (old)"), "{}", t.en);
-        assert!(t.en.contains("2 new workers (new1, new2)"), "{}", t.en);
+        assert!(
+            plain(&t.de).contains("1 Worker wieder online (old)"),
+            "{}",
+            plain(&t.de)
+        );
+        assert!(
+            plain(&t.de).contains("2 Worker neu (new1, new2)"),
+            "{}",
+            plain(&t.de)
+        );
+        assert!(
+            plain(&t.en).contains("1 worker back online (old)"),
+            "{}",
+            plain(&t.en)
+        );
+        assert!(
+            plain(&t.en).contains("2 new workers (new1, new2)"),
+            "{}",
+            plain(&t.en)
+        );
     }
 
     #[test]
@@ -444,11 +469,11 @@ mod tests {
         let off = names(&["axe01", "axe02", "axe03"]);
         let t = DeviceAggregateText::build(&agg_args("01.05.26, 14:30", &off, &[]));
         assert_eq!(
-            t.de,
+            plain(&t.de),
             "\u{1f4f4} 3 Worker offline (axe01, axe02, axe03) – Stand 01.05.26, 14:30."
         );
         assert_eq!(
-            t.en,
+            plain(&t.en),
             "\u{1f4f4} 3 workers offline (axe01, axe02, axe03) – as of 01.05.26, 14:30."
         );
     }
@@ -460,12 +485,16 @@ mod tests {
         let on = names(&["c"]);
         let t = DeviceAggregateText::build(&agg_args("01.05.26, 14:30", &off, &on));
         assert_eq!(
-            t.de,
+            plain(&t.de),
             "\u{1f4f4} 2 Worker offline (a, b) \u{b7} \u{1f4f6} 1 Worker wieder online (c) \
              – Stand 01.05.26, 14:30."
         );
         // English singular must not read "1 workers".
-        assert!(t.en.contains("1 worker back online (c)"), "{}", t.en);
+        assert!(
+            plain(&t.en).contains("1 worker back online (c)"),
+            "{}",
+            plain(&t.en)
+        );
     }
 
     /// Names are capped and the remainder is counted, never dropped.
@@ -473,12 +502,11 @@ mod tests {
     fn aggregate_caps_the_name_list_and_counts_the_rest() {
         let off = names(&["w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8", "w9"]);
         let t = DeviceAggregateText::build(&agg_args("01.05.26, 14:30", &off, &[]));
-        assert!(t
-            .de
+        assert!(plain(&t.de)
             .starts_with("\u{1f4f4} 9 Worker offline (w1, w2, w3, w4, w5, w6 … +3 weitere)"));
-        assert!(t.en.contains("… +3 more"), "{}", t.en);
+        assert!(plain(&t.en).contains("… +3 more"), "{}", plain(&t.en));
         assert!(
-            !t.de.contains("w7"),
+            !plain(&t.de).contains("w7"),
             "capped names must not leak into the list"
         );
     }
@@ -489,7 +517,11 @@ mod tests {
         let mut args = agg_args("01.05.26, 14:30", &off, &[]);
         args.address_suffix = Some(" – Adresse bc1q...xyz");
         let t = DeviceAggregateText::build(&args);
-        assert!(t.de.ends_with(" – Adresse bc1q...xyz."), "{}", t.de);
+        assert!(
+            plain(&t.de).ends_with(" – Adresse bc1q...xyz."),
+            "{}",
+            plain(&t.de)
+        );
     }
 
     /// An empty worker name renders as a placeholder.
@@ -497,7 +529,7 @@ mod tests {
     fn aggregate_renders_a_blank_worker_name_as_a_placeholder() {
         let off = names(&["", "b"]);
         let t = DeviceAggregateText::build(&agg_args("01.05.26, 14:30", &off, &[]));
-        assert!(t.de.contains("(unbekannt, b)"), "{}", t.de);
-        assert!(t.en.contains("(unknown, b)"), "{}", t.en);
+        assert!(plain(&t.de).contains("(unbekannt, b)"), "{}", plain(&t.de));
+        assert!(plain(&t.en).contains("(unknown, b)"), "{}", plain(&t.en));
     }
 }

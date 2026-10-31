@@ -43,7 +43,8 @@ impl NtfyAdapter {
         format!("{}/{}{}", base, self.config.topic_prefix, address)
     }
 
-    /// Publish a plain-text message to the address-topic. `Tags: bot`
+    /// Publish a bot message to the address-topic: it is Telegram HTML
+    /// ([`crate::format::html`]) and goes out as its plain text. `Tags: bot`
     /// is set so the SSE listener can ignore echoes of its own outbound
     /// traffic.
     pub async fn publish(&self, address: &str, message: &str) -> AdapterResult<()> {
@@ -53,7 +54,7 @@ impl NtfyAdapter {
             .post(&url)
             .header("Content-Type", "text/plain")
             .header("Tags", "bot")
-            .body(message.to_string());
+            .body(crate::format::html::to_plain(message));
         if let Some(token) = &self.config.access_token {
             request = request.header("Authorization", format!("Bearer {token}"));
         }

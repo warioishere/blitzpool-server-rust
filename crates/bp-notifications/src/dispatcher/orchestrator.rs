@@ -21,6 +21,7 @@ use crate::adapter::{
     AdapterError, AdapterResult, FcmAdapter, NtfyAdapter, PushKind, PushPayload, SmtpAdapter,
     TelegramAdapter, WebPushAdapter,
 };
+use crate::format::html;
 use crate::format::{
     format_device_time, format_number_suffix, format_sats, DeviceAggregateArgs,
     DeviceAggregateText, DevicePartialArgs, DevicePartialText, DeviceStatusArgs, DeviceStatusText,
@@ -600,7 +601,7 @@ async fn send_telegram_block_found(
             pool,
             sub.telegram_chat_id,
             "telegram-block",
-            adapter.send_text(sub.telegram_chat_id, &text).await,
+            adapter.send_html(sub.telegram_chat_id, &text).await,
         )
         .await;
     });
@@ -615,7 +616,7 @@ fn block_found_text(
     recipient: &BlockRecipient,
 ) -> String {
     let height = notice.height;
-    let short = short_address(recipient.address.as_str());
+    let short = html::addr(&short_address(recipient.address.as_str()));
     let mode = match notice.mode {
         MiningMode::Solo => "Solo",
         MiningMode::Pplns => "PPLNS",
@@ -623,28 +624,37 @@ fn block_found_text(
         MiningMode::Blockparty => "Blockparty",
     };
     let head = match (lang, recipient.is_finder) {
-        (Language::De, true) => {
-            format!("\u{1f389} Block {height} gefunden, von deinem Miner! ({mode})")
+        (Language::De, true) => format!(
+            "{} · von deinem Miner ({mode})",
+            html::title(Some("\u{1f389}"), &format!("Block {height} gefunden"))
+        ),
+        (Language::De, false) => html::title(
+            Some("\u{1f389}"),
+            &format!("{mode}-Block {height} gefunden"),
+        ),
+        (Language::En, true) => format!(
+            "{} · by your miner ({mode})",
+            html::title(Some("\u{1f389}"), &format!("Block {height} found"))
+        ),
+        (Language::En, false) => {
+            html::title(Some("\u{1f389}"), &format!("{mode} block {height} found"))
         }
-        (Language::De, false) => format!("\u{1f389} {mode}-Block {height} gefunden!"),
-        (Language::En, true) => format!("\u{1f389} Block {height} found by your miner! ({mode})"),
-        (Language::En, false) => format!("\u{1f389} {mode} block {height} found!"),
     };
     let detail = match (lang, recipient.paid_sats) {
         (Language::De, Some(sats)) => format!(
-            "Die Coinbase zahlt {} sats an {short}, sofern der Block in der Chain \
-             bleibt; ausgeben lässt es sich nach 100 Bestätigungen.",
-            format_sats(sats as i64)
+            "Die Coinbase zahlt {} an {short}, sofern der Block in der Chain bleibt. \
+             Ausgeben lässt es sich nach 100 Bestätigungen.",
+            html::bold(&format!("{} sats", format_sats(sats as i64)))
         ),
         (Language::De, None) => format!("Adresse: {short}"),
         (Language::En, Some(sats)) => format!(
-            "The coinbase pays {} sats to {short} if the block stays in the chain; \
-             it is spendable after 100 confirmations.",
-            format_sats(sats as i64)
+            "The coinbase pays {} to {short} if the block stays in the chain. \
+             It is spendable after 100 confirmations.",
+            html::bold(&format!("{} sats", format_sats(sats as i64)))
         ),
         (Language::En, None) => format!("Address: {short}"),
     };
-    format!("{head}\n{detail}")
+    format!("{head}\n\n{detail}")
 }
 
 async fn send_telegram_best_diff(
@@ -666,25 +676,25 @@ async fn send_telegram_best_diff(
             let chat_count = count_chat_subscriptions(&pool, sub.telegram_chat_id).await;
             let include_address = chat_count > 1;
             let fmt_addr = short_address(address.as_str());
-            let text = match (lang, include_address) {
-                (Language::De, true) => format!(
-                    "\u{1f3c6} Neue beste Difficulty für Adresse {fmt_addr}!\nWert: {formatted}"
-                ),
-                (Language::De, false) => {
-                    format!("\u{1f3c6} Neue beste Difficulty für deine Adresse!\nWert: {formatted}")
-                }
-                (Language::En, true) => format!(
-                    "\u{1f3c6} New best difficulty for address {fmt_addr}!\nValue: {formatted}"
-                ),
-                (Language::En, false) => {
-                    format!("\u{1f3c6} New best difficulty for your address!\nValue: {formatted}")
-                }
+            let title = match lang {
+                Language::De => html::title(Some("\u{1f3c6}"), "Neue beste Difficulty"),
+                Language::En => html::title(Some("\u{1f3c6}"), "New best difficulty"),
             };
+            let title = if include_address {
+                format!("{title} · {}", html::addr(&fmt_addr))
+            } else {
+                title
+            };
+            let value = match lang {
+                Language::De => html::row("Wert", &formatted),
+                Language::En => html::row("Value", &formatted),
+            };
+            let text = format!("{title}\n{value}");
             settle_telegram_push(
                 &pool,
                 sub.telegram_chat_id,
                 "telegram-best-diff",
-                adapter.send_text(sub.telegram_chat_id, &text).await,
+                adapter.send_html(sub.telegram_chat_id, &text).await,
             )
             .await;
         }
@@ -746,15 +756,15 @@ async fn send_telegram_device(
         let chat_count = count_chat_subscriptions(pool, sub.telegram_chat_id).await;
         let time_str = format_device_time(DEVICE_TIMEZONE, timestamp, lang);
         let suffix = (chat_count > 1).then(|| match lang {
-            Language::De => format!(" – Adresse {fmt_addr}"),
-            Language::En => format!(" – address {fmt_addr}"),
+            Language::De => format!(" – Adresse {}", html::addr(fmt_addr)),
+            Language::En => format!(" – address {}", html::addr(fmt_addr)),
         });
         let text = render(lang, &time_str, suffix.as_deref());
         settle_telegram_push(
             pool,
             sub.telegram_chat_id,
             label,
-            adapter.send_text(sub.telegram_chat_id, &text).await,
+            adapter.send_html(sub.telegram_chat_id, &text).await,
         )
         .await;
     });
@@ -808,7 +818,7 @@ fn device_partial_fcm_payload(partial: &DevicePartial) -> PushPayload {
     PushPayload {
         kind: PushKind::DeviceStatus,
         title: "Device Status".to_string(),
-        body: text.en,
+        body: html::to_plain(&text.en),
         tag: "reduced".to_string(),
         extras: vec![
             ("isReturning".into(), "false".to_string()),
@@ -850,7 +860,7 @@ fn device_partial_unified_payload(partial: &DevicePartial) -> PushPayload {
     PushPayload {
         kind: PushKind::DeviceStatus,
         title: "Device Status".to_string(),
-        body: text.en,
+        body: html::to_plain(&text.en),
         tag: String::new(),
         extras: Vec::new(),
     }
@@ -919,7 +929,7 @@ fn device_aggregate_fcm_payload(agg: &DeviceAggregate) -> PushPayload {
     PushPayload {
         kind: PushKind::DeviceStatus,
         title: "Device Status".to_string(),
-        body: text.en,
+        body: html::to_plain(&text.en),
         tag: status.to_string(),
         extras: vec![
             (
@@ -954,7 +964,7 @@ fn device_aggregate_unified_payload(agg: &DeviceAggregate) -> PushPayload {
     PushPayload {
         kind: PushKind::DeviceStatus,
         title: "Device Status".to_string(),
-        body: text.en,
+        body: html::to_plain(&text.en),
         tag: String::new(),
         extras: Vec::new(),
     }
@@ -967,8 +977,16 @@ async fn send_ntfy_best_diff(
     formatted: String,
 ) {
     let body = match lang {
-        Language::De => format!("\u{1f3c6} Neue beste Difficulty!\nWert: {formatted}"),
-        Language::En => format!("\u{1f3c6} New best difficulty!\nValue: {formatted}"),
+        Language::De => format!(
+            "{}\n{}",
+            html::title(Some("\u{1f3c6}"), "Neue beste Difficulty"),
+            html::row("Wert", &formatted)
+        ),
+        Language::En => format!(
+            "{}\n{}",
+            html::title(Some("\u{1f3c6}"), "New best difficulty"),
+            html::row("Value", &formatted)
+        ),
     };
     log_adapter_send("ntfy-best-diff", adapter.publish(&address, &body).await);
 }
@@ -1088,15 +1106,25 @@ fn join_request_push_payload(group_name: &str) -> PushPayload {
     }
 }
 
+/// The admin link shows as text, so the admin address in it does not stand
+/// in the chat.
 fn join_request_text(lang: Language, group_name: &str, admin_url: Option<&str>) -> String {
     let head = match lang {
-        Language::De => format!("\u{1f44b} Neue Beitrittsanfrage in {group_name}"),
-        Language::En => format!("\u{1f44b} New join request in {group_name}"),
+        Language::De => format!(
+            "{}\nTeam: {}",
+            html::title(Some("\u{1f44b}"), "Neue Beitrittsanfrage"),
+            html::bold(group_name)
+        ),
+        Language::En => format!(
+            "{}\nTeam: {}",
+            html::title(Some("\u{1f44b}"), "New join request"),
+            html::bold(group_name)
+        ),
     };
     match (lang, admin_url) {
         (_, None) => head,
-        (Language::De, Some(url)) => format!("{head}\nAdmin-Panel: {url}"),
-        (Language::En, Some(url)) => format!("{head}\nAdmin panel: {url}"),
+        (Language::De, Some(url)) => format!("{head}\n{}", html::link(url, "Admin-Panel öffnen")),
+        (Language::En, Some(url)) => format!("{head}\n{}", html::link(url, "Open the admin panel")),
     }
 }
 
@@ -1121,7 +1149,7 @@ async fn send_telegram_join_request(
                 &pool,
                 sub.telegram_chat_id,
                 "telegram-join-request",
-                adapter.send_text(sub.telegram_chat_id, &text).await,
+                adapter.send_html(sub.telegram_chat_id, &text).await,
             )
             .await;
         }
@@ -1363,12 +1391,18 @@ mod tests {
             paid: vec![(addr("bc1qmemberaddressxxxxxxxx"), 1_234_567)],
         };
         let [finder, member] = <[BlockRecipient; 2]>::try_from(notice.recipients()).unwrap();
-        let de = block_found_text(Language::De, &notice, &member);
+        for text in [
+            block_found_text(Language::De, &notice, &member),
+            block_found_text(Language::En, &notice, &finder),
+        ] {
+            assert!(html::is_valid_telegram_html(&text), "{text}");
+        }
+        let de = html::to_plain(&block_found_text(Language::De, &notice, &member));
         assert!(de.contains("Team-Block 973944 gefunden"), "{de}");
         assert!(de.contains("1,234,567 sats"), "{de}");
         assert!(!de.contains("found"), "no English in the German text: {de}");
-        let en = block_found_text(Language::En, &notice, &finder);
-        assert!(en.contains("Block 973944 found by your miner"), "{en}");
+        let en = html::to_plain(&block_found_text(Language::En, &notice, &finder));
+        assert!(en.contains("Block 973944 found · by your miner"), "{en}");
         assert_eq!(en.matches("973944").count(), 1, "{en}");
     }
 
@@ -1701,14 +1735,20 @@ mod tests {
 
     #[test]
     fn join_request_text_names_the_team_and_links_the_admin_panel_when_known() {
-        let url = "https://blitzpool.example/#/app/x/payout-group/admin";
-        assert_eq!(
-            join_request_text(Language::En, "PoolPals", Some(url)),
-            format!("\u{1f44b} New join request in PoolPals\nAdmin panel: {url}")
+        let url = "https://blitzpool.example/#/app/bc1qadmin/payout-group/admin";
+        let en = join_request_text(Language::En, "Pool<Pals>", Some(url));
+        assert!(html::is_valid_telegram_html(&en), "{en}");
+        assert!(
+            !en.contains(">https://"),
+            "the URL is no visible text: {en}"
         );
         assert_eq!(
-            join_request_text(Language::De, "PoolPals", None),
-            "\u{1f44b} Neue Beitrittsanfrage in PoolPals"
+            html::to_plain(&en),
+            format!("\u{1f44b} New join request\nTeam: Pool<Pals>\nOpen the admin panel ({url})")
+        );
+        assert_eq!(
+            html::to_plain(&join_request_text(Language::De, "PoolPals", None)),
+            "\u{1f44b} Neue Beitrittsanfrage\nTeam: PoolPals"
         );
     }
 }

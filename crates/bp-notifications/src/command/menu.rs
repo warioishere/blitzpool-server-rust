@@ -6,13 +6,46 @@
 //! answer "unknown command" when tapped.
 
 use crate::adapter::{AdapterResult, TelegramAdapter};
+use crate::format::html;
 use crate::format::Language;
 
 struct MenuEntry {
     command: &'static str,
+    section: Section,
     args: Args,
     de: &'static str,
     en: &'static str,
+}
+
+/// The heading a command stands under in `/help`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Addresses,
+    Notifications,
+    Queries,
+    Other,
+}
+
+impl Section {
+    const ALL: [Section; 4] = [
+        Section::Addresses,
+        Section::Notifications,
+        Section::Queries,
+        Section::Other,
+    ];
+
+    fn heading(self, lang: Language) -> &'static str {
+        match (self, lang) {
+            (Section::Addresses, Language::De) => "Adressen",
+            (Section::Addresses, Language::En) => "Addresses",
+            (Section::Notifications, Language::De) => "Benachrichtigungen",
+            (Section::Notifications, Language::En) => "Notifications",
+            (Section::Queries, Language::De) => "Abfragen",
+            (Section::Queries, Language::En) => "Queries",
+            (Section::Other, Language::De) => "Sonstiges",
+            (Section::Other, Language::En) => "Other",
+        }
+    }
 }
 
 /// The argument `/help` shows after a command. Telegram's menu has no room
@@ -42,144 +75,168 @@ impl Args {
 const MENU: &[MenuEntry] = &[
     MenuEntry {
         command: "/start",
+        section: Section::Addresses,
         args: Args::None,
         de: "Zeigt Willkommensnachricht",
         en: "Show welcome message",
     },
     MenuEntry {
         command: "/subscribe",
+        section: Section::Addresses,
         args: Args::Address,
         de: "Benachrichtigung bei Blockhit aktivieren",
         en: "Enable block hit notifications",
     },
     MenuEntry {
         command: "/settings",
+        section: Section::Notifications,
         args: Args::None,
         de: "Alle Benachrichtigungen pro Adresse schalten",
         en: "Switch every notification per address",
     },
     MenuEntry {
         command: "/subscribe_bestdiff",
+        section: Section::Notifications,
         args: Args::OptionalOnOff,
         de: "Best-Diff-Benachrichtigungen, alle Adressen (on/off)",
         en: "Best-diff notifications, all addresses (on/off)",
     },
     MenuEntry {
         command: "/bestdiff_reset",
+        section: Section::Notifications,
         args: Args::OptionalAddress,
         de: "Best-Diff zurücksetzen (Link ins Dashboard)",
         en: "Reset best difficulty (link to the dashboard)",
     },
     MenuEntry {
         command: "/device_notifications",
+        section: Section::Notifications,
         args: Args::OptionalOnOff,
         de: "Geräte-Benachrichtigungen, alle Adressen (on/off)",
         en: "Device notifications, all addresses (on/off)",
     },
     MenuEntry {
         command: "/team_requests",
+        section: Section::Notifications,
         args: Args::OptionalOnOff,
         de: "Team-Beitrittsanfragen als Admin, alle Adressen (on/off)",
         en: "Team join requests as admin, all addresses (on/off)",
     },
     MenuEntry {
         command: "/difficulty",
+        section: Section::Queries,
         args: Args::None,
         de: "Zeigt aktuelle Netzwerk-Difficulty",
         en: "Show current network difficulty",
     },
     MenuEntry {
         command: "/next_difficulty",
+        section: Section::Queries,
         args: Args::None,
         de: "Zeigt erwartete Änderung der Netzwerk-Difficulty",
         en: "Show expected network difficulty change",
     },
     MenuEntry {
         command: "/stats",
+        section: Section::Queries,
         args: Args::OptionalAddress,
         de: "Zeigt die Stats für deine Miner Adresse an",
         en: "Show stats for your miner address",
     },
     MenuEntry {
         command: "/show_workers",
+        section: Section::Queries,
         args: Args::OptionalAddress,
         de: "Zeigt Worker-Übersicht",
         en: "Show worker overview",
     },
     MenuEntry {
         command: "/send_hourly",
+        section: Section::Notifications,
         args: Args::OptionalOnOff,
         de: "Stündliche Stats- und Worker-Berichte, alle Adressen (on/off)",
         en: "Hourly stats and worker reports, all addresses (on/off)",
     },
     MenuEntry {
         command: "/poolhashrate",
+        section: Section::Queries,
         args: Args::None,
         de: "Zeigt die aktuelle Pool-Hashrate",
         en: "Show current pool hashrate",
     },
     MenuEntry {
         command: "/pplns_status",
+        section: Section::Queries,
         args: Args::OptionalAddress,
         de: "PPLNS-Status für deine Adresse",
         en: "PPLNS status for your address",
     },
     MenuEntry {
         command: "/pplns_top",
+        section: Section::Queries,
         args: Args::None,
         de: "Top 10 Miner im PPLNS-Window",
         en: "Top 10 miners in PPLNS window",
     },
     MenuEntry {
         command: "/team_status",
+        section: Section::Queries,
         args: Args::OptionalAddress,
         de: "Status des Teams deiner Adresse",
         en: "Status of the team your address belongs to",
     },
     MenuEntry {
         command: "/blockparty_status",
+        section: Section::Queries,
         args: Args::OptionalAddress,
         de: "Status der Blockparty deiner Adresse",
         en: "Status of the Blockparty your address belongs to",
     },
     MenuEntry {
         command: "/team_members",
+        section: Section::Queries,
         args: Args::OptionalAddress,
         de: "Mitglieder deines Teams",
         en: "Members of your team",
     },
     MenuEntry {
         command: "/team_history",
+        section: Section::Queries,
         args: Args::OptionalAddress,
         de: "Block-Auszahlungen deines Teams",
         en: "Block payouts of your team",
     },
     MenuEntry {
         command: "/remove",
+        section: Section::Addresses,
         args: Args::Address,
         de: "Adresse entfernen",
         en: "Remove address",
     },
     MenuEntry {
         command: "/show_addresses",
+        section: Section::Addresses,
         args: Args::None,
         de: "Zeigt gespeicherte Adressen",
         en: "Show stored addresses",
     },
     MenuEntry {
         command: "/deutsch",
+        section: Section::Other,
         args: Args::None,
         de: "Bot-Antworten auf Deutsch",
         en: "Bot replies in German",
     },
     MenuEntry {
         command: "/english",
+        section: Section::Other,
         args: Args::None,
         de: "Bot replies in English",
         en: "Bot replies in English",
     },
     MenuEntry {
         command: "/help",
+        section: Section::Other,
         args: Args::None,
         de: "Liste der Befehle",
         en: "List of commands",
@@ -200,25 +257,35 @@ fn menu_for(lang: Language) -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
-/// The `/help` reply: every menu entry with its argument.
+/// The `/help` reply: every menu entry with its argument, under its
+/// section. Commands stay plain so Telegram keeps them tappable.
 pub(crate) fn help_text(lang: Language) -> String {
-    let header = match lang {
-        Language::De => "Verfügbare Befehle:",
-        Language::En => "Available commands:",
+    let mut text = match lang {
+        Language::De => html::bold("Befehle"),
+        Language::En => html::bold("Commands"),
     };
-    let mut text = header.to_string();
-    for entry in MENU {
-        let description = match lang {
-            Language::De => entry.de,
-            Language::En => entry.en,
-        };
-        text.push_str(&format!(
-            "\n{}{} — {description}",
-            entry.command,
-            entry.args.usage(lang)
-        ));
+    for section in Section::ALL {
+        text.push_str("\n\n");
+        text.push_str(&html::bold(section.heading(lang)));
+        for entry in MENU.iter().filter(|e| e.section == section) {
+            text.push_str(&format!("\n{}", help_line(entry, lang)));
+        }
     }
     text
+}
+
+fn help_line(entry: &MenuEntry, lang: Language) -> String {
+    let description = match lang {
+        Language::De => entry.de,
+        Language::En => entry.en,
+    };
+    let usage = entry.args.usage(lang);
+    let usage = if usage.is_empty() {
+        String::new()
+    } else {
+        format!(" <i>{}</i>", html::esc(usage.trim_start()))
+    };
+    format!("{}{usage} — {}", entry.command, html::esc(description))
 }
 
 /// Send the menu to Telegram: English as the default for every client
@@ -268,16 +335,17 @@ mod tests {
         for lang in [Language::De, Language::En] {
             let help = help_text(lang);
             for entry in MENU {
-                let line = format!("{}{} — ", entry.command, entry.args.usage(lang));
-                assert!(
-                    help.lines().any(|l| l.starts_with(&line)),
+                let line = help_line(entry, lang);
+                assert_eq!(
+                    help.lines().filter(|l| *l == line).count(),
+                    1,
                     "{lang:?} help misses {line:?}:\n{help}"
                 );
             }
-            assert_eq!(help.lines().count(), MENU.len() + 1, "{lang:?}");
+            assert!(crate::format::html::is_valid_telegram_html(&help), "{help}");
         }
-        assert!(help_text(Language::De).contains("/subscribe ADRESSE — "));
-        assert!(help_text(Language::En).contains("/bestdiff_reset [ADDRESS] — "));
+        assert!(help_text(Language::De).contains("/subscribe <i>ADRESSE</i> — "));
+        assert!(help_text(Language::En).contains("/bestdiff_reset <i>[ADDRESS]</i> — "));
     }
 
     /// Telegram's limits: 1-32 lowercase letters, digits or underscores per

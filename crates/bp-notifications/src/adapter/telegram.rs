@@ -34,6 +34,18 @@ struct ReplyMarkup<'a> {
     inline_keyboard: &'a InlineKeyboard,
 }
 
+/// The bot's messages show links without a preview card; the links stay
+/// clickable.
+#[derive(Serialize, Clone, Copy)]
+struct LinkPreviewOptions {
+    is_disabled: bool,
+}
+
+const NO_PREVIEW: LinkPreviewOptions = LinkPreviewOptions { is_disabled: true };
+
+/// Every message text and edit is Telegram HTML.
+const PARSE_MODE: &str = "HTML";
+
 /// Opens the reply field on the message, so the user answers it directly.
 #[derive(Serialize)]
 struct ForceReply<'a> {
@@ -67,18 +79,23 @@ impl TelegramAdapter {
         Ok(Self { client, api_root })
     }
 
-    /// Plain-text `sendMessage`, no Markdown / HTML parse_mode: every
-    /// renderer in `format::*` produces plain text with emoji that
-    /// Telegram displays without parsing.
-    pub async fn send_text(&self, chat_id: i64, text: &str) -> AdapterResult<()> {
+    /// `sendMessage` of a bot message, Telegram HTML
+    /// ([`crate::format::html`]).
+    pub async fn send_html(&self, chat_id: i64, html: &str) -> AdapterResult<()> {
         #[derive(Serialize)]
         struct SendMessageBody<'a> {
             chat_id: i64,
             text: &'a str,
+            parse_mode: &'static str,
+            link_preview_options: LinkPreviewOptions,
         }
-        self.post("sendMessage", &SendMessageBody { chat_id, text })
-            .await
-            .map(|_| ())
+        let body = SendMessageBody {
+            chat_id,
+            text: html,
+            parse_mode: PARSE_MODE,
+            link_preview_options: NO_PREVIEW,
+        };
+        self.post("sendMessage", &body).await.map(|_| ())
     }
 
     /// `sendMessage` carrying an inline keyboard. Returns the new
@@ -122,12 +139,16 @@ impl TelegramAdapter {
         struct Body<'a, M: Serialize> {
             chat_id: i64,
             text: &'a str,
+            parse_mode: &'static str,
             reply_markup: &'a M,
+            link_preview_options: LinkPreviewOptions,
         }
         let body = Body {
             chat_id,
             text,
+            parse_mode: PARSE_MODE,
             reply_markup,
+            link_preview_options: NO_PREVIEW,
         };
         let resp = self.post("sendMessage", &body).await?;
         #[derive(Deserialize)]
@@ -160,6 +181,8 @@ impl TelegramAdapter {
             chat_id: i64,
             message_id: i64,
             text: &'a str,
+            parse_mode: &'static str,
+            link_preview_options: LinkPreviewOptions,
             #[serde(skip_serializing_if = "Option::is_none")]
             reply_markup: Option<ReplyMarkup<'a>>,
         }
@@ -167,6 +190,8 @@ impl TelegramAdapter {
             chat_id,
             message_id,
             text,
+            parse_mode: PARSE_MODE,
+            link_preview_options: NO_PREVIEW,
             reply_markup: keyboard.map(|inline_keyboard| ReplyMarkup { inline_keyboard }),
         };
         self.post("editMessageText", &body).await.map(|_| ())
