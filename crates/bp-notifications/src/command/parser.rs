@@ -18,9 +18,9 @@ pub enum Command {
         address: Option<String>,
     },
     ShowAddresses,
-    /// `/settings`, or a switch command without on|off: every switch of
-    /// every subscribed address.
-    Settings,
+    /// `/settings`, or a switch command without on|off (which one rides
+    /// along): every switch of every subscribed address.
+    Settings(Option<Switch>),
     /// A switch command with on|off, applied to every subscribed address.
     Toggle(Switch, FlagToggle),
     /// `/bestdiff_reset [<address>]`: a link to where that happens.
@@ -199,7 +199,7 @@ pub fn parse_command(text: &str) -> Command {
             address: arg.clone(),
         },
         "/show_addresses" => Command::ShowAddresses,
-        "/settings" => Command::Settings,
+        "/settings" => Command::Settings(None),
         "/subscribe_bestdiff" => switch_command(Switch::BestDiff, arg.as_deref()),
         "/device_notifications" => switch_command(Switch::Device, arg.as_deref()),
         "/team_requests" => switch_command(Switch::TeamRequests, arg.as_deref()),
@@ -228,7 +228,7 @@ pub fn parse_command(text: &str) -> Command {
 /// anything else is not understood.
 fn switch_command(switch: Switch, arg: Option<&str>) -> Command {
     match arg {
-        None => Command::Settings,
+        None => Command::Settings(Some(switch)),
         Some(arg) => parse_toggle(arg)
             .map(|toggle| Command::Toggle(switch, toggle))
             .unwrap_or(Command::Unknown),
@@ -316,14 +316,14 @@ mod tests {
 
     #[test]
     fn a_switch_without_argument_opens_the_settings() {
-        for cmd in [
-            "/settings",
-            "/subscribe_bestdiff",
-            "/device_notifications",
-            "/team_requests",
-            "/send_hourly",
+        for (cmd, switch) in [
+            ("/settings", None),
+            ("/subscribe_bestdiff", Some(Switch::BestDiff)),
+            ("/device_notifications", Some(Switch::Device)),
+            ("/team_requests", Some(Switch::TeamRequests)),
+            ("/send_hourly", Some(Switch::Hourly)),
         ] {
-            assert_eq!(parse_command(cmd), Command::Settings, "{cmd}");
+            assert_eq!(parse_command(cmd), Command::Settings(switch), "{cmd}");
         }
         assert_eq!(parse_command("/subscribe_bestdiff maybe"), Command::Unknown);
         assert_eq!(parse_command("/send_hourly foo"), Command::Unknown);
