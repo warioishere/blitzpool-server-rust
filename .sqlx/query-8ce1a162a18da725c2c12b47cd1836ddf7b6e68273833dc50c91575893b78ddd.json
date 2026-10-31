@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE ntfy_subscriptions_entity\n           SET \"teamBestNotificationsEnabled\" = $2, \"updatedAt\" = $3\n           WHERE address = $1 AND \"deletedAt\" IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bool",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8ce1a162a18da725c2c12b47cd1836ddf7b6e68273833dc50c91575893b78ddd"
+}

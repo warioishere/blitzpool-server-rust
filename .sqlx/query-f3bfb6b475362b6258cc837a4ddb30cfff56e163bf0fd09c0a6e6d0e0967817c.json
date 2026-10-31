@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT m.\"groupId\" AS \"group_id!\", s.\"telegramChatId\" AS \"chat_id!\"\n           FROM telegram_subscriptions_entity s\n           JOIN pplns_group_member m ON m.address = s.address\n           JOIN pplns_group g ON g.id = m.\"groupId\"\n           WHERE s.\"deletedAt\" IS NULL\n             AND s.\"teamBestNotificationsEnabled\"\n             AND g.\"dissolvedAt\" IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "group_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "chat_id!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "f3bfb6b475362b6258cc837a4ddb30cfff56e163bf0fd09c0a6e6d0e0967817c"
+}

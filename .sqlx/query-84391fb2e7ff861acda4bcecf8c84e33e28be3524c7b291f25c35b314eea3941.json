@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            \"telegramChatId\" AS \"telegram_chat_id!\",\n            \"bestDiffNotificationsEnabled\" AS \"best_diff_notifications_enabled!\",\n            \"isDefault\" AS \"is_default!\",\n            \"deviceNotificationsEnabled\" AS \"device_notifications_enabled!\",\n            \"hourlyStatsEnabled\" AS \"hourly_stats_enabled!\",\n            \"hourlyWorkersEnabled\" AS \"hourly_workers_enabled!\",\n            \"groupAdminNotificationsEnabled\" AS \"group_admin_notifications_enabled!\",\n            \"blockNotificationsEnabled\" AS \"block_notifications_enabled!\"\n           FROM telegram_subscriptions_entity\n           WHERE \"deletedAt\" IS NULL\n             AND (\"hourlyStatsEnabled\" = true OR \"hourlyWorkersEnabled\" = true)",
+  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            \"telegramChatId\" AS \"telegram_chat_id!\",\n            \"bestDiffNotificationsEnabled\" AS \"best_diff_notifications_enabled!\",\n            \"isDefault\" AS \"is_default!\",\n            \"deviceNotificationsEnabled\" AS \"device_notifications_enabled!\",\n            \"hourlyStatsEnabled\" AS \"hourly_stats_enabled!\",\n            \"hourlyWorkersEnabled\" AS \"hourly_workers_enabled!\",\n            \"groupAdminNotificationsEnabled\" AS \"group_admin_notifications_enabled!\",\n            \"blockNotificationsEnabled\" AS \"block_notifications_enabled!\",\n            \"teamBestNotificationsEnabled\" AS \"team_best_notifications_enabled!\"\n           FROM telegram_subscriptions_entity\n           WHERE address = $1 AND \"deletedAt\" IS NULL",
   "describe": {
     "columns": [
       {
@@ -67,10 +67,17 @@
         "ordinal": 12,
         "name": "block_notifications_enabled!",
         "type_info": "Bool"
+      },
+      {
+        "ordinal": 13,
+        "name": "team_best_notifications_enabled!",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
-      "Left": []
+      "Left": [
+        "Text"
+      ]
     },
     "nullable": [
       true,
@@ -85,8 +92,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "6cd3f0074b906c6da4c173ec13b402fab3a7c90d06c5d3fda82946d322b0cbe0"
+  "hash": "84391fb2e7ff861acda4bcecf8c84e33e28be3524c7b291f25c35b314eea3941"
 }

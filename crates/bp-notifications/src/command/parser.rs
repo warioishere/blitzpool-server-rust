@@ -45,6 +45,8 @@ pub enum Switch {
     Device,
     /// `/team_requests`: a Team admin's join-request notice.
     TeamRequests,
+    /// `/team_bestdiff`: a Team member's notice of a new round best.
+    TeamBest,
     /// `/send_hourly`: hourly stats and workers together.
     Hourly,
 }
@@ -112,16 +114,18 @@ pub enum SettingsField {
     BestDiff,
     Device,
     TeamRequests,
+    TeamBest,
     HourlyStats,
     HourlyWorkers,
 }
 
 impl SettingsField {
-    pub const ALL: [SettingsField; 6] = [
+    pub const ALL: [SettingsField; 7] = [
         SettingsField::Blocks,
         SettingsField::BestDiff,
         SettingsField::Device,
         SettingsField::TeamRequests,
+        SettingsField::TeamBest,
         SettingsField::HourlyStats,
         SettingsField::HourlyWorkers,
     ];
@@ -132,6 +136,7 @@ impl SettingsField {
             SettingsField::BestDiff => "bd",
             SettingsField::Device => "dv",
             SettingsField::TeamRequests => "tr",
+            SettingsField::TeamBest => "tb",
             SettingsField::HourlyStats => "hs",
             SettingsField::HourlyWorkers => "hw",
         }
@@ -203,6 +208,7 @@ pub fn parse_command(text: &str) -> Command {
         "/subscribe_bestdiff" => switch_command(Switch::BestDiff, arg.as_deref()),
         "/device_notifications" => switch_command(Switch::Device, arg.as_deref()),
         "/team_requests" => switch_command(Switch::TeamRequests, arg.as_deref()),
+        "/team_bestdiff" => switch_command(Switch::TeamBest, arg.as_deref()),
         "/send_hourly" => switch_command(Switch::Hourly, arg.as_deref()),
         "/bestdiff_reset" => Command::BestDiffReset {
             address: arg.clone(),
@@ -312,6 +318,10 @@ mod tests {
             parse_command("/team_requests on"),
             Command::Toggle(Switch::TeamRequests, FlagToggle::On)
         );
+        assert_eq!(
+            parse_command("/team_bestdiff off"),
+            Command::Toggle(Switch::TeamBest, FlagToggle::Off)
+        );
     }
 
     #[test]
@@ -321,6 +331,7 @@ mod tests {
             ("/subscribe_bestdiff", Some(Switch::BestDiff)),
             ("/device_notifications", Some(Switch::Device)),
             ("/team_requests", Some(Switch::TeamRequests)),
+            ("/team_bestdiff", Some(Switch::TeamBest)),
             ("/send_hourly", Some(Switch::Hourly)),
         ] {
             assert_eq!(parse_command(cmd), Command::Settings(switch), "{cmd}");

@@ -3,13 +3,15 @@
 //! Background crons, split by process role: maintenance (`payout` role: dead
 //! sessions, table retention, group invitation/join expiry) and notifications
 //! (`notify` role: network difficulty, digests, per-address best difficulty,
-//! whose baseline is seeded at spawn so a restart does not re-notify).
+//! whose baseline is seeded at spawn so a restart does not re-notify, and the
+//! Team round best).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use bp_cron_utils::SystemClock;
 use bp_group_mgmt_engine::cron::{spawn_invitation_expiry_cron, spawn_join_request_expiry_cron};
+use bp_group_solo_engine::round::GroupRoundStore;
 use bp_notifications::adapter::{NtfyAdapter, TelegramAdapter};
 use bp_notifications::cron::best_difficulty::{
     spawn_best_difficulty_cron, BestDifficultyCronConfig,
@@ -18,6 +20,7 @@ use bp_notifications::cron::hourly_stats::{spawn_hourly_stats_cron, HourlyStatsC
 use bp_notifications::cron::network_difficulty::{
     spawn_network_difficulty_cron, NetworkDifficultyCronConfig,
 };
+use bp_notifications::cron::team_best::{spawn_team_best_cron, TeamBestCronConfig};
 use bp_notifications::dispatcher::NotificationDispatcher;
 use chrono::Utc;
 use sqlx::PgPool;
@@ -58,6 +61,7 @@ pub(crate) mod offsets {
     pub(crate) const NETWORK_DIFFICULTY: Duration = Duration::from_secs(23);
     pub(crate) const HOURLY_STATS: Duration = Duration::from_secs(31);
     pub(crate) const BEST_DIFFICULTY: Duration = Duration::from_secs(37);
+    pub(crate) const TEAM_BEST: Duration = Duration::from_secs(47);
     pub(crate) const INVITATION_EXPIRY: Duration = Duration::from_secs(11);
     pub(crate) const JOIN_REQUEST_EXPIRY: Duration = Duration::from_secs(19);
     pub(crate) const STALE_PUSH_CLEANUP: Duration = Duration::from_secs(41);
@@ -101,6 +105,8 @@ struct Inner {
     hourly_stats_shutdown: Option<watch::Sender<bool>>,
     /// `None` when there is no dispatcher: the best-diff cron is not spawned.
     best_difficulty_shutdown: Option<watch::Sender<bool>>,
+    /// Spawned with the best-diff cron, on the same dispatcher.
+    team_best_shutdown: Option<watch::Sender<bool>>,
     /// Whether the network-difficulty cron has a push adapter (FCM or
     /// UnifiedPush). Without one it still keeps the tracker row fresh.
     /// Only reported by [`CronHandles::log_summary`].
@@ -135,6 +141,7 @@ impl CronHandles {
                 hourly_stats_telegram = inner.hourly_stats_telegram,
                 hourly_stats_ntfy = inner.hourly_stats_ntfy,
                 best_difficulty = inner.best_difficulty_shutdown.is_some(),
+                team_best = inner.team_best_shutdown.is_some(),
                 "crons summary"
             ),
         }
@@ -169,6 +176,9 @@ impl CronHandles {
             let _ = tx.send(true);
         }
         if let Some(tx) = inner.best_difficulty_shutdown {
+            let _ = tx.send(true);
+        }
+        if let Some(tx) = inner.team_best_shutdown {
             let _ = tx.send(true);
         }
         // Only the locally owned loops are joinable; the helper crons are
@@ -281,20 +291,34 @@ pub(crate) async fn spawn(
         None
     };
 
-    let best_difficulty_shutdown = match (run_notifications, dispatcher) {
-        (true, Some(dispatcher)) => Some(spawn_best_difficulty_cron(
-            BestDifficultyCronConfig {
-                startup_offset: offsets::BEST_DIFFICULTY,
-                ..BestDifficultyCronConfig::default()
-            },
-            pool.clone(),
-            dispatcher,
-        )),
+    let (best_difficulty_shutdown, team_best_shutdown) = match (run_notifications, dispatcher) {
+        (true, Some(dispatcher)) => (
+            Some(spawn_best_difficulty_cron(
+                BestDifficultyCronConfig {
+                    startup_offset: offsets::BEST_DIFFICULTY,
+                    ..BestDifficultyCronConfig::default()
+                },
+                pool.clone(),
+                Arc::clone(&dispatcher),
+            )),
+            Some(spawn_team_best_cron(
+                TeamBestCronConfig {
+                    startup_offset: offsets::TEAM_BEST,
+                    ..TeamBestCronConfig::default()
+                },
+                pool.clone(),
+                GroupRoundStore::new(foundation.redis.clone()),
+                dispatcher,
+            )),
+        ),
         (true, None) => {
-            info!("crons.best_difficulty: SKIPPED (no dispatcher — no transport adapters)");
-            None
+            info!(
+                "crons.best_difficulty, crons.team_best: SKIPPED \
+                 (no dispatcher — no transport adapters)"
+            );
+            (None, None)
         }
-        (false, _) => None,
+        (false, _) => (None, None),
     };
 
     CronHandles {
@@ -310,6 +334,7 @@ pub(crate) async fn spawn(
             network_difficulty_shutdown,
             hourly_stats_shutdown,
             best_difficulty_shutdown,
+            team_best_shutdown,
             network_difficulty_has_push,
             hourly_stats_telegram,
             hourly_stats_ntfy,

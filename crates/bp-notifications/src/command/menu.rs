@@ -123,6 +123,13 @@ const MENU: &[MenuEntry] = &[
         en: "Team join requests as admin, all addresses (on/off)",
     },
     MenuEntry {
+        command: "/team_bestdiff",
+        section: Section::Notifications,
+        args: Args::OptionalOnOff,
+        de: "Neuer Bestwert der Team-Runde, alle Adressen (on/off)",
+        en: "New best of the Team round, all addresses (on/off)",
+    },
+    MenuEntry {
         command: "/difficulty",
         section: Section::Queries,
         args: Args::None,

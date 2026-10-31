@@ -16,5 +16,5 @@ pub(crate) use orchestrator::{
     push_fcm, push_web, settle_telegram_push, PUSH_TYPE_FCM, PUSH_TYPE_UNIFIED,
 };
 pub use orchestrator::{
-    BlockFoundNotice, DeviceStatusEvent, JoinRequestNotice, NotificationDispatcher,
+    BlockFoundNotice, DeviceStatusEvent, JoinRequestNotice, NotificationDispatcher, TeamBestNotice,
 };

@@ -6,3 +6,4 @@
 pub mod best_difficulty;
 pub mod hourly_stats;
 pub mod network_difficulty;
+pub mod team_best;

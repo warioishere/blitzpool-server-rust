@@ -35,6 +35,8 @@ pub struct TelegramSubscriptionRow {
     pub group_admin_notifications_enabled: bool,
     #[sqlx(rename = "blockNotificationsEnabled")]
     pub block_notifications_enabled: bool,
+    #[sqlx(rename = "teamBestNotificationsEnabled")]
+    pub team_best_notifications_enabled: bool,
 }
 
 /// All non-soft-deleted Telegram subscriptions for `address`. Multiple
@@ -60,7 +62,8 @@ pub async fn find_telegram_subscriptions_by_address(
             "hourlyStatsEnabled" AS "hourly_stats_enabled!",
             "hourlyWorkersEnabled" AS "hourly_workers_enabled!",
             "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!",
-            "blockNotificationsEnabled" AS "block_notifications_enabled!"
+            "blockNotificationsEnabled" AS "block_notifications_enabled!",
+            "teamBestNotificationsEnabled" AS "team_best_notifications_enabled!"
            FROM telegram_subscriptions_entity
            WHERE address = $1 AND "deletedAt" IS NULL"#,
         address.as_str(),
@@ -90,7 +93,8 @@ pub async fn find_telegram_subscriptions_with_hourly_enabled(
             "hourlyStatsEnabled" AS "hourly_stats_enabled!",
             "hourlyWorkersEnabled" AS "hourly_workers_enabled!",
             "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!",
-            "blockNotificationsEnabled" AS "block_notifications_enabled!"
+            "blockNotificationsEnabled" AS "block_notifications_enabled!",
+            "teamBestNotificationsEnabled" AS "team_best_notifications_enabled!"
            FROM telegram_subscriptions_entity
            WHERE "deletedAt" IS NULL
              AND ("hourlyStatsEnabled" = true OR "hourlyWorkersEnabled" = true)"#,
@@ -122,7 +126,8 @@ pub async fn find_telegram_subscriptions_by_chat(
             "hourlyStatsEnabled" AS "hourly_stats_enabled!",
             "hourlyWorkersEnabled" AS "hourly_workers_enabled!",
             "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!",
-            "blockNotificationsEnabled" AS "block_notifications_enabled!"
+            "blockNotificationsEnabled" AS "block_notifications_enabled!",
+            "teamBestNotificationsEnabled" AS "team_best_notifications_enabled!"
            FROM telegram_subscriptions_entity
            WHERE "telegramChatId" = $1 AND "deletedAt" IS NULL"#,
         telegram_chat_id,
@@ -153,6 +158,8 @@ pub struct NtfySubscriptionRow {
     pub hourly_workers_enabled: bool,
     #[sqlx(rename = "groupAdminNotificationsEnabled")]
     pub group_admin_notifications_enabled: bool,
+    #[sqlx(rename = "teamBestNotificationsEnabled")]
+    pub team_best_notifications_enabled: bool,
 }
 
 /// All ntfy subscriptions where the hourly cron should fire — either
@@ -173,7 +180,8 @@ pub async fn find_ntfy_subscriptions_with_hourly_enabled(
             "deviceNotificationsEnabled" AS "device_notifications_enabled!",
             "hourlyStatsEnabled" AS "hourly_stats_enabled!",
             "hourlyWorkersEnabled" AS "hourly_workers_enabled!",
-            "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!"
+            "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!",
+            "teamBestNotificationsEnabled" AS "team_best_notifications_enabled!"
            FROM ntfy_subscriptions_entity
            WHERE "deletedAt" IS NULL
              AND ("hourlyStatsEnabled" = true OR "hourlyWorkersEnabled" = true)"#,
@@ -203,7 +211,8 @@ pub async fn find_ntfy_subscription_by_address(
             "deviceNotificationsEnabled" AS "device_notifications_enabled!",
             "hourlyStatsEnabled" AS "hourly_stats_enabled!",
             "hourlyWorkersEnabled" AS "hourly_workers_enabled!",
-            "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!"
+            "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!",
+            "teamBestNotificationsEnabled" AS "team_best_notifications_enabled!"
            FROM ntfy_subscriptions_entity
            WHERE address = $1 AND "deletedAt" IS NULL
            LIMIT 1"#,
@@ -786,6 +795,31 @@ pub async fn update_telegram_sub_block_flag(
     Ok(result.rows_affected())
 }
 
+/// Toggle the per-subscription `teamBestNotificationsEnabled` flag.
+pub async fn update_telegram_sub_team_best_flag(
+    pool: &PgPool,
+    telegram_chat_id: i64,
+    address: &AddressId,
+    value: bool,
+) -> Result<u64, DbError> {
+    let now_ms: i64 = chrono::Utc::now().timestamp_millis();
+    let result = sqlx::query!(
+        r#"UPDATE telegram_subscriptions_entity
+           SET "teamBestNotificationsEnabled" = $3, "updatedAt" = $4
+           WHERE "telegramChatId" = $1
+             AND address = $2
+             AND "deletedAt" IS NULL"#,
+        telegram_chat_id,
+        address.as_str(),
+        value,
+        now_ms,
+    )
+    .execute(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(result.rows_affected())
+}
+
 /// Toggle the per-subscription `groupAdminNotificationsEnabled` flag.
 pub async fn update_telegram_sub_group_admin_flag(
     pool: &PgPool,
@@ -948,6 +982,27 @@ pub async fn update_ntfy_sub_group_admin_flag(
     Ok(result.rows_affected())
 }
 
+/// Toggle `teamBestNotificationsEnabled` on the ntfy sub.
+pub async fn update_ntfy_sub_team_best_flag(
+    pool: &PgPool,
+    address: &AddressId,
+    value: bool,
+) -> Result<u64, DbError> {
+    let now_ms: i64 = chrono::Utc::now().timestamp_millis();
+    let result = sqlx::query!(
+        r#"UPDATE ntfy_subscriptions_entity
+           SET "teamBestNotificationsEnabled" = $2, "updatedAt" = $3
+           WHERE address = $1 AND "deletedAt" IS NULL"#,
+        address.as_str(),
+        value,
+        now_ms,
+    )
+    .execute(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(result.rows_affected())
+}
+
 /// Set both hourly flags on the ntfy sub (`/send_hourly`).
 pub async fn update_ntfy_sub_hourly_flags(
     pool: &PgPool,
@@ -1088,4 +1143,76 @@ pub async fn find_device_notification_addresses(pool: &PgPool) -> Result<Vec<Add
     .await
     .map_err(DbError::from)?;
     Ok(rows.into_iter().map(|r| r.address).collect())
+}
+
+// ── Team round best ──────────────────────────────────────────────────
+
+/// A Telegram chat that follows a Team's round best through one of its
+/// addresses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeamBestTelegramRecipient {
+    pub group_id: uuid::Uuid,
+    pub telegram_chat_id: i64,
+}
+
+/// An ntfy topic (its address) that follows a Team's round best.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeamBestNtfyRecipient {
+    pub group_id: uuid::Uuid,
+    pub address: AddressId,
+    pub language: String,
+}
+
+/// Every Telegram chat with the team-best switch on for an address that is
+/// a member of a Team that is not dissolved, once per chat and Team.
+pub async fn find_team_best_telegram_recipients(
+    pool: &PgPool,
+) -> Result<Vec<TeamBestTelegramRecipient>, DbError> {
+    let rows = sqlx::query!(
+        r#"SELECT DISTINCT m."groupId" AS "group_id!", s."telegramChatId" AS "chat_id!"
+           FROM telegram_subscriptions_entity s
+           JOIN pplns_group_member m ON m.address = s.address
+           JOIN pplns_group g ON g.id = m."groupId"
+           WHERE s."deletedAt" IS NULL
+             AND s."teamBestNotificationsEnabled"
+             AND g."dissolvedAt" IS NULL"#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| TeamBestTelegramRecipient {
+            group_id: r.group_id,
+            telegram_chat_id: r.chat_id,
+        })
+        .collect())
+}
+
+/// Every ntfy topic with the team-best switch on whose address is a member
+/// of a Team that is not dissolved.
+pub async fn find_team_best_ntfy_recipients(
+    pool: &PgPool,
+) -> Result<Vec<TeamBestNtfyRecipient>, DbError> {
+    let rows = sqlx::query!(
+        r#"SELECT m."groupId" AS "group_id!", s.address AS "address!: AddressId",
+                  s.language AS "language!"
+           FROM ntfy_subscriptions_entity s
+           JOIN pplns_group_member m ON m.address = s.address
+           JOIN pplns_group g ON g.id = m."groupId"
+           WHERE s."deletedAt" IS NULL
+             AND s."teamBestNotificationsEnabled"
+             AND g."dissolvedAt" IS NULL"#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| TeamBestNtfyRecipient {
+            group_id: r.group_id,
+            address: r.address,
+            language: r.language,
+        })
+        .collect())
 }

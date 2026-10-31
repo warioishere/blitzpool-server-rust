@@ -28,6 +28,7 @@ use crate::format::{
     Language,
 };
 use crate::template::{render_join_request_admin, JoinRequestAdminContext};
+use bp_group_solo_engine::reader::{CalendarReset, RoundReset};
 
 use super::device_gate::{DeviceAggregate, DeviceNotice, DevicePartial};
 
@@ -59,6 +60,17 @@ pub struct JoinRequestNotice {
     pub admin_address: AddressId,
     pub requester_address: AddressId,
     pub group_name: String,
+}
+
+/// A Team's round has a new best share.
+#[derive(Debug, Clone)]
+pub struct TeamBestNotice {
+    pub group_name: String,
+    pub difficulty: f64,
+    /// The address that submitted the share.
+    pub finder: String,
+    /// When the round starts over, so members know what "round" means.
+    pub reset: RoundReset,
 }
 
 /// A found block, for the notices it sends.
@@ -269,6 +281,39 @@ impl NotificationDispatcher {
         }
 
         join_all(tasks).await;
+    }
+
+    /// A Team's round has a new best: one notice to each chat and each ntfy
+    /// topic that follows it. Chats go one after another, as block notices
+    /// do, to stay under Telegram's send rate.
+    pub async fn notify_team_best(
+        &self,
+        notice: &TeamBestNotice,
+        telegram_chats: &[i64],
+        ntfy_topics: &[(AddressId, Language)],
+    ) {
+        if let Some(adapter) = &self.telegram {
+            for &chat_id in telegram_chats {
+                let lang = self.chat_languages.get(chat_id).await;
+                let text = team_best_text(lang, notice);
+                settle_telegram_push(
+                    &self.pool,
+                    chat_id,
+                    "telegram-team-best",
+                    adapter.send_html(chat_id, &text).await,
+                )
+                .await;
+            }
+        }
+        if let Some(adapter) = &self.ntfy {
+            for (address, lang) in ntfy_topics {
+                let text = team_best_text(*lang, notice);
+                log_adapter_send(
+                    "ntfy-team-best",
+                    adapter.publish(address.as_str(), &text).await,
+                );
+            }
+        }
     }
 
     /// Someone asked to join a Team. Every channel the admin follows the
@@ -655,6 +700,111 @@ fn block_found_text(
         (Language::En, None) => format!("Address: {short}"),
     };
     format!("{head}\n\n{detail}")
+}
+
+/// The team-best notice: the value, who found it, and when the Team's round
+/// starts over, so a member knows what it is measured against and whom to
+/// ask about it.
+fn team_best_text(lang: Language, notice: &TeamBestNotice) -> String {
+    let value = format_number_suffix(notice.difficulty);
+    let finder = html::addr(&short_address(&notice.finder));
+    let team = html::bold(&notice.group_name);
+    let icon = Some("\u{1f3c6}");
+    match lang {
+        Language::De => format!(
+            "{} · {team}\n{}\nVon: {finder}\n\n<i>{} Einstellen kann das der Team-Admin.</i>",
+            html::title(icon, "Neuer Bestwert der Team-Runde"),
+            html::row("Wert", &value),
+            round_reset_de(notice.reset),
+        ),
+        Language::En => format!(
+            "{} · {team}\n{}\nBy: {finder}\n\n<i>{} The Team's admin sets this.</i>",
+            html::title(icon, "New best of the Team round"),
+            html::row("Value", &value),
+            round_reset_en(notice.reset),
+        ),
+    }
+}
+
+fn round_reset_de(reset: RoundReset) -> String {
+    let calendar = |c: CalendarReset| match c {
+        CalendarReset::Daily => "jeden Tag".to_string(),
+        CalendarReset::Weekly => "jeden Montag".to_string(),
+        CalendarReset::Monthly => "am 1. jedes Monats".to_string(),
+        CalendarReset::EveryDays(n) => format!("alle {n} Tage"),
+    };
+    match reset {
+        RoundReset::Window {
+            best_on_block: true,
+        } => "Dieses Team zahlt nach gleitendem Fenster, sein Bestwert beginnt bei \
+              jedem Block des Teams neu."
+            .to_string(),
+        RoundReset::Window {
+            best_on_block: false,
+        } => "Dieses Team zahlt nach gleitendem Fenster, sein Bestwert wird nicht \
+              zurückgesetzt."
+            .to_string(),
+        RoundReset::Prop {
+            on_block: true,
+            calendar: Some(c),
+        } => format!(
+            "Die Runde beginnt bei jedem Block des Teams neu und zusätzlich {}.",
+            calendar(c)
+        ),
+        RoundReset::Prop {
+            on_block: true,
+            calendar: None,
+        } => "Die Runde beginnt bei jedem Block des Teams neu.".to_string(),
+        RoundReset::Prop {
+            on_block: false,
+            calendar: Some(c),
+        } => format!(
+            "Die Runde beginnt {} neu, nicht bei einem Block.",
+            calendar(c)
+        ),
+        RoundReset::Prop {
+            on_block: false,
+            calendar: None,
+        } => "Die Runde wird nicht automatisch zurückgesetzt.".to_string(),
+    }
+}
+
+fn round_reset_en(reset: RoundReset) -> String {
+    let calendar = |c: CalendarReset| match c {
+        CalendarReset::Daily => "every day".to_string(),
+        CalendarReset::Weekly => "every Monday".to_string(),
+        CalendarReset::Monthly => "on the 1st of each month".to_string(),
+        CalendarReset::EveryDays(n) => format!("every {n} days"),
+    };
+    match reset {
+        RoundReset::Window {
+            best_on_block: true,
+        } => "This Team pays by a sliding window; its best starts over at each of the \
+              Team's blocks."
+            .to_string(),
+        RoundReset::Window {
+            best_on_block: false,
+        } => "This Team pays by a sliding window; its best is not reset.".to_string(),
+        RoundReset::Prop {
+            on_block: true,
+            calendar: Some(c),
+        } => format!(
+            "The round starts over at each of the Team's blocks and also {}.",
+            calendar(c)
+        ),
+        RoundReset::Prop {
+            on_block: true,
+            calendar: None,
+        } => "The round starts over at each of the Team's blocks.".to_string(),
+        RoundReset::Prop {
+            on_block: false,
+            calendar: Some(c),
+        } => format!("The round starts over {}, not at a block.", calendar(c)),
+        RoundReset::Prop {
+            on_block: false,
+            calendar: None,
+        } => "The round is not reset automatically.".to_string(),
+    }
 }
 
 async fn send_telegram_best_diff(
@@ -1382,6 +1532,73 @@ mod tests {
         );
     }
 
+    /// The team-best notice is valid Telegram HTML for every reset rule,
+    /// shows the finder shortened, escapes the Team's name, and says when
+    /// the round starts over.
+    #[test]
+    fn a_team_best_notice_says_when_the_round_starts_over() {
+        let finder = "bc1qteambestfinderaddressxxxxxxxxxxxxxxx";
+        let notice = |reset| TeamBestNotice {
+            group_name: "Rig & <Co>".to_string(),
+            difficulty: 4_200_000_000.0,
+            finder: finder.to_string(),
+            reset,
+        };
+        let rules = [
+            RoundReset::Window {
+                best_on_block: false,
+            },
+            RoundReset::Window {
+                best_on_block: true,
+            },
+            RoundReset::Prop {
+                on_block: true,
+                calendar: Some(CalendarReset::Weekly),
+            },
+            RoundReset::Prop {
+                on_block: true,
+                calendar: None,
+            },
+            RoundReset::Prop {
+                on_block: false,
+                calendar: Some(CalendarReset::EveryDays(3)),
+            },
+            RoundReset::Prop {
+                on_block: false,
+                calendar: None,
+            },
+        ];
+        for rule in rules {
+            for lang in [Language::De, Language::En] {
+                let text = team_best_text(lang, &notice(rule));
+                assert!(html::is_valid_telegram_html(&text), "{text}");
+                let plain = html::to_plain(&text);
+                assert!(plain.contains("Rig & <Co>"), "{plain}");
+                assert!(plain.contains(&short_address(finder)), "{plain}");
+                assert!(!plain.contains(finder), "{plain}");
+            }
+        }
+        let de = html::to_plain(&team_best_text(Language::De, &notice(rules[2])));
+        assert!(de.contains("Wert: 4.2"), "{de}");
+        assert!(
+            de.contains("bei jedem Block des Teams neu und zusätzlich jeden Montag"),
+            "{de}"
+        );
+        assert!(de.contains("Team-Admin"), "{de}");
+        let en = html::to_plain(&team_best_text(Language::En, &notice(rules[4])));
+        assert!(
+            en.contains("The round starts over every 3 days, not at a block."),
+            "{en}"
+        );
+        let en = html::to_plain(&team_best_text(Language::En, &notice(rules[0])));
+        assert!(en.contains("sliding window; its best is not reset"), "{en}");
+        let de = html::to_plain(&team_best_text(Language::De, &notice(rules[1])));
+        assert!(
+            de.contains("Bestwert beginnt bei jedem Block des Teams neu"),
+            "{de}"
+        );
+    }
+
     #[test]
     fn a_block_notice_names_the_finder_and_the_amount_in_one_language() {
         let notice = BlockFoundNotice {
@@ -1596,6 +1813,7 @@ mod tests {
             hourly_workers_enabled: false,
             group_admin_notifications_enabled: group_admin,
             block_notifications_enabled: true,
+            team_best_notifications_enabled: true,
         }
     }
 
@@ -1612,6 +1830,7 @@ mod tests {
             hourly_stats_enabled: false,
             hourly_workers_enabled: false,
             group_admin_notifications_enabled: group_admin,
+            team_best_notifications_enabled: true,
         }
     }
 

@@ -13,8 +13,9 @@ use bp_db::{
     find_telegram_subscriptions_by_chat, promote_telegram_default_if_none,
     set_telegram_default_subscription, set_telegram_hourly_flags, update_ntfy_sub_best_diff_flag,
     update_ntfy_sub_device_flag, update_ntfy_sub_group_admin_flag, update_ntfy_sub_hourly_flags,
-    update_ntfy_sub_language, update_telegram_sub_best_diff_flag, update_telegram_sub_block_flag,
-    update_telegram_sub_device_flag, update_telegram_sub_group_admin_flag,
+    update_ntfy_sub_language, update_ntfy_sub_team_best_flag, update_telegram_sub_best_diff_flag,
+    update_telegram_sub_block_flag, update_telegram_sub_device_flag,
+    update_telegram_sub_group_admin_flag, update_telegram_sub_team_best_flag,
     upsert_ntfy_subscription, upsert_telegram_subscription, TelegramSubscriptionRow,
 };
 use sqlx::PgPool;
@@ -540,13 +541,13 @@ impl CommandHandler {
     }
 
     /// The `/settings` keyboard: per subscription a row naming the address
-    /// (⭐ on the default), then its switches with their state. The Team
-    /// request switch only where the address is a Team's admin: no other
-    /// address gets those notices.
+    /// (⭐ on the default), then its switches with their state. A Team
+    /// switch only where it can fire: join requests for a Team's admin, the
+    /// round best for a Team's member.
     fn build_settings_keyboard(
         subs: &[TelegramSubscriptionRow],
         lang: Language,
-        team_admins: &HashSet<AddressId>,
+        roles: &TeamRoles,
     ) -> (String, InlineKeyboard) {
         let mut sorted: Vec<&TelegramSubscriptionRow> = subs.iter().collect();
         sorted.sort_by_key(|s| s.id);
@@ -570,7 +571,7 @@ impl CommandHandler {
             };
             let fields: Vec<SettingsField> = SettingsField::ALL
                 .into_iter()
-                .filter(|f| *f != SettingsField::TeamRequests || team_admins.contains(&sub.address))
+                .filter(|f| roles.offers(*f, &sub.address))
                 .collect();
             for row in fields.chunks(3) {
                 keyboard.push(row.iter().map(|field| button(*field)).collect());
@@ -591,8 +592,8 @@ impl CommandHandler {
         (text, keyboard)
     }
 
-    /// Send the `/settings` keyboard (or a "no addresses" note). Opened by
-    /// `/team_requests` it first says so when no address admins a Team.
+    /// Send the `/settings` keyboard (or a "no addresses" note). Opened by a
+    /// Team switch it first says so when no address can get that notice.
     async fn send_settings(&self, chat_id: i64, lang: Language, switch: Option<Switch>) {
         let Some(adapter) = self.telegram.as_ref() else {
             return;
@@ -610,19 +611,19 @@ impl CommandHandler {
             return;
         }
         let addresses: Vec<AddressId> = subs.iter().map(|s| s.address.clone()).collect();
-        let team_admins = match self.team_admins(&addresses).await {
-            Ok(a) => a,
+        let roles = match self.team_roles(&addresses).await {
+            Ok(r) => r,
             Err(e) => {
-                warn!(target: "bp_notifications::command", error = %e, "settings: team admins");
+                warn!(target: "bp_notifications::command", error = %e, "settings: team roles");
                 let _ = adapter.send_html(chat_id, db_error_text(lang)).await;
                 return;
             }
         };
-        if switch == Some(Switch::TeamRequests) && team_admins.is_empty() {
-            let _ = adapter.send_html(chat_id, no_team_admin_text(lang)).await;
+        if let Some(refusal) = switch.and_then(|s| roles.refusal(s, lang)) {
+            let _ = adapter.send_html(chat_id, refusal).await;
             return;
         }
-        let (text, keyboard) = Self::build_settings_keyboard(&subs, lang, &team_admins);
+        let (text, keyboard) = Self::build_settings_keyboard(&subs, lang, &roles);
         if let Err(e) = adapter
             .send_message_with_keyboard(chat_id, &text, &keyboard)
             .await
@@ -681,8 +682,8 @@ impl CommandHandler {
             .await
             .unwrap_or_default();
         let addresses: Vec<AddressId> = fresh.iter().map(|s| s.address.clone()).collect();
-        let team_admins = self.team_admins(&addresses).await.unwrap_or_default();
-        let (text, keyboard) = Self::build_settings_keyboard(&fresh, lang, &team_admins);
+        let roles = self.team_roles(&addresses).await.unwrap_or_default();
+        let (text, keyboard) = Self::build_settings_keyboard(&fresh, lang, &roles);
         if let Err(e) = adapter
             .edit_message_text(chat_id, message_id, &text, Some(&keyboard))
             .await
@@ -698,15 +699,15 @@ impl CommandHandler {
         lang: Language,
         switch: Option<Switch>,
     ) -> String {
-        let is_admin = match self.team_admins(std::slice::from_ref(address)).await {
-            Ok(admins) => !admins.is_empty(),
+        let roles = match self.team_roles(std::slice::from_ref(address)).await {
+            Ok(r) => r,
             Err(e) => {
-                warn!(target: "bp_notifications::command", error = %e, "ntfy settings: team admin");
+                warn!(target: "bp_notifications::command", error = %e, "ntfy settings: team roles");
                 return db_error_text(lang).to_string();
             }
         };
-        if switch == Some(Switch::TeamRequests) && !is_admin {
-            return no_team_admin_text(lang).to_string();
+        if let Some(refusal) = switch.and_then(|s| roles.refusal(s, lang)) {
+            return refusal.to_string();
         }
         let row = match find_ntfy_subscription_by_address(&self.pool, address).await {
             Ok(Some(row)) => row,
@@ -723,12 +724,12 @@ impl CommandHandler {
         let mut out = match lang {
             Language::De => format!(
                 "{}\nSchalten mit /subscribe_bestdiff, /device_notifications, \
-                 /team_requests oder /send_hourly und on|off.\n",
+                 /team_requests, /team_bestdiff oder /send_hourly und on|off.\n",
                 html::title_for(None, "Benachrichtigungen", &short)
             ),
             Language::En => format!(
                 "{}\nSwitch with /subscribe_bestdiff, /device_notifications, \
-                 /team_requests or /send_hourly and on|off.\n",
+                 /team_requests, /team_bestdiff or /send_hourly and on|off.\n",
                 html::title_for(None, "Notifications", &short)
             ),
         };
@@ -740,10 +741,16 @@ impl CommandHandler {
             row.device_notifications_enabled,
             SettingsField::Device,
         ));
-        if is_admin {
+        if roles.offers(SettingsField::TeamRequests, address) {
             out.push_str(&line(
                 row.group_admin_notifications_enabled,
                 SettingsField::TeamRequests,
+            ));
+        }
+        if roles.offers(SettingsField::TeamBest, address) {
+            out.push_str(&line(
+                row.team_best_notifications_enabled,
+                SettingsField::TeamBest,
             ));
         }
         out.push_str(&line(row.hourly_stats_enabled, SettingsField::HourlyStats));
@@ -941,7 +948,7 @@ impl CommandHandler {
         toggle: FlagToggle,
     ) -> String {
         let value = toggle.as_bool();
-        if switch == Switch::TeamRequests {
+        if matches!(switch, Switch::TeamRequests | Switch::TeamBest) {
             let addresses = match transport {
                 Transport::Ntfy { address } => vec![address.clone()],
                 Transport::Telegram { chat_id } => {
@@ -954,13 +961,15 @@ impl CommandHandler {
                     }
                 }
             };
-            match self.team_admins(&addresses).await {
-                Ok(admins) if admins.is_empty() && !addresses.is_empty() => {
-                    return no_team_admin_text(lang).to_string();
+            match self.team_roles(&addresses).await {
+                Ok(roles) if !addresses.is_empty() => {
+                    if let Some(refusal) = roles.refusal(switch, lang) {
+                        return refusal.to_string();
+                    }
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    warn!(target: "bp_notifications::command", error = %e, "toggle: team admins");
+                    warn!(target: "bp_notifications::command", error = %e, "toggle: team roles");
                     return db_error_text(lang).to_string();
                 }
             }
@@ -980,6 +989,7 @@ impl CommandHandler {
                     Switch::BestDiff => &[SettingsField::BestDiff],
                     Switch::Device => &[SettingsField::Device],
                     Switch::TeamRequests => &[SettingsField::TeamRequests],
+                    Switch::TeamBest => &[SettingsField::TeamBest],
                     Switch::Hourly => &[SettingsField::HourlyStats, SettingsField::HourlyWorkers],
                 };
                 let mut total: u64 = 0;
@@ -1005,6 +1015,9 @@ impl CommandHandler {
                 Switch::Hourly => update_ntfy_sub_hourly_flags(&self.pool, address, value).await,
                 Switch::TeamRequests => {
                     update_ntfy_sub_group_admin_flag(&self.pool, address, value).await
+                }
+                Switch::TeamBest => {
+                    update_ntfy_sub_team_best_flag(&self.pool, address, value).await
                 }
             },
         };
@@ -1112,13 +1125,10 @@ impl CommandHandler {
         result.unwrap_or_else(|reply| reply)
     }
 
-    /// The given addresses that are the admin of a Team that is not
-    /// dissolved: who gets that Team's join requests.
-    async fn team_admins(
-        &self,
-        addresses: &[AddressId],
-    ) -> Result<HashSet<AddressId>, bp_db::DbError> {
-        let mut admins = HashSet::new();
+    /// Which of the given addresses are a member of a Team that is not
+    /// dissolved, and which of those are its admin.
+    async fn team_roles(&self, addresses: &[AddressId]) -> Result<TeamRoles, bp_db::DbError> {
+        let mut roles = TeamRoles::default();
         for address in addresses {
             let Some(member) = find_group_member_by_address(&self.pool, address).await? else {
                 continue;
@@ -1126,11 +1136,15 @@ impl CommandHandler {
             let Some(group) = find_group(&self.pool, member.group_id).await? else {
                 continue;
             };
-            if group.dissolved_at.is_none() && group.creator_address == *address {
-                admins.insert(address.clone());
+            if group.dissolved_at.is_some() {
+                continue;
+            }
+            roles.members.insert(address.clone());
+            if group.creator_address == *address {
+                roles.admins.insert(address.clone());
             }
         }
-        Ok(admins)
+        Ok(roles)
     }
 
     /// An address argument as typed, or opened when it came encrypted.
@@ -1185,6 +1199,43 @@ impl CommandHandler {
     }
 }
 
+/// The Team roles of a chat's addresses: who can get which Team notice.
+#[derive(Default)]
+struct TeamRoles {
+    /// Members of a Team that is not dissolved: its round best.
+    members: HashSet<AddressId>,
+    /// Admins among them: their Team's join requests.
+    admins: HashSet<AddressId>,
+}
+
+impl TeamRoles {
+    /// Whether `/settings` shows `field` for `address`.
+    fn offers(&self, field: SettingsField, address: &AddressId) -> bool {
+        match field {
+            SettingsField::TeamRequests => self.admins.contains(address),
+            SettingsField::TeamBest => self.members.contains(address),
+            SettingsField::Blocks
+            | SettingsField::BestDiff
+            | SettingsField::Device
+            | SettingsField::HourlyStats
+            | SettingsField::HourlyWorkers => true,
+        }
+    }
+
+    /// The reply to a Team switch that no address of the chat can use.
+    fn refusal(&self, switch: Switch, lang: Language) -> Option<&'static str> {
+        match switch {
+            Switch::TeamRequests if self.admins.is_empty() => Some(no_team_admin_text(lang)),
+            Switch::TeamBest if self.members.is_empty() => Some(no_team_member_text(lang)),
+            Switch::TeamRequests
+            | Switch::TeamBest
+            | Switch::BestDiff
+            | Switch::Device
+            | Switch::Hourly => None,
+        }
+    }
+}
+
 /// Write one switch of one Telegram subscription.
 async fn set_telegram_field(
     pool: &PgPool,
@@ -1207,6 +1258,9 @@ async fn set_telegram_field(
         SettingsField::TeamRequests => {
             update_telegram_sub_group_admin_flag(pool, chat_id, address, value).await
         }
+        SettingsField::TeamBest => {
+            update_telegram_sub_team_best_flag(pool, chat_id, address, value).await
+        }
         SettingsField::HourlyStats => {
             set_telegram_hourly_flags(pool, chat_id, address, value, sub.hourly_workers_enabled)
                 .await
@@ -1223,6 +1277,7 @@ fn settings_field_value(sub: &TelegramSubscriptionRow, field: SettingsField) -> 
         SettingsField::BestDiff => sub.best_diff_notifications_enabled,
         SettingsField::Device => sub.device_notifications_enabled,
         SettingsField::TeamRequests => sub.group_admin_notifications_enabled,
+        SettingsField::TeamBest => sub.team_best_notifications_enabled,
         SettingsField::HourlyStats => sub.hourly_stats_enabled,
         SettingsField::HourlyWorkers => sub.hourly_workers_enabled,
     }
@@ -1234,6 +1289,7 @@ fn set_settings_field_value(sub: &mut TelegramSubscriptionRow, field: SettingsFi
         SettingsField::BestDiff => &mut sub.best_diff_notifications_enabled,
         SettingsField::Device => &mut sub.device_notifications_enabled,
         SettingsField::TeamRequests => &mut sub.group_admin_notifications_enabled,
+        SettingsField::TeamBest => &mut sub.team_best_notifications_enabled,
         SettingsField::HourlyStats => &mut sub.hourly_stats_enabled,
         SettingsField::HourlyWorkers => &mut sub.hourly_workers_enabled,
     };
@@ -1246,12 +1302,14 @@ fn settings_field_label(lang: Language, field: SettingsField) -> &'static str {
         (Language::De, SettingsField::BestDiff) => "Best-Diff",
         (Language::De, SettingsField::Device) => "Geräte",
         (Language::De, SettingsField::TeamRequests) => "Team-Anfragen",
+        (Language::De, SettingsField::TeamBest) => "Team-Best",
         (Language::De, SettingsField::HourlyStats) => "Stats stündl.",
         (Language::De, SettingsField::HourlyWorkers) => "Worker stündl.",
         (Language::En, SettingsField::Blocks) => "Blocks",
         (Language::En, SettingsField::BestDiff) => "Best diff",
         (Language::En, SettingsField::Device) => "Devices",
         (Language::En, SettingsField::TeamRequests) => "Team requests",
+        (Language::En, SettingsField::TeamBest) => "Team best",
         (Language::En, SettingsField::HourlyStats) => "Hourly stats",
         (Language::En, SettingsField::HourlyWorkers) => "Hourly workers",
     }
@@ -1375,6 +1433,19 @@ fn no_team_admin_text(lang: Language) -> &'static str {
     }
 }
 
+fn no_team_member_text(lang: Language) -> &'static str {
+    match lang {
+        Language::De => {
+            "Keine deiner Adressen ist in einem Team. Den Bestwert der Team-Runde \
+             meldet der Bot den Mitgliedern des Teams."
+        }
+        Language::En => {
+            "None of your addresses is in a Team. The bot reports the best of a \
+             Team's round to the Team's members."
+        }
+    }
+}
+
 /// Several subscriptions and none of them the default.
 fn no_default_text(lang: Language) -> &'static str {
     match lang {
@@ -1482,6 +1553,12 @@ fn flag_toggle_ok_text(lang: Language, flag: Switch, value: bool) -> String {
         (Language::De, Switch::TeamRequests, false) => {
             "Benachrichtigungen über Team-Beitrittsanfragen deaktiviert.".into()
         }
+        (Language::De, Switch::TeamBest, true) => {
+            "Benachrichtigungen über den Bestwert der Team-Runde aktiviert.".into()
+        }
+        (Language::De, Switch::TeamBest, false) => {
+            "Benachrichtigungen über den Bestwert der Team-Runde deaktiviert.".into()
+        }
         (Language::En, Switch::BestDiff, true) => "Best-difficulty notifications enabled.".into(),
         (Language::En, Switch::BestDiff, false) => "Best-difficulty notifications disabled.".into(),
         (Language::En, Switch::Device, true) => "Device notifications enabled.".into(),
@@ -1493,6 +1570,12 @@ fn flag_toggle_ok_text(lang: Language, flag: Switch, value: bool) -> String {
         }
         (Language::En, Switch::TeamRequests, false) => {
             "Team join-request notifications disabled.".into()
+        }
+        (Language::En, Switch::TeamBest, true) => {
+            "Notifications of the Team round's best enabled.".into()
+        }
+        (Language::En, Switch::TeamBest, false) => {
+            "Notifications of the Team round's best disabled.".into()
         }
     }
 }
@@ -1582,14 +1665,16 @@ mod tests {
                 language_switch_ok_text(lang).to_string(),
                 engine_unconfigured_text(lang, "PPLNS"),
                 CommandHandler::build_address_keyboard(&subs, lang).0,
-                CommandHandler::build_settings_keyboard(&subs, lang, &HashSet::new()).0,
+                CommandHandler::build_settings_keyboard(&subs, lang, &TeamRoles::default()).0,
                 no_team_admin_text(lang).to_string(),
+                no_team_member_text(lang).to_string(),
                 super::super::help_text(lang),
             ];
             for switch in [
                 Switch::BestDiff,
                 Switch::Device,
                 Switch::TeamRequests,
+                Switch::TeamBest,
                 Switch::Hourly,
             ] {
                 for value in [true, false] {
@@ -1647,6 +1732,7 @@ mod tests {
             hourly_workers_enabled: false,
             group_admin_notifications_enabled: false,
             block_notifications_enabled: false,
+            team_best_notifications_enabled: false,
         }
     }
 
@@ -1674,27 +1760,31 @@ mod tests {
         let mut first = sub_row(2, "bc1qsecondaddressxxxxxx", false);
         first.hourly_workers_enabled = true;
         let subs = vec![first, sub_row(1, "bc1qfirstaddressxxxxxxx", true)];
-        // Only the second address admins a Team.
-        let admins = HashSet::from([AddressId::new("bc1qsecondaddressxxxxxx").unwrap()]);
-        let (_text, kb) = CommandHandler::build_settings_keyboard(&subs, Language::En, &admins);
-        // Per address: the address row and two switch rows, ordered by id.
-        assert_eq!(kb.len(), 6);
+        // Only the second address is in a Team, as its admin.
+        let second = AddressId::new("bc1qsecondaddressxxxxxx").unwrap();
+        let roles = TeamRoles {
+            members: HashSet::from([second.clone()]),
+            admins: HashSet::from([second]),
+        };
+        let (_text, kb) = CommandHandler::build_settings_keyboard(&subs, Language::En, &roles);
+        // Per address: the address row and its switches, three a row,
+        // ordered by id.
+        assert_eq!(kb.len(), 7);
         assert!(kb[0][0].text.starts_with("⭐ "));
         assert_eq!(kb[0][0].callback_data, "st:1");
-        // No Team request switch for the address that admins no Team.
+        // No Team switch for the address in no Team.
         let first_switches: Vec<&str> = kb[1]
             .iter()
             .chain(kb[2].iter())
             .map(|b| b.callback_data.as_str())
             .collect();
-        assert_eq!(first_switches.len(), SettingsField::ALL.len() - 1);
-        assert!(!first_switches.contains(
-            &SettingsCallback::Flip(1, SettingsField::TeamRequests)
-                .data()
-                .as_str()
-        ));
-        let switches: Vec<&InlineButton> = kb[4].iter().chain(kb[5].iter()).collect();
-        assert_eq!((kb[4].len(), kb[5].len()), (3, 3));
+        assert_eq!(first_switches.len(), SettingsField::ALL.len() - 2);
+        for field in [SettingsField::TeamRequests, SettingsField::TeamBest] {
+            assert!(!first_switches.contains(&SettingsCallback::Flip(1, field).data().as_str()));
+        }
+        assert_eq!(kb[3][0].callback_data, "st:2");
+        let switches: Vec<&InlineButton> = kb[4].iter().chain(&kb[5]).chain(&kb[6]).collect();
+        assert_eq!((kb[4].len(), kb[5].len(), kb[6].len()), (3, 3, 1));
         assert_eq!(switches.len(), SettingsField::ALL.len());
         for (button, field) in switches.iter().zip(SettingsField::ALL) {
             assert_eq!(
@@ -1751,14 +1841,17 @@ mod tests {
 
     /// Only a Team's creator, while the Team is not dissolved, admins it:
     /// `/team_requests` tells everyone else, and switches nothing for them.
+    /// `/team_bestdiff` is for every member, and refused to an address in
+    /// no Team.
     #[tokio::test]
-    async fn team_requests_are_for_the_team_admin_only() {
+    async fn team_switches_follow_the_team_role() {
         let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
             return;
         };
-        let (admin, member) = (
+        let (admin, member, outsider) = (
             AddressId::new("bc1qteamrequestadmin").unwrap(),
             AddressId::new("bc1qteamrequestmember").unwrap(),
+            AddressId::new("bc1qteamrequestoutsider").unwrap(),
         );
         // A run that stopped before its cleanup leaves its Team behind.
         sqlx::query("DELETE FROM pplns_group_member WHERE address = ANY($1)")
@@ -1770,6 +1863,18 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        // Fresh topics: a soft-deleted row from an earlier run would come
+        // back with its old switches.
+        let everyone = [admin.clone(), member.clone(), outsider.clone()];
+        let delete_topics = || {
+            sqlx::query("DELETE FROM ntfy_subscriptions_entity WHERE address = ANY($1)")
+                .bind(everyone.iter().map(AddressId::as_str).collect::<Vec<_>>())
+                .execute(&pool)
+        };
+        delete_topics().await.unwrap();
+        for address in &everyone {
+            upsert_ntfy_subscription(&pool, address).await.unwrap();
+        }
         let group_id = uuid::Uuid::new_v4();
         let now = chrono::Utc::now().timestamp_millis();
         bp_db::insert_pplns_group(
@@ -1792,17 +1897,81 @@ mod tests {
         }
         let handler = CommandHandler::new(pool.clone(), Network::Bitcoin, None, None);
         let refused = no_team_admin_text(Language::En).to_string();
+        let not_member = no_team_member_text(Language::En).to_string();
         let on = |address: &AddressId| Transport::Ntfy {
             address: address.clone(),
         };
 
+        let roles = handler
+            .team_roles(&[admin.clone(), member.clone(), outsider.clone()])
+            .await
+            .unwrap();
+        assert_eq!(roles.admins, HashSet::from([admin.clone()]));
+        assert_eq!(
+            roles.members,
+            HashSet::from([admin.clone(), member.clone()])
+        );
+        assert!(roles.offers(SettingsField::TeamBest, &member));
+        assert!(!roles.offers(SettingsField::TeamRequests, &member));
+        assert!(!roles.offers(SettingsField::TeamBest, &outsider));
         assert_eq!(
             handler
-                .team_admins(&[admin.clone(), member.clone()])
-                .await
-                .unwrap(),
-            HashSet::from([admin.clone()])
+                .ntfy_settings_text(&outsider, Language::En, Some(Switch::TeamBest))
+                .await,
+            not_member
         );
+        assert_eq!(
+            handler
+                .handle_flag_toggle(
+                    &on(&outsider),
+                    Language::En,
+                    Switch::TeamBest,
+                    FlagToggle::On
+                )
+                .await,
+            not_member
+        );
+        // Each address sees the Team switches its role gives it.
+        let label = |field| settings_field_label(Language::En, field);
+        for (address, requests, best) in [
+            (&admin, true, true),
+            (&member, false, true),
+            (&outsider, false, false),
+        ] {
+            let text = handler
+                .ntfy_settings_text(address, Language::En, None)
+                .await;
+            assert_eq!(
+                text.contains(label(SettingsField::TeamRequests)),
+                requests,
+                "{text}"
+            );
+            assert_eq!(
+                text.contains(label(SettingsField::TeamBest)),
+                best,
+                "{text}"
+            );
+        }
+        let team_best = || async {
+            find_ntfy_subscription_by_address(&pool, &member)
+                .await
+                .unwrap()
+                .unwrap()
+                .team_best_notifications_enabled
+        };
+        assert!(team_best().await, "on before the switch");
+        assert_eq!(
+            handler
+                .handle_flag_toggle(
+                    &on(&member),
+                    Language::En,
+                    Switch::TeamBest,
+                    FlagToggle::Off
+                )
+                .await,
+            flag_toggle_ok_text(Language::En, Switch::TeamBest, false)
+        );
+        assert!(!team_best().await);
         assert_eq!(
             handler
                 .handle_flag_toggle(
@@ -1830,11 +1999,11 @@ mod tests {
         bp_db::update_pplns_group_dissolved(&pool, group_id, now)
             .await
             .unwrap();
-        assert!(handler
-            .team_admins(std::slice::from_ref(&admin))
+        let roles = handler
+            .team_roles(std::slice::from_ref(&admin))
             .await
-            .unwrap()
-            .is_empty());
+            .unwrap();
+        assert!(roles.admins.is_empty() && roles.members.is_empty());
 
         bp_db::delete_pplns_group_members_for_group(&pool, group_id)
             .await
@@ -1844,6 +2013,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        delete_topics().await.unwrap();
     }
 
     /// An address sent encrypted is subscribed once the key opens it;

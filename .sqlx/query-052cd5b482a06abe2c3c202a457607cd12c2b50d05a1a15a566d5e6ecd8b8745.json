@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            language AS \"language!\",\n            \"bestDiffNotificationsEnabled\" AS \"best_diff_notifications_enabled!\",\n            \"deviceNotificationsEnabled\" AS \"device_notifications_enabled!\",\n            \"hourlyStatsEnabled\" AS \"hourly_stats_enabled!\",\n            \"hourlyWorkersEnabled\" AS \"hourly_workers_enabled!\",\n            \"groupAdminNotificationsEnabled\" AS \"group_admin_notifications_enabled!\"\n           FROM ntfy_subscriptions_entity\n           WHERE address = $1 AND \"deletedAt\" IS NULL\n           LIMIT 1",
+  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            language AS \"language!\",\n            \"bestDiffNotificationsEnabled\" AS \"best_diff_notifications_enabled!\",\n            \"deviceNotificationsEnabled\" AS \"device_notifications_enabled!\",\n            \"hourlyStatsEnabled\" AS \"hourly_stats_enabled!\",\n            \"hourlyWorkersEnabled\" AS \"hourly_workers_enabled!\",\n            \"groupAdminNotificationsEnabled\" AS \"group_admin_notifications_enabled!\",\n            \"teamBestNotificationsEnabled\" AS \"team_best_notifications_enabled!\"\n           FROM ntfy_subscriptions_entity\n           WHERE address = $1 AND \"deletedAt\" IS NULL\n           LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -57,6 +57,11 @@
         "ordinal": 10,
         "name": "group_admin_notifications_enabled!",
         "type_info": "Bool"
+      },
+      {
+        "ordinal": 11,
+        "name": "team_best_notifications_enabled!",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -75,8 +80,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "13803b845bc79f91e158ffa1cab358b9c9c4ede2c0c913a4a9da0788758b003f"
+  "hash": "052cd5b482a06abe2c3c202a457607cd12c2b50d05a1a15a566d5e6ecd8b8745"
 }
