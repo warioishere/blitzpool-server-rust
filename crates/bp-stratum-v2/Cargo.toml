@@ -47,9 +47,6 @@ stratum-apps = { workspace = true }
 # block reconstruction. Shared crate with bp-mining-job.
 bitcoin = { workspace = true }
 
-# SipHash-2-4 for SHORT_TX_ID hashing (matches TS sv2-siphash.ts).
-siphasher = { workspace = true }
-
 # Async runtime + utilities.
 tokio = { workspace = true }
 tokio-util = { workspace = true }

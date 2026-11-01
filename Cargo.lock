@@ -1169,7 +1169,6 @@ dependencies = [
  "hex",
  "proptest",
  "serde_json",
- "siphasher",
  "smallvec",
  "stratum-apps",
  "stratum-core",

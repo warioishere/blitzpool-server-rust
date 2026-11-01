@@ -105,7 +105,7 @@ PPLNS, Team Mining and Blockparty **park** a found block in Redis keyed by block
 ## Stratum support
 
 - **Stratum V1** — full SV1 stack with vardiff, `mining.notify` (ckpool-convention hex-padded fields), per-port difficulty.
-- **Stratum V2** — Noise handshake, standard + extended channels (extranonce rolling, merkle reconstruction, pool-side share validation), Template Distribution Protocol, Job Declaration Protocol with the non-custodial payouts extension (0x0003), which hands a miner that builds its own template the payout distribution its coinbase must pay, SipHash-2-4. SV1 and SV2 share the same TCP ports; the opening bytes of a connection decide its protocol.
+- **Stratum V2** — Noise handshake, standard + extended channels (extranonce rolling, merkle reconstruction, pool-side share validation), Template Distribution Protocol, Job Declaration Protocol with the non-custodial payouts extension (0x0003), which hands a miner that builds its own template the payout distribution its coinbase must pay. SV1 and SV2 share the same TCP ports; the opening bytes of a connection decide its protocol.
 
 ### Endpoints (operator-configured per-port TOML)
 

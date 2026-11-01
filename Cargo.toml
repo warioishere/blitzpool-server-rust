@@ -132,7 +132,6 @@ tower-http = { version = "0.7", features = ["cors", "trace", "compression-br", "
 
 # Bitcoin
 bitcoin = "0.32"
-secp256k1 = "0.29"
 # Base58Check round-trip for SV2 authority-key conversion in
 # `bin/blitzpool/src/stratum_v2.rs` (config holds the key as hex;
 # stratum-apps's `Secp256k1SecretKey::FromStr` only parses base58check).
@@ -196,11 +195,6 @@ stratum-apps = { git = "https://github.com/stratum-mining/sv2-apps.git", tag = "
 # Lösung über den JDP-IPC zu propagieren (§6.4.9 MUST). Reines `[lib]`-Crate,
 # selber tag damit Cargo einen Graph baut.
 jd_server_sv2 = { git = "https://github.com/stratum-mining/sv2-apps.git", tag = "v0.8.0" }
-# SipHash-2-4 als pure-math-Lib für SHORT_TX_ID-Hashing
-# (TS portiert eigene Impl in sv2-siphash.ts; in Rust nehmen wir
-# `siphasher` — die aktuell gepflegte Standard-Crate, MIT/Apache).
-# `siphash` (singular) ist seit Jahren stagnant bei 0.0.5.
-siphasher = "1"
 # async-channel: vom obigen Crate genutzte channel-Lib für die TDP-IO-Boundary.
 # Wir matchen die exakte Version damit Sender/Receiver kompatibel sind.
 async-channel = "1.5"

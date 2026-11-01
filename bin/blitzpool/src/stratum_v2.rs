@@ -91,7 +91,7 @@ fn noise_config_from_hex(hex_str: &str) -> Result<NoiseConfig, StratumV2SpawnErr
     let raw_bytes =
         hex::decode(hex_str).map_err(|e| StratumV2SpawnError::PrivkeyHex(e.to_string()))?;
     // Round-trip via base58check, the form `Secp256k1SecretKey::FromStr`
-    // parses: stratum-apps pins `secp256k1` 0.28 and the workspace 0.29,
+    // parses: stratum-apps pins `secp256k1` 0.28 and rust-bitcoin 0.32 uses 0.29,
     // so raw key types do not cross the version boundary.
     let b58 = bs58::encode(&raw_bytes).with_check().into_string();
     let authority_prv: Secp256k1SecretKey =
