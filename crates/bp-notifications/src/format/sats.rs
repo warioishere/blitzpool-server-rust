@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use super::{html, Language};
+
 /// Sats with en-US thousand separators ("12,345").
 pub fn format_sats(sats: i64) -> String {
     let abs = sats.unsigned_abs();
@@ -18,6 +20,18 @@ pub fn format_sats(sats: i64) -> String {
         format!("-{joined}")
     } else {
         joined
+    }
+}
+
+/// What a block paid its members: `<sats> an <n> Mitglieder`, the amount
+/// in bold.
+pub fn paid_members(lang: Language, sats: i64, members: usize) -> String {
+    let amount = html::bold(&format!("{} sats", format_sats(sats)));
+    match (lang, members) {
+        (Language::De, 1) => format!("{amount} an 1 Mitglied"),
+        (Language::De, n) => format!("{amount} an {n} Mitglieder"),
+        (Language::En, 1) => format!("{amount} to 1 member"),
+        (Language::En, n) => format!("{amount} to {n} members"),
     }
 }
 

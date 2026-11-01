@@ -25,7 +25,7 @@ use crate::adapter::{
 };
 use crate::format::html;
 use crate::format::{
-    format_device_time, format_number_suffix, format_sats, DeviceAggregateArgs,
+    format_device_time, format_number_suffix, format_sats, paid_members, DeviceAggregateArgs,
     DeviceAggregateText, DevicePartialArgs, DevicePartialText, DeviceStatusArgs, DeviceStatusText,
     Language,
 };
@@ -703,8 +703,9 @@ async fn send_telegram_block_found(
 }
 
 /// The block notice for one recipient: who found it, and what the coinbase
-/// pays this address. A group chat reads only that its Team or Blockparty
-/// found a block, without the address it follows or its pay.
+/// pays this address. A group chat reads the block instead: for a Team or
+/// Blockparty what the coinbase pays its members, for Solo and PPLNS only
+/// that it was found.
 fn block_found_text(
     lang: Language,
     notice: &BlockFoundNotice,
@@ -720,12 +721,21 @@ fn block_found_text(
         MiningMode::Blockparty => "Blockparty",
     };
     if group_chat {
-        return match lang {
+        let head = match lang {
             Language::De => html::title(
                 Some("\u{1f389}"),
                 &format!("{mode}-Block {height} gefunden"),
             ),
             Language::En => html::title(Some("\u{1f389}"), &format!("{mode} block {height} found")),
+        };
+        return match notice.mode {
+            MiningMode::GroupSolo | MiningMode::Blockparty if !notice.paid.is_empty() => {
+                format!("{head}\n\n{}", member_payouts_text(lang, &notice.paid))
+            }
+            MiningMode::GroupSolo
+            | MiningMode::Blockparty
+            | MiningMode::Solo
+            | MiningMode::Pplns => head,
         };
     }
     let head = match (lang, recipient.is_finder) {
@@ -865,6 +875,45 @@ fn round_reset_en(reset: RoundReset) -> String {
             calendar: None,
         } => "The round is not reset automatically.".to_string(),
     }
+}
+
+/// Most members a group's block notice lists one by one.
+const LISTED_PAYOUTS: usize = 15;
+
+/// What a Team or Blockparty block's coinbase pays its members, largest
+/// first, each address shortened.
+fn member_payouts_text(lang: Language, paid: &[(AddressId, u64)]) -> String {
+    let mut by_address: Vec<(&AddressId, u64)> = Vec::new();
+    for (address, sats) in paid {
+        match by_address.iter_mut().find(|(a, _)| *a == address) {
+            Some(entry) => entry.1 = entry.1.saturating_add(*sats),
+            None => by_address.push((address, *sats)),
+        }
+    }
+    by_address.sort_by_key(|(_, sats)| std::cmp::Reverse(*sats));
+    let total: u64 = by_address.iter().map(|(_, sats)| *sats).sum();
+    let summary = paid_members(lang, total as i64, by_address.len());
+    let mut lines = vec![match lang {
+        Language::De => {
+            format!("Die Coinbase zahlt {summary}, sofern der Block in der Chain bleibt:")
+        }
+        Language::En => format!("The coinbase pays {summary} if the block stays in the chain:"),
+    }];
+    for (address, sats) in by_address.iter().take(LISTED_PAYOUTS) {
+        lines.push(format!(
+            "{} {}",
+            html::addr(&short_address(address.as_str())),
+            html::bold(&format!("{} sats", format_sats(*sats as i64)))
+        ));
+    }
+    let rest = by_address.len().saturating_sub(LISTED_PAYOUTS);
+    if rest > 0 {
+        lines.push(match lang {
+            Language::De => format!("… und {rest} weitere"),
+            Language::En => format!("… and {rest} more"),
+        });
+    }
+    lines.join("\n")
 }
 
 async fn send_telegram_best_diff(
@@ -1836,14 +1885,43 @@ mod tests {
         let en = html::to_plain(&block_found_text(Language::En, &notice, &finder, false));
         assert!(en.contains("Block 973944 found · by your miner"), "{en}");
         assert_eq!(en.matches("973944").count(), 1, "{en}");
-        // A group chat reads the block, not the address it follows or its pay.
-        for (recipient, lang, expected) in [
-            (&finder, Language::De, "🎉 Team-Block 973944 gefunden"),
-            (&member, Language::En, "🎉 Team block 973944 found"),
-        ] {
-            let text = html::to_plain(&block_found_text(lang, &notice, recipient, true));
-            assert_eq!(text, expected);
+        // A group chat reads what the Team block pays its members, the same
+        // for whichever member it follows.
+        for recipient in [&finder, &member] {
+            let text = block_found_text(Language::De, &notice, recipient, true);
+            assert!(html::is_valid_telegram_html(&text), "{text}");
+            assert_eq!(
+                html::to_plain(&text),
+                "🎉 Team-Block 973944 gefunden\n\nDie Coinbase zahlt 1,234,567 sats an 1 \
+                 Mitglied, sofern der Block in der Chain bleibt:\nbc1q...xxxxx 1,234,567 sats"
+            );
         }
+        // A PPLNS block names no payees in a group.
+        let pplns = BlockFoundNotice {
+            mode: MiningMode::Pplns,
+            ..notice.clone()
+        };
+        assert_eq!(
+            html::to_plain(&block_found_text(Language::En, &pplns, &member, true)),
+            "🎉 PPLNS block 973944 found"
+        );
+        // A long list ends in a count of the rest, largest payouts first.
+        let many: Vec<(AddressId, u64)> = (0..20u64)
+            .map(|i| {
+                (
+                    addr(&format!("bc1qmember{i:02}xxxxxxxxxxxxxxxx")),
+                    1_000 + i,
+                )
+            })
+            .collect();
+        let text = html::to_plain(&member_payouts_text(Language::En, &many));
+        assert_eq!(text.lines().count(), 1 + LISTED_PAYOUTS + 1, "{text}");
+        assert!(text.contains("to 20 members"), "{text}");
+        assert!(text.ends_with("… and 5 more"), "{text}");
+        assert!(
+            text.lines().nth(1).unwrap().ends_with("1,019 sats"),
+            "{text}"
+        );
     }
 
     /// Push routing matches the stored lowercase `subscriptionType` in any casing.

@@ -15,4 +15,4 @@ pub use device_status::{
 };
 pub use language::Language;
 pub use number_suffix::format_number_suffix;
-pub use sats::format_sats;
+pub use sats::{format_sats, paid_members};

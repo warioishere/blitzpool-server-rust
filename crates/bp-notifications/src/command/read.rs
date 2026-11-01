@@ -29,7 +29,7 @@ use sqlx::PgPool;
 use tracing::warn;
 
 use crate::format::html::{addr, bold, esc, row, title, title_for};
-use crate::format::{format_number_suffix, format_sats, Language};
+use crate::format::{format_number_suffix, format_sats, paid_members, Language};
 
 const MEMPOOL_CURRENT_DIFF: &str = "https://mempool.space/api/v1/mining/hashrate/3d";
 const MEMPOOL_NEXT_ADJUST: &str = "https://mempool.space/api/v1/difficulty-adjustment";
@@ -388,17 +388,6 @@ fn block_line(lang: Language, height: i32, at_ms: i64, tail: &str) -> String {
         bold(&height.to_string()),
         esc(&when)
     )
-}
-
-/// What a block paid its members: `<sats> an <n> Mitglieder`.
-fn paid_members(lang: Language, sats: i64, members: usize) -> String {
-    let amount = bold(&format!("{} sats", format_sats(sats)));
-    match (lang, members) {
-        (Language::De, 1) => format!("{amount} an 1 Mitglied"),
-        (Language::De, n) => format!("{amount} an {n} Mitglieder"),
-        (Language::En, 1) => format!("{amount} to 1 member"),
-        (Language::En, n) => format!("{amount} to {n} members"),
-    }
 }
 
 /// The Team's recent blocks, each with what its coinbase paid the members
