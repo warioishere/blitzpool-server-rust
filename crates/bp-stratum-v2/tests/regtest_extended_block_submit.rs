@@ -309,7 +309,7 @@ async fn run_block_submit_case(miner_extranonce_size: u8, rolled_version_bits: u
     };
     assert!(
         !warning_text.to_lowercase().contains("unknown"),
-        "bitcoin-core v31 raised an unknown-rules/version warning after a \
+        "bitcoin-core raised an unknown-rules/version warning after a \
          block rolling 0x{rolled_version_bits:08x}: {warning_text:?}"
     );
 

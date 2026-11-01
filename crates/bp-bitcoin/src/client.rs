@@ -103,36 +103,6 @@ impl BitcoinRpc {
         .await
     }
 
-    /// `submitblock`: `None` when accepted, `Some(reason)` when rejected.
-    /// The only non-TDP submission path, for JDP PushSolution: JDP-declared
-    /// templates have no pool-side `template_id`, so
-    /// `TdpHandle::submit_solution` cannot be used.
-    pub async fn submit_block(&self, block_hex: String) -> Result<Option<String>, RpcError> {
-        let raw: serde_json::Value = self
-            .call_raw("submitblock", serde_json::json!([block_hex]))
-            .await?;
-        match raw {
-            serde_json::Value::Null => Ok(None),
-            serde_json::Value::String(reason) => Ok(Some(reason)),
-            other => Err(RpcError::BitcoinCore(RpcErrorDetail {
-                code: 0,
-                message: format!("unexpected submitblock result shape: {other}"),
-            })),
-        }
-    }
-
-    /// Like [`Self::call`], but a `null` result is a success: `submitblock`
-    /// answers "accepted" with `{"result": null}`, which `call` rejects as
-    /// "neither result nor error".
-    async fn call_raw(
-        &self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value, RpcError> {
-        let (envelope, _) = self.exchange(method, params).await?;
-        Ok(envelope.result.unwrap_or(serde_json::Value::Null))
-    }
-
     /// Generic RPC entry point for methods without a typed helper.
     pub async fn call<T: DeserializeOwned>(
         &self,

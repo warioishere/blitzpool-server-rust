@@ -28,11 +28,11 @@ use crate::extensions::{
     parse_distribution_id_tlv, SetPayoutDistribution, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
 };
 use crate::jdp::client::{
-    completion_refused, declare_refused_by_session, handle_allocate_token,
+    completion_refused, declaration_refusal, declare_refused_by_session, handle_allocate_token,
     handle_declare_mining_job, handle_provide_missing_transactions_success, handle_push_solution,
     handle_request_extensions, handle_setup_connection, parse_user_identifier_as_address,
     AllocateTokenContext, DeclarationContext, DeclarationRef, JdpHandlerOutcome, JdpOutboundFrame,
-    JdpSessionEvent, JdpSessionState, SolutionHeader,
+    JdpSessionEvent, JdpSessionState, PushSolutionInput,
 };
 use crate::jdp::dynamic_outputs::CandidateBacking;
 use crate::jdp::tx_validation::DeclaredTxs;
@@ -135,25 +135,31 @@ pub trait PayoutDistributionSource: Send + Sync {
     async fn next_distribution_id(&self) -> Option<u64>;
 }
 
-/// Block-submission sink for `PushSolution` candidates.
+/// Books the block a `PushSolution` solved on a declaration.
 #[async_trait]
-pub trait JdpBlockSubmissionSink: Send + Sync {
-    async fn submit_block_candidate(
+pub trait JdpFoundBlockSink: Send + Sync {
+    async fn book_found_block(
         &self,
         miner_address: AddressId,
         declaration: DeclarationRef,
         backing: CandidateBacking,
-        coinbase_raw: Vec<u8>,
-        transactions: Vec<Vec<u8>>,
-        header: SolutionHeader,
+        coinbase: bitcoin::Transaction,
+        header: bitcoin::block::Header,
     );
 }
 
-/// Hands a declared job to a Bitcoin node for a verdict (SV2 JDP/Job
-/// Declarator Server). `None` in [`JdpServerHooks::job_validator`] trusts the JDC.
+/// Hands a declared job to a Bitcoin node for a verdict, and a solution on it
+/// to the node for propagation (SV2 JDP/Job Declarator Server). `None` in
+/// [`JdpServerHooks::job_validator`] trusts the JDC and leaves propagation to it.
 #[async_trait]
 pub trait DeclaredJobValidator: Send + Sync {
     async fn validate_declaration(&self, job: DeclaredJobToValidate<'_>) -> JobVerdict;
+
+    /// Propagate a `PushSolution` through the node (SV2 JDP/PushSolution: the
+    /// JDS MUST propagate it). The block is rebuilt from the session's most
+    /// recent accepted declaration; a solution that does not rebuild into a
+    /// block meeting the target is left to the JDC.
+    async fn propagate_solution(&self, session_id: u32, solution: &PushSolutionInput);
 
     /// Drop whatever the validator keeps for this session.
     fn session_closed(&self, session_id: u32);
@@ -163,14 +169,17 @@ pub trait DeclaredJobValidator: Send + Sync {
 pub struct DeclaredJobToValidate<'a> {
     /// The validator keeps per-session state; must be the declaring connection.
     pub session_id: u32,
+    /// The declaration's `request_id`, the same on every ask about it, so the
+    /// node pairs an ask that supplies transactions with the one before it.
+    pub request_id: u32,
     pub version: u32,
     pub coinbase_tx_prefix: &'a [u8],
     pub coinbase_tx_suffix: &'a [u8],
     /// Declaration order, wire byte order.
     pub wtxid_list: &'a [[u8; 32]],
-    /// Raw txs the pool can supply; the node reports what it still misses.
-    pub known_raw_txs: &'a [&'a [u8]],
-    pub leg: DeclarationLeg,
+    /// `None`: the node judges with the transactions it holds. `Some`: every
+    /// declared transaction, in declaration order.
+    pub supplied_txs: Option<&'a [&'a [u8]]>,
 }
 
 #[derive(Debug)]
@@ -178,8 +187,7 @@ pub enum JobVerdict {
     Accepted,
     /// Carries the SV2 error code for `DeclareMiningJob.Error`.
     Rejected(String),
-    /// Not a rejection on the declare leg (`ProvideMissingTransactions` fetches
-    /// them); `missing-txs` on the second leg.
+    /// The node lacks transactions it was not supplied.
     NeedsTransactions,
 }
 
@@ -188,7 +196,7 @@ pub struct JdpServerHooks {
     pub allocate_resolver: Arc<dyn JdpAllocateResolver>,
     pub template_tx_provider: Arc<dyn TemplateTxProvider>,
     pub chain_tip: Arc<dyn ChainTipProvider>,
-    pub block_submission_sink: Arc<dyn JdpBlockSubmissionSink>,
+    pub found_block_sink: Arc<dyn JdpFoundBlockSink>,
     pub distribution_source: Arc<dyn PayoutDistributionSource>,
     /// `None` → every declaration is accepted on the JDC's word.
     pub job_validator: Option<Arc<dyn DeclaredJobValidator>>,
@@ -201,7 +209,7 @@ impl JdpServerHooks {
             allocate_resolver: n.clone(),
             template_tx_provider: n.clone(),
             chain_tip: n.clone(),
-            block_submission_sink: n.clone(),
+            found_block_sink: n.clone(),
             distribution_source: n,
             job_validator: None,
         }
@@ -260,15 +268,14 @@ impl ChainTipProvider for NoOpJdpHooks {
 }
 
 #[async_trait]
-impl JdpBlockSubmissionSink for NoOpJdpHooks {
-    async fn submit_block_candidate(
+impl JdpFoundBlockSink for NoOpJdpHooks {
+    async fn book_found_block(
         &self,
         _: AddressId,
         _: DeclarationRef,
         _: CandidateBacking,
-        _: Vec<u8>,
-        _: Vec<Vec<u8>>,
-        _: SolutionHeader,
+        _: bitcoin::Transaction,
+        _: bitcoin::block::Header,
     ) {
     }
 }
@@ -685,14 +692,30 @@ async fn dispatch_jdp_inbound(
             // Computed once for node and handler: it clones megabytes of raw txs.
             let txs = DeclaredTxs::against_template(&input.wtxid_list, &template_txs);
             // SV2 JDP/Job Declarator Server: the node judges before anything is
-            // registered, so a rejection needs no rollback.
-            if let Some(validator) = hooks.job_validator.as_ref() {
+            // registered, so a rejection needs no rollback. A declaration still
+            // missing transactions is judged once the JDC supplied them.
+            if let (Some(validator), Some(complete)) =
+                (hooks.job_validator.as_ref(), txs.complete())
+            {
+                let ctx = declaration_context(
+                    hooks,
+                    bridge,
+                    session_id,
+                    input.distribution_id,
+                    &declaring.miner_address,
+                    now_ms,
+                )
+                .await;
+                if let Err(refusal) =
+                    declaration_refusal(state, &input, &declaring.miner_address, &ctx)
+                {
+                    return refusal;
+                }
                 if let Some(refusal) = node_refuses_declaration(
                     validator,
                     session_id,
                     &input,
-                    &txs.known(),
-                    DeclarationLeg::Declare,
+                    &complete,
                     "jdp: node rejected the declared job — not accepting it",
                 )
                 .await
@@ -700,27 +723,16 @@ async fn dispatch_jdp_inbound(
                     return refusal;
                 }
             }
-            let current_prev_hash = hooks.chain_tip.current_prev_hash().await;
-            let distribution =
-                resolve_distribution_acceptance(bridge, session_id, input.distribution_id);
-            // The mode of THIS TOKEN's address: a session may hold tokens for
-            // several addresses.
-            let current_mode = hooks
-                .distribution_source
-                .current_mode(&declaring.miner_address)
-                .await;
-            handle_declare_mining_job(
-                state,
-                &input,
+            let ctx = declaration_context(
+                hooks,
+                bridge,
+                session_id,
+                input.distribution_id,
                 &declaring.miner_address,
-                txs,
-                DeclarationContext {
-                    current_prev_hash,
-                    distribution,
-                    current_mode,
-                    now_ms,
-                },
+                now_ms,
             )
+            .await;
+            handle_declare_mining_job(state, &input, &declaring.miner_address, txs, ctx)
         }
         InboundJdpFrame::ProvideMissingTransactionsSuccess(input) => {
             // Second leg: refused first on what needs no node, then the node is
@@ -730,96 +742,100 @@ async fn dispatch_jdp_inbound(
             if let Some(refusal) = completion_refused(state, input.request_id, tip_before_node) {
                 return refusal;
             }
-            let completed = hooks.job_validator.as_ref().and_then(|validator| {
-                let pending = state.pending_declarations.get(input.request_id)?;
-                let txs = pending.txs.completed_with(&input.transaction_list).ok()?;
-                Some((validator, &pending.input, txs))
-            });
-            if let Some((validator, declared, txs)) = completed {
-                if let Some(refusal) = node_refuses_declaration(
-                    validator,
-                    session_id,
-                    declared,
-                    &txs,
-                    DeclarationLeg::Completed,
-                    "jdp: node rejected the completed declaration — not accepting it",
-                )
-                .await
-                {
-                    state.pending_declarations.take(input.request_id);
-                    return refusal;
+            let pending = state
+                .pending_declarations
+                .get(input.request_id)
+                .expect("completion_refused passes only a held declaration");
+            let (distribution_id, miner_address) =
+                (pending.input.distribution_id, pending.miner_address.clone());
+            if let Some(validator) = hooks.job_validator.as_ref() {
+                // A list that does not fill the gaps is the handler's to refuse.
+                if let Ok(complete) = pending.txs.completed_with(&input.transaction_list) {
+                    let ctx = declaration_context(
+                        hooks,
+                        bridge,
+                        session_id,
+                        distribution_id,
+                        &miner_address,
+                        now_ms,
+                    )
+                    .await;
+                    let refusal =
+                        match declaration_refusal(state, &pending.input, &miner_address, &ctx) {
+                            Err(refusal) => Some(refusal),
+                            Ok(_) => node_refuses_declaration(
+                                validator,
+                                session_id,
+                                &pending.input,
+                                &complete,
+                                "jdp: node rejected the completed declaration — not accepting it",
+                            )
+                            .await,
+                        };
+                    if let Some(refusal) = refusal {
+                        state.pending_declarations.take(input.request_id);
+                        return refusal;
+                    }
                 }
             }
-            let current_prev_hash = hooks.chain_tip.current_prev_hash().await;
             // ext 0x0003/Grace Window is judged at ACCEPTANCE: re-resolve to
-            // catch a supersession or settlement during the round-trip.
-            let pending_distribution_id = state
-                .pending_declarations
-                .get(input.request_id)
-                .and_then(|p| p.input.distribution_id);
-            let distribution =
-                resolve_distribution_acceptance(bridge, session_id, pending_distribution_id);
-            // The pending declaration's miner, as on the declare leg.
-            let pending_miner = state
-                .pending_declarations
-                .get(input.request_id)
-                .map(|p| p.miner_address.clone());
-            let current_mode = match pending_miner {
-                Some(miner) => hooks.distribution_source.current_mode(&miner).await,
-                None => None,
-            };
-            handle_provide_missing_transactions_success(
-                state,
-                input,
-                DeclarationContext {
-                    current_prev_hash,
-                    distribution,
-                    current_mode,
-                    now_ms,
-                },
+            // catch a supersession or settlement during the node call.
+            let ctx = declaration_context(
+                hooks,
+                bridge,
+                session_id,
+                distribution_id,
+                &miner_address,
+                now_ms,
             )
+            .await;
+            handle_provide_missing_transactions_success(state, input, ctx)
         }
         InboundJdpFrame::PushSolution(input) => {
             let pool_target = hooks.chain_tip.current_target().await;
+            // Propagation first: it shrinks the orphan window, booking can wait.
+            if let Some(validator) = hooks.job_validator.as_ref() {
+                validator.propagate_solution(session_id, &input).await;
+            }
             handle_push_solution(state, &input, pool_target)
         }
     }
 }
 
-/// Ask the node about a declaration (both legs) and turn a rejection into the
-/// answer frame. `None` means nothing objected (see [`JobVerdict::NeedsTransactions`]).
+/// Ask the node about a declaration whose transactions the pool holds in full,
+/// and turn a rejection into the answer frame; `None` means the node accepts
+/// it. Like SRI's JDS, the node is asked first with what it holds, and the
+/// transactions are supplied only when it lacks some.
 async fn node_refuses_declaration(
     validator: &Arc<dyn DeclaredJobValidator>,
     session_id: u32,
     declared: &crate::jdp::client::DeclareMiningJobInput,
-    known_raw_txs: &[&[u8]],
-    leg: DeclarationLeg,
+    txs: &[&[u8]],
     log_message: &'static str,
 ) -> Option<JdpHandlerOutcome> {
-    let verdict = validator
-        .validate_declaration(DeclaredJobToValidate {
+    let ask = |supplied_txs| {
+        validator.validate_declaration(DeclaredJobToValidate {
             session_id,
+            request_id: declared.request_id,
             version: declared.version,
             coinbase_tx_prefix: &declared.coinbase_tx_prefix,
             coinbase_tx_suffix: &declared.coinbase_tx_suffix,
             wtxid_list: &declared.wtxid_list,
-            known_raw_txs,
-            leg,
+            supplied_txs,
         })
-        .await;
-    let (error_code, error_details): (String, &[u8]) = match (verdict, leg) {
-        (JobVerdict::Rejected(code), _) => {
-            (code, b"declared job rejected by the pool's bitcoin node")
-        }
-        // Nothing left to fetch, e.g. a tx whose bytes miss its declared wtxid.
-        (JobVerdict::NeedsTransactions, DeclarationLeg::Completed) => (
+    };
+    let verdict = match ask(None).await {
+        JobVerdict::NeedsTransactions => ask(Some(txs)).await,
+        verdict => verdict,
+    };
+    let (error_code, error_details): (String, &[u8]) = match verdict {
+        JobVerdict::Accepted => return None,
+        JobVerdict::Rejected(code) => (code, b"declared job rejected by the pool's bitcoin node"),
+        // Supplied and still missing, e.g. a tx whose bytes miss its declared wtxid.
+        JobVerdict::NeedsTransactions => (
             crate::jdp::client::ERR_MISSING_TXS.to_string(),
-            b"the pool's bitcoin node still lacks declared transactions after \
-              ProvideMissingTransactions.Success",
+            b"the pool's bitcoin node still lacks declared transactions it was supplied",
         ),
-        (JobVerdict::Accepted, _) | (JobVerdict::NeedsTransactions, DeclarationLeg::Declare) => {
-            return None
-        }
     };
     warn!(session_id, error_code, "{}", log_message);
     Some(JdpHandlerOutcome::declare_error(
@@ -829,14 +845,23 @@ async fn node_refuses_declaration(
     ))
 }
 
-/// Leg of the SV2 JDP/ProvideMissingTransactions round-trip; decides whether
-/// "the node lacks transactions" is still open or a refusal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeclarationLeg {
-    /// `DeclareMiningJob`: missing txs can still be fetched.
-    Declare,
-    /// `ProvideMissingTransactions.Success`: nothing left to fetch.
-    Completed,
+/// The pool's state a declaration is judged against, read now.
+async fn declaration_context(
+    hooks: &JdpServerHooks,
+    bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
+    session_id: u32,
+    distribution_id: Option<u64>,
+    miner_address: &AddressId,
+    now_ms: u64,
+) -> DeclarationContext {
+    DeclarationContext {
+        current_prev_hash: hooks.chain_tip.current_prev_hash().await,
+        distribution: resolve_distribution_acceptance(bridge, session_id, distribution_id),
+        // The mode of THIS declaration's address: a session may hold tokens
+        // for several addresses.
+        current_mode: hooks.distribution_source.current_mode(miner_address).await,
+        now_ms,
+    }
 }
 
 /// Resolve an ext 0x0003/distribution_id TLV Field reference against the
@@ -878,24 +903,16 @@ async fn fan_out_events(events: Vec<JdpSessionEvent>, hooks: &JdpServerHooks) {
             // Registered by `register_bridge_entries` before the write.
             JdpSessionEvent::TokenAllocated { .. } => {}
             JdpSessionEvent::JobDeclared { .. } => {}
-            JdpSessionEvent::BlockSubmissionCandidate {
+            JdpSessionEvent::FoundBlock {
                 miner_address,
                 declaration,
                 backing,
-                coinbase_raw,
-                transactions,
+                coinbase,
                 header,
             } => {
                 hooks
-                    .block_submission_sink
-                    .submit_block_candidate(
-                        miner_address,
-                        declaration,
-                        backing,
-                        coinbase_raw,
-                        transactions,
-                        header,
-                    )
+                    .found_block_sink
+                    .book_found_block(miner_address, declaration, backing, coinbase, header)
                     .await;
             }
             // The connection loop owns the socket and closes after the write.
@@ -1029,7 +1046,7 @@ pub(crate) fn register_bridge_entries(
             },
             // No wildcard, so a new event has to be classified here.
             JdpSessionEvent::SetupComplete
-            | JdpSessionEvent::BlockSubmissionCandidate { .. }
+            | JdpSessionEvent::FoundBlock { .. }
             | JdpSessionEvent::Disconnect { .. } => {}
         }
     }
@@ -1236,10 +1253,12 @@ mod tests {
         })
     }
 
-    /// Fake node: scripted verdicts, then `Accepted`; records each call.
+    /// Fake node: scripted verdicts, then `Accepted`. Records whether each ask
+    /// supplied transactions, and which sessions' solutions it propagated.
     struct StubValidator {
         verdicts: std::sync::Mutex<std::collections::VecDeque<JobVerdict>>,
-        calls: std::sync::atomic::AtomicUsize,
+        asks: std::sync::Mutex<Vec<bool>>,
+        propagated: std::sync::Mutex<Vec<u32>>,
     }
 
     impl StubValidator {
@@ -1249,24 +1268,32 @@ mod tests {
         fn answering(verdicts: Vec<JobVerdict>) -> Arc<Self> {
             Arc::new(Self {
                 verdicts: std::sync::Mutex::new(verdicts.into()),
-                calls: std::sync::atomic::AtomicUsize::new(0),
+                asks: std::sync::Mutex::new(Vec::new()),
+                propagated: std::sync::Mutex::new(Vec::new()),
             })
         }
         fn calls(&self) -> usize {
-            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+            self.asks.lock().unwrap().len()
+        }
+        /// Per ask, whether it supplied transactions.
+        fn supplied(&self) -> Vec<bool> {
+            self.asks.lock().unwrap().clone()
         }
     }
 
     #[async_trait]
     impl DeclaredJobValidator for StubValidator {
-        async fn validate_declaration(&self, _job: DeclaredJobToValidate<'_>) -> JobVerdict {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        async fn validate_declaration(&self, job: DeclaredJobToValidate<'_>) -> JobVerdict {
+            self.asks.lock().unwrap().push(job.supplied_txs.is_some());
             self.verdicts
                 .lock()
                 .expect("verdict lock")
                 .pop_front()
                 .unwrap_or(JobVerdict::Accepted)
+        }
+
+        async fn propagate_solution(&self, session_id: u32, _solution: &PushSolutionInput) {
+            self.propagated.lock().unwrap().push(session_id);
         }
 
         fn session_closed(&self, _session_id: u32) {}
@@ -1281,16 +1308,55 @@ mod tests {
             .token
     }
 
+    /// The one transaction `declare_input` declares.
+    const DECLARED_TX: [u8; 32] = [0xAB; 32];
+
+    /// A declaration the pool's own checks accept: a coinbase that rebuilds,
+    /// over `DECLARED_TX`.
     fn declare_input(token: Token) -> crate::jdp::client::DeclareMiningJobInput {
+        use crate::jdp::client::tests::{coinbase_prefix, coinbase_suffix, one_output_blob};
         crate::jdp::client::DeclareMiningJobInput {
             request_id: 11,
             mining_job_token: token,
             version: 0x2000_0000,
-            coinbase_tx_prefix: vec![0xBB; 8],
-            coinbase_tx_suffix: vec![0xCC; 8],
-            wtxid_list: vec![crate::jdp::tx_validation::wtxid_of(&[0xAB; 32])],
+            coinbase_tx_prefix: coinbase_prefix(),
+            coinbase_tx_suffix: coinbase_suffix(&one_output_blob()),
+            wtxid_list: vec![crate::jdp::tx_validation::wtxid_of(&DECLARED_TX)],
             distribution_id: None,
         }
+    }
+
+    /// A template that already holds `DECLARED_TX`, so a declaration of it is
+    /// complete without a round-trip.
+    struct TemplateWithTheDeclaredTx;
+
+    #[async_trait]
+    impl TemplateTxProvider for TemplateWithTheDeclaredTx {
+        async fn snapshot(&self) -> HashMap<[u8; 32], Vec<u8>> {
+            HashMap::from([(
+                crate::jdp::tx_validation::wtxid_of(&DECLARED_TX),
+                DECLARED_TX.to_vec(),
+            )])
+        }
+    }
+
+    /// Hooks asking `validator`, on a tip the pool knows. The template lacks
+    /// `DECLARED_TX` unless `template_has_it`.
+    fn validating_hooks(validator: &Arc<StubValidator>, template_has_it: bool) -> JdpServerHooks {
+        let mut hooks = JdpServerHooks::no_op();
+        hooks.job_validator = Some(validator.clone() as Arc<dyn DeclaredJobValidator>);
+        hooks.chain_tip = Arc::new(MovableTip(std::sync::Mutex::new(Some([0xAA; 32]))));
+        if template_has_it {
+            hooks.template_tx_provider = Arc::new(TemplateWithTheDeclaredTx);
+        }
+        hooks
+    }
+
+    fn declared(outcome: &JdpHandlerOutcome) -> bool {
+        outcome
+            .events
+            .iter()
+            .any(|e| matches!(e, JdpSessionEvent::JobDeclared { .. }))
     }
 
     /// A node rejection answers `DeclareMiningJob.Error` and registers nothing.
@@ -1301,19 +1367,10 @@ mod tests {
         state.full_template_mode = true;
         let token = issue_token(&mut state, 1_000);
         let validator = StubValidator::new(JobVerdict::Rejected("invalid-coinbase-tx".to_string()));
-        let mut hooks = JdpServerHooks::no_op();
-        hooks.job_validator = Some(validator.clone() as Arc<dyn DeclaredJobValidator>);
+        let hooks = validating_hooks(&validator, true);
         let bridge = fresh_bridge();
 
-        let outcome = dispatch_jdp_inbound(
-            &mut state,
-            InboundJdpFrame::DeclareMiningJob(declare_input(token)),
-            &hooks,
-            &bridge,
-            1,
-            1_000,
-        )
-        .await;
+        let outcome = declare_with(&mut state, &hooks, &bridge, token, 1_000).await;
 
         assert_eq!(validator.calls(), 1, "the node must actually be consulted");
         match &outcome.outbound[0] {
@@ -1328,8 +1385,8 @@ mod tests {
             other => panic!("expected DeclareMiningJobError, got {other:?}"),
         }
         assert!(
-            state.pending_declarations.is_empty(),
-            "a refused declaration must leave no half-finished round-trip behind"
+            state.declared_jobs.is_empty(),
+            "a refused declaration registers nothing"
         );
     }
 
@@ -1344,15 +1401,7 @@ mod tests {
         assert!(hooks.job_validator.is_none());
         let bridge = fresh_bridge();
 
-        let outcome = dispatch_jdp_inbound(
-            &mut state,
-            InboundJdpFrame::DeclareMiningJob(declare_input(token)),
-            &hooks,
-            &bridge,
-            1,
-            1_000,
-        )
-        .await;
+        let outcome = declare_with(&mut state, &hooks, &bridge, token, 1_000).await;
 
         assert!(
             !refused_by_node(&outcome),
@@ -1361,34 +1410,114 @@ mod tests {
         );
     }
 
-    /// `NeedsTransactions` on the declare leg starts the round-trip, not a rejection.
+    /// The node is asked first with what it holds; lacking transactions, it is
+    /// asked again with them, and its verdict on those stands.
     #[tokio::test(flavor = "current_thread")]
-    async fn needs_transactions_is_not_a_rejection() {
+    async fn a_node_lacking_transactions_is_asked_again_with_them() {
         let mut state = fresh_session();
         let _ = handle_setup_connection(&mut state, &jdp_setup());
         state.full_template_mode = true;
         let token = issue_token(&mut state, 1_000);
-        let validator = StubValidator::new(JobVerdict::NeedsTransactions);
-        let mut hooks = JdpServerHooks::no_op();
-        hooks.job_validator = Some(validator.clone() as Arc<dyn DeclaredJobValidator>);
+        let validator =
+            StubValidator::answering(vec![JobVerdict::NeedsTransactions, JobVerdict::Accepted]);
+        let hooks = validating_hooks(&validator, true);
         let bridge = fresh_bridge();
 
-        let outcome = dispatch_jdp_inbound(
+        let outcome = declare_with(&mut state, &hooks, &bridge, token, 1_000).await;
+
+        assert_eq!(
+            validator.supplied(),
+            vec![false, true],
+            "first without transactions, then with them"
+        );
+        assert!(declared(&outcome), "got {:?}", outcome.outbound);
+    }
+
+    /// A node that holds every transaction is asked once, without them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_node_holding_the_transactions_is_not_sent_them() {
+        let mut state = fresh_session();
+        let _ = handle_setup_connection(&mut state, &jdp_setup());
+        state.full_template_mode = true;
+        let token = issue_token(&mut state, 1_000);
+        let validator = StubValidator::new(JobVerdict::Accepted);
+        let hooks = validating_hooks(&validator, true);
+        let bridge = fresh_bridge();
+
+        let outcome = declare_with(&mut state, &hooks, &bridge, token, 1_000).await;
+
+        assert_eq!(validator.supplied(), vec![false]);
+        assert!(declared(&outcome), "got {:?}", outcome.outbound);
+    }
+
+    /// A declaration the pool's own checks refuse never reaches the node, whose
+    /// validation engine would otherwise keep it as the job a `PushSolution` is
+    /// rebuilt from. The same declaration on a known tip does reach it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_declaration_the_pool_refuses_never_reaches_the_node() {
+        let run = |tip: Option<[u8; 32]>| async move {
+            let mut state = fresh_session();
+            let _ = handle_setup_connection(&mut state, &jdp_setup());
+            state.full_template_mode = true;
+            let token = issue_token(&mut state, 1_000);
+            let validator = StubValidator::new(JobVerdict::Accepted);
+            let mut hooks = validating_hooks(&validator, true);
+            hooks.chain_tip = Arc::new(MovableTip(std::sync::Mutex::new(tip)));
+            let bridge = fresh_bridge();
+            let outcome = declare_with(&mut state, &hooks, &bridge, token, 1_000).await;
+            (outcome, validator.calls())
+        };
+
+        // No tip yet: the pool refuses the declaration on its own.
+        let (outcome, calls) = run(None).await;
+        assert_eq!(
+            declare_error_code(&outcome),
+            crate::jdp::client::ERR_STALE_CHAIN_TIP
+        );
+        assert_eq!(
+            calls, 0,
+            "a declaration the pool refuses must not reach the node"
+        );
+
+        let (outcome, calls) = run(Some([0xAA; 32])).await;
+        assert!(declared(&outcome), "control: got {:?}", outcome.outbound);
+        assert_eq!(
+            calls, 1,
+            "control: an acceptable declaration reaches the node"
+        );
+    }
+
+    /// A `PushSolution` is handed to the node for propagation, whether or not
+    /// the pool matches it to a declaration.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pushed_solution_is_handed_to_the_node() {
+        let mut state = fresh_session();
+        let _ = handle_setup_connection(&mut state, &jdp_setup());
+        state.full_template_mode = true;
+        let validator = StubValidator::new(JobVerdict::Accepted);
+        let hooks = validating_hooks(&validator, true);
+        let bridge = fresh_bridge();
+
+        let _ = dispatch_jdp_inbound(
             &mut state,
-            InboundJdpFrame::DeclareMiningJob(declare_input(token)),
+            InboundJdpFrame::PushSolution(PushSolutionInput {
+                extranonce: vec![0; 8],
+                header: crate::jdp::client::SolutionHeader {
+                    prev_hash: [0xAA; 32],
+                    version: 0x2000_0000,
+                    ntime: 0,
+                    nonce: 0,
+                    n_bits: 0,
+                },
+            }),
             &hooks,
             &bridge,
-            1,
+            7,
             1_000,
         )
         .await;
 
-        assert_eq!(validator.calls(), 1);
-        assert!(
-            !refused_by_node(&outcome),
-            "a node that lacks transactions must not fail the declaration: {:?}",
-            outcome.outbound
-        );
+        assert_eq!(*validator.propagated.lock().unwrap(), vec![7]);
     }
 
     fn refused_for_token(outcome: &JdpHandlerOutcome) -> bool {
@@ -1435,8 +1564,7 @@ mod tests {
         state.full_template_mode = true;
         let token = issue_token(&mut state, 1_000);
         let validator = StubValidator::new(JobVerdict::Accepted);
-        let mut hooks = JdpServerHooks::no_op();
-        hooks.job_validator = Some(validator.clone() as Arc<dyn DeclaredJobValidator>);
+        let hooks = validating_hooks(&validator, true);
         let bridge = fresh_bridge();
 
         let first = declare_with(&mut state, &hooks, &bridge, token, 1_100).await;
@@ -1464,8 +1592,18 @@ mod tests {
         );
     }
 
-    /// A `ProvideMissingTransactions.Success` with an unknown `request_id` does
-    /// not reach the node; the matching one does.
+    fn provide_missing(request_id: u32) -> InboundJdpFrame {
+        InboundJdpFrame::ProvideMissingTransactionsSuccess(
+            crate::jdp::client::ProvideMissingTransactionsSuccessInput {
+                request_id,
+                transaction_list: vec![DECLARED_TX.to_vec()],
+            },
+        )
+    }
+
+    /// A declaration still missing transactions is asked about only once the
+    /// JDC supplied them; a `ProvideMissingTransactions.Success` with an unknown
+    /// `request_id` does not reach the node, the matching one does.
     #[tokio::test(flavor = "current_thread")]
     async fn a_provide_missing_success_for_another_request_never_reaches_the_node() {
         let mut state = fresh_session();
@@ -1473,11 +1611,9 @@ mod tests {
         state.full_template_mode = true;
         let token = issue_token(&mut state, 1_000);
         let validator = StubValidator::new(JobVerdict::Accepted);
-        let mut hooks = JdpServerHooks::no_op();
-        hooks.job_validator = Some(validator.clone() as Arc<dyn DeclaredJobValidator>);
+        let hooks = validating_hooks(&validator, false);
         let bridge = fresh_bridge();
 
-        // No template txs wired, so the declared wtxid is missing.
         let first = declare_with(&mut state, &hooks, &bridge, token, 1_100).await;
         assert!(
             matches!(
@@ -1489,25 +1625,24 @@ mod tests {
         );
         assert_eq!(
             validator.calls(),
-            1,
-            "precondition: the declare reached the node"
+            0,
+            "a declaration still missing transactions is not asked about yet"
         );
 
-        let answer = |request_id| {
-            InboundJdpFrame::ProvideMissingTransactionsSuccess(
-                crate::jdp::client::ProvideMissingTransactionsSuccessInput {
-                    request_id,
-                    transaction_list: vec![vec![0xAB; 32]],
-                },
-            )
-        };
-
         // Wrong request_id: no node call, no frame, round-trip still pending.
-        let out = dispatch_jdp_inbound(&mut state, answer(9_999), &hooks, &bridge, 1, 1_200).await;
+        let out = dispatch_jdp_inbound(
+            &mut state,
+            provide_missing(9_999),
+            &hooks,
+            &bridge,
+            1,
+            1_200,
+        )
+        .await;
         assert!(out.outbound.is_empty(), "got {:?}", out.outbound);
         assert_eq!(
             validator.calls(),
-            1,
+            0,
             "a Success for another request must not be handed to the node"
         );
         assert!(
@@ -1515,13 +1650,15 @@ mod tests {
             "precondition for the loop this guards: the round-trip survives"
         );
 
-        // The real answer still goes through.
-        let _ = dispatch_jdp_inbound(&mut state, answer(11), &hooks, &bridge, 1, 1_300).await;
+        // The real answer goes through.
+        let out =
+            dispatch_jdp_inbound(&mut state, provide_missing(11), &hooks, &bridge, 1, 1_300).await;
         assert_eq!(
             validator.calls(),
-            2,
-            "the matching Success must be re-validated"
+            1,
+            "the matching Success must reach the node"
         );
+        assert!(declared(&out), "got {:?}", out.outbound);
     }
 
     /// A chain tip the tests move between the two legs of a round-trip.
@@ -1549,13 +1686,9 @@ mod tests {
             let _ = handle_setup_connection(&mut state, &jdp_setup());
             state.full_template_mode = true;
             let token = issue_token(&mut state, 1_000);
-            let validator = StubValidator::answering(vec![
-                JobVerdict::NeedsTransactions,
-                JobVerdict::Rejected("bad-cb-height".to_string()),
-            ]);
+            let validator = StubValidator::new(JobVerdict::Rejected("bad-cb-height".to_string()));
             let tip = Arc::new(MovableTip(std::sync::Mutex::new(Some([0xAA; 32]))));
-            let mut hooks = JdpServerHooks::no_op();
-            hooks.job_validator = Some(validator.clone() as Arc<dyn DeclaredJobValidator>);
+            let mut hooks = validating_hooks(&validator, false);
             hooks.chain_tip = tip.clone();
             let bridge = fresh_bridge();
 
@@ -1571,77 +1704,49 @@ mod tests {
             if tip_moves {
                 *tip.0.lock().unwrap() = Some([0xBB; 32]);
             }
-            let second = dispatch_jdp_inbound(
-                &mut state,
-                InboundJdpFrame::ProvideMissingTransactionsSuccess(
-                    crate::jdp::client::ProvideMissingTransactionsSuccessInput {
-                        request_id: 11,
-                        transaction_list: vec![vec![0xAB; 32]],
-                    },
-                ),
-                &hooks,
-                &bridge,
-                1,
-                1_200,
-            )
-            .await;
+            let second =
+                dispatch_jdp_inbound(&mut state, provide_missing(11), &hooks, &bridge, 1, 1_200)
+                    .await;
             (declare_error_code(&second).to_string(), validator.calls())
         };
 
         let (code, calls) = complete(true).await;
         assert_eq!(code, crate::jdp::client::ERR_STALE_CHAIN_TIP);
         assert_eq!(
-            calls, 1,
+            calls, 0,
             "the node must not judge a job on a tip that moved"
         );
 
         let (code, calls) = complete(false).await;
         assert_eq!(code, "bad-cb-height", "control: the node's verdict stands");
-        assert_eq!(calls, 2, "control: the second leg reached the node");
+        assert_eq!(
+            calls, 1,
+            "control: the completed declaration reached the node"
+        );
     }
 
-    /// `NeedsTransactions` on the second leg is refused `missing-txs`; the
-    /// same round-trip with the node accepting is not.
+    /// A node that still lacks transactions after being supplied them refuses
+    /// the declaration `missing-txs`; one that accepts the supplied set does not.
     #[tokio::test(flavor = "current_thread")]
     async fn a_completed_declaration_the_node_still_lacks_transactions_for_is_refused() {
-        let complete = |second_leg: JobVerdict| async move {
+        let complete = |supplied_verdict: JobVerdict| async move {
             let mut state = fresh_session();
             let _ = handle_setup_connection(&mut state, &jdp_setup());
             state.full_template_mode = true;
             let token = issue_token(&mut state, 1_000);
             let validator =
-                StubValidator::answering(vec![JobVerdict::NeedsTransactions, second_leg]);
-            let mut hooks = JdpServerHooks::no_op();
-            hooks.job_validator = Some(validator.clone() as Arc<dyn DeclaredJobValidator>);
+                StubValidator::answering(vec![JobVerdict::NeedsTransactions, supplied_verdict]);
+            let hooks = validating_hooks(&validator, false);
             let bridge = fresh_bridge();
 
-            let first = declare_with(&mut state, &hooks, &bridge, token, 1_100).await;
-            assert!(
-                matches!(
-                    first.outbound.first(),
-                    Some(JdpOutboundFrame::ProvideMissingTransactions { .. })
-                ),
-                "precondition: a round-trip must be in flight, got {:?}",
-                first.outbound
-            );
-            let second = dispatch_jdp_inbound(
-                &mut state,
-                InboundJdpFrame::ProvideMissingTransactionsSuccess(
-                    crate::jdp::client::ProvideMissingTransactionsSuccessInput {
-                        request_id: 11,
-                        transaction_list: vec![vec![0xAB; 32]],
-                    },
-                ),
-                &hooks,
-                &bridge,
-                1,
-                1_200,
-            )
-            .await;
+            let _ = declare_with(&mut state, &hooks, &bridge, token, 1_100).await;
+            let second =
+                dispatch_jdp_inbound(&mut state, provide_missing(11), &hooks, &bridge, 1, 1_200)
+                    .await;
             assert_eq!(
-                validator.calls(),
-                2,
-                "precondition: both legs reached the node"
+                validator.supplied(),
+                vec![false, true],
+                "precondition: asked without, then with the transactions"
             );
             (second, state)
         };
@@ -1652,27 +1757,19 @@ mod tests {
             crate::jdp::client::ERR_MISSING_TXS
         );
         assert!(
-            !refused
-                .events
-                .iter()
-                .any(|e| matches!(e, JdpSessionEvent::JobDeclared { .. })),
+            !declared(&refused),
             "a declaration the node never saw whole must not be declared"
         );
         assert!(state.declared_jobs.is_empty());
         assert!(
             state.pending_declarations.is_empty(),
-            "a refused declaration must leave no half-finished round-trip behind"
+            "the refused round-trip must not linger"
         );
 
         let (accepted, _) = complete(JobVerdict::Accepted).await;
         assert!(
-            !accepted.outbound.iter().any(|f| matches!(
-                f,
-                JdpOutboundFrame::DeclareMiningJobError { error_code, .. }
-                    if error_code == crate::jdp::client::ERR_MISSING_TXS
-            )),
-            "negative control: a node that accepts the complete set must not be refused \
-             missing-txs, got {:?}",
+            declared(&accepted),
+            "negative control: a node that accepts the supplied set must not be refused, got {:?}",
             accepted.outbound
         );
     }
@@ -1958,7 +2055,6 @@ mod tests {
             version: 0,
             coinbase_tx_prefix: vec![],
             coinbase_tx_suffix: vec![],
-            raw_transactions: Vec::new(),
             merkle_path: Some(Vec::new()),
             prev_hash: [0xCC; 32],
             declared_at_ms: 500,
@@ -1988,7 +2084,6 @@ mod tests {
             version: 0,
             coinbase_tx_prefix: vec![],
             coinbase_tx_suffix: vec![],
-            raw_transactions: Vec::new(),
             merkle_path: Some(Vec::new()),
             prev_hash: [0xCC; 32],
             declared_at_ms: u64::from(n),

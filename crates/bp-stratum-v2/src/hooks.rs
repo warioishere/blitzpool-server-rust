@@ -45,7 +45,7 @@ pub trait PayoutResolver: Send + Sync {
 // ── BlockSubmissionSink ─────────────────────────────────────────────
 
 /// Receives a block-candidate share. A JDC's PushSolution may reach
-/// bitcoin-core in parallel via the JDP server; `submitblock` is idempotent.
+/// bitcoin-core in parallel via the JDP server; the node accepts a block once.
 #[async_trait::async_trait]
 pub trait BlockSubmissionSink: Send + Sync {
     // `stream` routes the solution to the TDP handle the job was built on.

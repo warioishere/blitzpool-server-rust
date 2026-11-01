@@ -1151,7 +1151,8 @@ mod tests {
             crate::extensions::SV2_EXTENSION_TYPE_WORKER_ID,
             crate::extensions::SV2_FIELD_TYPE_USER_IDENTITY,
             user_identity.as_bytes().to_vec(),
-        )]
+        )
+        .unwrap()]
     }
 
     /// ext 0x0002 negotiated + valid TLV: the TLV names the worker.

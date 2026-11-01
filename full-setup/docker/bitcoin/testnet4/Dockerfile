@@ -1,11 +1,11 @@
-# Bitcoin Core 31 — testnet4 build for blitzpool-rust.
+# Bitcoin Core 32 — testnet4 build for blitzpool-rust.
 #
 # Uses `libexec/bitcoin-node` (multi-process build). See
 # regtest/Dockerfile for the full rationale.
 
 FROM debian:bookworm-slim AS build
 
-ARG BITCOIN_CORE_VER=31.0
+ARG BITCOIN_CORE_VER=32.1
 ARG TARGETARCH
 
 RUN apt-get update \

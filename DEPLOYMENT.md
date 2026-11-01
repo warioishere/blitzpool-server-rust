@@ -26,7 +26,7 @@ The repository has two setups; both run every payout mode:
 | `front` | Pool process with roles `front,api`: holds the miner connections (Stratum V1 and V2 on the same ports), builds and submits blocks, serves the HTTP API |
 | `back` | Pool process with roles `payout,stats,notify`: books payouts, writes statistics, sends notifications |
 | `postgres`, `redis` | Storage. Not published on the host |
-| `bitcoin` | Optional Bitcoin Core 31 node (`--profile bitcoin`) |
+| `bitcoin` | Optional Bitcoin Core 32 node (`--profile bitcoin`) |
 
 `front` and `back` are the same image with the same config. They talk through
 Redis streams, so `back` can restart without disconnecting a miner. They cannot
@@ -36,7 +36,7 @@ be merged into one process: the pool refuses to start with `front` and
 ## Requirements
 
 - Linux with Docker Engine and Docker Compose **2.20 or newer** (`docker compose version`).
-- **Bitcoin Core 31**, either:
+- **Bitcoin Core 32**, either:
   - the bundled node in this compose file (it syncs the chain itself), or
   - your own node, run as the multi-process binary `bitcoin-node` with an IPC
     socket. Plain `bitcoind` has no IPC socket and does not work.
@@ -98,7 +98,7 @@ serve work.
 
 ## 2b. With your own node
 
-Run Bitcoin Core 31's `bitcoin-node` (in `libexec/` of the release tarball)
+Run Bitcoin Core 32's `bitcoin-node` (in `libexec/` of the release tarball)
 with an IPC socket in a directory of its own, and RPC reachable from Docker:
 
 ```bash

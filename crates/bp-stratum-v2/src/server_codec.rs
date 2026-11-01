@@ -135,7 +135,7 @@ fn decode_update_channel(m: Sv2UpdateChannel<'_>) -> Result<UpdateChannelInput, 
     Ok(UpdateChannelInput {
         channel_id: m.channel_id,
         nominal_hash_rate: m.nominal_hash_rate,
-        maximum_target: bytes_to_32(m.maximum_target.as_bytes())?,
+        maximum_target: bytes_to_32(m.max_target.as_bytes())?,
     })
 }
 
@@ -187,7 +187,7 @@ fn decode_set_custom_mining_job(
         mining_job_token: token_from_bytes(m.token.as_bytes())?,
         version: m.version,
         prev_hash: bytes_to_32(m.prev_hash.as_bytes())?,
-        min_ntime: m.min_ntime,
+        min_ntime: m.ntime_start,
         n_bits: m.nbits,
         coinbase_tx_version: m.coinbase_tx_version,
         coinbase_prefix: m.coinbase_prefix.as_bytes().to_vec(),
@@ -275,7 +275,7 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessageOwned, C
         } => Ok(AnyMessageOwned::Mining(MiningOwned::SetTarget(
             Sv2SetTarget {
                 channel_id,
-                maximum_target: maximum_target.into(),
+                target: maximum_target.into(),
             },
         ))),
         OutboundFrame::SetExtranoncePrefix {
@@ -300,7 +300,7 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessageOwned, C
                 channel_id,
                 job_id,
                 prev_hash: prev_hash.into(),
-                min_ntime,
+                ntime_start: min_ntime,
                 nbits: n_bits,
             },
         ))),
@@ -314,7 +314,7 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessageOwned, C
             Sv2NewMiningJob {
                 channel_id,
                 job_id,
-                min_ntime: stratum_core::binary_sv2::Sv2OptionOwned::new(min_ntime),
+                ntime_start: stratum_core::binary_sv2::Sv2OptionOwned::new(min_ntime),
                 version,
                 merkle_root: merkle_root.into(),
             },
@@ -332,7 +332,7 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessageOwned, C
             Sv2NewExtMiningJob {
                 channel_id,
                 job_id,
-                min_ntime: stratum_core::binary_sv2::Sv2OptionOwned::new(min_ntime),
+                ntime_start: stratum_core::binary_sv2::Sv2OptionOwned::new(min_ntime),
                 version,
                 version_rolling_allowed,
                 merkle_path: seq_from_merkle_path(merkle_path)?,
@@ -592,7 +592,7 @@ mod tests {
         let msg = AnyMessage::Mining(Mining::UpdateChannel(Sv2UpdateChannel {
             channel_id: 5,
             nominal_hash_rate: 2.0e12,
-            maximum_target: (&[0xCCu8; 32]).into(),
+            max_target: (&[0xCCu8; 32]).into(),
         }));
         let out = decode_mining_inbound(msg).unwrap().unwrap();
         match out {
@@ -706,7 +706,7 @@ mod tests {
         match msg {
             AnyMessageOwned::Mining(MiningOwned::SetTarget(s)) => {
                 assert_eq!(s.channel_id, 1);
-                assert_eq!(s.maximum_target.as_bytes(), &[0xAA; 32]);
+                assert_eq!(s.target.as_bytes(), &[0xAA; 32]);
             }
             _ => panic!("expected SetTarget"),
         }
@@ -743,7 +743,7 @@ mod tests {
                 assert_eq!(p.channel_id, 1);
                 assert_eq!(p.job_id, 7);
                 assert_eq!(p.prev_hash.as_bytes(), &[0xAB; 32]);
-                assert_eq!(p.min_ntime, 0x6500_0001);
+                assert_eq!(p.ntime_start, 0x6500_0001);
                 assert_eq!(p.nbits, 0x1d00_ffff);
             }
             _ => panic!("expected SetNewPrevHash"),
@@ -766,7 +766,7 @@ mod tests {
                 assert_eq!(j.job_id, 7);
                 assert_eq!(j.version, 0x2000_0000);
                 assert_eq!(j.merkle_root.as_bytes(), &[0x12; 32]);
-                assert_eq!(j.min_ntime.clone().into_inner(), Some(0x6500_0001));
+                assert_eq!(j.ntime_start.clone().into_inner(), Some(0x6500_0001));
             }
             _ => panic!("expected NewMiningJob"),
         }

@@ -70,7 +70,8 @@ authority_privkey_hex = "CHANGE-ME"      # blitzpool --sv2-keygen
 # Job Declaration Protocol: lets a miner build its own block template.
 # jdp_enabled = true
 # jdp_port = 3335
-# Validate declared jobs against the node. On mainnet the [tdp] socket path
+# Validate declared jobs against the node and propagate pushed solutions
+# through it; unset leaves both to the JDC. On mainnet the [tdp] socket path
 # works as is; other networks need the layout <dir>/<network>/node.sock.
 # jdp_validation_socket_path = "/ipc/node.sock"
 

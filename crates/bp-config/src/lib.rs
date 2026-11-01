@@ -413,7 +413,7 @@ pub struct StratumConfig {
     pub difficulty_check_interval_ms: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sv2Config {
     /// 32-byte secp256k1 authority private key in hex (`blitzpool --sv2-keygen`).
@@ -425,15 +425,10 @@ pub struct Sv2Config {
     pub jdp_enabled: bool,
     #[serde(default)]
     pub jdp_port: Option<u16>,
-    /// Reconstruct a pushed solution and `submitblock` it: the only way to meet
-    /// SV2 JDP/PushSolution (JDS MUST propagate) on Core v31, whose IPC
-    /// solution submit is a stub. A "duplicate" answer is normal. `false` logs
-    /// only and leaves propagation to the JDC's own node.
-    #[serde(default = "default_true")]
-    pub jdp_orphan_submitblock: bool,
     /// bitcoin-core IPC socket (normally the `[tdp]` one) for `checkBlock`
-    /// validation of declared jobs (SV2 JDP/Job Declarator Server); unset
-    /// trusts the JDC. Must be a `<dir>/<network>/node.sock` path the engine
+    /// validation of declared jobs and `submitBlock` propagation of pushed
+    /// solutions (SV2 JDP/Job Declarator Server, SV2 JDP/PushSolution); unset
+    /// trusts the JDC and leaves propagation to it. Must be a `<dir>/<network>/node.sock` path the engine
     /// can derive, else boot refuses rather than validate against nothing.
     #[serde(default)]
     pub jdp_validation_socket_path: Option<PathBuf>,
@@ -442,16 +437,6 @@ pub struct Sv2Config {
     /// staleness between blocks. Default 60.
     #[serde(default)]
     pub jdp_payout_distribution_interval_secs: Option<u64>,
-}
-
-impl Default for Sv2Config {
-    /// A missing `[sv2]` section must equal an empty one. `#[derive(Default)]`
-    /// would skip serde's per-field defaults and turn `jdp_orphan_submitblock`
-    /// off, breaking SV2 JDP/PushSolution.
-    fn default() -> Self {
-        // Deserializing an empty table keeps that true for every future field.
-        toml::from_str("").expect("empty [sv2] table applies every serde default")
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1325,11 +1310,6 @@ mod tests {
         assert_eq!(cfg.stratum.job_retention_ms, 600_000);
         // [tdp] staleness threshold defaults to 120s when unset.
         assert_eq!(cfg.tdp.staleness_threshold_secs, 120);
-        // SV2 JDP/PushSolution: propagation is a MUST, so the default is on.
-        assert!(
-            cfg.sv2.jdp_orphan_submitblock,
-            "pool-side block propagation must default to on"
-        );
     }
 
     #[test]

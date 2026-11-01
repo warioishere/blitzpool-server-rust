@@ -18,7 +18,7 @@ use bp_stratum_v2::extensions::{
     encode_distribution_id_tlv, SetPayoutDistribution, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
 };
 use bp_stratum_v2::jdp::client::{
-    parse_user_identifier_as_address, AllocateTokenContext, DeclarationRef, SolutionHeader,
+    parse_user_identifier_as_address, AllocateTokenContext, DeclarationRef, PushSolutionInput,
     ERR_INVALID_MINING_JOB_TOKEN, ERR_INVALID_PAYOUT_DISTRIBUTION, ERR_STALE_PAYOUT_DISTRIBUTION,
     FLAG_DECLARE_TX_DATA,
 };
@@ -28,8 +28,8 @@ use bp_stratum_v2::jdp::dynamic_outputs::{
 use bp_stratum_v2::jdp::payout_distribution::{compute_payout_vector, WeightedOutput};
 use bp_stratum_v2::jdp_server::{
     AllocateOutcome, ChainTipProvider, DeclaredJobToValidate, DeclaredJobValidator,
-    JdpAllocateResolver, JdpBlockSubmissionSink, JdpServerHooks, JobVerdict,
-    PayoutDistributionSource, StratumV2JdpServer, TailoredDistribution,
+    JdpAllocateResolver, JdpFoundBlockSink, JdpServerHooks, JobVerdict, PayoutDistributionSource,
+    StratumV2JdpServer, TailoredDistribution,
 };
 use bp_stratum_v2::jdp_server_codec::EXT_0X0003_MSG_TYPE_SET_PAYOUT_DISTRIBUTION;
 use bp_stratum_v2::noise::NoiseConfig;
@@ -135,8 +135,9 @@ impl ChainTipProvider for FixedPrevHash {
         Some(PREV_HASH)
     }
 
+    /// Met by every header, so the pushed solution is judged on its declaration.
     async fn current_target(&self) -> Option<[u8; 32]> {
-        None
+        Some([0xFF; 32])
     }
 }
 
@@ -192,21 +193,21 @@ struct RecordingSink {
 }
 
 #[async_trait]
-impl JdpBlockSubmissionSink for RecordingSink {
-    async fn submit_block_candidate(
+impl JdpFoundBlockSink for RecordingSink {
+    async fn book_found_block(
         &self,
         miner_address: AddressId,
         _declaration: DeclarationRef,
         backing: CandidateBacking,
-        coinbase_raw: Vec<u8>,
-        _transactions: Vec<Vec<u8>>,
-        header: SolutionHeader,
+        coinbase: bitcoin::Transaction,
+        header: bitcoin::block::Header,
     ) {
+        use bitcoin::hashes::Hash as _;
         self.candidates.lock().unwrap().push(RecordedCandidate {
             miner_address: miner_address.as_str().to_string(),
             backing,
-            coinbase_raw,
-            prev_hash: header.prev_hash,
+            coinbase_raw: bitcoin::consensus::serialize(&coinbase),
+            prev_hash: header.prev_blockhash.to_byte_array(),
         });
     }
 }
@@ -224,7 +225,7 @@ async fn jdp_push_distribution_end_to_end() {
         next_id: AtomicU64::new(FIRST_ID),
     });
     hooks.chain_tip = Arc::new(FixedPrevHash);
-    hooks.block_submission_sink = sink.clone();
+    hooks.found_block_sink = sink.clone();
     hooks.allocate_resolver = Arc::new(BaseModeAllocateResolver);
 
     let server = StratumV2JdpServer::spawn(
@@ -443,7 +444,7 @@ async fn jdp_push_distribution_end_to_end() {
             }),
             "the booking must name exactly the validated distribution"
         );
-        // coinbase = prefix + extranonce + suffix, assembled server-side.
+        // coinbase = prefix + extranonce + suffix, as the pool books it.
         let raw = &c.coinbase_raw;
         let plen = coinbase_prefix().len();
         assert_eq!(&raw[..plen], &coinbase_prefix()[..]);
@@ -1710,6 +1711,8 @@ impl DeclaredJobValidator for ClosedSessions {
     async fn validate_declaration(&self, _job: DeclaredJobToValidate<'_>) -> JobVerdict {
         JobVerdict::Accepted
     }
+
+    async fn propagate_solution(&self, _session_id: u32, _solution: &PushSolutionInput) {}
 
     fn session_closed(&self, session_id: u32) {
         self.closed.lock().unwrap().push(session_id);

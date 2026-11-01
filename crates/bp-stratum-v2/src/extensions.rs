@@ -335,11 +335,11 @@ mod tests {
     #[test]
     fn distribution_id_tlv_rejects_malformed() {
         use stratum_core::parsers_sv2::Tlv;
-        let short = Tlv::new(0x0003, 0x01, vec![0x01, 0x02]);
+        let short = Tlv::new(0x0003, 0x01, vec![0x01, 0x02]).unwrap();
         assert_eq!(parse_distribution_id_tlv(&[short]), None);
-        let foreign = Tlv::new(0x0002, 0x01, vec![0u8; 8]);
+        let foreign = Tlv::new(0x0002, 0x01, vec![0u8; 8]).unwrap();
         assert_eq!(parse_distribution_id_tlv(&[foreign]), None);
-        let wrong_field = Tlv::new(0x0003, 0x02, vec![0u8; 8]);
+        let wrong_field = Tlv::new(0x0003, 0x02, vec![0u8; 8]).unwrap();
         assert_eq!(parse_distribution_id_tlv(&[wrong_field]), None);
         assert_eq!(parse_distribution_id_tlv(&[]), None);
     }
@@ -347,7 +347,7 @@ mod tests {
     #[test]
     fn distribution_id_tlv_found_among_others() {
         use stratum_core::parsers_sv2::Tlv;
-        let worker = Tlv::new(0x0002, 0x01, b"rig1".to_vec());
+        let worker = Tlv::new(0x0002, 0x01, b"rig1".to_vec()).unwrap();
         let dist = Tlv::decode(&encode_distribution_id_tlv(7)).unwrap();
         assert_eq!(parse_distribution_id_tlv(&[worker, dist]), Some(7));
     }
@@ -362,6 +362,7 @@ mod tests {
             SV2_FIELD_TYPE_USER_IDENTITY,
             user_identity.as_bytes().to_vec(),
         )
+        .unwrap()
     }
 
     /// The TLV header is LE; see the module doc for the spec's BE example.
@@ -395,7 +396,8 @@ mod tests {
             SV2_EXTENSION_TYPE_WORKER_ID,
             SV2_FIELD_TYPE_USER_IDENTITY,
             vec![0xFF, 0xFE],
-        );
+        )
+        .unwrap();
         assert_eq!(parse_worker_id_tlv(&[not_utf8]), None);
     }
 
@@ -403,14 +405,14 @@ mod tests {
     fn worker_id_tlv_returns_none_when_absent() {
         assert_eq!(parse_worker_id_tlv(&[]), None);
         assert_eq!(
-            parse_worker_id_tlv(&[Tlv::new(0x0099, 0x01, vec![0x42])]),
+            parse_worker_id_tlv(&[Tlv::new(0x0099, 0x01, vec![0x42]).unwrap()]),
             None
         );
     }
 
     #[test]
     fn worker_id_tlv_skips_unknown_leading_tlvs() {
-        let unknown = Tlv::new(0x0099, 0x01, vec![0; 4]);
+        let unknown = Tlv::new(0x0099, 0x01, vec![0; 4]).unwrap();
         assert_eq!(
             parse_worker_id_tlv(&[unknown, worker_tlv("rig42")]),
             Some("rig42")

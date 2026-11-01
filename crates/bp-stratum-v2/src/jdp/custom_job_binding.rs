@@ -23,8 +23,9 @@ pub struct DeclaredJobBinding {
     pub coinbase_tx_locktime: u32,
     /// Over the declared transaction set.
     pub merkle_path: Vec<[u8; 32]>,
-    /// The `PushSolution` rebuild splices the channel's extranonce into this
-    /// gap, so the widths must agree.
+    /// A pushed solution's coinbase is the declared one with the channel's
+    /// extranonce in this gap, both where the pool books the block and where
+    /// the node rebuilds it, so the widths must agree.
     pub extranonce_slot: usize,
 }
 
@@ -113,7 +114,7 @@ pub fn check_custom_job(
     if binding.merkle_path != mined.merkle_path {
         return Err(BindingViolation::MerklePath);
     }
-    // The pool reassembles a found block into the DECLARED gap; another width
+    // A pushed solution's extranonce goes into the DECLARED gap; another width
     // breaks the scriptSig length and the merkle root.
     if binding.extranonce_slot != mined.full_extranonce_size {
         return Err(BindingViolation::ExtranonceSlotWidth);
@@ -188,7 +189,6 @@ mod tests {
             coinbase_tx_prefix,
             coinbase_tx_suffix,
             merkle_path: declared_merkle_path(&raw_transactions),
-            raw_transactions,
             prev_hash: [0xAB; 32],
             declared_at_ms: 1_000,
             booking: None,
@@ -348,8 +348,7 @@ mod tests {
     #[test]
     fn an_undecodable_declared_transaction_projects_to_none() {
         let mut job = declared_job(2);
-        job.raw_transactions[1] = vec![0xFF, 0xFF];
-        job.merkle_path = declared_merkle_path(&job.raw_transactions);
+        job.merkle_path = declared_merkle_path(&[a_transaction(0xA0), vec![0xFF, 0xFF]]);
         assert!(job.merkle_path.is_none());
         assert!(binding_from_declared_job(&job).is_none());
     }

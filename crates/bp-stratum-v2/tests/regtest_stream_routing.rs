@@ -404,7 +404,7 @@ async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>
         loop {
             match read_any_message(&mut reader).await {
                 AnyMessageOwned::Mining(MiningOwned::NewMiningJob(j)) => {
-                    if let Some(t) = j.min_ntime.clone().into_inner() {
+                    if let Some(t) = j.ntime_start.clone().into_inner() {
                         ntime = Some(t);
                     }
                     job = Some((j.channel_id, j.job_id, j.version));
@@ -412,7 +412,7 @@ async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>
                 // A future job carries an empty min_ntime; the activating
                 // SetNewPrevHash supplies it.
                 AnyMessageOwned::Mining(MiningOwned::SetNewPrevHash(p)) => {
-                    ntime = Some(p.min_ntime);
+                    ntime = Some(p.ntime_start);
                 }
                 _ => {}
             }
@@ -464,12 +464,12 @@ async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>
                     // A future job keeps the previous ntime until its
                     // SetNewPrevHash arrives.
                     AnyMessageOwned::Mining(MiningOwned::NewMiningJob(j)) => {
-                        let nt = j.min_ntime.clone().into_inner().unwrap_or(nt);
+                        let nt = j.ntime_start.clone().into_inner().unwrap_or(nt);
                         latest_job = (j.channel_id, j.job_id, j.version, nt);
                     }
                     AnyMessageOwned::Mining(MiningOwned::SetNewPrevHash(p)) => {
                         let (cid, jid, ver, _) = latest_job;
-                        latest_job = (cid, jid, ver, p.min_ntime);
+                        latest_job = (cid, jid, ver, p.ntime_start);
                     }
                     _ => {}
                 }

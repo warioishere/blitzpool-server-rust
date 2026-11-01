@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! The `DeclareMiningJob` → `ProvideMissingTransactions` round-trip: the JDS
-//! needs every declared transaction to rebuild the block on `PushSolution`,
-//! so whatever the template lacks is requested. wtxids are in wire byte order.
+//! The `DeclareMiningJob` → `ProvideMissingTransactions` round-trip: the pool
+//! needs every declared transaction for the declaration's merkle branch, which
+//! identifies a block found on it, so whatever the template lacks is requested.
+//! wtxids are in wire byte order.
 
 use std::collections::HashMap;
 
@@ -55,9 +56,9 @@ impl DeclaredTxs {
             .collect()
     }
 
-    /// The transactions the pool already has, in declaration order.
-    pub fn known(&self) -> Vec<&[u8]> {
-        self.0.iter().filter_map(|(_, tx)| tx.as_deref()).collect()
+    /// Every transaction in declaration order, or `None` while one is missing.
+    pub fn complete(&self) -> Option<Vec<&[u8]>> {
+        self.0.iter().map(|(_, tx)| tx.as_deref()).collect()
     }
 
     /// Every transaction in declaration order, or `self` back when one is missing.
@@ -148,6 +149,7 @@ mod tests {
         template.insert(wtxid(0x02), vec![0xBB]);
         let txs = DeclaredTxs::against_template(&[wtxid(0x02), wtxid(0x01)], &template);
         assert!(txs.missing_positions().is_empty());
+        assert_eq!(txs.complete(), Some(vec![&[0xBB][..], &[0xAA][..]]));
         assert_eq!(txs.into_complete(), Ok(vec![vec![0xBB], vec![0xAA]]));
     }
 
@@ -158,7 +160,7 @@ mod tests {
         let list = [wtxid(0x01), wtxid(0x02), wtxid(0x03), wtxid(0x04)];
         let txs = DeclaredTxs::against_template(&list, &template);
         assert_eq!(txs.missing_positions(), vec![0, 2, 3]);
-        assert_eq!(txs.known(), vec![&[0xBB][..]]);
+        assert!(txs.complete().is_none());
         assert!(txs.into_complete().is_err());
     }
 

@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Per-connection store of accepted JDP declarations, FIFO-bounded at
-//! [`MAX_DECLARED_JOBS`] (each holds ~1–2 MB of raw transactions).
-//! `PushSolution` takes the declaration its header solves at the pool's
-//! target; before the pool has one, [`DeclaredJobStore::match_for_solution`]
-//! picks by `prev_hash`, then most recent.
+//! [`MAX_DECLARED_JOBS`]. `PushSolution` takes the declaration its header
+//! solves at the pool's target.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -13,11 +11,15 @@ use bp_common::AddressId;
 use super::dynamic_outputs::PayoutBooking;
 use crate::tokens::Token;
 
+/// Declarations a found block can still be booked on. A JDC keeps mining a
+/// declaration for a moment after declaring the next, so more than the newest
+/// is kept; the bound keeps a session's store small.
 pub const MAX_DECLARED_JOBS: usize = 3;
 
 // ── DeclaredJob ──────────────────────────────────────────────────────
 
-/// One declared job: everything `PushSolution` needs to rebuild the block.
+/// One declared job: everything `PushSolution` needs to identify and book
+/// the block solved on it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeclaredJob {
     /// The token issued in `DeclareMiningJobSuccess`.
@@ -30,9 +32,7 @@ pub struct DeclaredJob {
     pub coinbase_tx_prefix: Vec<u8>,
     /// Everything after the extranonce slot.
     pub coinbase_tx_suffix: Vec<u8>,
-    /// Witness-serialised, in merkle-leaf order, coinbase excluded.
-    pub raw_transactions: Vec<Vec<u8>>,
-    /// The coinbase's merkle branch over [`Self::raw_transactions`], from
+    /// The coinbase's merkle branch over the declared transactions, from
     /// [`declared_merkle_path`](crate::jdp::custom_job_binding::declared_merkle_path);
     /// `None` when one of them does not decode.
     pub merkle_path: Option<Vec<[u8; 32]>>,
@@ -100,28 +100,7 @@ impl DeclaredJobStore {
         self.jobs.get(new_token)
     }
 
-    /// The most recent job with this `prev_hash`, else the most recent job
-    /// overall (SV2 JDP/PushSolution). `None` only when empty.
-    pub fn match_for_solution(&self, solution_prev_hash: &[u8; 32]) -> Option<&DeclaredJob> {
-        let mut prev_hash_match: Option<&DeclaredJob> = None;
-        let mut overall_recent: Option<&DeclaredJob> = None;
-
-        for job in self.jobs.values() {
-            if &job.prev_hash == solution_prev_hash {
-                match prev_hash_match {
-                    Some(current) if current.declared_at_ms >= job.declared_at_ms => {}
-                    _ => prev_hash_match = Some(job),
-                }
-            }
-            match overall_recent {
-                Some(current) if current.declared_at_ms >= job.declared_at_ms => {}
-                _ => overall_recent = Some(job),
-            }
-        }
-        prev_hash_match.or(overall_recent)
-    }
-
-    /// Oldest first. For tests, which do not know the minted token to `get` by.
+    /// Oldest first.
     pub fn iter(&self) -> impl Iterator<Item = &DeclaredJob> {
         self.order.iter().filter_map(|t| self.jobs.get(t))
     }
@@ -144,7 +123,6 @@ mod tests {
             version: 0x2000_0000,
             coinbase_tx_prefix: vec![0xAA; 8],
             coinbase_tx_suffix: vec![0xBB; 8],
-            raw_transactions: Vec::new(),
             merkle_path: Some(Vec::new()),
             prev_hash,
             declared_at_ms: declared_at,
@@ -209,45 +187,8 @@ mod tests {
         assert!(s.get(&tok(0x02)).is_some());
     }
 
-    // ── match_for_solution ─────────────────────────────────────────
-
     fn ph(byte: u8) -> [u8; 32] {
         [byte; 32]
-    }
-
-    #[test]
-    fn match_for_solution_empty_store_returns_none() {
-        let s = DeclaredJobStore::new();
-        assert!(s.match_for_solution(&ph(0x11)).is_none());
-    }
-
-    #[test]
-    fn match_for_solution_picks_prev_hash_match() {
-        let mut s = DeclaredJobStore::new();
-        s.insert(job(0x01, 1_000, ph(0xAA)));
-        s.insert(job(0x02, 2_000, ph(0xBB)));
-        let matched = s.match_for_solution(&ph(0xAA)).unwrap();
-        assert_eq!(matched.new_token, tok(0x01));
-    }
-
-    #[test]
-    fn match_for_solution_prefers_most_recent_prev_hash_match() {
-        let mut s = DeclaredJobStore::new();
-        s.insert(job(0x01, 1_000, ph(0xAA)));
-        s.insert(job(0x02, 5_000, ph(0xAA)));
-        s.insert(job(0x03, 3_000, ph(0xAA)));
-        let matched = s.match_for_solution(&ph(0xAA)).unwrap();
-        assert_eq!(matched.new_token, tok(0x02));
-    }
-
-    #[test]
-    fn match_for_solution_falls_back_to_most_recent_when_no_prev_hash_match() {
-        let mut s = DeclaredJobStore::new();
-        s.insert(job(0x01, 1_000, ph(0xAA)));
-        s.insert(job(0x02, 5_000, ph(0xBB)));
-        s.insert(job(0x03, 3_000, ph(0xCC)));
-        let matched = s.match_for_solution(&ph(0xFF)).unwrap();
-        assert_eq!(matched.new_token, tok(0x02), "0x02 declared last");
     }
 
     // ── iter ───────────────────────────────────────────────────────

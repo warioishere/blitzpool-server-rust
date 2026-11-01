@@ -11,7 +11,7 @@ name: CI
 # by the integration tests.
 #
 # The bitcoin-core regtests (TDP/JDP/mining/block-submit) self-skip here: they
-# need the SV2-IPC `bitcoin-node` v31 binary, which GitHub runners don't have
+# need the SV2-IPC `bitcoin-node` v32 binary, which GitHub runners don't have
 # (`RegtestConfig::is_available()` is false → the test prints "skipping" and
 # returns). Those run on a self-hosted runner that has the binary.
 on:

@@ -55,7 +55,7 @@ A directed group sharing a hashpower rental. Each member gets a **fixed cut** (b
 
 ### 1. One IPC template stream per payout mode
 
-Blitzpool talks to **bitcoin-core v31 over its Cap'n-Proto IPC socket** (Template Distribution Protocol), not `getblocktemplate` + ZMQ. Each payout mode gets its **own IPC client = its own template stream** from core:
+Blitzpool talks to **bitcoin-core v32 over its Cap'n-Proto IPC socket** (Template Distribution Protocol), not `getblocktemplate` + ZMQ. Each payout mode gets its **own IPC client = its own template stream** from core:
 
 | Stream | Reservation | Serves |
 |---|---|---|
@@ -125,7 +125,7 @@ Routing on connect: **Team Mining membership → Blockparty admin address → th
 
 **[`DEPLOYMENT.md`](DEPLOYMENT.md)** sets up a working Solo pool with Docker
 Compose from [`simple-setup/`](simple-setup/README.md): the only prerequisite
-is Bitcoin Core 31 with its IPC socket, and the compose file can run that node
+is Bitcoin Core 32 with its IPC socket, and the compose file can run that node
 for you. [`full-setup/`](full-setup/README.md) is the four-process layout for
 redeploying single processes. Start from
 [`blitzpool.example.toml`](blitzpool.example.toml) (Solo) and add sections from

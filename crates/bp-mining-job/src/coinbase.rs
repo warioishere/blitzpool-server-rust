@@ -175,8 +175,8 @@ impl MiningJob {
     }
 }
 
-/// Convert a non-witness coinbase into the BIP-141 witness form `submitblock`
-/// expects (marker + flag after `version`, the 32-zero reserved value before
+/// Convert a non-witness coinbase into the BIP-141 witness form a block carries
+/// (marker + flag after `version`, the 32-zero reserved value before
 /// `locktime`). The one implementation, shared by SV1
 /// ([`MiningJob::witness_coinbase_with_extranonce`]), SV2 and JDP.
 pub fn assemble_witness_coinbase(stratum_coinbase: &[u8]) -> Vec<u8> {

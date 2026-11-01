@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! JDP server wiring: one listener on `[sv2].jdp_port`, no protocol detection.
-//! The [`TemplateTxCache`]-backed tx provider runs only with
-//! `[sv2].jdp_orphan_submitblock = true`, the one case that needs the declared
-//! tx bytes.
+//! The [`TemplateTxCache`]-backed tx provider supplies the declared transactions
+//! the pool's own templates carry, so a JDC need not send them.
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use bp_bitcoin::BitcoinRpc;
 use bp_common::AddressId;
 use bp_config::AppConfig;
 use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
@@ -85,9 +83,8 @@ pub(crate) async fn spawn(
     cfg: &AppConfig,
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
     tdp: TdpHandle,
-    bitcoin_rpc: BitcoinRpc,
     payout_resolver: Arc<ProductionPayoutResolver>,
-    template_tx_cache: Option<Arc<TemplateTxCache>>,
+    template_tx_cache: Arc<TemplateTxCache>,
     // Books a JDC-found block against the distribution its coinbase paid.
     ledger_booker: Arc<crate::block_sink::TdpBlockSubmissionSink>,
     // Allocates the strictly-increasing `distribution_id` (ext 0x0003/SetPayoutDistribution).
@@ -128,7 +125,8 @@ pub(crate) async fn spawn(
         .map_err(JdpSpawnError::ValidationSocket)?,
         None => {
             info!(
-                "jdp: declared jobs are NOT validated against bitcoin-core \
+                "jdp: declared jobs are NOT validated against bitcoin-core and pushed \
+                 solutions are NOT propagated by the pool, only by the JDC \
                  (set `[sv2].jdp_validation_socket_path` to enable, SV2 JDP/Job Declarator Server)"
             );
             None
@@ -137,11 +135,9 @@ pub(crate) async fn spawn(
 
     let hooks = build_jdp_hooks(
         tdp,
-        bitcoin_rpc,
         payout_resolver,
         template_tx_cache,
         network,
-        cfg.sv2.jdp_orphan_submitblock,
         ledger_booker,
         distribution_source,
         settle.clone(),

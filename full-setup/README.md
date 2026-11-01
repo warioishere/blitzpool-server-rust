@@ -30,7 +30,7 @@ the same host port numbers.
   builds the schema itself at boot — see *Schema sync* below.
 - **redis** — `valkey/valkey:8-alpine` with AOF + `everysec` fsync,
   `volatile-lru` eviction.
-- **bitcoin-{mainnet,testnet4,regtest}** — Bitcoin Core 31's
+- **bitcoin-{mainnet,testnet4,regtest}** — Bitcoin Core 32's
   multi-process build (`libexec/bitcoin-node`). Per-network
   Dockerfile under `docker/bitcoin/`.
 - **blitzpool-{core,api,payout,notify}** — the Rust pool, built once
@@ -51,8 +51,8 @@ the same host port numbers.
   per-template hot path. Only the `core` process mounts it.
 - **JSON-RPC** over the internal docker network (`http://bitcoin:8332`
   etc.). Used for one-shot calls: `getblockchaininfo` (PPLNS window
-  size needs current network difficulty), `submitblock` (fallback +
-  JDP orphan path), chain-tip stale-detection reads.
+  size needs current network difficulty), chain-tip stale-detection
+  reads.
 
 ## First-run checklist
 
@@ -80,7 +80,7 @@ docker compose --profile mainnet up -d --build
 #    testnet4 / regtest point BLITZPOOL_CONFIG at their config:
 BLITZPOOL_CONFIG=blitzpool-regtest.toml docker compose --profile regtest up -d --build
 
-# First build pulls Core 31 (~70 MB) + compiles the Rust workspace
+# First build pulls Core 32 (~94 MB) + compiles the Rust workspace
 # (~10-15 min the first time; cargo-chef caches deps so subsequent
 # builds are seconds). All four pool processes share the one image.
 
