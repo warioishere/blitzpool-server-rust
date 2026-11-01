@@ -12,7 +12,9 @@ use serde::Deserialize;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::command::{parse_command, Command, CommandHandler, PlainMessage, Transport};
+use crate::command::{
+    parse_command, Command, CommandHandler, GroupSender, PlainMessage, Transport,
+};
 
 #[derive(Debug, Clone)]
 pub struct TelegramListenerConfig {
@@ -192,6 +194,7 @@ async fn process_update(
         if let Some(text) = message.text.as_deref() {
             let chat_id = message.chat.id;
             let thread_id = message.topic();
+            let group = message.group_sender();
             if let Some(code) = message.from.and_then(|u| u.language_code) {
                 handler
                     .chat_languages()
@@ -203,16 +206,14 @@ async fn process_update(
                 let plain = PlainMessage {
                     chat_id,
                     thread_id,
-                    private: message.chat.kind == "private",
+                    group,
                     reply_to: message.reply_to_message.as_ref().map(|m| m.message_id),
                 };
                 if handler.answer_telegram_question(plain, text).await {
                     return Some(next_offset);
                 }
             }
-            let Some(command) =
-                command_for_this_bot(text, message.chat.kind == "private", bot_username)
-            else {
+            let Some(command) = command_for_this_bot(text, group.is_none(), bot_username) else {
                 return Some(next_offset);
             };
             debug!(
@@ -221,7 +222,11 @@ async fn process_update(
                 ?command,
                 "incoming command"
             );
-            let transport = Transport::Telegram { chat_id, thread_id };
+            let transport = Transport::Telegram {
+                chat_id,
+                thread_id,
+                group,
+            };
             handler.dispatch(&transport, &command).await;
         }
     }
@@ -234,12 +239,24 @@ async fn process_update(
         );
         // The handler answers the query (stops the spinner) and runs the
         // matching inline-keyboard flow via the Telegram adapter.
-        let (chat_id, message_id) = match callback.message {
-            Some(m) => (Some(m.chat.id), Some(m.message_id)),
-            None => (None, None),
+        let (chat_id, message_id, group) = match &callback.message {
+            Some(m) => (
+                Some(m.chat.id),
+                Some(m.message_id),
+                m.chat
+                    .is_group()
+                    .then_some(GroupSender::User(callback.from.id)),
+            ),
+            None => (None, None, None),
         };
         handler
-            .handle_telegram_callback(&callback.id, chat_id, message_id, callback.data.as_deref())
+            .handle_telegram_callback(
+                &callback.id,
+                chat_id,
+                message_id,
+                group,
+                callback.data.as_deref(),
+            )
             .await;
     }
     Some(next_offset)
@@ -277,9 +294,27 @@ struct Message {
     message_thread_id: Option<i64>,
     #[serde(default)]
     is_topic_message: bool,
+    /// The chat a message was sent on behalf of: the group itself for its
+    /// anonymous administrators.
+    #[serde(default)]
+    sender_chat: Option<Chat>,
 }
 
 impl Message {
+    /// Who sent it, in a group; `None` in a private chat.
+    fn group_sender(&self) -> Option<GroupSender> {
+        if !self.chat.is_group() {
+            return None;
+        }
+        if self.sender_chat.as_ref().map(|c| c.id) == Some(self.chat.id) {
+            return Some(GroupSender::AnonymousAdmin);
+        }
+        Some(match (&self.sender_chat, &self.from) {
+            (None, Some(user)) => GroupSender::User(user.id),
+            _ => GroupSender::OtherChat,
+        })
+    }
+
     /// The forum topic the message was sent in. `message_thread_id` can also
     /// name a reply thread, which `sendMessage` does not take as a target.
     fn topic(&self) -> Option<i64> {
@@ -298,6 +333,7 @@ struct RepliedTo {
 
 #[derive(Debug, Deserialize)]
 struct User {
+    id: i64,
     #[serde(default)]
     language_code: Option<String>,
 }
@@ -310,9 +346,17 @@ struct Chat {
     kind: String,
 }
 
+impl Chat {
+    fn is_group(&self) -> bool {
+        matches!(self.kind.as_str(), "group" | "supergroup")
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct CallbackQuery {
     id: String,
+    /// Who tapped.
+    from: User,
     #[serde(default)]
     data: Option<String>,
     /// The message the inline keyboard is attached to — carries the
@@ -333,6 +377,39 @@ mod tests {
 
     fn message(json: &str) -> Message {
         serde_json::from_str(json).unwrap()
+    }
+
+    /// The sender in a group: a user, the group's anonymous admin, or
+    /// another chat such as a linked channel; none in a private chat.
+    #[test]
+    fn a_group_message_names_its_sender() {
+        let group = r#""chat":{"id":-100,"type":"supergroup"},"text":"/subscribe""#;
+        let cases = [
+            (
+                format!(r#"{{{group},"from":{{"id":7}}}}"#),
+                Some(GroupSender::User(7)),
+            ),
+            (
+                format!(
+                    r#"{{{group},"from":{{"id":1087968824}},"sender_chat":{{"id":-100,"type":"supergroup"}}}}"#
+                ),
+                Some(GroupSender::AnonymousAdmin),
+            ),
+            (
+                format!(
+                    r#"{{{group},"from":{{"id":777000}},"sender_chat":{{"id":-200,"type":"channel"}}}}"#
+                ),
+                Some(GroupSender::OtherChat),
+            ),
+            (
+                r#"{"chat":{"id":7,"type":"private"},"from":{"id":7},"text":"/subscribe"}"#
+                    .to_string(),
+                None,
+            ),
+        ];
+        for (json, sender) in cases {
+            assert_eq!(message(&json).group_sender(), sender, "{json}");
+        }
     }
 
     /// In a group only commands for this bot get an answer: chat, unknown

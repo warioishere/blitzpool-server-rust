@@ -808,6 +808,36 @@ pub async fn update_telegram_sub_block_flag(
     Ok(result.rows_affected())
 }
 
+/// Leave a subscription only the notices a Team or Blockparty brings
+/// (blocks and the Team round best): a group follows an address for those,
+/// not for the notices about its owner's miners.
+pub async fn keep_telegram_group_notices_only(
+    pool: &PgPool,
+    telegram_chat_id: i64,
+    address: &AddressId,
+) -> Result<u64, DbError> {
+    let now_ms: i64 = chrono::Utc::now().timestamp_millis();
+    let result = sqlx::query!(
+        r#"UPDATE telegram_subscriptions_entity
+           SET "bestDiffNotificationsEnabled" = false,
+               "deviceNotificationsEnabled" = false,
+               "hourlyStatsEnabled" = false,
+               "hourlyWorkersEnabled" = false,
+               "groupAdminNotificationsEnabled" = false,
+               "updatedAt" = $3
+           WHERE "telegramChatId" = $1
+             AND address = $2
+             AND "deletedAt" IS NULL"#,
+        telegram_chat_id,
+        address.as_str(),
+        now_ms,
+    )
+    .execute(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(result.rows_affected())
+}
+
 /// Toggle the per-subscription `teamBestNotificationsEnabled` flag.
 pub async fn update_telegram_sub_team_best_flag(
     pool: &PgPool,

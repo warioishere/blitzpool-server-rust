@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE telegram_subscriptions_entity\n           SET \"bestDiffNotificationsEnabled\" = false,\n               \"deviceNotificationsEnabled\" = false,\n               \"hourlyStatsEnabled\" = false,\n               \"hourlyWorkersEnabled\" = false,\n               \"groupAdminNotificationsEnabled\" = false,\n               \"updatedAt\" = $3\n           WHERE \"telegramChatId\" = $1\n             AND address = $2\n             AND \"deletedAt\" IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3580dc7ded1a24b74f75500f2998ac9a43cc81a820ed366f906b0884e97cfd63"
+}

@@ -8,9 +8,10 @@ use std::sync::Arc;
 use bitcoin::Network;
 use bp_common::AddressId;
 use bp_db::{
-    delete_ntfy_subscription_by_address, delete_telegram_subscription_by_chat_address, find_group,
-    find_group_member_by_address, find_ntfy_subscription_by_address,
-    find_telegram_subscriptions_by_chat, promote_telegram_default_if_none,
+    delete_ntfy_subscription_by_address, delete_telegram_subscription_by_chat_address,
+    find_address_settings, find_group, find_group_member_by_address,
+    find_ntfy_subscription_by_address, find_telegram_subscriptions_by_chat,
+    keep_telegram_group_notices_only, promote_telegram_default_if_none,
     set_telegram_default_subscription, set_telegram_hourly_flags, update_ntfy_sub_best_diff_flag,
     update_ntfy_sub_device_flag, update_ntfy_sub_group_admin_flag, update_ntfy_sub_hourly_flags,
     update_ntfy_sub_language, update_ntfy_sub_team_best_flag, update_telegram_sub_best_diff_flag,
@@ -26,10 +27,12 @@ use super::chat_language::ChatLanguages;
 use super::encrypted_address::{
     looks_encrypted, open_encrypted_address, EncryptedAddressError, MessageKey,
 };
+use super::group::{group_access, GroupAccess, GroupSender};
 use super::parser::{
     parse_address_callback, parse_settings_callback, AddressCallback, Command, FlagToggle,
     LanguageSwitch, ReadCommand, SettingsCallback, SettingsField, Switch,
 };
+use super::read::Viewer;
 use crate::adapter::{
     AdapterError, AdapterResult, InlineButton, InlineKeyboard, NtfyAdapter, TelegramAdapter,
 };
@@ -41,11 +44,13 @@ use bp_common::short_address;
 /// reply-sink: handler dispatches reply text to the matching adapter.
 #[derive(Debug, Clone)]
 pub enum Transport {
-    /// A Telegram chat, and the forum topic the command came from
-    /// (`None`: the main topic), where the answer goes.
+    /// A Telegram chat, the forum topic the command came from (`None`: the
+    /// main topic), where the answer goes, and in a group who sent it
+    /// (`None`: a private chat).
     Telegram {
         chat_id: i64,
         thread_id: Option<i64>,
+        group: Option<GroupSender>,
     },
     Ntfy {
         address: AddressId,
@@ -68,8 +73,8 @@ pub struct PlainMessage {
     pub chat_id: i64,
     /// The forum topic it was sent in; `None` is the main topic.
     pub thread_id: Option<i64>,
-    /// A one-to-one chat with the bot.
-    pub private: bool,
+    /// Who sent it in a group; `None` in a private chat.
+    pub group: Option<GroupSender>,
     /// The message this one replies to.
     pub reply_to: Option<i64>,
 }
@@ -197,7 +202,9 @@ impl CommandHandler {
 
     async fn reply(&self, transport: &Transport, text: &str) -> AdapterResult<()> {
         match transport {
-            Transport::Telegram { chat_id, thread_id } => match &self.telegram {
+            Transport::Telegram {
+                chat_id, thread_id, ..
+            } => match &self.telegram {
                 Some(adapter) => adapter.send_html(*chat_id, *thread_id, text).await,
                 None => Err(AdapterError::Config(
                     "telegram adapter not configured".into(),
@@ -215,20 +222,46 @@ impl CommandHandler {
     /// formats reply, and pushes via the matching adapter.
     pub async fn dispatch(&self, transport: &Transport, command: &Command) {
         let lang = self.language(transport).await;
+        if let Transport::Telegram {
+            chat_id,
+            group: Some(sender),
+            ..
+        } = transport
+        {
+            let refusal = match group_access(command) {
+                GroupAccess::Anyone => None,
+                GroupAccess::Admin => self.group_admin(*chat_id, *sender).await.refusal(lang),
+                GroupAccess::PrivateOnly => Some(private_only_text(lang)),
+            };
+            if let Some(text) = refusal {
+                if let Err(e) = self.reply(transport, text).await {
+                    warn!(target: "bp_notifications::command", error = %e, "group refusal: send");
+                }
+                return;
+            }
+        }
         // Telegram inline-keyboard commands send their own message (with a
         // `reply_markup`) instead of a plain-text reply.
-        if let Transport::Telegram { chat_id, thread_id } = transport {
+        if let Transport::Telegram {
+            chat_id,
+            thread_id,
+            group,
+        } = transport
+        {
+            let in_group = group.is_some();
             match command {
                 Command::ShowAddresses | Command::Remove { address: None } => {
                     self.send_address_keyboard(*chat_id, *thread_id, lang).await;
                     return;
                 }
                 Command::Settings(switch) => {
-                    self.send_settings(*chat_id, *thread_id, lang, *switch)
+                    self.send_settings(*chat_id, *thread_id, in_group, lang, *switch)
                         .await;
                     return;
                 }
-                Command::Subscribe { address: None } => {
+                // A group gets the usage line, not a question every member
+                // could answer with an address of their own.
+                Command::Subscribe { address: None } if !in_group => {
                     self.ask_for_address(*chat_id, *thread_id, lang).await;
                     return;
                 }
@@ -237,11 +270,15 @@ impl CommandHandler {
         }
         let reply = match command {
             Command::Start => self.handle_start(transport, lang).await,
-            Command::Help => super::help_text(lang),
+            Command::Help => super::help_text(lang, is_group(transport)),
             Command::Subscribe {
                 address: Some(address),
             } => self.handle_subscribe(transport, lang, address).await,
-            // Telegram asks for the address above (early return).
+            // A private Telegram chat is asked for the address above (early
+            // return); a group and ntfy get the usage line.
+            Command::Subscribe { address: None } if is_group(transport) => {
+                group_subscribe_usage_text(lang).to_string()
+            }
             Command::Subscribe { address: None } => subscribe_usage_text(lang).to_string(),
             Command::Remove {
                 address: Some(address),
@@ -393,11 +430,14 @@ impl CommandHandler {
     }
 
     /// A plain message that answers the chat's open `/subscribe` question
-    /// subscribes the address it carries. In a private chat that is the
-    /// next plain message, a reply or not; in a group only a reply to the
-    /// question, so ordinary chat is not taken for an address. `false` when
-    /// the message answers no open question.
+    /// subscribes the address it carries: the next plain message, unless it
+    /// replies to another one. A group is never asked (see [`Self::dispatch`]),
+    /// so there no message answers. `false` when the message answers no open
+    /// question.
     pub async fn answer_telegram_question(&self, message: PlainMessage, text: &str) -> bool {
+        if message.group.is_some() {
+            return false;
+        }
         let now = chrono::Utc::now().timestamp_millis();
         let mut open = self.subscribe_questions.lock().await;
         let Some(question) = open.get(&message.chat_id).copied() else {
@@ -405,7 +445,7 @@ impl CommandHandler {
         };
         let answers = match message.reply_to {
             Some(id) => id == question.message_id,
-            None => message.private,
+            None => true,
         };
         if !answers || question.expires_at_ms <= now {
             return false;
@@ -418,6 +458,7 @@ impl CommandHandler {
             &Transport::Telegram {
                 chat_id: message.chat_id,
                 thread_id: message.thread_id,
+                group: message.group,
             },
             &command,
         )
@@ -427,16 +468,28 @@ impl CommandHandler {
 
     /// Entry point for a Telegram `callback_query` (inline-button tap),
     /// dispatched by its prefix. Always answers the query.
+    /// In a group only an administrator's tap changes anything.
     pub async fn handle_telegram_callback(
         &self,
         callback_id: &str,
         chat_id: Option<i64>,
         message_id: Option<i64>,
+        group: Option<GroupSender>,
         data: Option<&str>,
     ) {
         let Some(adapter) = self.telegram.as_ref() else {
             return;
         };
+        if let (Some(chat_id), Some(sender)) = (chat_id, group) {
+            let lang = self.chat_languages.get(chat_id).await;
+            if let Some(refusal) = self.group_admin(chat_id, sender).await.refusal(lang) {
+                let _ = adapter
+                    .answer_callback_query(callback_id, Some(refusal))
+                    .await;
+                return;
+            }
+        }
+        let in_group = group.is_some();
         if let (Some(chat_id), Some(message_id), Some(data)) = (chat_id, message_id, data) {
             if let Some(cb) = parse_address_callback(data) {
                 self.handle_address_callback(adapter, callback_id, chat_id, message_id, cb)
@@ -444,8 +497,15 @@ impl CommandHandler {
                 return;
             }
             if let Some(cb) = parse_settings_callback(data) {
-                self.handle_settings_callback(adapter, callback_id, chat_id, message_id, cb)
-                    .await;
+                self.handle_settings_callback(
+                    adapter,
+                    callback_id,
+                    chat_id,
+                    message_id,
+                    in_group,
+                    cb,
+                )
+                .await;
                 return;
             }
         }
@@ -566,6 +626,7 @@ impl CommandHandler {
         subs: &[TelegramSubscriptionRow],
         lang: Language,
         roles: &TeamRoles,
+        in_group: bool,
     ) -> (String, InlineKeyboard) {
         let mut sorted: Vec<&TelegramSubscriptionRow> = subs.iter().collect();
         sorted.sort_by_key(|s| s.id);
@@ -589,7 +650,7 @@ impl CommandHandler {
             };
             let fields: Vec<SettingsField> = SettingsField::ALL
                 .into_iter()
-                .filter(|f| roles.offers(*f, &sub.address))
+                .filter(|f| roles.offers(*f, &sub.address) && (!in_group || group_notice(*f)))
                 .collect();
             for row in fields.chunks(3) {
                 keyboard.push(row.iter().map(|field| button(*field)).collect());
@@ -616,6 +677,7 @@ impl CommandHandler {
         &self,
         chat_id: i64,
         thread_id: Option<i64>,
+        in_group: bool,
         lang: Language,
         switch: Option<Switch>,
     ) {
@@ -653,7 +715,7 @@ impl CommandHandler {
             let _ = adapter.send_html(chat_id, thread_id, refusal).await;
             return;
         }
-        let (text, keyboard) = Self::build_settings_keyboard(&subs, lang, &roles);
+        let (text, keyboard) = Self::build_settings_keyboard(&subs, lang, &roles, in_group);
         if let Err(e) = adapter
             .send_message_with_keyboard(chat_id, thread_id, &text, &keyboard)
             .await
@@ -668,6 +730,7 @@ impl CommandHandler {
         callback_id: &str,
         chat_id: i64,
         message_id: i64,
+        in_group: bool,
         cb: SettingsCallback,
     ) {
         let lang = self.chat_languages.get(chat_id).await;
@@ -699,6 +762,13 @@ impl CommandHandler {
             }
             SettingsCallback::Flip(_, field) => field,
         };
+        // A keyboard from before a group could show only its switches.
+        if in_group && !group_notice(field) {
+            let _ = adapter
+                .answer_callback_query(callback_id, Some(stale_button_text(lang)))
+                .await;
+            return;
+        }
         let value = !settings_field_value(sub, field);
         if let Err(e) = set_telegram_field(&self.pool, chat_id, sub, field, value).await {
             warn!(target: "bp_notifications::command", error = %e, "settings callback: update");
@@ -713,7 +783,7 @@ impl CommandHandler {
             .unwrap_or_default();
         let addresses: Vec<AddressId> = fresh.iter().map(|s| s.address.clone()).collect();
         let roles = self.team_roles(&addresses).await.unwrap_or_default();
-        let (text, keyboard) = Self::build_settings_keyboard(&fresh, lang, &roles);
+        let (text, keyboard) = Self::build_settings_keyboard(&fresh, lang, &roles, in_group);
         if let Err(e) = adapter
             .edit_message_text(chat_id, message_id, &text, Some(&keyboard))
             .await
@@ -797,6 +867,9 @@ impl CommandHandler {
     /// has any. A Telegram chat without one is told to `/subscribe`; an
     /// ntfy topic already is its address.
     async fn handle_start(&self, transport: &Transport, lang: Language) -> String {
+        if is_group(transport) {
+            return group_welcome_text(lang);
+        }
         let subscribed: Vec<AddressId> = match transport {
             Transport::Telegram { chat_id, .. } => {
                 find_telegram_subscriptions_by_chat(&self.pool, *chat_id)
@@ -860,10 +933,29 @@ impl CommandHandler {
             Err(reply) => return reply,
         };
         match transport {
-            Transport::Telegram { chat_id, thread_id } => {
-                match upsert_telegram_subscription(&self.pool, *chat_id, *thread_id, &address).await
-                {
-                    Ok(_) => subscribe_ok_text(lang, &address).to_string(),
+            Transport::Telegram {
+                chat_id,
+                thread_id,
+                group,
+            } => {
+                let subscribed = async {
+                    upsert_telegram_subscription(&self.pool, *chat_id, *thread_id, &address)
+                        .await?;
+                    // A group follows the Team or Blockparty, and cannot switch
+                    // notices about the owner's miners off again.
+                    if group.is_some() {
+                        keep_telegram_group_notices_only(&self.pool, *chat_id, &address).await?;
+                    }
+                    Ok::<_, bp_db::DbError>(())
+                }
+                .await;
+                match subscribed {
+                    Ok(()) if group.is_some() && self.has_mined(&address).await => format!(
+                        "{}\n\n{}",
+                        subscribe_ok_text(lang, &address),
+                        mining_address_in_group_text(lang)
+                    ),
+                    Ok(()) => subscribe_ok_text(lang, &address).to_string(),
                     Err(e) => {
                         warn!(target: "bp_notifications::command", error = %e, "telegram subscribe");
                         db_error_text(lang).to_string()
@@ -1102,6 +1194,11 @@ impl CommandHandler {
     ) -> String {
         let address = || self.target_address(transport, lang, arg);
         let redis = self.redis.as_ref();
+        let viewer = if is_group(transport) {
+            Viewer::Group
+        } else {
+            Viewer::Owner
+        };
         let result = match read {
             ReadCommand::PoolHashrate => Ok(super::read::build_pool_hashrate(redis, lang).await),
             ReadCommand::Difficulty => Ok(super::read::build_current_difficulty(lang).await),
@@ -1121,13 +1218,16 @@ impl CommandHandler {
                 Err(reply) => Err(reply),
             },
             ReadCommand::TeamHistory => match address().await {
-                Ok(addr) => Ok(super::read::build_group_history(&self.pool, lang, &addr).await),
+                Ok(addr) => {
+                    Ok(super::read::build_group_history(&self.pool, lang, &addr, viewer).await)
+                }
                 Err(reply) => Err(reply),
             },
             ReadCommand::BlockpartyStatus => match address().await {
-                Ok(addr) => {
-                    Ok(super::read::build_blockparty_status(&self.pool, redis, lang, &addr).await)
-                }
+                Ok(addr) => Ok(super::read::build_blockparty_status(
+                    &self.pool, redis, lang, &addr, viewer,
+                )
+                .await),
                 Err(reply) => Err(reply),
             },
             ReadCommand::PplnsStatus => match (&self.pplns_engine, address().await) {
@@ -1141,19 +1241,54 @@ impl CommandHandler {
                 (None, _) => Err(engine_unconfigured_text(lang, team_mining_name(lang))),
                 (Some(_), Err(reply)) => Err(reply),
                 (Some(engine), Ok(addr)) => Ok(super::read::build_group_status(
-                    &self.pool, redis, engine, lang, &addr,
+                    &self.pool, redis, engine, lang, &addr, viewer,
                 )
                 .await),
             },
             ReadCommand::TeamMembers => match (&self.group_solo_engine, address().await) {
                 (None, _) => Err(engine_unconfigured_text(lang, team_mining_name(lang))),
                 (Some(_), Err(reply)) => Err(reply),
-                (Some(engine), Ok(addr)) => {
-                    Ok(super::read::build_group_members(&self.pool, engine, lang, &addr).await)
-                }
+                (Some(engine), Ok(addr)) => Ok(super::read::build_group_members(
+                    &self.pool, engine, lang, &addr, viewer,
+                )
+                .await),
             },
         };
         result.unwrap_or_else(|reply| reply)
+    }
+
+    /// Whether `address` has mined here: the share statistics are the only
+    /// writer of its `address_settings` row.
+    async fn has_mined(&self, address: &AddressId) -> bool {
+        match find_address_settings(&self.pool, address).await {
+            Ok(row) => row.is_some(),
+            Err(e) => {
+                warn!(target: "bp_notifications::command", error = %e, "address settings read");
+                false
+            }
+        }
+    }
+
+    /// Whether `sender` administers the group `chat_id`. Without an answer
+    /// from Telegram the change waits: [`AdminCheck::Unknown`] allows
+    /// nothing.
+    async fn group_admin(&self, chat_id: i64, sender: GroupSender) -> AdminCheck {
+        let user_id = match sender {
+            GroupSender::AnonymousAdmin => return AdminCheck::Admin,
+            GroupSender::OtherChat => return AdminCheck::NotAdmin,
+            GroupSender::User(id) => id,
+        };
+        let Some(adapter) = self.telegram.as_ref() else {
+            return AdminCheck::Unknown;
+        };
+        match adapter.is_chat_admin(chat_id, user_id).await {
+            Ok(true) => AdminCheck::Admin,
+            Ok(false) => AdminCheck::NotAdmin,
+            Err(e) => {
+                warn!(target: "bp_notifications::command", error = %e, chat_id, "group admin check");
+                AdminCheck::Unknown
+            }
+        }
     }
 
     /// Which of the given addresses are a member of a Team that is not
@@ -1227,6 +1362,45 @@ impl CommandHandler {
                 .map(|s| s.address.clone())
                 .ok_or_else(|| no_default_text(lang).to_string()),
         }
+    }
+}
+
+/// What Telegram says about a group member's role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdminCheck {
+    Admin,
+    NotAdmin,
+    /// Telegram did not answer; it answers reliably only when the bot is
+    /// an admin of the group itself.
+    Unknown,
+}
+
+impl AdminCheck {
+    /// The reply to an admin-only command, `None` for an admin.
+    fn refusal(self, lang: Language) -> Option<&'static str> {
+        match self {
+            AdminCheck::Admin => None,
+            AdminCheck::NotAdmin => Some(group_admin_only_text(lang)),
+            AdminCheck::Unknown => Some(admin_unknown_text(lang)),
+        }
+    }
+}
+
+/// A command from a Telegram group.
+fn is_group(transport: &Transport) -> bool {
+    matches!(transport, Transport::Telegram { group: Some(_), .. })
+}
+
+/// The switches a group's `/settings` shows: what a Team or Blockparty
+/// brings, not the notices about one's own miners.
+fn group_notice(field: SettingsField) -> bool {
+    match field {
+        SettingsField::Blocks | SettingsField::TeamBest => true,
+        SettingsField::BestDiff
+        | SettingsField::Device
+        | SettingsField::TeamRequests
+        | SettingsField::HourlyStats
+        | SettingsField::HourlyWorkers => false,
     }
 }
 
@@ -1390,6 +1564,38 @@ fn subscribe_usage_text(lang: Language) -> &'static str {
     }
 }
 
+/// The address a group should follow: a Team member that does not mine,
+/// so no miner's address stands in the group.
+fn group_subscribe_usage_text(lang: Language) -> &'static str {
+    match lang {
+        Language::De => {
+            "Schick /subscribe ADRESSE. Am besten eine Adresse, die nicht mined und \
+             nur Mitglied des Teams oder der Blockparty ist: Die Gruppe bekommt damit \
+             die Blöcke und Team-Bestwerte, ohne dass die Adresse eines Miners hier steht."
+        }
+        Language::En => {
+            "Send /subscribe ADDRESS. Best use an address that does not mine and is only \
+             a member of the Team or Blockparty: the group gets the blocks and Team bests \
+             through it, and no miner's address stands here."
+        }
+    }
+}
+
+fn mining_address_in_group_text(lang: Language) -> &'static str {
+    match lang {
+        Language::De => {
+            "Hinweis: Diese Adresse mined bei uns, und jetzt steht sie in der Gruppe. \
+             Besser ist eine Adresse, die nicht mined und nur Mitglied des Teams oder \
+             der Blockparty ist. Mit /remove nimmst du diese wieder heraus."
+        }
+        Language::En => {
+            "Note: this address mines here, and now it stands in the group. Better is \
+             an address that does not mine and is only a member of the Team or \
+             Blockparty. /remove takes this one out again."
+        }
+    }
+}
+
 fn remove_usage_text(lang: Language) -> &'static str {
     match lang {
         Language::De => "Schick /remove mit der Adresse, z.B. /remove bc1q...",
@@ -1449,6 +1655,61 @@ fn encrypted_address_text(lang: Language, error: EncryptedAddressError) -> Strin
         }
     };
     text.to_string()
+}
+
+fn group_admin_only_text(lang: Language) -> &'static str {
+    match lang {
+        Language::De => "Das darf in dieser Gruppe nur ein Admin der Gruppe.",
+        Language::En => "Only an admin of this group can do that here.",
+    }
+}
+
+fn admin_unknown_text(lang: Language) -> &'static str {
+    match lang {
+        Language::De => {
+            "Ich kann gerade nicht prüfen, ob du Admin der Gruppe bist. Mach mich zum \
+             Admin der Gruppe oder schreib als anonymer Admin."
+        }
+        Language::En => {
+            "I cannot check right now whether you are an admin of this group. Make me \
+             an admin of the group, or post as an anonymous admin."
+        }
+    }
+}
+
+fn private_only_text(lang: Language) -> &'static str {
+    match lang {
+        Language::De => {
+            "In Gruppen gibt es nur Team- und Blockparty-Befehle. Alles zu deiner \
+             eigenen Adresse schreib mir privat."
+        }
+        Language::En => {
+            "In groups I only do Team and Blockparty commands. For your own address, \
+             message me privately."
+        }
+    }
+}
+
+fn group_welcome_text(lang: Language) -> String {
+    match lang {
+        Language::De => format!(
+            "{}\n\nIn dieser Gruppe zeige ich Team- und Blockparty-Status und melde \
+             Blöcke des Teams bzw. der Blockparty und neue Bestwerte des Teams. Welche \
+             Adresse die Gruppe verfolgt, legt ein Admin der Gruppe mit \
+             /subscribe ADRESSE fest, am besten eine Adresse, die nicht mined und nur \
+             Mitglied des Teams ist. Für deine eigene Adresse \
+             schreib mir privat. /help zeigt die Befehle hier.",
+            html::bold("Blitz Pool")
+        ),
+        Language::En => format!(
+            "{}\n\nIn this group I show Team and Blockparty status and report the \
+             blocks of the Team or Blockparty and the Team's new bests. A group admin \
+             sets the address the group follows with /subscribe ADDRESS, best one that \
+             does not mine and is only a member of the Team. For your own address, message me privately. \
+             /help lists the commands here.",
+            html::bold("Blitz Pool")
+        ),
+    }
 }
 
 fn no_team_admin_text(lang: Language) -> &'static str {
@@ -1696,10 +1957,18 @@ mod tests {
                 language_switch_ok_text(lang).to_string(),
                 engine_unconfigured_text(lang, "PPLNS"),
                 CommandHandler::build_address_keyboard(&subs, lang).0,
-                CommandHandler::build_settings_keyboard(&subs, lang, &TeamRoles::default()).0,
+                CommandHandler::build_settings_keyboard(&subs, lang, &TeamRoles::default(), false)
+                    .0,
                 no_team_admin_text(lang).to_string(),
                 no_team_member_text(lang).to_string(),
-                super::super::help_text(lang),
+                super::super::help_text(lang, false),
+                super::super::help_text(lang, true),
+                group_admin_only_text(lang).to_string(),
+                admin_unknown_text(lang).to_string(),
+                group_subscribe_usage_text(lang).to_string(),
+                mining_address_in_group_text(lang).to_string(),
+                private_only_text(lang).to_string(),
+                group_welcome_text(lang),
             ];
             for switch in [
                 Switch::BestDiff,
@@ -1798,7 +2067,8 @@ mod tests {
             members: HashSet::from([second.clone()]),
             admins: HashSet::from([second]),
         };
-        let (_text, kb) = CommandHandler::build_settings_keyboard(&subs, Language::En, &roles);
+        let (_text, kb) =
+            CommandHandler::build_settings_keyboard(&subs, Language::En, &roles, false);
         // Per address: the address row and its switches, three a row,
         // ordered by id.
         assert_eq!(kb.len(), 7);
@@ -1852,6 +2122,7 @@ mod tests {
         let transport = Transport::Telegram {
             chat_id,
             thread_id: None,
+            group: None,
         };
         let handler = CommandHandler::new(pool.clone(), Network::Bitcoin, None, None);
         let (a, b, c) = ("bc1qremovetesta", "bc1qremovetestb", "bc1qremovetestc");
@@ -2051,6 +2322,160 @@ mod tests {
         delete_topics().await.unwrap();
     }
 
+    /// In a group only an admin subscribes an address; a member is told so
+    /// and nothing is stored. A private chat subscribes as before.
+    #[tokio::test]
+    async fn in_a_group_only_an_admin_subscribes() {
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let (group_chat, private_chat) = (-7_700_501, 7_700_502);
+        let address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        let handler = CommandHandler::new(pool.clone(), Network::Bitcoin, None, None);
+        let subscribe = Command::Subscribe {
+            address: Some(address.to_string()),
+        };
+        let in_chat = |chat_id, group| Transport::Telegram {
+            chat_id,
+            thread_id: None,
+            group,
+        };
+        let count = |chat_id| {
+            let pool = pool.clone();
+            async move {
+                find_telegram_subscriptions_by_chat(&pool, chat_id)
+                    .await
+                    .unwrap()
+                    .len()
+            }
+        };
+        subscribed_chat(&pool, group_chat, &[]).await;
+        subscribed_chat(&pool, private_chat, &[]).await;
+
+        handler
+            .dispatch(
+                &in_chat(group_chat, Some(GroupSender::OtherChat)),
+                &subscribe,
+            )
+            .await;
+        assert_eq!(count(group_chat).await, 0, "not an admin");
+        handler
+            .dispatch(
+                &in_chat(group_chat, Some(GroupSender::AnonymousAdmin)),
+                &subscribe,
+            )
+            .await;
+        assert_eq!(count(group_chat).await, 1, "the group's admin");
+        // The group keeps only what a Team or Blockparty brings.
+        let row = &find_telegram_subscriptions_by_chat(&pool, group_chat)
+            .await
+            .unwrap()[0];
+        assert!(row.block_notifications_enabled && row.team_best_notifications_enabled);
+        assert!(
+            !(row.best_diff_notifications_enabled
+                || row.device_notifications_enabled
+                || row.hourly_stats_enabled
+                || row.hourly_workers_enabled
+                || row.group_admin_notifications_enabled),
+            "{row:?}"
+        );
+        handler
+            .dispatch(&in_chat(private_chat, None), &subscribe)
+            .await;
+        assert_eq!(count(private_chat).await, 1, "a private chat");
+        let row = &find_telegram_subscriptions_by_chat(&pool, private_chat)
+            .await
+            .unwrap()[0];
+        assert!(
+            row.best_diff_notifications_enabled,
+            "a private chat keeps its defaults"
+        );
+
+        subscribed_chat(&pool, group_chat, &[]).await;
+        subscribed_chat(&pool, private_chat, &[]).await;
+    }
+
+    /// A group that subscribes an address that has mined here is told so;
+    /// a dummy address that never mined is not.
+    #[tokio::test]
+    async fn a_group_hears_when_it_follows_a_mining_address() {
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let chat_id = -7_700_601;
+        // Real bech32 addresses: the pool network check parses them.
+        let mining = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+        let dummy = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        let cleanup = || async {
+            sqlx::query("DELETE FROM address_settings_entity WHERE address = ANY($1)")
+                .bind(vec![mining, dummy])
+                .execute(&pool)
+                .await
+                .unwrap();
+        };
+        cleanup().await;
+        subscribed_chat(&pool, chat_id, &[]).await;
+        sqlx::query(
+            r#"INSERT INTO address_settings_entity (address, shares, "bestDifficulty")
+               VALUES ($1, 10, 1)"#,
+        )
+        .bind(mining)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let handler = CommandHandler::new(pool.clone(), Network::Bitcoin, None, None);
+        let in_group = Transport::Telegram {
+            chat_id,
+            thread_id: None,
+            group: Some(GroupSender::AnonymousAdmin),
+        };
+        let note = mining_address_in_group_text(Language::En);
+
+        let reply = handler
+            .handle_subscribe(&in_group, Language::En, mining)
+            .await;
+        assert!(reply.contains(note), "{reply}");
+        let reply = handler
+            .handle_subscribe(&in_group, Language::En, dummy)
+            .await;
+        assert!(!reply.contains(note), "{reply}");
+        assert_eq!(
+            find_telegram_subscriptions_by_chat(&pool, chat_id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        subscribed_chat(&pool, chat_id, &[]).await;
+        cleanup().await;
+    }
+
+    /// A group's settings show only what a Team or Blockparty brings.
+    #[test]
+    fn a_groups_settings_show_only_team_switches() {
+        let address = AddressId::new("bc1qgroupsettingsxxxxxxx").unwrap();
+        let subs = vec![sub_row(1, address.as_str(), true)];
+        let roles = TeamRoles {
+            members: HashSet::from([address.clone()]),
+            admins: HashSet::from([address]),
+        };
+        let (_text, kb) =
+            CommandHandler::build_settings_keyboard(&subs, Language::En, &roles, true);
+        let switches: Vec<String> = kb[1..]
+            .iter()
+            .flatten()
+            .map(|b| b.callback_data.clone())
+            .collect();
+        assert_eq!(
+            switches,
+            vec![
+                SettingsCallback::Flip(1, SettingsField::Blocks).data(),
+                SettingsCallback::Flip(1, SettingsField::TeamBest).data(),
+            ]
+        );
+    }
+
     /// An address sent encrypted is subscribed once the key opens it;
     /// without the key the bot says it cannot read it. The welcome text
     /// mentions encryption only when the key is there.
@@ -2063,6 +2488,7 @@ mod tests {
         let transport = Transport::Telegram {
             chat_id,
             thread_id: None,
+            group: None,
         };
         let address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
         let (key, encrypt) = super::super::encrypted_address::test_key();
@@ -2114,6 +2540,7 @@ mod tests {
         let transport = Transport::Telegram {
             chat_id,
             thread_id: None,
+            group: None,
         };
         let handler = CommandHandler::new(pool.clone(), Network::Bitcoin, None, None);
         subscribed_chat(&pool, chat_id, &[]).await;
@@ -2133,9 +2560,8 @@ mod tests {
         subscribed_chat(&pool, chat_id, &[]).await;
     }
 
-    /// A private chat answers with its next plain message; a group only by
-    /// replying to the question. An expired question takes no answer, and an
-    /// answer is taken once.
+    /// A private chat answers with its next plain message, not with a reply
+    /// to another one; a group is never asked, so nothing there answers.
     #[tokio::test]
     async fn an_answer_to_the_subscribe_question_subscribes() {
         let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
@@ -2168,10 +2594,10 @@ mod tests {
                 );
             }
         };
-        let msg = |chat_id: i64, private: bool, reply_to: Option<i64>| PlainMessage {
+        let msg = |chat_id: i64, group: Option<GroupSender>, reply_to: Option<i64>| PlainMessage {
+            group,
             thread_id: None,
             chat_id,
-            private,
             reply_to,
         };
         for chat in [private_chat, group_chat] {
@@ -2182,43 +2608,56 @@ mod tests {
         ask(private_chat, QUESTION_TTL_MS).await;
         assert!(
             !handler
-                .answer_telegram_question(msg(private_chat, true, Some(99)), address)
+                .answer_telegram_question(msg(private_chat, None, Some(99)), address)
                 .await
         );
         assert!(
             handler
-                .answer_telegram_question(msg(private_chat, true, None), &format!("{address} x"))
+                .answer_telegram_question(msg(private_chat, None, None), &format!("{address} x"))
                 .await
         );
         assert_eq!(subscribed(private_chat).await, vec![address.to_string()]);
         assert!(
             !handler
-                .answer_telegram_question(msg(private_chat, true, None), address)
+                .answer_telegram_question(msg(private_chat, None, None), address)
                 .await,
             "taken once"
         );
 
-        // Group: only a reply to the question.
+        // Group: a bare /subscribe asks nothing, and even an admin's reply to
+        // a question left from before answers nothing.
+        handler
+            .dispatch(
+                &Transport::Telegram {
+                    chat_id: group_chat,
+                    thread_id: None,
+                    group: Some(GroupSender::AnonymousAdmin),
+                },
+                &Command::Subscribe { address: None },
+            )
+            .await;
+        assert!(!handler
+            .subscribe_questions
+            .lock()
+            .await
+            .contains_key(&group_chat));
         ask(group_chat, QUESTION_TTL_MS).await;
         assert!(
             !handler
-                .answer_telegram_question(msg(group_chat, false, None), address)
+                .answer_telegram_question(
+                    msg(group_chat, Some(GroupSender::AnonymousAdmin), Some(10)),
+                    address
+                )
                 .await
         );
         assert!(subscribed(group_chat).await.is_empty());
-        assert!(
-            handler
-                .answer_telegram_question(msg(group_chat, false, Some(10)), address)
-                .await
-        );
-        assert_eq!(subscribed(group_chat).await, vec![address.to_string()]);
 
         // Expired.
         subscribed_chat(&pool, private_chat, &[]).await;
         ask(private_chat, -1).await;
         assert!(
             !handler
-                .answer_telegram_question(msg(private_chat, true, None), address)
+                .answer_telegram_question(msg(private_chat, None, None), address)
                 .await
         );
         assert!(subscribed(private_chat).await.is_empty());

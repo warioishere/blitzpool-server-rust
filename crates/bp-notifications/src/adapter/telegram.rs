@@ -65,6 +65,14 @@ pub struct TelegramAdapter {
     api_root: String,
 }
 
+/// Which chats a command menu is for: the default list, or the one group
+/// and supergroup chats see instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandScope {
+    Default,
+    AllGroupChats,
+}
+
 /// The `sendMessage` request. `message_thread_id` only for a forum topic:
 /// Telegram takes it for forum supergroups and private chats with topics.
 #[derive(Serialize)]
@@ -269,6 +277,7 @@ impl TelegramAdapter {
     pub async fn set_my_commands(
         &self,
         commands: &[(&str, &str)],
+        scope: CommandScope,
         language_code: Option<&str>,
     ) -> AdapterResult<()> {
         #[derive(Serialize)]
@@ -277,8 +286,14 @@ impl TelegramAdapter {
             description: &'a str,
         }
         #[derive(Serialize)]
+        struct Scope {
+            #[serde(rename = "type")]
+            kind: &'static str,
+        }
+        #[derive(Serialize)]
         struct Body<'a> {
             commands: Vec<BotCommand<'a>>,
+            scope: Scope,
             #[serde(skip_serializing_if = "Option::is_none")]
             language_code: Option<&'a str>,
         }
@@ -290,9 +305,45 @@ impl TelegramAdapter {
                     description,
                 })
                 .collect(),
+            scope: Scope {
+                kind: match scope {
+                    CommandScope::Default => "default",
+                    CommandScope::AllGroupChats => "all_group_chats",
+                },
+            },
             language_code,
         };
         self.post("setMyCommands", &body).await.map(|_| ())
+    }
+
+    /// Whether `user_id` owns or administers `chat_id` (`getChatMember`;
+    /// Telegram guarantees the answer for other users only when the bot
+    /// is an administrator there).
+    pub async fn is_chat_admin(&self, chat_id: i64, user_id: i64) -> AdapterResult<bool> {
+        #[derive(Serialize)]
+        struct Body {
+            chat_id: i64,
+            user_id: i64,
+        }
+        #[derive(Deserialize)]
+        struct Member {
+            status: String,
+        }
+        #[derive(Deserialize)]
+        struct Envelope {
+            result: Member,
+        }
+        let resp = self
+            .post("getChatMember", &Body { chat_id, user_id })
+            .await?;
+        let member: Envelope = resp
+            .json()
+            .await
+            .map_err(|e| AdapterError::Server(format!("telegram getChatMember decode: {e}")))?;
+        Ok(matches!(
+            member.result.status.as_str(),
+            "creator" | "administrator"
+        ))
     }
 
     /// POST a JSON body to a Bot API method, mapping HTTP status into
@@ -438,6 +489,29 @@ mod tests {
             Err(AdapterError::Server(_))
         ));
         assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    /// The owner and administrators count as admins, a member does not, and
+    /// a refused lookup is an error, not a no.
+    #[tokio::test]
+    async fn a_chat_admin_is_the_owner_or_an_administrator() {
+        let (adapter, server) = fake_bot_api(vec![
+            (200, r#"{"ok":true,"result":{"status":"creator"}}"#),
+            (200, r#"{"ok":true,"result":{"status":"administrator"}}"#),
+            (200, r#"{"ok":true,"result":{"status":"member"}}"#),
+            (
+                400,
+                r#"{"ok":false,"description":"Bad Request: user not found"}"#,
+            ),
+        ])
+        .await;
+        assert!(adapter.is_chat_admin(-100, 1).await.unwrap());
+        assert!(adapter.is_chat_admin(-100, 2).await.unwrap());
+        assert!(!adapter.is_chat_admin(-100, 3).await.unwrap());
+        assert!(adapter.is_chat_admin(-100, 4).await.is_err());
+        let bodies = server.await.unwrap();
+        assert_eq!(bodies[2]["user_id"], 3);
+        assert_eq!(bodies[2]["chat_id"], -100);
     }
 
     /// A chat that is gone refuses the main topic too: the retry fails the

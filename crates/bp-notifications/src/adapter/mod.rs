@@ -18,5 +18,5 @@ pub use fcm::{FcmAdapter, FcmConfig, FcmOutcome, FcmServiceAccount};
 pub use ntfy::{NtfyAdapter, NtfyConfig};
 pub use payload::{PushKind, PushPayload};
 pub use smtp::{SmtpAdapter, SmtpConfig};
-pub use telegram::{InlineButton, InlineKeyboard, TelegramAdapter, TelegramConfig};
+pub use telegram::{CommandScope, InlineButton, InlineKeyboard, TelegramAdapter, TelegramConfig};
 pub use web_push::{VapidConfig, WebPushAdapter, WebPushOutcome};

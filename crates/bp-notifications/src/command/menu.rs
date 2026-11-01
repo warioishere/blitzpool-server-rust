@@ -5,7 +5,9 @@
 //! pool sends it at every start; an entry the parser does not know would
 //! answer "unknown command" when tapped.
 
-use crate::adapter::{AdapterResult, TelegramAdapter};
+use super::group::{group_access, GroupAccess};
+use super::parse_command;
+use crate::adapter::{AdapterResult, CommandScope, TelegramAdapter};
 use crate::format::html;
 use crate::format::Language;
 
@@ -262,13 +264,25 @@ const MENU: &[MenuEntry] = &[
     },
 ];
 
+/// The entries a chat sees: in a group only those
+/// [`group_access`] lets a group use.
+fn entries(group: bool) -> impl Iterator<Item = &'static MenuEntry> {
+    MENU.iter().filter(move |e| {
+        !group
+            || match group_access(&parse_command(e.command)) {
+                GroupAccess::Anyone | GroupAccess::Admin => true,
+                GroupAccess::PrivateOnly => false,
+            }
+    })
+}
+
 /// `(command without the slash, description)` pairs, as `setMyCommands`
 /// takes them: section by section, each description after its section's
 /// icon.
-fn menu_for(lang: Language) -> Vec<(&'static str, String)> {
+fn menu_for(lang: Language, group: bool) -> Vec<(&'static str, String)> {
     Section::ALL
         .into_iter()
-        .flat_map(|section| MENU.iter().filter(move |e| e.section == section))
+        .flat_map(move |section| entries(group).filter(move |e| e.section == section))
         .map(|e| {
             let description = match lang {
                 Language::De => e.de,
@@ -282,17 +296,21 @@ fn menu_for(lang: Language) -> Vec<(&'static str, String)> {
         .collect()
 }
 
-/// The `/help` reply: every menu entry with its argument, under its
+/// The `/help` reply: every entry the chat sees with its argument, under its
 /// section. Commands stay plain so Telegram keeps them tappable.
-pub(crate) fn help_text(lang: Language) -> String {
+pub(crate) fn help_text(lang: Language, group: bool) -> String {
     let mut text = match lang {
         Language::De => html::bold("Befehle"),
         Language::En => html::bold("Commands"),
     };
     for section in Section::ALL {
+        let mut lines = entries(group).filter(|e| e.section == section).peekable();
+        if lines.peek().is_none() {
+            continue;
+        }
         text.push_str("\n\n");
         text.push_str(&html::bold(section.heading(lang)));
-        for entry in MENU.iter().filter(|e| e.section == section) {
+        for entry in lines {
             text.push_str(&format!("\n{}", help_line(entry, lang)));
         }
     }
@@ -318,12 +336,24 @@ fn pairs<'a>(menu: &'a [(&'static str, String)]) -> Vec<(&'a str, &'a str)> {
 }
 
 /// Send the menu to Telegram: English as the default for every client
-/// language, plus one list each for German and English clients.
+/// language, plus one list each for German and English clients; once for
+/// private chats (the default scope) and once with only what a group may
+/// use, for group chats.
 pub async fn register_command_menu(adapter: &TelegramAdapter) -> AdapterResult<()> {
-    let (en, de) = (menu_for(Language::En), menu_for(Language::De));
-    adapter.set_my_commands(&pairs(&en), None).await?;
-    adapter.set_my_commands(&pairs(&de), Some("de")).await?;
-    adapter.set_my_commands(&pairs(&en), Some("en")).await
+    for (scope, group) in [
+        (CommandScope::Default, false),
+        (CommandScope::AllGroupChats, true),
+    ] {
+        let (en, de) = (menu_for(Language::En, group), menu_for(Language::De, group));
+        adapter.set_my_commands(&pairs(&en), scope, None).await?;
+        adapter
+            .set_my_commands(&pairs(&de), scope, Some("de"))
+            .await?;
+        adapter
+            .set_my_commands(&pairs(&en), scope, Some("en"))
+            .await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -357,7 +387,7 @@ mod tests {
     #[test]
     fn help_lists_every_menu_entry_with_its_argument() {
         for lang in [Language::De, Language::En] {
-            let help = help_text(lang);
+            let help = help_text(lang, false);
             for entry in MENU {
                 let line = help_line(entry, lang);
                 assert_eq!(
@@ -368,8 +398,8 @@ mod tests {
             }
             assert!(crate::format::html::is_valid_telegram_html(&help), "{help}");
         }
-        assert!(help_text(Language::De).contains("/subscribe <i>ADRESSE</i> — "));
-        assert!(help_text(Language::En).contains("/bestdiff_reset <i>[ADDRESS]</i> — "));
+        assert!(help_text(Language::De, false).contains("/subscribe <i>ADRESSE</i> — "));
+        assert!(help_text(Language::En, false).contains("/bestdiff_reset <i>[ADDRESS]</i> — "));
     }
 
     /// The menu goes section by section, each description behind its
@@ -377,7 +407,7 @@ mod tests {
     /// menu read alike.
     #[test]
     fn the_menu_is_grouped_by_section() {
-        let menu = menu_for(Language::De);
+        let menu = menu_for(Language::De, false);
         let listed: Vec<&str> = MENU
             .iter()
             .map(|e| e.command.trim_start_matches('/'))
@@ -391,13 +421,46 @@ mod tests {
         }
     }
 
+    /// A group's menu and `/help` list only Team, Blockparty and the
+    /// commands its admin follows addresses with.
+    #[test]
+    fn a_group_sees_only_team_and_blockparty_commands() {
+        let menu: Vec<&str> = menu_for(Language::De, true)
+            .into_iter()
+            .map(|(c, _)| c)
+            .collect();
+        assert_eq!(
+            menu,
+            vec![
+                "start",
+                "subscribe",
+                "show_addresses",
+                "remove",
+                "team_status",
+                "team_members",
+                "team_history",
+                "blockparty_status",
+                "settings",
+                "team_bestdiff",
+                "help",
+                "deutsch",
+                "english",
+            ]
+        );
+        let help = help_text(Language::En, true);
+        assert!(help.contains("/team_status"), "{help}");
+        assert!(!help.contains("/stats"), "{help}");
+        assert!(crate::format::html::is_valid_telegram_html(&help), "{help}");
+    }
+
     /// Telegram's limits: 1-32 lowercase letters, digits or underscores per
     /// command, 1-256 characters per description, no command twice.
     #[test]
     fn the_menu_fits_telegram_limits() {
         let mut seen = std::collections::HashSet::new();
         for lang in [Language::De, Language::En] {
-            for (command, description) in menu_for(lang) {
+            for (command, description) in [false, true].into_iter().flat_map(|g| menu_for(lang, g))
+            {
                 assert!(
                     (1..=32).contains(&command.len())
                         && command

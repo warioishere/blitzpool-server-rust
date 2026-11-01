@@ -287,6 +287,7 @@ pub(super) async fn build_group_history(
     pool: &PgPool,
     lang: Language,
     address: &AddressId,
+    viewer: Viewer,
 ) -> String {
     let member = match find_group_member_by_address(pool, address).await {
         Ok(opt) => opt,
@@ -318,6 +319,10 @@ pub(super) async fn build_group_history(
             return db_error_text(lang);
         }
     };
+    match viewer {
+        Viewer::Owner => {}
+        Viewer::Group => return team_blocks_text(lang, &group.name, &history),
+    }
     let mine: Vec<&PplnsGroupBlockHistoryRow> = history
         .iter()
         .filter(|h| h.address == address.clone())
@@ -365,6 +370,70 @@ pub(super) async fn build_group_history(
             "{}\nTeam {}",
             title_for(None, "Recent payouts", &short),
             bold(&group.name)
+        ),
+    };
+    format!("{head}\n\n{}", lines.join("\n"))
+}
+
+/// Who reads a Team or Blockparty answer: the owner of the address asked
+/// about, or a group that follows it and sees the Team without that address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Viewer {
+    Owner,
+    Group,
+}
+
+/// The Team's recent blocks, each with what its coinbase paid the members
+/// (one history row per paid member), newest first.
+fn team_blocks_text(lang: Language, team: &str, history: &[PplnsGroupBlockHistoryRow]) -> String {
+    let mut blocks: Vec<(i32, i64, i64, usize)> = Vec::new();
+    for row in history {
+        let sats: i64 = row.paid_sats.into();
+        match blocks.iter_mut().find(|b| b.0 == row.block_height) {
+            Some(block) => {
+                block.2 += sats;
+                block.3 += 1;
+            }
+            None => blocks.push((row.block_height, row.created_at, sats, 1)),
+        }
+    }
+    if blocks.is_empty() {
+        return match lang {
+            Language::De => format!("Das Team {} hat noch keinen Block gefunden.", bold(team)),
+            Language::En => format!("The Team {} has found no block yet.", bold(team)),
+        };
+    }
+    let lines: Vec<String> = blocks
+        .iter()
+        .take(10)
+        .map(|(height, at, sats, paid)| {
+            let when = DateTime::<Utc>::from_timestamp_millis(*at)
+                .map(|dt| match lang {
+                    Language::De => dt.format("%d.%m.%y, %H:%M UTC").to_string(),
+                    Language::En => dt.format("%-m/%-d/%y, %H:%M UTC").to_string(),
+                })
+                .unwrap_or_else(|| "—".to_string());
+            let amount = bold(&format!("{} sats", format_sats(*sats)));
+            match lang {
+                Language::De => format!(
+                    "Block {} · {} · {amount} an {paid} Mitglieder",
+                    bold(&height.to_string()),
+                    esc(&when)
+                ),
+                Language::En => format!(
+                    "Block {} · {} · {amount} to {paid} members",
+                    bold(&height.to_string()),
+                    esc(&when)
+                ),
+            }
+        })
+        .collect();
+    let head = match lang {
+        Language::De => format!("{} {}", title(None, "Letzte Blöcke des Teams"), bold(team)),
+        Language::En => format!(
+            "{} {}",
+            title(None, "Recent blocks of the Team"),
+            bold(team)
         ),
     };
     format!("{head}\n\n{}", lines.join("\n"))
@@ -675,6 +744,7 @@ pub(super) async fn build_group_status(
     group_solo: &Arc<GroupSoloEngine>,
     lang: Language,
     address: &AddressId,
+    viewer: Viewer,
 ) -> String {
     let member = match find_group_member_by_address(pool, address).await {
         Ok(opt) => opt,
@@ -774,32 +844,36 @@ pub(super) async fn build_group_status(
     let total_sh = format_number_suffix(total_shares);
     let rej_sh = format_number_suffix(total_rejected);
     let active = active_count.to_string();
-    match lang {
+    // A group sees the Team, not the address it follows it through.
+    let own = |line: String| match viewer {
+        Viewer::Owner => Some(line),
+        Viewer::Group => None,
+    };
+    let lines = match lang {
         Language::De => [
-            head("Team"),
-            format!("Adresse: {}", addr(&short)),
-            String::new(),
-            row("Aktive Miner in der Runde", &active),
-            row("Team-Hashrate", &group_h),
-            format!("{} ({my_sh} Shares)", row("Dein Anteil", &share)),
-            row("Shares in der Runde", &total_sh),
-            row("Abgelehnt in der Runde", &rej_sh),
-            best_line("Beste Difficulty im Team"),
-        ]
-        .join("\n"),
+            Some(head("Team")),
+            own(format!("Adresse: {}", addr(&short))),
+            Some(String::new()),
+            Some(row("Aktive Miner in der Runde", &active)),
+            Some(row("Team-Hashrate", &group_h)),
+            own(format!("{} ({my_sh} Shares)", row("Dein Anteil", &share))),
+            Some(row("Shares in der Runde", &total_sh)),
+            Some(row("Abgelehnt in der Runde", &rej_sh)),
+            Some(best_line("Beste Difficulty im Team")),
+        ],
         Language::En => [
-            head("Team"),
-            format!("Address: {}", addr(&short)),
-            String::new(),
-            row("Active miners this round", &active),
-            row("Team hashrate", &group_h),
-            format!("{} ({my_sh} shares)", row("Your share", &share)),
-            row("Shares this round", &total_sh),
-            row("Rejected this round", &rej_sh),
-            best_line("Best difficulty in the Team"),
-        ]
-        .join("\n"),
-    }
+            Some(head("Team")),
+            own(format!("Address: {}", addr(&short))),
+            Some(String::new()),
+            Some(row("Active miners this round", &active)),
+            Some(row("Team hashrate", &group_h)),
+            own(format!("{} ({my_sh} shares)", row("Your share", &share))),
+            Some(row("Shares this round", &total_sh)),
+            Some(row("Rejected this round", &rej_sh)),
+            Some(best_line("Best difficulty in the Team")),
+        ],
+    };
+    lines.into_iter().flatten().collect::<Vec<_>>().join("\n")
 }
 
 // ── /blockparty_status <address> ────────────────────────────────────
@@ -809,6 +883,7 @@ pub(super) async fn build_blockparty_status(
     redis: Option<&ConnectionManager>,
     lang: Language,
     address: &AddressId,
+    viewer: Viewer,
 ) -> String {
     let short = short_address(address.as_str());
     let not_in_party = || match lang {
@@ -871,41 +946,42 @@ pub(super) async fn build_blockparty_status(
     let count = members.len().to_string();
     let hashrate = format_hashrate_th(hashrate);
     let found = history.len().to_string();
+    // A group sees the Blockparty, not the address it follows it through.
+    let own = |line: String| match viewer {
+        Viewer::Owner => Some(line),
+        Viewer::Group => None,
+    };
     let mut lines = match lang {
         Language::De => vec![
-            head,
-            format!("Adresse: {}", addr(&short)),
-            String::new(),
-            format!("{} ({confirmed})", row("Dein Anteil", &share)),
-            row("Mitglieder", &count),
-            row("Hashrate", &hashrate),
-            row("Gefundene Blöcke", &found),
+            Some(head),
+            own(format!("Adresse: {}", addr(&short))),
+            Some(String::new()),
+            own(format!("{} ({confirmed})", row("Dein Anteil", &share))),
+            Some(row("Mitglieder", &count)),
+            Some(row("Hashrate", &hashrate)),
+            Some(row("Gefundene Blöcke", &found)),
         ],
         Language::En => vec![
-            head,
-            format!("Address: {}", addr(&short)),
-            String::new(),
-            format!("{} ({confirmed})", row("Your share", &share)),
-            row("Members", &count),
-            row("Hashrate", &hashrate),
-            row("Blocks found", &found),
+            Some(head),
+            own(format!("Address: {}", addr(&short))),
+            Some(String::new()),
+            own(format!("{} ({confirmed})", row("Your share", &share))),
+            Some(row("Members", &count)),
+            Some(row("Hashrate", &hashrate)),
+            Some(row("Blocks found", &found)),
         ],
     };
     if let Some((height, sats)) = last_block {
-        lines.push(match lang {
-            Language::De => format!(
-                "Letzter Block: {}, für dich {}",
-                bold(&height.to_string()),
-                bold(&format!("{sats} sats"))
-            ),
-            Language::En => format!(
-                "Last block: {}, {} for you",
-                bold(&height.to_string()),
-                bold(&format!("{sats} sats"))
-            ),
-        });
+        let height = bold(&height.to_string());
+        let sats = bold(&format!("{sats} sats"));
+        lines.push(Some(match (lang, viewer) {
+            (Language::De, Viewer::Owner) => format!("Letzter Block: {height}, für dich {sats}"),
+            (Language::En, Viewer::Owner) => format!("Last block: {height}, {sats} for you"),
+            (Language::De, Viewer::Group) => format!("Letzter Block: {height}"),
+            (Language::En, Viewer::Group) => format!("Last block: {height}"),
+        }));
     }
-    lines.join("\n")
+    lines.into_iter().flatten().collect::<Vec<_>>().join("\n")
 }
 
 fn blockparty_status_name(lang: Language, status: BlockpartyStatus) -> String {
@@ -931,6 +1007,7 @@ pub(super) async fn build_group_members(
     group_solo: &Arc<GroupSoloEngine>,
     lang: Language,
     address: &AddressId,
+    viewer: Viewer,
 ) -> String {
     let member = match find_group_member_by_address(pool, address).await {
         Ok(opt) => opt,
@@ -973,6 +1050,11 @@ pub(super) async fn build_group_members(
         }
     };
 
+    // A group's list leaves out the address it follows the Team through.
+    match viewer {
+        Viewer::Owner => {}
+        Viewer::Group => members.retain(|m| m.address != *address),
+    }
     // Compute percent per member from round.per_address share-counts.
     let percent_for = |addr: &str| -> Option<f64> {
         round.per_address.get(addr).map(|s| {
@@ -1236,6 +1318,101 @@ mod tests {
         assert_eq!(format_hashrate_th(0.0), "0.00 TH/s");
         assert_eq!(format_hashrate_th(1.0e12), "1.00 TH/s");
         assert_eq!(format_hashrate_th(12_500_000_000_000.0), "12.50 TH/s");
+    }
+
+    /// A group's Team history: per block what the coinbase paid the
+    /// members, without any member's address.
+    #[test]
+    fn a_groups_team_history_sums_each_block() {
+        let row = |height: i32, address: &str, sats: i64| PplnsGroupBlockHistoryRow {
+            id: 0,
+            group_id: uuid::Uuid::nil(),
+            block_height: height,
+            address: AddressId::new(address).unwrap(),
+            paid_sats: bp_common::Sats::from(sats),
+            percent: 0.0,
+            shares_in_round: 0,
+            total_shares_in_round: 0,
+            created_at: 1_793_000_000_000,
+            row_type: "coinbase".to_string(),
+        };
+        let history = [
+            row(900_002, "bc1qmemberaaaaaaaaaaaaaa", 3_000),
+            row(900_002, "bc1qmemberbbbbbbbbbbbbbb", 1_000),
+            row(900_001, "bc1qmemberaaaaaaaaaaaaaa", 500),
+        ];
+        let text = plain(&team_blocks_text(Language::De, "Rig & Co", &history));
+        assert!(text.contains("Rig & Co"), "{text}");
+        assert!(text.contains("Block 900002 · "), "{text}");
+        assert!(text.contains("4,000 sats an 2 Mitglieder"), "{text}");
+        assert!(text.contains("500 sats an 1 Mitglieder"), "{text}");
+        assert!(!text.contains("bc1q"), "{text}");
+        assert!(
+            text.find("900002") < text.find("900001"),
+            "newest first: {text}"
+        );
+        let none = plain(&team_blocks_text(Language::En, "Rig", &[]));
+        assert!(none.contains("has found no block yet"), "{none}");
+    }
+
+    /// A group sees the Blockparty without the address it follows; the
+    /// owner sees the address and its share.
+    #[tokio::test]
+    async fn a_group_sees_the_blockparty_without_the_followed_address() {
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let (dummy, miner) = (
+            AddressId::new("bc1qreadviewpartydummyxxxx").unwrap(),
+            AddressId::new("bc1qreadviewpartyminerxxxx").unwrap(),
+        );
+        let cleanup = || async {
+            sqlx::query("DELETE FROM blockparty_member WHERE address = ANY($1)")
+                .bind(vec![dummy.as_str(), miner.as_str()])
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM blockparty_group WHERE name LIKE 'bp-test-readview-%'")
+                .execute(&pool)
+                .await
+                .unwrap();
+        };
+        cleanup().await;
+        let party = uuid::Uuid::new_v4();
+        let now = chrono::Utc::now().timestamp_millis();
+        bp_db::insert_blockparty_group(
+            &pool,
+            party,
+            &format!("bp-test-readview-{party}"),
+            &miner,
+            "hash",
+            "active",
+            now,
+        )
+        .await
+        .unwrap();
+        for (a, bp) in [(&miner, 10_000), (&dummy, 0)] {
+            bp_db::insert_blockparty_member(&pool, party, a, "", bp, "member", Some(now), now)
+                .await
+                .unwrap();
+        }
+        let short = short_address(dummy.as_str());
+
+        let owner =
+            plain(&build_blockparty_status(&pool, None, Language::De, &dummy, Viewer::Owner).await);
+        assert!(
+            owner.contains(&short) && owner.contains("Dein Anteil"),
+            "{owner}"
+        );
+        let group =
+            plain(&build_blockparty_status(&pool, None, Language::De, &dummy, Viewer::Group).await);
+        assert!(group.contains("Mitglieder: 2"), "{group}");
+        assert!(
+            !group.contains(&short) && !group.contains("Dein Anteil"),
+            "{group}"
+        );
+
+        cleanup().await;
     }
 
     #[test]
