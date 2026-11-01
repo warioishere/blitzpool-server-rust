@@ -297,7 +297,7 @@ pub(super) async fn build_group_history(
         }
     };
     let Some(member) = member else {
-        return not_in_group_text(lang, address.as_str());
+        return not_in_group_text(lang, address.as_str(), viewer);
     };
     let group = match find_group(pool, member.group_id).await {
         Ok(Some(row)) => row,
@@ -448,11 +448,15 @@ fn db_error_text(lang: Language) -> String {
     }
 }
 
-fn not_in_group_text(lang: Language, address: &str) -> String {
+/// The address asked about is in no Team; a group is not shown the address
+/// it follows.
+fn not_in_group_text(lang: Language, address: &str, viewer: Viewer) -> String {
     let short = addr(&short_address(address));
-    match lang {
-        Language::De => format!("{short} ist in keinem Team."),
-        Language::En => format!("{short} is not in any Team."),
+    match (lang, viewer) {
+        (Language::De, Viewer::Owner) => format!("{short} ist in keinem Team."),
+        (Language::En, Viewer::Owner) => format!("{short} is not in any Team."),
+        (Language::De, Viewer::Group) => "Die Adresse gehört zu keinem Team.".to_string(),
+        (Language::En, Viewer::Group) => "The address belongs to no Team.".to_string(),
     }
 }
 
@@ -754,7 +758,7 @@ pub(super) async fn build_group_status(
         }
     };
     let Some(member) = member else {
-        return not_in_group_text(lang, address.as_str());
+        return not_in_group_text(lang, address.as_str(), viewer);
     };
     let group_id = member.group_id;
 
@@ -886,9 +890,11 @@ pub(super) async fn build_blockparty_status(
     viewer: Viewer,
 ) -> String {
     let short = short_address(address.as_str());
-    let not_in_party = || match lang {
-        Language::De => format!("{} ist in keiner Blockparty.", addr(&short)),
-        Language::En => format!("{} is not in any Blockparty.", addr(&short)),
+    let not_in_party = || match (lang, viewer) {
+        (Language::De, Viewer::Owner) => format!("{} ist in keiner Blockparty.", addr(&short)),
+        (Language::En, Viewer::Owner) => format!("{} is not in any Blockparty.", addr(&short)),
+        (Language::De, Viewer::Group) => "Die Adresse gehört zu keiner Blockparty.".to_string(),
+        (Language::En, Viewer::Group) => "The address belongs to no Blockparty.".to_string(),
     };
     let member = match find_blockparty_member_by_address(pool, address).await {
         Ok(Some(m)) => m,
@@ -1017,7 +1023,7 @@ pub(super) async fn build_group_members(
         }
     };
     let Some(member) = member else {
-        return not_in_group_text(lang, address.as_str());
+        return not_in_group_text(lang, address.as_str(), viewer);
     };
     let group_id = member.group_id;
 
@@ -1411,6 +1417,16 @@ mod tests {
             !group.contains(&short) && !group.contains("Dein Anteil"),
             "{group}"
         );
+        // An address in no Blockparty: named to its owner, not to a group.
+        let outsider = AddressId::new("bc1qreadviewnopartyxxxxxxx").unwrap();
+        let owner = plain(
+            &build_blockparty_status(&pool, None, Language::De, &outsider, Viewer::Owner).await,
+        );
+        assert!(owner.contains(&short_address(outsider.as_str())), "{owner}");
+        let group = plain(
+            &build_blockparty_status(&pool, None, Language::De, &outsider, Viewer::Group).await,
+        );
+        assert_eq!(group, "Die Adresse gehört zu keiner Blockparty.");
 
         cleanup().await;
     }
