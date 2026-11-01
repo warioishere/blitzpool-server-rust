@@ -91,7 +91,7 @@ bytes = "1"
 hex = "0.4"
 faster-hex = { version = "1.0", default-features = false, features = ["std"] }
 smallvec = { version = "1", features = ["union", "const_generics"] }
-parking_lot = "0.12"
+parking_lot = "0.13"
 # Zero-alloc composite-key lookups (Equivalent trait) on the share hot path.
 hashbrown = "0.17"
 
