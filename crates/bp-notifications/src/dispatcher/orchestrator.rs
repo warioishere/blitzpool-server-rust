@@ -249,7 +249,7 @@ impl NotificationDispatcher {
             )) as TaskFuture);
         }
         if let (Some(sub), Some(adapter)) = (ntfy_sub, &self.ntfy) {
-            let body = block_found_text(Language::parse(&sub.language), notice, recipient);
+            let body = block_found_text(Language::parse(&sub.language), notice, recipient, false);
             let adapter = Arc::clone(adapter);
             tasks.push(Box::pin(async move {
                 log_adapter_send(
@@ -688,7 +688,7 @@ async fn send_telegram_block_found(
         (&adapter, &pool, &chat_languages, &notice, &recipient);
     let tasks = subs.into_iter().map(|sub| async move {
         let lang = chat_languages.get(sub.telegram_chat_id).await;
-        let text = block_found_text(lang, notice, recipient);
+        let text = block_found_text(lang, notice, recipient, sub.group_chat);
         settle_telegram_push(
             pool,
             sub.telegram_chat_id,
@@ -703,11 +703,13 @@ async fn send_telegram_block_found(
 }
 
 /// The block notice for one recipient: who found it, and what the coinbase
-/// pays this address.
+/// pays this address. A group chat reads only that its Team or Blockparty
+/// found a block, without the address it follows or its pay.
 fn block_found_text(
     lang: Language,
     notice: &BlockFoundNotice,
     recipient: &BlockRecipient,
+    group_chat: bool,
 ) -> String {
     let height = notice.height;
     let short = html::addr(&short_address(recipient.address.as_str()));
@@ -717,6 +719,15 @@ fn block_found_text(
         MiningMode::GroupSolo => "Team",
         MiningMode::Blockparty => "Blockparty",
     };
+    if group_chat {
+        return match lang {
+            Language::De => html::title(
+                Some("\u{1f389}"),
+                &format!("{mode}-Block {height} gefunden"),
+            ),
+            Language::En => html::title(Some("\u{1f389}"), &format!("{mode} block {height} found")),
+        };
+    }
     let head = match (lang, recipient.is_finder) {
         (Language::De, true) => format!(
             "{} · von deinem Miner ({mode})",
@@ -1615,6 +1626,7 @@ mod tests {
             Language::De,
             &notice,
             &notice.recipients(&members)[2],
+            false,
         ));
         assert!(text.contains("Team-Block 900001 gefunden"), "{text}");
         assert!(!text.contains("sats"), "{text}");
@@ -1811,18 +1823,27 @@ mod tests {
         };
         let [finder, member] = <[BlockRecipient; 2]>::try_from(notice.recipients(&[])).unwrap();
         for text in [
-            block_found_text(Language::De, &notice, &member),
-            block_found_text(Language::En, &notice, &finder),
+            block_found_text(Language::De, &notice, &member, false),
+            block_found_text(Language::En, &notice, &finder, false),
+            block_found_text(Language::De, &notice, &finder, true),
         ] {
             assert!(html::is_valid_telegram_html(&text), "{text}");
         }
-        let de = html::to_plain(&block_found_text(Language::De, &notice, &member));
+        let de = html::to_plain(&block_found_text(Language::De, &notice, &member, false));
         assert!(de.contains("Team-Block 973944 gefunden"), "{de}");
         assert!(de.contains("1,234,567 sats"), "{de}");
         assert!(!de.contains("found"), "no English in the German text: {de}");
-        let en = html::to_plain(&block_found_text(Language::En, &notice, &finder));
+        let en = html::to_plain(&block_found_text(Language::En, &notice, &finder, false));
         assert!(en.contains("Block 973944 found · by your miner"), "{en}");
         assert_eq!(en.matches("973944").count(), 1, "{en}");
+        // A group chat reads the block, not the address it follows or its pay.
+        for (recipient, lang, expected) in [
+            (&finder, Language::De, "🎉 Team-Block 973944 gefunden"),
+            (&member, Language::En, "🎉 Team block 973944 found"),
+        ] {
+            let text = html::to_plain(&block_found_text(lang, &notice, recipient, true));
+            assert_eq!(text, expected);
+        }
     }
 
     /// Push routing matches the stored lowercase `subscriptionType` in any casing.
@@ -2017,6 +2038,7 @@ mod tests {
             block_notifications_enabled: true,
             team_best_notifications_enabled: true,
             message_thread_id: None,
+            group_chat: false,
         }
     }
 

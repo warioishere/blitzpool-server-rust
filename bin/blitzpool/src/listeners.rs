@@ -144,11 +144,14 @@ pub(crate) fn spawn(
 
     let telegram_shutdown = telegram_adapter.as_ref().map(|adapter| {
         let menu_adapter = Arc::clone(adapter);
+        let menu_handler = Arc::clone(&handler);
         tokio::spawn(async move {
             match register_command_menu(&menu_adapter).await {
                 Ok(()) => info!("listeners.telegram: command menu registered"),
                 Err(e) => warn!(error = %e, "listeners.telegram: command menu registration failed"),
             }
+            // A group's own menu outranks the one for all groups.
+            menu_handler.refresh_group_menus().await;
         });
         let bot_token = cfg
             .notifications

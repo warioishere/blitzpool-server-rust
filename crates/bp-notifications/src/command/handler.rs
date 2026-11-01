@@ -9,15 +9,16 @@ use bitcoin::Network;
 use bp_common::AddressId;
 use bp_db::{
     delete_ntfy_subscription_by_address, delete_telegram_subscription_by_chat_address,
-    find_address_settings, find_group, find_group_member_by_address,
-    find_ntfy_subscription_by_address, find_telegram_subscriptions_by_chat,
-    keep_telegram_group_notices_only, promote_telegram_default_if_none,
-    set_telegram_default_subscription, set_telegram_hourly_flags, update_ntfy_sub_best_diff_flag,
-    update_ntfy_sub_device_flag, update_ntfy_sub_group_admin_flag, update_ntfy_sub_hourly_flags,
-    update_ntfy_sub_language, update_ntfy_sub_team_best_flag, update_telegram_sub_best_diff_flag,
-    update_telegram_sub_block_flag, update_telegram_sub_device_flag,
-    update_telegram_sub_group_admin_flag, update_telegram_sub_team_best_flag,
-    upsert_ntfy_subscription, upsert_telegram_subscription, TelegramSubscriptionRow,
+    find_address_settings, find_blockparty_member_by_address, find_group,
+    find_group_member_by_address, find_ntfy_subscription_by_address, find_telegram_group_chats,
+    find_telegram_subscriptions_by_chat, make_telegram_group_subscription,
+    promote_telegram_default_if_none, set_telegram_default_subscription, set_telegram_hourly_flags,
+    update_ntfy_sub_best_diff_flag, update_ntfy_sub_device_flag, update_ntfy_sub_group_admin_flag,
+    update_ntfy_sub_hourly_flags, update_ntfy_sub_language, update_ntfy_sub_team_best_flag,
+    update_telegram_sub_best_diff_flag, update_telegram_sub_block_flag,
+    update_telegram_sub_device_flag, update_telegram_sub_group_admin_flag,
+    update_telegram_sub_team_best_flag, upsert_ntfy_subscription, upsert_telegram_subscription,
+    TelegramSubscriptionRow,
 };
 use sqlx::PgPool;
 use tokio::sync::{Mutex, Notify};
@@ -27,12 +28,13 @@ use super::chat_language::ChatLanguages;
 use super::encrypted_address::{
     looks_encrypted, open_encrypted_address, EncryptedAddressError, MessageKey,
 };
-use super::group::{group_access, GroupAccess, GroupSender};
+use super::group::{group_access, GroupAccess, GroupFollows, GroupSender};
 use super::parser::{
     parse_address_callback, parse_settings_callback, AddressCallback, Command, FlagToggle,
     LanguageSwitch, ReadCommand, SettingsCallback, SettingsField, Switch,
 };
 use super::read::Viewer;
+use super::MenuView;
 use crate::adapter::{
     AdapterError, AdapterResult, InlineButton, InlineKeyboard, NtfyAdapter, TelegramAdapter,
 };
@@ -270,7 +272,7 @@ impl CommandHandler {
         }
         let reply = match command {
             Command::Start => self.handle_start(transport, lang).await,
-            Command::Help => super::help_text(lang, is_group(transport)),
+            Command::Help => super::help_text(lang, self.menu_view(transport).await),
             Command::Subscribe {
                 address: Some(address),
             } => self.handle_subscribe(transport, lang, address).await,
@@ -494,6 +496,9 @@ impl CommandHandler {
             if let Some(cb) = parse_address_callback(data) {
                 self.handle_address_callback(adapter, callback_id, chat_id, message_id, cb)
                     .await;
+                if in_group && matches!(cb, AddressCallback::Remove(_)) {
+                    self.refresh_group_menu(chat_id).await;
+                }
                 return;
             }
             if let Some(cb) = parse_settings_callback(data) {
@@ -944,17 +949,22 @@ impl CommandHandler {
                     // A group follows the Team or Blockparty, and cannot switch
                     // notices about the owner's miners off again.
                     if group.is_some() {
-                        keep_telegram_group_notices_only(&self.pool, *chat_id, &address).await?;
+                        make_telegram_group_subscription(&self.pool, *chat_id, &address).await?;
                     }
                     Ok::<_, bp_db::DbError>(())
                 }
                 .await;
+                if subscribed.is_ok() && group.is_some() {
+                    self.refresh_group_menu(*chat_id).await;
+                }
                 match subscribed {
-                    Ok(()) if group.is_some() && self.has_mined(&address).await => format!(
-                        "{}\n\n{}",
-                        subscribe_ok_text(lang, &address),
-                        mining_address_in_group_text(lang)
-                    ),
+                    Ok(()) if group.is_some() && self.mining_address_in_group(&address).await => {
+                        format!(
+                            "{}\n\n{}",
+                            subscribe_ok_text(lang, &address),
+                            mining_address_in_group_text(lang)
+                        )
+                    }
                     Ok(()) => subscribe_ok_text(lang, &address).to_string(),
                     Err(e) => {
                         warn!(target: "bp_notifications::command", error = %e, "telegram subscribe");
@@ -1009,9 +1019,15 @@ impl CommandHandler {
         };
         match affected {
             Ok(n) if n > 0 => {
-                // An ntfy topic may have dropped — refresh the listener.
-                if matches!(transport, Transport::Ntfy { .. }) {
-                    self.signal_ntfy_reconnect();
+                match transport {
+                    // An ntfy topic may have dropped — refresh the listener.
+                    Transport::Ntfy { .. } => self.signal_ntfy_reconnect(),
+                    Transport::Telegram {
+                        chat_id,
+                        group: Some(_),
+                        ..
+                    } => self.refresh_group_menu(*chat_id).await,
+                    Transport::Telegram { group: None, .. } => {}
                 }
                 remove_ok_text(lang, &address).to_string()
             }
@@ -1230,6 +1246,20 @@ impl CommandHandler {
                 .await),
                 Err(reply) => Err(reply),
             },
+            ReadCommand::BlockpartyMembers => match address().await {
+                Ok(addr) => Ok(super::read::build_blockparty_members(
+                    &self.pool, lang, &addr, viewer,
+                )
+                .await),
+                Err(reply) => Err(reply),
+            },
+            ReadCommand::BlockpartyHistory => match address().await {
+                Ok(addr) => Ok(super::read::build_blockparty_history(
+                    &self.pool, lang, &addr, viewer,
+                )
+                .await),
+                Err(reply) => Err(reply),
+            },
             ReadCommand::PplnsStatus => match (&self.pplns_engine, address().await) {
                 (None, _) => Err(engine_unconfigured_text(lang, "PPLNS")),
                 (Some(_), Err(reply)) => Err(reply),
@@ -1257,13 +1287,94 @@ impl CommandHandler {
         result.unwrap_or_else(|reply| reply)
     }
 
-    /// Whether `address` has mined here: the share statistics are the only
-    /// writer of its `address_settings` row.
-    async fn has_mined(&self, address: &AddressId) -> bool {
-        match find_address_settings(&self.pool, address).await {
-            Ok(row) => row.is_some(),
+    /// What a group's subscriptions follow: a Team when one of its addresses
+    /// is a Team member, a Blockparty when one is a Blockparty member. A
+    /// failed read counts as not followed.
+    async fn group_follows(&self, chat_id: i64) -> GroupFollows {
+        let addresses: Vec<AddressId> =
+            match find_telegram_subscriptions_by_chat(&self.pool, chat_id).await {
+                Ok(subs) => subs.into_iter().map(|s| s.address).collect(),
+                Err(e) => {
+                    warn!(target: "bp_notifications::command", error = %e, "group follows: subs");
+                    return GroupFollows::default();
+                }
+            };
+        let team = match self.team_roles(&addresses).await {
+            Ok(roles) => !roles.members.is_empty(),
             Err(e) => {
-                warn!(target: "bp_notifications::command", error = %e, "address settings read");
+                warn!(target: "bp_notifications::command", error = %e, "group follows: teams");
+                false
+            }
+        };
+        let mut blockparty = false;
+        for address in &addresses {
+            match find_blockparty_member_by_address(&self.pool, address).await {
+                Ok(Some(_)) => {
+                    blockparty = true;
+                    break;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(target: "bp_notifications::command", error = %e, "group follows: parties");
+                    break;
+                }
+            }
+        }
+        GroupFollows { team, blockparty }
+    }
+
+    /// The menu and `/help` of the chat a command came from.
+    async fn menu_view(&self, transport: &Transport) -> MenuView {
+        match transport {
+            Transport::Telegram {
+                chat_id,
+                group: Some(_),
+                ..
+            } => MenuView::Group(self.group_follows(*chat_id).await),
+            Transport::Telegram { group: None, .. } | Transport::Ntfy { .. } => MenuView::Private,
+        }
+    }
+
+    /// Give every group with a group subscription its own menu again, so a
+    /// changed command list reaches the groups too: a group's own menu
+    /// outranks the one for all groups.
+    pub async fn refresh_group_menus(&self) {
+        match find_telegram_group_chats(&self.pool).await {
+            Ok(chats) => {
+                for chat_id in chats {
+                    self.refresh_group_menu(chat_id).await;
+                }
+            }
+            Err(e) => warn!(target: "bp_notifications::command", error = %e, "group menus: chats"),
+        }
+    }
+
+    /// Give a group its own menu: the Team or Blockparty commands it
+    /// follows. Best-effort; on failure the group keeps the menu it had.
+    async fn refresh_group_menu(&self, chat_id: i64) {
+        let Some(adapter) = self.telegram.as_ref() else {
+            return;
+        };
+        let follows = self.group_follows(chat_id).await;
+        if let Err(e) = super::set_group_menu(adapter, chat_id, follows).await {
+            warn!(target: "bp_notifications::command", error = %e, chat_id, "group menu");
+        }
+    }
+
+    /// Whether a group following `address` puts a miner's address in the
+    /// group where it could follow one that does not mine: `address` has
+    /// mined here (the share statistics are the only writer of its
+    /// `address_settings` row) and is no Blockparty member. A Blockparty has
+    /// no such address: every member takes a share of each block.
+    async fn mining_address_in_group(&self, address: &AddressId) -> bool {
+        let (mined, party) = tokio::join!(
+            find_address_settings(&self.pool, address),
+            find_blockparty_member_by_address(&self.pool, address),
+        );
+        match (mined, party) {
+            (Ok(mined), Ok(party)) => mined.is_some() && party.is_none(),
+            (Err(e), _) | (_, Err(e)) => {
+                warn!(target: "bp_notifications::command", error = %e, "mining address check");
                 false
             }
         }
@@ -1569,14 +1680,16 @@ fn subscribe_usage_text(lang: Language) -> &'static str {
 fn group_subscribe_usage_text(lang: Language) -> &'static str {
     match lang {
         Language::De => {
-            "Schick /subscribe ADRESSE. Am besten eine Adresse, die nicht mined und \
-             nur Mitglied des Teams oder der Blockparty ist: Die Gruppe bekommt damit \
-             die Blöcke und Team-Bestwerte, ohne dass die Adresse eines Miners hier steht."
+            "Schick /subscribe ADRESSE. Für ein Team am besten eine Adresse, die nicht \
+             mined und nur Mitglied des Teams ist: Die Gruppe bekommt damit die Blöcke \
+             und Team-Bestwerte, ohne dass die Adresse eines Miners hier steht. Einer \
+             Blockparty folgt die Gruppe über die Adresse ihres Admins."
         }
         Language::En => {
-            "Send /subscribe ADDRESS. Best use an address that does not mine and is only \
-             a member of the Team or Blockparty: the group gets the blocks and Team bests \
-             through it, and no miner's address stands here."
+            "Send /subscribe ADDRESS. For a Team best use an address that does not mine \
+             and is only a member of the Team: the group gets the blocks and Team bests \
+             through it, and no miner's address stands here. A group follows a \
+             Blockparty through the address of its admin."
         }
     }
 }
@@ -1585,13 +1698,13 @@ fn mining_address_in_group_text(lang: Language) -> &'static str {
     match lang {
         Language::De => {
             "Hinweis: Diese Adresse mined bei uns, und jetzt steht sie in der Gruppe. \
-             Besser ist eine Adresse, die nicht mined und nur Mitglied des Teams oder \
-             der Blockparty ist. Mit /remove nimmst du diese wieder heraus."
+             Besser ist eine Adresse, die nicht mined und nur Mitglied des Teams ist. \
+             Mit /remove nimmst du diese wieder heraus."
         }
         Language::En => {
             "Note: this address mines here, and now it stands in the group. Better is \
-             an address that does not mine and is only a member of the Team or \
-             Blockparty. /remove takes this one out again."
+             an address that does not mine and is only a member of the Team. /remove \
+             takes this one out again."
         }
     }
 }
@@ -1696,16 +1809,18 @@ fn group_welcome_text(lang: Language) -> String {
             "{}\n\nIn dieser Gruppe zeige ich Team- und Blockparty-Status und melde \
              Blöcke des Teams bzw. der Blockparty und neue Bestwerte des Teams. Welche \
              Adresse die Gruppe verfolgt, legt ein Admin der Gruppe mit \
-             /subscribe ADRESSE fest, am besten eine Adresse, die nicht mined und nur \
-             Mitglied des Teams ist. Für deine eigene Adresse \
+             /subscribe ADRESSE fest: für ein Team am besten eine Adresse, die nicht \
+             mined und nur Mitglied des Teams ist, für eine Blockparty die Adresse \
+             ihres Admins. Für deine eigene Adresse \
              schreib mir privat. /help zeigt die Befehle hier.",
             html::bold("Blitz Pool")
         ),
         Language::En => format!(
             "{}\n\nIn this group I show Team and Blockparty status and report the \
              blocks of the Team or Blockparty and the Team's new bests. A group admin \
-             sets the address the group follows with /subscribe ADDRESS, best one that \
-             does not mine and is only a member of the Team. For your own address, message me privately. \
+             sets the address the group follows with /subscribe ADDRESS: for a Team best \
+             one that does not mine and is only a member of the Team, for a Blockparty \
+             the address of its admin. For your own address, message me privately. \
              /help lists the commands here.",
             html::bold("Blitz Pool")
         ),
@@ -1961,8 +2076,8 @@ mod tests {
                     .0,
                 no_team_admin_text(lang).to_string(),
                 no_team_member_text(lang).to_string(),
-                super::super::help_text(lang, false),
-                super::super::help_text(lang, true),
+                super::super::help_text(lang, MenuView::Private),
+                super::super::help_text(lang, MenuView::Group(GroupFollows::default())),
                 group_admin_only_text(lang).to_string(),
                 admin_unknown_text(lang).to_string(),
                 group_subscribe_usage_text(lang).to_string(),
@@ -2034,6 +2149,7 @@ mod tests {
             block_notifications_enabled: false,
             team_best_notifications_enabled: false,
             message_thread_id: None,
+            group_chat: false,
         }
     }
 
@@ -2390,13 +2506,19 @@ mod tests {
             row.best_diff_notifications_enabled,
             "a private chat keeps its defaults"
         );
+        assert!(!row.group_chat);
+        // The group's own menu is renewed at start for the group, not for
+        // the private chat.
+        let group_chats = find_telegram_group_chats(&pool).await.unwrap();
+        assert!(group_chats.contains(&group_chat) && !group_chats.contains(&private_chat));
 
         subscribed_chat(&pool, group_chat, &[]).await;
         subscribed_chat(&pool, private_chat, &[]).await;
     }
 
     /// A group that subscribes an address that has mined here is told so;
-    /// a dummy address that never mined is not.
+    /// a dummy address that never mined is not, and neither is a Blockparty
+    /// member, the only address a group can follow a Blockparty through.
     #[tokio::test]
     async fn a_group_hears_when_it_follows_a_mining_address() {
         let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
@@ -2406,23 +2528,52 @@ mod tests {
         // Real bech32 addresses: the pool network check parses them.
         let mining = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
         let dummy = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        let party_admin = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
         let cleanup = || async {
             sqlx::query("DELETE FROM address_settings_entity WHERE address = ANY($1)")
-                .bind(vec![mining, dummy])
+                .bind(vec![mining, dummy, party_admin])
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+                .bind(party_admin)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM blockparty_group WHERE name LIKE 'bp-test-mininghint-%'")
                 .execute(&pool)
                 .await
                 .unwrap();
         };
         cleanup().await;
         subscribed_chat(&pool, chat_id, &[]).await;
-        sqlx::query(
-            r#"INSERT INTO address_settings_entity (address, shares, "bestDifficulty")
-               VALUES ($1, 10, 1)"#,
+        for address in [mining, party_admin] {
+            sqlx::query(
+                r#"INSERT INTO address_settings_entity (address, shares, "bestDifficulty")
+                   VALUES ($1, 10, 1)"#,
+            )
+            .bind(address)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let party = uuid::Uuid::new_v4();
+        let now = chrono::Utc::now().timestamp_millis();
+        let admin = AddressId::new(party_admin).unwrap();
+        bp_db::insert_blockparty_group(
+            &pool,
+            party,
+            &format!("bp-test-mininghint-{party}"),
+            &admin,
+            "hash",
+            "active",
+            now,
         )
-        .bind(mining)
-        .execute(&pool)
         .await
         .unwrap();
+        bp_db::insert_blockparty_member(&pool, party, &admin, "", 10_000, "admin", Some(now), now)
+            .await
+            .unwrap();
         let handler = CommandHandler::new(pool.clone(), Network::Bitcoin, None, None);
         let in_group = Transport::Telegram {
             chat_id,
@@ -2439,15 +2590,114 @@ mod tests {
             .handle_subscribe(&in_group, Language::En, dummy)
             .await;
         assert!(!reply.contains(note), "{reply}");
-        assert_eq!(
-            find_telegram_subscriptions_by_chat(&pool, chat_id)
-                .await
-                .unwrap()
-                .len(),
-            2
-        );
+        let reply = handler
+            .handle_subscribe(&in_group, Language::En, party_admin)
+            .await;
+        assert!(!reply.contains(note), "{reply}");
+        let subs = find_telegram_subscriptions_by_chat(&pool, chat_id)
+            .await
+            .unwrap();
+        assert_eq!(subs.len(), 3);
+        assert!(subs.iter().all(|s| s.group_chat), "{subs:?}");
 
         subscribed_chat(&pool, chat_id, &[]).await;
+        cleanup().await;
+    }
+
+    /// A group follows a Team through a Team member's address and a
+    /// Blockparty through a Blockparty member's; with no subscription,
+    /// nothing.
+    #[tokio::test]
+    async fn a_group_follows_what_its_addresses_belong_to() {
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let (team_chat, party_chat, empty_chat) = (-7_700_701, -7_700_702, -7_700_703);
+        let (team_addr, party_addr) = (
+            AddressId::new("bc1qgroupfollowsteamxxxxx").unwrap(),
+            AddressId::new("bc1qgroupfollowspartyxxxx").unwrap(),
+        );
+        let cleanup = || async {
+            sqlx::query("DELETE FROM pplns_group_member WHERE address = $1")
+                .bind(team_addr.as_str())
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM pplns_group WHERE name LIKE 'bp-test-follows-%'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+                .bind(party_addr.as_str())
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM blockparty_group WHERE name LIKE 'bp-test-follows-%'")
+                .execute(&pool)
+                .await
+                .unwrap();
+        };
+        cleanup().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let (team, party) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        bp_db::insert_pplns_group(
+            &pool,
+            team,
+            &format!("bp-test-follows-{team}"),
+            &team_addr,
+            "hash",
+            true,
+            false,
+            "prop",
+            now,
+        )
+        .await
+        .unwrap();
+        bp_db::insert_pplns_group_member(&pool, team, &team_addr, "creator", now)
+            .await
+            .unwrap();
+        bp_db::insert_blockparty_group(
+            &pool,
+            party,
+            &format!("bp-test-follows-{party}"),
+            &party_addr,
+            "hash",
+            "active",
+            now,
+        )
+        .await
+        .unwrap();
+        bp_db::insert_blockparty_member(
+            &pool,
+            party,
+            &party_addr,
+            "",
+            10_000,
+            "admin",
+            Some(now),
+            now,
+        )
+        .await
+        .unwrap();
+        subscribed_chat(&pool, team_chat, &[team_addr.as_str()]).await;
+        subscribed_chat(&pool, party_chat, &[party_addr.as_str()]).await;
+        subscribed_chat(&pool, empty_chat, &[]).await;
+        let handler = CommandHandler::new(pool.clone(), Network::Bitcoin, None, None);
+
+        let follows = |team, blockparty| GroupFollows { team, blockparty };
+        assert_eq!(handler.group_follows(team_chat).await, follows(true, false));
+        assert_eq!(
+            handler.group_follows(party_chat).await,
+            follows(false, true)
+        );
+        assert_eq!(
+            handler.group_follows(empty_chat).await,
+            follows(false, false)
+        );
+
+        for chat in [team_chat, party_chat, empty_chat] {
+            subscribed_chat(&pool, chat, &[]).await;
+        }
         cleanup().await;
     }
 

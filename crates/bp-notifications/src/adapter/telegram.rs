@@ -65,12 +65,14 @@ pub struct TelegramAdapter {
     api_root: String,
 }
 
-/// Which chats a command menu is for: the default list, or the one group
-/// and supergroup chats see instead.
+/// Which chats a command menu is for: the default list, the one group and
+/// supergroup chats see instead, or one chat's own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandScope {
     Default,
     AllGroupChats,
+    /// One chat; it comes before the group-wide list.
+    Chat(i64),
 }
 
 /// The `sendMessage` request. `message_thread_id` only for a forum topic:
@@ -289,6 +291,8 @@ impl TelegramAdapter {
         struct Scope {
             #[serde(rename = "type")]
             kind: &'static str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            chat_id: Option<i64>,
         }
         #[derive(Serialize)]
         struct Body<'a> {
@@ -305,10 +309,18 @@ impl TelegramAdapter {
                     description,
                 })
                 .collect(),
-            scope: Scope {
-                kind: match scope {
-                    CommandScope::Default => "default",
-                    CommandScope::AllGroupChats => "all_group_chats",
+            scope: match scope {
+                CommandScope::Default => Scope {
+                    kind: "default",
+                    chat_id: None,
+                },
+                CommandScope::AllGroupChats => Scope {
+                    kind: "all_group_chats",
+                    chat_id: None,
+                },
+                CommandScope::Chat(chat_id) => Scope {
+                    kind: "chat",
+                    chat_id: Some(chat_id),
                 },
             },
             language_code,
@@ -489,6 +501,20 @@ mod tests {
             Err(AdapterError::Server(_))
         ));
         assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    /// A group's own menu goes to Telegram scoped to that chat.
+    #[tokio::test]
+    async fn a_chat_menu_names_its_chat() {
+        let (adapter, server) = fake_bot_api(vec![(200, r#"{"ok":true,"result":true}"#)]).await;
+        adapter
+            .set_my_commands(&[("help", "Help")], CommandScope::Chat(-100), Some("de"))
+            .await
+            .unwrap();
+        let body = &server.await.unwrap()[0];
+        assert_eq!(body["scope"]["type"], "chat");
+        assert_eq!(body["scope"]["chat_id"], -100);
+        assert_eq!(body["language_code"], "de");
     }
 
     /// The owner and administrators count as admins, a member does not, and

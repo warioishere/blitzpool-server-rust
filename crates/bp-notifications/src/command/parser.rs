@@ -64,6 +64,8 @@ pub enum ReadCommand {
     TeamMembers,
     TeamHistory,
     BlockpartyStatus,
+    BlockpartyMembers,
+    BlockpartyHistory,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,6 +228,8 @@ pub fn parse_command(text: &str) -> Command {
         "/team_members" => read(ReadCommand::TeamMembers),
         "/team_history" => read(ReadCommand::TeamHistory),
         "/blockparty_status" => read(ReadCommand::BlockpartyStatus),
+        "/blockparty_members" => read(ReadCommand::BlockpartyMembers),
+        "/blockparty_history" => read(ReadCommand::BlockpartyHistory),
         _ => Command::Unknown,
     }
 }

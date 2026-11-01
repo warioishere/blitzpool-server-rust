@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            \"telegramChatId\" AS \"telegram_chat_id!\",\n            \"bestDiffNotificationsEnabled\" AS \"best_diff_notifications_enabled!\",\n            \"isDefault\" AS \"is_default!\",\n            \"deviceNotificationsEnabled\" AS \"device_notifications_enabled!\",\n            \"hourlyStatsEnabled\" AS \"hourly_stats_enabled!\",\n            \"hourlyWorkersEnabled\" AS \"hourly_workers_enabled!\",\n            \"groupAdminNotificationsEnabled\" AS \"group_admin_notifications_enabled!\",\n            \"blockNotificationsEnabled\" AS \"block_notifications_enabled!\",\n            \"teamBestNotificationsEnabled\" AS \"team_best_notifications_enabled!\",\n            \"messageThreadId\" AS \"message_thread_id?\"\n           FROM telegram_subscriptions_entity\n           WHERE address = $1 AND \"deletedAt\" IS NULL",
+  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            \"telegramChatId\" AS \"telegram_chat_id!\",\n            \"bestDiffNotificationsEnabled\" AS \"best_diff_notifications_enabled!\",\n            \"isDefault\" AS \"is_default!\",\n            \"deviceNotificationsEnabled\" AS \"device_notifications_enabled!\",\n            \"hourlyStatsEnabled\" AS \"hourly_stats_enabled!\",\n            \"hourlyWorkersEnabled\" AS \"hourly_workers_enabled!\",\n            \"groupAdminNotificationsEnabled\" AS \"group_admin_notifications_enabled!\",\n            \"blockNotificationsEnabled\" AS \"block_notifications_enabled!\",\n            \"teamBestNotificationsEnabled\" AS \"team_best_notifications_enabled!\",\n            \"messageThreadId\" AS \"message_thread_id?\",\n            \"groupChat\" AS \"group_chat!\"\n           FROM telegram_subscriptions_entity\n           WHERE \"telegramChatId\" = $1 AND \"deletedAt\" IS NULL",
   "describe": {
     "columns": [
       {
@@ -77,11 +77,16 @@
         "ordinal": 14,
         "name": "message_thread_id?",
         "type_info": "Int8"
+      },
+      {
+        "ordinal": 15,
+        "name": "group_chat!",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Int8"
       ]
     },
     "nullable": [
@@ -99,8 +104,9 @@
       false,
       false,
       false,
-      true
+      true,
+      false
     ]
   },
-  "hash": "8c160b387fc795f362b862e144c1e87032cbfb9e21e7a5634c26d91c05c5d04b"
+  "hash": "f69b361a0e199c7ab4af782a16708ad5d547902dd838beda73bba17bc4770f5e"
 }

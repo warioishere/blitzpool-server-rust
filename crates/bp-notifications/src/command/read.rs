@@ -16,7 +16,8 @@ use bp_db::{
     find_blockparty_member_by_address, find_clients_by_address, find_group,
     find_group_member_by_address, find_pplns_group_members_for_group,
     find_recent_group_block_history, list_blockparty_block_history,
-    list_blockparty_members_for_group, PplnsGroupBlockHistoryRow,
+    list_blockparty_members_for_group, BlockpartyGroupRow, BlockpartyMemberRow,
+    PplnsGroupBlockHistoryRow,
 };
 use bp_group_solo_engine::engine::GroupSoloEngine;
 use bp_pplns_engine::engine::PplnsEngine;
@@ -343,23 +344,14 @@ pub(super) async fn build_group_history(
             ),
         };
     }
-    let mut lines: Vec<String> = Vec::with_capacity(mine.len());
-    for entry in &mine {
-        let when = DateTime::<Utc>::from_timestamp_millis(entry.created_at)
-            .map(|dt| match lang {
-                Language::De => dt.format("%d.%m.%y, %H:%M UTC").to_string(),
-                Language::En => dt.format("%-m/%-d/%y, %H:%M UTC").to_string(),
-            })
-            .unwrap_or_else(|| "—".to_string());
-        let sats: i64 = entry.paid_sats.into();
-        let amount = format_sats(sats);
-        lines.push(format!(
-            "Block {} · {} · {}",
-            bold(&entry.block_height.to_string()),
-            esc(&when),
-            bold(&format!("{amount} sats")),
-        ));
-    }
+    let lines: Vec<String> = mine
+        .iter()
+        .map(|entry| {
+            let sats: i64 = entry.paid_sats.into();
+            let amount = bold(&format!("{} sats", format_sats(sats)));
+            block_line(lang, entry.block_height, entry.created_at, &amount)
+        })
+        .collect();
     let head = match lang {
         Language::De => format!(
             "{}\nTeam {}",
@@ -381,6 +373,32 @@ pub(super) async fn build_group_history(
 pub(crate) enum Viewer {
     Owner,
     Group,
+}
+
+/// One block of a history list: `Block <height> · <when> · <tail>`.
+fn block_line(lang: Language, height: i32, at_ms: i64, tail: &str) -> String {
+    let when = DateTime::<Utc>::from_timestamp_millis(at_ms)
+        .map(|dt| match lang {
+            Language::De => dt.format("%d.%m.%y, %H:%M UTC").to_string(),
+            Language::En => dt.format("%-m/%-d/%y, %H:%M UTC").to_string(),
+        })
+        .unwrap_or_else(|| "—".to_string());
+    format!(
+        "Block {} · {} · {tail}",
+        bold(&height.to_string()),
+        esc(&when)
+    )
+}
+
+/// What a block paid its members: `<sats> an <n> Mitglieder`.
+fn paid_members(lang: Language, sats: i64, members: usize) -> String {
+    let amount = bold(&format!("{} sats", format_sats(sats)));
+    match (lang, members) {
+        (Language::De, 1) => format!("{amount} an 1 Mitglied"),
+        (Language::De, n) => format!("{amount} an {n} Mitglieder"),
+        (Language::En, 1) => format!("{amount} to 1 member"),
+        (Language::En, n) => format!("{amount} to {n} members"),
+    }
 }
 
 /// The Team's recent blocks, each with what its coinbase paid the members
@@ -407,25 +425,7 @@ fn team_blocks_text(lang: Language, team: &str, history: &[PplnsGroupBlockHistor
         .iter()
         .take(10)
         .map(|(height, at, sats, paid)| {
-            let when = DateTime::<Utc>::from_timestamp_millis(*at)
-                .map(|dt| match lang {
-                    Language::De => dt.format("%d.%m.%y, %H:%M UTC").to_string(),
-                    Language::En => dt.format("%-m/%-d/%y, %H:%M UTC").to_string(),
-                })
-                .unwrap_or_else(|| "—".to_string());
-            let amount = bold(&format!("{} sats", format_sats(*sats)));
-            match lang {
-                Language::De => format!(
-                    "Block {} · {} · {amount} an {paid} Mitglieder",
-                    bold(&height.to_string()),
-                    esc(&when)
-                ),
-                Language::En => format!(
-                    "Block {} · {} · {amount} to {paid} members",
-                    bold(&height.to_string()),
-                    esc(&when)
-                ),
-            }
+            block_line(lang, *height, *at, &paid_members(lang, *sats, *paid))
         })
         .collect();
     let head = match lang {
@@ -890,35 +890,22 @@ pub(super) async fn build_blockparty_status(
     viewer: Viewer,
 ) -> String {
     let short = short_address(address.as_str());
-    let not_in_party = || match (lang, viewer) {
-        (Language::De, Viewer::Owner) => format!("{} ist in keiner Blockparty.", addr(&short)),
-        (Language::En, Viewer::Owner) => format!("{} is not in any Blockparty.", addr(&short)),
-        (Language::De, Viewer::Group) => "Die Adresse gehört zu keiner Blockparty.".to_string(),
-        (Language::En, Viewer::Group) => "The address belongs to no Blockparty.".to_string(),
+    let LiveBlockparty {
+        member,
+        group,
+        members,
+    } = match live_blockparty_of(pool, lang, address, viewer, "blockparty_status").await {
+        Ok(found) => found,
+        Err(reply) => return reply,
     };
-    let member = match find_blockparty_member_by_address(pool, address).await {
-        Ok(Some(m)) => m,
-        Ok(None) => return not_in_party(),
+    let history = match list_blockparty_block_history(pool, group.id).await {
+        Ok(h) => h,
         Err(e) => {
-            warn!(target: "bp_notifications::command::read", error = %e, "blockparty_status: member");
-            return db_error_text(lang);
-        }
-    };
-    let (group_res, members_res, history_res) = tokio::join!(
-        find_blockparty_group(pool, member.group_id),
-        list_blockparty_members_for_group(pool, member.group_id),
-        list_blockparty_block_history(pool, member.group_id),
-    );
-    let (group, members, history) = match (group_res, members_res, history_res) {
-        (Ok(Some(g)), Ok(m), Ok(h)) => (g, m, h),
-        (Ok(None), _, _) => return not_in_party(),
-        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
-            warn!(target: "bp_notifications::command::read", error = %e, "blockparty_status: group");
+            warn!(target: "bp_notifications::command::read", error = %e, "blockparty_status: history");
             return db_error_text(lang);
         }
     };
     let status = match group.status.parse::<BlockpartyStatus>() {
-        Ok(BlockpartyStatus::Dissolved) => return not_in_party(),
         Ok(status) => blockparty_status_name(lang, status),
         Err(_) => group.status.clone(),
     };
@@ -988,6 +975,197 @@ pub(super) async fn build_blockparty_status(
         }));
     }
     lines.into_iter().flatten().collect::<Vec<_>>().join("\n")
+}
+
+/// The address asked about is in no Blockparty; a group is not shown the
+/// address it follows.
+fn not_in_party_text(lang: Language, address: &AddressId, viewer: Viewer) -> String {
+    let short = addr(&short_address(address.as_str()));
+    match (lang, viewer) {
+        (Language::De, Viewer::Owner) => format!("{short} ist in keiner Blockparty."),
+        (Language::En, Viewer::Owner) => format!("{short} is not in any Blockparty."),
+        (Language::De, Viewer::Group) => "Die Adresse gehört zu keiner Blockparty.".to_string(),
+        (Language::En, Viewer::Group) => "The address belongs to no Blockparty.".to_string(),
+    }
+}
+
+/// The live Blockparty `address` is a member of: its membership, the party
+/// and all members. `Err` carries the reply when there is none or the read
+/// fails.
+async fn live_blockparty_of(
+    pool: &PgPool,
+    lang: Language,
+    address: &AddressId,
+    viewer: Viewer,
+    what: &str,
+) -> Result<LiveBlockparty, String> {
+    let member = match find_blockparty_member_by_address(pool, address).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return Err(not_in_party_text(lang, address, viewer)),
+        Err(e) => {
+            warn!(target: "bp_notifications::command::read", error = %e, what, "blockparty member");
+            return Err(db_error_text(lang));
+        }
+    };
+    let (group, members) = match tokio::join!(
+        find_blockparty_group(pool, member.group_id),
+        list_blockparty_members_for_group(pool, member.group_id),
+    ) {
+        (Ok(Some(g)), Ok(m)) => (g, m),
+        (Ok(None), _) => return Err(not_in_party_text(lang, address, viewer)),
+        (Err(e), _) | (_, Err(e)) => {
+            warn!(target: "bp_notifications::command::read", error = %e, what, "blockparty group");
+            return Err(db_error_text(lang));
+        }
+    };
+    match group.status.parse::<BlockpartyStatus>() {
+        Ok(BlockpartyStatus::Dissolved) => Err(not_in_party_text(lang, address, viewer)),
+        _ => Ok(LiveBlockparty {
+            member,
+            group,
+            members,
+        }),
+    }
+}
+
+struct LiveBlockparty {
+    member: BlockpartyMemberRow,
+    group: BlockpartyGroupRow,
+    members: Vec<BlockpartyMemberRow>,
+}
+
+// ── /blockparty_members <address> ───────────────────────────────────
+
+/// The members of `address`'s Blockparty with their fixed share of each
+/// block. A group lists the address it follows too: a Blockparty is
+/// followed through a member, its admin, who takes a share like the others.
+pub(super) async fn build_blockparty_members(
+    pool: &PgPool,
+    lang: Language,
+    address: &AddressId,
+    viewer: Viewer,
+) -> String {
+    let LiveBlockparty {
+        group, mut members, ..
+    } = match live_blockparty_of(pool, lang, address, viewer, "blockparty_members").await {
+        Ok(found) => found,
+        Err(reply) => return reply,
+    };
+    members.sort_by_key(|m| std::cmp::Reverse(m.percent_bp));
+    let lines: Vec<String> = members
+        .iter()
+        .map(|m| {
+            let share = bold(&format!("{:.2} %", f64::from(m.percent_bp) / 100.0));
+            let state = if m.confirmed_at.is_some() {
+                "✅"
+            } else {
+                "⏳"
+            };
+            let me = match (viewer, m.address == *address, lang) {
+                (Viewer::Owner, true, Language::De) => " (du)",
+                (Viewer::Owner, true, Language::En) => " (you)",
+                _ => "",
+            };
+            format!(
+                "{} {share} {state}{me}",
+                addr(&short_address(m.address.as_str()))
+            )
+        })
+        .collect();
+    let count = members.len();
+    match lang {
+        Language::De => format!(
+            "{} {} ({count})\nAnteil an jedem Block, ✅ bestätigt, ⏳ offen\n\n{}",
+            bold("Mitglieder der Blockparty"),
+            bold(&group.name),
+            lines.join("\n")
+        ),
+        Language::En => format!(
+            "{} {} ({count})\nShare of each block, ✅ confirmed, ⏳ pending\n\n{}",
+            bold("Members of the Blockparty"),
+            bold(&group.name),
+            lines.join("\n")
+        ),
+    }
+}
+
+// ── /blockparty_history <address> ───────────────────────────────────
+
+/// The Blockparty's recent blocks: what each paid `address` for its owner,
+/// what it paid the members for a group.
+pub(super) async fn build_blockparty_history(
+    pool: &PgPool,
+    lang: Language,
+    address: &AddressId,
+    viewer: Viewer,
+) -> String {
+    let group = match live_blockparty_of(pool, lang, address, viewer, "blockparty_history").await {
+        Ok(found) => found.group,
+        Err(reply) => return reply,
+    };
+    let history = match list_blockparty_block_history(pool, group.id).await {
+        Ok(h) => h,
+        Err(e) => {
+            warn!(target: "bp_notifications::command::read", error = %e, "blockparty_history");
+            return db_error_text(lang);
+        }
+    };
+    if history.is_empty() {
+        return match lang {
+            Language::De => format!(
+                "Die Blockparty {} hat noch keinen Block gefunden.",
+                bold(&group.name)
+            ),
+            Language::En => format!(
+                "The Blockparty {} has found no block yet.",
+                bold(&group.name)
+            ),
+        };
+    }
+    let lines: Vec<String> = history
+        .iter()
+        .take(10)
+        .map(|block| {
+            let tail = match viewer {
+                Viewer::Owner => {
+                    let mine: i64 = block
+                        .splits
+                        .iter()
+                        .filter(|s| s.address == address.as_str())
+                        .map(|s| s.sats)
+                        .sum();
+                    let amount = bold(&format!("{} sats", format_sats(mine)));
+                    match lang {
+                        Language::De => format!("{amount} für dich"),
+                        Language::En => format!("{amount} for you"),
+                    }
+                }
+                Viewer::Group => {
+                    let paid: Vec<i64> = block
+                        .splits
+                        .iter()
+                        .map(|s| s.sats)
+                        .filter(|s| *s > 0)
+                        .collect();
+                    paid_members(lang, paid.iter().sum(), paid.len())
+                }
+            };
+            block_line(lang, block.block_height, block.found_at, &tail)
+        })
+        .collect();
+    let head = match lang {
+        Language::De => format!(
+            "{} {}",
+            title(None, "Letzte Blöcke der Blockparty"),
+            bold(&group.name)
+        ),
+        Language::En => format!(
+            "{} {}",
+            title(None, "Recent blocks of the Blockparty"),
+            bold(&group.name)
+        ),
+    };
+    format!("{head}\n\n{}", lines.join("\n"))
 }
 
 fn blockparty_status_name(lang: Language, status: BlockpartyStatus) -> String {
@@ -1351,7 +1529,7 @@ mod tests {
         assert!(text.contains("Rig & Co"), "{text}");
         assert!(text.contains("Block 900002 · "), "{text}");
         assert!(text.contains("4,000 sats an 2 Mitglieder"), "{text}");
-        assert!(text.contains("500 sats an 1 Mitglieder"), "{text}");
+        assert!(text.contains("500 sats an 1 Mitglied"), "{text}");
         assert!(!text.contains("bc1q"), "{text}");
         assert!(
             text.find("900002") < text.find("900001"),
@@ -1373,6 +1551,13 @@ mod tests {
             AddressId::new("bc1qreadviewpartyminerxxxx").unwrap(),
         );
         let cleanup = || async {
+            sqlx::query(
+                "DELETE FROM blockparty_block_history WHERE \"groupId\" IN \
+                 (SELECT id FROM blockparty_group WHERE name LIKE 'bp-test-readview-%')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
             sqlx::query("DELETE FROM blockparty_member WHERE address = ANY($1)")
                 .bind(vec![dummy.as_str(), miner.as_str()])
                 .execute(&pool)
@@ -1397,7 +1582,7 @@ mod tests {
         )
         .await
         .unwrap();
-        for (a, bp) in [(&miner, 10_000), (&dummy, 0)] {
+        for (a, bp) in [(&miner, 6_000), (&dummy, 4_000)] {
             bp_db::insert_blockparty_member(&pool, party, a, "", bp, "member", Some(now), now)
                 .await
                 .unwrap();
@@ -1417,6 +1602,60 @@ mod tests {
             !group.contains(&short) && !group.contains("Dein Anteil"),
             "{group}"
         );
+        // Members: the owner is marked; a group sees every member, the
+        // followed one included.
+        let owner =
+            plain(&build_blockparty_members(&pool, Language::De, &dummy, Viewer::Owner).await);
+        assert!(
+            owner.contains("(2)") && owner.contains(&format!("{short} 40.00 % ✅ (du)")),
+            "{owner}"
+        );
+        let group =
+            plain(&build_blockparty_members(&pool, Language::De, &dummy, Viewer::Group).await);
+        assert!(
+            group.contains("(2)") && group.contains("60.00 %") && group.contains("40.00 %"),
+            "a Blockparty lists the admin it is followed through: {group}"
+        );
+        assert!(!group.contains("(du)"), "{group}");
+
+        // History: none yet, then one block, split 60/40.
+        let none =
+            plain(&build_blockparty_history(&pool, Language::De, &dummy, Viewer::Group).await);
+        assert!(none.contains("noch keinen Block"), "{none}");
+        let split = |a: &AddressId, percent_bp, sats| bp_db::BlockpartySplitSnapshot {
+            address: a.as_str().to_string(),
+            percent_bp,
+            sats,
+            trimmed: false,
+        };
+        bp_db::insert_blockparty_block_history(
+            &pool,
+            party,
+            900_010,
+            &format!("{party}-block"),
+            now,
+            bp_common::Sats::from(312_500_000),
+            bp_common::Sats::from(3_125_000),
+            &[
+                split(&miner, 6_000, 185_625_000),
+                split(&dummy, 4_000, 123_750_000),
+            ],
+            now,
+        )
+        .await
+        .unwrap();
+        let group =
+            plain(&build_blockparty_history(&pool, Language::De, &dummy, Viewer::Group).await);
+        assert!(group.contains("Block 900010 · "), "{group}");
+        assert!(
+            group.contains("309,375,000 sats an 2 Mitglieder"),
+            "{group}"
+        );
+        assert!(!group.contains(&short), "{group}");
+        let owner =
+            plain(&build_blockparty_history(&pool, Language::De, &dummy, Viewer::Owner).await);
+        assert!(owner.contains("123,750,000 sats für dich"), "{owner}");
+
         // An address in no Blockparty: named to its owner, not to a group.
         let outsider = AddressId::new("bc1qreadviewnopartyxxxxxxx").unwrap();
         let owner = plain(

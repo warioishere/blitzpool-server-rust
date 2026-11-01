@@ -5,7 +5,7 @@
 //! pool sends it at every start; an entry the parser does not know would
 //! answer "unknown command" when tapped.
 
-use super::group::{group_access, GroupAccess};
+use super::group::{group_access, group_topic, GroupAccess, GroupFollows};
 use super::parse_command;
 use crate::adapter::{AdapterResult, CommandScope, TelegramAdapter};
 use crate::format::html;
@@ -172,6 +172,20 @@ const MENU: &[MenuEntry] = &[
         en: "Status of the Blockparty your address belongs to",
     },
     MenuEntry {
+        command: "/blockparty_members",
+        section: Section::Queries,
+        args: Args::OptionalAddress,
+        de: "Mitglieder deiner Blockparty",
+        en: "Members of your Blockparty",
+    },
+    MenuEntry {
+        command: "/blockparty_history",
+        section: Section::Queries,
+        args: Args::OptionalAddress,
+        de: "Letzte Blöcke deiner Blockparty",
+        en: "Recent blocks of your Blockparty",
+    },
+    MenuEntry {
         command: "/poolhashrate",
         section: Section::Queries,
         args: Args::None,
@@ -264,25 +278,37 @@ const MENU: &[MenuEntry] = &[
     },
 ];
 
-/// The entries a chat sees: in a group only those
-/// [`group_access`] lets a group use.
-fn entries(group: bool) -> impl Iterator<Item = &'static MenuEntry> {
-    MENU.iter().filter(move |e| {
-        !group
-            || match group_access(&parse_command(e.command)) {
+/// Which chat a menu or `/help` is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MenuView {
+    Private,
+    /// A group, and what its subscriptions follow.
+    Group(GroupFollows),
+}
+
+/// The entries a chat sees: in a group only those [`group_access`] lets a
+/// group use, and of the Team and Blockparty commands those it follows.
+fn entries(view: MenuView) -> impl Iterator<Item = &'static MenuEntry> {
+    MENU.iter().filter(move |e| match view {
+        MenuView::Private => true,
+        MenuView::Group(follows) => {
+            let command = parse_command(e.command);
+            let allowed = match group_access(&command) {
                 GroupAccess::Anyone | GroupAccess::Admin => true,
                 GroupAccess::PrivateOnly => false,
-            }
+            };
+            allowed && group_topic(&command).is_none_or(|topic| follows.shows(topic))
+        }
     })
 }
 
 /// `(command without the slash, description)` pairs, as `setMyCommands`
 /// takes them: section by section, each description after its section's
 /// icon.
-fn menu_for(lang: Language, group: bool) -> Vec<(&'static str, String)> {
+fn menu_for(lang: Language, view: MenuView) -> Vec<(&'static str, String)> {
     Section::ALL
         .into_iter()
-        .flat_map(move |section| entries(group).filter(move |e| e.section == section))
+        .flat_map(move |section| entries(view).filter(move |e| e.section == section))
         .map(|e| {
             let description = match lang {
                 Language::De => e.de,
@@ -298,13 +324,13 @@ fn menu_for(lang: Language, group: bool) -> Vec<(&'static str, String)> {
 
 /// The `/help` reply: every entry the chat sees with its argument, under its
 /// section. Commands stay plain so Telegram keeps them tappable.
-pub(crate) fn help_text(lang: Language, group: bool) -> String {
+pub(crate) fn help_text(lang: Language, view: MenuView) -> String {
     let mut text = match lang {
         Language::De => html::bold("Befehle"),
         Language::En => html::bold("Commands"),
     };
     for section in Section::ALL {
-        let mut lines = entries(group).filter(|e| e.section == section).peekable();
+        let mut lines = entries(view).filter(|e| e.section == section).peekable();
         if lines.peek().is_none() {
             continue;
         }
@@ -335,25 +361,48 @@ fn pairs<'a>(menu: &'a [(&'static str, String)]) -> Vec<(&'a str, &'a str)> {
     menu.iter().map(|(c, d)| (*c, d.as_str())).collect()
 }
 
-/// Send the menu to Telegram: English as the default for every client
-/// language, plus one list each for German and English clients; once for
-/// private chats (the default scope) and once with only what a group may
-/// use, for group chats.
+/// Send the menu to Telegram: once for private chats (the default scope)
+/// and once with only what a group may use, for every group without a menu
+/// of its own.
 pub async fn register_command_menu(adapter: &TelegramAdapter) -> AdapterResult<()> {
-    for (scope, group) in [
-        (CommandScope::Default, false),
-        (CommandScope::AllGroupChats, true),
-    ] {
-        let (en, de) = (menu_for(Language::En, group), menu_for(Language::De, group));
-        adapter.set_my_commands(&pairs(&en), scope, None).await?;
-        adapter
-            .set_my_commands(&pairs(&de), scope, Some("de"))
-            .await?;
-        adapter
-            .set_my_commands(&pairs(&en), scope, Some("en"))
-            .await?;
-    }
-    Ok(())
+    set_menu(adapter, CommandScope::Default, MenuView::Private).await?;
+    set_menu(
+        adapter,
+        CommandScope::AllGroupChats,
+        MenuView::Group(GroupFollows::default()),
+    )
+    .await
+}
+
+/// One group's own menu: the Team or Blockparty commands it follows.
+pub(crate) async fn set_group_menu(
+    adapter: &TelegramAdapter,
+    chat_id: i64,
+    follows: GroupFollows,
+) -> AdapterResult<()> {
+    set_menu(
+        adapter,
+        CommandScope::Chat(chat_id),
+        MenuView::Group(follows),
+    )
+    .await
+}
+
+/// English as the default for every client language, plus one list each
+/// for German and English clients.
+async fn set_menu(
+    adapter: &TelegramAdapter,
+    scope: CommandScope,
+    view: MenuView,
+) -> AdapterResult<()> {
+    let (en, de) = (menu_for(Language::En, view), menu_for(Language::De, view));
+    adapter.set_my_commands(&pairs(&en), scope, None).await?;
+    adapter
+        .set_my_commands(&pairs(&de), scope, Some("de"))
+        .await?;
+    adapter
+        .set_my_commands(&pairs(&en), scope, Some("en"))
+        .await
 }
 
 #[cfg(test)]
@@ -387,7 +436,7 @@ mod tests {
     #[test]
     fn help_lists_every_menu_entry_with_its_argument() {
         for lang in [Language::De, Language::En] {
-            let help = help_text(lang, false);
+            let help = help_text(lang, MenuView::Private);
             for entry in MENU {
                 let line = help_line(entry, lang);
                 assert_eq!(
@@ -398,8 +447,9 @@ mod tests {
             }
             assert!(crate::format::html::is_valid_telegram_html(&help), "{help}");
         }
-        assert!(help_text(Language::De, false).contains("/subscribe <i>ADRESSE</i> — "));
-        assert!(help_text(Language::En, false).contains("/bestdiff_reset <i>[ADDRESS]</i> — "));
+        assert!(help_text(Language::De, MenuView::Private).contains("/subscribe <i>ADRESSE</i> — "));
+        assert!(help_text(Language::En, MenuView::Private)
+            .contains("/bestdiff_reset <i>[ADDRESS]</i> — "));
     }
 
     /// The menu goes section by section, each description behind its
@@ -407,7 +457,7 @@ mod tests {
     /// menu read alike.
     #[test]
     fn the_menu_is_grouped_by_section() {
-        let menu = menu_for(Language::De, false);
+        let menu = menu_for(Language::De, MenuView::Private);
         let listed: Vec<&str> = MENU
             .iter()
             .map(|e| e.command.trim_start_matches('/'))
@@ -425,7 +475,7 @@ mod tests {
     /// commands its admin follows addresses with.
     #[test]
     fn a_group_sees_only_team_and_blockparty_commands() {
-        let menu: Vec<&str> = menu_for(Language::De, true)
+        let menu: Vec<&str> = menu_for(Language::De, MenuView::Group(GroupFollows::default()))
             .into_iter()
             .map(|(c, _)| c)
             .collect();
@@ -440,6 +490,8 @@ mod tests {
                 "team_members",
                 "team_history",
                 "blockparty_status",
+                "blockparty_members",
+                "blockparty_history",
                 "settings",
                 "team_bestdiff",
                 "help",
@@ -447,10 +499,39 @@ mod tests {
                 "english",
             ]
         );
-        let help = help_text(Language::En, true);
+        let help = help_text(Language::En, MenuView::Group(GroupFollows::default()));
         assert!(help.contains("/team_status"), "{help}");
         assert!(!help.contains("/stats"), "{help}");
         assert!(crate::format::html::is_valid_telegram_html(&help), "{help}");
+        // A group that follows a Team sees no Blockparty commands, and the
+        // other way round.
+        let team: Vec<&str> = menu_for(
+            Language::En,
+            MenuView::Group(GroupFollows {
+                team: true,
+                blockparty: false,
+            }),
+        )
+        .into_iter()
+        .map(|(c, _)| c)
+        .collect();
+        assert!(team.contains(&"team_status") && team.contains(&"team_bestdiff"));
+        assert!(
+            !team.iter().any(|c| c.starts_with("blockparty")),
+            "{team:?}"
+        );
+        let party = help_text(
+            Language::En,
+            MenuView::Group(GroupFollows {
+                team: false,
+                blockparty: true,
+            }),
+        );
+        assert!(
+            party.contains("/blockparty_members") && !party.contains("/team_"),
+            "{party}"
+        );
+        assert!(party.contains("/subscribe"), "{party}");
     }
 
     /// Telegram's limits: 1-32 lowercase letters, digits or underscores per
@@ -459,7 +540,10 @@ mod tests {
     fn the_menu_fits_telegram_limits() {
         let mut seen = std::collections::HashSet::new();
         for lang in [Language::De, Language::En] {
-            for (command, description) in [false, true].into_iter().flat_map(|g| menu_for(lang, g))
+            for (command, description) in
+                [MenuView::Private, MenuView::Group(GroupFollows::default())]
+                    .into_iter()
+                    .flat_map(|v| menu_for(lang, v))
             {
                 assert!(
                     (1..=32).contains(&command.len())

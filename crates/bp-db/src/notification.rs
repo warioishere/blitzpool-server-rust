@@ -41,6 +41,10 @@ pub struct TelegramSubscriptionRow {
     /// `None` is the chat's main topic.
     #[sqlx(rename = "messageThreadId")]
     pub message_thread_id: Option<i64>,
+    /// Made in a group chat: its notices leave out the followed address
+    /// and what it was paid.
+    #[sqlx(rename = "groupChat")]
+    pub group_chat: bool,
 }
 
 /// All non-soft-deleted Telegram subscriptions for `address`. Multiple
@@ -68,7 +72,8 @@ pub async fn find_telegram_subscriptions_by_address(
             "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!",
             "blockNotificationsEnabled" AS "block_notifications_enabled!",
             "teamBestNotificationsEnabled" AS "team_best_notifications_enabled!",
-            "messageThreadId" AS "message_thread_id?"
+            "messageThreadId" AS "message_thread_id?",
+            "groupChat" AS "group_chat!"
            FROM telegram_subscriptions_entity
            WHERE address = $1 AND "deletedAt" IS NULL"#,
         address.as_str(),
@@ -100,7 +105,8 @@ pub async fn find_telegram_subscriptions_with_hourly_enabled(
             "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!",
             "blockNotificationsEnabled" AS "block_notifications_enabled!",
             "teamBestNotificationsEnabled" AS "team_best_notifications_enabled!",
-            "messageThreadId" AS "message_thread_id?"
+            "messageThreadId" AS "message_thread_id?",
+            "groupChat" AS "group_chat!"
            FROM telegram_subscriptions_entity
            WHERE "deletedAt" IS NULL
              AND ("hourlyStatsEnabled" = true OR "hourlyWorkersEnabled" = true)"#,
@@ -134,7 +140,8 @@ pub async fn find_telegram_subscriptions_by_chat(
             "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!",
             "blockNotificationsEnabled" AS "block_notifications_enabled!",
             "teamBestNotificationsEnabled" AS "team_best_notifications_enabled!",
-            "messageThreadId" AS "message_thread_id?"
+            "messageThreadId" AS "message_thread_id?",
+            "groupChat" AS "group_chat!"
            FROM telegram_subscriptions_entity
            WHERE "telegramChatId" = $1 AND "deletedAt" IS NULL"#,
         telegram_chat_id,
@@ -808,10 +815,24 @@ pub async fn update_telegram_sub_block_flag(
     Ok(result.rows_affected())
 }
 
-/// Leave a subscription only the notices a Team or Blockparty brings
-/// (blocks and the Team round best): a group follows an address for those,
-/// not for the notices about its owner's miners.
-pub async fn keep_telegram_group_notices_only(
+/// Every chat with a group subscription, for its own command menu.
+pub async fn find_telegram_group_chats(pool: &PgPool) -> Result<Vec<i64>, DbError> {
+    let rows = sqlx::query!(
+        r#"SELECT DISTINCT "telegramChatId" AS "chat_id!"
+           FROM telegram_subscriptions_entity
+           WHERE "groupChat" AND "deletedAt" IS NULL"#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(rows.into_iter().map(|r| r.chat_id).collect())
+}
+
+/// Make a subscription a group chat's: only the notices a Team or
+/// Blockparty brings (blocks and the Team round best) stay on, since a group
+/// follows an address for those, not for the notices about its owner's
+/// miners.
+pub async fn make_telegram_group_subscription(
     pool: &PgPool,
     telegram_chat_id: i64,
     address: &AddressId,
@@ -824,6 +845,7 @@ pub async fn keep_telegram_group_notices_only(
                "hourlyStatsEnabled" = false,
                "hourlyWorkersEnabled" = false,
                "groupAdminNotificationsEnabled" = false,
+               "groupChat" = true,
                "updatedAt" = $3
            WHERE "telegramChatId" = $1
              AND address = $2
