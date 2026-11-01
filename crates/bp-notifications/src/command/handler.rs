@@ -9,8 +9,9 @@ use bitcoin::Network;
 use bp_common::AddressId;
 use bp_db::{
     delete_ntfy_subscription_by_address, delete_telegram_subscription_by_chat_address,
-    find_address_settings, find_blockparty_member_by_address, find_group,
-    find_group_member_by_address, find_ntfy_subscription_by_address, find_telegram_group_chats,
+    delete_telegram_subscriptions_by_chat, find_address_settings, find_blockparty_group,
+    find_blockparty_member_by_address, find_group, find_group_member_by_address,
+    find_ntfy_subscription_by_address, find_telegram_group_chats,
     find_telegram_subscriptions_by_chat, make_telegram_group_subscription,
     promote_telegram_default_if_none, set_telegram_default_subscription, set_telegram_hourly_flags,
     update_ntfy_sub_best_diff_flag, update_ntfy_sub_device_flag, update_ntfy_sub_group_admin_flag,
@@ -253,7 +254,8 @@ impl CommandHandler {
             let in_group = group.is_some();
             match command {
                 Command::ShowAddresses | Command::Remove { address: None } => {
-                    self.send_address_keyboard(*chat_id, *thread_id, lang).await;
+                    self.send_address_keyboard(*chat_id, *thread_id, in_group, lang)
+                        .await;
                     return;
                 }
                 Command::Settings(switch) => {
@@ -336,6 +338,8 @@ impl CommandHandler {
     fn build_address_keyboard(
         subs: &[TelegramSubscriptionRow],
         lang: Language,
+        in_group: bool,
+        names: &HashMap<i32, String>,
     ) -> (String, InlineKeyboard) {
         let mut sorted: Vec<&TelegramSubscriptionRow> = subs.iter().collect();
         sorted.sort_by_key(|s| s.id);
@@ -343,11 +347,9 @@ impl CommandHandler {
             .iter()
             .map(|s| {
                 let star = if s.is_default { "⭐ " } else { "" };
+                let label = subscription_label(lang, s, in_group, names);
                 vec![
-                    InlineButton::new(
-                        format!("{star}{}", short_address(s.address.as_str())),
-                        format!("addr:set:{}", s.id),
-                    ),
+                    InlineButton::new(format!("{star}{label}"), format!("addr:set:{}", s.id)),
                     InlineButton::new("🗑", format!("addr:rm:{}", s.id)),
                 ]
             })
@@ -368,7 +370,13 @@ impl CommandHandler {
 
     /// Send the `/show_addresses` keyboard to a Telegram chat (or a
     /// "no addresses" note when the chat has none).
-    async fn send_address_keyboard(&self, chat_id: i64, thread_id: Option<i64>, lang: Language) {
+    async fn send_address_keyboard(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        in_group: bool,
+        lang: Language,
+    ) {
         let Some(adapter) = self.telegram.as_ref() else {
             return;
         };
@@ -388,7 +396,8 @@ impl CommandHandler {
                 .await;
             return;
         }
-        let (text, keyboard) = Self::build_address_keyboard(&subs, lang);
+        let names = self.group_names(&subs, in_group).await;
+        let (text, keyboard) = Self::build_address_keyboard(&subs, lang, in_group, &names);
         if let Err(e) = adapter
             .send_message_with_keyboard(chat_id, thread_id, &text, &keyboard)
             .await
@@ -494,8 +503,15 @@ impl CommandHandler {
         let in_group = group.is_some();
         if let (Some(chat_id), Some(message_id), Some(data)) = (chat_id, message_id, data) {
             if let Some(cb) = parse_address_callback(data) {
-                self.handle_address_callback(adapter, callback_id, chat_id, message_id, cb)
-                    .await;
+                self.handle_address_callback(
+                    adapter,
+                    callback_id,
+                    chat_id,
+                    message_id,
+                    in_group,
+                    cb,
+                )
+                .await;
                 if in_group && matches!(cb, AddressCallback::Remove(_)) {
                     self.refresh_group_menu(chat_id).await;
                 }
@@ -530,6 +546,7 @@ impl CommandHandler {
         callback_id: &str,
         chat_id: i64,
         message_id: i64,
+        in_group: bool,
         cb: AddressCallback,
     ) {
         let lang = self.chat_languages.get(chat_id).await;
@@ -553,7 +570,10 @@ impl CommandHandler {
                 .await;
             return;
         };
-        let trimmed = short_address(target.address.as_str());
+        let names = self
+            .group_names(std::slice::from_ref(target), in_group)
+            .await;
+        let trimmed = subscription_label(lang, target, in_group, &names);
         match cb {
             AddressCallback::SetDefault(_) => {
                 if target.is_default {
@@ -614,7 +634,8 @@ impl CommandHandler {
                 .await;
             return;
         }
-        let (text, keyboard) = Self::build_address_keyboard(&fresh, lang);
+        let names = self.group_names(&fresh, in_group).await;
+        let (text, keyboard) = Self::build_address_keyboard(&fresh, lang, in_group, &names);
         if let Err(e) = adapter
             .edit_message_text(chat_id, message_id, &text, Some(&keyboard))
             .await
@@ -632,6 +653,7 @@ impl CommandHandler {
         lang: Language,
         roles: &TeamRoles,
         in_group: bool,
+        names: &HashMap<i32, String>,
     ) -> (String, InlineKeyboard) {
         let mut sorted: Vec<&TelegramSubscriptionRow> = subs.iter().collect();
         sorted.sort_by_key(|s| s.id);
@@ -639,7 +661,7 @@ impl CommandHandler {
         for sub in sorted {
             let star = if sub.is_default { "⭐ " } else { "" };
             keyboard.push(vec![InlineButton::new(
-                format!("{star}{}", short_address(sub.address.as_str())),
+                format!("{star}{}", subscription_label(lang, sub, in_group, names)),
                 SettingsCallback::Address(sub.id).data(),
             )]);
             let button = |field| {
@@ -720,7 +742,8 @@ impl CommandHandler {
             let _ = adapter.send_html(chat_id, thread_id, refusal).await;
             return;
         }
-        let (text, keyboard) = Self::build_settings_keyboard(&subs, lang, &roles, in_group);
+        let names = self.group_names(&subs, in_group).await;
+        let (text, keyboard) = Self::build_settings_keyboard(&subs, lang, &roles, in_group, &names);
         if let Err(e) = adapter
             .send_message_with_keyboard(chat_id, thread_id, &text, &keyboard)
             .await
@@ -788,7 +811,9 @@ impl CommandHandler {
             .unwrap_or_default();
         let addresses: Vec<AddressId> = fresh.iter().map(|s| s.address.clone()).collect();
         let roles = self.team_roles(&addresses).await.unwrap_or_default();
-        let (text, keyboard) = Self::build_settings_keyboard(&fresh, lang, &roles, in_group);
+        let names = self.group_names(&fresh, in_group).await;
+        let (text, keyboard) =
+            Self::build_settings_keyboard(&fresh, lang, &roles, in_group, &names);
         if let Err(e) = adapter
             .edit_message_text(chat_id, message_id, &text, Some(&keyboard))
             .await
@@ -944,6 +969,11 @@ impl CommandHandler {
                 group,
             } => {
                 let subscribed = async {
+                    // A group follows one Team or Blockparty: a new address
+                    // takes the place of the one before.
+                    if group.is_some() {
+                        delete_telegram_subscriptions_by_chat(&self.pool, *chat_id).await?;
+                    }
                     upsert_telegram_subscription(&self.pool, *chat_id, *thread_id, &address)
                         .await?;
                     // A group follows the Team or Blockparty, and cannot switch
@@ -961,11 +991,11 @@ impl CommandHandler {
                     Ok(()) if group.is_some() && self.mining_address_in_group(&address).await => {
                         format!(
                             "{}\n\n{}",
-                            subscribe_ok_text(lang, &address),
+                            subscribe_ok_text(lang, &address, group.is_some()),
                             mining_address_in_group_text(lang)
                         )
                     }
-                    Ok(()) => subscribe_ok_text(lang, &address).to_string(),
+                    Ok(()) => subscribe_ok_text(lang, &address, group.is_some()).to_string(),
                     Err(e) => {
                         warn!(target: "bp_notifications::command", error = %e, "telegram subscribe");
                         db_error_text(lang).to_string()
@@ -980,7 +1010,7 @@ impl CommandHandler {
                     Ok(_) => {
                         // New topic — refresh the SSE listener now.
                         self.signal_ntfy_reconnect();
-                        subscribe_ok_text(lang, &address).to_string()
+                        subscribe_ok_text(lang, &address, false).to_string()
                     }
                     Err(e) => {
                         warn!(target: "bp_notifications::command", error = %e, "ntfy subscribe");
@@ -1029,9 +1059,9 @@ impl CommandHandler {
                     } => self.refresh_group_menu(*chat_id).await,
                     Transport::Telegram { group: None, .. } => {}
                 }
-                remove_ok_text(lang, &address).to_string()
+                remove_ok_text(lang, &address, is_group(transport)).to_string()
             }
-            Ok(_) => remove_missing_text(lang, &address).to_string(),
+            Ok(_) => remove_missing_text(lang, &address, is_group(transport)).to_string(),
             Err(e) => {
                 warn!(target: "bp_notifications::command", error = %e, "remove");
                 db_error_text(lang).to_string()
@@ -1321,6 +1351,48 @@ impl CommandHandler {
             }
         }
         GroupFollows { team, blockparty }
+    }
+
+    /// For a group, what each subscription follows by name ("Team X",
+    /// "Blockparty Y"), by subscription id; a subscription in neither, or a
+    /// failed read, gets no name. Empty for a private chat.
+    async fn group_names(
+        &self,
+        subs: &[TelegramSubscriptionRow],
+        in_group: bool,
+    ) -> HashMap<i32, String> {
+        let mut names = HashMap::new();
+        if !in_group {
+            return names;
+        }
+        for sub in subs {
+            if let Some(name) = self.followed_name(&sub.address).await {
+                names.insert(sub.id, name);
+            }
+        }
+        names
+    }
+
+    /// `Team <name>` or `Blockparty <name>` for the live Team or Blockparty
+    /// `address` is a member of.
+    async fn followed_name(&self, address: &AddressId) -> Option<String> {
+        if let Ok(Some(member)) = find_group_member_by_address(&self.pool, address).await {
+            if let Ok(Some(team)) = find_group(&self.pool, member.group_id).await {
+                if team.dissolved_at.is_none() {
+                    return Some(format!("Team {}", team.name));
+                }
+            }
+        }
+        let member = find_blockparty_member_by_address(&self.pool, address)
+            .await
+            .ok()??;
+        let party = find_blockparty_group(&self.pool, member.group_id)
+            .await
+            .ok()??;
+        match party.status.parse::<bp_blockparty::BlockpartyStatus>() {
+            Ok(bp_blockparty::BlockpartyStatus::Dissolved) => None,
+            _ => Some(format!("Blockparty {}", party.name)),
+        }
     }
 
     /// The menu and `/help` of the chat a command came from.
@@ -1888,31 +1960,59 @@ fn db_error_text(lang: Language) -> &'static str {
     }
 }
 
-fn subscribe_ok_text(lang: Language, address: &AddressId) -> String {
+/// A group is never shown the address it follows, not even shortened.
+fn subscribe_ok_text(lang: Language, address: &AddressId, in_group: bool) -> String {
     let address = html::addr(&short_address(address.as_str()));
-    match lang {
-        Language::De => {
+    match (lang, in_group) {
+        (Language::De, false) => {
             format!("✅ {address} abonniert.\nMit /settings schaltest du, was ich dir dazu melde.")
         }
-        Language::En => {
+        (Language::En, false) => {
             format!("✅ Following {address}.\n/settings switches what I tell you about it.")
         }
+        (Language::De, true) => "✅ Die Gruppe folgt jetzt dieser Adresse.\nMit /settings \
+                                 schaltest du, was ich hier melde."
+            .to_string(),
+        (Language::En, true) => "✅ This group now follows the address.\n/settings switches \
+                                 what I report here."
+            .to_string(),
     }
 }
 
-fn remove_ok_text(lang: Language, address: &AddressId) -> String {
+fn remove_ok_text(lang: Language, address: &AddressId, in_group: bool) -> String {
     let address = html::addr(&short_address(address.as_str()));
-    match lang {
-        Language::De => format!("{address} entfernt."),
-        Language::En => format!("{address} removed."),
+    match (lang, in_group) {
+        (Language::De, false) => format!("{address} entfernt."),
+        (Language::En, false) => format!("{address} removed."),
+        (Language::De, true) => "Adresse entfernt.".to_string(),
+        (Language::En, true) => "Address removed.".to_string(),
     }
 }
 
-fn remove_missing_text(lang: Language, address: &AddressId) -> String {
+fn remove_missing_text(lang: Language, address: &AddressId, in_group: bool) -> String {
     let address = html::addr(&short_address(address.as_str()));
-    match lang {
-        Language::De => format!("{address} war nicht abonniert."),
-        Language::En => format!("{address} was not followed."),
+    match (lang, in_group) {
+        (Language::De, false) => format!("{address} war nicht abonniert."),
+        (Language::En, false) => format!("{address} was not followed."),
+        (Language::De, true) => "Diese Adresse war nicht abonniert.".to_string(),
+        (Language::En, true) => "That address was not followed.".to_string(),
+    }
+}
+
+/// How a keyboard names a subscription: its shortened address, or in a
+/// group the Team or Blockparty it follows (`names`, by subscription id),
+/// since a group is not shown the address it follows.
+fn subscription_label(
+    lang: Language,
+    sub: &TelegramSubscriptionRow,
+    in_group: bool,
+    names: &HashMap<i32, String>,
+) -> String {
+    match (in_group, names.get(&sub.id), lang) {
+        (false, _, _) => short_address(sub.address.as_str()),
+        (true, Some(name), _) => name.clone(),
+        (true, None, Language::De) => "Adresse".to_string(),
+        (true, None, Language::En) => "Address".to_string(),
     }
 }
 
@@ -2063,17 +2163,27 @@ mod tests {
                 ),
                 no_default_text(lang).to_string(),
                 db_error_text(lang).to_string(),
-                subscribe_ok_text(lang, &address),
-                remove_ok_text(lang, &address),
-                remove_missing_text(lang, &address),
+                subscribe_ok_text(lang, &address, false),
+                subscribe_ok_text(lang, &address, true),
+                remove_ok_text(lang, &address, false),
+                remove_ok_text(lang, &address, true),
+                remove_missing_text(lang, &address, false),
+                remove_missing_text(lang, &address, true),
                 no_address_text(lang).to_string(),
                 list_addresses(lang, ["bc1q<bc1q<odd>&address>"].into_iter()),
                 best_diff_reset_text(lang, &address, Some("https://pool.example")),
                 language_switch_ok_text(lang).to_string(),
                 engine_unconfigured_text(lang, "PPLNS"),
-                CommandHandler::build_address_keyboard(&subs, lang).0,
-                CommandHandler::build_settings_keyboard(&subs, lang, &TeamRoles::default(), false)
-                    .0,
+                CommandHandler::build_address_keyboard(&subs, lang, false, &HashMap::new()).0,
+                CommandHandler::build_address_keyboard(&subs, lang, true, &HashMap::new()).0,
+                CommandHandler::build_settings_keyboard(
+                    &subs,
+                    lang,
+                    &TeamRoles::default(),
+                    false,
+                    &HashMap::new(),
+                )
+                .0,
                 no_team_admin_text(lang).to_string(),
                 no_team_member_text(lang).to_string(),
                 super::super::help_text(lang, MenuView::Private),
@@ -2108,9 +2218,9 @@ mod tests {
         let address = AddressId::new(full).unwrap();
         for lang in [Language::De, Language::En] {
             for text in [
-                subscribe_ok_text(lang, &address),
-                remove_ok_text(lang, &address),
-                remove_missing_text(lang, &address),
+                subscribe_ok_text(lang, &address, false),
+                remove_ok_text(lang, &address, false),
+                remove_missing_text(lang, &address, false),
             ] {
                 assert!(
                     text.contains("bc1q...jwcy8") && !text.contains(full),
@@ -2160,7 +2270,8 @@ mod tests {
             sub_row(2, "bc1qsecondaddressxxxxxx", false),
             sub_row(1, "bc1qfirstaddressxxxxxxx", true),
         ];
-        let (text, kb) = CommandHandler::build_address_keyboard(&subs, Language::En);
+        let (text, kb) =
+            CommandHandler::build_address_keyboard(&subs, Language::En, false, &HashMap::new());
         assert!(text.contains("default"));
         assert_eq!(kb.len(), 2);
         // Row 0 = id 1 (the default → ⭐), row 1 = id 2.
@@ -2183,8 +2294,13 @@ mod tests {
             members: HashSet::from([second.clone()]),
             admins: HashSet::from([second]),
         };
-        let (_text, kb) =
-            CommandHandler::build_settings_keyboard(&subs, Language::En, &roles, false);
+        let (_text, kb) = CommandHandler::build_settings_keyboard(
+            &subs,
+            Language::En,
+            &roles,
+            false,
+            &HashMap::new(),
+        );
         // Per address: the address row and its switches, three a row,
         // ordered by id.
         assert_eq!(kb.len(), 7);
@@ -2597,8 +2713,11 @@ mod tests {
         let subs = find_telegram_subscriptions_by_chat(&pool, chat_id)
             .await
             .unwrap();
-        assert_eq!(subs.len(), 3);
-        assert!(subs.iter().all(|s| s.group_chat), "{subs:?}");
+        // A group follows one address: each subscribe took the place of the
+        // one before.
+        assert_eq!(subs.len(), 1, "{subs:?}");
+        assert_eq!(subs[0].address.as_str(), party_admin);
+        assert!(subs[0].group_chat);
 
         subscribed_chat(&pool, chat_id, &[]).await;
         cleanup().await;
@@ -2701,6 +2820,45 @@ mod tests {
         cleanup().await;
     }
 
+    /// A group is never shown an address it follows: not in a
+    /// confirmation, not on a keyboard. A private chat still is.
+    #[test]
+    fn a_group_is_never_shown_the_address_it_follows() {
+        let full = "bc1qtpa45phz26kays4hk63hcmxf9sty454wqjwcy8";
+        let address = AddressId::new(full).unwrap();
+        let subs = vec![
+            sub_row(3, full, true),
+            sub_row(1, "bc1qotheraddressxxxxxxxx", false),
+        ];
+        for lang in [Language::De, Language::En] {
+            for text in [
+                subscribe_ok_text(lang, &address, true),
+                remove_ok_text(lang, &address, true),
+                remove_missing_text(lang, &address, true),
+            ] {
+                assert!(!text.contains("bc1q"), "{text}");
+            }
+            let (_, kb) =
+                CommandHandler::build_address_keyboard(&subs, lang, true, &HashMap::new());
+            let (_, settings) = CommandHandler::build_settings_keyboard(
+                &subs,
+                lang,
+                &TeamRoles::default(),
+                true,
+                &HashMap::new(),
+            );
+            for button in kb.iter().chain(&settings).flatten() {
+                assert!(!button.text.contains("bc1q"), "{}", button.text);
+            }
+        }
+        // Named by what it follows; without a name, "Adresse".
+        let names = HashMap::from([(3, "Team Rig".to_string())]);
+        let (_, kb) = CommandHandler::build_address_keyboard(&subs, Language::De, true, &names);
+        assert_eq!(kb[0][0].text, "Adresse");
+        assert_eq!(kb[1][0].text, "⭐ Team Rig");
+        assert!(subscribe_ok_text(Language::De, &address, false).contains("bc1q...jwcy8"));
+    }
+
     /// A group's settings show only what a Team or Blockparty brings.
     #[test]
     fn a_groups_settings_show_only_team_switches() {
@@ -2710,8 +2868,13 @@ mod tests {
             members: HashSet::from([address.clone()]),
             admins: HashSet::from([address]),
         };
-        let (_text, kb) =
-            CommandHandler::build_settings_keyboard(&subs, Language::En, &roles, true);
+        let (_text, kb) = CommandHandler::build_settings_keyboard(
+            &subs,
+            Language::En,
+            &roles,
+            true,
+            &HashMap::new(),
+        );
         let switches: Vec<String> = kb[1..]
             .iter()
             .flatten()
