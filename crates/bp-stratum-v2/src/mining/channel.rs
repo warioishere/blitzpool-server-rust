@@ -65,12 +65,6 @@ pub struct ChannelState {
     /// tip's hashes outlive the tip.
     pub seen_shares: SeenShares,
 
-    /// Content signature of the last job sent. A same-block refresh with the
-    /// same signature is not re-issued: BraiinsOS resets its hashing pipeline
-    /// on every `NewMiningJob`, so identical re-announced work stalls it. A
-    /// block change (`SetNewPrevHash`) is always sent.
-    pub last_sent_job_signature: Option<u64>,
-
     /// Target memo for the per-share accept check. Per-job difficulty
     /// changes only on a vardiff ratchet.
     target_memo: TargetMemo,
@@ -96,7 +90,6 @@ impl ChannelState {
             extended_jobs: HashMap::new(),
             next_job_id: 1,
             seen_shares: SeenShares::new(),
-            last_sent_job_signature: None,
             target_memo: TargetMemo::default(),
         }
     }
@@ -121,7 +114,6 @@ impl ChannelState {
             extended_jobs: HashMap::new(),
             next_job_id: 1,
             seen_shares: SeenShares::new(),
-            last_sent_job_signature: None,
             target_memo: TargetMemo::default(),
         }
     }

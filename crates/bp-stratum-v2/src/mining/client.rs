@@ -1497,31 +1497,6 @@ fn standard_member_root_and_coinbase(
 
 // ── apply_template_broadcast ────────────────────────────────────────
 
-/// Content signature of everything the miner hashes over, deliberately
-/// EXCLUDING `min_ntime`, so a clock-only refresh counts as identical work.
-/// Re-issuing identical work under a fresh `job_id` freezes strict firmware
-/// that resets its pipeline on every new job.
-fn job_content_signature(
-    version: u32,
-    prev_hash: &[u8; 32],
-    n_bits: u32,
-    merkle_root: Option<&[u8; 32]>,
-    merkle_path: &[[u8; 32]],
-    coinbase_prefix: &[u8],
-    coinbase_suffix: &[u8],
-) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    version.hash(&mut h);
-    prev_hash.hash(&mut h);
-    n_bits.hash(&mut h);
-    merkle_root.hash(&mut h);
-    merkle_path.hash(&mut h);
-    coinbase_prefix.hash(&mut h);
-    coinbase_suffix.hash(&mut h);
-    h.finish()
-}
-
 /// A [`TemplateBroadcast`] for a connection that set `REQUIRES_WORK_SELECTION`
 /// (SV2 Mining/SetupConnection): it mines only the jobs it sets with
 /// `SetCustomMiningJob`, so it gets no pool job. A block change retires its
@@ -1625,22 +1600,6 @@ pub fn apply_template_broadcast<C: Clock>(
                     &template.merkle_path,
                 );
 
-                // Suppress an identical same-block refresh (see
-                // `job_content_signature`); a block change is always sent.
-                let sig = job_content_signature(
-                    template.version,
-                    &template.prev_hash,
-                    template.n_bits,
-                    Some(&merkle_root),
-                    &[],
-                    &[],
-                    &[],
-                );
-                if !is_new_block && channel.last_sent_job_signature == Some(sig) {
-                    continue;
-                }
-                channel.last_sent_job_signature = Some(sig);
-
                 let template_snapshot = StandardTemplateSnapshot {
                     version: template.version,
                     prev_hash: template.prev_hash,
@@ -1689,21 +1648,6 @@ pub fn apply_template_broadcast<C: Clock>(
                 let tx_prefix = mining_job.coinbase_prefix().to_vec();
                 let tx_suffix = mining_job.coinbase_suffix().to_vec();
                 let merkle_path = template.merkle_path.clone();
-
-                // Same identical-refresh suppression as the Standard arm.
-                let sig = job_content_signature(
-                    template.version,
-                    &template.prev_hash,
-                    template.n_bits,
-                    None,
-                    &merkle_path,
-                    &tx_prefix,
-                    &tx_suffix,
-                );
-                if !is_new_block && channel.last_sent_job_signature == Some(sig) {
-                    continue;
-                }
-                channel.last_sent_job_signature = Some(sig);
 
                 let ext_job = extended_job(
                     template,
@@ -5143,72 +5087,6 @@ pub(crate) mod tests {
             ch.standard_jobs.classify(1, 2_000),
             Some(bp_jobs_lifecycle::JobClassification::Active),
             "Refresh must not retire existing entries"
-        );
-    }
-
-    /// An identical same-block refresh is suppressed; changed work and block changes are sent.
-    #[test]
-    fn template_broadcast_refresh_suppresses_byte_identical_reissue() {
-        let mut s = session_with_standard_channel();
-        let mj = synthetic_mining_job_inputs();
-        // Seed the channel's last-job signature via a block change.
-        let seed = apply_template_broadcast(
-            &mut s,
-            &broadcast(TemplateChange::NewBlock, [0xAB; 32]),
-            &mj,
-            1_000,
-            None,
-        );
-        assert!(seed
-            .outbound
-            .iter()
-            .any(|f| matches!(f, OutboundFrame::NewMiningJob { .. })));
-
-        // Byte-identical refresh → nothing on the wire.
-        let dup = apply_template_broadcast(
-            &mut s,
-            &broadcast(TemplateChange::Refresh, [0xAB; 32]),
-            &mj,
-            2_000,
-            None,
-        );
-        assert!(
-            dup.outbound.is_empty(),
-            "byte-identical refresh must not re-issue a job"
-        );
-
-        // Refresh with changed work → a fresh NewMiningJob.
-        let mut mj2 = synthetic_mining_job_inputs();
-        mj2.coinbase_prefix = vec![0x01, 0xC9];
-        let changed = apply_template_broadcast(
-            &mut s,
-            &broadcast(TemplateChange::Refresh, [0xAB; 32]),
-            &mj2,
-            3_000,
-            None,
-        );
-        assert!(
-            changed
-                .outbound
-                .iter()
-                .any(|f| matches!(f, OutboundFrame::NewMiningJob { .. })),
-            "a refresh with changed work must be sent"
-        );
-
-        // A block change re-issues even if the work matches the last job.
-        let block = apply_template_broadcast(
-            &mut s,
-            &broadcast(TemplateChange::NewBlock, [0xCD; 32]),
-            &mj2,
-            4_000,
-            None,
-        );
-        assert!(
-            block
-                .outbound
-                .iter()
-                .any(|f| matches!(f, OutboundFrame::NewMiningJob { .. })),
-            "a block change must always be sent"
         );
     }
 
