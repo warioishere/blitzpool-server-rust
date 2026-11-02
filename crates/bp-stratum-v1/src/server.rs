@@ -598,20 +598,7 @@ async fn run_connection(
                             );
                         }
                         if run_inline_vardiff {
-                            let payouts = match current_template.as_deref() {
-                                Some(t) => resolve_payouts_for_state(&state, &hooks, t).await,
-                                None => ResolvedPayouts::unsnapshotted(vec![]),
-                            };
-                            let outcome = apply_vardiff_check(
-                                &mut state,
-                                &server_config,
-                                &port_config,
-                                &registry,
-                                &job_cache,
-                                current_template.as_ref(),
-                                &payouts,
-                                now,
-                            );
+                            let outcome = apply_vardiff_check(&mut state, now);
                             if !apply_outcome(
                                 outcome,
                                 &mut state,
@@ -682,21 +669,7 @@ async fn run_connection(
                 }
             }
             _ = vardiff_tick.tick() => {
-                // Resolved even if no ratchet follows: cheap, and keeps the handler synchronous.
-                let payouts = match current_template.as_deref() {
-                    Some(t) => resolve_payouts_for_state(&state, &hooks, t).await,
-                    None => ResolvedPayouts::unsnapshotted(vec![]),
-                };
-                let outcome = apply_vardiff_check(
-                    &mut state,
-                    &server_config,
-                    &port_config,
-                    &registry,
-                    &job_cache,
-                    current_template.as_ref(),
-                    &payouts,
-                    SystemClock.now_ms(),
-                );
+                let outcome = apply_vardiff_check(&mut state, SystemClock.now_ms());
                 if !apply_outcome(
                     outcome,
                     &mut state,

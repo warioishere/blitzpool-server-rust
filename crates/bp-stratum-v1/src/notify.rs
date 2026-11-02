@@ -64,15 +64,6 @@ impl ActiveSV1Template {
         self.n_bits_hex = format!("{:08x}", self.template.n_bits);
         self.header_timestamp_hex = format!("{:08x}", self.template.header_timestamp);
     }
-
-    /// This template offering `ntime` as its header timestamp. A job
-    /// registered on it is checked against that ntime's window.
-    pub(crate) fn with_header_timestamp(&self, ntime: u32) -> Self {
-        let mut active = self.clone();
-        active.template.header_timestamp = ntime;
-        active.recompute_notify_header_hex();
-        active
-    }
 }
 
 impl ActiveFromTemplate for ActiveSV1Template {

@@ -67,8 +67,6 @@ pub(crate) struct SessionState<C: Clock> {
     pub vardiff: VarDiffEngine<C>,
     pub last_difficulty_check_ms: u64,
     pub share_cache: SessionShareCache,
-    /// ntime of the last `mining.notify` sent; see [`retarget_ntime`].
-    pub last_notify_ntime: u32,
 
     // Live caches mirrored back from vardiff
     pub hash_rate: f64,
@@ -124,7 +122,6 @@ impl<C: Clock> SessionState<C> {
             vardiff,
             last_difficulty_check_ms: 0,
             share_cache: SessionShareCache::new(),
-            last_notify_ntime: 0,
             hash_rate: 0.0,
             stream: bp_common::StreamKind::Pplns,
             share_logs: server_config.share_logs,
@@ -549,20 +546,14 @@ pub(crate) fn handle_submit<C: Clock>(
 // ── Periodic vardiff check (60s timer poll) ──────────────────────────
 
 /// Vardiff retarget, polled on the timer and after each accepted current-diff
-/// share. A retarget sends `mining.set_difficulty` plus a notify with
-/// `clean_jobs=false`: in-flight shares on older jobs are judged at those
-/// jobs' send-time difficulty (see `validate_submit`), not lost to a job
-/// flush. A session never sent a notify is not judged (see
-/// [`VarDiffEngine::note_work_available`]).
-#[allow(clippy::too_many_arguments)]
+/// share. A retarget sends `mining.set_difficulty` alone: the jobs the miner
+/// holds stay, and the next template's job is the first registered at the new
+/// difficulty. Until then a share on an older job is judged at the lower of
+/// its job's send-time difficulty and the session's (see `validate_submit`),
+/// whichever moment the miner applies the new one. A session never sent a
+/// notify is not judged (see [`VarDiffEngine::note_work_available`]).
 pub(crate) fn apply_vardiff_check<C: Clock>(
     state: &mut SessionState<C>,
-    server_config: &ServerConfig,
-    port_config: &PortConfig,
-    registry: &Arc<JobRegistry>,
-    job_cache: &MiningJobCache,
-    current_template: Option<&Arc<ActiveSV1Template>>,
-    payouts: &ResolvedPayouts,
     now_ms: u64,
 ) -> HandlerOutcome {
     let mut out = HandlerOutcome::default();
@@ -571,51 +562,15 @@ pub(crate) fn apply_vardiff_check<C: Clock>(
     let Some(target) = state.vardiff.suggested_difficulty(state.session_difficulty) else {
         return out;
     };
-    if !target.is_finite() || target == state.session_difficulty {
+    if target == state.session_difficulty {
         return out;
     }
 
-    // Before the notify below, so the new job is registered at `target`.
     state.session_difficulty = target;
     state.vardiff.note_difficulty_assigned(target);
     out.push_event(SessionEvent::DifficultyChanged);
-
     out.push_frame(write_set_difficulty(target));
-
-    if let Some(template) = current_template {
-        // Same template and payouts, so the same coinbase and merkle path as
-        // the session's last job. A miner may restart its search on the new
-        // job id; with that job's ntime it would re-find headers already
-        // credited. A later ntime makes it new work.
-        let ntime = retarget_ntime(template.header_timestamp, state.last_notify_ntime, now_ms);
-        let template = Arc::new(template.with_header_timestamp(ntime));
-        if let Some(frame) = build_and_register_notify(
-            state,
-            server_config,
-            port_config,
-            registry,
-            job_cache,
-            &template,
-            payouts,
-            false,
-            now_ms,
-        ) {
-            out.push_frame(frame);
-        }
-    }
     out
-}
-
-/// The ntime of a retarget's job: the clock's, but never behind the template
-/// and always past the last ntime this session was offered, so the job is new
-/// work even when the retarget falls in the same second as that notify.
-fn retarget_ntime(template_ntime: u32, last_notify_ntime: u32, now_ms: u64) -> u32 {
-    // A clock past what u32 seconds hold counts as no clock: the other two
-    // bounds alone still make the job new work.
-    let now_secs = u32::try_from(now_ms / 1000).unwrap_or(0);
-    template_ntime
-        .max(now_secs)
-        .max(last_notify_ntime.saturating_add(1))
 }
 
 // ── New-template event (server-driven; see translator in notify.rs) ──
@@ -667,7 +622,7 @@ pub(crate) fn apply_new_template<C: Clock>(
 /// from the caller because resolving it is async.
 #[allow(clippy::too_many_arguments)]
 fn build_and_register_notify<C: Clock>(
-    state: &mut SessionState<C>,
+    state: &SessionState<C>,
     server_config: &ServerConfig,
     _port_config: &PortConfig,
     registry: &Arc<JobRegistry>,
@@ -718,7 +673,6 @@ fn build_and_register_notify<C: Clock>(
         state.session_difficulty,
         now_ms,
     );
-    state.last_notify_ntime = template.header_timestamp;
     Some(build_notify_frame(
         template,
         &mining_job,
@@ -783,12 +737,12 @@ mod tests {
     #[test]
     fn no_notify_is_built_when_the_resolver_serves_no_job() {
         let port = solo_port(1.0);
-        let mut state = fresh_state(TestClock::new(0), &port);
+        let state = fresh_state(TestClock::new(0), &port);
         let template = mineable_template();
         let cache = MiningJobCache::new();
 
         let out = build_and_register_notify(
-            &mut state,
+            &state,
             &server_config(),
             &port,
             &empty_registry(),
@@ -805,7 +759,7 @@ mod tests {
 
         // Control: a real list DOES produce one.
         let out = build_and_register_notify(
-            &mut state,
+            &state,
             &server_config(),
             &port,
             &empty_registry(),
@@ -1414,17 +1368,7 @@ mod tests {
     fn vardiff_check_without_samples_is_a_noop() {
         let port = solo_port(16384.0);
         let mut state = fresh_state(TestClock::new(0), &port);
-        let reg = empty_registry();
-        let out = apply_vardiff_check(
-            &mut state,
-            &server_config(),
-            &port,
-            &reg,
-            &MiningJobCache::new(),
-            None,
-            &ResolvedPayouts::unsnapshotted(vec![]),
-            1_000,
-        );
+        let out = apply_vardiff_check(&mut state, 1_000);
         assert!(out.outbound_frames.is_empty());
         assert_eq!(state.last_difficulty_check_ms, 1_000);
     }
@@ -1449,20 +1393,9 @@ mod tests {
 
     fn vardiff_check_now(
         state: &mut SessionState<Arc<TestClock>>,
-        sc: &ServerConfig,
-        port: &PortConfig,
         clock: &Arc<TestClock>,
     ) -> HandlerOutcome {
-        apply_vardiff_check(
-            state,
-            sc,
-            port,
-            &empty_registry(),
-            &MiningJobCache::new(),
-            Some(&mineable_template()),
-            &ResolvedPayouts::unsnapshotted(vec![]),
-            clock.now_ms(),
-        )
+        apply_vardiff_check(state, clock.now_ms())
     }
 
     /// A session is judged only once it got work. Without a notify it holds
@@ -1477,7 +1410,7 @@ mod tests {
         state.stratum_initialized = true;
         state.authorization = Some(authorize_req(REGTEST_ADDR));
         clock.advance_ms(600_000);
-        let out = vardiff_check_now(&mut state, &sc, &port, &clock);
+        let out = vardiff_check_now(&mut state, &clock);
         assert!(out.outbound_frames.is_empty(), "no notify yet, no retarget");
 
         let notify = apply_new_template(
@@ -1496,7 +1429,7 @@ mod tests {
             "precondition: a notify went out"
         );
         clock.advance_ms(61_000);
-        let out = vardiff_check_now(&mut state, &sc, &port, &clock);
+        let out = vardiff_check_now(&mut state, &clock);
         let frame = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert!(
             frame.contains("mining.set_difficulty"),
@@ -1512,11 +1445,11 @@ mod tests {
     #[test]
     fn silence_eases_a_quiet_session_on_the_wire() {
         let clock = Arc::new(TestClock::new(0));
-        let (mut state, sc, port) = measured_session(&clock);
+        let (mut state, _, _) = measured_session(&clock);
         // 400 s of silence: 29 arrivals over 700 s → target ≈ 6787, below
         // half of 16384, rounds UP on the power-of-two ladder to 8192.
         clock.advance_ms(400_000);
-        let out = vardiff_check_now(&mut state, &sc, &port, &clock);
+        let out = vardiff_check_now(&mut state, &clock);
         let frame = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert!(
             frame.contains("mining.set_difficulty"),
@@ -1561,7 +1494,7 @@ mod tests {
             let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
             assert!(s.contains("\"stale\""), "expected a stale reject, got {s}");
         }
-        let out = vardiff_check_now(&mut state, &sc, &port, &clock);
+        let out = vardiff_check_now(&mut state, &clock);
         assert!(
             out.outbound_frames.is_empty(),
             "a session sending stale shares at its cadence must hold"
@@ -1574,7 +1507,7 @@ mod tests {
     #[test]
     fn unknown_job_rejects_do_not_count_as_arrivals() {
         let clock = Arc::new(TestClock::new(0));
-        let (mut state, sc, port) = measured_session(&clock);
+        let (mut state, _, _) = measured_session(&clock);
         state.authorization = Some(authorize_req(REGTEST_ADDR));
         let reg = empty_registry();
         let job_ids: Vec<String> = (0..40).map(|i| format!("{i:x}")).collect();
@@ -1587,7 +1520,7 @@ mod tests {
                 "expected an unknown-job reject, got {s}"
             );
         }
-        let _ = vardiff_check_now(&mut state, &sc, &port, &clock);
+        let _ = vardiff_check_now(&mut state, &clock);
         assert!(
             state.session_difficulty < 16384.0,
             "unknown-job rejects held the session at {}",
@@ -1645,7 +1578,7 @@ mod tests {
                 "submit #{i}: expected Duplicate share, got {s}"
             );
         }
-        let _ = vardiff_check_now(&mut state, &sc, &port, &clock);
+        let _ = vardiff_check_now(&mut state, &clock);
         assert!(
             state.session_difficulty < 16384.0,
             "duplicates held the session at {}",
@@ -1653,30 +1586,16 @@ mod tests {
         );
     }
 
-    /// `(job id, ntime)` of a notify frame.
-    fn notify_job_and_ntime(frame: &[u8]) -> (String, String) {
-        let v: serde_json::Value =
-            serde_json::from_slice(&frame[..frame.len() - 1]).expect("notify is JSON");
-        let p = v["params"].as_array().expect("params array");
-        (
-            p[0].as_str().expect("job id").to_string(),
-            p[7].as_str().expect("ntime").to_string(),
-        )
-    }
-
-    /// A retarget re-sends the session's template as a new job. A miner may
-    /// restart its search on it from the same extranonce2 and nonce; with the
-    /// previous job's ntime that reproduces headers already credited, which
-    /// the duplicate guard then refuses. The new job's later ntime makes the
-    /// restarted search new work, and the previous ntime is outside its window.
+    /// A retarget sends `set_difficulty` alone. No job goes out again, so a
+    /// miner that restarts its search on every new job never re-finds shares
+    /// already credited. The job the miner holds keeps its difficulty, and the
+    /// next template's job is the first at the new one.
     #[test]
-    fn a_retarget_job_is_new_work_not_a_replay_of_the_previous_one() {
+    fn a_retarget_sends_set_difficulty_alone_and_the_next_job_carries_it() {
         let clock = Arc::new(TestClock::new(0));
         let (mut state, sc, port) = measured_session(&clock);
-        state.authorization = Some(authorize_req(REGTEST_ADDR));
         let reg = empty_registry();
         let cache = MiningJobCache::new();
-        let template = Arc::new(template_for_regtest());
         let payouts = solo_payouts_fixture(REGTEST_ADDR);
         let first = apply_new_template(
             &mut state,
@@ -1684,75 +1603,55 @@ mod tests {
             &port,
             &reg,
             &cache,
-            &template,
+            &Arc::new(template_for_regtest()),
             &payouts,
             false,
             clock.now_ms(),
         );
-        let (job_a, ntime_a) = notify_job_and_ntime(&first.outbound_frames[0]);
+        let held_job = notify_job_id(&first.outbound_frames[0]);
 
         // Silence, as in `silence_eases_a_quiet_session_on_the_wire`.
         clock.advance_ms(400_000);
-        let retarget = apply_vardiff_check(
+        let out = apply_vardiff_check(&mut state, clock.now_ms());
+        assert_eq!(
+            out.outbound_frames.len(),
+            1,
+            "set_difficulty and nothing else"
+        );
+        let frame = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
+        assert!(frame.contains("\"params\":[8192]"), "got {frame}");
+        assert_eq!(state.session_difficulty, 8192.0);
+        let owner = state.job_owner;
+        let difficulty_of = |job_id: &str| {
+            reg.classify(job_id, owner, clock.now_ms())
+                .expect("the job is registered")
+                .difficulty
+        };
+        assert_eq!(
+            difficulty_of(&held_job),
+            16384.0,
+            "the job the miner holds keeps its difficulty"
+        );
+
+        let mut refreshed = template_for_regtest();
+        refreshed.template.coinbase_tx_value_remaining += 1;
+        let next = apply_new_template(
             &mut state,
             &sc,
             &port,
             &reg,
             &cache,
-            Some(&template),
+            &Arc::new(refreshed),
             &payouts,
+            false,
             clock.now_ms(),
         );
+        assert_eq!(next.outbound_frames.len(), 1, "the notify alone");
         assert_eq!(
-            retarget.outbound_frames.len(),
-            2,
-            "precondition: the retarget sends set_difficulty and a notify"
+            difficulty_of(&notify_job_id(&next.outbound_frames[0])),
+            8192.0,
+            "the next job is sent at the new difficulty"
         );
-        let (job_b, ntime_b) = notify_job_and_ntime(&retarget.outbound_frames[1]);
-        assert_ne!(job_a, job_b, "precondition: the retarget job has a new id");
-
-        let extranonce1 = state.extranonce1;
-        let easy = SessionContext {
-            extranonce1: &extranonce1,
-            job_owner: state.job_owner,
-            session_difficulty: 0.0,
-            share_logs: false,
-            version_rolling_mask: state.version_rolling_mask,
-        };
-        let mut submit = |job_id: &str, ntime_hex: &str| {
-            let share = SubmitRequest {
-                ntime_hex,
-                ..submit_req(job_id)
-            };
-            validate_submit(&share, &easy, &mut state.share_cache, &reg, clock.now_ms())
-        };
-        assert!(
-            matches!(submit(&job_a, &ntime_a), ShareValidation::Accepted(_)),
-            "precondition: the first job's share is accepted"
-        );
-        // The restarted search: same extranonce2 and nonce, the notify's ntime.
-        let restarted = submit(&job_b, &ntime_b);
-        assert!(
-            matches!(restarted, ShareValidation::Accepted(_)),
-            "the retarget job must be new work, got {restarted:?}"
-        );
-        assert!(
-            !matches!(submit(&job_b, &ntime_a), ShareValidation::Accepted(_)),
-            "the previous job's ntime must not be creditable on the retarget job"
-        );
-    }
-
-    #[test]
-    fn a_retarget_ntime_is_later_than_the_last_offered_and_never_behind_the_template() {
-        const T: u32 = 1_700_000_000;
-        // The template is ahead of the clock: one past the last notify.
-        assert_eq!(retarget_ntime(T, T, 0), T + 1);
-        // The clock is ahead of everything offered so far.
-        assert_eq!(retarget_ntime(T, T, (T as u64 + 600) * 1000), T + 600);
-        // An earlier retarget in the same second still gets a later ntime.
-        assert_eq!(retarget_ntime(T, T + 600, (T as u64 + 600) * 1000), T + 601);
-        // A last notify from an older, earlier template never pulls it below this one.
-        assert_eq!(retarget_ntime(T, T - 50, 0), T);
     }
 
     // ── apply_new_template ────────────────────────────────────────────
