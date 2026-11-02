@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Team round-best cron: tells a Team's members when the best share of the
-//! Team's current round rises. The round is the group-solo engine's (see
-//! [`bp_group_solo_engine::reader::round_reset`]); a lower best after it
-//! starts over is recorded without a notice, as the per-address best-diff
-//! cron does. The best last seen is kept in memory, only for Teams that have
-//! followers; a Team seen for the first time is only recorded.
+//! Team best cron: tells a Team's members when the Team's best share rises.
+//! The best starts over only at the Team's own block, when
+//! `resetRoundOnBlock` is set; a lower best after that is recorded without a
+//! notice, as the per-address best-diff cron does. The best last seen is
+//! kept in memory, only for Teams that have followers; a Team seen for the
+//! first time is only recorded.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use bp_common::AddressId;
 use bp_db::{find_group, find_team_best_ntfy_recipients, find_team_best_telegram_recipients};
-use bp_group_solo_engine::reader::round_reset;
 use bp_group_solo_engine::round::GroupRoundStore;
 use sqlx::PgPool;
 use tokio::sync::watch;
@@ -43,7 +42,7 @@ impl Default for TeamBestCronConfig {
     }
 }
 
-/// Who follows one Team's round best.
+/// Who follows one Team's best.
 #[derive(Default)]
 struct Followers {
     /// Chat and forum topic.
@@ -116,7 +115,7 @@ async fn run_once(
             Ok(Some(best)) => best,
             Ok(None) => continue,
             Err(e) => {
-                warn!(target: TARGET, %group_id, error = %e, "round best read failed");
+                warn!(target: TARGET, %group_id, error = %e, "team best read failed");
                 continue;
             }
         };
@@ -140,7 +139,7 @@ async fn run_once(
         };
         seen.insert(group_id, best.difficulty);
         let notice = TeamBestNotice {
-            reset: round_reset(&group),
+            best_resets_on_block: group.reset_round_on_block,
             group_name: group.name,
             difficulty: best.difficulty,
             finder: best.address,

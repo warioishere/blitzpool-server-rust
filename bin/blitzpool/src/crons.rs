@@ -4,7 +4,7 @@
 //! sessions, table retention, group invitation/join expiry) and notifications
 //! (`notify` role: network difficulty, digests, per-address best difficulty,
 //! whose baseline is seeded at spawn so a restart does not re-notify, and the
-//! Team round best).
+//! Team best).
 
 use std::sync::Arc;
 use std::time::Duration;

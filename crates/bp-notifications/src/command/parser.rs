@@ -45,7 +45,7 @@ pub enum Switch {
     Device,
     /// `/team_requests`: a Team admin's join-request notice.
     TeamRequests,
-    /// `/team_bestdiff`: a Team member's notice of a new round best.
+    /// `/team_bestdiff`: a Team member's notice of a new Team best.
     TeamBest,
     /// `/send_hourly`: hourly stats and workers together.
     Hourly,

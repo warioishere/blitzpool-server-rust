@@ -193,38 +193,57 @@ async fn reset_for_block_found_preserves_last_accepted_share_at() {
     );
 }
 
-// ── Test 5 — reset_full wipes including last-accepted-share-at ─────
+// ── Test 5 — the calendar reset wipes the round, not the best share ──
 
+/// The calendar reset starts the round over, `last-accepted-share-at`
+/// included, and keeps the best share, which starts over only at a block.
+/// The control: `reset_full`, for a dissolved group, drops the best share too.
 #[tokio::test]
-async fn reset_full_wipes_everything_including_last_accepted() {
+async fn the_calendar_reset_keeps_the_best_share_and_reset_full_drops_it() {
     let conn = match connect_or_skip(4).await {
         Some(c) => c,
         None => return,
     };
     let store = GroupRoundStore::new(conn.clone());
-    let group = "g_reset_full";
+    let group = "g_reset_calendar";
 
     store
         .record_share(Some("ep1:0"), group, "bc1qfoo", 10.0, 1_700_000_000_001)
         .await
         .unwrap();
     store.record_reject(group, "bc1qfoo", 1.0).await.unwrap();
-    store.reset_full(group).await.unwrap();
+    store
+        .update_best_share_if_better(group, "bc1qfoo", 50.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+    store.reset_for_calendar(group).await.unwrap();
 
     let mut conn = conn;
+    let by_addr_exists: bool = conn.exists(key_by_address(group)).await.unwrap();
     let last_at_exists: bool = conn
         .exists(key_last_accepted_share_at(group))
         .await
         .unwrap();
     let rejected_exists: bool = conn.exists(key_rejected_shares(group)).await.unwrap();
     let applied_exists: bool = conn.exists(key_applied(group)).await.unwrap();
+    assert!(!by_addr_exists, "the round's shares wiped");
     assert!(!last_at_exists, "last-accepted-share-at wiped");
     assert!(!rejected_exists, "rejected-shares wiped");
     // Reapplying an un-ACKed batch would hand those miners an unearned start.
     assert!(
         applied_exists,
-        "the dedup zset must survive a full reset too"
+        "the dedup zset must survive a calendar reset too"
     );
+    let best = store.read_best_share(group).await.unwrap();
+    assert_eq!(
+        best.map(|b| b.difficulty),
+        Some(50.0),
+        "the best share survives the calendar reset"
+    );
+
+    store.reset_full(group).await.unwrap();
+    let best_exists: bool = conn.exists(key_best_share(group)).await.unwrap();
+    assert!(!best_exists, "reset_full drops the best share");
 }
 
 // ── Test 6 — best-share only updates on improvement ────────────────

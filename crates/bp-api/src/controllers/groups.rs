@@ -1502,7 +1502,7 @@ struct BestDifficultyResponse {
     best_difficulty: u64,
     /// Masked; the full address is never sent.
     address_label: Option<String>,
-    /// `None` while the current round has no best yet.
+    /// `None` while the Team has no best yet, or after it started over.
     time: Option<String>,
 }
 

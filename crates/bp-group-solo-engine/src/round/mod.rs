@@ -210,7 +210,9 @@ pub enum RoundError {
 
 // ── BestShare ──────────────────────────────────────────────────────
 
-/// In-round best share for a group. Stored as a Redis hash.
+/// A group's best share, stored as a Redis hash. It starts over only at the
+/// group's own block, when `resetRoundOnBlock` is set, and when the group is
+/// dissolved.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BestShare {
     pub address: String,
@@ -602,17 +604,31 @@ impl GroupRoundStore {
         Ok(true)
     }
 
-    /// Scheduled (calendar-aligned) reset: wipe everything including
-    /// `last-accepted-share-at`.
+    /// Scheduled (calendar-aligned) reset: the round starts over, including
+    /// `last-accepted-share-at`. The best share stays; it starts over only at
+    /// the group's own block, when `resetRoundOnBlock` is set (see
+    /// [`Self::reset_for_block_found`]).
+    pub async fn reset_for_calendar(&self, group_id: &str) -> Result<(), RoundError> {
+        self.wipe_round(group_id, false).await
+    }
+
+    /// Everything the group holds here, its best share included: for a
+    /// dissolved group.
     pub async fn reset_full(&self, group_id: &str) -> Result<(), RoundError> {
+        self.wipe_round(group_id, true).await
+    }
+
+    async fn wipe_round(&self, group_id: &str, with_best_share: bool) -> Result<(), RoundError> {
         let mut conn = self.conn.clone();
-        let keys = vec![
+        let mut keys = vec![
             key_by_address(group_id),
             key_rejected_shares(group_id),
-            key_best_share(group_id),
             key_last_accepted_share_at(group_id),
             // NOT `key_applied`: see `reset_for_block_found`.
         ];
+        if with_best_share {
+            keys.push(key_best_share(group_id));
+        }
         let _: i64 = conn.del(keys).await?;
         self.delete_window_keys(&mut conn, group_id).await?;
         Ok(())

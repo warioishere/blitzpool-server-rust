@@ -3,7 +3,7 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! Who follows a Team's round best.
+//! Who follows a Team's best.
 
 use bp_common::AddressId;
 use bp_db::{

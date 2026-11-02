@@ -829,7 +829,7 @@ pub async fn find_telegram_group_chats(pool: &PgPool) -> Result<Vec<i64>, DbErro
 }
 
 /// Make a subscription a group chat's: only the notices a Team or
-/// Blockparty brings (blocks and the Team round best) stay on, since a group
+/// Blockparty brings (blocks and the Team best) stay on, since a group
 /// follows an address for those, not for the notices about its owner's
 /// miners.
 pub async fn make_telegram_group_subscription(
@@ -1210,9 +1210,9 @@ pub async fn find_device_notification_addresses(pool: &PgPool) -> Result<Vec<Add
     Ok(rows.into_iter().map(|r| r.address).collect())
 }
 
-// ── Team round best ──────────────────────────────────────────────────
+// ── Team best ────────────────────────────────────────────────────────
 
-/// A Telegram chat, in a forum topic, that follows a Team's round best
+/// A Telegram chat, in a forum topic, that follows a Team's best
 /// through one of its addresses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TeamBestTelegramRecipient {
@@ -1222,7 +1222,7 @@ pub struct TeamBestTelegramRecipient {
     pub message_thread_id: Option<i64>,
 }
 
-/// An ntfy topic (its address) that follows a Team's round best.
+/// An ntfy topic (its address) that follows a Team's best.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TeamBestNtfyRecipient {
     pub group_id: uuid::Uuid,

@@ -647,7 +647,7 @@ impl CommandHandler {
     /// The `/settings` keyboard: per subscription a row naming the address
     /// (⭐ on the default), then its switches with their state. A Team
     /// switch only where it can fire: join requests for a Team's admin, the
-    /// round best for a Team's member.
+    /// best for a Team's member.
     fn build_settings_keyboard(
         subs: &[TelegramSubscriptionRow],
         lang: Language,
@@ -1590,7 +1590,7 @@ fn group_notice(field: SettingsField) -> bool {
 /// The Team roles of a chat's addresses: who can get which Team notice.
 #[derive(Default)]
 struct TeamRoles {
-    /// Members of a Team that is not dissolved: its round best.
+    /// Members of a Team that is not dissolved: its best.
     members: HashSet<AddressId>,
     /// Admins among them: their Team's join requests.
     admins: HashSet<AddressId>,
@@ -1915,12 +1915,12 @@ fn no_team_admin_text(lang: Language) -> &'static str {
 fn no_team_member_text(lang: Language) -> &'static str {
     match lang {
         Language::De => {
-            "Keine deiner Adressen ist in einem Team. Den Bestwert der Team-Runde \
+            "Keine deiner Adressen ist in einem Team. Den Bestwert eines Teams \
              meldet der Bot den Mitgliedern des Teams."
         }
         Language::En => {
-            "None of your addresses is in a Team. The bot reports the best of a \
-             Team's round to the Team's members."
+            "None of your addresses is in a Team. The bot reports a Team's best \
+             to the Team's members."
         }
     }
 }
@@ -2061,10 +2061,10 @@ fn flag_toggle_ok_text(lang: Language, flag: Switch, value: bool) -> String {
             "Benachrichtigungen über Team-Beitrittsanfragen deaktiviert.".into()
         }
         (Language::De, Switch::TeamBest, true) => {
-            "Benachrichtigungen über den Bestwert der Team-Runde aktiviert.".into()
+            "Benachrichtigungen über den Bestwert des Teams aktiviert.".into()
         }
         (Language::De, Switch::TeamBest, false) => {
-            "Benachrichtigungen über den Bestwert der Team-Runde deaktiviert.".into()
+            "Benachrichtigungen über den Bestwert des Teams deaktiviert.".into()
         }
         (Language::En, Switch::BestDiff, true) => "Best-difficulty notifications enabled.".into(),
         (Language::En, Switch::BestDiff, false) => "Best-difficulty notifications disabled.".into(),
@@ -2079,10 +2079,10 @@ fn flag_toggle_ok_text(lang: Language, flag: Switch, value: bool) -> String {
             "Team join-request notifications disabled.".into()
         }
         (Language::En, Switch::TeamBest, true) => {
-            "Notifications of the Team round's best enabled.".into()
+            "Notifications of the Team's best enabled.".into()
         }
         (Language::En, Switch::TeamBest, false) => {
-            "Notifications of the Team round's best disabled.".into()
+            "Notifications of the Team's best disabled.".into()
         }
     }
 }
