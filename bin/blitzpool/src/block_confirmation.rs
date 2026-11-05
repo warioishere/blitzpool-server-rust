@@ -314,7 +314,6 @@ pub(crate) async fn settle_block(
             let block = bp_group_solo_engine::engine::FoundGroupBlock {
                 height,
                 hash: &pb.block_hash,
-                found_at_ms: pb.found_at_ms,
                 round_at_find: round_at_find.clone(),
             };
             engine

@@ -10,7 +10,7 @@ use bp_group_mgmt::group::PayoutMode;
 use bp_group_solo_engine::round::{
     key_applied, key_best_share, key_by_address, key_last_accepted_share_at, key_rejected_shares,
     key_settled_blocks, key_shares_since_block, key_window_buckets, key_window_by_address,
-    GroupRoundStore, SettleScope, WindowLane, WINDOW_BUCKET_MS,
+    GroupRoundStore, WindowLane, WINDOW_BUCKET_MS,
 };
 use redis::{aio::ConnectionManager, AsyncCommands, Client};
 
@@ -160,16 +160,10 @@ async fn a_booked_block_preserves_last_accepted_share_at() {
         .record_share(Some("ep1:0"), group, "bc1qfoo", 50.0, 1_700_000_000_001)
         .await
         .unwrap();
-    store
-        .update_best_share_if_better(group, "bc1qfoo", 50.0, 1_700_000_000_001)
-        .await
-        .unwrap();
-
     settle_now(&store, group, "block-1").await;
 
     let mut conn = conn;
     let by_addr_exists: bool = conn.exists(key_by_address(group)).await.unwrap();
-    let best_exists: bool = conn.exists(key_best_share(group)).await.unwrap();
     let applied_exists: bool = conn.exists(key_applied(group)).await.unwrap();
     let last_at_exists: bool = conn
         .exists(key_last_accepted_share_at(group))
@@ -177,7 +171,6 @@ async fn a_booked_block_preserves_last_accepted_share_at() {
         .unwrap();
 
     assert!(!by_addr_exists, "by-address wiped");
-    assert!(!best_exists, "best-share wiped");
     assert!(
         last_at_exists,
         "last-accepted-share-at preserved across block-found reset"
@@ -1016,20 +1009,14 @@ async fn forget_member_window_removes_the_address_from_both_lanes() {
 
 // ── What a booked block takes out ───────────────────────────────────
 
-const ALL: SettleScope = SettleScope {
-    round: true,
-    best_share: true,
-};
-
-/// Book a block found now with everything a `resetRoundOnBlock` Prop group's
-/// booking takes out.
+/// Book a block found now as a `resetRoundOnBlock` Prop group's booking does.
 async fn settle_now(store: &GroupRoundStore, group: &str, hash: &str) {
     let at_find = store
         .read_round_at_find(group, PayoutMode::Prop, 0, 0)
         .await
         .unwrap();
     assert!(store
-        .settle_block(group, hash, i64::MAX, &at_find, ALL)
+        .settle_block(group, hash, &at_find, true)
         .await
         .unwrap());
 }
@@ -1047,7 +1034,7 @@ async fn round_of(store: &GroupRoundStore, group: &str) -> Vec<(String, f64)> {
 
 /// MONEY: the shares a group mines while its block waits for confirmations
 /// belong to the next block, so booking must take out only what the find
-/// covered: round, counter and a best share not newer than the find.
+/// covered: round, rejects and counter.
 #[tokio::test]
 async fn a_booked_block_takes_out_only_what_was_mined_before_its_find() {
     let conn = match connect_or_skip(22).await {
@@ -1065,10 +1052,6 @@ async fn a_booked_block_takes_out_only_what_was_mined_before_its_find() {
         .await
         .unwrap();
     store.record_reject(group, "bc1qfoo", 2.0).await.unwrap();
-    store
-        .update_best_share_if_better(group, "bc1qfoo", 10.0, 1_000)
-        .await
-        .unwrap();
 
     let at_find = store
         .read_round_at_find(group, PayoutMode::Prop, 0, 0)
@@ -1084,13 +1067,9 @@ async fn a_booked_block_takes_out_only_what_was_mined_before_its_find() {
         .record_share(Some("a2"), group, "bc1qbar", 4.0, 3_000)
         .await
         .unwrap();
-    store
-        .update_best_share_if_better(group, "bc1qbar", 50.0, 3_000)
-        .await
-        .unwrap();
 
     assert!(store
-        .settle_block(group, "block-a", 2_000, &at_find, ALL)
+        .settle_block(group, "block-a", &at_find, true)
         .await
         .unwrap());
     assert_eq!(
@@ -1102,16 +1081,10 @@ async fn a_booked_block_takes_out_only_what_was_mined_before_its_find() {
         "the found-time rejects go"
     );
     assert_eq!(store.read_shares_since_block(group).await.unwrap(), 4.0);
-    let best = store
-        .read_best_share(group)
-        .await
-        .unwrap()
-        .expect("a newer best stays");
-    assert_eq!((best.address.as_str(), best.difficulty), ("bc1qbar", 50.0));
 
     assert!(
         !store
-            .settle_block(group, "block-a", 2_000, &at_find, ALL)
+            .settle_block(group, "block-a", &at_find, true)
             .await
             .unwrap(),
         "a redelivered booking is a no-op"
@@ -1148,10 +1121,6 @@ async fn a_block_takes_only_the_counter_out_of_a_round_it_does_not_reset() {
         None => return,
     };
     let store = GroupRoundStore::new(conn);
-    let none = SettleScope {
-        round: false,
-        best_share: false,
-    };
     let prop = "g_settle_flag_off";
     store
         .record_share(None, prop, "bc1qfoo", 10.0, 1)
@@ -1165,10 +1134,7 @@ async fn a_block_takes_only_the_counter_out_of_a_round_it_does_not_reset() {
         .record_share(None, prop, "bc1qfoo", 5.0, 2)
         .await
         .unwrap();
-    store
-        .settle_block(prop, "p", i64::MAX, &cover, none)
-        .await
-        .unwrap();
+    store.settle_block(prop, "p", &cover, false).await.unwrap();
     assert_eq!(
         round_of(&store, prop).await,
         vec![("bc1qfoo".to_string(), 15.0)]
@@ -1178,10 +1144,6 @@ async fn a_block_takes_only_the_counter_out_of_a_round_it_does_not_reset() {
     let window = "g_settle_window";
     let window_ms = 3_600_000;
     let now = 10 * WINDOW_BUCKET_MS;
-    let window_scope = SettleScope {
-        round: false,
-        best_share: true,
-    };
     store
         .record_share_windowed(Some("w1"), window, "bc1qfoo", 3.0, now)
         .await
@@ -1204,7 +1166,7 @@ async fn a_block_takes_only_the_counter_out_of_a_round_it_does_not_reset() {
         .await
         .unwrap();
     store
-        .settle_block(window, "w", i64::MAX, &cover, window_scope)
+        .settle_block(window, "w", &cover, false)
         .await
         .unwrap();
     let kept = store
@@ -1249,7 +1211,7 @@ async fn a_calendar_reset_while_the_block_is_parked_keeps_the_new_round() {
         .unwrap();
 
     assert!(store
-        .settle_block(group, "b", i64::MAX, &at_find, ALL)
+        .settle_block(group, "b", &at_find, true)
         .await
         .unwrap());
     assert_eq!(
@@ -1285,7 +1247,7 @@ async fn a_spent_large_sum_leaves_no_float_remainder() {
         .await
         .unwrap();
     store
-        .settle_block(group, "f", i64::MAX, &at_find, ALL)
+        .settle_block(group, "f", &at_find, true)
         .await
         .unwrap();
     assert!(

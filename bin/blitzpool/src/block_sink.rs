@@ -33,6 +33,32 @@ use crate::pending_blocks::{
     is_pending_block, park_unbookable_block, put_pending_block, PendingBlock, PendingSettlement,
 };
 
+/// Reads at a group block's find before it counts as unreadable.
+const FIND_READ_ATTEMPTS: u32 = 3;
+const FIND_READ_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// [`GroupSoloEngine::cut_round_at_find`],
+/// retried so a Redis or Postgres blip at the find does not leave the block
+/// unbooked.
+async fn cut_round_at_find(
+    engine: &GroupSoloEngine,
+    group_id: uuid::Uuid,
+    block_hash: &str,
+) -> Result<bp_group_solo_engine::round::RoundAtFind, bp_group_solo_engine::engine::EngineError> {
+    let mut attempt = 1;
+    loop {
+        match engine.cut_round_at_find(group_id, block_hash).await {
+            Err(err) if attempt < FIND_READ_ATTEMPTS => {
+                warn!(%err, %group_id, attempt,
+                    "block-found: group-solo round state unreadable at the find; retrying");
+                attempt += 1;
+                tokio::time::sleep(FIND_READ_RETRY_PAUSE).await;
+            }
+            cut => return cut,
+        }
+    }
+}
+
 /// The Core→Satellite block-found event: the front submits and records the
 /// block, the payout Satellite applies the ledger from this. Producer and
 /// consumer run the same version: a release that changes this format deploys
@@ -809,7 +835,7 @@ impl BlockFoundApplier {
                         } else {
                             // Taken now, so booking leaves the shares mined
                             // while the block waits for its confirmations.
-                            match engine.round_at_find(group_id).await {
+                            match cut_round_at_find(engine, group_id, block_hash).await {
                                 Ok(round_at_find) => {
                                     self.gate_or_apply(
                                         address_str,
@@ -828,7 +854,7 @@ impl BlockFoundApplier {
                                 Err(err) => {
                                     error!(%err, %group_id, address = address_str, height,
                                         "block-found: group-solo round state unreadable at the \
-                                         find — parked as unbookable, NOT booked");
+                                         find after retries — parked as unbookable, NOT booked");
                                     self.park_unbookable(event, group_id).await;
                                 }
                             }

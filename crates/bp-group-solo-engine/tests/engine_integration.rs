@@ -21,11 +21,14 @@ const FEE_ADDR: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
 
 /// A block at `height` booked right at its find: it covers the group's state now.
 async fn found(engine: &GroupSoloEngine, group_id: Uuid, height: i32) -> FoundGroupBlock<'static> {
+    let hash: &'static str = Box::leak(format!("{height:064x}").into_boxed_str());
     FoundGroupBlock {
         height,
-        hash: Box::leak(format!("{height:064x}").into_boxed_str()),
-        found_at_ms: i64::MAX,
-        round_at_find: engine.round_at_find(group_id).await.expect("round at find"),
+        hash,
+        round_at_find: engine
+            .cut_round_at_find(group_id, hash)
+            .await
+            .expect("round at find"),
     }
 }
 
@@ -1806,7 +1809,11 @@ async fn shares_mined_while_a_block_is_parked_stay_for_the_next_block() {
         .await
         .expect("build");
     let actual = actual_paying_exactly(&booked, reward);
-    let at_find = h.engine.round_at_find(h.group_id).await.expect("at find");
+    let at_find = h
+        .engine
+        .cut_round_at_find(h.group_id, "parked-block")
+        .await
+        .expect("at find");
 
     // Mined while the block waits for its confirmations.
     h.engine
@@ -1816,7 +1823,6 @@ async fn shares_mined_while_a_block_is_parked_stay_for_the_next_block() {
     let parked = FoundGroupBlock {
         height,
         hash: "parked-block",
-        found_at_ms: 1,
         round_at_find: at_find,
     };
     h.engine
@@ -1907,6 +1913,75 @@ async fn a_block_of_a_dissolved_group_writes_no_round_state() {
     .await
     .unwrap();
     assert!(!settled, "no settled-blocks key for a group that is gone");
+
+    drop_harness(h).await;
+}
+
+/// The block's own share is the best of its round, so the best starts over
+/// at the find, not at the booking: a share mined while the block waits sets
+/// the next best and survives the booking. Without `resetRoundOnBlock` the
+/// best stays.
+#[tokio::test]
+async fn the_team_best_starts_over_at_the_find_and_the_booking_keeps_the_next_one() {
+    let h = match spawn_or_skip(28, None).await {
+        Some(h) => h,
+        None => return,
+    };
+    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+    let later = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    let reward = 312_500_000;
+    let best = |h: &Harness| {
+        let engine = h.engine.clone();
+        let group_id = h.group_id;
+        async move {
+            engine
+                .reader()
+                .best_difficulty(group_id)
+                .await
+                .unwrap()
+                .map(|b| (b.address, b.difficulty))
+        }
+    };
+
+    // The block's share: credited at the share target, best at what it solved.
+    h.engine
+        .record_share(None, h.group_id, finder.as_str(), 100.0, 1e12, 1)
+        .await
+        .unwrap();
+    let booked = h
+        .engine
+        .build_distribution(h.group_id, reward, &finder)
+        .await
+        .expect("build");
+    let actual = actual_paying_exactly(&booked, reward);
+
+    let parked = found(&h.engine, h.group_id, 9_995_071).await;
+    assert_eq!(best(&h).await, None, "the find starts the best over");
+    h.engine
+        .record_share(None, h.group_id, later, 10.0, 5e6, 2)
+        .await
+        .unwrap();
+    h.engine
+        .on_block_found(h.group_id, parked, &actual)
+        .await
+        .expect("apply");
+    assert_eq!(
+        best(&h).await,
+        Some((later.to_string(), 5e6)),
+        "the best mined while the block waited survives its booking"
+    );
+
+    sqlx::query(r#"UPDATE pplns_group SET "resetRoundOnBlock" = false WHERE id = $1"#)
+        .bind(h.group_id)
+        .execute(&h.pool)
+        .await
+        .expect("flag off");
+    let _ = found(&h.engine, h.group_id, 9_995_072).await;
+    assert_eq!(
+        best(&h).await,
+        Some((later.to_string(), 5e6)),
+        "without resetRoundOnBlock the find keeps the best"
+    );
 
     drop_harness(h).await;
 }

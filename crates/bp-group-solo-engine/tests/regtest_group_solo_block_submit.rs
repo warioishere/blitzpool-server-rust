@@ -213,8 +213,10 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
             FoundGroupBlock {
                 height: after as i32,
                 hash: "regtest-group-solo-block",
-                found_at_ms: i64::MAX,
-                round_at_find: engine.round_at_find(group_id).await.expect("round at find"),
+                round_at_find: engine
+                    .cut_round_at_find(group_id, "regtest-group-solo-block")
+                    .await
+                    .expect("round at find"),
             },
             &actual,
         )
