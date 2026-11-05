@@ -6,12 +6,19 @@
       {
         "ordinal": 0,
         "name": "address!",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "client_statistics_entity",
+            "name": "address"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "time!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": "Expression"
       }
     ],
     "parameters": {

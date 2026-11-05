@@ -6,27 +6,57 @@
       {
         "ordinal": 0,
         "name": "address!: AddressId",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_custom_extranonce",
+            "name": "address"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "worker!",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_custom_extranonce",
+            "name": "worker"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "prefix!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pplns_custom_extranonce",
+            "name": "prefix"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "created_at!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pplns_custom_extranonce",
+            "name": "createdAt"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "updated_at!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pplns_custom_extranonce",
+            "name": "updatedAt"
+          }
+        }
       }
     ],
     "parameters": {

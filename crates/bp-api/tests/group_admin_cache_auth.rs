@@ -50,10 +50,12 @@ async fn cleanup(pool: &PgPool, group_id: Uuid) {
         "pplns_group_join_request",
         "pplns_group_member",
     ] {
-        let _ = sqlx::query(&format!(r#"DELETE FROM {table} WHERE "groupId" = $1"#))
-            .bind(group_id)
-            .execute(pool)
-            .await;
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            r#"DELETE FROM {table} WHERE "groupId" = $1"#
+        )))
+        .bind(group_id)
+        .execute(pool)
+        .await;
     }
     let _ = sqlx::query("DELETE FROM pplns_group WHERE id = $1")
         .bind(group_id)

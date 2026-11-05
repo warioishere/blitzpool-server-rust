@@ -44,7 +44,7 @@ members = [
 # the UI compares against.
 version = "2.4.2"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.94"
 authors = ["Blitzpool contributors"]
 publish = false
 license = "AGPL-3.0-or-later"
@@ -96,7 +96,7 @@ parking_lot = "0.13"
 hashbrown = "0.17"
 
 # Database
-sqlx = { version = "0.8", default-features = false, features = [
+sqlx = { version = "0.9", default-features = false, features = [
     "postgres",
     "runtime-tokio",
     "tls-rustls-ring-native-roots",

@@ -6,47 +6,101 @@
       {
         "ordinal": 0,
         "name": "id!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "blockparty_block_history",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "group_id!",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "blockparty_block_history",
+            "name": "groupId"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "block_height!",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "blockparty_block_history",
+            "name": "blockHeight"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "block_hash!",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "blockparty_block_history",
+            "name": "blockHash"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "found_at!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "blockparty_block_history",
+            "name": "foundAt"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "coinbase_value_sats!: Sats",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "blockparty_block_history",
+            "name": "coinbaseValueSats"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "pool_fee_sats!: Sats",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "blockparty_block_history",
+            "name": "poolFeeSats"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "splits!: Json<Vec<BlockpartySplitSnapshot>>",
-        "type_info": "Jsonb"
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "blockparty_block_history",
+            "name": "splits"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "created_at!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "blockparty_block_history",
+            "name": "createdAt"
+          }
+        }
       }
     ],
     "parameters": {

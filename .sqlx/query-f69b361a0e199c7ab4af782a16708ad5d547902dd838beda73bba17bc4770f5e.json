@@ -6,82 +6,178 @@
       {
         "ordinal": 0,
         "name": "deleted_at?",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "telegram_subscriptions_entity",
+            "name": "deletedAt"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "created_at!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "telegram_subscriptions_entity",
+            "name": "createdAt"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "updated_at!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "telegram_subscriptions_entity",
+            "name": "updatedAt"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "id!",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "telegram_subscriptions_entity",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "address!: AddressId",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "telegram_subscriptions_entity",
+            "name": "address"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "telegram_chat_id!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "telegram_subscriptions_entity",
+            "name": "telegramChatId"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "best_diff_notifications_enabled!",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "telegram_subscriptions_entity",
+            "name": "bestDiffNotificationsEnabled"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "is_default!",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "telegram_subscriptions_entity",
+            "name": "isDefault"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "device_notifications_enabled!",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "telegram_subscriptions_entity",
+            "name": "deviceNotificationsEnabled"
+          }
+        }
       },
       {
         "ordinal": 9,
         "name": "hourly_stats_enabled!",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "telegram_subscriptions_entity",
+            "name": "hourlyStatsEnabled"
+          }
+        }
       },
       {
         "ordinal": 10,
         "name": "hourly_workers_enabled!",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "telegram_subscriptions_entity",
+            "name": "hourlyWorkersEnabled"
+          }
+        }
       },
       {
         "ordinal": 11,
         "name": "group_admin_notifications_enabled!",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "telegram_subscriptions_entity",
+            "name": "groupAdminNotificationsEnabled"
+          }
+        }
       },
       {
         "ordinal": 12,
         "name": "block_notifications_enabled!",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "telegram_subscriptions_entity",
+            "name": "blockNotificationsEnabled"
+          }
+        }
       },
       {
         "ordinal": 13,
         "name": "team_best_notifications_enabled!",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "telegram_subscriptions_entity",
+            "name": "teamBestNotificationsEnabled"
+          }
+        }
       },
       {
         "ordinal": 14,
         "name": "message_thread_id?",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "telegram_subscriptions_entity",
+            "name": "messageThreadId"
+          }
+        }
       },
       {
         "ordinal": 15,
         "name": "group_chat!",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "telegram_subscriptions_entity",
+            "name": "groupChat"
+          }
+        }
       }
     ],
     "parameters": {

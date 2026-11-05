@@ -6,52 +6,112 @@
       {
         "ordinal": 0,
         "name": "token!",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_group_invitation",
+            "name": "token"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "group_id!",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "pplns_group_invitation",
+            "name": "groupId"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "address?: AddressId",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_group_invitation",
+            "name": "address"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "email?",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_group_invitation",
+            "name": "email"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "status!",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_group_invitation",
+            "name": "status"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "created_at!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pplns_group_invitation",
+            "name": "createdAt"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "expires_at!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pplns_group_invitation",
+            "name": "expiresAt"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "responded_at?",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pplns_group_invitation",
+            "name": "respondedAt"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "invite_type!",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_group_invitation",
+            "name": "inviteType"
+          }
+        }
       },
       {
         "ordinal": 9,
         "name": "approval_required!",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "pplns_group_invitation",
+            "name": "approvalRequired"
+          }
+        }
       }
     ],
     "parameters": {

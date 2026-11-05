@@ -6,42 +6,90 @@
       {
         "ordinal": 0,
         "name": "deleted_at?",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "network_difficulty_tracker_entity",
+            "name": "deletedAt"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "created_at!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "network_difficulty_tracker_entity",
+            "name": "createdAt"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "updated_at!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "network_difficulty_tracker_entity",
+            "name": "updatedAt"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "id!",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "network_difficulty_tracker_entity",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "current_difficulty!",
-        "type_info": "Float8"
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "network_difficulty_tracker_entity",
+            "name": "currentDifficulty"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "previous_difficulty?",
-        "type_info": "Float8"
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "network_difficulty_tracker_entity",
+            "name": "previousDifficulty"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "last_checked_at!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "network_difficulty_tracker_entity",
+            "name": "lastCheckedAt"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "last_changed_at?",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "network_difficulty_tracker_entity",
+            "name": "lastChangedAt"
+          }
+        }
       }
     ],
     "parameters": {

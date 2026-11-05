@@ -6,7 +6,13 @@
       {
         "ordinal": 0,
         "name": "chat_id!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "telegram_subscriptions_entity",
+            "name": "telegramChatId"
+          }
+        }
       }
     ],
     "parameters": {

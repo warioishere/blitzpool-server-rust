@@ -13,7 +13,7 @@ use bp_db::{
     find_best_difficulty_scan_addresses, update_telegram_sub_best_diff_flag,
     upsert_ntfy_subscription, upsert_push_subscription, upsert_telegram_subscription,
 };
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::{postgres::PgPoolOptions, AssertSqlSafe, PgPool};
 
 const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
 const TEST_CHAT_ID: i64 = 990_000_779;
@@ -60,11 +60,13 @@ async fn hard_cleanup(pool: &PgPool) {
         "ntfy_subscriptions_entity",
         "push_subscription_entity",
     ] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE address = ANY($1)"))
-            .bind(ALL.map(str::to_string).to_vec())
-            .execute(pool)
-            .await
-            .expect("cleanup delete");
+        sqlx::query(AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE address = ANY($1)"
+        )))
+        .bind(ALL.map(str::to_string).to_vec())
+        .execute(pool)
+        .await
+        .expect("cleanup delete");
     }
 }
 

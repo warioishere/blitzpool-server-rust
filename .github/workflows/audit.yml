@@ -20,5 +20,5 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
-      # Exceptions live in .cargo/audit.toml, each with its reason.
+      # An exception goes in .cargo/audit.toml, with its reason.
       - run: cargo audit

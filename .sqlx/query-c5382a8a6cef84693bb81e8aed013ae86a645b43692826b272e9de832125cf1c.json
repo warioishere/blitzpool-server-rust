@@ -6,17 +6,30 @@
       {
         "ordinal": 0,
         "name": "address!",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "client_entity",
+            "name": "address"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "client_name!",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "client_entity",
+            "name": "clientName"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "first_seen_ms!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": "Expression"
       }
     ],
     "parameters": {

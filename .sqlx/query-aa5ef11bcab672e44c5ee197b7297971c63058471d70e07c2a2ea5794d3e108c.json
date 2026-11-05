@@ -6,32 +6,68 @@
       {
         "ordinal": 0,
         "name": "address!: AddressId",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_address_ownership",
+            "name": "address"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "method!",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_address_ownership",
+            "name": "method"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "script_type!",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_address_ownership",
+            "name": "scriptType"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "verified_at!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pplns_address_ownership",
+            "name": "verifiedAt"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "created_at!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pplns_address_ownership",
+            "name": "createdAt"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "updated_at!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pplns_address_ownership",
+            "name": "updatedAt"
+          }
+        }
       }
     ],
     "parameters": {

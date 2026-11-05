@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use sqlx::migrate::Migrator;
-use sqlx::{postgres::PgPoolOptions, Executor, PgPool};
+use sqlx::{postgres::PgPoolOptions, AssertSqlSafe, Executor, PgPool};
 
 const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
 
@@ -42,11 +42,13 @@ async fn throwaway_db(tag: &str) -> Option<(PgPool, String, String)> {
     let admin = connect(&url).await?;
     let db = format!("bp_baseline_{tag}_{}", std::process::id());
     admin
-        .execute(format!(r#"DROP DATABASE IF EXISTS "{db}" WITH (FORCE)"#).as_str())
+        .execute(AssertSqlSafe(format!(
+            r#"DROP DATABASE IF EXISTS "{db}" WITH (FORCE)"#
+        )))
         .await
         .unwrap();
     admin
-        .execute(format!(r#"CREATE DATABASE "{db}""#).as_str())
+        .execute(AssertSqlSafe(format!(r#"CREATE DATABASE "{db}""#)))
         .await
         .unwrap();
     let base = url.rsplit_once('/').expect("db url has a path").0;
@@ -55,7 +57,9 @@ async fn throwaway_db(tag: &str) -> Option<(PgPool, String, String)> {
 
 async fn drop_db(admin: &PgPool, db: &str) {
     admin
-        .execute(format!(r#"DROP DATABASE IF EXISTS "{db}" WITH (FORCE)"#).as_str())
+        .execute(AssertSqlSafe(format!(
+            r#"DROP DATABASE IF EXISTS "{db}" WITH (FORCE)"#
+        )))
         .await
         .unwrap();
 }
@@ -128,7 +132,7 @@ async fn an_empty_database_boots_to_the_full_schema() {
     );
     drop_db(&admin, &db).await;
     admin
-        .execute(format!(r#"CREATE DATABASE "{db}""#).as_str())
+        .execute(AssertSqlSafe(format!(r#"CREATE DATABASE "{db}""#)))
         .await
         .unwrap();
 

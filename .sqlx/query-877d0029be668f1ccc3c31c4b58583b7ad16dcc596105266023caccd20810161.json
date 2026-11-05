@@ -6,102 +6,222 @@
       {
         "ordinal": 0,
         "name": "id!",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "pplns_group",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "name!",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_group",
+            "name": "name"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "creator_address!: AddressId",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_group",
+            "name": "creatorAddress"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "admin_token_hash!",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_group",
+            "name": "adminTokenHash"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "active!",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "pplns_group",
+            "name": "active"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "created_at!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pplns_group",
+            "name": "createdAt"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "updated_at!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pplns_group",
+            "name": "updatedAt"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "dissolved_at?",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pplns_group",
+            "name": "dissolvedAt"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "round_reset_interval_days?",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "pplns_group",
+            "name": "roundResetIntervalDays"
+          }
+        }
       },
       {
         "ordinal": 9,
         "name": "round_reset_hour_local?",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "pplns_group",
+            "name": "roundResetHourLocal"
+          }
+        }
       },
       {
         "ordinal": 10,
         "name": "round_reset_timezone?",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_group",
+            "name": "roundResetTimezone"
+          }
+        }
       },
       {
         "ordinal": 11,
         "name": "last_round_reset_at?",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pplns_group",
+            "name": "lastRoundResetAt"
+          }
+        }
       },
       {
         "ordinal": 12,
         "name": "finder_bonus_sats?: Sats",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pplns_group",
+            "name": "finderBonusSats"
+          }
+        }
       },
       {
         "ordinal": 13,
         "name": "finder_bonus_ppm?",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "pplns_group",
+            "name": "finderBonusPpm"
+          }
+        }
       },
       {
         "ordinal": 14,
         "name": "round_reset_preset?",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_group",
+            "name": "roundResetPreset"
+          }
+        }
       },
       {
         "ordinal": 15,
         "name": "is_public!",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "pplns_group",
+            "name": "isPublic"
+          }
+        }
       },
       {
         "ordinal": 16,
         "name": "reset_round_on_block!",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "pplns_group",
+            "name": "resetRoundOnBlock"
+          }
+        }
       },
       {
         "ordinal": 17,
         "name": "max_members?",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "pplns_group",
+            "name": "maxMembers"
+          }
+        }
       },
       {
         "ordinal": 18,
         "name": "payout_mode!",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_group",
+            "name": "payoutMode"
+          }
+        }
       },
       {
         "ordinal": 19,
         "name": "coinbase_tag?",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_group",
+            "name": "coinbaseTag"
+          }
+        }
       }
     ],
     "parameters": {

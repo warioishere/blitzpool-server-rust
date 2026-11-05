@@ -518,10 +518,10 @@ async fn client_reset_best_difficulty_succeeds() {
 
 async fn purge_probe(pool: &sqlx::PgPool, addr: &str, worker: &str, session: &str) {
     for table in ["client_statistics_entity", "client_entity"] {
-        let _ = sqlx::query(&format!(
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
             r#"DELETE FROM {table}
                WHERE address = $1 AND "clientName" = $2 AND "sessionId" = $3"#
-        ))
+        )))
         .bind(addr)
         .bind(worker)
         .bind(session)
@@ -851,10 +851,12 @@ async fn worker_shares_lists_connected_workers_with_a_row_in_name_order() {
     let addr = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh";
     let cleanup = || async {
         for table in ["client_entity", "worker_shares_entity"] {
-            let _ = sqlx::query(&format!("DELETE FROM {table} WHERE address = $1"))
-                .bind(addr)
-                .execute(&pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE address = $1"
+            )))
+            .bind(addr)
+            .execute(&pool)
+            .await;
         }
     };
     cleanup().await;
@@ -984,10 +986,12 @@ async fn delete_stats_zeroes_the_address_total_with_the_workers() {
     let addr = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
     let cleanup = || async {
         for table in ["address_settings_entity", "worker_shares_entity"] {
-            let _ = sqlx::query(&format!("DELETE FROM {table} WHERE address = $1"))
-                .bind(addr)
-                .execute(&pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE address = $1"
+            )))
+            .bind(addr)
+            .execute(&pool)
+            .await;
         }
     };
     cleanup().await;

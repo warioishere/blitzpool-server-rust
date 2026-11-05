@@ -6,17 +6,35 @@
       {
         "ordinal": 0,
         "name": "time!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pool_rejected_statistics_entity",
+            "name": "time"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "reason!",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pool_rejected_statistics_entity",
+            "name": "reason"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "count!",
-        "type_info": "Float4"
+        "type_info": "Float4",
+        "origin": {
+          "Table": {
+            "table": "pool_rejected_statistics_entity",
+            "name": "count"
+          }
+        }
       }
     ],
     "parameters": {

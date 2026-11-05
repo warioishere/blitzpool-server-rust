@@ -6,37 +6,79 @@
       {
         "ordinal": 0,
         "name": "id",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "pplns_payout_history",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "block_height",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "pplns_payout_history",
+            "name": "blockHeight"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "address",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_payout_history",
+            "name": "address"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "paid_sats",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pplns_payout_history",
+            "name": "paidSats"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "percent",
-        "type_info": "Float4"
+        "type_info": "Float4",
+        "origin": {
+          "Table": {
+            "table": "pplns_payout_history",
+            "name": "percent"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "row_type",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_payout_history",
+            "name": "rowType"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "created_at",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pplns_payout_history",
+            "name": "createdAt"
+          }
+        }
       }
     ],
     "parameters": {

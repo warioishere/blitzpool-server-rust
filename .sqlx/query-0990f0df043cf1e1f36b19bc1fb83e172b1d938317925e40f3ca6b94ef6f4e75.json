@@ -6,22 +6,46 @@
       {
         "ordinal": 0,
         "name": "address!: AddressId",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "client_entity",
+            "name": "address"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "client_name!",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "client_entity",
+            "name": "clientName"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "session_id!",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "client_entity",
+            "name": "sessionId"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "deleted_at!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "client_entity",
+            "name": "deletedAt"
+          }
+        }
       }
     ],
     "parameters": {

@@ -6,82 +6,178 @@
       {
         "ordinal": 0,
         "name": "address!: AddressId",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "client_statistics_entity",
+            "name": "address"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "client_name!",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "client_statistics_entity",
+            "name": "clientName"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "session_id!",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "client_statistics_entity",
+            "name": "sessionId"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "time!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "client_statistics_entity",
+            "name": "time"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "shares!",
-        "type_info": "Float4"
+        "type_info": "Float4",
+        "origin": {
+          "Table": {
+            "table": "client_statistics_entity",
+            "name": "shares"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "rejected_job_not_found_count!",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "client_statistics_entity",
+            "name": "rejectedJobNotFoundCount"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "rejected_job_not_found_diff1!",
-        "type_info": "Float4"
+        "type_info": "Float4",
+        "origin": {
+          "Table": {
+            "table": "client_statistics_entity",
+            "name": "rejectedJobNotFoundDiff1"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "rejected_duplicate_share_count!",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "client_statistics_entity",
+            "name": "rejectedDuplicateShareCount"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "rejected_duplicate_share_diff1!",
-        "type_info": "Float4"
+        "type_info": "Float4",
+        "origin": {
+          "Table": {
+            "table": "client_statistics_entity",
+            "name": "rejectedDuplicateShareDiff1"
+          }
+        }
       },
       {
         "ordinal": 9,
         "name": "rejected_low_difficulty_share_count!",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "client_statistics_entity",
+            "name": "rejectedLowDifficultyShareCount"
+          }
+        }
       },
       {
         "ordinal": 10,
         "name": "rejected_low_difficulty_share_diff1!",
-        "type_info": "Float4"
+        "type_info": "Float4",
+        "origin": {
+          "Table": {
+            "table": "client_statistics_entity",
+            "name": "rejectedLowDifficultyShareDiff1"
+          }
+        }
       },
       {
         "ordinal": 11,
         "name": "rejected_version_rolling_count!",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "client_statistics_entity",
+            "name": "rejectedVersionRollingCount"
+          }
+        }
       },
       {
         "ordinal": 12,
         "name": "rejected_version_rolling_diff1!",
-        "type_info": "Float4"
+        "type_info": "Float4",
+        "origin": {
+          "Table": {
+            "table": "client_statistics_entity",
+            "name": "rejectedVersionRollingDiff1"
+          }
+        }
       },
       {
         "ordinal": 13,
         "name": "rejected_stale_count!",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "client_statistics_entity",
+            "name": "rejectedStaleCount"
+          }
+        }
       },
       {
         "ordinal": 14,
         "name": "rejected_stale_diff1!",
-        "type_info": "Float4"
+        "type_info": "Float4",
+        "origin": {
+          "Table": {
+            "table": "client_statistics_entity",
+            "name": "rejectedStaleDiff1"
+          }
+        }
       },
       {
         "ordinal": 15,
         "name": "max_difficulty!",
-        "type_info": "Float4"
+        "type_info": "Float4",
+        "origin": {
+          "Table": {
+            "table": "client_statistics_entity",
+            "name": "maxDifficulty"
+          }
+        }
       }
     ],
     "parameters": {

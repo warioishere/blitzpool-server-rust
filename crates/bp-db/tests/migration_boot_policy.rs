@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use sqlx::migrate::{MigrateError, Migrator};
-use sqlx::{postgres::PgPoolOptions, Executor, PgPool};
+use sqlx::{postgres::PgPoolOptions, AssertSqlSafe, Executor, PgPool};
 
 const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
 
@@ -60,11 +60,11 @@ async fn an_older_binary_boots_after_a_newer_one_migrated() {
     };
     let db = format!("bp_migration_boot_policy_{}", std::process::id());
     admin
-        .execute(format!(r#"DROP DATABASE IF EXISTS "{db}""#).as_str())
+        .execute(AssertSqlSafe(format!(r#"DROP DATABASE IF EXISTS "{db}""#)))
         .await
         .unwrap();
     admin
-        .execute(format!(r#"CREATE DATABASE "{db}""#).as_str())
+        .execute(AssertSqlSafe(format!(r#"CREATE DATABASE "{db}""#)))
         .await
         .unwrap();
     let base = url.rsplit_once('/').expect("db url has a path").0;
@@ -104,7 +104,9 @@ async fn an_older_binary_boots_after_a_newer_one_migrated() {
     let _ = std::fs::remove_dir_all(&newer);
     let _ = std::fs::remove_dir_all(&older);
     admin
-        .execute(format!(r#"DROP DATABASE IF EXISTS "{db}" WITH (FORCE)"#).as_str())
+        .execute(AssertSqlSafe(format!(
+            r#"DROP DATABASE IF EXISTS "{db}" WITH (FORCE)"#
+        )))
         .await
         .unwrap();
 }

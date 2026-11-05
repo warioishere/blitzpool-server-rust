@@ -6,12 +6,24 @@
       {
         "ordinal": 0,
         "name": "address",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_payout_history",
+            "name": "address"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "paid_sats",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pplns_payout_history",
+            "name": "paidSats"
+          }
+        }
       }
     ],
     "parameters": {

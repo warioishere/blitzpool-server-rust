@@ -6,17 +6,35 @@
       {
         "ordinal": 0,
         "name": "scope",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "redis_state_backup",
+            "name": "scope"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "redis_key",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "redis_state_backup",
+            "name": "redis_key"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "dump",
-        "type_info": "Bytea"
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "redis_state_backup",
+            "name": "dump"
+          }
+        }
       }
     ],
     "parameters": {
