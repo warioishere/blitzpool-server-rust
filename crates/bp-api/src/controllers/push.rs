@@ -5,7 +5,7 @@
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::Json,
     routing::{get, post},
     Router,
@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::error::ApiError;
+use crate::middleware::require_address_token;
 use crate::state::SharedState;
 use crate::time_range::format_iso_ms;
 
@@ -206,9 +207,11 @@ struct SubscriptionSummary {
 
 async fn register(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(body): Json<RegisterBody>,
 ) -> Result<Json<RegisterResponse>, ApiError> {
     let (address, endpoint) = require_address_and(body.address, body.endpoint, "endpoint")?;
+    require_address_token(&state, &headers, address.as_str()).await?;
     let platform = normalise_platform(body.platform, "unknown");
     validate_miner_address(&state, &address).await?;
     let row = bp_db::upsert_push_subscription(
@@ -243,9 +246,11 @@ struct OkResponse {
 
 async fn unregister(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(body): Json<UnregisterBody>,
 ) -> Result<Json<OkResponse>, ApiError> {
     let address = parse_address(body.address)?;
+    require_address_token(&state, &headers, address.as_str()).await?;
     if let Some(endpoint) = body.endpoint.as_deref().filter(|e| !e.is_empty()) {
         bp_db::delete_push_subscription_by_endpoint(&state.pool, &address, endpoint)
             .await
@@ -344,9 +349,11 @@ struct ConfigureBody {
 
 async fn configure(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(body): Json<ConfigureBody>,
 ) -> Result<Json<OkResponse>, ApiError> {
     let (address, endpoint) = require_address_and(body.address, body.endpoint, "endpoint")?;
+    require_address_token(&state, &headers, address.as_str()).await?;
     bp_db::update_push_subscription_preferences(
         &state.pool,
         &address,
@@ -384,9 +391,11 @@ struct FcmRegisterResponse {
 
 async fn register_fcm(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(body): Json<FcmRegisterBody>,
 ) -> Result<Json<FcmRegisterResponse>, ApiError> {
     let (address, token) = require_address_and(body.address, body.token, "token")?;
+    require_address_token(&state, &headers, address.as_str()).await?;
     let platform = normalise_platform(body.platform, "fcm");
     validate_miner_address(&state, &address).await?;
     if token.len() < MIN_FCM_TOKEN_LEN {
@@ -419,9 +428,11 @@ struct FcmUnregisterBody {
 
 async fn unregister_fcm(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(body): Json<FcmUnregisterBody>,
 ) -> Result<Json<OkResponse>, ApiError> {
     let address = parse_address(body.address)?;
+    require_address_token(&state, &headers, address.as_str()).await?;
     if let Some(token) = body.token.as_deref().filter(|t| !t.is_empty()) {
         bp_db::delete_push_subscription_by_endpoint_and_type(&state.pool, &address, token, FCM)
             .await

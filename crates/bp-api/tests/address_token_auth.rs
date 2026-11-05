@@ -151,6 +151,38 @@ fn body_routes() -> Vec<AddressRoute> {
     ]
 }
 
+/// The push writes: each registers, changes or removes a device's
+/// subscription for the address in its body.
+fn push_routes() -> Vec<AddressRoute> {
+    vec![
+        AddressRoute {
+            name: "push register",
+            uri: "/api/push/register".into(),
+            body: |a| json!({ "address": a, "endpoint": "https://push.example/phone" }),
+        },
+        AddressRoute {
+            name: "push unregister",
+            uri: "/api/push/unregister".into(),
+            body: |a| json!({ "address": a }),
+        },
+        AddressRoute {
+            name: "push configure",
+            uri: "/api/push/configure".into(),
+            body: |a| json!({ "address": a, "endpoint": "https://push.example/phone" }),
+        },
+        AddressRoute {
+            name: "fcm register",
+            uri: "/api/push/fcm/register".into(),
+            body: |a| json!({ "address": a, "token": "fcm:token" }),
+        },
+        AddressRoute {
+            name: "fcm unregister",
+            uri: "/api/push/fcm/unregister".into(),
+            body: |a| json!({ "address": a }),
+        },
+    ]
+}
+
 const CLIENT_WRITES: [&str; 3] = ["reset", "delete-stats", "delete-all"];
 
 #[tokio::test]
@@ -165,7 +197,7 @@ async fn every_address_route_refuses_a_request_without_its_token() {
         ("garbage", Some("not-a-token")),
     ];
     for (what, token) in refused {
-        for route in body_routes() {
+        for route in body_routes().into_iter().chain(push_routes()) {
             let res = post(&app, &route.uri, token, (route.body)(ADDRESS)).await;
             assert_login_required(res, &format!("{}: {what}", route.name));
         }
@@ -180,7 +212,7 @@ async fn every_address_route_refuses_a_request_without_its_token() {
 #[tokio::test]
 async fn a_token_for_another_address_is_refused() {
     let app = app(unconnected_pool(), required());
-    for route in body_routes() {
+    for route in body_routes().into_iter().chain(push_routes()) {
         let res = post(&app, &route.uri, Some(TOKEN), (route.body)(OTHER)).await;
         assert_login_required(res, route.name);
     }
@@ -227,6 +259,19 @@ async fn the_matching_token_reaches_the_handlers_own_checks() {
             route.name
         );
         assert_ne!(body, json!({ "error": "login required" }), "{}", route.name);
+    }
+}
+
+/// With the matching token a push write passes the check and runs into
+/// the handler; without the check it goes through as well.
+#[tokio::test]
+async fn the_matching_token_passes_the_push_writes() {
+    for (auth, token) in [(required(), Some(TOKEN)), (AddressAuth::Off(None), None)] {
+        let app = app(unconnected_pool(), auth);
+        for route in push_routes() {
+            let (status, body) = post(&app, &route.uri, token, (route.body)(ADDRESS)).await;
+            assert_ne!(status, StatusCode::UNAUTHORIZED, "{}: {body}", route.name);
+        }
     }
 }
 
