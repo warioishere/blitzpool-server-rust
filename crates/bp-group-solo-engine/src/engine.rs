@@ -479,8 +479,10 @@ impl GroupSoloEngine {
     /// settlement: withheld value goes to the pool ([`bp_pplns::WithheldValue::ToPool`]),
     /// so what the coinbase paid is the whole truth. Idempotent: the history
     /// via the `(groupId, blockHeight, address)` UNIQUE key, the round reset
-    /// via [`crate::round::key_reset_height`], so a redelivery leaves the
-    /// shares mined since untouched and a retry completes an interrupted reset.
+    /// via [`crate::round::key_reset_height`] and the shares-since-block
+    /// counter via [`crate::round::key_shares_since_block_height`], so a
+    /// redelivery leaves the shares mined since untouched and a retry
+    /// completes an interrupted reset.
     pub async fn on_block_found(
         &self,
         group_id: Uuid,
@@ -541,6 +543,14 @@ impl GroupSoloEngine {
             now_ms,
         )
         .await?;
+
+        // Every block of the group starts this counter over, whatever
+        // `resetRoundOnBlock` says, so switching the flag on later shows the
+        // shares since the last block right away.
+        self.inner
+            .round
+            .clear_shares_since_block(&group_key, block_height)
+            .await?;
 
         match (mode, reset_on_block) {
             (PayoutMode::Prop | PayoutMode::Window, true) => {

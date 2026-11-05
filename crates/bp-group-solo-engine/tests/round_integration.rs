@@ -9,7 +9,8 @@
 use bp_group_mgmt::group::PayoutMode;
 use bp_group_solo_engine::round::{
     key_applied, key_best_share, key_by_address, key_last_accepted_share_at, key_rejected_shares,
-    key_window_buckets, key_window_by_address, GroupRoundStore, WindowLane, WINDOW_BUCKET_MS,
+    key_shares_since_block, key_shares_since_block_height, key_window_buckets,
+    key_window_by_address, GroupRoundStore, WindowLane, WINDOW_BUCKET_MS,
 };
 use redis::{aio::ConnectionManager, AsyncCommands, Client};
 
@@ -1017,4 +1018,114 @@ async fn forget_member_window_removes_the_address_from_both_lanes() {
         .await
         .unwrap();
     assert!(b_in_5);
+}
+
+// ── Shares since the group's last block ─────────────────────────────
+
+/// The counter sums both modes' accepted shares exactly once, survives the
+/// calendar reset, a member's removal and a Window block reset, and starts
+/// over once per block height; dissolving the group drops it.
+#[tokio::test]
+async fn shares_since_block_spans_round_resets_and_starts_over_once_per_block() {
+    let conn = match connect_or_skip(22).await {
+        Some(c) => c,
+        None => return,
+    };
+    let store = GroupRoundStore::new(conn.clone());
+    let prop = "g_since_block_prop";
+    let window = "g_since_block_window";
+    let since = |g: &'static str| {
+        let store = store.clone();
+        async move { store.read_shares_since_block(g).await.unwrap() }
+    };
+
+    assert_eq!(
+        since(prop).await,
+        0.0,
+        "nothing counted before the first share"
+    );
+    store
+        .record_share(Some("s1"), prop, "bc1qfoo", 10.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+    store
+        .record_share(Some("s1"), prop, "bc1qfoo", 10.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+    store
+        .record_share(Some("s2"), prop, "bc1qbar", 5.0, 1_700_000_000_002)
+        .await
+        .unwrap();
+    assert_eq!(since(prop).await, 15.0, "a redelivered share counts once");
+
+    store.reset_for_calendar(prop).await.unwrap();
+    assert!(
+        store.read_by_address(prop).await.unwrap().is_empty(),
+        "precondition: the calendar reset wiped the round"
+    );
+    store
+        .forget_member(prop, "bc1qbar", PayoutMode::Prop)
+        .await
+        .unwrap();
+    assert_eq!(
+        since(prop).await,
+        15.0,
+        "the calendar reset and a removed member leave the count alone"
+    );
+
+    assert!(store.clear_shares_since_block(prop, 100).await.unwrap());
+    assert_eq!(since(prop).await, 0.0, "the block starts the count over");
+    store
+        .record_share(Some("s3"), prop, "bc1qfoo", 7.0, 1_700_000_000_003)
+        .await
+        .unwrap();
+    assert!(
+        !store.clear_shares_since_block(prop, 100).await.unwrap(),
+        "a redelivered block is a no-op"
+    );
+    assert_eq!(
+        since(prop).await,
+        7.0,
+        "and keeps the shares mined after it"
+    );
+    assert!(store.clear_shares_since_block(prop, 101).await.unwrap());
+    assert_eq!(
+        since(prop).await,
+        0.0,
+        "the next block starts it over again"
+    );
+
+    store
+        .record_share_windowed(Some("w1"), window, "bc1qfoo", 3.0, 1_700_000_000_004)
+        .await
+        .unwrap();
+    store
+        .record_share_windowed(Some("w1"), window, "bc1qfoo", 3.0, 1_700_000_000_004)
+        .await
+        .unwrap();
+    store
+        .reset_for_block_found(window, 200, PayoutMode::Window)
+        .await
+        .unwrap();
+    assert_eq!(
+        since(window).await,
+        3.0,
+        "Window shares count once and only the per-block clear starts them over"
+    );
+
+    store
+        .record_share(Some("s4"), prop, "bc1qfoo", 2.0, 1_700_000_000_005)
+        .await
+        .unwrap();
+    store.reset_full(prop).await.unwrap();
+    let mut conn = conn;
+    let left: bool = conn.exists(key_shares_since_block(prop)).await.unwrap();
+    let marker: bool = conn
+        .exists(key_shares_since_block_height(prop))
+        .await
+        .unwrap();
+    assert!(
+        !left && !marker,
+        "dissolving the group drops the count and its marker"
+    );
 }

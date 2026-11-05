@@ -605,6 +605,16 @@ async fn a_redelivered_apply_does_not_reset_the_round_again() {
         after_replay.total_shares, 40.0,
         "a redelivered block must not wipe the shares mined since it was booked"
     );
+    let since_block = h
+        .engine
+        .reader()
+        .shares_since_block(h.group_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        since_block, 40.0,
+        "a redelivered block must not clear the shares counted since it"
+    );
 
     drop_harness(h).await;
 }
@@ -717,6 +727,18 @@ async fn on_block_found_keeps_round_when_reset_flag_false() {
     assert_eq!(
         stats.total_shares, 100.0,
         "round must persist when resetRoundOnBlock=false"
+    );
+    // The flag only governs the round: the shares since the last block
+    // start over at every block of the group.
+    let since_block = h
+        .engine
+        .reader()
+        .shares_since_block(h.group_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        since_block, 0.0,
+        "the block must start the shares-since-block count over with the flag off"
     );
 
     drop_harness(h).await;

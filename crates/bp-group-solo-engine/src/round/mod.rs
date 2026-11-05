@@ -48,6 +48,17 @@ pub fn key_applied(group_id: &str) -> String {
 pub fn key_reset_height(group_id: &str) -> String {
     key(group_id, "reset-height")
 }
+/// Σ diff-1 the group's accepted shares carry since its last block, in both
+/// modes. Only a block and dissolving the group clear it; the calendar reset
+/// and removing a member leave it alone.
+pub fn key_shares_since_block(group_id: &str) -> String {
+    key(group_id, "shares-since-block")
+}
+/// Height of the block [`key_shares_since_block`] was last cleared for, so a
+/// redelivered block does not clear the shares mined after it.
+pub fn key_shares_since_block_height(group_id: &str) -> String {
+    key(group_id, "shares-since-block-height")
+}
 
 // ── Window-mode keys (PayoutMode::Window only) ──────────────────────
 // Kept under the `groupsolo:{id}:` prefix so backup/restore covers them.
@@ -121,7 +132,7 @@ pub const WINDOW_BUCKET_MS: i64 = 60 * 60 * 1000;
 const DEDUP_KEEP: i64 = 100_000;
 
 /// Append one accepted share to the PROP round; returns 0 on a deduped no-op.
-/// `KEYS` = by-address, last-accepted-share-at, applied; `ARGV` =
+/// `KEYS` = by-address, last-accepted-share-at, applied, shares-since-block; `ARGV` =
 /// difficulty, address, timestamp_ms, share_id (empty ⇒ no dedup), keep-count.
 /// The dedup marker is written in the same script so a crash before ack cannot double-count.
 const RECORD_SHARE_LUA: &str = r#"
@@ -131,6 +142,7 @@ if has_dedup and redis.call('ZSCORE', KEYS[3], ARGV[4]) then
 end
 redis.call('HINCRBYFLOAT', KEYS[1], ARGV[2], ARGV[1])
 redis.call('HSET', KEYS[2], ARGV[2], ARGV[3])
+redis.call('INCRBYFLOAT', KEYS[4], ARGV[1])
 if has_dedup then
     redis.call('ZADD', KEYS[3], ARGV[3], ARGV[4])
     redis.call('ZREMRANGEBYRANK', KEYS[3], 0, -tonumber(ARGV[5]) - 1)
@@ -139,7 +151,8 @@ return 1
 "#;
 
 /// Window-mode twin of `RECORD_SHARE_LUA`, same dedup contract. `KEYS` = applied,
-/// wbuckets, window:by-address, wbucket:{bid}, last-accepted-share-at; `ARGV` =
+/// wbuckets, window:by-address, wbucket:{bid}, last-accepted-share-at,
+/// shares-since-block; `ARGV` =
 /// difficulty, address, share_id, keep-count, bucket_id, timestamp_ms.
 /// Bucket, aggregate and index move together so a snapshot never sees a partial write.
 const RECORD_SHARE_WINDOWED_LUA: &str = r#"
@@ -151,6 +164,7 @@ redis.call('HINCRBYFLOAT', KEYS[4], ARGV[2], ARGV[1])
 redis.call('ZADD', KEYS[2], ARGV[5], ARGV[5])
 redis.call('HINCRBYFLOAT', KEYS[3], ARGV[2], ARGV[1])
 redis.call('HSET', KEYS[5], ARGV[2], ARGV[6])
+redis.call('INCRBYFLOAT', KEYS[6], ARGV[1])
 if has_dedup then
     redis.call('ZADD', KEYS[1], ARGV[6], ARGV[3])
     redis.call('ZREMRANGEBYRANK', KEYS[1], 0, -tonumber(ARGV[4]) - 1)
@@ -188,6 +202,18 @@ end
 redis.call('DEL', bkey)
 redis.call('ZREM', KEYS[1], bid)
 return {1, underflowed}
+"#;
+
+/// Clear the shares-since-block counter once per block. `KEYS` = counter,
+/// its height marker; `ARGV` = block height. Returns 0 when that height
+/// already cleared it.
+const CLEAR_SHARES_SINCE_BLOCK_LUA: &str = r#"
+if redis.call('GET', KEYS[2]) == ARGV[1] then
+    return 0
+end
+redis.call('DEL', KEYS[1])
+redis.call('SET', KEYS[2], ARGV[1])
+return 1
 "#;
 
 /// Append one rejected share into its time bucket. `KEYS` = wrbuckets,
@@ -262,6 +288,7 @@ impl GroupRoundStore {
             .key(key_by_address(group_id))
             .key(key_last_accepted_share_at(group_id))
             .key(key_applied(group_id))
+            .key(key_shares_since_block(group_id))
             .arg(difficulty.to_string())
             .arg(address)
             .arg(timestamp_ms)
@@ -294,6 +321,7 @@ impl GroupRoundStore {
             .key(key_window_by_address(group_id))
             .key(key_window_bucket(group_id, bucket_id))
             .key(key_last_accepted_share_at(group_id))
+            .key(key_shares_since_block(group_id))
             .arg(difficulty.to_string())
             .arg(address)
             .arg(share_id.unwrap_or(""))
@@ -604,21 +632,40 @@ impl GroupRoundStore {
         Ok(true)
     }
 
+    /// Start [`key_shares_since_block`] over for the group's block at
+    /// `block_height`, whether or not the round resets with it. `false` when
+    /// that block already cleared it. Compared for equality, like
+    /// [`Self::reset_for_block_found`].
+    pub async fn clear_shares_since_block(
+        &self,
+        group_id: &str,
+        block_height: i32,
+    ) -> Result<bool, RoundError> {
+        let mut conn = self.conn.clone();
+        let cleared: i64 = redis::Script::new(CLEAR_SHARES_SINCE_BLOCK_LUA)
+            .key(key_shares_since_block(group_id))
+            .key(key_shares_since_block_height(group_id))
+            .arg(block_height)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(cleared == 1)
+    }
+
     /// Scheduled (calendar-aligned) reset: the round starts over, including
-    /// `last-accepted-share-at`. The best share stays; it starts over only at
-    /// the group's own block, when `resetRoundOnBlock` is set (see
-    /// [`Self::reset_for_block_found`]).
+    /// `last-accepted-share-at`. The best share and the shares since the
+    /// last block stay; they start over only at the group's own block (see
+    /// [`Self::reset_for_block_found`], [`Self::clear_shares_since_block`]).
     pub async fn reset_for_calendar(&self, group_id: &str) -> Result<(), RoundError> {
         self.wipe_round(group_id, false).await
     }
 
-    /// Everything the group holds here, its best share included: for a
-    /// dissolved group.
+    /// Everything the group holds here, its best share and shares since the
+    /// last block included: for a dissolved group.
     pub async fn reset_full(&self, group_id: &str) -> Result<(), RoundError> {
         self.wipe_round(group_id, true).await
     }
 
-    async fn wipe_round(&self, group_id: &str, with_best_share: bool) -> Result<(), RoundError> {
+    async fn wipe_round(&self, group_id: &str, dissolve: bool) -> Result<(), RoundError> {
         let mut conn = self.conn.clone();
         let mut keys = vec![
             key_by_address(group_id),
@@ -626,8 +673,10 @@ impl GroupRoundStore {
             key_last_accepted_share_at(group_id),
             // NOT `key_applied`: see `reset_for_block_found`.
         ];
-        if with_best_share {
+        if dissolve {
             keys.push(key_best_share(group_id));
+            keys.push(key_shares_since_block(group_id));
+            keys.push(key_shares_since_block_height(group_id));
         }
         let _: i64 = conn.del(keys).await?;
         self.delete_window_keys(&mut conn, group_id).await?;
@@ -656,6 +705,14 @@ impl GroupRoundStore {
                 }
             })
             .collect())
+    }
+
+    /// Σ diff-1 since the group's last block (see [`key_shares_since_block`]);
+    /// 0 before its first share.
+    pub async fn read_shares_since_block(&self, group_id: &str) -> Result<f64, RoundError> {
+        let mut conn = self.conn.clone();
+        let v: Option<String> = conn.get(key_shares_since_block(group_id)).await?;
+        Ok(v.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0.0))
     }
 
     pub async fn read_rejected(&self, group_id: &str) -> Result<HashMap<String, f64>, RoundError> {
@@ -798,6 +855,14 @@ mod tests {
             "groupsolo:g1:last-accepted-share-at"
         );
         assert_eq!(key_best_share("g1"), "groupsolo:g1:best-share");
+        assert_eq!(
+            key_shares_since_block("g1"),
+            "groupsolo:g1:shares-since-block"
+        );
+        assert_eq!(
+            key_shares_since_block_height("g1"),
+            "groupsolo:g1:shares-since-block-height"
+        );
     }
 
     #[test]

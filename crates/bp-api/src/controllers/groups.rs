@@ -1284,6 +1284,9 @@ struct DistributionResponse {
     total_shares: f64,
     #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     total_rejected: f64,
+    /// Accepted shares since the group's last block, across round resets.
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
+    shares_since_block: f64,
     per_address: Vec<DistributionEntry>,
 }
 
@@ -1317,11 +1320,13 @@ async fn distribution(
                     .as_deref()
                     .ok_or(ApiError::Unavailable("group-solo-engine not wired"))?;
                 let stats = engine.reader().round_stats(id).await?;
+                let shares_since_block = engine.reader().shares_since_block(id).await?;
                 // Rejects come from the same round store, so both describe the
                 // current round or window, not an all-time total.
                 Ok(DistributionResponse {
                     total_shares: stats.per_address.values().sum(),
                     total_rejected: stats.total_rejected,
+                    shares_since_block,
                     per_address: distribution_entries(
                         id,
                         stats.per_address,

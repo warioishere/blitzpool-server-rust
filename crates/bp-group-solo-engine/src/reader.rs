@@ -47,6 +47,17 @@ impl ReaderView<'_> {
         Ok(stats)
     }
 
+    /// Σ diff-1 of the group's accepted shares since its last block, across
+    /// round resets (see [`crate::round::key_shares_since_block`]).
+    pub async fn shares_since_block(&self, group_id: Uuid) -> Result<f64, EngineError> {
+        let shares = self
+            .engine
+            .round()
+            .read_shares_since_block(&group_id.to_string())
+            .await?;
+        Ok(shares)
+    }
+
     /// The group's best share (see [`BestShare`]). `None` before the first
     /// share, or after the best started over.
     pub async fn best_difficulty(&self, group_id: Uuid) -> Result<Option<BestShare>, EngineError> {
