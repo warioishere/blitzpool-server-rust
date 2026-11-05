@@ -137,8 +137,8 @@ async fn a_revocation_voids_the_tokens_issued_before_it() {
     );
     assert_eq!(
         reset(&app, address, &old_format).await,
-        StatusCode::OK,
-        "precondition"
+        StatusCode::UNAUTHORIZED,
+        "a token without an issue time is refused outright"
     );
 
     let (status, body) = revoke(&app, &revocation(address, now - 5_000, now + 60_000)).await;
@@ -146,11 +146,6 @@ async fn a_revocation_voids_the_tokens_issued_before_it() {
 
     assert_eq!(
         reset(&app, address, &before).await,
-        StatusCode::UNAUTHORIZED
-    );
-    // Without an issue time a token counts as a week older than its expiry.
-    assert_eq!(
-        reset(&app, address, &old_format).await,
         StatusCode::UNAUTHORIZED
     );
     let after = secret().issue(address, now, now + 60_000);

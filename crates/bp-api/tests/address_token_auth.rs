@@ -23,9 +23,9 @@ const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_p
 
 const SECRET: &str = "test-secret-for-bp-api";
 const ADDRESS: &str = "bc1qtokenvectoraddress";
-const TOKEN: &str = "eyJhIjoiYmMxcXRva2VudmVjdG9yYWRkcmVzcyIsImUiOjQxMDI0NDQ4MDAwMDB9.bG_liAI04HABECVjbYh-FutN61qwWXhMmph4R6AZlts";
+const TOKEN: &str = "eyJhIjoiYmMxcXRva2VudmVjdG9yYWRkcmVzcyIsImUiOjQxMDI0NDQ4MDAwMDAsImkiOjQxMDE4NDAwMDAwMDB9.zau-gB8Tz65HFZ6IbRjbckZ11OAoahcjFUsbWd9729I";
 const BASE58: &str = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2";
-const BASE58_TOKEN: &str = "eyJhIjoiMWJ2Ym1zZXlzdHdldHF0Zm41YXU0bTRnZmc3eGphbnZuMiIsImUiOjQxMDI0NDQ4MDAwMDB9.ZCOb5F4HvrtHwXDIJ6mLdvSMw-AlXQlrNPKLfr9kmss";
+const BASE58_TOKEN: &str = "eyJhIjoiMWJ2Ym1zZXlzdHdldHF0Zm41YXU0bTRnZmc3eGphbnZuMiIsImUiOjQxMDI0NDQ4MDAwMDAsImkiOjQxMDE4NDAwMDAwMDB9.yTyt5hatkjQ1sbcTOEjU2zwXZgaw3M0iciv9F1FSvQU";
 const EXPIRED_TOKEN: &str = "eyJhIjoiYmMxcXRva2VudmVjdG9yYWRkcmVzcyIsImUiOjEwMDB9.7xQ1LDXx9V6e61DJIJ8v3RVwEgG221JRRJbzk2yDHwc";
 const ACCOUNT_TOKEN: &str =
     "eyJhY2N0IjoiMDJhYmMiLCJlIjo0MTAyNDQ0ODAwMDAwfQ.9RvDIeR-pfWTnaK1-gQv_gQdL-5Ou7qotLbNk-KDzBM";

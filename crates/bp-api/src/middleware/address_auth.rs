@@ -42,11 +42,6 @@ use crate::state::{AppState, SharedState};
 /// How long a token this api issues stays valid.
 pub const ISSUED_TOKEN_TTL_MS: i64 = 60 * 60 * 1000;
 
-/// A token without an issue time counts as issued this long before it
-/// expires: the sidecar's token lifetime, early on purpose so that a
-/// revocation covers it.
-const UNSTAMPED_TOKEN_AGE_MS: f64 = 7.0 * 24.0 * 60.0 * 60.0 * 1000.0;
-
 /// The HMAC key the sidecar signs address tokens with.
 #[derive(Clone)]
 pub struct AddressTokenSecret(String);
@@ -99,14 +94,12 @@ impl AddressTokenSecret {
         (expires_at >= now_ms as f64).then_some(json)
     }
 
-    /// The address key `token` is bound to and when it was issued.
+    /// The address key `token` is bound to and when it was issued. A token
+    /// without an issue time is refused: a revocation could not date it.
     fn token_address_key(&self, token: &str, now_ms: i64) -> Option<(String, i64)> {
         let json = self.claims(token, now_ms)?;
         let key = json.get("a")?.as_str()?.to_string();
-        let issued_at = match json.get("i") {
-            Some(i) => i.as_f64()?,
-            None => json.get("e")?.as_f64()? - UNSTAMPED_TOKEN_AGE_MS,
-        };
+        let issued_at = json.get("i")?.as_f64()?;
         Some((key, issued_at as i64))
     }
 
@@ -250,8 +243,11 @@ mod tests {
 
     // Issued by the sidecar's own algorithm with this secret.
     const SECRET: &str = "test-secret-for-bp-api";
-    const VALID: &str = "eyJhIjoiYmMxcXRva2VudmVjdG9yYWRkcmVzcyIsImUiOjQxMDI0NDQ4MDAwMDB9.bG_liAI04HABECVjbYh-FutN61qwWXhMmph4R6AZlts";
-    const VALID_BASE58: &str = "eyJhIjoiMWJ2Ym1zZXlzdHdldHF0Zm41YXU0bTRnZmc3eGphbnZuMiIsImUiOjQxMDI0NDQ4MDAwMDB9.ZCOb5F4HvrtHwXDIJ6mLdvSMw-AlXQlrNPKLfr9kmss";
+    // {"a":ADDRESS,"e":EXPIRES,"i":ISSUED}, and the same for a base58 key.
+    const VALID: &str = "eyJhIjoiYmMxcXRva2VudmVjdG9yYWRkcmVzcyIsImUiOjQxMDI0NDQ4MDAwMDAsImkiOjQxMDE4NDAwMDAwMDB9.zau-gB8Tz65HFZ6IbRjbckZ11OAoahcjFUsbWd9729I";
+    const VALID_BASE58: &str = "eyJhIjoiMWJ2Ym1zZXlzdHdldHF0Zm41YXU0bTRnZmc3eGphbnZuMiIsImUiOjQxMDI0NDQ4MDAwMDAsImkiOjQxMDE4NDAwMDAwMDB9.yTyt5hatkjQ1sbcTOEjU2zwXZgaw3M0iciv9F1FSvQU";
+    // {"a":ADDRESS,"e":EXPIRES}: no issue time.
+    const UNSTAMPED: &str = "eyJhIjoiYmMxcXRva2VudmVjdG9yYWRkcmVzcyIsImUiOjQxMDI0NDQ4MDAwMDB9.bG_liAI04HABECVjbYh-FutN61qwWXhMmph4R6AZlts";
     const EXPIRED: &str = "eyJhIjoiYmMxcXRva2VudmVjdG9yYWRkcmVzcyIsImUiOjEwMDB9.7xQ1LDXx9V6e61DJIJ8v3RVwEgG221JRRJbzk2yDHwc";
     const ACCOUNT: &str = "eyJhY2N0IjoiMDJhYmMiLCJlIjo0MTAyNDQ0ODAwMDAwfQ.9RvDIeR-pfWTnaK1-gQv_gQdL-5Ou7qotLbNk-KDzBM";
     // {"a":ADDRESS,"e":4102444800000,"i":4101840000000}
@@ -283,10 +279,13 @@ mod tests {
     }
 
     #[test]
-    fn a_token_carries_its_issue_time_or_counts_as_a_week_older_than_its_expiry() {
+    fn a_token_carries_its_issue_time_and_one_without_is_refused() {
         let issued = |t: &str| authorize(&secret(), &headers(&format!("Bearer {t}")), ADDRESS, NOW);
         assert_eq!(issued(STAMPED).unwrap(), ISSUED);
-        assert_eq!(issued(VALID).unwrap(), EXPIRES - 7 * 24 * 60 * 60 * 1000);
+        assert!(
+            issued(UNSTAMPED).is_err(),
+            "no issue time, no way to revoke it"
+        );
     }
 
     #[test]
