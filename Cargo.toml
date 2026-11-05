@@ -91,7 +91,7 @@ bytes = "1"
 hex = "0.4"
 faster-hex = { version = "1.0", default-features = false, features = ["std"] }
 smallvec = { version = "1", features = ["union", "const_generics"] }
-parking_lot = "0.12"
+parking_lot = "0.13"
 # Zero-alloc composite-key lookups (Equivalent trait) on the share hot path.
 hashbrown = "0.17"
 
@@ -138,9 +138,9 @@ bitcoin = "0.32"
 bs58 = { version = "0.5", features = ["check"] }
 
 # Hashing + big integer arithmetic (pure math, no Bitcoin-crate dep needed)
-sha2 = { version = "0.10", features = ["asm"] }
+sha2 = "0.11"
 # HMAC-SHA256 over sha2 for the address tokens the UI sidecar issues.
-hmac = "0.12"
+hmac = "0.13"
 num-bigint = "0.5"
 num-traits = "0.2"
 
