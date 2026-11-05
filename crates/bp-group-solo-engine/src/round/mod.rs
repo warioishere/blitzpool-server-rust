@@ -2,8 +2,8 @@
 
 //! Redis-backed per-group round state under `groupsolo:{groupId}:*`.
 //! A `Prop` group is a round a booked block takes its found-time state out
-//! of; a `Window` group is a time-bucketed sliding window trimmed by age, of
-//! which a booked block resets only the best share.
+//! of; a `Window` group is a time-bucketed sliding window trimmed by age,
+//! which a block never reduces. A found block starts the best share over.
 //! Every reset path keeps `applied` (see [`key_applied`]) so an un-ACKed batch is not reapplied.
 
 use std::collections::HashMap;
@@ -597,8 +597,6 @@ impl GroupRoundStore {
 
     // ── Best-share update (fire-and-forget improvement check) ─────
 
-    /// Read the current best share. Returns `None` if no shares have
-    /// been recorded for this round yet.
     /// Start the best share over, as a block of a `resetRoundOnBlock` group
     /// does when it is found, unless that block is booked already: a
     /// redelivered block-found event then leaves the best set since alone.
@@ -617,6 +615,8 @@ impl GroupRoundStore {
         Ok(())
     }
 
+    /// Read the current best share. Returns `None` if no shares have
+    /// been recorded for this round yet.
     pub async fn read_best_share(&self, group_id: &str) -> Result<Option<BestShare>, RoundError> {
         let mut conn = self.conn.clone();
         let hash: HashMap<String, String> = conn.hgetall(key_best_share(group_id)).await?;
@@ -751,8 +751,8 @@ impl GroupRoundStore {
 
     /// Scheduled (calendar-aligned) reset: the round starts over, including
     /// `last-accepted-share-at`. The best share and the shares since the
-    /// last block stay; only the group's own block takes them out (see
-    /// [`Self::settle_block`]).
+    /// last block stay; only the group's own block starts them over (see
+    /// [`Self::reset_best_share_for`], [`Self::settle_block`]).
     pub async fn reset_for_calendar(&self, group_id: &str) -> Result<(), RoundError> {
         self.wipe_round(group_id, false).await
     }

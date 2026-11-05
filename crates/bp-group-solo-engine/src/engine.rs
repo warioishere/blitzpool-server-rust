@@ -511,10 +511,17 @@ impl GroupSoloEngine {
             .read_round_at_find(&group_key, mode, now_ms, window_ms)
             .await?;
         if reset_on_block {
-            self.inner
+            // Display only: a failed reset must not keep the block from
+            // being parked and booked.
+            if let Err(e) = self
+                .inner
                 .round
                 .reset_best_share_for(&group_key, block_hash)
-                .await?;
+                .await
+            {
+                warn!(%group_id, block_hash, error = %e,
+                    "group-solo: best share not started over at the find");
+            }
         }
         Ok(at_find)
     }

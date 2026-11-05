@@ -60,7 +60,6 @@ subtle = { workspace = true }
 # UTC slot-label formatting for chart endpoints (time_range util).
 chrono = { workspace = true }
 
-
 # Per-endpoint response cache. moka gives us an async cache with
 # per-entry TTL + LRU eviction; values are stored as `Bytes`
 # (pre-serialized JSON) so cache hits skip both the DB hop and the

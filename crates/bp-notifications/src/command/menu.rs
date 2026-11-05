@@ -337,18 +337,22 @@ pub(crate) fn help_text(lang: Language, view: MenuView) -> String {
         text.push_str("\n\n");
         text.push_str(&html::bold(section.heading(lang)));
         for entry in lines {
-            text.push_str(&format!("\n{}", help_line(entry, lang)));
+            text.push_str(&format!("\n{}", help_line(entry, lang, view)));
         }
     }
     text
 }
 
-fn help_line(entry: &MenuEntry, lang: Language) -> String {
+/// A group's commands take no address of their own, so its help shows none.
+fn help_line(entry: &MenuEntry, lang: Language, view: MenuView) -> String {
     let description = match lang {
         Language::De => entry.de,
         Language::En => entry.en,
     };
-    let usage = entry.args.usage(lang);
+    let usage = match (view, entry.args) {
+        (MenuView::Group(_), Args::OptionalAddress) => "",
+        (MenuView::Private | MenuView::Group(_), args) => args.usage(lang),
+    };
     let usage = if usage.is_empty() {
         String::new()
     } else {
@@ -434,11 +438,27 @@ mod tests {
     }
 
     #[test]
+    fn a_groups_help_shows_no_address_argument() {
+        let view = MenuView::Group(GroupFollows {
+            team: true,
+            blockparty: true,
+        });
+        for lang in [Language::De, Language::En] {
+            let help = help_text(lang, view);
+            assert!(help.contains("/team_status"), "{help}");
+            assert!(
+                !help.contains("[ADDRESS]") && !help.contains("[ADRESSE]"),
+                "{help}"
+            );
+        }
+    }
+
+    #[test]
     fn help_lists_every_menu_entry_with_its_argument() {
         for lang in [Language::De, Language::En] {
             let help = help_text(lang, MenuView::Private);
             for entry in MENU {
-                let line = help_line(entry, lang);
+                let line = help_line(entry, lang, MenuView::Private);
                 assert_eq!(
                     help.lines().filter(|l| *l == line).count(),
                     1,

@@ -2242,6 +2242,29 @@ mod tests {
                 .unwrap(),
             None
         );
+
+        // The supergroup already follows its own address when the old
+        // group's notice fails: the group keeps one, its own.
+        let own = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        cleanup().await;
+        for (chat, address) in [(from, address), (to, own)] {
+            sqlx::query(r#"INSERT INTO telegram_subscriptions_entity (address, "telegramChatId", "groupChat") VALUES ($1, $2, true)"#)
+                .bind(address)
+                .bind(chat)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        settle_telegram_push(&pool, from, "telegram", Err(AdapterError::ChatMigrated(to))).await;
+        let kept = find_telegram_subscriptions_by_chat(&pool, to)
+            .await
+            .unwrap();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].address.as_str(), own);
+        assert!(find_telegram_subscriptions_by_chat(&pool, from)
+            .await
+            .unwrap()
+            .is_empty());
         cleanup().await;
     }
 }

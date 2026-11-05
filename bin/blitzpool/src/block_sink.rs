@@ -33,28 +33,27 @@ use crate::pending_blocks::{
     is_pending_block, park_unbookable_block, put_pending_block, PendingBlock, PendingSettlement,
 };
 
-/// Reads at a group block's find before it counts as unreadable.
+/// Reads at a block's find before it counts as unreadable.
 const FIND_READ_ATTEMPTS: u32 = 3;
 const FIND_READ_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// [`GroupSoloEngine::cut_round_at_find`],
-/// retried so a Redis or Postgres blip at the find does not leave the block
-/// unbooked.
-async fn cut_round_at_find(
-    engine: &GroupSoloEngine,
-    group_id: uuid::Uuid,
-    block_hash: &str,
-) -> Result<bp_group_solo_engine::round::RoundAtFind, bp_group_solo_engine::engine::EngineError> {
+/// A read a found block's booking depends on, retried so a Redis or
+/// Postgres blip at the find does not leave the block unbooked.
+async fn read_at_find<T, E, F, Fut>(what: &'static str, mut read: F) -> Result<T, E>
+where
+    E: std::fmt::Display,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
     let mut attempt = 1;
     loop {
-        match engine.cut_round_at_find(group_id, block_hash).await {
+        match read().await {
             Err(err) if attempt < FIND_READ_ATTEMPTS => {
-                warn!(%err, %group_id, attempt,
-                    "block-found: group-solo round state unreadable at the find; retrying");
+                warn!(%err, attempt, what, "block-found: unreadable at the find; retrying");
                 attempt += 1;
                 tokio::time::sleep(FIND_READ_RETRY_PAUSE).await;
             }
-            cut => return cut,
+            result => return result,
         }
     }
 }
@@ -504,7 +503,11 @@ impl TdpBlockSubmissionSink {
                     None
                 })?;
                 let fingerprint = pool_built(payouts_fingerprint)?;
-                match engine.weight_snapshot_for_block_found(&fingerprint).await {
+                match read_at_find("pplns snapshot", || {
+                    engine.weight_snapshot_for_block_found(&fingerprint)
+                })
+                .await
+                {
                     Ok(Some(snap)) => Some(snap),
                     Ok(None) => {
                         error!(
@@ -835,7 +838,7 @@ impl BlockFoundApplier {
                         } else {
                             // Taken now, so booking leaves the shares mined
                             // while the block waits for its confirmations.
-                            match cut_round_at_find(engine, group_id, block_hash).await {
+                            match read_at_find("group-solo round", || engine.cut_round_at_find(group_id, block_hash)).await {
                                 Ok(round_at_find) => {
                                     self.gate_or_apply(
                                         address_str,

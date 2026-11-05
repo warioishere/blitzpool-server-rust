@@ -197,7 +197,17 @@ async fn fan_out_change(
             }
         }
     }
-    for (address, sub) in once_per_endpoint(targets) {
+    for (address, sub, siblings) in once_per_endpoint(targets) {
+        // The other addresses on this device got the notice through it, so
+        // their subscriptions count as notified too and are not cleaned up
+        // as idle.
+        for id in siblings {
+            if let Err(e) =
+                bp_db::update_push_subscription_last_notification(pool, id, now_ms).await
+            {
+                warn!(target: "bp_notifications::cron::network_difficulty", error = %e, id, "bump lastNotificationAt");
+            }
+        }
         let kind = sub.subscription_type.as_str();
         if kind.eq_ignore_ascii_case(PUSH_TYPE_FCM) {
             if let Some(adapter) = fcm {
@@ -215,15 +225,22 @@ async fn fan_out_change(
 }
 
 /// The network difficulty is the same for every address, so a device that
-/// follows several addresses with one endpoint gets it once.
+/// follows several addresses with one endpoint gets it once: the first
+/// subscription per endpoint, with the ids of the others on it.
 fn once_per_endpoint(
     targets: Vec<(AddressId, PushSubscriptionRow)>,
-) -> Vec<(AddressId, PushSubscriptionRow)> {
-    let mut seen = std::collections::HashSet::new();
-    targets
-        .into_iter()
-        .filter(|(_, sub)| seen.insert(sub.endpoint.clone()))
-        .collect()
+) -> Vec<(AddressId, PushSubscriptionRow, Vec<i32>)> {
+    let mut out: Vec<(AddressId, PushSubscriptionRow, Vec<i32>)> = Vec::new();
+    for (address, sub) in targets {
+        match out
+            .iter_mut()
+            .find(|(_, first, _)| first.endpoint == sub.endpoint)
+        {
+            Some((_, _, siblings)) => siblings.push(sub.id),
+            None => out.push((address, sub, Vec::new())),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -232,7 +249,7 @@ mod tests {
 
     #[test]
     fn a_device_following_several_addresses_gets_the_change_once() {
-        let sub = |address: &str, endpoint: &str| {
+        let sub = |address: &str, endpoint: &str, id: i32| {
             let address = AddressId::new(address).unwrap();
             (
                 address.clone(),
@@ -240,7 +257,7 @@ mod tests {
                     deleted_at: None,
                     created_at: 0,
                     updated_at: 0,
-                    id: 1,
+                    id,
                     address,
                     endpoint: endpoint.to_string(),
                     platform: "android".to_string(),
@@ -255,14 +272,21 @@ mod tests {
             )
         };
         let kept = once_per_endpoint(vec![
-            sub("bc1qa", "https://push.example/phone"),
-            sub("bc1qb", "https://push.example/phone"),
-            sub("bc1qc", "https://push.example/tablet"),
+            sub("bc1qa", "https://push.example/phone", 1),
+            sub("bc1qb", "https://push.example/phone", 2),
+            sub("bc1qc", "https://push.example/tablet", 3),
         ]);
-        let endpoints: Vec<&str> = kept.iter().map(|(_, s)| s.endpoint.as_str()).collect();
+        let sent: Vec<(&str, i32, &[i32])> = kept
+            .iter()
+            .map(|(_, s, siblings)| (s.endpoint.as_str(), s.id, siblings.as_slice()))
+            .collect();
         assert_eq!(
-            endpoints,
-            ["https://push.example/phone", "https://push.example/tablet"]
+            sent,
+            [
+                ("https://push.example/phone", 1, &[2][..]),
+                ("https://push.example/tablet", 3, &[][..])
+            ],
+            "one send per device, and the other subscriptions on it are named"
         );
     }
 

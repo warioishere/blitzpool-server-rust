@@ -26,7 +26,7 @@ const ADDRESS: &str = "bc1qtokenvectoraddress";
 const TOKEN: &str = "eyJhIjoiYmMxcXRva2VudmVjdG9yYWRkcmVzcyIsImUiOjQxMDI0NDQ4MDAwMDAsImkiOjQxMDE4NDAwMDAwMDB9.zau-gB8Tz65HFZ6IbRjbckZ11OAoahcjFUsbWd9729I";
 const BASE58: &str = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2";
 const BASE58_TOKEN: &str = "eyJhIjoiMWJ2Ym1zZXlzdHdldHF0Zm41YXU0bTRnZmc3eGphbnZuMiIsImUiOjQxMDI0NDQ4MDAwMDAsImkiOjQxMDE4NDAwMDAwMDB9.yTyt5hatkjQ1sbcTOEjU2zwXZgaw3M0iciv9F1FSvQU";
-const EXPIRED_TOKEN: &str = "eyJhIjoiYmMxcXRva2VudmVjdG9yYWRkcmVzcyIsImUiOjEwMDB9.7xQ1LDXx9V6e61DJIJ8v3RVwEgG221JRRJbzk2yDHwc";
+const EXPIRED_TOKEN: &str = "eyJhIjoiYmMxcXRva2VudmVjdG9yYWRkcmVzcyIsImUiOjEwMDAsImkiOjB9.UOQSGtO3l11TDl4ecaQGpPvq_H9grH1rnvqLoEruOIU";
 const ACCOUNT_TOKEN: &str =
     "eyJhY2N0IjoiMDJhYmMiLCJlIjo0MTAyNDQ0ODAwMDAwfQ.9RvDIeR-pfWTnaK1-gQv_gQdL-5Ou7qotLbNk-KDzBM";
 const OTHER: &str = "bc1qsomeoneelseaddress";
@@ -262,12 +262,16 @@ async fn the_matching_token_reaches_the_handlers_own_checks() {
     }
 }
 
-/// With the matching token a push write passes the check and runs into
-/// the handler; without the check it goes through as well.
+/// With the matching token a push write passes the check, revocation lookup
+/// included, and runs into the handler; without the check it goes through
+/// as well.
 #[tokio::test]
 async fn the_matching_token_passes_the_push_writes() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
     for (auth, token) in [(required(), Some(TOKEN)), (AddressAuth::Off(None), None)] {
-        let app = app(unconnected_pool(), auth);
+        let app = app(pool.clone(), auth);
         for route in push_routes() {
             let (status, body) = post(&app, &route.uri, token, (route.body)(ADDRESS)).await;
             assert_ne!(status, StatusCode::UNAUTHORIZED, "{}: {body}", route.name);

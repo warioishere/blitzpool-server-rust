@@ -44,6 +44,7 @@ async fn info() -> Json<Value> {
         "success": true,
         "version": "1.0.0",
         "description": "BlitzPool Push Notification API",
+        "authentication": "With address auth on, every POST needs the address token of the address in its body (Authorization: Bearer <token>).",
         "notificationTypes": [
             {
                 "type": "best_difficulty",

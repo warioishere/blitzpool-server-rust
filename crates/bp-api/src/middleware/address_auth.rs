@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Address tokens for the routes that act for one address: deleting its
-//! statistics, binding its email, and putting it into a Team or Blockparty.
+//! statistics, binding its email, putting it into a Team or Blockparty, and
+//! changing its push subscriptions.
 //! The UI's session sidecar issues them with its `SESSION_TOKEN_SECRET`; a
 //! token proves control of exactly one address until it expires.
 //!
@@ -248,10 +249,8 @@ mod tests {
     const VALID_BASE58: &str = "eyJhIjoiMWJ2Ym1zZXlzdHdldHF0Zm41YXU0bTRnZmc3eGphbnZuMiIsImUiOjQxMDI0NDQ4MDAwMDAsImkiOjQxMDE4NDAwMDAwMDB9.yTyt5hatkjQ1sbcTOEjU2zwXZgaw3M0iciv9F1FSvQU";
     // {"a":ADDRESS,"e":EXPIRES}: no issue time.
     const UNSTAMPED: &str = "eyJhIjoiYmMxcXRva2VudmVjdG9yYWRkcmVzcyIsImUiOjQxMDI0NDQ4MDAwMDB9.bG_liAI04HABECVjbYh-FutN61qwWXhMmph4R6AZlts";
-    const EXPIRED: &str = "eyJhIjoiYmMxcXRva2VudmVjdG9yYWRkcmVzcyIsImUiOjEwMDB9.7xQ1LDXx9V6e61DJIJ8v3RVwEgG221JRRJbzk2yDHwc";
+    const EXPIRED: &str = "eyJhIjoiYmMxcXRva2VudmVjdG9yYWRkcmVzcyIsImUiOjEwMDAsImkiOjB9.UOQSGtO3l11TDl4ecaQGpPvq_H9grH1rnvqLoEruOIU";
     const ACCOUNT: &str = "eyJhY2N0IjoiMDJhYmMiLCJlIjo0MTAyNDQ0ODAwMDAwfQ.9RvDIeR-pfWTnaK1-gQv_gQdL-5Ou7qotLbNk-KDzBM";
-    // {"a":ADDRESS,"e":4102444800000,"i":4101840000000}
-    const STAMPED: &str = "eyJhIjoiYmMxcXRva2VudmVjdG9yYWRkcmVzcyIsImUiOjQxMDI0NDQ4MDAwMDAsImkiOjQxMDE4NDAwMDAwMDB9.zau-gB8Tz65HFZ6IbRjbckZ11OAoahcjFUsbWd9729I";
     // {"rv":ADDRESS,"b":4101840000000,"e":4102444800000}
     const REVOCATION: &str = "eyJydiI6ImJjMXF0b2tlbnZlY3RvcmFkZHJlc3MiLCJiIjo0MTAxODQwMDAwMDAwLCJlIjo0MTAyNDQ0ODAwMDAwfQ.1rcSopEwNuQXGxIOLh6OjL-44ZXHyXDxPLgxCXdU_Ic";
     const EXPIRES: i64 = 4_102_444_800_000;
@@ -275,13 +274,13 @@ mod tests {
 
     #[test]
     fn an_issued_token_is_the_sidecars_string() {
-        assert_eq!(secret().issue(ADDRESS, ISSUED, EXPIRES), STAMPED);
+        assert_eq!(secret().issue(ADDRESS, ISSUED, EXPIRES), VALID);
     }
 
     #[test]
     fn a_token_carries_its_issue_time_and_one_without_is_refused() {
         let issued = |t: &str| authorize(&secret(), &headers(&format!("Bearer {t}")), ADDRESS, NOW);
-        assert_eq!(issued(STAMPED).unwrap(), ISSUED);
+        assert_eq!(issued(VALID).unwrap(), ISSUED);
         assert!(
             issued(UNSTAMPED).is_err(),
             "no issue time, no way to revoke it"
@@ -299,7 +298,7 @@ mod tests {
         let other = AddressTokenSecret::new("another-secret").unwrap();
         assert_eq!(revocation(&other, &h, NOW), None, "another secret");
         assert!(!passes(&format!("Bearer {REVOCATION}"), ADDRESS));
-        let h = headers(&format!("Bearer {STAMPED}"));
+        let h = headers(&format!("Bearer {VALID}"));
         assert_eq!(revocation(&secret(), &h, NOW), None);
     }
 

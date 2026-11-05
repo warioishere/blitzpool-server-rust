@@ -684,15 +684,19 @@ pub async fn delete_telegram_subscriptions_by_chat(
 }
 
 /// Move a chat's live subscriptions and its language to the id Telegram
-/// gave the chat when a group became a supergroup. A language the new chat
-/// already has stays. Returns the subscriptions moved.
+/// gave the chat when a group became a supergroup. A subscription or
+/// language the new chat already has stays, and the old chat's are dropped:
+/// a group follows one address. Returns the subscriptions moved.
 pub async fn move_telegram_chat(pool: &PgPool, from: i64, to: i64) -> Result<u64, DbError> {
     let now_ms: i64 = chrono::Utc::now().timestamp_millis();
     let mut tx = pool.begin().await.map_err(DbError::from)?;
     let moved = sqlx::query!(
         r#"UPDATE telegram_subscriptions_entity
            SET "telegramChatId" = $2, "messageThreadId" = NULL, "updatedAt" = $3
-           WHERE "telegramChatId" = $1 AND "deletedAt" IS NULL"#,
+           WHERE "telegramChatId" = $1 AND "deletedAt" IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM telegram_subscriptions_entity
+               WHERE "telegramChatId" = $2 AND "deletedAt" IS NULL)"#,
         from,
         to,
         now_ms,
@@ -701,6 +705,16 @@ pub async fn move_telegram_chat(pool: &PgPool, from: i64, to: i64) -> Result<u64
     .await
     .map_err(DbError::from)?
     .rows_affected();
+    sqlx::query!(
+        r#"UPDATE telegram_subscriptions_entity
+           SET "deletedAt" = $2, "updatedAt" = $2
+           WHERE "telegramChatId" = $1 AND "deletedAt" IS NULL"#,
+        from,
+        now_ms,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(DbError::from)?;
     sqlx::query!(
         r#"INSERT INTO telegram_chat_language ("telegramChatId", language, "updatedAt")
            SELECT $2, language, $3 FROM telegram_chat_language WHERE "telegramChatId" = $1
