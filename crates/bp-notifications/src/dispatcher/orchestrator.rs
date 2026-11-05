@@ -8,7 +8,7 @@ use bp_db::{
     find_address_email, find_blockparty_member_by_address, find_group_member_by_address,
     find_ntfy_subscription_by_address, find_pplns_group_members_for_group,
     find_push_subscriptions_by_address, find_telegram_subscriptions_by_address,
-    find_telegram_subscriptions_by_chat, list_blockparty_members_for_group,
+    find_telegram_subscriptions_by_chat, list_blockparty_members_for_group, move_telegram_chat,
     update_push_subscription_last_notification, DbError, NtfySubscriptionRow, PushSubscriptionRow,
     TelegramSubscriptionRow,
 };
@@ -82,8 +82,8 @@ pub struct BlockFoundNotice {
     pub mode: MiningMode,
     /// The address that mined the block.
     pub finder: AddressId,
-    /// What the block's own coinbase pays each address; empty when the
-    /// coinbase was not decoded.
+    /// What the block's own coinbase pays each address, every address once
+    /// with its sum; empty when the coinbase was not decoded.
     pub paid: Vec<(AddressId, u64)>,
 }
 
@@ -103,9 +103,8 @@ impl BlockFoundNotice {
         let paid_to = |address: &AddressId| {
             self.paid
                 .iter()
-                .filter(|(a, _)| a == address)
+                .find(|(a, _)| a == address)
                 .map(|(_, sats)| *sats)
-                .reduce(u64::saturating_add)
         };
         let mut out = vec![BlockRecipient {
             address: self.finder.clone(),
@@ -636,7 +635,8 @@ struct JoinRequestRoute {
 /// An admin who follows the Team on a channel this dispatcher can send on
 /// gets the notice there, where that subscription's switch is on; a switch
 /// turned off is a choice, not a reason to mail instead. Only an admin on no
-/// such channel at all gets the mail.
+/// such channel at all gets the mail. A Telegram group following the admin's
+/// address is not the admin's channel: it never gets join requests.
 fn route_join_request(
     telegram: Vec<TelegramSubscriptionRow>,
     ntfy: Option<NtfySubscriptionRow>,
@@ -657,7 +657,7 @@ fn route_join_request(
                 || (kind.eq_ignore_ascii_case(PUSH_TYPE_UNIFIED) && transports.web_push)
         })
         .collect();
-    let mail = telegram.is_empty() && ntfy.is_none() && push.is_empty();
+    let mail = telegram.iter().all(|s| s.group_chat) && ntfy.is_none() && push.is_empty();
     JoinRequestRoute {
         telegram: telegram
             .into_iter()
@@ -810,13 +810,7 @@ const LISTED_PAYOUTS: usize = 15;
 /// What a Team or Blockparty block's coinbase pays its members, largest
 /// first, each address shortened.
 fn member_payouts_text(lang: Language, paid: &[(AddressId, u64)]) -> String {
-    let mut by_address: Vec<(&AddressId, u64)> = Vec::new();
-    for (address, sats) in paid {
-        match by_address.iter_mut().find(|(a, _)| *a == address) {
-            Some(entry) => entry.1 = entry.1.saturating_add(*sats),
-            None => by_address.push((address, *sats)),
-        }
-    }
+    let mut by_address: Vec<(&AddressId, u64)> = paid.iter().map(|(a, sats)| (a, *sats)).collect();
     by_address.sort_by_key(|(_, sats)| std::cmp::Reverse(*sats));
     let total: u64 = by_address.iter().map(|(_, sats)| *sats).sum();
     let summary = paid_members(lang, total as i64, by_address.len());
@@ -1484,7 +1478,8 @@ async fn bump_last_notification(pool: &PgPool, id: i32) {
 }
 
 /// Log a failed Telegram push. A chat Telegram reports as gone loses its
-/// subscriptions, so nothing is sent to it again.
+/// subscriptions, so nothing is sent to it again; a group that became a
+/// supergroup takes them to its new chat id, so the next notice reaches it.
 pub(crate) async fn settle_telegram_push(
     pool: &PgPool,
     chat_id: i64,
@@ -1493,6 +1488,16 @@ pub(crate) async fn settle_telegram_push(
 ) {
     match result {
         Ok(()) => {}
+        Err(AdapterError::ChatMigrated(to)) => match move_telegram_chat(pool, chat_id, to).await {
+            Ok(moved) => info!(
+                target: "bp_notifications::dispatcher",
+                chat_id, to, moved, "telegram group became a supergroup, subscriptions moved"
+            ),
+            Err(e) => warn!(
+                target: "bp_notifications::dispatcher",
+                error = %e, chat_id, to, "telegram group became a supergroup, moving subscriptions failed"
+            ),
+        },
         Err(AdapterError::InvalidRecipient(reason)) => {
             match delete_telegram_subscriptions_by_chat(pool, chat_id).await {
                 Ok(removed) => info!(
@@ -1525,19 +1530,14 @@ mod tests {
         AddressId::new(s).unwrap()
     }
 
-    /// The finder comes first even when its coinbase pays it nothing, and a
-    /// script paid twice is one recipient with the sum.
+    /// The finder comes first even when its coinbase pays it nothing.
     #[test]
     fn block_recipients_are_the_finder_and_every_paid_address() {
         let notice = BlockFoundNotice {
             height: 900_000,
             mode: MiningMode::Pplns,
             finder: addr("bc1qfinder"),
-            paid: vec![
-                (addr("bc1qalice"), 1_000),
-                (addr("bc1qbob"), 2_000),
-                (addr("bc1qalice"), 500),
-            ],
+            paid: vec![(addr("bc1qalice"), 1_500), (addr("bc1qbob"), 2_000)],
         };
         assert_eq!(
             notice.recipients(&[]),
@@ -2102,6 +2102,21 @@ mod tests {
         assert_eq!(one_on.push.len(), 1);
     }
 
+    /// An admin whose address only a Telegram group follows is mailed: the
+    /// group is not the admin's channel and gets no join request itself.
+    #[test]
+    fn an_admin_followed_only_by_a_group_is_mailed() {
+        let group = TelegramSubscriptionRow {
+            group_chat: true,
+            group_admin_notifications_enabled: false,
+            ..telegram_sub(false)
+        };
+        let route = route_join_request(vec![group.clone()], None, Vec::new(), ALL);
+        assert!(route.mail && route.telegram.is_empty());
+        let with_own = route_join_request(vec![group, telegram_sub(false)], None, Vec::new(), ALL);
+        assert!(!with_own.mail, "an own channel switched off stays a choice");
+    }
+
     /// A subscription on a transport this process cannot send on does not
     /// count as a channel, so the admin is mailed instead of told nowhere.
     #[test]
@@ -2165,5 +2180,68 @@ mod tests {
             html::to_plain(&join_request_text(Language::De, "PoolPals", None)),
             "\u{1f44b} Neue Beitrittsanfrage\nTeam: PoolPals"
         );
+    }
+
+    /// A group that became a supergroup keeps its subscriptions and its
+    /// language under the new chat id, so the next notice reaches it.
+    #[tokio::test]
+    async fn a_supergroup_takes_the_old_groups_subscriptions() {
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let (from, to) = (-7_700_801_i64, -1_007_700_801_i64);
+        let address = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+        let cleanup = || async {
+            for chat in [from, to] {
+                sqlx::query(
+                    r#"DELETE FROM telegram_subscriptions_entity WHERE "telegramChatId" = $1"#,
+                )
+                .bind(chat)
+                .execute(&pool)
+                .await
+                .unwrap();
+                sqlx::query(r#"DELETE FROM telegram_chat_language WHERE "telegramChatId" = $1"#)
+                    .bind(chat)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        };
+        cleanup().await;
+        sqlx::query(r#"INSERT INTO telegram_subscriptions_entity (address, "telegramChatId", "groupChat") VALUES ($1, $2, true)"#)
+            .bind(address)
+            .bind(from)
+            .execute(&pool)
+            .await
+            .unwrap();
+        bp_db::upsert_telegram_chat_language(&pool, from, "de")
+            .await
+            .unwrap();
+
+        settle_telegram_push(&pool, from, "telegram", Err(AdapterError::ChatMigrated(to))).await;
+
+        let moved = find_telegram_subscriptions_by_chat(&pool, to)
+            .await
+            .unwrap();
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert!(moved[0].group_chat);
+        assert!(find_telegram_subscriptions_by_chat(&pool, from)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            bp_db::find_telegram_chat_language(&pool, to)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("de")
+        );
+        assert_eq!(
+            bp_db::find_telegram_chat_language(&pool, from)
+                .await
+                .unwrap(),
+            None
+        );
+        cleanup().await;
     }
 }

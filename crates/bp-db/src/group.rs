@@ -182,8 +182,44 @@ pub struct PplnsGroupBlockHistoryRow {
     pub row_type: String,
 }
 
-/// Most recent `limit` payout rows for a group, newest first. Powers
+/// Every payout row of a group's `blocks` most recent blocks, newest first,
+/// so each block comes whole however many members it paid. Powers
 /// `/team_history`.
+pub async fn find_group_block_history_of_recent_blocks(
+    pool: &PgPool,
+    group_id: Uuid,
+    blocks: i64,
+) -> Result<Vec<PplnsGroupBlockHistoryRow>, DbError> {
+    sqlx::query_as!(
+        PplnsGroupBlockHistoryRow,
+        r#"SELECT
+            id AS "id!",
+            "groupId" AS "group_id!",
+            "blockHeight" AS "block_height!",
+            address AS "address!: AddressId",
+            "paidSats" AS "paid_sats!: Sats",
+            percent AS "percent!",
+            "sharesInRound" AS "shares_in_round!",
+            "totalSharesInRound" AS "total_shares_in_round!",
+            "createdAt" AS "created_at!",
+            "rowType" AS "row_type!"
+           FROM pplns_group_block_history
+           WHERE "groupId" = $1
+             AND "blockHeight" IN (
+               SELECT DISTINCT "blockHeight" FROM pplns_group_block_history
+               WHERE "groupId" = $1
+               ORDER BY "blockHeight" DESC
+               LIMIT $2)
+           ORDER BY "createdAt" DESC"#,
+        group_id,
+        blocks,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::from)
+}
+
+/// Most recent `limit` payout rows for a group, newest first.
 pub async fn find_recent_group_block_history(
     pool: &PgPool,
     group_id: Uuid,

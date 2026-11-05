@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO telegram_chat_language (\"telegramChatId\", language, \"updatedAt\")\n           SELECT $2, language, $3 FROM telegram_chat_language WHERE \"telegramChatId\" = $1\n           ON CONFLICT (\"telegramChatId\") DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a5493ffd7e07a6723c79eae920174f231d0ab3fc00d20390a6e0de5c2d911908"
+}

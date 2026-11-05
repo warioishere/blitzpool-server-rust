@@ -31,18 +31,17 @@ pub(super) enum EncryptedAddressError {
 }
 
 impl MessageKey {
-    /// A PEM private key, PKCS#8 (`BEGIN PRIVATE KEY`) or PKCS#1
-    /// (`BEGIN RSA PRIVATE KEY`).
+    /// A PKCS#8 PEM private key (`BEGIN PRIVATE KEY`).
     pub fn from_pem(pem: &[u8]) -> Result<Self, String> {
         let der = PrivateKeyDer::from_pem_slice(pem).map_err(|e| e.to_string())?;
-        let key = match der {
-            PrivateKeyDer::Pkcs8(k) => PrivateDecryptingKey::from_pkcs8(k.secret_pkcs8_der()),
-            PrivateKeyDer::Pkcs1(k) => {
-                PrivateDecryptingKey::from_pkcs8(&pkcs8_from_pkcs1(k.secret_pkcs1_der()))
-            }
-            _ => return Err("not an RSA private key".to_string()),
-        }
-        .map_err(|e| e.to_string())?;
+        let PrivateKeyDer::Pkcs8(k) = der else {
+            return Err(
+                "not a PKCS#8 private key; convert it with `openssl pkcs8 -topk8 -nocrypt`"
+                    .to_string(),
+            );
+        };
+        let key =
+            PrivateDecryptingKey::from_pkcs8(k.secret_pkcs8_der()).map_err(|e| e.to_string())?;
         OaepPrivateDecryptingKey::new(key)
             .map(Self)
             .map_err(|e| e.to_string())
@@ -96,37 +95,6 @@ pub(super) fn open_encrypted_address(
         .ok_or(EncryptedAddressError::Unreadable)
 }
 
-/// Wrap a PKCS#1 `RSAPrivateKey` into the PKCS#8 document the decrypting
-/// key is built from: version 0, the rsaEncryption algorithm, the key.
-fn pkcs8_from_pkcs1(pkcs1: &[u8]) -> Vec<u8> {
-    // AlgorithmIdentifier { rsaEncryption (1.2.840.113549.1.1.1), NULL }.
-    const RSA_ALGORITHM: [u8; 15] = [
-        0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
-    ];
-    let mut body = vec![0x02, 0x01, 0x00];
-    body.extend_from_slice(&RSA_ALGORITHM);
-    body.extend(der_tlv(0x04, pkcs1));
-    der_tlv(0x30, &body)
-}
-
-fn der_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
-    let mut out = vec![tag];
-    let len = value.len();
-    if len < 0x80 {
-        out.push(len as u8);
-    } else {
-        let bytes: Vec<u8> = len
-            .to_be_bytes()
-            .into_iter()
-            .skip_while(|b| *b == 0)
-            .collect();
-        out.push(0x80 | bytes.len() as u8);
-        out.extend(bytes);
-    }
-    out.extend_from_slice(value);
-    out
-}
-
 /// A fresh key and an encryptor for its public half, as the dashboard and
 /// the script use it.
 #[cfg(test)]
@@ -173,31 +141,6 @@ mod tests {
         (pkcs8, encrypt)
     }
 
-    /// The `RSAPrivateKey` inside a PKCS#8 document: version, algorithm,
-    /// then the octet string that holds it.
-    fn pkcs1_inside(pkcs8: &[u8]) -> Vec<u8> {
-        fn header(der: &[u8]) -> (usize, usize) {
-            match der[1] {
-                n if n < 0x80 => (2, n as usize),
-                n => {
-                    let k = (n & 0x7f) as usize;
-                    let len = der[2..2 + k]
-                        .iter()
-                        .fold(0usize, |a, b| a << 8 | *b as usize);
-                    (2 + k, len)
-                }
-            }
-        }
-        let (start, _) = header(pkcs8);
-        let mut rest = &pkcs8[start..];
-        for _ in 0..2 {
-            let (h, len) = header(rest);
-            rest = &rest[h + len..];
-        }
-        let (h, len) = header(rest);
-        rest[h..h + len].to_vec()
-    }
-
     #[test]
     fn an_address_encrypted_with_the_public_key_opens() {
         let (pkcs8, encrypt) = key_pair();
@@ -210,22 +153,6 @@ mod tests {
                 Ok(ADDRESS)
             );
         }
-    }
-
-    #[test]
-    fn a_pkcs1_key_opens_the_same() {
-        let (pkcs8, encrypt) = key_pair();
-        let pkcs1 = pkcs1_inside(&pkcs8);
-        assert_eq!(
-            pkcs8_from_pkcs1(&pkcs1),
-            pkcs8,
-            "the wrap rebuilds the document"
-        );
-        let key = MessageKey::from_pem(pem("RSA PRIVATE KEY", &pkcs1).as_bytes()).unwrap();
-        assert_eq!(
-            open_encrypted_address(Some(&key), &encrypt(ADDRESS)).as_deref(),
-            Ok(ADDRESS)
-        );
     }
 
     #[test]

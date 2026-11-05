@@ -790,7 +790,8 @@ impl CommandHandler {
             }
             SettingsCallback::Flip(_, field) => field,
         };
-        // A keyboard from before a group could show only its switches.
+        // A keyboard Telegram still shows may offer a switch a group cannot
+        // have.
         if in_group && !group_notice(field) {
             let _ = adapter
                 .answer_callback_query(callback_id, Some(stale_button_text(lang)))
@@ -1229,8 +1230,11 @@ impl CommandHandler {
     }
 
     /// Dispatch read-style commands recognised by the parser. A command
-    /// about an address takes the one it was given, else the origin's; an
-    /// engine command answers "not configured" when its engine isn't wired.
+    /// about an address takes the one it was given, else the origin's; in a
+    /// group always the one the group follows, since comparing a view of
+    /// another address with the group's own would single out the followed
+    /// address. An engine command answers "not configured" when its engine
+    /// isn't wired.
     async fn handle_read(
         &self,
         transport: &Transport,
@@ -1238,6 +1242,7 @@ impl CommandHandler {
         read: ReadCommand,
         arg: Option<&str>,
     ) -> String {
+        let arg = if is_group(transport) { None } else { arg };
         let address = || self.target_address(transport, lang, arg);
         let redis = self.redis.as_ref();
         let viewer = if is_group(transport) {
@@ -1537,6 +1542,7 @@ impl CommandHandler {
         };
         // The only subscription, else the default one.
         match subs.as_slice() {
+            [] if is_group(transport) => Err(group_no_address_text(lang).to_string()),
             [] => Err(no_address_text(lang).to_string()),
             [only] => Ok(only.address.clone()),
             many => many
@@ -1758,7 +1764,7 @@ fn group_subscribe_usage_text(lang: Language) -> &'static str {
              Blockparty folgt die Gruppe über die Adresse ihres Admins."
         }
         Language::En => {
-            "Send /subscribe ADDRESS. For a Team best use an address that does not mine \
+            "Send /subscribe ADDRESS. For a Team, ideally an address that does not mine \
              and is only a member of the Team: the group gets the blocks and Team bests \
              through it, and no miner's address stands here. A group follows a \
              Blockparty through the address of its admin."
@@ -1890,7 +1896,7 @@ fn group_welcome_text(lang: Language) -> String {
         Language::En => format!(
             "{}\n\nIn this group I show Team and Blockparty status and report the \
              blocks of the Team or Blockparty and the Team's new bests. A group admin \
-             sets the address the group follows with /subscribe ADDRESS: for a Team best \
+             sets the address the group follows with /subscribe ADDRESS: for a Team, ideally \
              one that does not mine and is only a member of the Team, for a Blockparty \
              the address of its admin. For your own address, message me privately. \
              /help lists the commands here.",
@@ -1902,11 +1908,11 @@ fn group_welcome_text(lang: Language) -> String {
 fn no_team_admin_text(lang: Language) -> &'static str {
     match lang {
         Language::De => {
-            "Keine deiner Adressen ist Admin eines Teams. Beitrittsanfragen meldet der \
-             Bot nur dem Admin des Teams."
+            "Keine abonnierte Adresse ist Admin eines Teams. Beitrittsanfragen meldet \
+             der Bot nur dem Admin des Teams."
         }
         Language::En => {
-            "None of your addresses is the admin of a Team. The bot reports join \
+            "No subscribed address is the admin of a Team. The bot reports join \
              requests only to the Team's admin."
         }
     }
@@ -1915,11 +1921,11 @@ fn no_team_admin_text(lang: Language) -> &'static str {
 fn no_team_member_text(lang: Language) -> &'static str {
     match lang {
         Language::De => {
-            "Keine deiner Adressen ist in einem Team. Den Bestwert eines Teams \
+            "Keine abonnierte Adresse ist in einem Team. Den Bestwert eines Teams \
              meldet der Bot den Mitgliedern des Teams."
         }
         Language::En => {
-            "None of your addresses is in a Team. The bot reports a Team's best \
+            "No subscribed address is in a Team. The bot reports a Team's best \
              to the Team's members."
         }
     }
@@ -2016,6 +2022,21 @@ fn subscription_label(
     }
 }
 
+/// A group's command with no address the group follows yet. A group's
+/// commands take no address of their own.
+fn group_no_address_text(lang: Language) -> &'static str {
+    match lang {
+        Language::De => {
+            "Diese Gruppe folgt noch keiner Adresse. Ein Admin der Gruppe legt sie mit \
+             /subscribe ADRESSE fest."
+        }
+        Language::En => {
+            "This group follows no address yet. A group admin sets it with \
+             /subscribe ADDRESS."
+        }
+    }
+}
+
 /// No address given and none to fall back on.
 fn no_address_text(lang: Language) -> &'static str {
     match lang {
@@ -2089,7 +2110,7 @@ fn flag_toggle_ok_text(lang: Language, flag: Switch, value: bool) -> String {
 
 /// Resetting the best difficulty is a write for one address, so it happens
 /// in the dashboard, behind that address's login; the bot only points there.
-/// The link carries no address, so a group chat does not see it in full.
+/// The link carries no address, so the address shows up nowhere in full.
 fn best_diff_reset_text(lang: Language, address: &AddressId, base_url: Option<&str>) -> String {
     let short = html::addr(&short_address(address.as_str()));
     let mut text = match lang {
@@ -2170,6 +2191,7 @@ mod tests {
                 remove_missing_text(lang, &address, false),
                 remove_missing_text(lang, &address, true),
                 no_address_text(lang).to_string(),
+                group_no_address_text(lang).to_string(),
                 list_addresses(lang, ["bc1q<bc1q<odd>&address>"].into_iter()),
                 best_diff_reset_text(lang, &address, Some("https://pool.example")),
                 language_switch_ok_text(lang).to_string(),
@@ -2721,6 +2743,38 @@ mod tests {
 
         subscribed_chat(&pool, chat_id, &[]).await;
         cleanup().await;
+    }
+
+    /// In a group a read command answers for the address the group follows
+    /// and ignores an address it is given, so a view of another address
+    /// cannot be compared with the group's own.
+    #[tokio::test]
+    async fn a_group_read_command_ignores_an_address_argument() {
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let chat_id = -7_700_611;
+        subscribed_chat(&pool, chat_id, &[]).await;
+        let handler = CommandHandler::new(pool.clone(), Network::Bitcoin, None, None);
+        let in_group = Transport::Telegram {
+            chat_id,
+            thread_id: None,
+            group: Some(GroupSender::AnonymousAdmin),
+        };
+        let other = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+        let reply = handler
+            .handle_read(
+                &in_group,
+                Language::En,
+                ReadCommand::TeamHistory,
+                Some(other),
+            )
+            .await;
+        assert_eq!(
+            reply,
+            group_no_address_text(Language::En),
+            "a group with no subscription has no address to answer for, whatever it names"
+        );
     }
 
     /// A group follows a Team through a Team member's address and a

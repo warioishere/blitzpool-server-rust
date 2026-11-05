@@ -107,7 +107,7 @@ pub(crate) fn group_topic(command: &Command) -> Option<GroupTopic> {
 /// What a group's subscriptions follow: a Team, a Blockparty, both, or
 /// nothing yet.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct GroupFollows {
+pub(crate) struct GroupFollows {
     pub team: bool,
     pub blockparty: bool,
 }

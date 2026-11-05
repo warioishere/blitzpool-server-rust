@@ -98,8 +98,8 @@ const MENU: &[MenuEntry] = &[
         command: "/subscribe",
         section: Section::Addresses,
         args: Args::Address,
-        de: "Adresse abonnieren (alle Meldungen)",
-        en: "Subscribe an address (all notices)",
+        de: "Adresse abonnieren",
+        en: "Subscribe an address",
     },
     MenuEntry {
         command: "/show_addresses",

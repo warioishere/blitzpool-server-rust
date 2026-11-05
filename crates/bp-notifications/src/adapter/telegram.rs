@@ -392,9 +392,23 @@ impl TelegramAdapter {
             400 if snippet.contains("chat not found") => Err(AdapterError::InvalidRecipient(
                 format!("telegram {code}: {snippet}"),
             )),
+            400 => match migrated_to(&snippet) {
+                Some(to) => Err(AdapterError::ChatMigrated(to)),
+                None => Err(AdapterError::Server(format!("telegram {code}: {snippet}"))),
+            },
             _ => Err(AdapterError::Server(format!("telegram {code}: {snippet}"))),
         }
     }
+}
+
+/// The chat id a 400 names when the group became a supergroup
+/// (`parameters.migrate_to_chat_id`).
+fn migrated_to(body: &str) -> Option<i64> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("parameters")?
+        .get("migrate_to_chat_id")?
+        .as_i64()
 }
 
 #[cfg(test)]
@@ -538,6 +552,25 @@ mod tests {
         let bodies = server.await.unwrap();
         assert_eq!(bodies[2]["user_id"], 3);
         assert_eq!(bodies[2]["chat_id"], -100);
+    }
+
+    /// A group that became a supergroup is reported with its new chat id;
+    /// any other 400 stays a server error.
+    #[tokio::test]
+    async fn a_group_that_became_a_supergroup_names_its_new_chat() {
+        const MOVED: &str = r#"{"ok":false,"error_code":400,"description":"Bad Request: group chat was upgraded to a supergroup chat","parameters":{"migrate_to_chat_id":-1001234567890}}"#;
+        const OTHER: &str =
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: message is too long"}"#;
+        let (adapter, server) = fake_bot_api(vec![(400, MOVED), (400, OTHER)]).await;
+        assert!(matches!(
+            adapter.send_html(-100, None, "a").await,
+            Err(AdapterError::ChatMigrated(-1_001_234_567_890))
+        ));
+        assert!(matches!(
+            adapter.send_html(-100, None, "a").await,
+            Err(AdapterError::Server(_))
+        ));
+        assert_eq!(server.await.unwrap().len(), 2);
     }
 
     /// A chat that is gone refuses the main topic too: the retry fails the

@@ -14,8 +14,8 @@ use bp_common::{short_address, AddressId, MiningMode};
 use bp_db::{
     find_address_settings, find_address_settings_for_addresses, find_blockparty_group,
     find_blockparty_member_by_address, find_clients_by_address, find_group,
-    find_group_member_by_address, find_pplns_group_members_for_group,
-    find_recent_group_block_history, list_blockparty_block_history,
+    find_group_block_history_of_recent_blocks, find_group_member_by_address,
+    find_pplns_group_members_for_group, list_blockparty_block_history,
     list_blockparty_members_for_group, BlockpartyGroupRow, BlockpartyMemberRow,
     PplnsGroupBlockHistoryRow,
 };
@@ -313,7 +313,7 @@ pub(super) async fn build_group_history(
             return db_error_text(lang);
         }
     };
-    let history = match find_recent_group_block_history(pool, member.group_id, 50).await {
+    let history = match find_group_block_history_of_recent_blocks(pool, member.group_id, 10).await {
         Ok(v) => v,
         Err(e) => {
             warn!(target: "bp_notifications::command::read", error = %e, "group_history: history");

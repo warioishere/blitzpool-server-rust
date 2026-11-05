@@ -89,7 +89,7 @@ pub enum LanguageSwitch {
 /// A parsed `addr:` inline-keyboard tap from the `/show_addresses`
 /// keyboard. Carries the subscription row id the button referenced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AddressCallback {
+pub(crate) enum AddressCallback {
     /// `addr:set:<id>` — make subscription `id` the chat's default.
     SetDefault(i32),
     /// `addr:rm:<id>` — remove subscription `id`.
@@ -98,7 +98,7 @@ pub enum AddressCallback {
 
 /// Parse an `addr:set:<id>` / `addr:rm:<id>` callback payload. Returns
 /// `None` for any other shape (unknown action, non-numeric id, …).
-pub fn parse_address_callback(data: &str) -> Option<AddressCallback> {
+pub(crate) fn parse_address_callback(data: &str) -> Option<AddressCallback> {
     let rest = data.strip_prefix("addr:")?;
     let (action, id_str) = rest.split_once(':')?;
     let id: i32 = id_str.parse().ok()?;
@@ -111,7 +111,7 @@ pub fn parse_address_callback(data: &str) -> Option<AddressCallback> {
 
 /// One switch of one subscription in the `/settings` keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingsField {
+pub(crate) enum SettingsField {
     Blocks,
     BestDiff,
     Device,
@@ -122,7 +122,7 @@ pub enum SettingsField {
 }
 
 impl SettingsField {
-    pub const ALL: [SettingsField; 7] = [
+    pub(crate) const ALL: [SettingsField; 7] = [
         SettingsField::Blocks,
         SettingsField::BestDiff,
         SettingsField::Device,
@@ -148,13 +148,13 @@ impl SettingsField {
 /// A `/settings` keyboard tap: `st:<id>` names subscription `id`,
 /// `st:<id>:<field>` flips one of its switches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingsCallback {
+pub(crate) enum SettingsCallback {
     Address(i32),
     Flip(i32, SettingsField),
 }
 
 impl SettingsCallback {
-    pub fn data(self) -> String {
+    pub(crate) fn data(self) -> String {
         match self {
             SettingsCallback::Address(id) => format!("st:{id}"),
             SettingsCallback::Flip(id, field) => format!("st:{id}:{}", field.code()),
@@ -162,7 +162,7 @@ impl SettingsCallback {
     }
 }
 
-pub fn parse_settings_callback(data: &str) -> Option<SettingsCallback> {
+pub(crate) fn parse_settings_callback(data: &str) -> Option<SettingsCallback> {
     let rest = data.strip_prefix("st:")?;
     let (id, field) = match rest.split_once(':') {
         Some((id, code)) => (

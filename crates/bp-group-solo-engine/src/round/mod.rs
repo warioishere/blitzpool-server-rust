@@ -268,6 +268,17 @@ redis.call('HINCRBYFLOAT', KEYS[2], ARGV[2], ARGV[1])
 return 1
 "#;
 
+/// An `address → Σdiff` hash as read from Redis, keeping only what parses
+/// to a positive amount.
+fn positive_diffs(hash: HashMap<String, String>) -> HashMap<String, f64> {
+    hash.into_iter()
+        .filter_map(|(addr, v)| {
+            let d: f64 = v.parse().ok()?;
+            (d > 0.0).then_some((addr, d))
+        })
+        .collect()
+}
+
 // ── Errors ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
@@ -473,17 +484,7 @@ impl GroupRoundStore {
     ) -> Result<HashMap<String, f64>, RoundError> {
         let mut conn = self.conn.clone();
         let hash: HashMap<String, String> = conn.hgetall(lane.aggregate_key(group_id)).await?;
-        Ok(hash
-            .into_iter()
-            .filter_map(|(addr, diff_str)| {
-                let diff: f64 = diff_str.parse().ok()?;
-                if diff > 0.0 {
-                    Some((addr, diff))
-                } else {
-                    None
-                }
-            })
-            .collect())
+        Ok(positive_diffs(hash))
     }
 
     /// Mode-aware payout read, the single chokepoint for every payout/audit/stats
@@ -530,16 +531,7 @@ impl GroupRoundStore {
         Ok(bucket_ids
             .into_iter()
             .zip(raw)
-            .map(|(bid, hash)| {
-                let map = hash
-                    .into_iter()
-                    .filter_map(|(addr, v)| {
-                        let d: f64 = v.parse().ok()?;
-                        (d > 0.0).then_some((addr, d))
-                    })
-                    .collect();
-                (bid, map)
-            })
+            .map(|(bid, hash)| (bid, positive_diffs(hash)))
             .collect())
     }
 
@@ -707,19 +699,9 @@ impl GroupRoundStore {
             .key(key_round_generation(group_id))
             .invoke_async(&mut conn)
             .await?;
-        let positive = |m: HashMap<String, String>| -> HashMap<String, f64> {
-            m.into_iter()
-                .filter_map(|(addr, v)| {
-                    v.parse::<f64>()
-                        .ok()
-                        .filter(|d| *d > 0.0)
-                        .map(|d| (addr, d))
-                })
-                .collect()
-        };
         Ok(RoundAtFind {
-            payout_shares: positive(payout),
-            rejected: positive(rejected),
+            payout_shares: positive_diffs(payout),
+            rejected: positive_diffs(rejected),
             shares_since_block: counter.parse().unwrap_or(0.0),
             round_generation: generation.parse().unwrap_or(0),
         })
@@ -819,17 +801,7 @@ impl GroupRoundStore {
     ) -> Result<HashMap<String, f64>, RoundError> {
         let mut conn = self.conn.clone();
         let hash: HashMap<String, String> = conn.hgetall(key_by_address(group_id)).await?;
-        Ok(hash
-            .into_iter()
-            .filter_map(|(addr, diff_str)| {
-                let diff: f64 = diff_str.parse().ok()?;
-                if diff > 0.0 {
-                    Some((addr, diff))
-                } else {
-                    None
-                }
-            })
-            .collect())
+        Ok(positive_diffs(hash))
     }
 
     /// Σ diff-1 since the group's last block (see [`key_shares_since_block`]);

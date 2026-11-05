@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM telegram_chat_language WHERE \"telegramChatId\" = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6259850022cbf55eb25736588af16080fd18b361d399abce227ae2cedf112b56"
+}

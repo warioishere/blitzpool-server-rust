@@ -683,6 +683,46 @@ pub async fn delete_telegram_subscriptions_by_chat(
     Ok(result.rows_affected())
 }
 
+/// Move a chat's live subscriptions and its language to the id Telegram
+/// gave the chat when a group became a supergroup. A language the new chat
+/// already has stays. Returns the subscriptions moved.
+pub async fn move_telegram_chat(pool: &PgPool, from: i64, to: i64) -> Result<u64, DbError> {
+    let now_ms: i64 = chrono::Utc::now().timestamp_millis();
+    let mut tx = pool.begin().await.map_err(DbError::from)?;
+    let moved = sqlx::query!(
+        r#"UPDATE telegram_subscriptions_entity
+           SET "telegramChatId" = $2, "messageThreadId" = NULL, "updatedAt" = $3
+           WHERE "telegramChatId" = $1 AND "deletedAt" IS NULL"#,
+        from,
+        to,
+        now_ms,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(DbError::from)?
+    .rows_affected();
+    sqlx::query!(
+        r#"INSERT INTO telegram_chat_language ("telegramChatId", language, "updatedAt")
+           SELECT $2, language, $3 FROM telegram_chat_language WHERE "telegramChatId" = $1
+           ON CONFLICT ("telegramChatId") DO NOTHING"#,
+        from,
+        to,
+        now_ms,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(DbError::from)?;
+    sqlx::query!(
+        r#"DELETE FROM telegram_chat_language WHERE "telegramChatId" = $1"#,
+        from,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(DbError::from)?;
+    tx.commit().await.map_err(DbError::from)?;
+    Ok(moved)
+}
+
 /// The language a Telegram chat picked, `None` when it never picked one.
 pub async fn find_telegram_chat_language(
     pool: &PgPool,

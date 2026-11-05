@@ -15,6 +15,11 @@ pub enum AdapterError {
     #[error("invalid recipient: {0}")]
     InvalidRecipient(String),
 
+    /// The Telegram group became a supergroup and lives on under this chat
+    /// id. The caller moves its subscriptions there.
+    #[error("telegram chat moved to {0}")]
+    ChatMigrated(i64),
+
     /// Network / transport failure (DNS, TCP, TLS). Transient by
     /// default — caller retries on the next event.
     #[error("transport error: {0}")]
