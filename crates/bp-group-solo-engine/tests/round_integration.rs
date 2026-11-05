@@ -9,8 +9,8 @@
 use bp_group_mgmt::group::PayoutMode;
 use bp_group_solo_engine::round::{
     key_applied, key_best_share, key_by_address, key_last_accepted_share_at, key_rejected_shares,
-    key_shares_since_block, key_shares_since_block_height, key_window_buckets,
-    key_window_by_address, GroupRoundStore, WindowLane, WINDOW_BUCKET_MS,
+    key_settled_blocks, key_shares_since_block, key_window_buckets, key_window_by_address,
+    GroupRoundStore, SettleScope, WindowLane, WINDOW_BUCKET_MS,
 };
 use redis::{aio::ConnectionManager, AsyncCommands, Client};
 
@@ -144,10 +144,10 @@ async fn read_by_address_returns_aggregate() {
     assert!((result["bc1qbar"] - 20.0).abs() < 1e-9);
 }
 
-// ── Test 4 — reset_for_block_found preserves last-accepted-share-at
+// ── Test 4 — a booked block preserves last-accepted-share-at
 
 #[tokio::test]
-async fn reset_for_block_found_preserves_last_accepted_share_at() {
+async fn a_booked_block_preserves_last_accepted_share_at() {
     let conn = match connect_or_skip(3).await {
         Some(c) => c,
         None => return,
@@ -165,10 +165,7 @@ async fn reset_for_block_found_preserves_last_accepted_share_at() {
         .await
         .unwrap();
 
-    store
-        .reset_for_block_found(group, 1, PayoutMode::Prop)
-        .await
-        .unwrap();
+    settle_now(&store, group, "block-1").await;
 
     let mut conn = conn;
     let by_addr_exists: bool = conn.exists(key_by_address(group)).await.unwrap();
@@ -459,10 +456,7 @@ async fn a_redelivered_share_is_still_deduped_across_a_round_reset() {
         .await
         .expect("ok"));
     // …a block is found for the group and the round is wiped…
-    store
-        .reset_for_block_found(group, 1, PayoutMode::Prop)
-        .await
-        .unwrap();
+    settle_now(&store, group, "block-1").await;
     // …and only now does the batch get redelivered (the ack never landed).
     let replay = store
         .record_share(Some("ep9:7"), group, addr, 100.0, 1_700_000_000_000)
@@ -1020,112 +1014,285 @@ async fn forget_member_window_removes_the_address_from_both_lanes() {
     assert!(b_in_5);
 }
 
-// ── Shares since the group's last block ─────────────────────────────
+// ── What a booked block takes out ───────────────────────────────────
 
-/// The counter sums both modes' accepted shares exactly once, survives the
-/// calendar reset, a member's removal and a Window block reset, and starts
-/// over once per block height; dissolving the group drops it.
+const ALL: SettleScope = SettleScope {
+    round: true,
+    best_share: true,
+};
+
+/// Book a block found now with everything a `resetRoundOnBlock` Prop group's
+/// booking takes out.
+async fn settle_now(store: &GroupRoundStore, group: &str, hash: &str) {
+    let at_find = store
+        .read_round_at_find(group, PayoutMode::Prop, 0, 0)
+        .await
+        .unwrap();
+    assert!(store
+        .settle_block(group, hash, i64::MAX, &at_find, ALL)
+        .await
+        .unwrap());
+}
+
+async fn round_of(store: &GroupRoundStore, group: &str) -> Vec<(String, f64)> {
+    let mut round: Vec<(String, f64)> = store
+        .read_by_address(group)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    round.sort_by(|a, b| a.0.cmp(&b.0));
+    round
+}
+
+/// MONEY: the shares a group mines while its block waits for confirmations
+/// belong to the next block, so booking must take out only what the find
+/// covered: round, counter and a best share not newer than the find.
 #[tokio::test]
-async fn shares_since_block_spans_round_resets_and_starts_over_once_per_block() {
+async fn a_booked_block_takes_out_only_what_was_mined_before_its_find() {
     let conn = match connect_or_skip(22).await {
         Some(c) => c,
         None => return,
     };
     let store = GroupRoundStore::new(conn.clone());
-    let prop = "g_since_block_prop";
-    let window = "g_since_block_window";
-    let since = |g: &'static str| {
-        let store = store.clone();
-        async move { store.read_shares_since_block(g).await.unwrap() }
-    };
+    let group = "g_settle_after_find";
+    store
+        .record_share(Some("a1"), group, "bc1qfoo", 10.0, 1_000)
+        .await
+        .unwrap();
+    store
+        .record_share(Some("a1"), group, "bc1qfoo", 10.0, 1_000)
+        .await
+        .unwrap();
+    store.record_reject(group, "bc1qfoo", 2.0).await.unwrap();
+    store
+        .update_best_share_if_better(group, "bc1qfoo", 10.0, 1_000)
+        .await
+        .unwrap();
 
+    let at_find = store
+        .read_round_at_find(group, PayoutMode::Prop, 0, 0)
+        .await
+        .unwrap();
     assert_eq!(
-        since(prop).await,
-        0.0,
-        "nothing counted before the first share"
+        at_find.shares_since_block, 10.0,
+        "a redelivered share counts once"
     );
-    store
-        .record_share(Some("s1"), prop, "bc1qfoo", 10.0, 1_700_000_000_001)
-        .await
-        .unwrap();
-    store
-        .record_share(Some("s1"), prop, "bc1qfoo", 10.0, 1_700_000_000_001)
-        .await
-        .unwrap();
-    store
-        .record_share(Some("s2"), prop, "bc1qbar", 5.0, 1_700_000_000_002)
-        .await
-        .unwrap();
-    assert_eq!(since(prop).await, 15.0, "a redelivered share counts once");
 
-    store.reset_for_calendar(prop).await.unwrap();
+    // Mined after the find, while the block is parked.
+    store
+        .record_share(Some("a2"), group, "bc1qbar", 4.0, 3_000)
+        .await
+        .unwrap();
+    store
+        .update_best_share_if_better(group, "bc1qbar", 50.0, 3_000)
+        .await
+        .unwrap();
+
+    assert!(store
+        .settle_block(group, "block-a", 2_000, &at_find, ALL)
+        .await
+        .unwrap());
+    assert_eq!(
+        round_of(&store, group).await,
+        vec![("bc1qbar".to_string(), 4.0)]
+    );
     assert!(
-        store.read_by_address(prop).await.unwrap().is_empty(),
-        "precondition: the calendar reset wiped the round"
+        store.read_rejected(group).await.unwrap().is_empty(),
+        "the found-time rejects go"
     );
-    store
-        .forget_member(prop, "bc1qbar", PayoutMode::Prop)
+    assert_eq!(store.read_shares_since_block(group).await.unwrap(), 4.0);
+    let best = store
+        .read_best_share(group)
         .await
-        .unwrap();
-    assert_eq!(
-        since(prop).await,
-        15.0,
-        "the calendar reset and a removed member leave the count alone"
-    );
+        .unwrap()
+        .expect("a newer best stays");
+    assert_eq!((best.address.as_str(), best.difficulty), ("bc1qbar", 50.0));
 
-    assert!(store.clear_shares_since_block(prop, 100).await.unwrap());
-    assert_eq!(since(prop).await, 0.0, "the block starts the count over");
-    store
-        .record_share(Some("s3"), prop, "bc1qfoo", 7.0, 1_700_000_000_003)
-        .await
-        .unwrap();
     assert!(
-        !store.clear_shares_since_block(prop, 100).await.unwrap(),
-        "a redelivered block is a no-op"
+        !store
+            .settle_block(group, "block-a", 2_000, &at_find, ALL)
+            .await
+            .unwrap(),
+        "a redelivered booking is a no-op"
     );
     assert_eq!(
-        since(prop).await,
-        7.0,
-        "and keeps the shares mined after it"
-    );
-    assert!(store.clear_shares_since_block(prop, 101).await.unwrap());
-    assert_eq!(
-        since(prop).await,
-        0.0,
-        "the next block starts it over again"
+        round_of(&store, group).await,
+        vec![("bc1qbar".to_string(), 4.0)]
     );
 
+    // The calendar reset and a removed member leave the counter alone;
+    // dissolving the group drops it and the settled set.
+    store.reset_for_calendar(group).await.unwrap();
     store
-        .record_share_windowed(Some("w1"), window, "bc1qfoo", 3.0, 1_700_000_000_004)
+        .forget_member(group, "bc1qbar", PayoutMode::Prop)
         .await
         .unwrap();
-    store
-        .record_share_windowed(Some("w1"), window, "bc1qfoo", 3.0, 1_700_000_000_004)
-        .await
-        .unwrap();
-    store
-        .reset_for_block_found(window, 200, PayoutMode::Window)
-        .await
-        .unwrap();
-    assert_eq!(
-        since(window).await,
-        3.0,
-        "Window shares count once and only the per-block clear starts them over"
-    );
-
-    store
-        .record_share(Some("s4"), prop, "bc1qfoo", 2.0, 1_700_000_000_005)
-        .await
-        .unwrap();
-    store.reset_full(prop).await.unwrap();
+    assert_eq!(store.read_shares_since_block(group).await.unwrap(), 4.0);
+    store.reset_full(group).await.unwrap();
     let mut conn = conn;
-    let left: bool = conn.exists(key_shares_since_block(prop)).await.unwrap();
-    let marker: bool = conn
-        .exists(key_shares_since_block_height(prop))
+    let counter: bool = conn.exists(key_shares_since_block(group)).await.unwrap();
+    let settled: bool = conn.exists(key_settled_blocks(group)).await.unwrap();
+    assert!(
+        !counter && !settled,
+        "dissolving drops the counter and the settled set"
+    );
+}
+
+/// Without `resetRoundOnBlock` the round stays and only the counter moves; a
+/// `Window` group keeps its window either way.
+#[tokio::test]
+async fn a_block_takes_only_the_counter_out_of_a_round_it_does_not_reset() {
+    let conn = match connect_or_skip(24).await {
+        Some(c) => c,
+        None => return,
+    };
+    let store = GroupRoundStore::new(conn);
+    let none = SettleScope {
+        round: false,
+        best_share: false,
+    };
+    let prop = "g_settle_flag_off";
+    store
+        .record_share(None, prop, "bc1qfoo", 10.0, 1)
+        .await
+        .unwrap();
+    let cover = store
+        .read_round_at_find(prop, PayoutMode::Prop, 0, 0)
+        .await
+        .unwrap();
+    store
+        .record_share(None, prop, "bc1qfoo", 5.0, 2)
+        .await
+        .unwrap();
+    store
+        .settle_block(prop, "p", i64::MAX, &cover, none)
+        .await
+        .unwrap();
+    assert_eq!(
+        round_of(&store, prop).await,
+        vec![("bc1qfoo".to_string(), 15.0)]
+    );
+    assert_eq!(store.read_shares_since_block(prop).await.unwrap(), 5.0);
+
+    let window = "g_settle_window";
+    let window_ms = 3_600_000;
+    let now = 10 * WINDOW_BUCKET_MS;
+    let window_scope = SettleScope {
+        round: false,
+        best_share: true,
+    };
+    store
+        .record_share_windowed(Some("w1"), window, "bc1qfoo", 3.0, now)
+        .await
+        .unwrap();
+    store
+        .record_share_windowed(Some("w1"), window, "bc1qfoo", 3.0, now)
+        .await
+        .unwrap();
+    let cover = store
+        .read_round_at_find(window, PayoutMode::Window, now, window_ms)
+        .await
+        .unwrap();
+    assert_eq!(
+        cover.payout_shares.get("bc1qfoo"),
+        Some(&3.0),
+        "the window at the find"
+    );
+    store
+        .record_share_windowed(Some("w2"), window, "bc1qfoo", 2.0, now)
+        .await
+        .unwrap();
+    store
+        .settle_block(window, "w", i64::MAX, &cover, window_scope)
+        .await
+        .unwrap();
+    let kept = store
+        .read_payout_shares(window, PayoutMode::Window, now, window_ms)
+        .await
+        .unwrap();
+    assert_eq!(
+        kept.get("bc1qfoo"),
+        Some(&5.0),
+        "the window pays on, untouched"
+    );
+    assert_eq!(store.read_shares_since_block(window).await.unwrap(), 2.0);
+}
+
+/// MONEY: a calendar reset while the block is parked has wiped the round the
+/// block covered; its booking must leave the new round alone, or it takes the
+/// shares mined since the reset out.
+#[tokio::test]
+async fn a_calendar_reset_while_the_block_is_parked_keeps_the_new_round() {
+    let conn = match connect_or_skip(23).await {
+        Some(c) => c,
+        None => return,
+    };
+    let store = GroupRoundStore::new(conn);
+    let group = "g_settle_across_reset";
+    store
+        .record_share(None, group, "bc1qfoo", 100.0, 1)
+        .await
+        .unwrap();
+    let at_find = store
+        .read_round_at_find(group, PayoutMode::Prop, 0, 0)
+        .await
+        .unwrap();
+    store.reset_for_calendar(group).await.unwrap();
+    store
+        .record_share(None, group, "bc1qfoo", 30.0, 2)
+        .await
+        .unwrap();
+    store
+        .record_share(None, group, "bc1qbar", 30.0, 3)
+        .await
+        .unwrap();
+
+    assert!(store
+        .settle_block(group, "b", i64::MAX, &at_find, ALL)
+        .await
+        .unwrap());
+    assert_eq!(
+        round_of(&store, group).await,
+        vec![("bc1qbar".to_string(), 30.0), ("bc1qfoo".to_string(), 30.0)],
+        "the round since the reset stays whole"
+    );
+    assert_eq!(
+        store.read_shares_since_block(group).await.unwrap(),
+        60.0,
+        "the counter, which the reset keeps, still loses the block's share"
+    );
+}
+
+/// Large diff-1 sums do not leave float dust behind once a block takes them
+/// out: the address leaves the round and the counter key goes.
+#[tokio::test]
+async fn a_spent_large_sum_leaves_no_float_remainder() {
+    let conn = match connect_or_skip(25).await {
+        Some(c) => c,
+        None => return,
+    };
+    let store = GroupRoundStore::new(conn.clone());
+    let group = "g_settle_float_dust";
+    for i in 0..2000 {
+        store
+            .record_share(None, group, "bc1qfoo", 123_456_789.123_456_7, i)
+            .await
+            .unwrap();
+    }
+    let at_find = store
+        .read_round_at_find(group, PayoutMode::Prop, 0, 0)
+        .await
+        .unwrap();
+    store
+        .settle_block(group, "f", i64::MAX, &at_find, ALL)
         .await
         .unwrap();
     assert!(
-        !left && !marker,
-        "dissolving the group drops the count and its marker"
+        round_of(&store, group).await.is_empty(),
+        "no dust in the round"
     );
+    let mut conn = conn;
+    let counter: bool = conn.exists(key_shares_since_block(group)).await.unwrap();
+    assert!(!counter, "no dust in the counter");
 }

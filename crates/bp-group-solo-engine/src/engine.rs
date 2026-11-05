@@ -29,7 +29,7 @@ use crate::reset::{
     scheduled_reset, spawn_per_group_task, GroupResetRunner, ResetError, ResetSchedule,
 };
 
-use crate::round::{GroupRoundStore, RoundError, WINDOW_BUCKET_MS};
+use crate::round::{GroupRoundStore, RoundAtFind, RoundError, SettleScope, WINDOW_BUCKET_MS};
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -76,6 +76,18 @@ impl EngineError {
             | EngineError::Distribution(_) => false,
         }
     }
+}
+
+/// One found block of a group as its booking sees it.
+#[derive(Clone, Debug)]
+pub struct FoundGroupBlock<'a> {
+    pub height: i32,
+    /// Block hash; each block is taken out of the round once per hash.
+    pub hash: &'a str,
+    /// When the block was found; a best share newer than this stays.
+    pub found_at_ms: i64,
+    /// The group's state at the find, which booking takes out of the round.
+    pub round_at_find: RoundAtFind,
 }
 
 #[derive(Clone)]
@@ -475,21 +487,37 @@ impl GroupSoloEngine {
             .map_err(EngineError::Distribution)
     }
 
-    /// Book a found block from its OWN coinbase, then move the round on. No
-    /// settlement: withheld value goes to the pool ([`bp_pplns::WithheldValue::ToPool`]),
-    /// so what the coinbase paid is the whole truth. Idempotent: the history
-    /// via the `(groupId, blockHeight, address)` UNIQUE key, the round reset
-    /// via [`crate::round::key_reset_height`] and the shares-since-block
-    /// counter via [`crate::round::key_shares_since_block_height`], so a
-    /// redelivery leaves the shares mined since untouched and a retry
-    /// completes an interrupted reset.
+    /// What a block of the group found now covers, parked with the block so
+    /// its booking takes out only what was mined before the find.
+    pub async fn round_at_find(&self, group_id: Uuid) -> Result<RoundAtFind, EngineError> {
+        let (mode, window_ms) = match find_group(&self.inner.pool, group_id).await? {
+            Some(g) => group_mode_from_row(&g),
+            None => (PayoutMode::Prop, 0),
+        };
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        Ok(self
+            .inner
+            .round
+            .read_round_at_find(&group_id.to_string(), mode, now_ms, window_ms)
+            .await?)
+    }
+
+    /// Book a found block from its OWN coinbase, then take its found-time
+    /// state out of the round. No settlement: withheld value goes to the pool
+    /// ([`bp_pplns::WithheldValue::ToPool`]), so what the coinbase paid is
+    /// the whole truth. Idempotent: the history via the `(groupId,
+    /// blockHeight, address)` UNIQUE key, the round via
+    /// [`crate::round::key_settled_blocks`], so a redelivery or a retry in any
+    /// order takes each block's state out exactly once and leaves the shares
+    /// mined since the find.
     pub async fn on_block_found(
         &self,
         group_id: Uuid,
-        block_height: i32,
+        block: FoundGroupBlock<'_>,
         actual: &bp_coinbase_snapshot::ActualCoinbase,
     ) -> Result<ApplyDistributionResult, EngineError> {
         let group_key = group_id.to_string();
+        let block_height = block.height;
 
         if let Err(subsidy) =
             actual.check_subsidy(block_height, self.inner.config.subsidy_halving_interval)
@@ -508,33 +536,28 @@ impl GroupSoloEngine {
                 subsidy,
             });
         }
-        // 2. Mode + reset gate, and the round state for the audit fields,
-        //    read BEFORE any reset wipes it.
+        // 2. Mode + reset gate. A dissolved group still gets its history, but
+        //    no round state is written back for it.
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let (mode, window_ms, reset_on_block) = match find_group(&self.inner.pool, group_id).await {
-            Ok(Some(g)) => {
-                let (mode, window_ms) = group_mode_from_row(&g);
-                (mode, window_ms, g.reset_round_on_block)
+        // A failed read is an error, so the watcher retries the block rather
+        // than settle it on a guessed mode.
+        let group = find_group(&self.inner.pool, group_id).await?;
+        let (mode, reset_on_block, group_live) = match group {
+            Some(g) => {
+                let (mode, _) = group_mode_from_row(&g);
+                (mode, g.reset_round_on_block, g.dissolved_at.is_none())
             }
-            Ok(None) => (PayoutMode::Prop, 0, false),
-            Err(e) => {
-                warn!(%group_id, error = %e,
-                    "group row read failed in on_block_found — defaulting to PROP / no reset");
-                (PayoutMode::Prop, 0, false)
-            }
+            None => (PayoutMode::Prop, false, false),
         };
-        let round_by_addr = self
-            .inner
-            .round
-            .read_payout_shares(&group_key, mode, now_ms, window_ms)
-            .await?;
-        let total_shares_in_round: f64 = round_by_addr.values().sum();
+        let at_find = &block.round_at_find;
+        let total_shares_in_round: f64 = at_find.payout_shares.values().sum();
         let total_shares_i64 = total_shares_in_round.round() as i64;
 
         let audit_rows =
-            history_rows_from_coinbase(group_id, actual, &round_by_addr, total_shares_i64);
+            history_rows_from_coinbase(group_id, actual, &at_find.payout_shares, total_shares_i64);
 
-        // 3. Write the history, 4. move the round on, 5. drop the build cache.
+        // 3. Write the history, 4. take the block out of the round, 5. drop
+        //    the build cache.
         let outcome = apply_distribution(
             &self.inner.pool,
             group_id,
@@ -544,36 +567,18 @@ impl GroupSoloEngine {
         )
         .await?;
 
-        // Every block of the group starts this counter over, whatever
-        // `resetRoundOnBlock` says, so switching the flag on later shows the
-        // shares since the last block right away.
-        self.inner
-            .round
-            .clear_shares_since_block(&group_key, block_height)
-            .await?;
-
-        match (mode, reset_on_block) {
-            (PayoutMode::Prop | PayoutMode::Window, true) => {
-                // An error leaves the block pending: the history is booked,
-                // and the retry finishes the reset.
-                if !self
-                    .inner
-                    .round
-                    .reset_for_block_found(&group_key, block_height, mode)
-                    .await?
-                {
-                    info!(%group_id, block_height,
-                        "group-solo: round already reset for this block — left as it stands");
-                }
-            }
-            (PayoutMode::Window, false) => {
-                info!(%group_id,
-                    "group-solo: window mode — no per-block round reset (window self-trims by age)");
-            }
-            (PayoutMode::Prop, false) => {
-                info!(%group_id,
-                    "group-solo: per-block round reset disabled (resetRoundOnBlock=false) — \
-                     round accumulates until its calendar reset");
+        if group_live {
+            let scope = settle_scope(mode, reset_on_block);
+            // An error leaves the block pending: the history is booked, and
+            // the retry finishes the settle.
+            if !self
+                .inner
+                .round
+                .settle_block(&group_key, block.hash, block.found_at_ms, at_find, scope)
+                .await?
+            {
+                info!(%group_id, block_height, block_hash = block.hash,
+                    "group-solo: block already taken out of the round — left as it stands");
             }
         }
 
@@ -586,6 +591,29 @@ impl GroupSoloEngine {
             "group-solo on_block_found applied"
         );
         Ok(outcome)
+    }
+}
+
+/// What booking a block of a group takes out of it besides its share of the
+/// shares-since-block counter, which every block takes out whatever
+/// `resetRoundOnBlock` says, so switching the flag on later shows the shares
+/// since the last block right away.
+fn settle_scope(mode: PayoutMode, reset_on_block: bool) -> SettleScope {
+    match (mode, reset_on_block) {
+        (PayoutMode::Prop, true) => SettleScope {
+            round: true,
+            best_share: true,
+        },
+        // The window pays from its own age-trimmed span; only its best
+        // share starts over.
+        (PayoutMode::Window, true) => SettleScope {
+            round: false,
+            best_share: true,
+        },
+        (PayoutMode::Prop | PayoutMode::Window, false) => SettleScope {
+            round: false,
+            best_share: false,
+        },
     }
 }
 
@@ -710,6 +738,15 @@ const _SHUTDOWN_HOOK_DOC: Duration = Duration::from_secs(0);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_block_resets_the_round_only_for_prop_and_the_best_share_with_the_flag() {
+        let scope = |round, best_share| SettleScope { round, best_share };
+        assert_eq!(settle_scope(PayoutMode::Prop, true), scope(true, true));
+        assert_eq!(settle_scope(PayoutMode::Window, true), scope(false, true));
+        assert_eq!(settle_scope(PayoutMode::Prop, false), scope(false, false));
+        assert_eq!(settle_scope(PayoutMode::Window, false), scope(false, false));
+    }
 
     #[test]
     fn engine_error_carries_source_variants() {

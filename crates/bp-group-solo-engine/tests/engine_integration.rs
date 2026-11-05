@@ -8,7 +8,7 @@
 
 use bp_common::AddressId;
 use bp_group_solo_engine::config::GroupSoloEngineConfig;
-use bp_group_solo_engine::engine::GroupSoloEngine;
+use bp_group_solo_engine::engine::{FoundGroupBlock, GroupSoloEngine};
 use redis::{aio::ConnectionManager, Client};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use uuid::Uuid;
@@ -18,6 +18,16 @@ const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
 
 /// Pool-output recipient; the weight model needs one.
 const FEE_ADDR: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
+
+/// A block at `height` booked right at its find: it covers the group's state now.
+async fn found(engine: &GroupSoloEngine, group_id: Uuid, height: i32) -> FoundGroupBlock<'static> {
+    FoundGroupBlock {
+        height,
+        hash: Box::leak(format!("{height:064x}").into_boxed_str()),
+        found_at_ms: i64::MAX,
+        round_at_find: engine.round_at_find(group_id).await.expect("round at find"),
+    }
+}
 
 struct Harness {
     engine: GroupSoloEngine,
@@ -332,7 +342,11 @@ async fn on_block_found_applies_distribution_and_resets_round() {
     let actual = actual_paying_exactly(&result, 312_500_000);
     let outcome = h
         .engine
-        .on_block_found(h.group_id, block_height, &actual)
+        .on_block_found(
+            h.group_id,
+            found(&h.engine, h.group_id, block_height).await,
+            &actual,
+        )
         .await
         .expect("ok");
     assert!(outcome.history_inserted >= 1);
@@ -402,7 +416,7 @@ async fn a_richer_block_leaves_nobody_owing() {
     h.engine
         .on_block_found(
             h.group_id,
-            9_995_401,
+            found(&h.engine, h.group_id, 9_995_401).await,
             &actual_paying_exactly(&result, T_ACTUAL),
         )
         .await
@@ -503,7 +517,11 @@ async fn block_found_books_the_job_coinbase_after_the_round_moved() {
 
     let height = 9_995_010;
     h.engine
-        .on_block_found(h.group_id, height, &paid)
+        .on_block_found(
+            h.group_id,
+            found(&h.engine, h.group_id, height).await,
+            &paid,
+        )
         .await
         .expect("apply");
     let history = read_block_history(&h.pool, h.group_id, height).await;
@@ -541,7 +559,15 @@ async fn a_redelivered_apply_books_nothing() {
         .expect("build");
 
     let actual = actual_paying_exactly(&booked, reward);
-    let apply = || h.engine.on_block_found(h.group_id, 9_995_021, &actual);
+    let apply = || async {
+        h.engine
+            .on_block_found(
+                h.group_id,
+                found(&h.engine, h.group_id, 9_995_021).await,
+                &actual,
+            )
+            .await
+    };
     let first = apply().await.expect("apply ok");
     assert!(
         first.history_inserted >= 1,
@@ -577,7 +603,11 @@ async fn a_redelivered_apply_does_not_reset_the_round_again() {
     let actual = actual_paying_exactly(&booked, reward);
     let first = h
         .engine
-        .on_block_found(h.group_id, 9_995_031, &actual)
+        .on_block_found(
+            h.group_id,
+            found(&h.engine, h.group_id, 9_995_031).await,
+            &actual,
+        )
         .await
         .expect("apply ok");
     assert!(
@@ -596,7 +626,11 @@ async fn a_redelivered_apply_does_not_reset_the_round_again() {
         .await
         .unwrap();
     h.engine
-        .on_block_found(h.group_id, 9_995_031, &actual)
+        .on_block_found(
+            h.group_id,
+            found(&h.engine, h.group_id, 9_995_031).await,
+            &actual,
+        )
         .await
         .expect("a redelivery is a no-op, not an error");
 
@@ -667,7 +701,11 @@ async fn a_retry_completes_a_reset_the_first_apply_did_not_reach() {
 
     let retry = h
         .engine
-        .on_block_found(h.group_id, height, &actual)
+        .on_block_found(
+            h.group_id,
+            found(&h.engine, h.group_id, height).await,
+            &actual,
+        )
         .await
         .expect("the retry applies");
     assert_eq!(retry.history_inserted, 0, "the retry books nothing twice");
@@ -706,7 +744,7 @@ async fn on_block_found_keeps_round_when_reset_flag_false() {
     h.engine
         .on_block_found(
             h.group_id,
-            9_997_001,
+            found(&h.engine, h.group_id, 9_997_001).await,
             &actual_paying_exactly(&dist, 312_500_000),
         )
         .await
@@ -767,7 +805,11 @@ async fn duplicate_block_found_does_not_double_the_history() {
     let actual = actual_paying_exactly(&job, reward);
 
     h.engine
-        .on_block_found(h.group_id, height, &actual)
+        .on_block_found(
+            h.group_id,
+            found(&h.engine, h.group_id, height).await,
+            &actual,
+        )
         .await
         .expect("apply 1");
     let after_first = read_block_history(&h.pool, h.group_id, height).await;
@@ -775,7 +817,11 @@ async fn duplicate_block_found_does_not_double_the_history() {
     assert!(after_first[finder.as_str()] > 0);
 
     h.engine
-        .on_block_found(h.group_id, height, &actual)
+        .on_block_found(
+            h.group_id,
+            found(&h.engine, h.group_id, height).await,
+            &actual,
+        )
         .await
         .expect("apply 2 (replay) must not error");
     let after_replay = read_block_history(&h.pool, h.group_id, height).await;
@@ -826,8 +872,16 @@ async fn concurrent_applies_of_one_block_book_it_once() {
     let gid = h.group_id;
     let actual1 = actual.clone();
     let actual2 = actual;
-    let task1 = tokio::spawn(async move { engine1.on_block_found(gid, 9_995_002, &actual1).await });
-    let task2 = tokio::spawn(async move { engine2.on_block_found(gid, 9_995_002, &actual2).await });
+    let task1 = tokio::spawn(async move {
+        engine1
+            .on_block_found(gid, found(&engine1, gid, 9_995_002).await, &actual1)
+            .await
+    });
+    let task2 = tokio::spawn(async move {
+        engine2
+            .on_block_found(gid, found(&engine2, gid, 9_995_002).await, &actual2)
+            .await
+    });
 
     let (r1, r2) = tokio::join!(task1, task2);
     // The UNIQUE key decides: whichever insert lands second writes nothing.
@@ -966,7 +1020,7 @@ async fn on_block_found_with_finder_bonus_merges_duplicate_outputs() {
         .engine
         .on_block_found(
             h.group_id,
-            block_height,
+            found(&h.engine, h.group_id, block_height).await,
             &actual_paying_exactly(&result, reward),
         )
         .await
@@ -1327,7 +1381,7 @@ async fn book_block(h: &Harness, finder: &AddressId, height: i32) {
     h.engine
         .on_block_found(
             h.group_id,
-            height,
+            found(&h.engine, h.group_id, height).await,
             &actual_paying_exactly(&dist, 312_500_000),
         )
         .await
@@ -1635,7 +1689,7 @@ async fn a_group_block_far_off_the_reference_is_still_booked() {
     h.engine
         .on_block_found(
             h.group_id,
-            height,
+            found(&h.engine, h.group_id, height).await,
             &actual_paying_exactly(&result, T_ACTUAL),
         )
         .await
@@ -1695,7 +1749,7 @@ async fn a_group_coinbase_below_the_block_subsidy_is_refused() {
         .engine
         .on_block_found(
             h.group_id,
-            height,
+            found(&h.engine, h.group_id, height).await,
             &actual_paying_exactly(&result, subsidy - 1),
         )
         .await
@@ -1722,6 +1776,137 @@ async fn a_group_coinbase_below_the_block_subsidy_is_refused() {
     .await
     .expect("count");
     assert_eq!(booked, 0, "nothing may be booked for a burned block");
+
+    drop_harness(h).await;
+}
+
+// ── A parked block leaves the shares mined while it waits ──────────
+
+/// MONEY: a block is booked confirmations after its find. Its booking takes
+/// out the round as it stood at the find, books the history from it, and
+/// leaves the work mined while it waited for the next block.
+#[tokio::test]
+async fn shares_mined_while_a_block_is_parked_stay_for_the_next_block() {
+    let h = match spawn_or_skip(26, None).await {
+        Some(h) => h,
+        None => return,
+    };
+    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+    let later = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    let reward = 312_500_000;
+    let height = 9_995_051;
+
+    h.engine
+        .record_share(None, h.group_id, finder.as_str(), 100.0, 100.0, 1)
+        .await
+        .unwrap();
+    let booked = h
+        .engine
+        .build_distribution(h.group_id, reward, &finder)
+        .await
+        .expect("build");
+    let actual = actual_paying_exactly(&booked, reward);
+    let at_find = h.engine.round_at_find(h.group_id).await.expect("at find");
+
+    // Mined while the block waits for its confirmations.
+    h.engine
+        .record_share(None, h.group_id, later, 30.0, 30.0, 2)
+        .await
+        .unwrap();
+    let parked = FoundGroupBlock {
+        height,
+        hash: "parked-block",
+        found_at_ms: 1,
+        round_at_find: at_find,
+    };
+    h.engine
+        .on_block_found(h.group_id, parked, &actual)
+        .await
+        .expect("apply");
+
+    let round = h.engine.reader().round_stats(h.group_id).await.unwrap();
+    assert_eq!(
+        round.per_address.get(later),
+        Some(&30.0),
+        "the shares mined while the block was parked stay"
+    );
+    assert_eq!(round.total_shares, 30.0, "and only those");
+    assert_eq!(
+        h.engine
+            .reader()
+            .shares_since_block(h.group_id)
+            .await
+            .unwrap(),
+        30.0
+    );
+    let (shares, total): (i64, i64) = sqlx::query_as(
+        r#"SELECT "sharesInRound", "totalSharesInRound" FROM pplns_group_block_history
+           WHERE "groupId" = $1 AND "blockHeight" = $2 AND address = $3"#,
+    )
+    .bind(h.group_id)
+    .bind(height)
+    .bind(finder.as_str())
+    .fetch_one(&h.pool)
+    .await
+    .expect("the finder's history row");
+    assert_eq!(
+        (shares, total),
+        (100, 100),
+        "the history shows the round the block covered"
+    );
+
+    drop_harness(h).await;
+}
+
+/// A group dissolved while its block was parked still gets its history, and
+/// its booking writes no round state back for it.
+#[tokio::test]
+async fn a_block_of_a_dissolved_group_writes_no_round_state() {
+    let h = match spawn_or_skip(27, None).await {
+        Some(h) => h,
+        None => return,
+    };
+    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+    let reward = 312_500_000;
+    h.engine
+        .record_share(None, h.group_id, finder.as_str(), 100.0, 100.0, 1)
+        .await
+        .unwrap();
+    let booked = h
+        .engine
+        .build_distribution(h.group_id, reward, &finder)
+        .await
+        .expect("build");
+    let actual = actual_paying_exactly(&booked, reward);
+    sqlx::query(r#"UPDATE pplns_group SET "dissolvedAt" = 1, active = false WHERE id = $1"#)
+        .bind(h.group_id)
+        .execute(&h.pool)
+        .await
+        .expect("dissolve");
+
+    h.engine
+        .on_block_found(
+            h.group_id,
+            found(&h.engine, h.group_id, 9_995_061).await,
+            &actual,
+        )
+        .await
+        .expect("the history still books");
+    let redis_url = format!(
+        "{}/{}",
+        std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string()),
+        bp_test_support::redis_db_in_range(bp_test_support::redis_db::GS_ENGINE, 27).await
+    );
+    let mut conn = bp_test_support::connection_manager(Client::open(redis_url).unwrap())
+        .await
+        .unwrap();
+    let settled: bool = redis::AsyncCommands::exists(
+        &mut conn,
+        bp_group_solo_engine::round::key_settled_blocks(&h.group_id.to_string()),
+    )
+    .await
+    .unwrap();
+    assert!(!settled, "no settled-blocks key for a group that is gone");
 
     drop_harness(h).await;
 }

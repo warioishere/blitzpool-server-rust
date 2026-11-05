@@ -29,7 +29,9 @@ use tracing::{error, info, warn};
 use crate::block_confirmation::{settle_block, SettleFailure};
 use crate::boot::FoundationHandles;
 use crate::engines::{BlitzpoolModeGate, EngineHandles};
-use crate::pending_blocks::{put_pending_block, PendingBlock, PendingSettlement};
+use crate::pending_blocks::{
+    is_pending_block, park_unbookable_block, put_pending_block, PendingBlock, PendingSettlement,
+};
 
 /// The Core→Satellite block-found event: the front submits and records the
 /// block, the payout Satellite applies the ledger from this. Producer and
@@ -619,6 +621,44 @@ impl BlockFoundApplier {
         self.apply_now(address_str, reward, &pending).await;
     }
 
+    /// Whether `block_hash` is parked already; `false` without Redis or when
+    /// the store cannot be read, so the block is parked (again).
+    async fn is_parked(&self, block_hash: &str) -> bool {
+        let Some(redis) = self.redis.as_ref() else {
+            return false;
+        };
+        let mut conn = redis.clone();
+        is_pending_block(&mut conn, block_hash)
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Keep a group-solo block whose found-time state could not be read in
+    /// the unbookable store, for the operator, instead of losing it.
+    async fn park_unbookable(&self, event: &BlockFoundEvent, group_id: uuid::Uuid) {
+        let (Some(redis), Some(actual)) = (self.redis.as_ref(), event.actual_coinbase.as_ref())
+        else {
+            error!(%group_id, height = event.height, block_hash = %event.block_hash,
+                "block-found: no Redis or no parsed coinbase — the block is NOT kept anywhere");
+            return;
+        };
+        let pending = PendingBlock {
+            block_hash: event.block_hash.clone(),
+            found_at_ms: chrono::Utc::now().timestamp_millis(),
+            block_height: event.height,
+            actual_coinbase: actual.clone(),
+            settlement: PendingSettlement::GroupSolo {
+                group_id,
+                round_at_find: Default::default(),
+            },
+        };
+        let mut conn = redis.clone();
+        if let Err(err) = park_unbookable_block(&mut conn, &pending).await {
+            error!(%err, %group_id, height = event.height, block_hash = %event.block_hash,
+                "block-found: unbookable-store write failed — the block is NOT kept anywhere");
+        }
+    }
+
     /// Fallback of [`Self::gate_or_apply`]; the same settlement the
     /// confirmation watcher runs, on the same blob it would have parked.
     async fn apply_now(&self, address_str: &str, reward: u64, pending: &PendingBlock) {
@@ -760,17 +800,39 @@ impl BlockFoundApplier {
                 },
             ) => {
                 match (event.group_id, self.group_solo.as_ref()) {
-                    (Some(group_id), Some(_engine)) => {
-                        self.gate_or_apply(
-                            address_str,
-                            height,
-                            reward,
-                            block_hash,
-                            event.actual_coinbase.as_ref(),
-                            event.payouts_fingerprint,
-                            PendingSettlement::GroupSolo { group_id },
-                        )
-                        .await;
+                    (Some(group_id), Some(engine)) => {
+                        if self.is_parked(block_hash).await {
+                            // A redelivered event: the parked state is the
+                            // one taken at the find.
+                            info!(%group_id, height, block_hash,
+                                "block-found: group-solo block already parked — left as it stands");
+                        } else {
+                            // Taken now, so booking leaves the shares mined
+                            // while the block waits for its confirmations.
+                            match engine.round_at_find(group_id).await {
+                                Ok(round_at_find) => {
+                                    self.gate_or_apply(
+                                        address_str,
+                                        height,
+                                        reward,
+                                        block_hash,
+                                        event.actual_coinbase.as_ref(),
+                                        event.payouts_fingerprint,
+                                        PendingSettlement::GroupSolo {
+                                            group_id,
+                                            round_at_find,
+                                        },
+                                    )
+                                    .await;
+                                }
+                                Err(err) => {
+                                    error!(%err, %group_id, address = address_str, height,
+                                        "block-found: group-solo round state unreadable at the \
+                                         find — parked as unbookable, NOT booked");
+                                    self.park_unbookable(event, group_id).await;
+                                }
+                            }
+                        }
                     }
                     (None, _) => warn!(
                         address = address_str,
@@ -1380,7 +1442,14 @@ mod tests {
         for (hash, fingerprint, settlement) in [
             ("pplns-none", None, pplns()),
             ("pplns-zero", Some([0u8; 32]), pplns()),
-            ("gs-none", None, PendingSettlement::GroupSolo { group_id }),
+            (
+                "gs-none",
+                None,
+                PendingSettlement::GroupSolo {
+                    group_id,
+                    round_at_find: Default::default(),
+                },
+            ),
         ] {
             applier
                 .gate_or_apply("bc1q", 1, 0, hash, Some(&actual), fingerprint, settlement)
@@ -1396,7 +1465,10 @@ mod tests {
             (
                 "gs-built",
                 Some([7u8; 32]),
-                PendingSettlement::GroupSolo { group_id },
+                PendingSettlement::GroupSolo {
+                    group_id,
+                    round_at_find: Default::default(),
+                },
             ),
             ("bp-none", None, PendingSettlement::Blockparty { group_id }),
         ] {

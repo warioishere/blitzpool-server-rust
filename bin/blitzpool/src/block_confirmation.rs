@@ -305,11 +305,20 @@ pub(crate) async fn settle_block(
     let height = pb.block_height;
     let actual = &pb.actual_coinbase;
     match &pb.settlement {
-        PendingSettlement::GroupSolo { group_id } => {
+        PendingSettlement::GroupSolo {
+            group_id,
+            round_at_find,
+        } => {
             let engine = settlers.group_solo.ok_or(SettleFailure::NoEngine)?;
-            // Books from the coinbase alone; the snapshot inputs are PPLNS's.
+            // Books from the coinbase alone; the weight snapshot is PPLNS's.
+            let block = bp_group_solo_engine::engine::FoundGroupBlock {
+                height,
+                hash: &pb.block_hash,
+                found_at_ms: pb.found_at_ms,
+                round_at_find: round_at_find.clone(),
+            };
             engine
-                .on_block_found(*group_id, height, actual)
+                .on_block_found(*group_id, block, actual)
                 .await
                 .map(|o| o.history_inserted)
                 .map_err(|e| SettleFailure::Engine(SettleError::GroupSolo(e)))

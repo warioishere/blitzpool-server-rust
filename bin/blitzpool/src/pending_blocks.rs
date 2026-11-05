@@ -48,6 +48,9 @@ pub(crate) enum PendingSettlement {
     },
     GroupSolo {
         group_id: Uuid,
+        /// The group's state at the find, which booking takes out of the
+        /// round.
+        round_at_find: bp_group_solo_engine::round::RoundAtFind,
     },
     Blockparty {
         group_id: Uuid,
@@ -77,7 +80,7 @@ impl PendingSettlement {
     pub(crate) fn group_id(&self) -> Option<Uuid> {
         match self {
             Self::Pplns { .. } => None,
-            Self::GroupSolo { group_id } | Self::Blockparty { group_id } => Some(*group_id),
+            Self::GroupSolo { group_id, .. } | Self::Blockparty { group_id } => Some(*group_id),
         }
     }
 }
@@ -103,6 +106,14 @@ pub(crate) async fn put_pending_block(
     pending: &PendingBlock,
 ) -> Result<(), RedisError> {
     put_at(conn, PENDING_KEY, pending).await
+}
+
+/// Whether a block is parked in the not-yet-confirmed store.
+pub(crate) async fn is_pending_block(
+    conn: &mut ConnectionManager,
+    block_hash: &str,
+) -> Result<bool, RedisError> {
+    conn.hexists(PENDING_KEY, block_hash).await
 }
 
 /// Copy a block no automatic path can book into [`UNBOOKABLE_KEY`]. The

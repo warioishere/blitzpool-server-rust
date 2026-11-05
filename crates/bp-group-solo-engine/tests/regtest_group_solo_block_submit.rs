@@ -13,7 +13,7 @@ use std::time::Duration;
 use bitcoin::Network;
 use bp_common::{AddressId, Sats};
 use bp_group_solo_engine::config::GroupSoloEngineConfig;
-use bp_group_solo_engine::engine::GroupSoloEngine;
+use bp_group_solo_engine::engine::{FoundGroupBlock, GroupSoloEngine};
 use bp_mining_job::PayoutEntry;
 use bp_pplns::DEFAULT_MIN_PAYOUT_SATS;
 use bp_regtest_harness::{RegtestConfig, RegtestNode};
@@ -208,7 +208,16 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
         bp_coinbase_snapshot::ActualCoinbase::from_coinbase(&coinbase_tx, Network::Regtest);
     assert_eq!(actual.total_value_sats, reward_sats);
     let outcome = engine
-        .on_block_found(group_id, after as i32, &actual)
+        .on_block_found(
+            group_id,
+            FoundGroupBlock {
+                height: after as i32,
+                hash: "regtest-group-solo-block",
+                found_at_ms: i64::MAX,
+                round_at_find: engine.round_at_find(group_id).await.expect("round at find"),
+            },
+            &actual,
+        )
         .await
         .expect("the accepted coinbase must book");
     assert!(outcome.history_inserted >= 1, "audit rows written");

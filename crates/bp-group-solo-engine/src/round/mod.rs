@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Redis-backed per-group round state under `groupsolo:{groupId}:*`.
-//! A `Prop` group is a round wiped on block-found; a `Window` group is a
-//! time-bucketed sliding window trimmed by age, of which a block-found
-//! resets only the best share.
-//! Both reset paths keep `applied` (see [`key_applied`]) so an un-ACKed batch is not reapplied.
+//! A `Prop` group is a round a booked block takes its found-time state out
+//! of; a `Window` group is a time-bucketed sliding window trimmed by age, of
+//! which a booked block resets only the best share.
+//! Every reset path keeps `applied` (see [`key_applied`]) so an un-ACKed batch is not reapplied.
 
 use std::collections::HashMap;
 
 use bp_group_mgmt::group::PayoutMode;
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, RedisError};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 
@@ -42,22 +43,22 @@ pub fn key_best_share(group_id: &str) -> String {
 pub fn key_applied(group_id: &str) -> String {
     key(group_id, "applied")
 }
-/// Height of the block the round was last reset for, so each booked block
-/// resets it once: a redelivery finds its own height and leaves the round
-/// alone, a retry after a failed or interrupted reset finds another.
-pub fn key_reset_height(group_id: &str) -> String {
-    key(group_id, "reset-height")
+/// Hashes of the blocks whose found-time state [`GroupRoundStore::settle_block`]
+/// took out of the round, so each block does it once whatever order its
+/// bookings and their retries run in.
+pub fn key_settled_blocks(group_id: &str) -> String {
+    key(group_id, "settled-blocks")
 }
 /// Σ diff-1 the group's accepted shares carry since its last block, in both
-/// modes. Only a block and dissolving the group clear it; the calendar reset
-/// and removing a member leave it alone.
+/// modes. A booked block takes its found-time share of it out; the calendar
+/// reset and removing a member leave it alone, dissolving the group drops it.
 pub fn key_shares_since_block(group_id: &str) -> String {
     key(group_id, "shares-since-block")
 }
-/// Height of the block [`key_shares_since_block`] was last cleared for, so a
-/// redelivered block does not clear the shares mined after it.
-pub fn key_shares_since_block_height(group_id: &str) -> String {
-    key(group_id, "shares-since-block-height")
+/// Count of calendar resets of the round. A block found before one has its
+/// round taken out already, so its booking leaves the round alone.
+pub fn key_round_generation(group_id: &str) -> String {
+    key(group_id, "round-generation")
 }
 
 // ── Window-mode keys (PayoutMode::Window only) ──────────────────────
@@ -204,15 +205,63 @@ redis.call('ZREM', KEYS[1], bid)
 return {1, underflowed}
 "#;
 
-/// Clear the shares-since-block counter once per block. `KEYS` = counter,
-/// its height marker; `ARGV` = block height. Returns 0 when that height
-/// already cleared it.
-const CLEAR_SHARES_SINCE_BLOCK_LUA: &str = r#"
-if redis.call('GET', KEYS[2]) == ARGV[1] then
+/// One consistent read of what a block covers: the payout aggregate, the
+/// reject aggregate, the shares-since-block counter and the round generation.
+/// `KEYS` = those four.
+const READ_ROUND_AT_FIND_LUA: &str = r#"
+return {
+    redis.call('HGETALL', KEYS[1]),
+    redis.call('HGETALL', KEYS[2]),
+    redis.call('GET', KEYS[3]) or '0',
+    redis.call('GET', KEYS[4]) or '0'
+}
+"#;
+
+/// Take one block's found-time state out of the group, once per block hash.
+/// `KEYS` = settled-blocks, by-address, rejected-shares, best-share,
+/// shares-since-block, round-generation; `ARGV` = block hash, found_at_ms,
+/// counter at the find, subtract-round flag, reset-best flag, round
+/// generation at the find, then `n` and `n` (address, diff) pairs of round
+/// shares, then `m` and `m` pairs of rejects. The round is left alone when a
+/// calendar reset came after the find. A remainder within float noise of
+/// zero is removed, so a member removed since the find leaves nothing
+/// behind. The best share goes only if it is not newer than the find.
+const SETTLE_BLOCK_LUA: &str = r#"
+if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 1 then
     return 0
 end
-redis.call('DEL', KEYS[1])
-redis.call('SET', KEYS[2], ARGV[1])
+local function spent(rem, d)
+    return rem <= 1e-9 * math.max(1, math.abs(d))
+end
+local snap = tonumber(ARGV[3])
+local left = tonumber(redis.call('INCRBYFLOAT', KEYS[5], -snap))
+if spent(left, snap) then
+    redis.call('DEL', KEYS[5])
+end
+local function subtract(key, at)
+    local n = tonumber(ARGV[at])
+    for j = 0, n - 1 do
+        local addr = ARGV[at + 1 + 2 * j]
+        local d = tonumber(ARGV[at + 2 + 2 * j])
+        local rem = tonumber(redis.call('HINCRBYFLOAT', key, addr, -d))
+        if spent(rem, d) then
+            redis.call('HDEL', key, addr)
+        end
+    end
+    return at + 1 + 2 * n
+end
+local same_round = (redis.call('GET', KEYS[6]) or '0') == ARGV[6]
+if ARGV[4] == '1' and same_round then
+    local next_at = subtract(KEYS[2], 7)
+    subtract(KEYS[3], next_at)
+end
+if ARGV[5] == '1' then
+    local ts = redis.call('HGET', KEYS[4], 'timestamp_ms')
+    if ts and tonumber(ts) <= tonumber(ARGV[2]) then
+        redis.call('DEL', KEYS[4])
+    end
+end
+redis.call('SADD', KEYS[1], ARGV[1])
 return 1
 "#;
 
@@ -244,6 +293,37 @@ pub struct BestShare {
     pub address: String,
     pub difficulty: f64,
     pub timestamp_ms: i64,
+}
+
+// ── What a found block covers ──────────────────────────────────────
+
+/// The group's state when one of its blocks was found: what booking that
+/// block takes out of the round, so the shares mined while it waits for its
+/// confirmations stay. Parked with the block. Known limits, not handled at
+/// the pool's size: a second block of the group found before the first is
+/// booked covers the first one's stretch too; the state is read when `payout`
+/// handles the block-found event, so shares still on the share stream then
+/// fall on the wrong side of the cut; a member removed and re-added before
+/// the booking loses their new shares up to their found-time amount.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RoundAtFind {
+    /// Per-address payout shares (the round, or the trimmed window).
+    pub payout_shares: HashMap<String, f64>,
+    /// Per-address rejected shares over the same period.
+    pub rejected: HashMap<String, f64>,
+    /// [`key_shares_since_block`] at the find.
+    pub shares_since_block: f64,
+    /// [`key_round_generation`] at the find.
+    pub round_generation: u64,
+}
+
+/// What [`GroupRoundStore::settle_block`] takes out besides the counter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SettleScope {
+    /// Subtract the found-time round and rejects (`Prop` with `resetRoundOnBlock`).
+    pub round: bool,
+    /// Drop a best share not newer than the find (`resetRoundOnBlock`).
+    pub best_share: bool,
 }
 
 // ── Aggregated round stats ─────────────────────────────────────────
@@ -593,68 +673,105 @@ impl GroupRoundStore {
 
     // ── Round-reset paths ──────────────────────────────────────────
 
-    /// Block-found reset. A `Prop` round is wiped but keeps
-    /// `last-accepted-share-at` (the inactivity clock survives). A `Window`
-    /// group keeps its window, which is what it pays from; only its best
-    /// share starts over. `false` when the round was already reset for
-    /// `block_height`. Compared for equality, not order: heights start over
-    /// on a fresh regtest chain.
-    pub async fn reset_for_block_found(
+    /// What a block found now covers: the group's state now, read in one
+    /// step. A `Window` group is trimmed first, as its payout read is.
+    pub async fn read_round_at_find(
         &self,
         group_id: &str,
-        block_height: i32,
         mode: PayoutMode,
-    ) -> Result<bool, RoundError> {
-        let mut conn = self.conn.clone();
-        let marker = key_reset_height(group_id);
-        let last: Option<i32> = conn.get(&marker).await?;
-        if last == Some(block_height) {
-            return Ok(false);
-        }
-        match mode {
-            PayoutMode::Prop => {
-                let keys = vec![
-                    key_by_address(group_id),
-                    key_rejected_shares(group_id),
-                    key_best_share(group_id),
-                    // NOT `key_applied`: an un-ACKed satellite batch would
-                    // otherwise be reapplied into the fresh round on redelivery.
-                ];
-                let _: i64 = conn.del(keys).await?;
-                self.delete_window_keys(&mut conn, group_id).await?;
-            }
+        now_ms: i64,
+        window_ms: i64,
+    ) -> Result<RoundAtFind, RoundError> {
+        let (payout_key, rejected_key) = match mode {
+            PayoutMode::Prop => (key_by_address(group_id), key_rejected_shares(group_id)),
             PayoutMode::Window => {
-                let _: i64 = conn.del(key_best_share(group_id)).await?;
+                self.trim_window(group_id, now_ms, window_ms).await?;
+                (
+                    WindowLane::Accepted.aggregate_key(group_id),
+                    WindowLane::Rejected.aggregate_key(group_id),
+                )
             }
-        }
-        // Last, so an interrupted reset is redone by the retry.
-        let _: () = conn.set(&marker, block_height).await?;
-        Ok(true)
-    }
-
-    /// Start [`key_shares_since_block`] over for the group's block at
-    /// `block_height`, whether or not the round resets with it. `false` when
-    /// that block already cleared it. Compared for equality, like
-    /// [`Self::reset_for_block_found`].
-    pub async fn clear_shares_since_block(
-        &self,
-        group_id: &str,
-        block_height: i32,
-    ) -> Result<bool, RoundError> {
+        };
         let mut conn = self.conn.clone();
-        let cleared: i64 = redis::Script::new(CLEAR_SHARES_SINCE_BLOCK_LUA)
+        let (payout, rejected, counter, generation): (
+            HashMap<String, String>,
+            HashMap<String, String>,
+            String,
+            String,
+        ) = redis::Script::new(READ_ROUND_AT_FIND_LUA)
+            .key(payout_key)
+            .key(rejected_key)
             .key(key_shares_since_block(group_id))
-            .key(key_shares_since_block_height(group_id))
-            .arg(block_height)
+            .key(key_round_generation(group_id))
             .invoke_async(&mut conn)
             .await?;
-        Ok(cleared == 1)
+        let positive = |m: HashMap<String, String>| -> HashMap<String, f64> {
+            m.into_iter()
+                .filter_map(|(addr, v)| {
+                    v.parse::<f64>()
+                        .ok()
+                        .filter(|d| *d > 0.0)
+                        .map(|d| (addr, d))
+                })
+                .collect()
+        };
+        Ok(RoundAtFind {
+            payout_shares: positive(payout),
+            rejected: positive(rejected),
+            shares_since_block: counter.parse().unwrap_or(0.0),
+            round_generation: generation.parse().unwrap_or(0),
+        })
+    }
+
+    /// Take a booked block's found-time state out of the group: always its
+    /// share of the shares-since-block counter, and what `scope` names. Keeps
+    /// `last-accepted-share-at` (the inactivity clock survives) and
+    /// `applied`, so an un-ACKed satellite batch is not reapplied. `false`
+    /// when this block hash was already settled.
+    pub async fn settle_block(
+        &self,
+        group_id: &str,
+        block_hash: &str,
+        found_at_ms: i64,
+        at_find: &RoundAtFind,
+        scope: SettleScope,
+    ) -> Result<bool, RoundError> {
+        let flag = |on: bool| if on { "1" } else { "0" };
+        let script = redis::Script::new(SETTLE_BLOCK_LUA);
+        let mut invocation = script.prepare_invoke();
+        invocation
+            .key(key_settled_blocks(group_id))
+            .key(key_by_address(group_id))
+            .key(key_rejected_shares(group_id))
+            .key(key_best_share(group_id))
+            .key(key_shares_since_block(group_id))
+            .key(key_round_generation(group_id))
+            .arg(block_hash)
+            .arg(found_at_ms)
+            .arg(at_find.shares_since_block.to_string())
+            .arg(flag(scope.round))
+            .arg(flag(scope.best_share))
+            .arg(at_find.round_generation);
+        for map in [&at_find.payout_shares, &at_find.rejected] {
+            let pairs: Vec<(&String, &f64)> = if scope.round {
+                map.iter().collect()
+            } else {
+                Vec::new()
+            };
+            invocation.arg(pairs.len());
+            for (addr, d) in pairs {
+                invocation.arg(addr).arg(d.to_string());
+            }
+        }
+        let mut conn = self.conn.clone();
+        let settled: i64 = invocation.invoke_async(&mut conn).await?;
+        Ok(settled == 1)
     }
 
     /// Scheduled (calendar-aligned) reset: the round starts over, including
     /// `last-accepted-share-at`. The best share and the shares since the
-    /// last block stay; they start over only at the group's own block (see
-    /// [`Self::reset_for_block_found`], [`Self::clear_shares_since_block`]).
+    /// last block stay; only the group's own block takes them out (see
+    /// [`Self::settle_block`]).
     pub async fn reset_for_calendar(&self, group_id: &str) -> Result<(), RoundError> {
         self.wipe_round(group_id, false).await
     }
@@ -671,14 +788,20 @@ impl GroupRoundStore {
             key_by_address(group_id),
             key_rejected_shares(group_id),
             key_last_accepted_share_at(group_id),
-            // NOT `key_applied`: see `reset_for_block_found`.
+            // NOT `key_applied`: an un-ACKed satellite batch would otherwise
+            // be reapplied into the fresh round on redelivery.
         ];
         if dissolve {
             keys.push(key_best_share(group_id));
             keys.push(key_shares_since_block(group_id));
-            keys.push(key_shares_since_block_height(group_id));
+            keys.push(key_settled_blocks(group_id));
+            keys.push(key_round_generation(group_id));
         }
         let _: i64 = conn.del(keys).await?;
+        if !dissolve {
+            // A block parked across this reset finds its round gone already.
+            let _: i64 = conn.incr(key_round_generation(group_id), 1).await?;
+        }
         self.delete_window_keys(&mut conn, group_id).await?;
         Ok(())
     }
@@ -859,10 +982,7 @@ mod tests {
             key_shares_since_block("g1"),
             "groupsolo:g1:shares-since-block"
         );
-        assert_eq!(
-            key_shares_since_block_height("g1"),
-            "groupsolo:g1:shares-since-block-height"
-        );
+        assert_eq!(key_settled_blocks("g1"), "groupsolo:g1:settled-blocks");
     }
 
     #[test]
