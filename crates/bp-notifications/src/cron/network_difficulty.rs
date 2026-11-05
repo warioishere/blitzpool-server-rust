@@ -7,9 +7,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bp_common::AddressId;
 use bp_db::{
     find_addresses_with_push_subscription, find_network_difficulty_tracker,
-    upsert_network_difficulty_tracker,
+    upsert_network_difficulty_tracker, PushSubscriptionRow,
 };
 use chrono::Utc;
 use reqwest::Client;
@@ -183,38 +184,87 @@ async fn fan_out_change(
         ],
     };
 
+    let mut targets = Vec::new();
     for address in addresses {
-        let subs = match bp_db::find_push_subscriptions_by_address(pool, &address).await {
-            Ok(v) => v,
+        match bp_db::find_push_subscriptions_by_address(pool, &address).await {
+            Ok(subs) => targets.extend(
+                subs.into_iter()
+                    .filter(|s| s.network_diff_notifications_enabled)
+                    .map(|sub| (address.clone(), sub)),
+            ),
             Err(e) => {
                 warn!(target: "bp_notifications::cron::network_difficulty", error = %e, address = %address.as_str(), "subs lookup");
-                continue;
             }
-        };
-        for sub in subs
-            .into_iter()
-            .filter(|s| s.network_diff_notifications_enabled)
-        {
-            let kind = sub.subscription_type.as_str();
-            if kind.eq_ignore_ascii_case(PUSH_TYPE_FCM) {
-                if let Some(adapter) = fcm {
-                    push_fcm(adapter, pool, &address, &sub, &payload, "FCM send").await;
-                }
-            } else if kind.eq_ignore_ascii_case(PUSH_TYPE_UNIFIED) {
-                if let Some(adapter) = web_push {
-                    push_web(adapter, pool, &address, &sub, &payload, "UnifiedPush send").await;
-                }
-            } else {
-                warn!(target: "bp_notifications::cron::network_difficulty", kind, "unknown subscription_type — skipped");
+        }
+    }
+    for (address, sub) in once_per_endpoint(targets) {
+        let kind = sub.subscription_type.as_str();
+        if kind.eq_ignore_ascii_case(PUSH_TYPE_FCM) {
+            if let Some(adapter) = fcm {
+                push_fcm(adapter, pool, &address, &sub, &payload, "FCM send").await;
             }
+        } else if kind.eq_ignore_ascii_case(PUSH_TYPE_UNIFIED) {
+            if let Some(adapter) = web_push {
+                push_web(adapter, pool, &address, &sub, &payload, "UnifiedPush send").await;
+            }
+        } else {
+            warn!(target: "bp_notifications::cron::network_difficulty", kind, "unknown subscription_type — skipped");
         }
     }
     Ok(())
 }
 
+/// The network difficulty is the same for every address, so a device that
+/// follows several addresses with one endpoint gets it once.
+fn once_per_endpoint(
+    targets: Vec<(AddressId, PushSubscriptionRow)>,
+) -> Vec<(AddressId, PushSubscriptionRow)> {
+    let mut seen = std::collections::HashSet::new();
+    targets
+        .into_iter()
+        .filter(|(_, sub)| seen.insert(sub.endpoint.clone()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_device_following_several_addresses_gets_the_change_once() {
+        let sub = |address: &str, endpoint: &str| {
+            let address = AddressId::new(address).unwrap();
+            (
+                address.clone(),
+                PushSubscriptionRow {
+                    deleted_at: None,
+                    created_at: 0,
+                    updated_at: 0,
+                    id: 1,
+                    address,
+                    endpoint: endpoint.to_string(),
+                    platform: "android".to_string(),
+                    last_notification_at: None,
+                    best_diff_notifications_enabled: true,
+                    device_notifications_enabled: true,
+                    block_notifications_enabled: true,
+                    subscription_type: PUSH_TYPE_UNIFIED.to_string(),
+                    network_diff_notifications_enabled: true,
+                    group_admin_notifications_enabled: true,
+                },
+            )
+        };
+        let kept = once_per_endpoint(vec![
+            sub("bc1qa", "https://push.example/phone"),
+            sub("bc1qb", "https://push.example/phone"),
+            sub("bc1qc", "https://push.example/tablet"),
+        ]);
+        let endpoints: Vec<&str> = kept.iter().map(|(_, s)| s.endpoint.as_str()).collect();
+        assert_eq!(
+            endpoints,
+            ["https://push.example/phone", "https://push.example/tablet"]
+        );
+    }
 
     #[test]
     fn threshold_filters_tiny_changes() {
