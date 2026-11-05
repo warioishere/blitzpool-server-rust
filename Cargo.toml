@@ -158,8 +158,8 @@ proptest = "1"
 
 # Bitcoin Core IPC bridge (Cap'n-Proto over UNIX socket → SV2 TDP/JDP).
 # Runtime dependency (MIT/Apache, no source copy); Cargo caches the checkout in
-# ~/.cargo/git. Speaks the Bitcoin Core v32 IPC schema
-# (`bp_template_distribution::BITCOIN_CORE_VERSION`) and needs
+# ~/.cargo/git. Speaks the Bitcoin Core v31 and v32 IPC schemas, picked by
+# `[tdp] bitcoin_core_version`, and needs
 # capnproto/libcapnp-dev as system deps. Pin policy and bump procedure:
 # UPSTREAM_DEPS.md.
 #

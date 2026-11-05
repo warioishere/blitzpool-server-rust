@@ -36,10 +36,16 @@ be merged into one process: the pool refuses to start with `front` and
 ## Requirements
 
 - Linux with Docker Engine and Docker Compose **2.20 or newer** (`docker compose version`).
-- **Bitcoin Core 32**, either:
-  - the bundled node in this compose file (it syncs the chain itself), or
-  - your own node, run as the multi-process binary `bitcoin-node` with an IPC
-    socket. Plain `bitcoind` has no IPC socket and does not work.
+- **Bitcoin Core**, either:
+  - the bundled Bitcoin Core 32 node in this compose file (it syncs the chain
+    itself), or
+  - your own node, Bitcoin Core 31 or 32, run as the multi-process binary
+    `bitcoin-node` with an IPC socket. Plain `bitcoind` has no IPC socket and
+    does not work. Set `[tdp] bitcoin_core_version` to its major release
+    (default 32); the pool refuses to start against a node of another
+    release. With JDP and `jdp_validation_socket_path`, only 32 lets the pool
+    propagate a block a miner's JDC pushes; on 31 the JDC's own node
+    propagates it alone.
 
 The pool gets its block templates over that IPC socket (Template Distribution
 Protocol) and uses JSON-RPC only for one-off calls.
@@ -98,7 +104,7 @@ serve work.
 
 ## 2b. With your own node
 
-Run Bitcoin Core 32's `bitcoin-node` (in `libexec/` of the release tarball)
+Run Bitcoin Core's `bitcoin-node` (in `libexec/` of the release tarball)
 with an IPC socket in a directory of its own, and RPC reachable from Docker:
 
 ```bash

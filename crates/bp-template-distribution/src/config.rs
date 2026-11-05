@@ -5,6 +5,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use bitcoin_core_sv2::runtime_api::BitcoinCoreVersion;
+
 /// Short enough that a bitcoind restart is transparent to miners (the last
 /// template stays live), long enough that a hard-down core doesn't spin the
 /// reconnect loop hot.
@@ -23,6 +25,9 @@ pub const DEFAULT_BROADCAST_CAPACITY: usize = 64;
 
 /// Bounded so pool requests feel back-pressure when the worker stalls.
 pub const DEFAULT_SUBMIT_CAPACITY: usize = 32;
+
+/// IPC schema spoken to bitcoin-core when the operator names no release.
+pub const DEFAULT_BITCOIN_CORE_VERSION: BitcoinCoreVersion = BitcoinCoreVersion::V32X;
 
 /// Advertised to bitcoin-core so its templates leave room for the pool's own
 /// coinbase outputs.
@@ -46,6 +51,8 @@ impl Default for TdpCoinbaseConstraints {
 #[derive(Debug, Clone)]
 pub struct TdpConfig {
     pub socket_path: PathBuf,
+    /// The node's release line, which fixes the IPC schema the worker speaks.
+    pub bitcoin_core_version: BitcoinCoreVersion,
     pub fee_threshold: u64,
     pub min_interval_secs: u8,
     pub coinbase_constraints: TdpCoinbaseConstraints,
@@ -60,6 +67,7 @@ impl TdpConfig {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
+            bitcoin_core_version: DEFAULT_BITCOIN_CORE_VERSION,
             fee_threshold: DEFAULT_FEE_THRESHOLD,
             min_interval_secs: DEFAULT_MIN_INTERVAL_SECS,
             coinbase_constraints: TdpCoinbaseConstraints::default(),
@@ -71,6 +79,11 @@ impl TdpConfig {
 
     pub fn with_reconnect_backoff(mut self, backoff: Duration) -> Self {
         self.reconnect_backoff = backoff;
+        self
+    }
+
+    pub fn with_bitcoin_core_version(mut self, version: BitcoinCoreVersion) -> Self {
+        self.bitcoin_core_version = version;
         self
     }
 
@@ -107,6 +120,7 @@ mod tests {
     #[test]
     fn defaults_match_documented_values() {
         let cfg = TdpConfig::new("/tmp/anything.sock");
+        assert_eq!(cfg.bitcoin_core_version, BitcoinCoreVersion::V32X);
         assert_eq!(cfg.fee_threshold, 100_000);
         assert_eq!(cfg.min_interval_secs, 10);
         assert_eq!(cfg.broadcast_capacity, 64);
@@ -118,6 +132,7 @@ mod tests {
     #[test]
     fn builder_overrides_chain() {
         let cfg = TdpConfig::new("/x.sock")
+            .with_bitcoin_core_version(BitcoinCoreVersion::V31X)
             .with_fee_threshold(7)
             .with_min_interval_secs(3)
             .with_broadcast_capacity(8)
@@ -126,6 +141,7 @@ mod tests {
                 max_additional_size: 256,
                 max_additional_sigops: 4,
             });
+        assert_eq!(cfg.bitcoin_core_version, BitcoinCoreVersion::V31X);
         assert_eq!(cfg.fee_threshold, 7);
         assert_eq!(cfg.min_interval_secs, 3);
         assert_eq!(cfg.broadcast_capacity, 8);

@@ -11,12 +11,12 @@ use bp_common::AddressId;
 use bp_config::AppConfig;
 use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
 use bp_stratum_v2::jdp_server::StratumV2JdpServer;
-use bp_template_distribution::{TdpHandle, TemplateTxCache};
+use bp_template_distribution::{BitcoinCoreVersion, TdpHandle, TemplateTxCache};
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::jdp_hooks::build_jdp_hooks;
 use crate::payout_resolver::{ProductionDistributionSource, ProductionPayoutResolver};
@@ -116,13 +116,26 @@ pub(crate) async fn spawn(
     // SV2 JDP/Job Declarator Server: unset socket means trusted; an unusable
     // one stops boot rather than claiming validation that does not happen.
     let job_validator = match cfg.sv2.jdp_validation_socket_path.clone() {
-        Some(socket_path) => crate::jdp_hooks::ProductionJobValidator::connect(
-            socket_path,
-            cfg.network,
-            tokio_util::sync::CancellationToken::new(),
-        )
-        .await
-        .map_err(JdpSpawnError::ValidationSocket)?,
+        Some(socket_path) => {
+            let version = crate::boot::bitcoin_core_version(&cfg.tdp);
+            match version {
+                BitcoinCoreVersion::V30X | BitcoinCoreVersion::V31X => warn!(
+                    bitcoin_core_version = version.as_major(),
+                    "jdp: declared jobs are validated, but pushed solutions are NOT \
+                     propagated by the pool, only by the JDC: Bitcoin Core below 32 has no \
+                     IPC submitBlock (SV2 JDP/PushSolution)"
+                ),
+                BitcoinCoreVersion::V32X => {}
+            }
+            crate::jdp_hooks::ProductionJobValidator::connect(
+                socket_path,
+                version,
+                cfg.network,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .map_err(JdpSpawnError::ValidationSocket)?
+        }
         None => {
             info!(
                 "jdp: declared jobs are NOT validated against bitcoin-core and pushed \

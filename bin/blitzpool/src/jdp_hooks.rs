@@ -665,6 +665,7 @@ impl ProductionJobValidator {
     /// `Ok(None)` on testnet3, which has no socket layout.
     pub(crate) async fn connect(
         socket_path: std::path::PathBuf,
+        bitcoin_core_version: bp_template_distribution::BitcoinCoreVersion,
         network: bp_config::Network,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Option<Arc<dyn DeclaredJobValidator>>, String> {
@@ -681,13 +682,8 @@ impl ProductionJobValidator {
             }
         };
         let data_dir = Self::data_dir_for_socket(&socket_path, sri_network.clone())?;
-        match BitcoinCoreIPCEngine::new(
-            bp_template_distribution::BITCOIN_CORE_VERSION,
-            sri_network,
-            Some(data_dir),
-            cancel,
-        )
-        .await
+        match BitcoinCoreIPCEngine::new(bitcoin_core_version, sri_network, Some(data_dir), cancel)
+            .await
         {
             Ok(engine) => {
                 info!(
@@ -859,6 +855,7 @@ mod jdp_validation_regtest {
         let cancel = tokio_util::sync::CancellationToken::new();
         let validator = ProductionJobValidator::connect(
             node.ipc_socket_path(),
+            bp_template_distribution::DEFAULT_BITCOIN_CORE_VERSION,
             bp_config::Network::Regtest,
             cancel.clone(),
         )
@@ -903,6 +900,7 @@ mod jdp_validation_regtest {
         let cancel = tokio_util::sync::CancellationToken::new();
         let validator = ProductionJobValidator::connect(
             node.ipc_socket_path(),
+            bp_template_distribution::DEFAULT_BITCOIN_CORE_VERSION,
             bp_config::Network::Regtest,
             cancel.clone(),
         )

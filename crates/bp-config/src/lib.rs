@@ -94,6 +94,29 @@ pub enum Network {
     Regtest,
 }
 
+/// A Bitcoin Core major release the pool's IPC clients can speak, written
+/// as its number (`bitcoin_core_version = 31`).
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "u8")]
+pub enum BitcoinCoreVersion {
+    V31,
+    V32,
+}
+
+impl TryFrom<u8> for BitcoinCoreVersion {
+    type Error = String;
+
+    fn try_from(major: u8) -> Result<Self, Self::Error> {
+        match major {
+            31 => Ok(Self::V31),
+            32 => Ok(Self::V32),
+            other => Err(format!(
+                "bitcoin_core_version = {other} is not supported; use 31 or 32"
+            )),
+        }
+    }
+}
+
 /// Deployment role; the set a process runs gates each subsystem at boot.
 /// "Satellite" is any non-[`Role::Front`] process: it consumes the front's
 /// Redis streams (at-least-once, dedup on `share_id`), so it can restart
@@ -154,8 +177,15 @@ pub struct BitcoinRpcConfig {
 pub struct TdpConfig {
     /// bitcoin-core IPC socket the templates arrive over (TDP).
     pub socket_path: PathBuf,
+    /// Major release of the Bitcoin Core node behind `socket_path`: 31 or
+    /// 32. Picks the IPC schema TDP and the JDP validation engine speak;
+    /// boot refuses a node whose `getnetworkinfo` reports another major.
+    /// Below 32 the node has no `submitBlock`, so a solution a JDC pushes
+    /// (SV2 JDP/PushSolution) is propagated only by the JDC. Default 32.
+    #[serde(default)]
+    pub bitcoin_core_version: Option<BitcoinCoreVersion>,
     /// Minimum block-reward fee (sats) before a refreshed template supersedes
-    /// the previous one. Lower → more template churn. Default 1_000_000.
+    /// the previous one. Lower → more template churn. Default 100_000.
     #[serde(default)]
     pub fee_threshold_sats: Option<u64>,
     /// Minimum interval between template refreshes (seconds).
@@ -426,8 +456,9 @@ pub struct Sv2Config {
     #[serde(default)]
     pub jdp_port: Option<u16>,
     /// bitcoin-core IPC socket (normally the `[tdp]` one) for `checkBlock`
-    /// validation of declared jobs and `submitBlock` propagation of pushed
-    /// solutions (SV2 JDP/Job Declarator Server, SV2 JDP/PushSolution); unset
+    /// validation of declared jobs and, on Bitcoin Core 32, `submitBlock`
+    /// propagation of pushed solutions (SV2 JDP/Job Declarator Server, SV2
+    /// JDP/PushSolution); unset
     /// trusts the JDC and leaves propagation to it. Must be a `<dir>/<network>/node.sock` path the engine
     /// can derive, else boot refuses rather than validate against nothing.
     #[serde(default)]
@@ -1320,5 +1351,23 @@ mod tests {
         "#;
         let c: TdpConfig = toml::from_str(text).expect("parses");
         assert_eq!(c.staleness_threshold_secs, 45);
+    }
+
+    #[test]
+    fn tdp_bitcoin_core_version_parses_its_major_and_refuses_others() {
+        let parse = |extra: &str| {
+            toml::from_str::<TdpConfig>(&format!("socket_path = \"/x.sock\"\n{extra}"))
+        };
+        assert_eq!(parse("").unwrap().bitcoin_core_version, None);
+        for (major, version) in [(31, BitcoinCoreVersion::V31), (32, BitcoinCoreVersion::V32)] {
+            let c = parse(&format!("bitcoin_core_version = {major}")).unwrap();
+            assert_eq!(c.bitcoin_core_version, Some(version));
+        }
+        for refused in ["30", "33", "\"32\""] {
+            assert!(
+                parse(&format!("bitcoin_core_version = {refused}")).is_err(),
+                "{refused} must not parse"
+            );
+        }
     }
 }

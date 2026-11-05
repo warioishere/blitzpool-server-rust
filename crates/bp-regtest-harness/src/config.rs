@@ -29,7 +29,7 @@ const CANDIDATE_PREFIXES: &[&str] = &[
 ];
 
 /// Lowest bitcoin-core major version the harness can drive. The pool's IPC
-/// clients speak the v32 schema (`bp_template_distribution::BITCOIN_CORE_VERSION`),
+/// clients speak the v32 schema by default (`bp_template_distribution::DEFAULT_BITCOIN_CORE_VERSION`),
 /// where a solved block goes through `Mining.submitBlock @7` and
 /// `submitSolution` is `@10`; checked up front to skip cleanly.
 pub const MIN_BITCOIN_NODE_MAJOR: u32 = 32;

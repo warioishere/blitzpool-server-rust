@@ -1478,6 +1478,12 @@ fn print_boot_error_help(err: &BootError) {
                  started (not in IBD)."
             );
         }
+        BootError::BitcoinCoreVersionMismatch { node, .. } => {
+            eprintln!(
+                "hint: set `[tdp] bitcoin_core_version` to the node's major release \
+                 (31 or 32; unset means 32). The node reports {node}."
+            );
+        }
         BootError::Tdp(_) => {
             eprintln!(
                 "hint: `[tdp] socket_path` must point at the bitcoin-core IPC \

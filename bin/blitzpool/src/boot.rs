@@ -9,13 +9,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bp_bitcoin::{BitcoinRpc, BitcoinRpcConfig as BtcRpcConfig, RpcAuth};
+use bp_bitcoin::{BitcoinRpc, BitcoinRpcConfig as BtcRpcConfig, NetworkInfo, RpcAuth};
 use bp_common::StreamKind;
 use bp_config::{AppConfig, BitcoinRpcConfig, DatabaseConfig, RedisConfig, Role, TdpConfig};
 use bp_db::{Db, DbConfig};
 use bp_geoip::{GeoIpService, ReqwestGeoIpClient};
 use bp_metrics::{MetricsService, MetricsServiceHandle, PrometheusConfig};
-use bp_template_distribution::{TdpCoinbaseConstraints, TdpConfig as TdpSpawnConfig, TdpHandle};
+use bp_template_distribution::{
+    BitcoinCoreVersion, TdpCoinbaseConstraints, TdpConfig as TdpSpawnConfig, TdpHandle,
+    DEFAULT_BITCOIN_CORE_VERSION,
+};
 use redis::aio::ConnectionManager;
 use thiserror::Error;
 use tracing::{info, warn};
@@ -74,6 +77,17 @@ pub(crate) enum BootError {
     /// bitcoin-core unreachable, wrong RPC credentials or a closed port.
     #[error("bitcoin rpc liveness ping failed: {0}")]
     BitcoinRpcLiveness(bp_bitcoin::RpcError),
+    /// The node answers but runs another release than `[tdp]
+    /// bitcoin_core_version` names, so the IPC schema would not match it.
+    #[error(
+        "the node runs Bitcoin Core {node} ({subversion}) but the pool speaks the v{configured} \
+         IPC schema"
+    )]
+    BitcoinCoreVersionMismatch {
+        configured: u8,
+        node: String,
+        subversion: String,
+    },
 }
 
 /// Boot-time flags that override the strict defaults (staging only).
@@ -97,7 +111,8 @@ pub(crate) async fn boot(
 ) -> Result<FoundationHandles, BootError> {
     let db = spawn_pg(&cfg.database).await?;
     let redis = spawn_redis(&cfg.redis).await?;
-    let bitcoin_rpc = spawn_bitcoin_rpc(&cfg.bitcoin_rpc, opts.skip_bitcoin_rpc_liveness).await?;
+    let (bitcoin_rpc, node_info) =
+        spawn_bitcoin_rpc(&cfg.bitcoin_rpc, opts.skip_bitcoin_rpc_liveness).await?;
     // TDP feeds the share path and block submit, a front-only concern; a
     // process without the `front` role builds no jobs and needs no IPC
     // socket.
@@ -111,6 +126,9 @@ pub(crate) async fn boot(
         }
         (None, HashMap::new())
     } else {
+        if let Some(info) = &node_info {
+            check_node_release(info, bitcoin_core_version(&cfg.tdp))?;
+        }
         // Default stream: PPLNS-autoscaled (or DEFAULT_COINBASE_WEIGHT_BUDGET
         // when no PPLNS). Serves PPLNS connections.
         let default_constraints = coinbase_constraints_from_pplns_budget(cfg.pplns.as_ref());
@@ -252,10 +270,12 @@ fn redis_connection_info(cfg: &RedisConfig) -> redis::RedisResult<redis::Connect
 
 // ─── Bitcoin RPC ──────────────────────────────────────────────────
 
+/// The client plus the node's `getnetworkinfo` answer, `None` when the
+/// liveness ping is skipped.
 async fn spawn_bitcoin_rpc(
     cfg: &BitcoinRpcConfig,
     skip_liveness: bool,
-) -> Result<BitcoinRpc, BootError> {
+) -> Result<(BitcoinRpc, Option<NetworkInfo>), BootError> {
     // Append the default port when the operator-supplied URL doesn't
     // already carry one. Conservative: an explicit port in `url` wins.
     let url = if cfg.url.matches(':').count() >= 2 {
@@ -276,15 +296,42 @@ async fn spawn_bitcoin_rpc(
     let rpc = BitcoinRpc::new(btc_cfg)?;
     if skip_liveness {
         warn!("bitcoin rpc: liveness ping skipped via --skip-bitcoin-rpc-liveness");
-        return Ok(rpc);
+        return Ok((rpc, None));
     }
     // Liveness ping with its own error variant, so an unreachable node or
     // wrong credentials fail at boot with a pointed message.
-    rpc.get_network_info()
+    let info = rpc
+        .get_network_info()
         .await
         .map_err(BootError::BitcoinRpcLiveness)?;
-    info!("bitcoin rpc: ready (getnetworkinfo ok)");
-    Ok(rpc)
+    info!(subversion = %info.subversion, "bitcoin rpc: ready (getnetworkinfo ok)");
+    Ok((rpc, Some(info)))
+}
+
+// ─── Bitcoin Core release ─────────────────────────────────────────
+
+/// The IPC schema every IPC client of this process speaks: the TDP streams
+/// and the JDP validation engine. All of them reach the node `[tdp]` names.
+pub(crate) fn bitcoin_core_version(cfg: &TdpConfig) -> BitcoinCoreVersion {
+    match cfg.bitcoin_core_version {
+        None => DEFAULT_BITCOIN_CORE_VERSION,
+        Some(bp_config::BitcoinCoreVersion::V31) => BitcoinCoreVersion::V31X,
+        Some(bp_config::BitcoinCoreVersion::V32) => BitcoinCoreVersion::V32X,
+    }
+}
+
+/// Refuses a node whose release is not the one the IPC schema is built for.
+/// `getnetworkinfo` encodes 32.1.0 as `320100`.
+fn check_node_release(info: &NetworkInfo, version: BitcoinCoreVersion) -> Result<(), BootError> {
+    let node_major = info.version / 10_000;
+    if node_major == u64::from(version.as_major()) {
+        return Ok(());
+    }
+    Err(BootError::BitcoinCoreVersionMismatch {
+        configured: version.as_major(),
+        node: format!("{}.{}", node_major, info.version / 100 % 100),
+        subversion: info.subversion.clone(),
+    })
 }
 
 // ─── TDP ──────────────────────────────────────────────────────────
@@ -320,7 +367,8 @@ fn spawn_tdp_stream(
     constraints: TdpCoinbaseConstraints,
     label: &str,
 ) -> Result<TdpHandle, BootError> {
-    let mut spawn_cfg = TdpSpawnConfig::new(&cfg.socket_path);
+    let mut spawn_cfg =
+        TdpSpawnConfig::new(&cfg.socket_path).with_bitcoin_core_version(bitcoin_core_version(cfg));
     if let Some(fee) = cfg.fee_threshold_sats {
         spawn_cfg = spawn_cfg.with_fee_threshold(fee);
     }
@@ -334,6 +382,7 @@ fn spawn_tdp_stream(
     info!(
         stream = label,
         socket = %cfg.socket_path.display(),
+        bitcoin_core_version = bitcoin_core_version(cfg).as_major(),
         coinbase_max_additional_size = constraints.max_additional_size,
         coinbase_max_additional_sigops = constraints.max_additional_sigops,
         "tdp: spawning worker"
@@ -569,5 +618,71 @@ mod tests {
         };
         let c = coinbase_constraints_from_pplns_budget(Some(&pplns));
         assert_eq!(c.max_additional_size, 12_501 + 256);
+    }
+
+    fn node_info(version: u64, subversion: &str) -> NetworkInfo {
+        serde_json::from_value(serde_json::json!({
+            "version": version,
+            "subversion": subversion,
+            "protocolversion": 70016,
+            "localservices": "0000000000000409",
+            "localrelay": true,
+            "timeoffset": 0,
+            "networkactive": true,
+            "connections": 0,
+            "networks": [],
+            "relayfee": 0.00001,
+            "incrementalfee": 0.00001,
+        }))
+        .expect("getnetworkinfo fixture")
+    }
+
+    #[test]
+    fn the_configured_release_picks_the_ipc_schema_and_unset_means_v32() {
+        let tdp = |version: Option<bp_config::BitcoinCoreVersion>| TdpConfig {
+            socket_path: "/x.sock".into(),
+            bitcoin_core_version: version,
+            fee_threshold_sats: None,
+            min_interval_secs: None,
+            broadcast_capacity: None,
+            staleness_threshold_secs: 120,
+        };
+        assert_eq!(bitcoin_core_version(&tdp(None)), BitcoinCoreVersion::V32X);
+        for (configured, schema) in [
+            (bp_config::BitcoinCoreVersion::V31, BitcoinCoreVersion::V31X),
+            (bp_config::BitcoinCoreVersion::V32, BitcoinCoreVersion::V32X),
+        ] {
+            assert_eq!(bitcoin_core_version(&tdp(Some(configured))), schema);
+        }
+    }
+
+    #[test]
+    fn boot_accepts_a_node_of_the_configured_release_and_refuses_another() {
+        assert!(check_node_release(
+            &node_info(320100, "/Satoshi:32.1.0/"),
+            BitcoinCoreVersion::V32X
+        )
+        .is_ok());
+        assert!(check_node_release(
+            &node_info(310000, "/Satoshi:31.0.0/"),
+            BitcoinCoreVersion::V31X
+        )
+        .is_ok());
+        match check_node_release(
+            &node_info(310000, "/Satoshi:31.0.0/"),
+            BitcoinCoreVersion::V32X,
+        ) {
+            Err(BootError::BitcoinCoreVersionMismatch {
+                configured,
+                node,
+                subversion,
+            }) => {
+                assert_eq!(
+                    (configured, node.as_str(), subversion.as_str()),
+                    (32, "31.0", "/Satoshi:31.0.0/")
+                );
+            }
+            other => panic!("a v31 node under the v32 schema must refuse boot, got {other:?}"),
+        }
     }
 }

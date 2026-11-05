@@ -432,6 +432,7 @@ mod tests {
             },
             tdp: TomlTdpConfig {
                 socket_path: PathBuf::from("/tmp/bp-tdp.sock"),
+                bitcoin_core_version: None,
                 fee_threshold_sats: None,
                 min_interval_secs: None,
                 broadcast_capacity: None,

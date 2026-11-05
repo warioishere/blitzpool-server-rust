@@ -23,11 +23,14 @@ port = 8332                       # mainnet 8332, testnet4 48332, regtest 18443
 user = "blitzpool"                # rpcuser from bitcoin.conf
 password = "CHANGE-ME"            # rpcpassword from bitcoin.conf
 
-# Block templates come over Bitcoin Core 32's IPC socket (Template
+# Block templates come over Bitcoin Core's IPC socket (Template
 # Distribution Protocol). The node must run as `bitcoin-node` (not bitcoind)
 # with -ipcbind=unix:<path>; the compose file mounts that socket here.
+# bitcoin_core_version is the node's major release: 31 or 32 (default 32).
+# Boot refuses a node that reports another one.
 [tdp]
 socket_path = "/ipc/node.sock"
+# bitcoin_core_version = 32
 
 [database]
 host = "postgres"

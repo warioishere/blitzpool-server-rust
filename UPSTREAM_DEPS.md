@@ -100,11 +100,14 @@ requirement, not only a build-size concern: `jdp_hooks.rs` hands
 `DeclareMiningJobOwned` values to `jd_server_sv2`, and two `binary_sv2` majors
 side by side do not type-check.
 
-The code goes through the version-agnostic `bitcoin_core_sv2::runtime_api`
-and selects the **`v32x`** backend (Bitcoin Core v32) with one constant,
-`bp_template_distribution::BITCOIN_CORE_VERSION`, shared by the TDP worker and
-the JDP validation engine. A pushed JDP solution is propagated through the same
-engine (`BitcoinCoreIPCEngine::handle_push_solution`, IPC `submitBlock`).
+The code goes through the version-agnostic `bitcoin_core_sv2::runtime_api`.
+The backend (`v31x` or `v32x`) follows `[tdp] bitcoin_core_version`,
+default `bp_template_distribution::DEFAULT_BITCOIN_CORE_VERSION` (v32), and is
+resolved once in `bin/blitzpool/src/boot.rs` for the TDP worker and the JDP
+validation engine alike. A pushed JDP solution is propagated through the same
+engine (`BitcoinCoreIPCEngine::handle_push_solution`, IPC `submitBlock`); the
+`v31x` backend drops it with a warning, since a v31 node has no `submitBlock`.
+Upstream's `v30x` backend is not offered: no regtest here has run it.
 
 ### Tag to tag, never upstream `main`
 
@@ -153,9 +156,9 @@ workspace version is always the exact crates.io version the pinned
    stop: that is the unreproducible case described above.
 5. `cargo update -p bitcoin_core_sv2 -p stratum-apps -p jd_server_sv2 -p stratum-core`.
 6. **Bitcoin Core compatibility**: the Cap'n-Proto schema in
-   `bitcoin_core_sv2` targets specific Bitcoin Core releases. Confirm the
-   backend in `BITCOIN_CORE_VERSION` still matches the Core version the pool
-   runs against. The schema files live under `bitcoin-core-sv2/` upstream.
+   `bitcoin_core_sv2` targets specific Bitcoin Core releases. Confirm every
+   release `bp_config::BitcoinCoreVersion` accepts still has a backend, and
+   that `DEFAULT_BITCOIN_CORE_VERSION` matches the Core the regtests run. The schema files live under `bitcoin-core-sv2/` upstream.
 7. `cargo check --workspace`, then `cargo test --workspace -- --nocapture`.
    Breaking changes usually surface in `bp-template-distribution`,
    `bin/blitzpool/src/jdp_hooks.rs` and the `bp-stratum-v2` codecs. The

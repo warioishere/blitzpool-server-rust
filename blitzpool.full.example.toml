@@ -21,6 +21,7 @@ password = "CHANGE-ME"
 
 [tdp]
 socket_path = "/ipc/node.sock"
+# bitcoin_core_version = 32       # optional: the node's major release, 31 or 32
 # staleness_threshold_secs = 120  # optional: /api/health reports "stale" after this
 
 [database]
@@ -73,6 +74,7 @@ authority_privkey_hex = "CHANGE-ME"      # blitzpool --sv2-keygen
 # Validate declared jobs against the node and propagate pushed solutions
 # through it; unset leaves both to the JDC. On mainnet the [tdp] socket path
 # works as is; other networks need the layout <dir>/<network>/node.sock.
+# Propagating needs Bitcoin Core 32; on 31 the pool only validates.
 # jdp_validation_socket_path = "/ipc/node.sock"
 
 # ── Solo (always on) ─────────────────────────────────────────────────

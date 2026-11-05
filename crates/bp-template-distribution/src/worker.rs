@@ -70,6 +70,7 @@ fn run_thread(
     ready_tx: std::sync::mpsc::SyncSender<Result<(), String>>,
 ) {
     let socket_path: PathBuf = config.socket_path.clone();
+    let bitcoin_core_version = config.bitcoin_core_version;
     let coinbase_constraints = config.coinbase_constraints;
     let fee_threshold = config.fee_threshold;
     let min_interval = config.min_interval_secs;
@@ -113,7 +114,7 @@ fn run_thread(
                 async_channel::unbounded::<TemplateDistributionOwned>();
 
             let tdp = match tdp_runtime::new(
-                crate::BITCOIN_CORE_VERSION,
+                bitcoin_core_version,
                 &socket_path,
                 fee_threshold,
                 min_interval,
