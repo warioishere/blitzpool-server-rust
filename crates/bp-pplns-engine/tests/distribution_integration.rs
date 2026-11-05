@@ -99,7 +99,7 @@ async fn connect_or_skip(redis_db: u8, address_prefix: &str) -> Option<Harness> 
         /*factor=*/ 4.0,
         /*bucket_shares=*/ 100,
         net_diff,
-        AGE_RULE_OFF,
+        INACTIVITY_OFF,
     );
     let cfg = DistributionConfig::from_engine_config(&PplnsEngineConfig {
         fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
@@ -154,9 +154,8 @@ async fn cleanup_addresses(pool: &PgPool, addresses: &[&str]) {
 
 // ── Test 1 — end-to-end build returns payouts + writes snapshot ────
 
-/// `max_age_days` for tests not about ageing. Not `0`: the constructor
-/// floors it at one day, so `0` would mean 24 hours.
-const AGE_RULE_OFF: u32 = 3650;
+/// Inactivity period for tests not about it: longer than any timestamp gap here.
+const INACTIVITY_OFF: u32 = 3650;
 
 #[tokio::test]
 async fn build_with_shares_only_returns_payouts_and_writes_snapshot() {
@@ -598,7 +597,7 @@ async fn build_window(h: &Harness) -> WindowStore {
         .await
         .expect("conn");
     let nd = NetworkDifficulty::new(1_000_000.0);
-    WindowStore::new(conn, 4.0, 100, nd, AGE_RULE_OFF)
+    WindowStore::new(conn, 4.0, 100, nd, INACTIVITY_OFF)
 }
 
 fn redis_db_for_prefix(prefix: &str) -> u8 {
@@ -680,7 +679,7 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
             4.0,
             100,
             NetworkDifficulty::new(1_000_000.0),
-            AGE_RULE_OFF,
+            INACTIVITY_OFF,
         ),
         DistributionConfig::from_engine_config(&PplnsEngineConfig {
             fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),

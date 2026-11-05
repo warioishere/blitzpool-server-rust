@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use bp_pplns_engine::window::{
     bucket_key, NetworkDifficulty, WindowStore, KEY_APPLIED, KEY_BUCKETS, KEY_WINDOW_BY_ADDRESS,
-    KEY_WINDOW_TOTAL,
+    KEY_WINDOW_LAST_SHARE, KEY_WINDOW_TOTAL,
 };
 use redis::{aio::ConnectionManager, AsyncCommands, Client};
 
@@ -62,9 +62,8 @@ async fn connect_or_skip(test_db: u8) -> Option<ConnectionManager> {
     Some(conn)
 }
 
-/// `max_age_days` for tests not about ageing. Not `0`: the constructor floors
-/// it to one day, so `0` would mean "24 hours", not "off".
-const AGE_RULE_OFF: u32 = 3650;
+/// Inactivity period for tests not about it: longer than any timestamp gap here.
+const INACTIVITY_OFF: u32 = 3650;
 
 /// `bucket_shares = 1` makes each share its own bucket (per-share trim).
 fn make_store(
@@ -78,13 +77,13 @@ fn make_store(
         /*window_factor=*/ 4.0,
         bucket_shares,
         nd.clone(),
-        AGE_RULE_OFF,
+        INACTIVITY_OFF,
     );
     (store, nd)
 }
 
-/// Share timestamp near now for tests not about ageing: a fixed old one would
-/// let the age rule empty the window. The offset keeps the relative order.
+/// Share timestamp near now for tests not about inactivity. The offset keeps
+/// the relative order.
 fn ts(offset: u64) -> u64 {
     (bp_common::now_ms() as u64) - 1_000_000 + offset
 }
@@ -208,7 +207,7 @@ async fn trim_window_drops_oldest_over_window_size() {
         None => return,
     };
     // window_size = 4.0 × 1.0 = 4.0. 1 share/bucket → finest trim. The 5th
-    // share (total 5.0 > 4.0) ages out the oldest miner (bc1q1).
+    // share (total 5.0 > 4.0) trims the oldest miner (bc1q1) out.
     let (store, _) = make_store(conn.clone(), 1.0, 1);
 
     for i in 1..=5 {
@@ -224,7 +223,10 @@ async fn trim_window_drops_oldest_over_window_size() {
         "total after trim = {total}, must be ≤ 4.0"
     );
     let by = store.read_window_by_address().await.unwrap();
-    assert!(!by.contains_key("bc1q1"), "oldest miner aged out + cleaned");
+    assert!(
+        !by.contains_key("bc1q1"),
+        "oldest miner trimmed out + cleaned"
+    );
     assert!((by["bc1q5"] - 1.0).abs() < 1e-9);
 }
 
@@ -771,21 +773,22 @@ async fn lowering_bucket_shares_keeps_new_work_above_the_live_window() {
     );
 }
 
-// ── Age rule ────────────────────────────────────────────────────────
-// The size rule never fires on a pool far below its cap, so the age rule is
-// what removes a miner that stopped.
+// ── Inactivity rule ─────────────────────────────────────────────────
+// The size rule never fires on a pool far below its cap, so the inactivity rule
+// is what removes a miner that stopped. It judges the address, not the share:
+// an address that keeps mining keeps every share, however old.
 
-/// Makes the size cap unreachable, so only the age rule can drop anything.
+/// Makes the size cap unreachable, so only the inactivity rule can drop anything.
 const UNREACHABLE_SIZE_DIFF: f64 = 1e12;
 const DAY_MS: u64 = 86_400_000;
 
-fn make_aged_store(
+fn make_inactivity_store(
     conn: ConnectionManager,
     bucket_shares: u64,
-    max_age_days: u32,
+    inactive_days: u32,
 ) -> (WindowStore, NetworkDifficulty) {
     let nd = NetworkDifficulty::new(UNREACHABLE_SIZE_DIFF);
-    let store = WindowStore::new(conn, 4.0, bucket_shares, nd.clone(), max_age_days);
+    let store = WindowStore::new(conn, 4.0, bucket_shares, nd.clone(), inactive_days);
     (store, nd)
 }
 
@@ -793,89 +796,401 @@ fn ms_ago(days: u64) -> u64 {
     (bp_common::now_ms() as u64) - days * DAY_MS
 }
 
+async fn aggregate(conn: &mut ConnectionManager) -> HashMap<String, f64> {
+    let raw: HashMap<String, String> = conn.hgetall(KEY_WINDOW_BY_ADDRESS).await.unwrap();
+    raw.into_iter()
+        .map(|(a, v)| (a, v.parse::<f64>().unwrap()))
+        .collect()
+}
+
+async fn total(conn: &mut ConnectionManager) -> f64 {
+    let raw: String = conn.get(KEY_WINDOW_TOTAL).await.unwrap();
+    raw.parse().unwrap()
+}
+
+/// Buckets, aggregate and total agree.
+async fn assert_lockstep(conn: &mut ConnectionManager) {
+    let agg = aggregate(conn).await;
+    let summed = sum_buckets(conn).await;
+    assert_eq!(
+        summed.len(),
+        agg.len(),
+        "buckets {summed:?} vs aggregate {agg:?}"
+    );
+    for (address, weight) in &agg {
+        assert!(
+            (summed[address] - weight).abs() < 1e-9,
+            "{address}: buckets {} vs aggregate {weight}",
+            summed[address]
+        );
+    }
+    let agg_sum: f64 = agg.values().sum();
+    assert!((total(conn).await - agg_sum).abs() < 1e-9);
+}
+
 #[tokio::test]
-async fn an_old_bucket_is_dropped_by_age_even_far_below_the_size_cap() {
+async fn an_address_without_a_share_for_the_inactivity_period_leaves_with_all_its_weight() {
     let Some(mut conn) = connect_or_skip(16).await else {
         return;
     };
-    let (store, _nd) = make_aged_store(conn.clone(), /*bucket_shares=*/ 1, 90);
+    let (store, _nd) = make_inactivity_store(conn.clone(), /*bucket_shares=*/ 1, 60);
 
-    // A's bucket is scored with its 100-day-old accept time.
-    store
-        .record_share(None, "addr_a", 100.0, ms_ago(100))
-        .await
-        .unwrap();
-    for (addr, diff) in [("addr_b", 200.0), ("addr_c", 300.0)] {
-        store
-            .record_share(None, addr, diff, ms_ago(0))
-            .await
-            .unwrap();
+    // addr_b / addr_c mine now; addr_gone's two shares, the latest 61 days
+    // ago, are replayed after them, within the share path's check interval.
+    for (addr, diff, at) in [
+        ("addr_b", 200.0, ms_ago(0)),
+        ("addr_c", 300.0, ms_ago(0)),
+        ("addr_gone", 100.0, ms_ago(70)),
+        ("addr_gone", 150.0, ms_ago(61)),
+    ] {
+        store.record_share(None, addr, diff, at).await.unwrap();
     }
-
-    // Any further share runs the trim.
-    store
-        .record_share(None, "addr_d", 400.0, ms_ago(0))
-        .await
-        .unwrap();
-
-    let by_addr: HashMap<String, String> = conn.hgetall(KEY_WINDOW_BY_ADDRESS).await.unwrap();
-    assert!(
-        !by_addr.contains_key("addr_a"),
-        "the 100-day-old bucket must be gone, got {by_addr:?}"
+    let before = aggregate(&mut conn).await;
+    assert_eq!(
+        before.get("addr_gone").copied(),
+        Some(250.0),
+        "precondition: the replayed old shares are in the window before the check"
     );
-    for still_here in ["addr_b", "addr_c", "addr_d"] {
-        assert!(
-            by_addr.contains_key(still_here),
-            "{still_here} is inside the window and must stay"
-        );
-    }
 
-    // Decremented by exactly what left: 200+300+400 remain.
-    let total: String = conn.get(KEY_WINDOW_TOTAL).await.unwrap();
+    store.forget_inactive(ms_ago(0)).await.unwrap();
+
+    let after = aggregate(&mut conn).await;
     assert!(
-        (total.parse::<f64>().unwrap() - 900.0).abs() < 1e-9,
-        "total must drop by exactly the removed bucket, got {total}"
+        !after.contains_key("addr_gone"),
+        "an address with no share for 60 days leaves completely, got {after:?}"
+    );
+    assert_eq!(after.get("addr_b").copied(), Some(200.0));
+    assert_eq!(after.get("addr_c").copied(), Some(300.0));
+    assert!(
+        (total(&mut conn).await - 500.0).abs() < 1e-9,
+        "total drops by exactly the address's weight"
     );
     let summed = sum_buckets(&mut conn).await;
-    assert!(!summed.contains_key("addr_a"));
+    assert!(
+        !summed.contains_key("addr_gone"),
+        "no bucket keeps any of it"
+    );
+    let seen: Option<String> = conn.hget(KEY_WINDOW_LAST_SHARE, "addr_gone").await.unwrap();
+    assert!(seen.is_none(), "its last-share entry leaves with it");
+    let index: Vec<String> = conn.zrange(KEY_BUCKETS, 0, -1).await.unwrap();
+    assert_eq!(
+        index.len(),
+        2,
+        "the buckets it emptied leave the index, got {index:?}"
+    );
+    assert_lockstep(&mut conn).await;
 }
 
-/// Control for the test above: a bucket inside the age window is not touched.
+/// The rule is per address: shares far older than the period stay while the
+/// address still mines. A per-share age trim fails this.
 #[tokio::test]
-async fn a_bucket_inside_the_age_window_is_left_alone() {
+async fn an_address_that_keeps_mining_keeps_its_old_shares() {
     let Some(mut conn) = connect_or_skip(17).await else {
         return;
     };
-    let (store, _nd) = make_aged_store(conn.clone(), /*bucket_shares=*/ 1, 90);
+    let (store, _nd) = make_inactivity_store(conn.clone(), /*bucket_shares=*/ 1, 60);
 
-    // One day old against a 90-day rule.
-    store
-        .record_share(None, "addr_a", 100.0, ms_ago(1))
-        .await
-        .unwrap();
-    for (addr, diff) in [("addr_b", 200.0), ("addr_c", 300.0), ("addr_d", 400.0)] {
-        store
-            .record_share(None, addr, diff, ms_ago(0))
-            .await
-            .unwrap();
+    for (addr, diff, at) in [
+        ("addr_steady", 100.0, ms_ago(150)),
+        ("addr_steady", 100.0, ms_ago(90)),
+        ("addr_steady", 100.0, ms_ago(1)),
+        ("addr_other", 50.0, ms_ago(0)),
+        ("addr_other", 50.0, ms_ago(0)),
+    ] {
+        store.record_share(None, addr, diff, at).await.unwrap();
     }
+    store.forget_inactive(ms_ago(0)).await.unwrap();
 
-    let by_addr: HashMap<String, String> = conn.hgetall(KEY_WINDOW_BY_ADDRESS).await.unwrap();
-    assert!(
-        by_addr.contains_key("addr_a"),
-        "a one-day-old bucket is inside a 90-day window, got {by_addr:?}"
+    let after = aggregate(&mut conn).await;
+    assert_eq!(
+        after.get("addr_steady").copied(),
+        Some(300.0),
+        "all three shares stay, the 150- and 90-day-old ones too, got {after:?}"
     );
-    let total: String = conn.get(KEY_WINDOW_TOTAL).await.unwrap();
-    assert!((total.parse::<f64>().unwrap() - 1000.0).abs() < 1e-9);
+    assert!((total(&mut conn).await - 400.0).abs() < 1e-9);
+    assert_eq!(
+        sum_buckets(&mut conn).await.get("addr_steady"),
+        Some(&300.0)
+    );
 }
 
-/// A later share into the same bucket does not move its opening score (`NX`).
+/// The prod window: many old buckets carrying one opening time, no last-share
+/// entries yet. Seeding takes each address's newest bucket; past the period only
+/// the addresses with nothing newer leave, and one that mined since keeps its old
+/// weight too.
 #[tokio::test]
-async fn a_second_share_does_not_refresh_its_buckets_age() {
+async fn seeded_from_buckets_with_one_opening_time_only_the_stopped_addresses_leave() {
     let Some(mut conn) = connect_or_skip(19).await else {
         return;
     };
-    let (store, _nd) = make_aged_store(conn.clone(), /*bucket_shares=*/ 10, 90);
+    let (store, _nd) = make_inactivity_store(conn.clone(), /*bucket_shares=*/ 1, 60);
+    let stamped = ms_ago(61);
+
+    // Twelve old buckets, all opened at the same instant.
+    for i in 0..12u64 {
+        let addr = if i % 2 == 0 {
+            "addr_stopped"
+        } else {
+            "addr_back"
+        };
+        store.record_share(None, addr, 10.0, stamped).await.unwrap();
+    }
+    // addr_back mined again since; addr_new only since.
+    store
+        .record_share(None, "addr_back", 10.0, ms_ago(5))
+        .await
+        .unwrap();
+    store
+        .record_share(None, "addr_new", 10.0, ms_ago(5))
+        .await
+        .unwrap();
+    // The state before this rule existed: no last-share entries.
+    let _: () = conn.del(KEY_WINDOW_LAST_SHARE).await.unwrap();
+
+    store.bootstrap_window_if_needed().await.unwrap();
+    let seeded: HashMap<String, String> = conn.hgetall(KEY_WINDOW_LAST_SHARE).await.unwrap();
+    assert_eq!(seeded.len(), 3, "every address gets a time, got {seeded:?}");
+    assert_eq!(
+        seeded["addr_stopped"].parse::<u64>().unwrap(),
+        stamped,
+        "an address only in the old buckets gets their opening time"
+    );
+    assert!(
+        seeded["addr_back"].parse::<u64>().unwrap() > stamped,
+        "an address in a newer bucket gets that bucket's time"
+    );
+
+    store.forget_inactive(ms_ago(0)).await.unwrap();
+
+    let after = aggregate(&mut conn).await;
+    assert!(!after.contains_key("addr_stopped"), "got {after:?}");
+    assert_eq!(
+        after.get("addr_back").copied(),
+        Some(70.0),
+        "its six old shares stay with the new one"
+    );
+    assert_eq!(after.get("addr_new").copied(), Some(10.0));
+    assert!((total(&mut conn).await - 80.0).abs() < 1e-9);
+    assert_lockstep(&mut conn).await;
+}
+
+/// Seeding never lowers a time a share wrote.
+#[tokio::test]
+async fn seeding_keeps_a_recorded_last_share() {
+    let Some(mut conn) = connect_or_skip(20).await else {
+        return;
+    };
+    let (store, _nd) = make_inactivity_store(conn.clone(), /*bucket_shares=*/ 10, 60);
+    let opened = ms_ago(30);
+    store
+        .record_share(None, "addr_a", 10.0, opened)
+        .await
+        .unwrap();
+    let latest = ms_ago(1);
+    store
+        .record_share(None, "addr_a", 10.0, latest)
+        .await
+        .unwrap();
+    let index: Vec<(String, f64)> = conn.zrange_withscores(KEY_BUCKETS, 0, -1).await.unwrap();
+    assert_eq!(
+        index,
+        vec![("0".to_string(), opened as f64)],
+        "precondition: both shares in one bucket opened at {opened}"
+    );
+
+    store.bootstrap_window_if_needed().await.unwrap();
+
+    let seen: String = conn.hget(KEY_WINDOW_LAST_SHARE, "addr_a").await.unwrap();
+    assert_eq!(
+        seen.parse::<u64>().unwrap(),
+        latest,
+        "the share's own time, not the bucket's opening time {opened}"
+    );
+}
+
+/// An entry older than the work the window holds for its address, as a writer
+/// that kept no last-share times leaves it, is raised at startup, so the
+/// address is not taken for gone while it mines.
+#[tokio::test]
+async fn seeding_raises_a_stale_entry_to_the_newest_bucket() {
+    let Some(mut conn) = connect_or_skip(26).await else {
+        return;
+    };
+    let (store, _nd) = make_inactivity_store(conn.clone(), /*bucket_shares=*/ 1, 60);
+    store
+        .record_share(None, "addr_back", 10.0, ms_ago(70))
+        .await
+        .unwrap();
+    let recent = ms_ago(5);
+    store
+        .record_share(None, "addr_back", 10.0, recent)
+        .await
+        .unwrap();
+    let _: () = conn
+        .hset(KEY_WINDOW_LAST_SHARE, "addr_back", ms_ago(70))
+        .await
+        .unwrap();
+
+    store.bootstrap_window_if_needed().await.unwrap();
+
+    let seen: String = conn.hget(KEY_WINDOW_LAST_SHARE, "addr_back").await.unwrap();
+    assert_eq!(seen.parse::<u64>().unwrap(), recent);
+    store.forget_inactive(ms_ago(0)).await.unwrap();
+    assert_eq!(
+        aggregate(&mut conn).await.get("addr_back").copied(),
+        Some(20.0),
+        "it mined five days ago and keeps both shares"
+    );
+}
+
+/// An address in the aggregate but in no bucket gets the current time.
+#[tokio::test]
+async fn seeding_gives_an_address_in_no_bucket_the_current_time() {
+    let Some(mut conn) = connect_or_skip(27).await else {
+        return;
+    };
+    let (store, _nd) = make_inactivity_store(conn.clone(), /*bucket_shares=*/ 1, 60);
+    store
+        .record_share(None, "addr_a", 10.0, ms_ago(1))
+        .await
+        .unwrap();
+    let _: () = conn
+        .hset(KEY_WINDOW_BY_ADDRESS, "addr_orphan", "5")
+        .await
+        .unwrap();
+    let before = bp_common::now_ms() as u64;
+
+    store.bootstrap_window_if_needed().await.unwrap();
+
+    let seen: String = conn
+        .hget(KEY_WINDOW_LAST_SHARE, "addr_orphan")
+        .await
+        .unwrap();
+    assert!(seen.parse::<u64>().unwrap() >= before);
+}
+
+/// A replayed older share does not move the last-share time back.
+#[tokio::test]
+async fn a_replayed_older_share_does_not_lower_the_last_share_time() {
+    let Some(mut conn) = connect_or_skip(22).await else {
+        return;
+    };
+    let (store, _nd) = make_inactivity_store(conn.clone(), /*bucket_shares=*/ 1, 60);
+    let latest = ms_ago(1);
+    store
+        .record_share(None, "addr_a", 10.0, latest)
+        .await
+        .unwrap();
+    store
+        .record_share(None, "addr_a", 10.0, ms_ago(80))
+        .await
+        .unwrap();
+
+    let seen: String = conn.hget(KEY_WINDOW_LAST_SHARE, "addr_a").await.unwrap();
+    assert_eq!(seen.parse::<u64>().unwrap(), latest);
+}
+
+/// The check runs off the share path in share time: a backlog replayed long
+/// after it was mined does not drop an address whose newer shares follow.
+#[tokio::test]
+async fn the_share_path_judges_inactivity_in_share_time() {
+    let Some(mut conn) = connect_or_skip(23).await else {
+        return;
+    };
+    let (store, _nd) = make_inactivity_store(conn.clone(), /*bucket_shares=*/ 1, 60);
+
+    // A backlog from 100 days ago: addr_a's last share there is followed by
+    // addr_b's 10 minutes later, inside the period in share time.
+    store
+        .record_share(None, "addr_a", 10.0, ms_ago(100))
+        .await
+        .unwrap();
+    store
+        .record_share(None, "addr_b", 10.0, ms_ago(100) + 600_000)
+        .await
+        .unwrap();
+    assert!(
+        aggregate(&mut conn).await.contains_key("addr_a"),
+        "share time says addr_a mined 10 minutes ago"
+    );
+
+    // A share 61 days after addr_a's last one runs the check and takes it out.
+    store
+        .record_share(None, "addr_b", 10.0, ms_ago(39))
+        .await
+        .unwrap();
+    let after = aggregate(&mut conn).await;
+    assert!(!after.contains_key("addr_a"), "got {after:?}");
+    assert_eq!(after.get("addr_b").copied(), Some(20.0));
+    assert_lockstep(&mut conn).await;
+}
+
+/// The share path checks at most once per minute of share time.
+#[tokio::test]
+async fn the_share_path_checks_at_most_once_a_minute() {
+    let Some(mut conn) = connect_or_skip(28).await else {
+        return;
+    };
+    let (store, _nd) = make_inactivity_store(conn.clone(), /*bucket_shares=*/ 1, 60);
+    let t0 = ms_ago(1);
+    // The first share runs the check, before addr_gone is in the window.
+    store.record_share(None, "addr_b", 10.0, t0).await.unwrap();
+    store
+        .record_share(None, "addr_gone", 10.0, t0 - 61 * DAY_MS)
+        .await
+        .unwrap();
+
+    store
+        .record_share(None, "addr_b", 10.0, t0 + 30_000)
+        .await
+        .unwrap();
+    assert!(
+        aggregate(&mut conn).await.contains_key("addr_gone"),
+        "30 s after the last check: no check yet"
+    );
+
+    store
+        .record_share(None, "addr_b", 10.0, t0 + 61_000)
+        .await
+        .unwrap();
+    assert!(
+        !aggregate(&mut conn).await.contains_key("addr_gone"),
+        "61 s after it: checked and gone"
+    );
+}
+
+/// A size trim that takes an address's last weight takes its last-share entry.
+#[tokio::test]
+async fn a_size_trim_that_empties_an_address_drops_its_last_share_entry() {
+    let Some(mut conn) = connect_or_skip(24).await else {
+        return;
+    };
+    // window = 4 × 1 = 4: the second share pushes the first bucket out.
+    let (store, _) = make_store(conn.clone(), 1.0, 1);
+    store
+        .record_share(None, "addr_a", 10.0, ts(0))
+        .await
+        .unwrap();
+    let seen: Option<String> = conn.hget(KEY_WINDOW_LAST_SHARE, "addr_a").await.unwrap();
+    assert!(seen.is_some(), "precondition: the share wrote its entry");
+    store
+        .record_share(None, "addr_b", 10.0, ts(1))
+        .await
+        .unwrap();
+
+    assert!(!aggregate(&mut conn).await.contains_key("addr_a"));
+    let seen: Option<String> = conn.hget(KEY_WINDOW_LAST_SHARE, "addr_a").await.unwrap();
+    assert!(seen.is_none());
+}
+
+/// A later share into the same bucket does not move its opening score (`NX`),
+/// which keeps FIFO order for the size rule and bounds the seeded time.
+#[tokio::test]
+async fn a_second_share_does_not_move_its_buckets_opening_time() {
+    let Some(mut conn) = connect_or_skip(25).await else {
+        return;
+    };
+    let (store, _nd) = make_inactivity_store(conn.clone(), /*bucket_shares=*/ 10, 90);
 
     store
         .record_share(None, "addr_old", 100.0, ms_ago(100))
@@ -900,7 +1215,7 @@ async fn a_second_share_does_not_refresh_its_buckets_age() {
     );
 }
 
-/// The bucket still taking shares is never dropped, however old or wherever
+/// The bucket still taking shares is never dropped by the size rule, wherever
 /// it sorts. The active bucket here sorts FIRST, so a rule that merely spared
 /// the last entry would drop `addr_b` and keep `addr_a`.
 #[tokio::test]
@@ -908,25 +1223,27 @@ async fn the_currently_filling_bucket_is_never_dropped() {
     let Some(mut conn) = connect_or_skip(21).await else {
         return;
     };
-    // One share per bucket, so the second share opens the active bucket.
-    let (store, _nd) = make_aged_store(conn.clone(), /*bucket_shares=*/ 1, 90);
+    // window = 4 × 1 = 4, one share per bucket, so every share is over size.
+    let (store, _nd) = make_store(conn.clone(), 1.0, 1);
 
-    // Bucket 1: past the cutoff, but active, so its own append keeps it.
+    let later = ts(1_000);
+    let earlier = later - 1_000;
+    // Bucket 1: over size, but active, so its own append keeps it.
     store
-        .record_share(None, "addr_a", 10.0, ms_ago(100))
+        .record_share(None, "addr_a", 10.0, later)
         .await
         .unwrap();
     let index: Vec<String> = conn.zrange(KEY_BUCKETS, 0, -1).await.unwrap();
     assert_eq!(
         index,
         vec!["1"],
-        "precondition: the aged bucket is active and stays"
+        "precondition: the over-size bucket is active and stays"
     );
 
-    // Bucket 2, now active, opened by a replayed 101-day-old share, so it is
-    // the index head; the completed bucket 1 is the one that has to go.
+    // Bucket 2, now active, opened by a replayed older share, so it is the
+    // index head; the completed bucket 1 is the one that has to go.
     store
-        .record_share(None, "addr_b", 10.0, ms_ago(101))
+        .record_share(None, "addr_b", 10.0, earlier)
         .await
         .unwrap();
 
@@ -934,24 +1251,17 @@ async fn the_currently_filling_bucket_is_never_dropped() {
     assert_eq!(
         index,
         vec!["2"],
-        "the completed, aged bucket 1 is dropped and the active bucket 2 stays \
-         although it sorts first and is older — got {index:?}"
+        "the completed bucket 1 is dropped and the active bucket 2 stays \
+         although it sorts first — got {index:?}"
     );
     let score: f64 = conn.zscore(KEY_BUCKETS, "2").await.unwrap();
     assert!(
-        score < ms_ago(100) as f64,
+        score < later as f64,
         "the survivor is the one that sorted FIRST, score {score}"
     );
 
-    let by_addr: HashMap<String, String> = conn.hgetall(KEY_WINDOW_BY_ADDRESS).await.unwrap();
-    assert!(
-        !by_addr.contains_key("addr_a"),
-        "the aged bucket's share must be gone, got {by_addr:?}"
-    );
-    assert!(
-        by_addr.contains_key("addr_b"),
-        "the open bucket keeps its share, got {by_addr:?}"
-    );
-    let total: String = conn.get(KEY_WINDOW_TOTAL).await.unwrap();
-    assert!((total.parse::<f64>().unwrap() - 10.0).abs() < 1e-9);
+    let by_addr = aggregate(&mut conn).await;
+    assert!(!by_addr.contains_key("addr_a"), "got {by_addr:?}");
+    assert!(by_addr.contains_key("addr_b"), "got {by_addr:?}");
+    assert!((total(&mut conn).await - 10.0).abs() < 1e-9);
 }

@@ -499,8 +499,9 @@ pub struct PplnsConfig {
     /// abandoned debit). Manual admin sweeps work regardless.
     #[serde(default = "default_true")]
     pub dust_sweep_enabled: bool,
-    /// Inactivity (days) before a `pplns_balance` row is sweepable. Must be
-    /// positive so freshly credited rows are never swept.
+    /// Inactivity (days) before a `pplns_balance` row is sweepable and before an
+    /// address with no share in that time leaves the PPLNS window with all its
+    /// weight. Must be positive so freshly credited rows are never swept.
     #[serde(default = "default_abandoned_days")]
     pub abandoned_balance_days: u32,
     /// Confirmations before a found block's distribution is booked, so an

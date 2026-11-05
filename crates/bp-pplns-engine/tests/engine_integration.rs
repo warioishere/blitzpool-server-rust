@@ -184,8 +184,7 @@ async fn drop_harness(h: EngineHarness) {
 
 // ── Test 1 — record_share appears in window_stats ──────────────────
 
-/// Share timestamp near now: a fixed old one would be aged out of the window
-/// mid-test. The offset keeps the relative order.
+/// Share timestamp near now. The offset keeps the relative order.
 fn ts(offset: u64) -> u64 {
     (bp_common::now_ms() as u64) - 1_000_000 + offset
 }

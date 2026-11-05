@@ -40,7 +40,7 @@ You versus Bitcoin. Your share wins → the entire coinbase goes to your address
 ### 🔗 PPLNS (Pay Per Last N Shares)
 Sliding-window pooled mining with a **multi-output coinbase** and a **signed credit/debit ledger**. Every miner in the window gets their proportional cut as their own coinbase output.
 
-- Window size: `4 × networkDifficulty` in diff-1-weighted shares, kept in buckets of 10 000 shares — anti-hop by design (sliding window, not per-block reset). Buckets older than `abandoned_balance_days` (default 90) leave the window as well.
+- Window size: `4 × networkDifficulty` in diff-1-weighted shares, kept in buckets of 10 000 shares — anti-hop by design (sliding window, not per-block reset). An address with no share for `abandoned_balance_days` (default 90) leaves the window with all its weight; an address that keeps mining keeps all its shares until the size rule takes them.
 - A per-miner **signed balance** keeps the pool non-custodial to the sat: sats a block's coinbase could not pay a miner (trimmed or sub-dust) become a *pending credit* for that miner, and the miners paid in its place book matching *pending debits*. Pool-wide balances sum to ~0 (bounded floor-rounding drift).
 
 ### 👥 Team Mining

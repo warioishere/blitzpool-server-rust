@@ -142,6 +142,9 @@ impl PplnsEngine {
             net_diff,
             config.abandoned_balance_days,
         );
+        // Every role runs this, not only the writer: the rebuild only fills a
+        // lost aggregate and the last-share seeding only raises, so a process
+        // running it next to the live writer never undoes a share.
         window.bootstrap_window_if_needed().await?;
         let dist_cfg = DistributionConfig::from_engine_config(&config);
         let distribution_builder = DistributionBuilder::new(pool.clone(), window.clone(), dist_cfg);
@@ -171,7 +174,7 @@ impl PplnsEngine {
             min_payout_sats = config.min_payout_sats.0,
             fee_percent = config.fee_percent,
             dust_sweep_enabled = config.dust_sweep_enabled,
-            // One field, not two: the window's age rule reads the same knob.
+            // One field, not two: the window's inactivity rule reads the same knob.
             abandoned_balance_days = config.abandoned_balance_days,
             background_tasks,
             "pplns-engine spawned"

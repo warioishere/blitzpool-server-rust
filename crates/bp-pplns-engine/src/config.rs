@@ -132,8 +132,8 @@ pub enum ConfigError {
 }
 
 /// Epoch-ms before which an owner counts as gone. The one place that turns
-/// `abandoned_balance_days` into a boundary, for the sweep, the window trim
-/// and the ledger summary alike.
+/// `abandoned_balance_days` into a boundary, for the sweep, the window's
+/// inactivity rule and the ledger summary alike.
 pub(crate) fn abandoned_cutoff_ms(now_ms: i64, abandoned_days: u32) -> i64 {
     now_ms - (abandoned_days as i64) * 86_400_000
 }

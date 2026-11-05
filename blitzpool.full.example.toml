@@ -103,7 +103,7 @@ coinbase_weight_budget = 50000
 min_payout_sats = 10000
 # confirmation_depth = 3                 # optional: blocks before a found block is booked
 # dust_sweep_enabled = true              # optional
-# abandoned_balance_days = 90            # optional
+# abandoned_balance_days = 90            # optional: days without a share before an address leaves the window and its balance is sweepable
 
 # Optional: grow the coinbase budget automatically when miners would be
 # left out, up to max_weight_budget.
