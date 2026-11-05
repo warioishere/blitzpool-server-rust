@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use axum::{extract::State, response::Json, routing::post, Router};
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 
 use crate::error::ApiError;
 use crate::state::SharedState;
@@ -19,8 +19,8 @@ const TTL_MS: i64 = 5 * 60 * 1000;
 /// In-memory report store, a process-global singleton. Each entry
 /// stores the report + receive timestamp; entries past TTL are dropped
 /// on every read.
-static STORE: Lazy<Mutex<HashMap<String, (DownstreamMinerReport, i64)>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static STORE: LazyLock<Mutex<HashMap<String, (DownstreamMinerReport, i64)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub(crate) fn routes() -> Router<SharedState> {
     Router::new().route("/api/downstream-report", post(receive).get(list))

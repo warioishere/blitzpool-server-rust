@@ -60,9 +60,6 @@ subtle = { workspace = true }
 # UTC slot-label formatting for chart endpoints (time_range util).
 chrono = { workspace = true }
 
-# In-process singleton for the downstream-report TTL-store (TS keeps it
-# on a NestJS singleton service; we mirror that with `once_cell`).
-once_cell = "1"
 
 # Per-endpoint response cache. moka gives us an async cache with
 # per-entry TTL + LRU eviction; values are stored as `Bytes`

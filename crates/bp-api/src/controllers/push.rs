@@ -269,12 +269,13 @@ struct StatusResponse {
     tracker: Option<TrackerInfo>,
 }
 
+/// Public, so it carries no endpoint: an ntfy topic or push URL would let
+/// anyone receive the address's notices.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StatusSubscription {
     id: i32,
     platform: String,
-    endpoint: String,
     subscription_type: String,
     created_at: String,
     last_notification_at: Option<String>,
@@ -307,7 +308,6 @@ async fn status(
         .map(|s| StatusSubscription {
             id: s.id,
             platform: s.platform.clone(),
-            endpoint: s.endpoint.clone(),
             subscription_type: s.subscription_type.clone(),
             created_at: format_iso_ms(s.created_at),
             last_notification_at: s.last_notification_at.map(format_iso_ms),

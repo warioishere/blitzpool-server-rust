@@ -143,9 +143,16 @@ impl IntoResponse for ApiError {
             return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
         }
         let status = self.status();
+        // A server error's detail stays in the log: it can name tables,
+        // queries or hosts. The client gets the stable code.
+        let message = if status.is_server_error() {
+            self.code().to_string()
+        } else {
+            self.to_string()
+        };
         let body = ErrorBody {
             code: self.code(),
-            message: self.to_string(),
+            message,
         };
         if status.is_server_error() {
             tracing::warn!(target: "bp_api", code = %body.code, error = %self,
@@ -257,5 +264,30 @@ mod degrade_tests {
             or_degraded(Ok::<f64, LiveReadError>(42.0), || 0.0).unwrap(),
             42.0
         );
+    }
+}
+
+#[cfg(test)]
+mod body_tests {
+    use super::*;
+
+    async fn body_of(err: ApiError) -> serde_json::Value {
+        let resp = err.into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// A server error answers with its code, never the detail behind it; a
+    /// client error keeps its message.
+    #[tokio::test]
+    async fn a_server_error_hides_its_detail_and_a_client_error_keeps_it() {
+        let internal = body_of(ApiError::Internal("relation \"x\" does not exist".into())).await;
+        assert_eq!(internal["message"], "internal-error");
+        assert!(!internal.to_string().contains("relation"));
+
+        let bad = body_of(ApiError::BadRequest("amount must be positive")).await;
+        assert_eq!(bad["message"], "bad request: amount must be positive");
     }
 }

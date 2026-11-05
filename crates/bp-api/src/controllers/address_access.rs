@@ -19,14 +19,14 @@ use axum::{
     Router,
 };
 use moka::sync::Cache;
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 
 use crate::controllers::address_ownership::parse_supported_address;
 use crate::controllers::email::email_error;
 use crate::email_hooks::AddressAccessContext;
 use crate::error::ApiError;
-use crate::middleware::address_auth::{revocation, ISSUED_TOKEN_TTL_MS};
+use crate::middleware::address_auth::revocation;
 use crate::middleware::{rate_limit, AddressAuth};
 use crate::state::SharedState;
 
@@ -34,7 +34,7 @@ use crate::state::SharedState;
 /// cannot flood the bound inbox.
 const PER_ADDRESS_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
-static RECENTLY_SENT: Lazy<Cache<String, ()>> = Lazy::new(|| {
+static RECENTLY_SENT: LazyLock<Cache<String, ()>> = LazyLock::new(|| {
     Cache::builder()
         .time_to_live(PER_ADDRESS_COOLDOWN)
         .max_capacity(100_000)
@@ -94,9 +94,7 @@ async fn password_link(
     if let Some(binding) = bound {
         if !RECENTLY_SENT.contains_key(address.as_str()) {
             RECENTLY_SENT.insert(address.as_str().to_string(), ());
-            let now = bp_common::now_ms();
-            let expires_at = now + ISSUED_TOKEN_TTL_MS;
-            let token = secret.issue(address.as_str(), now, expires_at);
+            let (token, expires_at) = secret.issue_now(address.as_str());
             state
                 .email_verification_hooks
                 .send_address_access(AddressAccessContext {

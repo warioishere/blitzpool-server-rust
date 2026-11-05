@@ -683,7 +683,6 @@ dependencies = [
  "hex",
  "hmac",
  "moka",
- "once_cell",
  "redis",
  "serde",
  "serde_json",

@@ -58,6 +58,14 @@ impl AddressTokenSecret {
         (!trimmed.is_empty()).then(|| Self(trimmed.to_string()))
     }
 
+    /// An address token for `address` issued now and valid for
+    /// [`ISSUED_TOKEN_TTL_MS`], with the moment it expires.
+    pub fn issue_now(&self, address: &str) -> (String, i64) {
+        let now = bp_common::now_ms();
+        let expires_at = now + ISSUED_TOKEN_TTL_MS;
+        (self.issue(address, now, expires_at), expires_at)
+    }
+
     /// An address token for `address`, issued at `issued_at_ms` and valid
     /// until `expires_at_ms`, the same string the sidecar issues for it.
     pub fn issue(&self, address: &str, issued_at_ms: i64, expires_at_ms: i64) -> String {
@@ -200,10 +208,7 @@ pub fn revocation(
 pub fn issue_address_token(state: &AppState, address: &str) -> Option<String> {
     match &state.address_auth {
         AddressAuth::Off(_) => None,
-        AddressAuth::Required(secret) => {
-            let now = bp_common::now_ms();
-            Some(secret.issue(address, now, now + ISSUED_TOKEN_TTL_MS))
-        }
+        AddressAuth::Required(secret) => Some(secret.issue_now(address).0),
     }
 }
 
