@@ -856,22 +856,12 @@ async fn main() -> ExitCode {
                             .and_then(membership::Membership::blockparty_service),
                         membership.as_ref().map(|m| m.coinbase_tags.clone()),
                     ));
-                // Needed to rebuild a full block for `submitblock`. Spawned
-                // before jdp::spawn so it subscribes before the first NewTemplate.
-                let template_tx_cache: Option<
-                    std::sync::Arc<bp_template_distribution::TemplateTxCache>,
-                > = if cfg.sv2.jdp_orphan_submitblock {
-                    Some(std::sync::Arc::new(
-                        bp_template_distribution::TemplateTxCache::spawn(&tdp_handle),
-                    ))
-                } else {
-                    tracing::info!(
-                        "jdp tx-cache: SKIPPED (sv2.jdp_orphan_submitblock = false); pool does \
-                         not need declared tx-bytes — JDC propagates blocks via its own TDP \
-                         submit_solution"
-                    );
-                    None
-                };
+                // Supplies declared transactions the pool's templates already
+                // carry. Spawned before jdp::spawn so it subscribes before the
+                // first NewTemplate.
+                let template_tx_cache = std::sync::Arc::new(
+                    bp_template_distribution::TemplateTxCache::spawn(&tdp_handle),
+                );
                 // Same constructor as the Stratum sinks, so a declared block
                 // books through the same path as a pool-built one.
                 let jdp_ledger_booker =
@@ -887,7 +877,6 @@ async fn main() -> ExitCode {
                     &cfg,
                     jdp_bridge,
                     tdp_handle,
-                    handles.bitcoin_rpc.clone(),
                     jdp_payout_resolver,
                     template_tx_cache,
                     jdp_ledger_booker,

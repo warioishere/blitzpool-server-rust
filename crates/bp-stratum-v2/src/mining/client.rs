@@ -5414,7 +5414,6 @@ pub(crate) mod tests {
                 merkle_path: crate::jdp::custom_job_binding::declared_merkle_path(
                     &raw_transactions,
                 ),
-                raw_transactions,
                 prev_hash: [0xAB; 32],
                 declared_at_ms: 1_000,
                 booking: None,
@@ -7574,7 +7573,6 @@ pub(crate) mod tests {
                 merkle_path: crate::jdp::custom_job_binding::declared_merkle_path(
                     &raw_transactions,
                 ),
-                raw_transactions,
                 prev_hash: [0xAB; 32],
                 declared_at_ms: 1_000,
                 booking: None,

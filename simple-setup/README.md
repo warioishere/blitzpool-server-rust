@@ -1,7 +1,7 @@
 # simple-setup
 
 The starting point for a new pool: two pool processes, Postgres, Valkey and
-an optional Bitcoin Core 31 node, all from one `docker-compose.yml`. Every
+an optional Bitcoin Core 32 node, all from one `docker-compose.yml`. Every
 payout mode works here; Solo is on by default, the others are switched on in
 the config.
 

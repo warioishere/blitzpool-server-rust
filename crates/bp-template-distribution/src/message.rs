@@ -130,7 +130,7 @@ impl TemplateUpdate {
                 Some(Self::SetNewPrevHash(SetNewPrevHash {
                     template_id: p.template_id,
                     prev_hash: prev,
-                    header_timestamp: p.header_timestamp,
+                    header_timestamp: p.ntime_start,
                     n_bits: p.n_bits,
                     target: tgt,
                 }))
@@ -225,7 +225,7 @@ mod tests {
         let upstream = TemplateDistributionOwned::SetNewPrevHash(TdSetNewPrevHash {
             template_id: 7,
             prev_hash: u256(0xa1),
-            header_timestamp: 1_700_000_000,
+            ntime_start: 1_700_000_000,
             n_bits: 0x1d00_ffff,
             target: u256(0xff),
         });
@@ -312,7 +312,7 @@ mod tests {
         let upstream2 = TemplateDistributionOwned::SetNewPrevHash(TdSetNewPrevHash {
             template_id: 1,
             prev_hash: u256(0xaa),
-            header_timestamp: 1_700_000_000,
+            ntime_start: 1_700_000_000,
             n_bits: 0x1d00_ffff,
             target: u256(0xff),
         });
@@ -374,8 +374,8 @@ mod tests {
             TemplateDistributionOwned::SubmitSolution(TdSubmitSolution {
                 template_id: 1,
                 version: 0,
-                header_timestamp: 0,
-                header_nonce: 0,
+                ntime: 0,
+                nonce: 0,
                 coinbase_tx: b064k(vec![0x01]),
             }),
         ];

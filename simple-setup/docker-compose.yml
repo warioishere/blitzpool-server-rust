@@ -1,5 +1,5 @@
 # Blitzpool: two pool processes, Postgres and Valkey, and optionally a
-# Bitcoin Core 31 node. See DEPLOYMENT.md in the repo root.
+# Bitcoin Core 32 node. See DEPLOYMENT.md in the repo root.
 #
 #   cp ../blitzpool.example.toml blitzpool.toml   # then edit it
 #   docker compose --profile bitcoin up -d --build   # with the bundled node
@@ -121,7 +121,7 @@ services:
     volumes:
       - "redis-data:/data"
 
-  # Optional Bitcoin Core 31 node: `docker compose --profile bitcoin up`.
+  # Optional Bitcoin Core 32 node: `docker compose --profile bitcoin up`.
   # Mainnet needs a full initial sync (days) before the pool can serve work.
   bitcoin:
     profiles: ["bitcoin"]

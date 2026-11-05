@@ -24,14 +24,15 @@ const CANDIDATE_PREFIXES: &[&str] = &[
     "/usr/local",
     "/opt/bitcoin",
     // Extracted-tarball directories in a home directory.
-    "~/bitcoin-31.0",
-    "~/bitcoin-30.0",
+    "~/bitcoin-32.1",
+    "~/bitcoin-32.0",
 ];
 
-/// Lowest bitcoin-core major version the harness can drive. The v31 IPC
-/// schema has `Init.makeMining @3` (`@2` in v30), so a v30 node fails TDP
-/// startup with a capnp `Unimplemented`; checked up front to skip cleanly.
-pub const MIN_BITCOIN_NODE_MAJOR: u32 = 31;
+/// Lowest bitcoin-core major version the harness can drive. The pool's IPC
+/// clients speak the v32 schema (`bp_template_distribution::BITCOIN_CORE_VERSION`),
+/// where a solved block goes through `Mining.submitBlock @7` and
+/// `submitSolution` is `@10`; checked up front to skip cleanly.
+pub const MIN_BITCOIN_NODE_MAJOR: u32 = 32;
 
 /// Find a usable `bitcoin-node`. Returns `(path, found)`; when not found the
 /// path only makes the skip message concrete (a too-old binary if any).
@@ -54,7 +55,7 @@ pub fn discover_bitcoin_node() -> (PathBuf, bool) {
             if is_usable(&candidate) {
                 return (candidate, true);
             }
-            // A v30 earlier on `$PATH` must not shadow a v31 later; keep it
+            // An older node earlier on `$PATH` must not shadow a v32 later; keep it
             // for the skip message.
             too_old.get_or_insert_with(|| candidate.clone());
         }
@@ -229,11 +230,10 @@ impl RegtestConfig {
 fn too_old_reason(path: &Path, major: u32) -> String {
     let path = path.display();
     format!(
-        "{path} is v{major}; the SV2 IPC bindings call `Init.makeMining @3`, which only \
-         exists from v{MIN_BITCOIN_NODE_MAJOR} on. Point \
-         {BITCOIN_NODE_PATH_ENV} at a v{MIN_BITCOIN_NODE_MAJOR}+ multiprocess build (that \
-         also bypasses this check, for a master build whose `v30.99` banner cannot say \
-         which side of the renumbering it is on)"
+        "{path} is v{major}; the pool's IPC clients speak the \
+         v{MIN_BITCOIN_NODE_MAJOR} schema. Point {BITCOIN_NODE_PATH_ENV} at a \
+         v{MIN_BITCOIN_NODE_MAJOR}+ multiprocess build (that also bypasses this check, for a \
+         master build whose banner cannot say which schema it speaks)"
     )
 }
 
@@ -353,13 +353,18 @@ mod tests {
         );
     }
 
-    /// Pins that a real banner is parsed and v30 is rejected.
+    /// Pins that a real banner is parsed and a node older than v32 is rejected.
     #[test]
-    fn version_banner_is_parsed_and_v30_is_rejected() {
+    fn version_banner_is_parsed_and_pre_v32_is_rejected() {
         let v30 = "Bitcoin Core daemon version v30.2 bitcoin-node\n\
                    Copyright (C) 2009-2026 The Bitcoin Core developers";
         assert_eq!(parse_major_version(v30), Some(30));
         assert!(parse_major_version(v30).unwrap() < MIN_BITCOIN_NODE_MAJOR);
+        let v31 = "Bitcoin Core daemon version v31.2 bitcoin-node";
+        assert!(
+            parse_major_version(v31).unwrap() < MIN_BITCOIN_NODE_MAJOR,
+            "a v31 node lacks the v32 IPC schema"
+        );
 
         assert_eq!(
             parse_major_version("Bitcoin Core daemon version v31.0 bitcoin-node"),
@@ -433,7 +438,7 @@ mod tests {
             "a missing binary should name the override env var: {reason}"
         );
         // A stub that really answers with a v30 banner reaches the too-old arm.
-        let hallmark = "the SV2 IPC bindings call";
+        let hallmark = "IPC clients speak the";
         let stub = v30_banner_stub();
         let old = RegtestConfig::default().with_bitcoin_node_path(&stub);
         assert!(

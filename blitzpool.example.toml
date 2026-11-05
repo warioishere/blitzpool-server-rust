@@ -16,14 +16,14 @@ network = "mainnet"
 # Written into every coinbase scriptSig.
 pool_identifier = "blitzpool"
 
-# JSON-RPC to Bitcoin Core: submitblock fallback, chain reads.
+# JSON-RPC to Bitcoin Core: chain reads.
 [bitcoin_rpc]
 url = "http://bitcoin"            # bundled node; your own node: http://host.docker.internal
 port = 8332                       # mainnet 8332, testnet4 48332, regtest 18443
 user = "blitzpool"                # rpcuser from bitcoin.conf
 password = "CHANGE-ME"            # rpcpassword from bitcoin.conf
 
-# Block templates come over Bitcoin Core 31's IPC socket (Template
+# Block templates come over Bitcoin Core 32's IPC socket (Template
 # Distribution Protocol). The node must run as `bitcoin-node` (not bitcoind)
 # with -ipcbind=unix:<path>; the compose file mounts that socket here.
 [tdp]

@@ -38,7 +38,7 @@ bp-test-support = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 chrono = { workspace = true }
 async-trait = { workspace = true }
-# E2E regtest deps — boot bitcoin-core 31, attach TDP, assemble + submit
+# E2E regtest deps — boot bitcoin-core 32, attach TDP, assemble + submit
 # a Blockparty coinbase, assert tip advances + history idempotency.
 bp-regtest-harness = { workspace = true }
 bp-template-distribution = { workspace = true }

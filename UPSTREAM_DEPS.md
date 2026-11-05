@@ -86,23 +86,25 @@ uses `<dep> = { workspace = true }`, so the version is set in one place.
 
 | Crate | Source | Pin type | Current pin |
 |---|---|---|---|
-| `stratum-core` | crates.io | `version` | `0.6.0` (`binary_sv2 v7`) |
-| `stratum-apps` | `github.com/stratum-mining/sv2-apps.git` | `tag = "..."` | `v0.8.0` |
-| `bitcoin_core_sv2` | `github.com/stratum-mining/sv2-apps.git` | `tag = "..."` | `v0.8.0` |
-| `jd_server_sv2` | `github.com/stratum-mining/sv2-apps.git` | `tag = "..."` | `v0.8.0` |
+| `stratum-core` | crates.io | `version` | `0.7.0` (`binary_sv2 v8`) |
+| `stratum-apps` | `github.com/stratum-mining/sv2-apps.git` | `tag = "..."` | `v0.9.0` |
+| `bitcoin_core_sv2` | `github.com/stratum-mining/sv2-apps.git` | `tag = "..."` | `v0.9.0` |
+| `jd_server_sv2` | `github.com/stratum-mining/sv2-apps.git` | `tag = "..."` | `v0.9.0` |
 
-**Why they must agree**: `bitcoin_core_sv2` at `v0.8.0` transitively pins
-`stratum-core = "0.6.0"` from crates.io. The workspace declares the same
-`0.6.0` so Cargo builds one `stratum-core` instead of two. All three sv2-apps
+**Why they must agree**: `bitcoin_core_sv2` at `v0.9.0` transitively pins
+`stratum-core = "0.7.0"` from crates.io. The workspace declares the same
+`0.7.0` so Cargo builds one `stratum-core` instead of two. All three sv2-apps
 crates carry the same tag for the same reason: a mismatch splits the
 transitive `stratum` graph and the build breaks. This is a type-level
 requirement, not only a build-size concern: `jdp_hooks.rs` hands
 `DeclareMiningJobOwned` values to `jd_server_sv2`, and two `binary_sv2` majors
 side by side do not type-check.
 
-The code consumes the **`v31x`** backend (Bitcoin Core v31):
-`bitcoin_core_sv2::unix_capnp::v31x::template_distribution_protocol` plus
-`bitcoin_core_sv2::runtime_api` for the message types.
+The code goes through the version-agnostic `bitcoin_core_sv2::runtime_api`
+and selects the **`v32x`** backend (Bitcoin Core v32) with one constant,
+`bp_template_distribution::BITCOIN_CORE_VERSION`, shared by the TDP worker and
+the JDP validation engine. A pushed JDP solution is propagated through the same
+engine (`BitcoinCoreIPCEngine::handle_push_solution`, IPC `submitBlock`).
 
 ### Tag to tag, never upstream `main`
 
@@ -152,8 +154,8 @@ workspace version is always the exact crates.io version the pinned
 5. `cargo update -p bitcoin_core_sv2 -p stratum-apps -p jd_server_sv2 -p stratum-core`.
 6. **Bitcoin Core compatibility**: the Cap'n-Proto schema in
    `bitcoin_core_sv2` targets specific Bitcoin Core releases. Confirm the
-   backend in use (`v31x`) still matches the Core version the pool runs
-   against. The schema files live under `bitcoin-core-sv2/` upstream.
+   backend in `BITCOIN_CORE_VERSION` still matches the Core version the pool
+   runs against. The schema files live under `bitcoin-core-sv2/` upstream.
 7. `cargo check --workspace`, then `cargo test --workspace -- --nocapture`.
    Breaking changes usually surface in `bp-template-distribution`,
    `bin/blitzpool/src/jdp_hooks.rs` and the `bp-stratum-v2` codecs. The
@@ -225,20 +227,20 @@ their paths):
 # published from. That repo's tags are v1.x and do not follow the crate
 # version, so take the commit from the published crate itself:
 SHA=$(grep -o '"sha1": "[0-9a-f]*"' \
-  ~/.cargo/registry/src/*/stratum-core-0.6.0/.cargo_vcs_info.json | cut -d'"' -f4)
+  ~/.cargo/registry/src/*/stratum-core-0.7.0/.cargo_vcs_info.json | cut -d'"' -f4)
 git -C "$STRATUM" log --oneline "$SHA"..origin/main | head -40
 
 # sv2-apps changes since the pinned tag
-git -C "$SV2_APPS" log --oneline v0.8.0..origin/main | head -40
+git -C "$SV2_APPS" log --oneline v0.9.0..origin/main | head -40
 
 # bitcoin_core_sv2-specific changes
-git -C "$SV2_APPS" log --oneline v0.8.0..origin/main -- bitcoin-core-sv2/
+git -C "$SV2_APPS" log --oneline v0.9.0..origin/main -- bitcoin-core-sv2/
 
 # stratum-apps-specific changes
-git -C "$SV2_APPS" log --oneline v0.8.0..origin/main -- stratum-apps/
+git -C "$SV2_APPS" log --oneline v0.9.0..origin/main -- stratum-apps/
 
 # jd_server_sv2-specific changes (only the validation engine is used)
-git -C "$SV2_APPS" log --oneline v0.8.0..origin/main -- pool-apps/jd-server/
+git -C "$SV2_APPS" log --oneline v0.9.0..origin/main -- pool-apps/jd-server/
 ```
 
 Look for:

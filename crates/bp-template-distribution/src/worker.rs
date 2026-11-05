@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use async_channel::{Receiver as AcReceiver, Sender as AcSender};
-use bitcoin_core_sv2::unix_capnp::v31x::template_distribution_protocol::BitcoinCoreSv2TDP;
+use bitcoin_core_sv2::runtime_api::template_distribution_protocol as tdp_runtime;
 use stratum_core::{
     parsers_sv2::TemplateDistributionOwned,
     template_distribution_sv2::{
@@ -22,6 +22,14 @@ use tracing::{debug, error, info, warn};
 use crate::config::{TdpCoinbaseConstraints, TdpConfig};
 use crate::error::TdpError;
 use crate::message::{TdpRequest, TemplateUpdate};
+
+/// How many templates the runtime keeps open at one chain tip: all of them.
+/// A `SubmitSolution` names the template its job was built from, and Core
+/// rebuilds the block from that template, so a destroyed one loses the block.
+/// SV1 and SV2 jobs stay valid for the whole tip (`bp-jobs-lifecycle` retires
+/// them only on a new block), so every template of the tip must stay open
+/// until the tip changes. The runtime logs a memory warning for this value.
+const MAX_SAME_TIP_TEMPLATES: Option<usize> = Some(usize::MAX);
 
 /// Spawns the dedicated TDP thread. Returns once the TDP's `new()` call has
 /// completed (success or failure). The thread itself keeps running until
@@ -104,10 +112,12 @@ fn run_thread(
             let (from_tdp_tx, from_tdp_rx) =
                 async_channel::unbounded::<TemplateDistributionOwned>();
 
-            let tdp = match BitcoinCoreSv2TDP::new(
+            let tdp = match tdp_runtime::new(
+                crate::BITCOIN_CORE_VERSION,
                 &socket_path,
                 fee_threshold,
                 min_interval,
+                MAX_SAME_TIP_TEMPLATES,
                 into_tdp_rx,
                 from_tdp_tx,
                 conn_cancel.clone(),
@@ -338,8 +348,8 @@ fn make_submit_solution(
         SubmitSolutionOwned {
             template_id,
             version,
-            header_timestamp,
-            header_nonce,
+            ntime: header_timestamp,
+            nonce: header_nonce,
             coinbase_tx,
         },
     ))

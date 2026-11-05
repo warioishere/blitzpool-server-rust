@@ -25,3 +25,9 @@ pub use message::{
     SetNewPrevHash, TdpRequest, TemplateSnapshot, TemplateUpdate,
 };
 pub use tx_cache::TemplateTxCache;
+
+/// The Bitcoin Core IPC schema family every IPC client in the pool speaks: the
+/// TDP worker here and the JDP validation engine in the binary. Both talk to
+/// the same node, so they share this one value.
+pub const BITCOIN_CORE_VERSION: bitcoin_core_sv2::runtime_api::BitcoinCoreVersion =
+    bitcoin_core_sv2::runtime_api::BitcoinCoreVersion::V32X;

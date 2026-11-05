@@ -218,17 +218,15 @@ pub enum JdpSessionEvent {
     /// A `DeclareMiningJob` was accepted. Only the key: the rest is read off
     /// the stored [`DeclaredJob`], so nothing here can disagree with it.
     JobDeclared { new_token: Token },
-    /// A `PushSolution` resolved against a declared job; the IO layer builds
-    /// the block and calls `submitblock` (idempotent, the JDC submits too).
-    BlockSubmissionCandidate {
+    /// A `PushSolution` resolved against a declared job; the IO layer books
+    /// it. Propagation is the validator's (`DeclaredJobValidator::propagate_solution`).
+    FoundBlock {
         miner_address: AddressId,
         declaration: DeclarationRef,
-        /// Non-witness coinbase: prefix + extranonce + suffix.
-        coinbase_raw: Vec<u8>,
-        /// Positions 1..=N in `wtxid_list` order, coinbase excluded; may carry
-        /// witness data.
-        transactions: Vec<Vec<u8>>,
-        header: SolutionHeader,
+        /// The declared coinbase with the pushed extranonce.
+        coinbase: bitcoin::Transaction,
+        /// The solved block's header.
+        header: bitcoin::block::Header,
         /// From the declare-time ext 0x0003/Output Verification proof; decides
         /// both booking and settlement, see [`CandidateBacking`].
         backing: CandidateBacking,
@@ -672,15 +670,28 @@ pub fn handle_provide_missing_transactions_success(
     accept_declaration(state, &pending.input, merged, pending.miner_address, ctx)
 }
 
-// ── Internal: accept_declaration ────────────────────────────────────
+// ── Declaration acceptance ──────────────────────────────────────────
 
-fn accept_declaration(
-    state: &mut JdpSessionState,
+/// What the pool's own checks settle about a declaration it would accept.
+#[derive(Clone, Copy, Debug)]
+pub struct DeclarationAcceptance {
+    /// The pool's tip the declaration binds to.
+    prev_hash: [u8; 32],
+    booking: Option<PayoutBooking>,
+    /// See [`DeclaredJob::distribution_id`].
+    distribution_id: Option<u64>,
+}
+
+/// The pool's own checks on a declaration, refusing it or settling what it is
+/// accepted on. Pure, so the IO layer runs it before asking the node: the
+/// node's validation engine keeps the last declaration it accepted as the one
+/// a `PushSolution` is rebuilt from, so it must not see one the pool refuses.
+pub fn declaration_refusal(
+    state: &JdpSessionState,
     input: &DeclareMiningJobInput,
-    raw_transactions: Vec<Vec<u8>>,
-    miner_address: AddressId,
-    ctx: DeclarationContext,
-) -> JdpHandlerOutcome {
+    miner_address: &AddressId,
+    ctx: &DeclarationContext,
+) -> Result<DeclarationAcceptance, JdpHandlerOutcome> {
     // A declaration binds to the pool's tip; before the first template there
     // is none, so refuse with the one code a JD-client retries.
     let Some(prev_hash) = ctx.current_prev_hash else {
@@ -688,11 +699,11 @@ fn accept_declaration(
             request_id = input.request_id,
             "jdp: declaration arrived before the pool knows a chain tip — rejecting retryably"
         );
-        return JdpHandlerOutcome::declare_error(
+        return Err(JdpHandlerOutcome::declare_error(
             input.request_id,
             ERR_STALE_CHAIN_TIP,
             b"the pool has no chain tip yet",
-        );
+        ));
     };
 
     // Must rebuild on EVERY connection: `crate::jdp::custom_job_binding`
@@ -704,11 +715,11 @@ fn accept_declaration(
             request_id = input.request_id,
             "jdp: declared coinbase cannot be reconstructed — rejecting the declaration"
         );
-        return JdpHandlerOutcome::declare_error(
+        return Err(JdpHandlerOutcome::declare_error(
             input.request_id,
             ERR_INVALID_JOB_PARAM_COINBASE,
             b"declared coinbase does not rebuild from prefix + slot + suffix",
-        );
+        ));
     };
 
     // ext 0x0003/Validation: a negotiated declaration MUST reference a published
@@ -726,11 +737,11 @@ fn accept_declaration(
                 request_id = input.request_id,
                 "jdp: 0x0003 negotiated but DeclareMiningJob carries no distribution_id TLV — rejecting"
             );
-            return JdpHandlerOutcome::declare_error(
+            return Err(JdpHandlerOutcome::declare_error(
                 input.request_id,
                 ERR_INVALID_PAYOUT_DISTRIBUTION,
                 b"missing distribution_id TLV (ext 0x0003 is negotiated)",
-            );
+            ));
         }
         // Judged against the address's mode NOW and the token's miner: a
         // `PushSolution` block books from the declaration alone, so a plan of
@@ -768,16 +779,34 @@ fn accept_declaration(
                     ?refusal,
                     "jdp: declared coinbase refused against its ext 0x0003 distribution"
                 );
-                return JdpHandlerOutcome::declare_error(
+                return Err(JdpHandlerOutcome::declare_error(
                     input.request_id,
                     refusal.error_code(),
                     refusal.details(),
-                );
+                ));
             }
         }
     }
     // No base-protocol designated-output check: such jobs are Solo-only, where
     // that output is the declarer's own. ⚠️ Must change if served off Solo.
+    Ok(DeclarationAcceptance {
+        prev_hash,
+        booking: declared_booking,
+        distribution_id: declared_distribution_id,
+    })
+}
+
+fn accept_declaration(
+    state: &mut JdpSessionState,
+    input: &DeclareMiningJobInput,
+    raw_transactions: Vec<Vec<u8>>,
+    miner_address: AddressId,
+    ctx: DeclarationContext,
+) -> JdpHandlerOutcome {
+    let acceptance = match declaration_refusal(state, input, &miner_address, &ctx) {
+        Ok(acceptance) => acceptance,
+        Err(refusal) => return refusal,
+    };
 
     // Minted outside `allocate`, so the allocate rate limit cannot block it.
     let new_token = match state.tokens.mint_for_declaration() {
@@ -800,11 +829,10 @@ fn accept_declaration(
         coinbase_tx_prefix: input.coinbase_tx_prefix.clone(),
         coinbase_tx_suffix: input.coinbase_tx_suffix.clone(),
         merkle_path: crate::jdp::custom_job_binding::declared_merkle_path(&raw_transactions),
-        raw_transactions,
-        prev_hash,
+        prev_hash: acceptance.prev_hash,
         declared_at_ms: ctx.now_ms,
-        booking: declared_booking,
-        distribution_id: declared_distribution_id,
+        booking: acceptance.booking,
+        distribution_id: acceptance.distribution_id,
     });
 
     JdpHandlerOutcome {
@@ -818,9 +846,10 @@ fn accept_declaration(
 
 // ── Handler: PushSolution ───────────────────────────────────────────
 
-/// Handle `PushSolution`: match a declared job
-/// ([`DeclaredJobStore::match_for_solution`]), rebuild the coinbase and emit a
-/// [`JdpSessionEvent::BlockSubmissionCandidate`] booked to that job's own miner.
+/// Handle `PushSolution`: find the declared job whose block meets the pool's
+/// target and emit it as a [`JdpSessionEvent::FoundBlock`], booked to that
+/// job's own miner. Propagation is not done here; the caller hands the
+/// solution to the node.
 pub fn handle_push_solution(
     state: &mut JdpSessionState,
     input: &PushSolutionInput,
@@ -831,25 +860,31 @@ pub fn handle_push_solution(
     if !state.full_template_mode {
         tracing::info!(
             prev_hash = %input.header.prev_hash.as_hex(),
-            "jdp: PushSolution from a Coinbase-only session — no declaration to reassemble the \
+            "jdp: PushSolution from a Coinbase-only session — no declaration to identify the \
              block from; the JDC propagates it and the mining side records it"
         );
         return JdpHandlerOutcome::default();
     }
-    // `PushSolution` names no declaration, so the one whose header meets the
-    // pool's target is the one solved; a frame matching none is dropped
-    // before any transaction is copied or the block rebuilt.
-    let job = match pool_target {
-        Some(target) => state
-            .declared_jobs
-            .iter()
-            .find(|job| solution_meets_target(job, input, &target)),
-        // Before the first template there is no target to check against.
-        None => state
-            .declared_jobs
-            .match_for_solution(&input.header.prev_hash),
+    // Before the first template the pool has no target, and no declaration:
+    // `declaration_refusal` refuses every one until it knows a tip.
+    let Some(target) = pool_target else {
+        tracing::warn!(
+            prev_hash = %input.header.prev_hash.as_hex(),
+            "jdp: PushSolution before the pool knows a chain tip — no declaration to match"
+        );
+        return JdpHandlerOutcome::default();
     };
-    let Some(job) = job else {
+    // `PushSolution` names no declaration, so the one whose block meets the
+    // pool's target is the one solved.
+    use bitcoin::hashes::Hash as _;
+    let target = bp_share::Target::from_le_bytes(target);
+    let solved = state.declared_jobs.iter().find_map(|job| {
+        let (coinbase, header) = solved_block(job, input)?;
+        target
+            .is_met_by_le(&header.block_hash().to_byte_array())
+            .then_some((job, coinbase, header))
+    });
+    let Some((job, coinbase, header)) = solved else {
         tracing::warn!(
             prev_hash = %input.header.prev_hash.as_hex(),
             declared = state.declared_jobs.len(),
@@ -859,8 +894,6 @@ pub fn handle_push_solution(
         return JdpHandlerOutcome::default();
     };
 
-    let new_token = job.new_token;
-    let miner_address = job.miner_address.clone();
     // `match` over BOTH fields: `booking.is_some()` answers a different question.
     let backing = match (job.booking, job.distribution_id) {
         (Some(booking), _) => CandidateBacking::Bookable(booking),
@@ -881,51 +914,38 @@ pub fn handle_push_solution(
         // Base-protocol: nothing to book or settle.
         (None, None) => CandidateBacking::BaseProtocol,
     };
-    let coinbase_prefix = job.coinbase_tx_prefix.clone();
-    let coinbase_suffix = job.coinbase_tx_suffix.clone();
-    let transactions = job.raw_transactions.clone();
-
-    let mut coinbase_raw =
-        Vec::with_capacity(coinbase_prefix.len() + input.extranonce.len() + coinbase_suffix.len());
-    coinbase_raw.extend_from_slice(&coinbase_prefix);
-    coinbase_raw.extend_from_slice(&input.extranonce);
-    coinbase_raw.extend_from_slice(&coinbase_suffix);
 
     JdpHandlerOutcome {
         outbound: Vec::new(),
-        events: vec![JdpSessionEvent::BlockSubmissionCandidate {
-            miner_address,
+        events: vec![JdpSessionEvent::FoundBlock {
+            miner_address: job.miner_address.clone(),
             declaration: DeclarationRef {
-                new_token,
+                new_token: job.new_token,
                 jdp_session_id: state.session_id,
             },
             backing,
-            coinbase_raw,
-            transactions,
-            header: input.header,
+            coinbase,
+            header,
         }],
     }
 }
 
-/// Whether `input` solves `job` below `target` (little-endian, the pool's own).
-fn solution_meets_target(job: &DeclaredJob, input: &PushSolutionInput, target: &[u8; 32]) -> bool {
-    solution_hash(job, input)
-        .is_some_and(|hash| bp_share::Target::from_le_bytes(*target).is_met_by_le(&hash))
-}
-
-/// The header hash `input` gives on `job`: the declared coinbase with the
-/// pushed extranonce, the declaration's merkle branch and the pushed header
-/// fields. `None` when the coinbase does not decode or the declared
-/// transactions did not.
-fn solution_hash(job: &DeclaredJob, input: &PushSolutionInput) -> Option<[u8; 32]> {
+/// The block `input` solves on `job`: the declared coinbase with the pushed
+/// extranonce, and the header of the pushed fields over its merkle root folded
+/// up the declaration's branch. `None` when the coinbase does not decode or
+/// the declared transactions did not.
+fn solved_block(
+    job: &DeclaredJob,
+    input: &PushSolutionInput,
+) -> Option<(bitcoin::Transaction, bitcoin::block::Header)> {
     use bitcoin::hashes::Hash as _;
     let merkle_path = job.merkle_path.as_deref()?;
-    let mut coinbase_raw = Vec::with_capacity(
-        job.coinbase_tx_prefix.len() + input.extranonce.len() + job.coinbase_tx_suffix.len(),
-    );
-    coinbase_raw.extend_from_slice(&job.coinbase_tx_prefix);
-    coinbase_raw.extend_from_slice(&input.extranonce);
-    coinbase_raw.extend_from_slice(&job.coinbase_tx_suffix);
+    let coinbase_raw = [
+        job.coinbase_tx_prefix.as_slice(),
+        &input.extranonce,
+        &job.coinbase_tx_suffix,
+    ]
+    .concat();
     let coinbase = crate::jdp::dynamic_outputs::decode_solution_coinbase(&coinbase_raw)?;
     let merkle_root = bp_mining_job::merkle_root_from_coinbase(
         &coinbase.compute_txid().to_byte_array(),
@@ -939,14 +959,16 @@ fn solution_hash(job: &DeclaredJob, input: &PushSolutionInput) -> Option<[u8; 32
         input.header.n_bits,
         input.header.nonce,
     );
-    Some(bp_share::sha256d(&header))
+    let header = bitcoin::consensus::deserialize(&header).expect("80 bytes are a block header");
+    Some((coinbase, header))
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::extensions::RequestExtensions;
     use crate::jdp::payout_distribution::{compute_payout_vector, WeightedOutput};
+    use bitcoin::hashes::Hash as _;
     use std::collections::HashMap;
 
     // ── Fixtures ───────────────────────────────────────────────────
@@ -1009,7 +1031,7 @@ mod tests {
     /// A well-formed `coinbase_tx_prefix`: header, BIP-34 height push, and a
     /// 12-byte extranonce slot the prefix stops at.
     const EXTRANONCE_SLOT: usize = 12;
-    fn coinbase_prefix() -> Vec<u8> {
+    pub(crate) fn coinbase_prefix() -> Vec<u8> {
         use bitcoin::consensus::Encodable;
         let script_sig_head: [u8; 3] = [0x03, 0xC8, 0x00];
         let mut p = Vec::new();
@@ -1025,7 +1047,7 @@ mod tests {
     }
 
     /// One consensus-serialised output, enough to make a rebuildable coinbase.
-    fn one_output_blob() -> Vec<u8> {
+    pub(crate) fn one_output_blob() -> Vec<u8> {
         let mut b = vec![0x01]; // output count
         b.extend_from_slice(&312_500_000u64.to_le_bytes());
         b.push(0x01); // script length
@@ -1034,7 +1056,7 @@ mod tests {
     }
 
     /// `nSequence + outputs + nLockTime`, paired with [`coinbase_prefix`].
-    fn coinbase_suffix(outputs_consensus: &[u8]) -> Vec<u8> {
+    pub(crate) fn coinbase_suffix(outputs_consensus: &[u8]) -> Vec<u8> {
         let mut s = 0xFFFF_FFFFu32.to_le_bytes().to_vec();
         s.extend_from_slice(outputs_consensus);
         s.extend_from_slice(&0u32.to_le_bytes());
@@ -2515,7 +2537,7 @@ mod tests {
                 n_bits: 0,
             },
         };
-        let out = handle_push_solution(&mut s, &solution, None);
+        let out = handle_push_solution(&mut s, &solution, Some(EASIEST_TARGET));
         assert!(out.outbound.is_empty());
         assert!(out.events.is_empty());
     }
@@ -2534,7 +2556,7 @@ mod tests {
                 n_bits: 0,
             },
         };
-        let out = handle_push_solution(&mut s, &solution, None);
+        let out = handle_push_solution(&mut s, &solution, Some(EASIEST_TARGET));
         assert!(out.events.is_empty());
     }
 
@@ -2545,13 +2567,13 @@ mod tests {
         let token = complete_setup_and_allocate(&mut s);
         let wtxid_a = [0x01; 32];
         let mut tpl = HashMap::new();
-        tpl.insert(wtxid_a, vec![0xCA; 8]);
+        tpl.insert(wtxid_a, a_decodable_transaction());
         let _ = declared(&mut s, &declare(7, token, vec![wtxid_a]), &tpl, ctx(3_000));
 
         s.tokens = TokenStore::new();
 
         let solution = PushSolutionInput {
-            extranonce: vec![0xEE; 8],
+            extranonce: vec![0xEE; EXTRANONCE_SLOT],
             header: SolutionHeader {
                 prev_hash: [0xAB; 32],
                 version: 0x2000_0000,
@@ -2560,9 +2582,9 @@ mod tests {
                 n_bits: 0x1d00_ffff,
             },
         };
-        let out = handle_push_solution(&mut s, &solution, None);
+        let out = handle_push_solution(&mut s, &solution, Some(EASIEST_TARGET));
         match &out.events[0] {
-            JdpSessionEvent::BlockSubmissionCandidate { miner_address, .. } => {
+            JdpSessionEvent::FoundBlock { miner_address, .. } => {
                 assert_eq!(
                     miner_address,
                     &addr(),
@@ -2574,9 +2596,12 @@ mod tests {
                     "a fabricated address resolves to Solo and books nothing"
                 );
             }
-            other => panic!("expected BlockSubmissionCandidate, got {other:?}"),
+            other => panic!("expected FoundBlock, got {other:?}"),
         }
     }
+
+    /// A little-endian target every header meets.
+    const EASIEST_TARGET: [u8; 32] = [0xFF; 32];
 
     /// Two transaction-free declarations whose coinbases differ, the older
     /// one first, and a solution header with a full-width extranonce.
@@ -2614,15 +2639,15 @@ mod tests {
         let out = handle_push_solution(&mut s, &solution, Some([0u8; 32]));
         assert!(out.events.is_empty(), "got {:?}", out.events);
 
-        let out = handle_push_solution(&mut s, &solution, Some([0xFF; 32]));
+        let out = handle_push_solution(&mut s, &solution, Some(EASIEST_TARGET));
         assert!(matches!(
             out.events.first(),
-            Some(JdpSessionEvent::BlockSubmissionCandidate { .. })
+            Some(JdpSessionEvent::FoundBlock { .. })
         ));
     }
 
     /// The declaration the header actually solves is chosen, even when it is
-    /// the older one the most-recent guess would skip.
+    /// not the most recent one.
     #[test]
     fn the_declaration_a_solution_solves_is_the_one_booked() {
         let mut s = fresh();
@@ -2631,43 +2656,68 @@ mod tests {
         let (older_job, newer_job) = (job(older), job(newer));
         // A nonce at which the older declaration hashes lower, so a target of
         // exactly its hash is met by it alone.
+        let hash = |job: &DeclaredJob, solution: &PushSolutionInput| {
+            solved_block(job, solution).map(|(_, header)| header.block_hash().to_byte_array())
+        };
         let target = (0..64)
             .find_map(|nonce| {
                 solution.header.nonce = nonce;
-                let lo = solution_hash(&older_job, &solution)?;
-                let hi = solution_hash(&newer_job, &solution)?;
+                let lo = hash(&older_job, &solution)?;
+                let hi = hash(&newer_job, &solution)?;
                 let lower = bp_share::Target::from_le_bytes(hi).is_met_by_le(&lo) && lo != hi;
                 lower.then_some(lo)
             })
             .expect("one of 64 nonces orders the two hashes this way");
 
+        assert!(
+            older_job.declared_at_ms < newer_job.declared_at_ms,
+            "precondition: the solved declaration is not the most recent"
+        );
+
         let out = handle_push_solution(&mut s, &solution, Some(target));
         match out.events.first() {
-            Some(JdpSessionEvent::BlockSubmissionCandidate { declaration, .. }) => {
+            Some(JdpSessionEvent::FoundBlock { declaration, .. }) => {
                 assert_eq!(declaration.new_token, older, "the solved declaration");
             }
-            other => panic!("expected a candidate, got {other:?}"),
+            other => panic!("expected a found block, got {other:?}"),
         }
-        assert_eq!(
-            s.declared_jobs
-                .match_for_solution(&solution.header.prev_hash)
-                .map(|j| j.new_token),
-            Some(newer),
-            "control: the guess would have picked the newer declaration"
-        );
     }
 
-    /// A matching solution yields a candidate with the reconstructed coinbase.
+    /// A decodable non-coinbase transaction, so a declaration has a merkle branch.
+    fn a_decodable_transaction() -> Vec<u8> {
+        use bitcoin::hashes::Hash as _;
+        bitcoin::consensus::serialize(&bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([0xCA; 32]),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        })
+    }
+
+    /// A matching solution yields the found block: the declared coinbase with
+    /// the pushed extranonce, and a header whose merkle root is the one
+    /// `bitcoin` computes over the coinbase and the declared transaction.
     #[test]
-    fn push_solution_emits_block_submission_candidate() {
+    fn push_solution_emits_the_found_block() {
         let mut s = fresh();
         let token = complete_setup_and_allocate(&mut s);
         let wtxid_a = [0x01; 32];
         let mut tpl = HashMap::new();
-        tpl.insert(wtxid_a, vec![0xCA; 8]);
+        tpl.insert(wtxid_a, a_decodable_transaction());
         let input = declare(7, token, vec![wtxid_a]);
         let _ = declared(&mut s, &input, &tpl, ctx(3_000));
-        let extranonce = vec![0xEE; 8];
+        let extranonce = vec![0xEE; EXTRANONCE_SLOT];
         let solution = PushSolutionInput {
             extranonce: extranonce.clone(),
             header: SolutionHeader {
@@ -2678,30 +2728,34 @@ mod tests {
                 n_bits: 0x1d00_ffff,
             },
         };
-        let out = handle_push_solution(&mut s, &solution, None);
+        let out = handle_push_solution(&mut s, &solution, Some(EASIEST_TARGET));
         assert!(out.outbound.is_empty());
-        match &out.events[0] {
-            JdpSessionEvent::BlockSubmissionCandidate {
-                coinbase_raw,
-                transactions,
-                header,
-                ..
-            } => {
-                let plen = coinbase_prefix().len();
-                let slen = coinbase_suffix(&one_output_blob()).len();
-                assert_eq!(coinbase_raw.len(), plen + extranonce.len() + slen);
-                assert_eq!(&coinbase_raw[..plen], &coinbase_prefix()[..]);
-                assert_eq!(
-                    &coinbase_raw[plen..plen + extranonce.len()],
-                    &extranonce[..]
-                );
-                assert_eq!(transactions.len(), 1, "1 non-coinbase tx");
-                assert_eq!(transactions[0], vec![0xCA; 8]);
-                assert_eq!(header.prev_hash, [0xAB; 32]);
-                assert_eq!(header.ntime, 0x6500_0001);
-            }
-            _ => panic!("expected BlockSubmissionCandidate"),
-        }
+        let Some(JdpSessionEvent::FoundBlock {
+            coinbase, header, ..
+        }) = out.events.first()
+        else {
+            panic!("expected FoundBlock, got {:?}", out.events);
+        };
+        assert_eq!(
+            bitcoin::consensus::serialize(coinbase),
+            [
+                coinbase_prefix(),
+                extranonce,
+                coinbase_suffix(&one_output_blob())
+            ]
+            .concat(),
+            "the declared coinbase with the pushed extranonce"
+        );
+        let declared_tx: bitcoin::Transaction =
+            bitcoin::consensus::deserialize(&a_decodable_transaction()).unwrap();
+        let block = bitcoin::Block {
+            header: *header,
+            txdata: vec![coinbase.clone(), declared_tx],
+        };
+        assert_eq!(block.compute_merkle_root(), Some(header.merkle_root));
+        assert_eq!(header.prev_blockhash.to_byte_array(), [0xAB; 32]);
+        assert_eq!(header.time, 0x6500_0001);
+        assert_eq!(header.nonce, 0x1234_5678);
     }
 
     #[test]
@@ -2726,7 +2780,7 @@ mod tests {
                 n_bits: 0,
             },
         };
-        let out = handle_push_solution(&mut s, &solution, None);
+        let out = handle_push_solution(&mut s, &solution, Some(EASIEST_TARGET));
         assert!(out.events.is_empty());
     }
 }

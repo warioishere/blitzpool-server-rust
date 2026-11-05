@@ -157,44 +157,30 @@ subtle = "2.6"
 proptest = "1"
 
 # Bitcoin Core IPC bridge (Cap'n-Proto over UNIX socket → SV2 TDP/JDP).
-# git-Dep mit Commit-Pin (RUNTIME-Dep, MIT/Apache — konform mit unserer
-# non-commercial Lizenz-Linie, kein Source-Copy). Cargo cached den Checkout
-# in ~/.cargo/git, der lokale sv2-apps-Clone ist NICHT Build-Voraussetzung.
-# Pinnt bitcoin-core v31.0 + capnproto/libcapnp-dev als system deps. Beim
-# Hochziehen auf neuen sv2-apps-Stand: tag tauschen, `stratum-core` auf die
-# Version setzen, die der Tag pinnt, dann `cargo update -p bitcoin_core_sv2
-# -p stratum-apps -p jd_server_sv2 -p stratum-core`.
+# Runtime dependency (MIT/Apache, no source copy); Cargo caches the checkout in
+# ~/.cargo/git. Speaks the Bitcoin Core v32 IPC schema
+# (`bp_template_distribution::BITCOIN_CORE_VERSION`) and needs
+# capnproto/libcapnp-dev as system deps. Pin policy and bump procedure:
+# UPSTREAM_DEPS.md.
 #
-# UPSTREAM-PIN: stratum-mining/sv2-apps RELEASE TAG v0.8.0 (rev 7f490743).
-# Der Fork ist WEG. Er trug genau einen Patch — skip-statt-sleep im
-# v31x-TDP-Monitor gegen sv2-apps#541 — und v0.7.0 löst dasselbe Problem
-# besser: im min_interval-Fenster wird `fee_threshold = MAX_MONEY` gesetzt,
-# damit Core gar nicht erst wegen Fees aufweckt; `waitNext` bleibt permanent
-# offen, Tip-Wechsel werden sofort erkannt (Commit 4b4a55cd, 2026-07-07).
-# v0.8.0 (2026-09-17) zieht stratum-core 0.6.0 von crates.io (binary_sv2 v7,
-# geliehene `X<'a>` und eigenständige `XOwned` Wire-Typen getrennt) und
-# bringt den MempoolMirror-Fix (caeda86b: deklarierte Txs werden erst nach
-# erfolgreichem checkBlock in den Spiegel übernommen).
-bitcoin_core_sv2 = { git = "https://github.com/stratum-mining/sv2-apps.git", tag = "v0.8.0" }
-# stratum-core liefert `parsers_sv2::TemplateDistribution` und die Subprotokoll-
-# Strukturen, die wir zum Bauen von SubmitSolution/CoinbaseOutputConstraints
-# brauchen. bitcoin_core_sv2 re-exportiert das (noch) nicht.
-# Fester crates.io-semver — exakt die Version, die sv2-apps v0.8.0 pinnt, damit
-# Cargo EINEN stratum-core-Graph (binary_sv2 v7) baut.
-stratum-core = "0.6.0"
-# stratum-apps liefert die App-Layer-Helfer für SV2 (Noise-wrapped tokio
-# TcpStream via `network_helpers::accept_noise_connection`, key_utils,
-# task_manager). Feature `pool` zieht network + config + core
-# + with_buffer_pool. Selber tag wie bitcoin_core_sv2 damit Cargo nur einen
-# stratum-core-Graph baut. Runtime-Dep, kein Source-Copy.
-stratum-apps = { git = "https://github.com/stratum-mining/sv2-apps.git", tag = "v0.8.0", features = ["pool"] }
-# SRIs eigene JDS-Bibliothek. Wir brauchen daraus genau
+# UPSTREAM-PIN: stratum-mining/sv2-apps tag v0.9.0. All three sv2-apps crates
+# share the tag so Cargo builds one stratum-core graph.
+bitcoin_core_sv2 = { git = "https://github.com/stratum-mining/sv2-apps.git", tag = "v0.9.0" }
+# stratum-core: the SV2 message types the pool builds and parses directly.
+# Exactly the crates.io version sv2-apps v0.9.0 pins (0.7.0, binary_sv2 v8),
+# so Cargo builds one stratum-core graph.
+stratum-core = "0.7.0"
+# stratum-apps: the SV2 app-layer helpers (Noise-wrapped tokio TcpStream via
+# `network_helpers::accept_noise_connection`, key_utils, task_manager).
+# Feature `pool` pulls network + config + core + with_buffer_pool. Same tag
+# as bitcoin_core_sv2 so Cargo builds one stratum-core graph.
+stratum-apps = { git = "https://github.com/stratum-mining/sv2-apps.git", tag = "v0.9.0", features = ["pool"] }
+# SRI's JDS library, used for exactly
 # `job_declarator::job_validation::bitcoin_core_ipc::BitcoinCoreIPCEngine`:
-# den gepflegten Weg, einen deklarierten Job von bitcoin-core per `checkBlock`
-# prüfen zu lassen (SV2-Spec §6.1 "Maintaining an internal mempool") und eine
-# Lösung über den JDP-IPC zu propagieren (§6.4.9 MUST). Reines `[lib]`-Crate,
-# selber tag damit Cargo einen Graph baut.
-jd_server_sv2 = { git = "https://github.com/stratum-mining/sv2-apps.git", tag = "v0.8.0" }
+# bitcoin-core validates a declared job (`checkBlock`, SV2 JDP/Job Declarator
+# Server) and propagates a pushed solution (`submitBlock`, SV2
+# JDP/PushSolution). A pure `[lib]` crate; same tag so Cargo builds one graph.
+jd_server_sv2 = { git = "https://github.com/stratum-mining/sv2-apps.git", tag = "v0.9.0" }
 # async-channel: vom obigen Crate genutzte channel-Lib für die TDP-IO-Boundary.
 # Wir matchen die exakte Version damit Sender/Receiver kompatibel sind.
 async-channel = "1.5"

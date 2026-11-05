@@ -1,14 +1,14 @@
-# Bitcoin Core 31 — regtest build for blitzpool-rust.
+# Bitcoin Core 32 — regtest build for blitzpool-rust.
 #
 # Uses the multi-process binary `libexec/bitcoin-node` (NOT the
 # monolithic `bin/bitcoind`). Only the multi-process build exposes
 # the TDP IPC server that blitzpool-rust subscribes to via Unix
-# domain socket. The official `bitcoin/bitcoin:31` Docker image
+# domain socket. The official `bitcoin/bitcoin` Docker image
 # does NOT ship `bitcoin-node`, hence the tarball install.
 
 FROM debian:bookworm-slim AS build
 
-ARG BITCOIN_CORE_VER=31.0
+ARG BITCOIN_CORE_VER=32.1
 ARG TARGETARCH
 
 RUN apt-get update \

@@ -1065,8 +1065,8 @@ fn decode_actual_coinbase(
 
 /// Decode a transaction and require that it consumed every byte:
 /// `consensus_decode` silently succeeds on a valid prefix of malformed input,
-/// and anything booked from or put in a block must be the whole thing.
-pub(crate) fn decode_whole_tx(bytes: &[u8]) -> Option<bitcoin::Transaction> {
+/// and anything booked from must be the whole thing.
+fn decode_whole_tx(bytes: &[u8]) -> Option<bitcoin::Transaction> {
     let mut cursor = bytes;
     let tx = <bitcoin::Transaction as bitcoin::consensus::Decodable>::consensus_decode(&mut cursor)
         .ok()?;

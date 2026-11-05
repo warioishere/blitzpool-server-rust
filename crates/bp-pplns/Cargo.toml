@@ -21,7 +21,7 @@ thiserror = { workspace = true }
 bp-test-support = { workspace = true }
 proptest = { workspace = true }
 # Phase-7.8-follow-up regtest harness: bp-regtest-harness boots
-# bitcoin-node v31 + IPC, bp-mining-job turns PPLNS payouts into
+# bitcoin-node v32 + IPC, bp-mining-job turns PPLNS payouts into
 # coinbase bytes, bp-template-distribution attaches TDP + submits
 # solutions, bp-share supplies the Target/sha256d helpers, bitcoin
 # decodes scripts.

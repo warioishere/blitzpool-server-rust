@@ -10,61 +10,42 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
-use bitcoin::block::{Block, Header, Version as BlockVersion};
+use bitcoin::block::Header;
 use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::Hash;
-use bitcoin::pow::CompactTarget;
-use bitcoin::{BlockHash, Network as BitcoinNetwork, TxMerkleNode};
-use bp_bitcoin::BitcoinRpc;
+use bitcoin::Network as BitcoinNetwork;
 use bp_common::{AddressId, StreamKind};
 use bp_stratum_v2::jdp::client::{
-    parse_user_identifier_as_address, AllocateTokenContext, DeclarationRef, SolutionHeader,
+    parse_user_identifier_as_address, AllocateTokenContext, DeclarationRef, PushSolutionInput,
 };
 use bp_stratum_v2::jdp::dynamic_outputs::{
     declared_coinbase_tx, designated_output_blob, CandidateBacking,
 };
 use bp_stratum_v2::jdp_server::{
-    AllocateOutcome, ChainTipProvider, JdpAllocateResolver, JdpBlockSubmissionSink, JdpServerHooks,
+    AllocateOutcome, ChainTipProvider, JdpAllocateResolver, JdpFoundBlockSink, JdpServerHooks,
     PayoutDistributionSource, TemplateTxProvider,
 };
 use bp_template_distribution::{TdpHandle, TemplateTxCache};
 use tracing::{debug, info, warn};
 
-use crate::block_sink::{decode_whole_tx, FoundBlockRecord};
+use crate::block_sink::FoundBlockRecord;
 use crate::payout_resolver::ProductionPayoutResolver;
 
-/// Build the production `JdpServerHooks`. `orphan_submitblock_enabled` only
-/// switches the pool-side resubmit; ledger booking runs either way.
+/// Build the production `JdpServerHooks`. A pushed solution is propagated by
+/// `job_validator` and booked by the block sink.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_jdp_hooks(
     tdp: TdpHandle,
-    bitcoin_rpc: BitcoinRpc,
     payout_resolver: Arc<ProductionPayoutResolver>,
-    template_tx_cache: Option<Arc<TemplateTxCache>>,
+    template_tx_cache: Arc<TemplateTxCache>,
     network: BitcoinNetwork,
-    orphan_submitblock_enabled: bool,
     ledger_booker: Arc<crate::block_sink::TdpBlockSubmissionSink>,
     distribution_source: Arc<dyn PayoutDistributionSource>,
     settle: crate::settlement::SettlementSignal,
     job_validator: Option<Arc<dyn DeclaredJobValidator>>,
 ) -> JdpServerHooks {
-    let propagator: Option<Arc<dyn BlockPropagator>> = if orphan_submitblock_enabled {
-        info!(
-            "jdp: pool-side block propagation ENABLED (submitblock RPC) — \
-             the pool's half of the SV2 JDP/PushSolution redundancy"
-        );
-        Some(Arc::new(bitcoin_rpc))
-    } else {
-        info!(
-            "jdp: pool-side block propagation DISABLED \
-             (`[sv2].jdp_orphan_submitblock = false`) — the JDC is the sole \
-             propagator, so the pool does not do what SV2 JDP/PushSolution asks of a JDS"
-        );
-        None
-    };
-    let block_sink: Arc<dyn JdpBlockSubmissionSink> = Arc::new(ProductionJdpBlockSink {
-        propagator,
+    let block_sink: Arc<dyn JdpFoundBlockSink> = Arc::new(ProductionJdpBlockSink {
         booker: ledger_booker,
         chain: Arc::new(tdp.clone()),
         booked: StdMutex::new(VecDeque::new()),
@@ -81,7 +62,7 @@ pub(crate) fn build_jdp_hooks(
             cache: template_tx_cache,
         }),
         chain_tip: Arc::new(TdpChainTipProvider { tdp }),
-        block_submission_sink: block_sink,
+        found_block_sink: block_sink,
         distribution_source,
         job_validator,
     }
@@ -243,19 +224,16 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
 
 // ─── 2. TdpTemplateTxProvider ────────────────────────────────────
 
-/// The newest template's `wtxid -> raw_witness_tx` map; empty without the
-/// cache. Anything missing the JDC sends via `ProvideMissingTransactions`.
+/// The newest template's `wtxid -> raw_witness_tx` map. Anything missing the
+/// JDC sends via `ProvideMissingTransactions`.
 pub(crate) struct TdpTemplateTxProvider {
-    cache: Option<Arc<TemplateTxCache>>,
+    cache: Arc<TemplateTxCache>,
 }
 
 #[async_trait]
 impl TemplateTxProvider for TdpTemplateTxProvider {
     async fn snapshot(&self) -> HashMap<[u8; 32], Vec<u8>> {
-        match &self.cache {
-            Some(cache) => cache.current_template_txs().unwrap_or_default(),
-            None => HashMap::new(),
-        }
+        self.cache.current_template_txs().unwrap_or_default()
     }
 }
 
@@ -283,40 +261,6 @@ impl ChainTipProvider for TdpChainTipProvider {
 }
 
 // ─── 4. ProductionJdpBlockSink ───────────────────────────────────
-
-/// Where a found block goes for the pool's own anti-orphan resubmit.
-#[async_trait]
-pub(crate) trait BlockPropagator: Send + Sync {
-    async fn propagate(&self, miner_address: &AddressId, block: &Block);
-}
-
-#[async_trait]
-impl BlockPropagator for BitcoinRpc {
-    async fn propagate(&self, miner_address: &AddressId, block: &Block) {
-        let block_hex = serialize_hex(block);
-        let block_bytes = block_hex.len() / 2;
-        info!(
-            block_bytes,
-            tx_count = block.txdata.len(),
-            "JDP submit: dispatching submitblock RPC"
-        );
-        match self.submit_block(block_hex).await {
-            Ok(None) => info!(
-                miner = miner_address.as_str(),
-                "JDP block accepted by bitcoin-core (orphan-protection redundancy)"
-            ),
-            Ok(Some(reason)) => warn!(
-                miner = miner_address.as_str(),
-                reason, "JDP block rejected by bitcoin-core"
-            ),
-            Err(err) => warn!(
-                %err,
-                miner = miner_address.as_str(),
-                "JDP submitblock RPC failed (best-effort; JDC also submits via TDP)"
-            ),
-        }
-    }
-}
 
 /// What the pool's own node says the next block must satisfy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -389,12 +333,12 @@ impl ChainView for TdpHandle {
 /// retry is dropped as a duplicate.
 #[async_trait]
 pub(crate) trait DeclaredBlockBooker: Send + Sync {
+    /// Books what `actual_coinbase`, the block's own coinbase, paid.
     async fn book(
         &self,
         record: FoundBlockRecord,
-        reward_sats: u64,
         payouts_fingerprint: [u8; 32],
-        actual_coinbase: Option<bp_coinbase_snapshot::ActualCoinbase>,
+        actual_coinbase: bp_coinbase_snapshot::ActualCoinbase,
     ) -> bool;
 
     /// Record a block the pool CANNOT book: `blocks_entity` row and
@@ -407,12 +351,16 @@ impl DeclaredBlockBooker for crate::block_sink::TdpBlockSubmissionSink {
     async fn book(
         &self,
         record: FoundBlockRecord,
-        reward_sats: u64,
         payouts_fingerprint: [u8; 32],
-        actual_coinbase: Option<bp_coinbase_snapshot::ActualCoinbase>,
+        actual_coinbase: bp_coinbase_snapshot::ActualCoinbase,
     ) -> bool {
-        self.book_declared_block_found(record, reward_sats, payouts_fingerprint, actual_coinbase)
-            .await
+        self.book_declared_block_found(
+            record,
+            actual_coinbase.total_value_sats,
+            payouts_fingerprint,
+            Some(actual_coinbase),
+        )
+        .await
     }
 
     async fn record_unbookable(&self, record: FoundBlockRecord) -> bool {
@@ -420,57 +368,9 @@ impl DeclaredBlockBooker for crate::block_sink::TdpBlockSubmissionSink {
     }
 }
 
-/// Reassemble the block a `PushSolution` describes; `None` when the JDC's
-/// bytes don't parse.
-fn assemble_declared_block(
-    coinbase_raw: &[u8],
-    transactions: &[Vec<u8>],
-    solution: SolutionHeader,
-) -> Option<Block> {
-    let Some(coinbase_tx) =
-        bp_stratum_v2::jdp::dynamic_outputs::decode_solution_coinbase(coinbase_raw)
-    else {
-        warn!(
-            len = coinbase_raw.len(),
-            "JDP block: declared coinbase parses in neither serialisation — not submitting"
-        );
-        return None;
-    };
-    let mut txdata: Vec<Transaction> = Vec::with_capacity(1 + transactions.len());
-    txdata.push(coinbase_tx);
-    for (i, raw) in transactions.iter().enumerate() {
-        match decode_whole_tx(raw) {
-            Some(tx) => txdata.push(tx),
-            None => {
-                warn!(idx = i, "JDP block: declared tx parse failed");
-                return None;
-            }
-        }
-    }
-    let mut header = Header {
-        version: BlockVersion::from_consensus(solution.version as i32),
-        prev_blockhash: BlockHash::from_byte_array(solution.prev_hash),
-        merkle_root: TxMerkleNode::all_zeros(),
-        time: solution.ntime,
-        bits: CompactTarget::from_consensus(solution.n_bits),
-        nonce: solution.nonce,
-    };
-    let mut block = Block { header, txdata };
-    let merkle_root = block.compute_merkle_root().unwrap_or_else(|| {
-        warn!("JDP block: merkle root compute returned None (empty block?); using zero");
-        TxMerkleNode::all_zeros()
-    });
-    header = block.header;
-    header.merkle_root = merkle_root;
-    block.header = header;
-    Some(block)
-}
-
-/// The pool's end of a JDC-found block: reassemble it once, propagate it, book
-/// it. The resubmit is switchable; booking a proven block is not.
+/// The pool's end of a JDC-found block: identify it from its declaration and
+/// book it. Propagation is the job validator's, ahead of this.
 pub(crate) struct ProductionJdpBlockSink {
-    /// `None`: the JDC is the sole propagator.
-    propagator: Option<Arc<dyn BlockPropagator>>,
     booker: Arc<dyn DeclaredBlockBooker>,
     /// Booking is checked against this, never against what the JDC sent.
     chain: Arc<dyn ChainView>,
@@ -510,13 +410,13 @@ impl ProductionJdpBlockSink {
     /// its tip, the ordinary case once the block has propagated.
     fn block_is_proven(
         &self,
-        block: &Block,
+        header: &Header,
         demands_on_arrival: Option<ChainDemands>,
     ) -> Result<(), NotEvidence> {
-        match solution_is_evidence(&block.header, demands_on_arrival) {
+        match solution_is_evidence(header, demands_on_arrival) {
             Err(NotEvidence::WrongTip) => {
                 let our_tip = self.chain.demands().map(|d| d.prev_hash);
-                if our_tip == Some(block.header.block_hash().to_byte_array()) {
+                if our_tip == Some(header.block_hash().to_byte_array()) {
                     return Ok(());
                 }
                 Err(NotEvidence::WrongTip)
@@ -534,10 +434,11 @@ impl ProductionJdpBlockSink {
         backing: CandidateBacking,
         miner_address: &AddressId,
         declaration: DeclarationRef,
-        block: &Block,
+        header: &Header,
+        coinbase: &Transaction,
         demands_on_arrival: Option<ChainDemands>,
     ) {
-        if let Err(reason) = self.block_is_proven(block, demands_on_arrival) {
+        if let Err(reason) = self.block_is_proven(header, demands_on_arrival) {
             // Either a false claim, or the pool matched an older declaration on
             // this tip (`PushSolution` carries no token) and got the merkle wrong.
             warn!(
@@ -550,7 +451,7 @@ impl ProductionJdpBlockSink {
             );
             return;
         }
-        let hash = block.header.block_hash();
+        let hash = header.block_hash();
         if self.already_booked(&hash.to_byte_array()) {
             info!(
                 miner = miner_address.as_str(),
@@ -573,7 +474,7 @@ impl ProductionJdpBlockSink {
                         miner_address: miner_address.as_str().to_string(),
                         session_id: declaration_session_id(declaration.jdp_session_id),
                         block_hash: hash.to_string(),
-                        block_data: serialize_hex(&block.header),
+                        block_data: serialize_hex(header),
                     })
                     .await;
                 if recorded {
@@ -595,14 +496,7 @@ impl ProductionJdpBlockSink {
             CandidateBacking::BaseProtocol => return,
         };
         // Book what the block's own coinbase ACTUALLY pays, never the intent.
-        let actual = block
-            .txdata
-            .first()
-            .map(|cb| bp_coinbase_snapshot::ActualCoinbase::from_coinbase(cb, self.network));
-        let reward_sats = actual
-            .as_ref()
-            .map(|a| a.total_value_sats)
-            .unwrap_or(booking.reference_reward_sats);
+        let actual = bp_coinbase_snapshot::ActualCoinbase::from_coinbase(coinbase, self.network);
         let booked = self
             .booker
             .book(
@@ -610,9 +504,8 @@ impl ProductionJdpBlockSink {
                     miner_address: miner_address.as_str().to_string(),
                     session_id: declaration_session_id(declaration.jdp_session_id),
                     block_hash: hash.to_string(),
-                    block_data: serialize_hex(&block.header),
+                    block_data: serialize_hex(header),
                 },
-                reward_sats,
                 booking.payouts_fingerprint,
                 actual,
             )
@@ -631,25 +524,22 @@ impl ProductionJdpBlockSink {
 }
 
 #[async_trait]
-impl JdpBlockSubmissionSink for ProductionJdpBlockSink {
-    async fn submit_block_candidate(
+impl JdpFoundBlockSink for ProductionJdpBlockSink {
+    async fn book_found_block(
         &self,
         miner_address: AddressId,
         declaration: DeclarationRef,
         backing: CandidateBacking,
-        coinbase_raw: Vec<u8>,
-        transactions: Vec<Vec<u8>>,
-        solution: SolutionHeader,
+        coinbase: Transaction,
+        header: Header,
     ) {
         info!(
             miner = miner_address.as_str(),
             token = ?declaration.new_token,
             session = %declaration_session_id(declaration.jdp_session_id),
-            tx_count = transactions.len(),
-            coinbase_len = coinbase_raw.len(),
+            block_hash = %header.block_hash(),
             ?backing,
-            pool_resubmit = self.propagator.is_some(),
-            "JDP block-candidate received"
+            "JDP found block received"
         );
         log_booking_status(&miner_address, backing);
 
@@ -659,36 +549,21 @@ impl JdpBlockSubmissionSink for ProductionJdpBlockSink {
                 false
             }
         };
-        // Skip reassembly when nothing (resubmit, booking, settle) needs the block.
-        if self.propagator.is_none() && !bookable && !backing.paid_a_published_distribution() {
+        if !bookable && !backing.paid_a_published_distribution() {
             return;
         }
-        let Some(block) = assemble_declared_block(&coinbase_raw, &transactions, solution) else {
-            warn!(
-                miner = miner_address.as_str(),
-                "JDP block: reassembly failed — the block can be neither resubmitted nor booked"
-            );
-            return;
-        };
-        // Read BEFORE propagating: the resubmit advances the tip, and every
-        // found block would then look like it is on the wrong tip.
-        let needs_evidence = bookable || backing.paid_a_published_distribution();
-        let demands_on_arrival = needs_evidence.then(|| self.chain.demands()).flatten();
-
-        // Propagation first: it shrinks the orphan window, booking can wait.
-        if let Some(propagator) = &self.propagator {
-            propagator.propagate(&miner_address, &block).await;
-        }
-        if needs_evidence {
-            self.settle_and_book(
-                backing,
-                &miner_address,
-                declaration,
-                &block,
-                demands_on_arrival,
-            )
-            .await;
-        }
+        // The node may already hold this block as its tip by now;
+        // `block_is_proven` accepts that.
+        let demands_on_arrival = self.chain.demands();
+        self.settle_and_book(
+            backing,
+            &miner_address,
+            declaration,
+            &header,
+            &coinbase,
+            demands_on_arrival,
+        )
+        .await;
     }
 }
 
@@ -724,12 +599,9 @@ fn log_booking_status(miner_address: &AddressId, backing: CandidateBacking) {
 
 // ─── 6. ProductionJobValidator (SV2 JDP/Job Declarator Server) ───────
 // Asks bitcoin-core's `job_declaration_protocol` IPC (`checkBlock`) for a
-// consensus verdict.
+// consensus verdict, and propagates a pushed solution through it (`submitBlock`).
 
-use bitcoin_core_sv2::runtime_api::BitcoinCoreVersion;
-use bp_stratum_v2::jdp_server::{
-    DeclarationLeg, DeclaredJobToValidate, DeclaredJobValidator, JobVerdict,
-};
+use bp_stratum_v2::jdp_server::{DeclaredJobToValidate, DeclaredJobValidator, JobVerdict};
 use jd_server_sv2::job_declarator::job_validation::{
     bitcoin_core_ipc::BitcoinCoreIPCEngine, DeclareMiningJobResult, JobValidationEngine,
 };
@@ -737,6 +609,7 @@ use stratum_apps::tp_type::BitcoinNetwork as SriBitcoinNetwork;
 use stratum_core::job_declaration_sv2::{
     DeclareMiningJobOwned as Sv2DeclareMiningJob,
     ProvideMissingTransactionsSuccessOwned as Sv2ProvideMissingTransactionsSuccess,
+    PushSolutionOwned as Sv2PushSolution,
 };
 
 pub(crate) struct ProductionJobValidator {
@@ -809,7 +682,7 @@ impl ProductionJobValidator {
         };
         let data_dir = Self::data_dir_for_socket(&socket_path, sri_network.clone())?;
         match BitcoinCoreIPCEngine::new(
-            BitcoinCoreVersion::V31X,
+            bp_template_distribution::BITCOIN_CORE_VERSION,
             sri_network,
             Some(data_dir),
             cancel,
@@ -845,7 +718,11 @@ impl DeclaredJobValidator for ProductionJobValidator {
             );
             return JobVerdict::Rejected("invalid-coinbase-tx".to_string());
         }
-        // Token and excess data play no part in validation; placeholders.
+        // The engine keys a session's declarations by token and keeps one per
+        // token, so one fixed token holds it at the latest declaration; the pool
+        // checks `SetCustomMiningJob` itself, never through the engine. Its
+        // most recent accepted declaration, which a `PushSolution` is rebuilt
+        // from, is kept apart and survives a newer declaration.
         let wtxids: Vec<stratum_core::binary_sv2::U256Owned> = job
             .wtxid_list
             .iter()
@@ -865,7 +742,7 @@ impl DeclaredJobValidator for ProductionJobValidator {
             return JobVerdict::Rejected("invalid-coinbase-tx".to_string());
         };
         let declare = Sv2DeclareMiningJob {
-            request_id: 0,
+            request_id: job.request_id,
             mining_job_token,
             version: job.version,
             coinbase_tx_prefix: prefix,
@@ -874,24 +751,19 @@ impl DeclaredJobValidator for ProductionJobValidator {
             excess_data,
         };
 
-        // One engine slot per session: a new declaration resets it, or its
-        // first leg is judged against the previous declaration's chain context.
-        match job.leg {
-            DeclarationLeg::Declare => self.engine.cleanup_downstream(job.session_id as usize),
-            DeclarationLeg::Completed => {}
-        }
-
-        let provided: Vec<stratum_core::binary_sv2::B016MOwned> = job
-            .known_raw_txs
-            .iter()
-            .filter_map(|tx| tx.to_vec().try_into().ok())
-            .collect();
-        let provide = stratum_core::binary_sv2::Seq064KOwned::new(provided)
-            .ok()
-            .map(|transaction_list| Sv2ProvideMissingTransactionsSuccess {
-                request_id: 0,
-                transaction_list,
-            });
+        // `None` has the engine judge with the transactions the node holds.
+        let provide = job.supplied_txs.and_then(|txs| {
+            let provided: Vec<stratum_core::binary_sv2::B016MOwned> = txs
+                .iter()
+                .filter_map(|tx| tx.to_vec().try_into().ok())
+                .collect();
+            stratum_core::binary_sv2::Seq064KOwned::new(provided)
+                .ok()
+                .map(|transaction_list| Sv2ProvideMissingTransactionsSuccess {
+                    request_id: job.request_id,
+                    transaction_list,
+                })
+        });
 
         match self
             .engine
@@ -903,6 +775,24 @@ impl DeclaredJobValidator for ProductionJobValidator {
             // Fetched from the JDC; the second leg asks again with the full set.
             DeclareMiningJobResult::MissingTransactions(_) => JobVerdict::NeedsTransactions,
         }
+    }
+
+    async fn propagate_solution(&self, session_id: u32, solution: &PushSolutionInput) {
+        let push_solution = Sv2PushSolution {
+            extranonce: solution
+                .extranonce
+                .clone()
+                .try_into()
+                .expect("decoded from the wire's B032, so it fits one"),
+            prev_hash: solution.header.prev_hash.into(),
+            nonce: solution.header.nonce,
+            ntime: solution.header.ntime,
+            nbits: solution.header.n_bits,
+            version: solution.header.version,
+        };
+        self.engine
+            .handle_push_solution(session_id as usize, push_solution)
+            .await;
     }
 
     fn session_closed(&self, session_id: u32) {
@@ -1022,22 +912,21 @@ mod jdp_validation_regtest {
         Some((node, validator, cancel))
     }
 
-    /// One declared coinbase, no transactions, declare leg.
+    /// One declared coinbase over `wtxid_list`, with `supplied_txs` or none.
     fn declaration<'a>(
         prefix: &'a [u8],
         suffix: &'a [u8],
         wtxid_list: &'a [[u8; 32]],
-        known_raw_txs: &'a [&'a [u8]],
-        leg: DeclarationLeg,
+        supplied_txs: Option<&'a [&'a [u8]]>,
     ) -> DeclaredJobToValidate<'a> {
         DeclaredJobToValidate {
             session_id: 1,
+            request_id: 0,
             version: 0x2000_0000,
             coinbase_tx_prefix: prefix,
             coinbase_tx_suffix: suffix,
             wtxid_list,
-            known_raw_txs,
-            leg,
+            supplied_txs,
         }
     }
 
@@ -1045,13 +934,7 @@ mod jdp_validation_regtest {
     async fn verdict_from_a_real_node(prefix: &[u8], suffix: &[u8]) -> Option<JobVerdict> {
         let (node, validator, cancel) = real_validator().await?;
         let verdict = validator
-            .validate_declaration(declaration(
-                prefix,
-                suffix,
-                &[],
-                &[],
-                DeclarationLeg::Declare,
-            ))
+            .validate_declaration(declaration(prefix, suffix, &[], None))
             .await;
         cancel.cancel();
         node.shutdown().await.expect("regtest shutdown");
@@ -1099,20 +982,25 @@ mod jdp_validation_regtest {
     /// Long enough for the engine's template monitor (`waitNext`) to see a new tip.
     const ENGINE_SEES_NEW_TIP: std::time::Duration = std::time::Duration::from_secs(2);
 
-    /// A first leg is not judged against the previous declaration's tip; a
-    /// second leg straddling a tip change still is `stale-chain-tip`.
+    /// A new declaration is not judged against the previous declaration's tip;
+    /// supplying transactions for one across a tip change is `stale-chain-tip`.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_tip_change_between_two_declarations_is_not_a_stale_tip() {
         let Some((node, validator, cancel)) = real_validator().await else {
             return;
         };
         let (prefix, suffix) = super::coinbase_shapes::honest_segwit();
-        // Unknown wtxid: the engine stops at "missing".
+        // Unknown wtxid: the engine stops at "missing". A JDC numbers its
+        // declarations, so each gets its own `request_id`.
         let unknown = [[0x5a; 32]];
-        let leg =
-            |leg| validator.validate_declaration(declaration(&prefix, &suffix, &unknown, &[], leg));
+        let ask = |request_id, supplied_txs| {
+            validator.validate_declaration(DeclaredJobToValidate {
+                request_id,
+                ..declaration(&prefix, &suffix, &unknown, supplied_txs)
+            })
+        };
 
-        let first = leg(DeclarationLeg::Declare).await;
+        let first = ask(1, None).await;
         assert!(
             matches!(first, JobVerdict::NeedsTransactions),
             "precondition: the engine reports the unknown wtxid missing, got {first:?}"
@@ -1120,7 +1008,7 @@ mod jdp_validation_regtest {
 
         node.generate_to_self(1).await.expect("mine a block");
         tokio::time::sleep(ENGINE_SEES_NEW_TIP).await;
-        let next = leg(DeclarationLeg::Declare).await;
+        let next = ask(2, None).await;
         assert!(
             matches!(next, JobVerdict::NeedsTransactions),
             "a new declaration after a tip change is not stale, got {next:?}"
@@ -1128,10 +1016,10 @@ mod jdp_validation_regtest {
 
         node.generate_to_self(1).await.expect("mine a block");
         tokio::time::sleep(ENGINE_SEES_NEW_TIP).await;
-        let completed = leg(DeclarationLeg::Completed).await;
+        let completed = ask(2, Some(&[])).await;
         assert!(
             matches!(&completed, JobVerdict::Rejected(code) if code == "stale-chain-tip"),
-            "negative control: the second leg of a declaration that straddles a tip change \
+            "negative control: supplying transactions for a declaration across a tip change \
              IS stale, got {completed:?}"
         );
 
@@ -1153,26 +1041,14 @@ mod jdp_validation_regtest {
         );
 
         let verdict = validator
-            .validate_declaration(declaration(
-                &prefix,
-                &suffix,
-                &[],
-                &[],
-                DeclarationLeg::Declare,
-            ))
+            .validate_declaration(declaration(&prefix, &suffix, &[], None))
             .await;
         assert!(matches!(verdict, JobVerdict::Accepted), "got {verdict:?}");
 
         // Negative control: the wrong height is refused.
         let (prefix, suffix) = super::coinbase_shapes::valid_segwit_coinbase(height + 1);
         let verdict = validator
-            .validate_declaration(declaration(
-                &prefix,
-                &suffix,
-                &[],
-                &[],
-                DeclarationLeg::Declare,
-            ))
+            .validate_declaration(declaration(&prefix, &suffix, &[], None))
             .await;
         assert!(
             matches!(verdict, JobVerdict::Rejected(_)),
@@ -1183,49 +1059,40 @@ mod jdp_validation_regtest {
         node.shutdown().await.expect("regtest shutdown");
     }
 
-    /// A supplied transaction fills only its own wtxid's slot (and the declared
-    /// one does get past the lookup).
+    /// The engine stages a supplied transaction only under the wtxid it hashes
+    /// to, and refuses a declaration that supplies one it did not declare.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_supplied_transaction_counts_only_under_its_own_wtxid() {
+    async fn a_supplied_transaction_that_was_not_declared_refuses_the_declaration() {
         let Some((node, validator, cancel)) = real_validator().await else {
             return;
         };
         let height = node.current_height().await.expect("height") + 1;
         let (prefix, suffix) = super::coinbase_shapes::valid_segwit_coinbase(height);
         let declared = super::coinbase_shapes::unrelated_transaction(1);
-        let other = super::coinbase_shapes::unrelated_transaction(2);
+        let other =
+            bitcoin::consensus::serialize(&super::coinbase_shapes::unrelated_transaction(2));
         let wtxids = [declared.compute_wtxid().to_byte_array()];
-        let supply = |tx: &bitcoin::Transaction| bitcoin::consensus::serialize(tx);
 
-        let mismatched = supply(&other);
         let verdict = validator
-            .validate_declaration(declaration(
-                &prefix,
-                &suffix,
-                &wtxids,
-                &[mismatched.as_slice()],
-                DeclarationLeg::Completed,
-            ))
+            .validate_declaration(declaration(&prefix, &suffix, &wtxids, Some(&[])))
             .await;
         assert!(
             matches!(verdict, JobVerdict::NeedsTransactions),
-            "a transaction under another wtxid must not fill the slot, got {verdict:?}"
+            "control: nothing supplied, the declared transaction is reported missing, got \
+             {verdict:?}"
         );
 
-        let matching = supply(&declared);
         let verdict = validator
             .validate_declaration(declaration(
                 &prefix,
                 &suffix,
                 &wtxids,
-                &[matching.as_slice()],
-                DeclarationLeg::Completed,
+                Some(&[other.as_slice()]),
             ))
             .await;
         assert!(
-            matches!(verdict, JobVerdict::Rejected(_)),
-            "negative control: the declared transaction is found, and the block with its \
-             unspendable input is judged, got {verdict:?}"
+            matches!(&verdict, JobVerdict::Rejected(code) if code == "invalid-job"),
+            "a transaction under another wtxid refuses the declaration, got {verdict:?}"
         );
 
         cancel.cancel();
@@ -1861,70 +1728,17 @@ mod jdp_validation_socket_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::block::Version as BlockVersion;
+    use bitcoin::pow::CompactTarget;
+    use bitcoin::{BlockHash, TxMerkleNode};
     use bp_stratum_v2::jdp::dynamic_outputs::PayoutBooking;
+
+    use bp_stratum_v2::jdp::dynamic_outputs::decode_solution_coinbase;
 
     /// Garbage bytes decline, without panic.
     #[test]
-    fn assemble_declared_block_declines_unparsable_bytes() {
-        assert!(assemble_declared_block(
-            &[0xFF, 0xFF, 0xFF],
-            &[],
-            SolutionHeader {
-                prev_hash: [0u8; 32],
-                version: 0x2000_0000,
-                ntime: 1_700_000_000,
-                nonce: 42,
-                n_bits: 0x1d00_ffff,
-            },
-        )
-        .is_none());
-    }
-
-    /// The merkle root is computed, not left at zero.
-    #[test]
-    fn assemble_declared_block_computes_the_merkle_root() {
-        use bitcoin::absolute::LockTime;
-        use bitcoin::consensus::Encodable;
-        use bitcoin::transaction::Version as TxVersion;
-        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
-
-        let coinbase = Transaction {
-            version: TxVersion::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint::null(),
-                script_sig: ScriptBuf::from_bytes(vec![0x51, 0x00, 0x00]),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(5_000_000_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
-        };
-        let mut raw = Vec::new();
-        coinbase
-            .consensus_encode(&mut raw)
-            .expect("encode coinbase");
-
-        let block = assemble_declared_block(
-            &raw,
-            &[],
-            SolutionHeader {
-                prev_hash: [0xABu8; 32],
-                version: 0x2000_0000,
-                ntime: 1_700_000_000,
-                nonce: 42,
-                n_bits: 0x1d00_ffff,
-            },
-        )
-        .expect("a well-formed coinbase must reassemble");
-        assert_ne!(
-            block.header.merkle_root,
-            TxMerkleNode::all_zeros(),
-            "an uncomputed merkle root would name the wrong block"
-        );
-        assert_eq!(block.txdata.len(), 1);
+    fn a_pushed_coinbase_of_unparsable_bytes_declines() {
+        assert!(decode_solution_coinbase(&[0xFF, 0xFF, 0xFF]).is_none());
     }
 
     /// A regtest JDC's declared coinbase off the wire, already witness-serialised.
@@ -1936,38 +1750,26 @@ fa0000000000000000266a24aa21a9edbfb3fcf6fc1b9e46c9dc5e85fde2375dc46d51f45e6\
 be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
 00000000000000b70b0000";
 
-    /// A witness-form coinbase reassembles byte-identically, not double-wrapped.
+    /// A witness-form coinbase decodes byte-identically, not double-wrapped.
     #[test]
-    fn a_witness_serialised_declared_coinbase_reassembles_verbatim() {
+    fn a_witness_serialised_declared_coinbase_decodes_verbatim() {
         let raw = hex::decode(JDC_DECLARED_COINBASE_WITNESS_FORM).expect("fixture hex");
         assert_eq!(raw.len(), 198, "fixture must be the captured bytes");
 
-        let block = assemble_declared_block(
-            &raw,
-            &[],
-            SolutionHeader {
-                prev_hash: [0xABu8; 32],
-                version: 0x2000_0000,
-                ntime: 1_700_000_000,
-                nonce: 42,
-                n_bits: 0x1d00_ffff,
-            },
-        )
-        .expect("the reference client's own coinbase must reassemble");
-
-        let cb = &block.txdata[0];
+        let cb = &decode_solution_coinbase(&raw)
+            .expect("the reference client's own coinbase must decode");
         assert_eq!(cb.input.len(), 1, "the coinbase input was read as data");
         assert_eq!(cb.output.len(), 2, "payout + witness commitment");
         assert_eq!(
             bitcoin::consensus::serialize(cb),
             raw,
-            "the reassembled coinbase must be the declared bytes, unchanged"
+            "the decoded coinbase must be the declared bytes, unchanged"
         );
     }
 
-    /// A non-witness coinbase still reassembles (via the wrapping).
+    /// A non-witness coinbase still decodes (via the wrapping).
     #[test]
-    fn a_non_witness_declared_coinbase_still_reassembles() {
+    fn a_non_witness_declared_coinbase_still_decodes() {
         use bitcoin::absolute::LockTime;
         use bitcoin::transaction::Version as TxVersion;
         use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
@@ -1989,41 +1791,15 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         let raw = bitcoin::consensus::serialize(&coinbase);
         assert_ne!(raw[4], 0x00, "fixture must NOT be witness-serialised");
 
-        let block = assemble_declared_block(
-            &raw,
-            &[],
-            SolutionHeader {
-                prev_hash: [0xABu8; 32],
-                version: 0x2000_0000,
-                ntime: 1_700_000_000,
-                nonce: 42,
-                n_bits: 0x1d00_ffff,
-            },
-        )
-        .expect("a non-witness coinbase must still reassemble");
-        assert_eq!(block.txdata[0].input.len(), 1);
-        assert_eq!(block.txdata[0].output.len(), 1);
-    }
-
-    /// Trailing bytes after a complete transaction are a decode failure.
-    #[test]
-    fn a_transaction_that_decodes_from_a_prefix_only_is_rejected() {
-        let mut raw = hex::decode(JDC_DECLARED_COINBASE_WITNESS_FORM).expect("fixture hex");
-        assert!(
-            decode_whole_tx(&raw).is_some(),
-            "precondition: the clean bytes decode"
-        );
-        raw.extend_from_slice(&[0xAB; 8]);
-        assert!(
-            decode_whole_tx(&raw).is_none(),
-            "trailing bytes mean these are not the declared transaction"
-        );
+        let cb = decode_solution_coinbase(&raw).expect("a non-witness coinbase must still decode");
+        assert_eq!(cb.input.len(), 1);
+        assert_eq!(cb.output.len(), 1);
     }
 
     /// A re-sent solution is booked once; the memory stays bounded.
     #[tokio::test]
     async fn a_repeated_block_is_booked_only_once() {
-        let sink = sink_with_halves(None, Arc::new(RecordingBooker::default()), None);
+        let sink = sink_with_halves(Arc::new(RecordingBooker::default()), None);
         assert!(!sink.already_booked(&[1u8; 32]), "first sighting");
         sink.remember_booked([1u8; 32]);
         assert!(sink.already_booked(&[1u8; 32]), "the same block again");
@@ -2043,75 +1819,11 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
 
     /// A malformed coinbase past the length guard declines, not indexed into.
     #[test]
-    fn assemble_declared_block_declines_a_malformed_but_long_coinbase() {
-        let garbage = vec![0xFFu8; 64];
-        assert!(assemble_declared_block(
-            &garbage,
-            &[],
-            SolutionHeader {
-                prev_hash: [0u8; 32],
-                version: 0x2000_0000,
-                ntime: 1_700_000_000,
-                nonce: 42,
-                n_bits: 0x1d00_ffff,
-            },
-        )
-        .is_none());
-    }
-
-    /// One corrupt declared transaction declines the whole block.
-    #[test]
-    fn assemble_declared_block_declines_a_corrupt_transaction() {
-        use bitcoin::absolute::LockTime;
-        use bitcoin::consensus::Encodable;
-        use bitcoin::transaction::Version as TxVersion;
-        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
-
-        let coinbase = Transaction {
-            version: TxVersion::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint::null(),
-                script_sig: ScriptBuf::from_bytes(vec![0x51, 0x00, 0x00]),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(5_000_000_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
-        };
-        let mut raw = Vec::new();
-        coinbase.consensus_encode(&mut raw).expect("encode");
-        assert!(assemble_declared_block(
-            &raw,
-            &[vec![0xFFu8; 40]],
-            SolutionHeader {
-                prev_hash: [0u8; 32],
-                version: 0x2000_0000,
-                ntime: 1_700_000_000,
-                nonce: 42,
-                n_bits: 0x1d00_ffff,
-            },
-        )
-        .is_none());
+    fn a_malformed_but_long_pushed_coinbase_declines() {
+        assert!(decode_solution_coinbase(&[0xFFu8; 64]).is_none());
     }
 
     // ── ProductionJdpBlockSink ──────────────────────────────────────
-
-    #[derive(Default)]
-    struct RecordingPropagator {
-        propagated: StdMutex<Vec<BlockHash>>,
-    }
-    #[async_trait]
-    impl BlockPropagator for RecordingPropagator {
-        async fn propagate(&self, _: &AddressId, block: &Block) {
-            self.propagated
-                .lock()
-                .unwrap()
-                .push(block.header.block_hash());
-        }
-    }
 
     #[derive(Default)]
     struct RecordingBooker {
@@ -2136,11 +1848,13 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         async fn book(
             &self,
             record: FoundBlockRecord,
-            reward: u64,
             fp: [u8; 32],
-            _: Option<bp_coinbase_snapshot::ActualCoinbase>,
+            actual: bp_coinbase_snapshot::ActualCoinbase,
         ) -> bool {
-            self.booked.lock().unwrap().push((reward, fp));
+            self.booked
+                .lock()
+                .unwrap()
+                .push((actual.total_value_sats, fp));
             self.session_ids.lock().unwrap().push(record.session_id);
             self.hashes.lock().unwrap().push(record.block_hash);
             !self.wrote_nothing
@@ -2187,52 +1901,22 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         }
     }
 
-    /// A chain whose tip can move.
-    #[derive(Clone)]
-    struct MovingChain(Arc<StdMutex<Option<ChainDemands>>>);
-    impl MovingChain {
-        fn at(demands: ChainDemands) -> Self {
-            MovingChain(Arc::new(StdMutex::new(Some(demands))))
-        }
-        fn move_to(&self, demands: ChainDemands) {
-            *self.0.lock().unwrap() = Some(demands);
-        }
-    }
-    impl ChainView for MovingChain {
-        fn demands(&self) -> Option<ChainDemands> {
-            *self.0.lock().unwrap()
-        }
-        fn reference_revenue(&self) -> Option<u64> {
-            None
+    /// The header `push` below books for `nonce`. The block holds only the
+    /// coinbase, so its merkle root is the coinbase's txid.
+    fn pushed_header(nonce: u32) -> Header {
+        let coinbase = pushed_coinbase();
+        Header {
+            version: BlockVersion::from_consensus(0x2000_0000),
+            prev_blockhash: BlockHash::from_byte_array([0u8; 32]),
+            merkle_root: TxMerkleNode::from_byte_array(coinbase.compute_txid().to_byte_array()),
+            time: 1_700_000_000,
+            bits: CompactTarget::from_consensus(0x1d00_ffff),
+            nonce,
         }
     }
 
-    /// A resubmit that advances the tip, as the real one does.
-    struct PropagatorThatMovesTheTip {
-        chain: MovingChain,
-        to: ChainDemands,
-    }
-    #[async_trait]
-    impl BlockPropagator for PropagatorThatMovesTheTip {
-        async fn propagate(&self, _: &AddressId, _: &Block) {
-            self.chain.move_to(self.to);
-        }
-    }
-
-    /// The block `push` below reassembles, so a test can name it.
-    fn pushed_block(nonce: u32) -> Block {
-        assemble_declared_block(
-            &coinbase_bytes(),
-            &[],
-            SolutionHeader {
-                prev_hash: [0u8; 32],
-                version: 0x2000_0000,
-                ntime: 1_700_000_000,
-                nonce,
-                n_bits: 0x1d00_ffff,
-            },
-        )
-        .expect("fixture coinbase reassembles")
+    fn pushed_coinbase() -> Transaction {
+        decode_solution_coinbase(&coinbase_bytes()).expect("fixture coinbase")
     }
 
     fn coinbase_bytes() -> Vec<u8> {
@@ -2259,15 +1943,13 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         raw
     }
 
-    /// A sink with whichever halves the test cares about wired up.
+    /// A sink booking into `booker` on a chain at `chain`.
     fn sink_with_halves(
-        propagator: Option<Arc<RecordingPropagator>>,
         booker: Arc<RecordingBooker>,
         chain: Option<ChainDemands>,
     ) -> ProductionJdpBlockSink {
         ProductionJdpBlockSink {
             network: BitcoinNetwork::Regtest,
-            propagator: propagator.map(|p| p as Arc<dyn BlockPropagator>),
             booker,
             settle: crate::settlement::SettlementSignal::local_only(),
             chain: Arc::new(FixedChain(chain)),
@@ -2275,43 +1957,25 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         }
     }
 
-    /// The fully-wired production shape: resubmit on, ledger wired.
-    fn sink_with(
-        chain: Option<ChainDemands>,
-    ) -> (
-        ProductionJdpBlockSink,
-        Arc<RecordingPropagator>,
-        Arc<RecordingBooker>,
-    ) {
-        let propagator = Arc::new(RecordingPropagator::default());
+    /// The production shape with a recording ledger.
+    fn sink_with(chain: Option<ChainDemands>) -> (ProductionJdpBlockSink, Arc<RecordingBooker>) {
         let booker = Arc::new(RecordingBooker::default());
-        (
-            sink_with_halves(Some(propagator.clone()), booker.clone(), chain),
-            propagator,
-            booker,
-        )
+        (sink_with_halves(booker.clone(), chain), booker)
     }
 
     /// The JDP session every pushed candidate in these tests belongs to.
     const TEST_JDP_SESSION_ID: u32 = 0x00c0_ffee;
 
     async fn push(sink: &ProductionJdpBlockSink, backing: CandidateBacking, nonce: u32) {
-        sink.submit_block_candidate(
+        sink.book_found_block(
             AddressId::new("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080").unwrap(),
             DeclarationRef {
                 new_token: bp_stratum_v2::tokens::Token([9u8; 16]),
                 jdp_session_id: TEST_JDP_SESSION_ID,
             },
             backing,
-            coinbase_bytes(),
-            vec![],
-            SolutionHeader {
-                prev_hash: [0u8; 32],
-                version: 0x2000_0000,
-                ntime: 1_700_000_000,
-                nonce,
-                n_bits: 0x1d00_ffff,
-            },
+            pushed_coinbase(),
+            pushed_header(nonce),
         )
         .await;
     }
@@ -2387,7 +2051,6 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
 
         let sink = ProductionJdpBlockSink {
             network: BitcoinNetwork::Regtest,
-            propagator: None,
             booker,
             settle,
             chain: Arc::new(FixedChain(chain)),
@@ -2555,76 +2218,6 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         server.shutdown().await;
     }
 
-    /// Every candidate is resubmitted, whatever the ledger decides.
-    #[tokio::test]
-    async fn the_block_always_reaches_the_resubmit_sink() {
-        let easy = ChainDemands {
-            prev_hash: [0u8; 32],
-            target: [0xFFu8; 32],
-        };
-        for (chain, backing) in [
-            (Some(easy), CandidateBacking::Bookable(a_booking())),
-            (Some(easy), CandidateBacking::BaseProtocol),
-            (None, CandidateBacking::Bookable(a_booking())),
-        ] {
-            let (sink, propagator, _) = sink_with(chain);
-            push(&sink, backing, 1).await;
-            assert_eq!(propagator.propagated.lock().unwrap().len(), 1);
-        }
-    }
-
-    /// With the resubmit off the block is still booked.
-    #[tokio::test]
-    async fn booking_does_not_hinge_on_the_resubmit_switch() {
-        let booker = Arc::new(RecordingBooker::default());
-        let sink = sink_with_halves(
-            None,
-            booker.clone(),
-            Some(ChainDemands {
-                prev_hash: [0u8; 32],
-                target: [0xFFu8; 32],
-            }),
-        );
-        push(&sink, CandidateBacking::Bookable(a_booking()), 1).await;
-        assert_eq!(
-            *booker.booked.lock().unwrap(),
-            vec![(5_000_000_000, [0x11; 32])]
-        );
-    }
-
-    /// The tip is read before the resubmit advances it.
-    #[tokio::test]
-    async fn the_tip_is_judged_as_of_the_solutions_arrival() {
-        let easy = ChainDemands {
-            prev_hash: [0u8; 32],
-            target: [0xFFu8; 32],
-        };
-        // Not the pushed block, so the already-the-tip route cannot rescue it.
-        let moved_on = ChainDemands {
-            prev_hash: [0x77u8; 32],
-            target: [0xFFu8; 32],
-        };
-        let chain = MovingChain::at(easy);
-        let booker = Arc::new(RecordingBooker::default());
-        let sink = ProductionJdpBlockSink {
-            network: BitcoinNetwork::Regtest,
-            propagator: Some(Arc::new(PropagatorThatMovesTheTip {
-                chain: chain.clone(),
-                to: moved_on,
-            })),
-            booker: booker.clone(),
-            settle: crate::settlement::SettlementSignal::local_only(),
-            chain: Arc::new(chain),
-            booked: StdMutex::new(VecDeque::new()),
-        };
-        push(&sink, CandidateBacking::Bookable(a_booking()), 1).await;
-        assert_eq!(
-            booker.booked.lock().unwrap().len(),
-            1,
-            "the tip moved because we submitted the block — that must not un-book it"
-        );
-    }
-
     /// A block the pool's node already holds as its tip is proven.
     #[tokio::test]
     async fn a_block_our_node_already_holds_as_its_tip_is_proven() {
@@ -2633,10 +2226,9 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         unreachable_target[0] = 0x01;
         let booker = Arc::new(RecordingBooker::default());
         let sink = sink_with_halves(
-            None,
             booker.clone(),
             Some(ChainDemands {
-                prev_hash: pushed_block(1).header.block_hash().to_byte_array(),
+                prev_hash: pushed_header(1).block_hash().to_byte_array(),
                 target: unreachable_target,
             }),
         );
@@ -2649,7 +2241,6 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
     async fn a_foreign_tip_is_still_refused() {
         let booker = Arc::new(RecordingBooker::default());
         let sink = sink_with_halves(
-            None,
             booker.clone(),
             Some(ChainDemands {
                 prev_hash: [0x99u8; 32],
@@ -2660,22 +2251,25 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         assert!(booker.booked.lock().unwrap().is_empty());
     }
 
-    /// The booked block is the propagated block.
+    /// The booked block is the solved one: the pushed header fields over the
+    /// coinbase's merkle root.
     #[tokio::test]
-    async fn the_booked_block_is_the_propagated_block() {
-        let (sink, propagator, booker) = sink_with(Some(ChainDemands {
+    async fn the_booked_block_is_the_solved_block() {
+        let (sink, booker) = sink_with(Some(ChainDemands {
             prev_hash: [0u8; 32],
             target: [0xFFu8; 32],
         }));
         push(&sink, CandidateBacking::Bookable(a_booking()), 1).await;
-        let propagated = propagator.propagated.lock().unwrap()[0];
-        assert_eq!(booker.hashes.lock().unwrap()[0], propagated.to_string());
+        assert_eq!(
+            booker.hashes.lock().unwrap().clone(),
+            vec![pushed_header(1).block_hash().to_string()]
+        );
     }
 
     /// Evidence is booked with the distribution the declaration vouched for.
     #[tokio::test]
     async fn evidence_books_the_vouched_distribution() {
-        let (sink, _, booker) = sink_with(Some(ChainDemands {
+        let (sink, booker) = sink_with(Some(ChainDemands {
             prev_hash: [0u8; 32],
             target: [0xFFu8; 32],
         }));
@@ -2692,23 +2286,18 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         // Little-endian 1: the hardest target there is.
         let mut hard = [0u8; 32];
         hard[0] = 0x01;
-        let (sink, propagator, booker) = sink_with(Some(ChainDemands {
+        let (sink, booker) = sink_with(Some(ChainDemands {
             prev_hash: [0u8; 32],
             target: hard,
         }));
         push(&sink, CandidateBacking::Bookable(a_booking()), 42).await;
         assert!(booker.booked.lock().unwrap().is_empty());
-        assert_eq!(
-            propagator.propagated.lock().unwrap().len(),
-            1,
-            "still propagated — bitcoin-core is the one to reject it"
-        );
     }
 
     /// Real work without a vouched distribution books nothing.
     #[tokio::test]
     async fn work_without_a_vouched_distribution_books_nothing() {
-        let (sink, _, booker) = sink_with(Some(ChainDemands {
+        let (sink, booker) = sink_with(Some(ChainDemands {
             prev_hash: [0u8; 32],
             target: [0xFFu8; 32],
         }));
@@ -2721,7 +2310,6 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
     async fn a_booking_that_wrote_nothing_leaves_the_retry_open() {
         let booker = Arc::new(RecordingBooker::that_writes_nothing());
         let sink = sink_with_halves(
-            None,
             booker.clone(),
             Some(ChainDemands {
                 prev_hash: [0u8; 32],
@@ -2742,7 +2330,6 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
     async fn a_booking_that_wrote_suppresses_the_repeat() {
         let booker = Arc::new(RecordingBooker::default());
         let sink = sink_with_halves(
-            None,
             booker.clone(),
             Some(ChainDemands {
                 prev_hash: [0u8; 32],
@@ -2754,21 +2341,16 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         assert_eq!(booker.booked.lock().unwrap().len(), 1);
     }
 
-    /// A re-sent solution books once but propagates twice.
+    /// A re-sent solution books once.
     #[tokio::test]
     async fn the_same_block_pushed_twice_books_once() {
-        let (sink, propagator, booker) = sink_with(Some(ChainDemands {
+        let (sink, booker) = sink_with(Some(ChainDemands {
             prev_hash: [0u8; 32],
             target: [0xFFu8; 32],
         }));
         push(&sink, CandidateBacking::Bookable(a_booking()), 1).await;
         push(&sink, CandidateBacking::Bookable(a_booking()), 1).await;
         assert_eq!(booker.booked.lock().unwrap().len(), 1);
-        assert_eq!(
-            propagator.propagated.lock().unwrap().len(),
-            2,
-            "propagation is not deduped — only the ledger write is"
-        );
     }
 
     fn header_with(prev: [u8; 32], nonce: u32) -> Header {
