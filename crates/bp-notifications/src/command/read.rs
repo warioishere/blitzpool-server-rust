@@ -12,12 +12,11 @@ use bp_blockparty::BlockpartyStatus;
 use bp_client_live::{hashrate_for_addresses, pool_hashrate};
 use bp_common::{short_address, AddressId, MiningMode};
 use bp_db::{
-    find_address_settings, find_address_settings_for_addresses, find_blockparty_group,
-    find_blockparty_member_by_address, find_clients_by_address, find_group,
-    find_group_block_history_of_recent_blocks, find_group_member_by_address,
-    find_pplns_group_members_for_group, list_blockparty_block_history,
-    list_blockparty_members_for_group, BlockpartyGroupRow, BlockpartyMemberRow,
-    PplnsGroupBlockHistoryRow,
+    find_address_settings, find_blockparty_group, find_blockparty_member_by_address,
+    find_clients_by_address, find_group, find_group_block_history_of_recent_blocks,
+    find_group_member_by_address, find_pplns_group_members_for_group,
+    list_blockparty_block_history, list_blockparty_members_for_group, BlockpartyGroupRow,
+    BlockpartyMemberRow, PplnsGroupBlockHistoryRow,
 };
 use bp_group_solo_engine::engine::GroupSoloEngine;
 use bp_pplns_engine::engine::PplnsEngine;
@@ -752,10 +751,12 @@ pub(super) async fn build_group_status(
     let group_id = member.group_id;
 
     let reader = group_solo.reader();
-    let (group_res, members_res, round_res) = tokio::join!(
+    let (group_res, members_res, round_res, since_block_res, best_res) = tokio::join!(
         find_group(pool, group_id),
         find_pplns_group_members_for_group(pool, group_id),
         reader.round_stats(group_id),
+        reader.shares_since_block(group_id),
+        reader.best_difficulty(group_id),
     );
 
     let group = match group_res {
@@ -773,9 +774,9 @@ pub(super) async fn build_group_status(
             return db_error_text(lang);
         }
     };
-    let round = match round_res {
-        Ok(r) => r,
-        Err(e) => {
+    let (round, shares_since_block, best) = match (round_res, since_block_res, best_res) {
+        (Ok(r), Ok(s), Ok(b)) => (r, s, b),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
             warn!(target: "bp_notifications::command::read", error = %e, "group_status: round");
             return engine_error_text(lang);
         }
@@ -804,27 +805,13 @@ pub(super) async fn build_group_status(
     let total_rejected = round.total_rejected;
     let active_count = round.per_address.len();
 
-    // The highest all-time best among the members, as the dashboard shows
-    // it for the Team.
-    let member_strings: Vec<String> = member_addresses
-        .iter()
-        .map(|a| a.as_str().to_string())
-        .collect();
-    let best = match find_address_settings_for_addresses(pool, &member_strings).await {
-        Ok(rows) => rows
-            .into_iter()
-            .filter(|r| r.best_difficulty > 0.0)
-            .max_by(|a, b| a.best_difficulty.total_cmp(&b.best_difficulty)),
-        Err(e) => {
-            warn!(target: "bp_notifications::command::read", error = %e, "group_status: member bests");
-            return db_error_text(lang);
-        }
-    };
+    // The Team's best share, as the dashboard and the Team-best notice show
+    // it.
     let best_line = |label: &str| match &best {
         Some(b) => format!(
             "{} ({})",
-            row(label, &format_number_suffix(b.best_difficulty)),
-            addr(&short_address(b.address.as_str()))
+            row(label, &format_number_suffix(b.difficulty)),
+            addr(&short_address(&b.address))
         ),
         None => row(label, "—"),
     };
@@ -835,6 +822,10 @@ pub(super) async fn build_group_status(
     let share = format!("{my_percent:.2} %");
     let my_sh = format_number_suffix(my_shares);
     let total_sh = format_number_suffix(total_shares);
+    let since_block_sh = format_number_suffix(shares_since_block);
+    // Where the round is exactly the shares since the last block, one line
+    // says it.
+    let round_line = |line: String| (!round_is_since_block(&group)).then_some(line);
     let rej_sh = format_number_suffix(total_rejected);
     let active = active_count.to_string();
     // A group sees the Team, not the address it follows it through.
@@ -850,7 +841,8 @@ pub(super) async fn build_group_status(
             Some(row("Aktive Miner in der Runde", &active)),
             Some(row("Team-Hashrate", &group_h)),
             own(format!("{} ({my_sh} Shares)", row("Dein Anteil", &share))),
-            Some(row("Shares in der Runde", &total_sh)),
+            round_line(row("Shares in der Runde", &total_sh)),
+            Some(row("Shares seit dem letzten Block", &since_block_sh)),
             Some(row("Abgelehnt in der Runde", &rej_sh)),
             Some(best_line("Beste Difficulty im Team")),
         ],
@@ -861,12 +853,30 @@ pub(super) async fn build_group_status(
             Some(row("Active miners this round", &active)),
             Some(row("Team hashrate", &group_h)),
             own(format!("{} ({my_sh} shares)", row("Your share", &share))),
-            Some(row("Shares this round", &total_sh)),
+            round_line(row("Shares this round", &total_sh)),
+            Some(row("Shares since the last block", &since_block_sh)),
             Some(row("Rejected this round", &rej_sh)),
             Some(best_line("Best difficulty in the Team")),
         ],
     };
     lines.into_iter().flatten().collect::<Vec<_>>().join("\n")
+}
+
+/// Whether a Team's round holds exactly its shares since the last block: a
+/// Prop Team that starts its round over at each block and has no calendar
+/// reset. A Window Team's round is its window, and a calendar reset or a
+/// round kept across blocks makes the two differ.
+fn round_is_since_block(group: &bp_db::PplnsGroupRow) -> bool {
+    match bp_group_mgmt::group::PayoutMode::parse_or_default(&group.payout_mode) {
+        bp_group_mgmt::group::PayoutMode::Window => false,
+        bp_group_mgmt::group::PayoutMode::Prop => {
+            group.reset_round_on_block
+                && matches!(
+                    bp_group_solo_engine::reset::scheduled_reset(group),
+                    Ok(None)
+                )
+        }
+    }
 }
 
 // ── /blockparty_status <address> ────────────────────────────────────
@@ -1675,5 +1685,156 @@ mod tests {
     fn engine_error_text_per_language() {
         assert!(engine_error_text(Language::De).contains("Engine-Fehler"));
         assert!(engine_error_text(Language::En).contains("Engine error"));
+    }
+
+    const FEE_ADDRESS: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+
+    /// `/team_status` shows the Team's best share, not a member's all-time
+    /// best, and the shares since the last block. The round line is left out
+    /// where it holds exactly those shares.
+    #[tokio::test]
+    async fn team_status_shows_the_team_best_and_the_shares_since_the_block() {
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        // Index 31 of the share-stream range, lent to this binary.
+        let Some(redis) = bp_test_support::connect_redis_in_range_or_skip(
+            bp_test_support::redis_db::SHARE_STREAM,
+            31,
+        )
+        .await
+        else {
+            return;
+        };
+        let (on_block, kept) = (
+            AddressId::new("bc1qreadviewteamonblockxxxx").unwrap(),
+            AddressId::new("bc1qreadviewteamkeptxxxxxxx").unwrap(),
+        );
+        let cleanup = || async {
+            sqlx::query("DELETE FROM pplns_group_member WHERE address = ANY($1)")
+                .bind(vec![on_block.as_str(), kept.as_str()])
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM pplns_group WHERE name LIKE 'bp-test-teamstatus-%'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM address_settings_entity WHERE address = ANY($1)")
+                .bind(vec![on_block.as_str(), kept.as_str()])
+                .execute(&pool)
+                .await
+                .unwrap();
+        };
+        cleanup().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut teams = Vec::new();
+        for (address, reset_on_block) in [(&on_block, true), (&kept, false)] {
+            let team = uuid::Uuid::new_v4();
+            bp_db::insert_pplns_group(
+                &pool,
+                team,
+                &format!("bp-test-teamstatus-{team}"),
+                address,
+                "hash",
+                true,
+                false,
+                "prop",
+                now,
+            )
+            .await
+            .unwrap();
+            sqlx::query("UPDATE pplns_group SET \"resetRoundOnBlock\" = $2 WHERE id = $1")
+                .bind(team)
+                .bind(reset_on_block)
+                .execute(&pool)
+                .await
+                .unwrap();
+            bp_db::insert_pplns_group_member(&pool, team, address, "creator", now)
+                .await
+                .unwrap();
+            // A member's all-time best above the Team's best.
+            sqlx::query(
+                "INSERT INTO address_settings_entity (address, \"bestDifficulty\") VALUES ($1, 9e12)",
+            )
+            .bind(address.as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+            let id = team.to_string();
+            let mut conn = redis.clone();
+            let _: () = redis::cmd("HSET")
+                .arg(bp_group_solo_engine::round::key_best_share(&id))
+                .arg(&[
+                    ("address", address.as_str()),
+                    ("difficulty", "2000000000000"),
+                    ("timestamp_ms", "1793471837000"),
+                ])
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            let _: () = redis::cmd("SET")
+                .arg(bp_group_solo_engine::round::key_shares_since_block(&id))
+                .arg("4500000")
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            teams.push(team);
+        }
+        let engine = Arc::new(
+            GroupSoloEngine::spawn_core(
+                bp_group_solo_engine::config::GroupSoloEngineConfig {
+                    fee_address: Some(AddressId::new(FEE_ADDRESS).unwrap()),
+                    ..Default::default()
+                },
+                redis.clone(),
+                pool.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let status = |address: &AddressId| {
+            let (pool, engine, address) = (pool.clone(), engine.clone(), address.clone());
+            async move {
+                plain(
+                    &build_group_status(
+                        &pool,
+                        None,
+                        &engine,
+                        Language::De,
+                        &address,
+                        Viewer::Owner,
+                    )
+                    .await,
+                )
+            }
+        };
+        let text = status(&on_block).await;
+        assert!(text.contains("Beste Difficulty im Team: 2.00T"), "{text}");
+        assert!(
+            !text.contains("9.00T"),
+            "not a member's all-time best: {text}"
+        );
+        assert!(
+            text.contains("Shares seit dem letzten Block: 4.50M"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("Shares in der Runde"),
+            "the round is the shares since the block here: {text}"
+        );
+        let text = status(&kept).await;
+        assert!(
+            text.contains("Shares in der Runde"),
+            "a round kept across blocks: {text}"
+        );
+        assert!(
+            text.contains("Shares seit dem letzten Block: 4.50M"),
+            "{text}"
+        );
+
+        engine.shutdown();
+        cleanup().await;
     }
 }

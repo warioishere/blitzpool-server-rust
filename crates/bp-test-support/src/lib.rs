@@ -347,6 +347,8 @@ pub mod redis_db {
     pub const RANGE: u16 = 32;
 
     pub const BLITZPOOL_BIN: u16 = 0;
+    /// Index 31 of this range is lent to the `bp-notifications` lib tests
+    /// (`/team_status`): don't claim it here.
     pub const SHARE_STREAM: u16 = RANGE;
     pub const GS_DISTRIBUTION: u16 = 2 * RANGE;
     pub const GS_ENGINE: u16 = 3 * RANGE;
