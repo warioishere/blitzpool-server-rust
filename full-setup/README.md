@@ -28,11 +28,13 @@ the same host port numbers.
 
 - **postgres** — `postgres:18-alpine`. Single shared instance. The pool
   builds the schema itself at boot — see *Schema sync* below.
-- **redis** — `valkey/valkey:8-alpine` with AOF + `everysec` fsync,
-  `volatile-lru` eviction.
-- **bitcoin-{mainnet,testnet4,regtest}** — Bitcoin Core 32's
-  multi-process build (`libexec/bitcoin-node`). Per-network
-  Dockerfile under `docker/bitcoin/`.
+- **redis** — `valkey/valkey:8-alpine` with AOF + `everysec` fsync and
+  no RDB snapshots, `volatile-lru` eviction.
+- **bitcoin-{mainnet,testnet4,regtest}** — Bitcoin Core 32.1's
+  multi-process build (`libexec/bitcoin-node`), one Dockerfile under
+  `docker/bitcoin/` that checks the release tarball's SHA-256. Each
+  network has its own `bitcoin.conf` there; `.env.example` shows how to
+  build another release.
 - **blitzpool-{core,api,payout,notify}** — the Rust pool, built once
   from the repo-root `Dockerfile` and run as four role-gated processes:
   - `core` (`roles=front`) — Stratum listeners + share producer + block

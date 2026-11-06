@@ -129,7 +129,12 @@ services:
   bitcoin:
     profiles: ["bitcoin"]
     build:
-      context: ../full-setup/docker/bitcoin/mainnet
+      context: ../full-setup/docker/bitcoin
+      # Taken from `.env` when set there; unset, the Dockerfile's defaults apply.
+      args:
+        - BITCOIN_CORE_VER
+        - BITCOIN_CORE_SHA256_X86_64
+        - BITCOIN_CORE_SHA256_AARCH64
     restart: unless-stopped
     stop_grace_period: 60s
     command:

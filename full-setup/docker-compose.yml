@@ -36,6 +36,13 @@
 # (cutover-to-rust.sh) renames the migrated TS DB `public_pool` →
 # `blitzpool`, so no PG_DATABASE override is needed post-cutover.
 
+# Bitcoin Core release the node images build, taken from `.env` when set
+# there (see .env.example); unset, the Dockerfile's defaults apply.
+x-bitcoin-core-args: &bitcoin-core-args
+  - BITCOIN_CORE_VER
+  - BITCOIN_CORE_SHA256_X86_64
+  - BITCOIN_CORE_SHA256_AARCH64
+
 # Shared base for the four pool processes — they differ only by
 # BLITZPOOL_ROLES, ports, and RUST_LOG. Enabled in every network profile;
 # the mounted config (BLITZPOOL_CONFIG) selects the network.
@@ -165,7 +172,8 @@ services:
     profiles: ["mainnet"]
     container_name: blitzpool-bitcoin-mainnet
     build:
-      context: ./docker/bitcoin/mainnet
+      context: ./docker/bitcoin
+      args: *bitcoin-core-args
     restart: unless-stopped
     stop_grace_period: 30s
     logging:
@@ -191,7 +199,14 @@ services:
     profiles: ["testnet4"]
     container_name: blitzpool-bitcoin-testnet4
     build:
-      context: ./docker/bitcoin/testnet4
+      context: ./docker/bitcoin
+      args: *bitcoin-core-args
+    command:
+      - "-printtoconsole"
+      - "-testnet4"
+      - "-datadir=/app/data"
+      - "-conf=/app/data/bitcoin.conf"
+      - "-ipcbind=unix:/ipc/node.sock"
     restart: unless-stopped
     stop_grace_period: 30s
     logging:
@@ -215,7 +230,14 @@ services:
     profiles: ["regtest"]
     container_name: blitzpool-bitcoin-regtest
     build:
-      context: ./docker/bitcoin/regtest
+      context: ./docker/bitcoin
+      args: *bitcoin-core-args
+    command:
+      - "-printtoconsole"
+      - "-regtest"
+      - "-datadir=/app/data"
+      - "-conf=/app/data/bitcoin.conf"
+      - "-ipcbind=unix:/ipc/node.sock"
     restart: unless-stopped
     stop_grace_period: 30s
     logging:
