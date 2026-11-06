@@ -19,7 +19,10 @@ use bp_share_hook::{
     SharedRejectedShareOwned, SharedRejectedShareSink,
 };
 use redis::aio::ConnectionManager;
-use redis::streams::{StreamMaxlen, StreamReadOptions, StreamReadReply};
+use redis::streams::{
+    StreamInfoGroupsReply, StreamMaxlen, StreamPendingReply, StreamReadOptions, StreamReadReply,
+    StreamTrimOptions, StreamTrimmingMode,
+};
 use redis::{AsyncCommands, RedisError};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -513,6 +516,65 @@ impl<T: DeserializeOwned> StreamConsumer<T> {
         }
         (good, raw)
     }
+}
+
+/// Removes the entries every consumer group of `stream_key` is done with:
+/// those older than the oldest entry some group has not acknowledged yet. A
+/// group with pending entries holds the stream at its oldest pending one, so
+/// a restarted consumer still re-reads them; a group that is behind or down
+/// holds it at its last delivered entry, and `MAXLEN` stays the cap. A stream
+/// without groups is left alone. A group created later from `0` starts at
+/// what is left, so it does not see the entries removed before it existed.
+/// Returns the number of entries removed, at most Redis's default limit for
+/// one approximate trim (100 × `stream-node-max-entries`, 10000 entries).
+pub async fn trim_consumed(
+    conn: &ConnectionManager,
+    stream_key: &str,
+) -> Result<usize, StreamError> {
+    let mut conn = conn.clone();
+    let exists: bool = conn.exists(stream_key).await?;
+    if !exists {
+        return Ok(0);
+    }
+    let info: StreamInfoGroupsReply = conn.xinfo_groups(stream_key).await?;
+    let mut keep_from: Option<(u64, u64)> = None;
+    for group in info.groups {
+        let oldest_needed = if group.pending > 0 {
+            let pending: StreamPendingReply = conn.xpending(stream_key, &group.name).await?;
+            match pending {
+                StreamPendingReply::Data(data) => data.start_id,
+                // Acknowledged between the two reads.
+                StreamPendingReply::Empty => group.last_delivered_id,
+                // A reply shape this code does not know leaves the stream
+                // untouched.
+                _ => return Ok(0),
+            }
+        } else {
+            group.last_delivered_id
+        };
+        // Redis ids are `ms-seq`; anything else leaves the stream untouched.
+        let Some(id) = parse_stream_id(&oldest_needed) else {
+            return Ok(0);
+        };
+        keep_from = Some(keep_from.map_or(id, |kept| kept.min(id)));
+    }
+    let Some((ms, seq)) = keep_from else {
+        return Ok(0);
+    };
+    // `~` removes whole radix nodes only, so it never removes an entry at or
+    // after the threshold.
+    let removed: usize = conn
+        .xtrim_options(
+            stream_key,
+            &StreamTrimOptions::minid(StreamTrimmingMode::Approx, format!("{ms}-{seq}")),
+        )
+        .await?;
+    Ok(removed)
+}
+
+fn parse_stream_id(id: &str) -> Option<(u64, u64)> {
+    let (ms, seq) = id.split_once('-')?;
+    Some((ms.parse().ok()?, seq.parse().ok()?))
 }
 
 #[cfg(test)]
@@ -1249,5 +1311,111 @@ mod tests {
             len < 1000,
             "trimmed well below the produced count, got {len}"
         );
+    }
+
+    async fn xlen(conn: &ConnectionManager, key: &str) -> usize {
+        conn.clone().xlen(key).await.expect("xlen")
+    }
+
+    async fn publish_n(conn: &ConnectionManager, key: &str, count: u32) -> Vec<String> {
+        let producer: StreamProducer<Evt> = StreamProducer::new(conn.clone(), key);
+        let mut ids = Vec::new();
+        for n in 0..count {
+            ids.push(
+                producer
+                    .publish(&Evt {
+                        n,
+                        label: String::new(),
+                    })
+                    .await
+                    .expect("publish"),
+            );
+        }
+        ids
+    }
+
+    /// Entries every group acknowledged go; the slow group's pending entries
+    /// and everything after them stay, and its consumer re-reads them after a
+    /// restart with their payload intact.
+    #[tokio::test]
+    async fn trim_consumed_keeps_what_a_group_still_needs() {
+        let Some(conn) = connect_or_skip(18).await else {
+            return;
+        };
+        let key = "bp:test:trim";
+        let fast: StreamConsumer<Evt> = StreamConsumer::new(conn.clone(), key, "fast", "c1");
+        let slow: StreamConsumer<Evt> = StreamConsumer::new(conn.clone(), key, "slow", "c1");
+        fast.ensure_group().await.expect("ensure fast");
+        slow.ensure_group().await.expect("ensure slow");
+        let ids = publish_n(&conn, key, 1000).await;
+
+        let all = fast.read_new(1000, 1000).await.expect("fast read");
+        assert_eq!(all.len(), 1000);
+        fast.ack(&all.iter().map(|c| c.id.clone()).collect::<Vec<_>>())
+            .await
+            .expect("fast ack");
+        // The slow group got 900 and acknowledged the first 500, so its 400
+        // pending entries span several radix nodes below its last delivered
+        // entry.
+        let got = slow.read_new(900, 1000).await.expect("slow read");
+        assert_eq!(got.len(), 900);
+        slow.ack(&got[..500].iter().map(|c| c.id.clone()).collect::<Vec<_>>())
+            .await
+            .expect("slow ack");
+
+        let removed = trim_consumed(&conn, key).await.expect("trim");
+        assert!(removed > 0, "entries both groups acknowledged are removed");
+        assert_eq!(xlen(&conn, key).await, 1000 - removed);
+        assert!(
+            removed <= 500,
+            "nothing at or after the oldest pending entry goes"
+        );
+
+        let replay = slow.read_pending(1000).await.expect("slow replay");
+        assert_eq!(replay.len(), 400, "the 400 pending entries survive");
+        assert_eq!(replay[0].id, ids[500]);
+        assert_eq!(replay[0].value.n, 500, "with their payload");
+        let rest = slow.read_new(1000, 1000).await.expect("slow rest");
+        assert_eq!(rest.len(), 100, "undelivered entries all stay");
+
+        let lag = group_lag(&conn, key, "slow").await;
+        assert_eq!(lag, Some(0), "the lag stays computable after a trim");
+    }
+
+    /// A group that has read nothing holds the whole stream, and a stream
+    /// without groups is left alone.
+    #[tokio::test]
+    async fn trim_consumed_leaves_unread_and_groupless_streams_alone() {
+        let Some(conn) = connect_or_skip(19).await else {
+            return;
+        };
+        let unread = "bp:test:trim:unread";
+        let consumer: StreamConsumer<Evt> = StreamConsumer::new(conn.clone(), unread, "g", "c1");
+        consumer.ensure_group().await.expect("ensure");
+        publish_n(&conn, unread, 500).await;
+        assert_eq!(trim_consumed(&conn, unread).await.expect("trim"), 0);
+        assert_eq!(xlen(&conn, unread).await, 500);
+
+        let groupless = "bp:test:trim:groupless";
+        publish_n(&conn, groupless, 500).await;
+        assert_eq!(trim_consumed(&conn, groupless).await.expect("trim"), 0);
+        assert_eq!(xlen(&conn, groupless).await, 500);
+
+        assert_eq!(
+            trim_consumed(&conn, "bp:test:trim:missing")
+                .await
+                .expect("trim"),
+            0,
+            "a missing stream is not an error"
+        );
+    }
+
+    async fn group_lag(conn: &ConnectionManager, key: &str, group: &str) -> Option<usize> {
+        let info: StreamInfoGroupsReply = conn.clone().xinfo_groups(key).await.expect("xinfo");
+        info.groups
+            .into_iter()
+            .find(|g| g.name == group)
+            .expect("group")
+            .lag
     }
 }

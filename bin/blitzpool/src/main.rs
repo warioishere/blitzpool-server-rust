@@ -55,6 +55,7 @@ mod stratum;
 mod stratum_v1;
 mod stratum_v2;
 mod stream_monitor;
+mod stream_trim;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -606,6 +607,18 @@ async fn main() -> ExitCode {
             handles.db.pool().clone(),
             crate::redis_backup::DEFAULT_INTERVAL,
             crate::redis_backup::DEFAULT_RETENTION,
+        ))
+    } else {
+        None
+    };
+
+    // Keeps the share and device streams to what a consumer still needs. Runs
+    // with the money consumer: while it is down nothing is trimmed and
+    // `MAXLEN` stays the buffer.
+    let _stream_trim = if cfg.has_role(Role::Payout) {
+        Some(crate::stream_trim::spawn_trim_task(
+            handles.redis.clone(),
+            crate::stream_trim::DEFAULT_INTERVAL,
         ))
     } else {
         None

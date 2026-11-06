@@ -41,7 +41,9 @@ keep editing one config.
 * While `blitzpool-payout` (or `notify`) is down, events **buffer in the Redis
   stream** (capped at ~1M entries ≈ hours). On restart it resumes from the
   consumer-group offset (pending backlog first, then new) — nothing lost for a
-  normal restart.
+  normal restart. Payout trims the accepted-share, rejected-share and
+  device-status streams to the oldest entry some group still needs (whole
+  stream nodes, so a few older entries can remain).
 * Only the **core** needs the bitcoin-core IPC socket (TDP is front-only); the
   `api`, `payout`, and `notify` containers don't mount it.
 

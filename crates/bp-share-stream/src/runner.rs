@@ -82,13 +82,26 @@ impl<T: DeserializeOwned + Send + 'static> StreamConsumer<T> {
     ) where
         H: StreamEntryHandler<T>,
     {
-        let ensured = match ensure {
-            EnsureMode::FromZero => self.ensure_group().await,
-            EnsureMode::FromTail => self.ensure_group_at_tail().await,
-        };
-        if let Err(err) = ensured {
-            warn!(%err, label = config.label, "stream-consumer: ensure_group failed; task not started");
-            return;
+        // Retried until it succeeds: a group that does not exist yet is not
+        // waiting for this consumer, and the stream trim removes what the
+        // other groups have acknowledged.
+        loop {
+            let ensured = match ensure {
+                EnsureMode::FromZero => self.ensure_group().await,
+                EnsureMode::FromTail => self.ensure_group_at_tail().await,
+            };
+            let Err(err) = ensured else {
+                break;
+            };
+            warn!(%err, label = config.label, "stream-consumer: ensure_group failed; retrying");
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    info!(label = config.label, "stream-consumer: stopped before the group existed");
+                    return;
+                }
+                _ = tokio::time::sleep(config.error_backoff) => {}
+            }
         }
 
         // An error ends the replay instead of retrying: `drain_pending` re-reads
@@ -321,6 +334,56 @@ mod tests {
             "driver acked the batch"
         );
 
+        cancel.cancel();
+        task.await.expect("loop task joins after cancel");
+    }
+
+    /// A failed `ensure_group` is retried, so the consumer starts once the
+    /// group can be created and handles what was published meanwhile.
+    #[tokio::test]
+    async fn run_retries_a_failed_ensure_group() {
+        let Some(conn) = connect_or_skip(20).await else {
+            return;
+        };
+        let key = "bp:test:runner:ensure";
+        // A string under the stream key makes `XGROUP CREATE … MKSTREAM` fail.
+        let _: () = redis::cmd("SET")
+            .arg(key)
+            .arg("not a stream")
+            .query_async(&mut conn.clone())
+            .await
+            .expect("set");
+
+        let seen = Arc::new(AsyncMutex::new(Vec::new()));
+        let consumer: StreamConsumer<Evt> = StreamConsumer::new(conn.clone(), key, "g", "c1");
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(consumer.run(
+            EnsureMode::FromZero,
+            ConsumerLoopConfig::new(16, "test"),
+            cancel.clone(),
+            RecordingHandler { seen: seen.clone() },
+        ));
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(
+            !task.is_finished(),
+            "the consumer keeps trying instead of giving up"
+        );
+
+        let _: () = redis::cmd("DEL")
+            .arg(key)
+            .query_async(&mut conn.clone())
+            .await
+            .expect("del");
+        producer(conn, key)
+            .publish(&Evt { n: 7 })
+            .await
+            .expect("publish");
+
+        assert!(
+            wait_until_len(&seen, 1).await,
+            "handled once the group exists"
+        );
+        assert_eq!(*seen.lock().await, vec![7]);
         cancel.cancel();
         task.await.expect("loop task joins after cancel");
     }
