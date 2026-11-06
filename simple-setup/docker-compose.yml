@@ -106,11 +106,14 @@ services:
     stop_grace_period: 30s
     # Append-only file: the pool keeps its payout windows and parked blocks
     # here. volatile-lru evicts only keys with a TTL, so state without one
-    # (parked blocks awaiting confirmation) is never evicted.
+    # (parked blocks awaiting confirmation) is never evicted. `--save ""`
+    # turns off the RDB snapshots, which a restart does not read while AOF
+    # is on.
     command: >
       valkey-server
       --appendonly yes
       --appendfsync everysec
+      --save ""
       --maxmemory ${REDIS_MAX_MEMORY:-1gb}
       --maxmemory-policy volatile-lru
     healthcheck:

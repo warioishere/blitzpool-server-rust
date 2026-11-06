@@ -144,10 +144,14 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    # Persistence is the append-only file alone. `--save ""` turns off the
+    # RDB snapshots, which a restart does not read while AOF is on and which
+    # rewrite the whole dataset each time enough keys have changed.
     command: >
       valkey-server
       --appendonly yes
       --appendfsync everysec
+      --save ""
       --maxmemory ${REDIS_MAX_MEMORY:-4096mb}
       --maxmemory-policy volatile-lru
       --io-threads 2
