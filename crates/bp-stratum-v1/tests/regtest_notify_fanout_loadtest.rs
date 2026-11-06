@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Load test: prints the trigger to `mining.notify` latency across N miners,
-//! for a new block and for a fee refresh. The spread (max − min) of a block
-//! is the per-connection fan-out cost; a refresh is spread over
-//! `REFRESH_SPREAD` on purpose, and the histogram shows how evenly. The
+//! for a new block and for a fee refresh, and asserts that every miner gets
+//! both, a block within half of `REFRESH_SPREAD` and a refresh spread over
+//! `REFRESH_SPREAD`. The spread (max − min) of a block is the per-connection
+//! fan-out cost; the histogram shows how evenly a refresh is spread. The
 //! absolute numbers include the shared RPC + IPC hop. Run with `--nocapture`;
 //! `LOADTEST_SIZES=100,500` picks N.
 
@@ -381,16 +382,17 @@ async fn notify_fanout_latency_under_load() {
                     "a block reaches every miner at once, spread {spread} ms at N={n}"
                 ),
                 Trigger::Refresh => {
+                    let tolerance_ms = 250;
+                    assert!(
+                        spread <= spread_ms + tolerance_ms,
+                        "every miner gets the refresh within the window, spread {spread} ms at N={n}"
+                    );
                     // Miners per 100 ms slice after the first arrival.
-                    let mut slices = vec![0usize; (spread_ms / 100) as usize + 1];
+                    let mut slices = vec![0usize; ((spread_ms + tolerance_ms) / 100) as usize + 1];
                     for us in &samples {
                         slices[(((us - min) / 1000) / 100) as usize] += 1;
                     }
                     eprintln!("{:>15}  per 100 ms: {slices:?}", "");
-                    assert!(
-                        spread <= spread_ms + 250,
-                        "every miner gets the refresh within the window, spread {spread} ms at N={n}"
-                    );
                     if n >= 50 {
                         assert!(
                             spread >= spread_ms / 2,

@@ -30,24 +30,15 @@ pub struct RefreshPacer<T> {
 }
 
 impl<T: PacedBroadcast> RefreshPacer<T> {
-    /// `seed` picks this connection's delay inside `spread`; any per-connection
-    /// value works (a session id).
+    /// `seed` picks this connection's delay inside `spread`. It must be spread
+    /// evenly itself; both servers pass their random session id.
     pub fn new(seed: u64, spread: Duration) -> Self {
         let spread_ms = u64::try_from(spread.as_millis()).unwrap_or(u64::MAX);
-        let delay_ms = if spread_ms == 0 {
-            0
-        } else {
-            splitmix64(seed) % spread_ms
-        };
+        let delay_ms = if spread_ms == 0 { 0 } else { seed % spread_ms };
         Self {
             delay: Duration::from_millis(delay_ms),
             held: None,
         }
-    }
-
-    /// This connection's refresh delay.
-    pub fn delay(&self) -> Duration {
-        self.delay
     }
 
     /// Drops a held refresh. Call it when the connection switches to another
@@ -59,8 +50,9 @@ impl<T: PacedBroadcast> RefreshPacer<T> {
     /// The next broadcast to apply. A new block comes at once and drops a held
     /// refresh. A refresh is held until this connection's delay has passed; a
     /// newer refresh in the meantime replaces it and keeps the time. A lag
-    /// error drops a held refresh too, since the skipped broadcasts may hold a
-    /// new block. Cancel-safe: a held refresh survives the future being dropped.
+    /// error drops a held refresh too: it may belong to a tip the skipped
+    /// broadcasts moved past. Cancel-safe: a held refresh survives the future
+    /// being dropped.
     pub async fn next(
         &mut self,
         rx: &mut broadcast::Receiver<T>,
@@ -99,14 +91,6 @@ impl<T: PacedBroadcast> RefreshPacer<T> {
     }
 }
 
-/// Spreads sequential seeds (SV2 session ids count up) evenly over the window.
-fn splitmix64(seed: u64) -> u64 {
-    let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,12 +121,20 @@ mod tests {
         }
     }
 
-    /// A pacer whose delay is exactly `delay_ms`, found by trying seeds.
     fn pacer_with_delay(delay_ms: u64) -> RefreshPacer<Evt> {
-        (0..100_000u64)
-            .map(|seed| RefreshPacer::new(seed, REFRESH_SPREAD))
-            .find(|p| p.delay() == Duration::from_millis(delay_ms))
-            .expect("some seed gives this delay")
+        let pacer = RefreshPacer::new(delay_ms, REFRESH_SPREAD);
+        assert_eq!(pacer.delay, Duration::from_millis(delay_ms));
+        pacer
+    }
+
+    /// Nothing comes out of `next` within `wait`.
+    async fn assert_nothing_within(
+        pacer: &mut RefreshPacer<Evt>,
+        rx: &mut broadcast::Receiver<Evt>,
+        wait: Duration,
+    ) {
+        let got = tokio::time::timeout(wait, pacer.next(rx)).await;
+        assert!(got.is_err(), "nothing is due, got {got:?}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -178,10 +170,9 @@ mod tests {
         });
         assert_eq!(pacer.next(&mut rx).await.unwrap(), new_block(2));
         assert_eq!(start.elapsed(), Duration::from_millis(300));
-        let tx = sender.await.unwrap();
-        // Nothing is left to deliver: the stale refresh is gone.
-        tx.send(new_block(3)).unwrap();
-        assert_eq!(pacer.next(&mut rx).await.unwrap(), new_block(3));
+        let _tx = sender.await.unwrap();
+        // The stale refresh is gone: nothing comes at its old time or after.
+        assert_nothing_within(&mut pacer, &mut rx, Duration::from_secs(2)).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -225,8 +216,33 @@ mod tests {
             _ = tokio::time::sleep(Duration::from_millis(100)) => {}
         }
         pacer.clear();
-        tx.send(new_block(2)).unwrap();
-        assert_eq!(pacer.next(&mut rx).await.unwrap(), new_block(2));
+        assert_nothing_within(&mut pacer, &mut rx, Duration::from_secs(2)).await;
+        drop(tx);
+    }
+
+    /// A lag error drops a held refresh: the skipped broadcasts may have
+    /// moved the tip.
+    #[tokio::test(start_paused = true)]
+    async fn a_lag_error_drops_a_held_refresh() {
+        let (tx, mut rx) = broadcast::channel(2);
+        let mut pacer = pacer_with_delay(700);
+        tx.send(refresh(1)).unwrap();
+        tokio::select! {
+            _ = pacer.next(&mut rx) => panic!("not due yet"),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+        // Three more than the channel holds: the next read reports a lag.
+        for n in 2..5 {
+            tx.send(refresh(n)).unwrap();
+        }
+        assert!(matches!(
+            pacer.next(&mut rx).await,
+            Err(broadcast::error::RecvError::Lagged(_))
+        ));
+        // Drain what is left, then nothing may come at the held time.
+        while rx.try_recv().is_ok() {}
+        assert_nothing_within(&mut pacer, &mut rx, Duration::from_secs(2)).await;
+        drop(tx);
     }
 
     #[tokio::test(start_paused = true)]
@@ -239,14 +255,19 @@ mod tests {
         assert_eq!(start.elapsed(), Duration::ZERO);
     }
 
-    /// 1000 connections with counting seeds, as SV2 hands them out: every
-    /// delay stays inside the window and no 100 ms slice gets far more than
-    /// its share.
+    /// 1000 connections with random u32 seeds, as both servers hand them out:
+    /// every delay stays inside the window and no 100 ms slice gets far more
+    /// than its share.
     #[test]
     fn delays_spread_evenly_over_the_window() {
         let mut slices = [0usize; 10];
-        for seed in 0..1000u64 {
-            let delay = RefreshPacer::<Evt>::new(seed, REFRESH_SPREAD).delay();
+        // A fixed xorshift sequence stands in for the session ids.
+        let mut x: u32 = 0x9e37_79b9;
+        for _ in 0..1000 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let delay = RefreshPacer::<Evt>::new(u64::from(x), REFRESH_SPREAD).delay;
             assert!(delay < REFRESH_SPREAD);
             slices[(delay.as_millis() / 100) as usize] += 1;
         }
