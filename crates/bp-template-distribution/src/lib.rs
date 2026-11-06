@@ -10,6 +10,7 @@ mod config;
 mod error;
 mod handle;
 mod message;
+mod pacing;
 mod tx_cache;
 mod worker;
 
@@ -26,4 +27,5 @@ pub use message::{
     apply_to_snapshot, NewTemplate, RequestTransactionDataError, RequestTransactionDataSuccess,
     SetNewPrevHash, TdpRequest, TemplateSnapshot, TemplateUpdate,
 };
+pub use pacing::{PacedBroadcast, RefreshPacer, REFRESH_SPREAD};
 pub use tx_cache::TemplateTxCache;

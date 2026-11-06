@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Load test, not pass/fail: prints the new-block to `mining.notify` latency
-//! across N miners. The spread (max − min) isolates per-connection fan-out
-//! cost; the absolute numbers include the shared RPC + IPC hop. Run with
-//! `--nocapture`; `LOADTEST_SIZES=100,500` picks N.
+//! Load test: prints the trigger to `mining.notify` latency across N miners,
+//! for a new block and for a fee refresh. The spread (max − min) of a block
+//! is the per-connection fan-out cost; a refresh is spread over
+//! `REFRESH_SPREAD` on purpose, and the histogram shows how evenly. The
+//! absolute numbers include the shared RPC + IPC hop. Run with `--nocapture`;
+//! `LOADTEST_SIZES=100,500` picks N.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -17,7 +19,7 @@ use bp_regtest_harness::{RegtestConfig, RegtestNode};
 use bp_stratum_v1::{
     PayoutResolver, PortConfig, ServerConfig, ServerHooks, SharedExtranonce, StratumV1Server,
 };
-use bp_template_distribution::{TdpCoinbaseConstraints, TdpConfig, TdpHandle};
+use bp_template_distribution::{TdpCoinbaseConstraints, TdpConfig, TdpHandle, REFRESH_SPREAD};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::OwnedReadHalf;
@@ -52,6 +54,36 @@ async fn read_frame(reader: &mut BufReader<OwnedReadHalf>) -> Option<Value> {
     serde_json::from_str::<Value>(&line).ok()
 }
 
+/// What a measurement triggers, and which notify answers it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Trigger {
+    /// Mine a block: the first notify with a new prev-hash.
+    Block,
+    /// Send a transaction: the first notify on the same prev-hash with
+    /// `clean_jobs=false`.
+    Refresh,
+}
+
+impl Trigger {
+    fn answers(self, f: &Value, baseline_prev: &str) -> bool {
+        let Some(ph) = prevhash_of_notify(f) else {
+            return false;
+        };
+        let clean = f["params"].get(8).and_then(Value::as_bool);
+        match self {
+            Self::Block => ph != baseline_prev,
+            Self::Refresh => ph == baseline_prev && clean == Some(false),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Refresh => "refresh",
+        }
+    }
+}
+
 fn prevhash_of_notify(f: &Value) -> Option<String> {
     if f.get("method").and_then(|m| m.as_str()) != Some("mining.notify") {
         return None;
@@ -63,10 +95,14 @@ fn prevhash_of_notify(f: &Value) -> Option<String> {
         .map(String::from)
 }
 
-/// Connect `n` miners, mine one block, and return `(connected, samples_us)`:
-/// per miner, the time from the trigger to the first notify with a new
-/// prev-hash.
-async fn measure(node: &RegtestNode, addr: SocketAddr, n: usize) -> (usize, Vec<u128>) {
+/// Connect `n` miners, fire `trigger`, and return `(connected, samples_us)`:
+/// per miner, the time from the trigger to the first notify answering it.
+async fn measure(
+    node: &RegtestNode,
+    addr: SocketAddr,
+    n: usize,
+    trigger: Trigger,
+) -> (usize, Vec<u128>) {
     // Set once, immediately before the block trigger; read by each miner task.
     let t0: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
     let (sample_tx, mut sample_rx) = mpsc::channel::<Option<u128>>(n.max(1));
@@ -134,15 +170,15 @@ async fn measure(node: &RegtestNode, addr: SocketAddr, n: usize) -> (usize, Vec<
             };
             let _ = ready_tx.send(()).await;
 
-            // A new prev-hash marks the block; mempool refreshes keep the old one.
             let got = tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
                     match read_frame(&mut reader).await {
                         Some(f) => {
-                            if let Some(ph) = prevhash_of_notify(&f) {
-                                if ph != baseline_prev {
-                                    let started = *t0.lock().unwrap();
-                                    return started.map(|s| s.elapsed().as_micros());
+                            let started = *t0.lock().unwrap();
+                            // Frames before the trigger cannot answer it.
+                            if let Some(s) = started {
+                                if trigger.answers(&f, &baseline_prev) {
+                                    return Some(s.elapsed().as_micros());
                                 }
                             }
                         }
@@ -168,11 +204,20 @@ async fn measure(node: &RegtestNode, addr: SocketAddr, n: usize) -> (usize, Vec<
     // Let the connections settle so the block-notify isn't racing a mid-connect.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Trigger: capture the origin, then mine one block.
     *t0.lock().unwrap() = Some(Instant::now());
-    node.generate_to_self(1)
-        .await
-        .expect("mine block for fan-out");
+    match trigger {
+        Trigger::Block => {
+            node.generate_to_self(1)
+                .await
+                .expect("mine block for fan-out");
+        }
+        Trigger::Refresh => {
+            let dest = node.new_address("bech32").await.expect("new address");
+            node.wallet_call("sendtoaddress", serde_json::json!([dest, 0.01]))
+                .await
+                .expect("sendtoaddress for a fee refresh");
+        }
+    }
 
     // Collect one result per spawned miner task.
     let mut samples = Vec::with_capacity(n);
@@ -296,38 +341,72 @@ async fn notify_fanout_latency_under_load() {
         });
     }
 
-    eprintln!("\n========= notify fan-out load test (Block → mining.notify) =========");
+    eprintln!("\n========= notify fan-out load test (trigger → mining.notify) =========");
     eprintln!(
-        "{:>6}  {:>6}  {:>8}  {:>8}  {:>8}  {:>8}  {:>10}",
-        "miners", "recv", "min_ms", "p50_ms", "p95_ms", "max_ms", "spread_ms"
+        "{:>6}  {:>7}  {:>6}  {:>8}  {:>8}  {:>8}  {:>8}  {:>10}",
+        "miners", "trigger", "recv", "min_ms", "p50_ms", "p95_ms", "max_ms", "spread_ms"
     );
+    let spread_ms = REFRESH_SPREAD.as_millis();
     for &n in &sizes {
-        let (connected, mut samples) = measure(&node, addr, n).await;
-        samples.sort_unstable();
-        let ms = |us: u128| us as f64 / 1000.0;
-        let (min, max) = (
-            samples.first().copied().unwrap_or(0),
-            samples.last().copied().unwrap_or(0),
-        );
-        eprintln!(
-            "{:>6}  {:>6}  {:>8.2}  {:>8.2}  {:>8.2}  {:>8.2}  {:>10.2}",
-            n,
-            samples.len(),
-            ms(min),
-            ms(pct(&samples, 0.50)),
-            ms(pct(&samples, 0.95)),
-            ms(max),
-            ms(max.saturating_sub(min)),
-        );
-        assert!(
-            !samples.is_empty(),
-            "no miner received a new-block notify at N={n} (connected={connected})"
-        );
-        // Let sockets from this round close before the next.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        for trigger in [Trigger::Block, Trigger::Refresh] {
+            let (connected, mut samples) = measure(&node, addr, n, trigger).await;
+            samples.sort_unstable();
+            let ms = |us: u128| us as f64 / 1000.0;
+            let (min, max) = (
+                samples.first().copied().unwrap_or(0),
+                samples.last().copied().unwrap_or(0),
+            );
+            let spread = max.saturating_sub(min) / 1000;
+            eprintln!(
+                "{:>6}  {:>7}  {:>6}  {:>8.2}  {:>8.2}  {:>8.2}  {:>8.2}  {:>10.2}",
+                n,
+                trigger.label(),
+                samples.len(),
+                ms(min),
+                ms(pct(&samples, 0.50)),
+                ms(pct(&samples, 0.95)),
+                ms(max),
+                ms(max.saturating_sub(min)),
+            );
+            assert_eq!(
+                samples.len(),
+                connected,
+                "every connected miner answers the {} at N={n}",
+                trigger.label()
+            );
+            match trigger {
+                // A block is never held back.
+                Trigger::Block => assert!(
+                    spread < spread_ms / 2,
+                    "a block reaches every miner at once, spread {spread} ms at N={n}"
+                ),
+                Trigger::Refresh => {
+                    // Miners per 100 ms slice after the first arrival.
+                    let mut slices = vec![0usize; (spread_ms / 100) as usize + 1];
+                    for us in &samples {
+                        slices[(((us - min) / 1000) / 100) as usize] += 1;
+                    }
+                    eprintln!("{:>15}  per 100 ms: {slices:?}", "");
+                    assert!(
+                        spread <= spread_ms + 250,
+                        "every miner gets the refresh within the window, spread {spread} ms at N={n}"
+                    );
+                    if n >= 50 {
+                        assert!(
+                            spread >= spread_ms / 2,
+                            "the refresh is spread out, spread {spread} ms at N={n}"
+                        );
+                    }
+                }
+            }
+            // Let sockets from this round close before the next.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
-    eprintln!("spread = max−min = pure per-connection fan-out serialisation cost");
-    eprintln!("====================================================================\n");
+    eprintln!(
+        "block spread = per-connection fan-out cost; refresh spread = REFRESH_SPREAD by design"
+    );
+    eprintln!("=======================================================================\n");
 
     server.shutdown().await;
     tdp_default.shutdown().ok();

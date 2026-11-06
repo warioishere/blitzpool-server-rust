@@ -38,7 +38,9 @@ use crate::mining::client::{
     HandlerOutcome, MiningJobInputs, MiningSessionState, OutboundFrame, PortConfig, SessionEvent,
     ERR_CHANNEL_CAPACITY_EXHAUSTED,
 };
-use bp_template_distribution::{ActiveTemplate, TemplateAssembler, TemplateChange};
+use bp_template_distribution::{
+    ActiveTemplate, RefreshPacer, TemplateAssembler, TemplateChange, REFRESH_SPREAD,
+};
 
 use crate::mining::translator::TemplateBroadcast;
 use crate::noise::{accept_pool_noise, NoiseConfig, NoiseTcpWriteHalf};
@@ -451,6 +453,9 @@ async fn run_mining_connection(
     // traces (`🎯 Extended share difficulty`) on it.
     state.share_logs = server_config.share_logs;
     state.current_template = initial_template;
+    // A fee refresh reaches this connection within `REFRESH_SPREAD`, at its
+    // own offset, so the pool does not send it to every miner at once.
+    let mut refresh_pacer = RefreshPacer::new(u64::from(session_id), REFRESH_SPREAD);
 
     let mut vardiff_tick = tokio::time::interval(Duration::from_millis(state.vardiff_interval_ms));
     vardiff_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -636,6 +641,7 @@ async fn run_mining_connection(
                             if !resolved.is_pplns() {
                                 if let Some(alt) = alt_streams.remove(&resolved) {
                                     template_rx = alt.rx;
+                                    refresh_pacer.clear();
                                     state.current_template = alt.initial;
                                     state.stream = resolved;
                                     debug!(
@@ -806,7 +812,7 @@ async fn run_mining_connection(
                     }
                 }
             }
-            broadcast_recv = template_rx.recv() => {
+            broadcast_recv = refresh_pacer.next(&mut template_rx) => {
                 let payload = match broadcast_recv {
                     Ok(p) => p,
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,

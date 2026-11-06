@@ -22,4 +22,4 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 bp-regtest-harness = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros"] }

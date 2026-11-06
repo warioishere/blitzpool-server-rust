@@ -33,7 +33,9 @@ use crate::hooks::ServerHooks;
 use crate::jobs::JobRegistry;
 use crate::notify::ActiveSV1Template;
 use bp_mining_job::{MiningJobCache, ResolvedPayouts};
-use bp_template_distribution::{TemplateAssembler, TemplateChange};
+use bp_template_distribution::{
+    PacedBroadcast, RefreshPacer, TemplateAssembler, TemplateChange, REFRESH_SPREAD,
+};
 use bp_vardiff::{Clock, SystemClock};
 
 /// Extranonce1 allocator shared by every SV1 port, so two miners, even on
@@ -103,6 +105,12 @@ pub(crate) struct TemplateBroadcast {
     /// `Arc` so each connected session gets a refcount bump, not a deep copy.
     pub template: Arc<ActiveSV1Template>,
     pub change: TemplateChange,
+}
+
+impl PacedBroadcast for TemplateBroadcast {
+    fn template_change(&self) -> TemplateChange {
+        self.change
+    }
 }
 
 /// A lagged connection skips the missed broadcasts and continues with the next one.
@@ -431,6 +439,12 @@ async fn run_connection(
         }
     }
     let mut current_template = initial_template;
+    // A fee refresh reaches this connection within `REFRESH_SPREAD`, at its
+    // own offset, so the pool does not send it to every miner at once.
+    let mut refresh_pacer = RefreshPacer::new(
+        u64::from_str_radix(&state.session_id_hex, 16).unwrap_or_default(),
+        REFRESH_SPREAD,
+    );
 
     let mut vardiff_tick = tokio::time::interval(std::time::Duration::from_millis(
         server_config.difficulty_check_interval_ms,
@@ -536,6 +550,7 @@ async fn run_connection(
                                     if !resolved.is_pplns() {
                                         if let Some(alt) = alt_streams.remove(&resolved) {
                                             template_rx = alt.rx;
+                                            refresh_pacer.clear();
                                             current_template = alt.initial;
                                             state.stream = resolved;
                                             debug!(
@@ -630,7 +645,7 @@ async fn run_connection(
                     }
                 }
             }
-            broadcast = template_rx.recv() => {
+            broadcast = refresh_pacer.next(&mut template_rx) => {
                 let payload = match broadcast {
                     Ok(p) => p,
                     Err(broadcast::error::RecvError::Lagged(_)) => {

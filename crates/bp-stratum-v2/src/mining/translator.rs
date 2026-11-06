@@ -18,3 +18,9 @@ pub struct TemplateBroadcast {
     pub template: Arc<ActiveTemplate>,
     pub change: TemplateChange,
 }
+
+impl bp_template_distribution::PacedBroadcast for TemplateBroadcast {
+    fn template_change(&self) -> TemplateChange {
+        self.change
+    }
+}
