@@ -82,7 +82,7 @@ The distribution builder reserves the structural coinbase overhead, then greedil
 
 Where a trimmed payout goes differs by mode, deliberately. **PPLNS**: the value stays inside the miners' cut as a signed pending credit and is repaid from a later block (`WithheldValue::ToOtherMiners`). **Team Mining**: it is paid to the pool (`WithheldValue::ToPool`) — there is no team ledger and no carry-forward, which is why membership is hard-capped at what the coinbase can actually pay. Under-sizing a PPLNS budget therefore costs *fairness* (a small miner waits a block or two), never *validity*.
 
-Capacity is monitored externally rather than by the pool: `GET /api/pplns/groups/coinbase-capacity` reports the member ceiling and `GET /api/pplns/fees` the PPLNS `maxMinerOutputsAdaptive`, each divided into the current fill (`members.length` from the team detail, or the length of `GET /api/pplns/distribution`).
+Capacity is monitored externally rather than by the pool: `GET /api/pplns/groups/coinbase-capacity` reports the member ceiling and `GET /api/pplns/fees` the PPLNS `maxMinerOutputsAdaptive` (with `maxMinerOutputsCeiling` for the most the autoscaler can raise it to), each divided into the current fill (`members.length` from the team detail, or the length of `GET /api/pplns/distribution`).
 
 ### 4. Core/Satellite split (horizontal scale)
 

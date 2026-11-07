@@ -268,6 +268,11 @@ struct FeesResponse {
     coinbase_witness_commitment_weight: u32,
     max_miner_outputs: u32,
     max_miner_outputs_adaptive: u32,
+    /// The ceiling the autoscaler may raise `coinbase_weight_budget` to;
+    /// `null` while the budget is fixed.
+    max_weight_budget: Option<u32>,
+    /// `max_miner_outputs` at `max_weight_budget`, or at the fixed budget.
+    max_miner_outputs_ceiling: u32,
     min_difficulty: u64,
 }
 
@@ -294,6 +299,11 @@ async fn fees(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
                 let max_miner_outputs =
                     u32::try_from(max_coinbase_outputs(coinbase_weight_budget)).unwrap_or(u32::MAX);
                 let max_miner_outputs_adaptive = max_miner_outputs;
+                let max_weight_budget = s.pplns_budget_ceiling;
+                let max_miner_outputs_ceiling = u32::try_from(max_coinbase_outputs(
+                    max_weight_budget.unwrap_or(coinbase_weight_budget),
+                ))
+                .unwrap_or(u32::MAX);
                 Ok(FeesResponse {
                     fee_percent: cfg.fee_percent,
                     fee_address: cfg.fee_address.as_ref().map(|a| a.as_str().to_string()),
@@ -313,6 +323,8 @@ async fn fees(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
                     coinbase_witness_commitment_weight: COINBASE_WITNESS_COMMITMENT_WEIGHT,
                     max_miner_outputs,
                     max_miner_outputs_adaptive,
+                    max_weight_budget,
+                    max_miner_outputs_ceiling,
                     min_difficulty: cfg.min_difficulty,
                 })
             },
@@ -325,7 +337,7 @@ async fn fees(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
 /// value another process persists in Redis. Otherwise, or when the key is
 /// missing or unreadable, the config budget (a leftover key would be stale).
 async fn live_pplns_budget(state: &AppState, config_budget: u32) -> u32 {
-    if !state.pplns_budget_autoscaled {
+    if state.pplns_budget_ceiling.is_none() {
         return config_budget;
     }
     let Some(mut redis) = state.redis.clone() else {
@@ -605,14 +617,14 @@ mod tests {
         let mut state = AppState::new(pool, "0.0.0");
         state.redis = Some(redis.clone());
 
-        state.pplns_budget_autoscaled = false;
+        state.pplns_budget_ceiling = None;
         assert_eq!(
             live_pplns_budget(&state, CONFIG_BUDGET).await,
             CONFIG_BUDGET,
             "autoscaler off: a stored budget is stale and must be ignored"
         );
 
-        state.pplns_budget_autoscaled = true;
+        state.pplns_budget_ceiling = Some(200_000);
         assert_eq!(
             live_pplns_budget(&state, CONFIG_BUDGET).await,
             LIVE_BUDGET,
@@ -628,6 +640,37 @@ mod tests {
             CONFIG_BUDGET,
             "autoscaler on but nothing persisted yet: the config budget stands"
         );
+    }
+
+    #[test]
+    fn fees_response_reports_the_autoscale_ceiling() {
+        let fees = |max_weight_budget: Option<u32>, max_miner_outputs_ceiling| FeesResponse {
+            fee_percent: 1.0,
+            fee_address: None,
+            coinbase_weight_budget: 35_000,
+            group_fee_percent: None,
+            group_fee_address: None,
+            blockparty_fee_percent: None,
+            dust_limit_sats: 546,
+            min_payout_sats: 5_000,
+            coinbase_base_weight: 328,
+            coinbase_output_weight: 172,
+            coinbase_witness_commitment_weight: 188,
+            max_miner_outputs: 198,
+            max_miner_outputs_adaptive: 198,
+            max_weight_budget,
+            max_miner_outputs_ceiling,
+            min_difficulty: 500,
+        };
+        let scaled: Value = serde_json::to_value(fees(Some(150_000), 866)).unwrap();
+        assert_eq!(scaled["maxWeightBudget"], 150_000);
+        assert_eq!(scaled["maxMinerOutputsCeiling"], 866);
+        let fixed: Value = serde_json::to_value(fees(None, 198)).unwrap();
+        assert!(
+            fixed["maxWeightBudget"].is_null(),
+            "a fixed budget has no ceiling"
+        );
+        assert_eq!(fixed["maxMinerOutputsCeiling"], 198);
     }
 
     #[test]

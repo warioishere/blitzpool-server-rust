@@ -31,9 +31,11 @@ pub struct AppState {
     /// the resolution chain.
     pub redis: Option<RedisConn>,
     pub pplns: Option<Arc<PplnsEngine>>,
-    /// `[pplns.coinbase_autoscale]` is enabled, so the PPLNS budget in force
-    /// is the live value the autoscaler persists, not the configured floor.
-    pub pplns_budget_autoscaled: bool,
+    /// `max_weight_budget` of `[pplns.coinbase_autoscale]` while it is enabled:
+    /// the PPLNS budget in force is then the live value the autoscaler
+    /// persists, not the configured floor, and never above this ceiling.
+    /// `None` while the budget is fixed.
+    pub pplns_budget_ceiling: Option<u32>,
     pub group_solo: Option<Arc<GroupSoloEngine>>,
     pub group_service: Option<Arc<GroupService>>,
     pub invitation_service: Option<Arc<InvitationService>>,
@@ -88,7 +90,7 @@ impl AppState {
             pool,
             redis: None,
             pplns: None,
-            pplns_budget_autoscaled: false,
+            pplns_budget_ceiling: None,
             group_solo: None,
             group_service: None,
             invitation_service: None,
