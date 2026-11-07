@@ -7,7 +7,6 @@
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use bp_common::AddressId;
 use bp_config::AppConfig;
 use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
 use bp_stratum_v2::jdp_server::StratumV2JdpServer;
@@ -100,17 +99,12 @@ pub(crate) async fn spawn(
     let noise = stratum_v2::build_noise_config(cfg)?;
     let network = crate::boot::bitcoin_network(cfg.network);
     // Same resolver as the allocate path, so the published distribution and
-    // the pool's coinbase agree. The fee address anchors modes with no pool output.
-    let fee_address = cfg
-        .pplns
-        .as_ref()
-        .and_then(|p| AddressId::new(p.fee_address.clone()).ok());
+    // the pool's coinbase agree.
     let distribution_source = Arc::new(ProductionDistributionSource {
         resolver: payout_resolver.clone(),
         chain: Arc::new(tdp.clone()),
         redis: Some(redis),
         network,
-        fee_address,
     });
 
     // SV2 JDP/Job Declarator Server: unset socket means trusted; an unusable

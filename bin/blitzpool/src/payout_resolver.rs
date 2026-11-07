@@ -196,6 +196,8 @@ async fn blockparty_payouts(
 /// Which of the two tailored (per-miner) builds a mode gets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TailoredMode {
+    /// Built only while the Solo coinbase carries a fee output
+    /// ([`solo_fee_output`]); without one the base protocol serves Solo.
     Solo,
     GroupSolo,
 }
@@ -228,6 +230,19 @@ fn jdp_distribution_for(mode: Option<MiningMode>) -> JdpDistributionFor {
         Some(MiningMode::GroupSolo) => JdpDistributionFor::Tailored(TailoredMode::GroupSolo),
         Some(MiningMode::Blockparty) => JdpDistributionFor::Nothing,
     }
+}
+
+/// The fee output of a Solo coinbase, as `(address, sats)`: the one ext 0x0003
+/// gives a Solo miner, as the distribution's pool output. `None` when the
+/// coinbase pays only the miner, which the base protocol already expresses.
+/// Read from `entries`, the payout list `solo_payouts` builds the real Solo
+/// coinbase from, so the distribution and the coinbase cannot disagree.
+fn solo_fee_output(entries: &[(String, u64)], fee: &SoloFeeConfig) -> Option<(String, u64)> {
+    let fee_address = fee.dev_fee_address.as_deref()?;
+    entries
+        .iter()
+        .find(|(address, _)| address == fee_address)
+        .cloned()
 }
 
 /// Which accounting a tailored build belongs to; it travels with the build
@@ -435,9 +450,6 @@ pub(crate) struct ProductionDistributionSource {
     pub(crate) chain: std::sync::Arc<dyn crate::jdp_hooks::ChainView>,
     pub(crate) redis: Option<redis::aio::ConnectionManager>,
     pub(crate) network: bitcoin::Network,
-    /// Pool-output recipient for tailored distributions whose own
-    /// allocator has no pool output (plain Solo without a dev fee).
-    pub(crate) fee_address: Option<AddressId>,
 }
 
 impl ProductionDistributionSource {
@@ -607,29 +619,21 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
                         .into_iter()
                         .map(|p| (p.address, p.sats))
                         .collect();
-                // The dev-fee output doubles as pool_payout; without one the
-                // pool fee address anchors `weight_P` at weight 1 (it only
-                // takes the ext 0x0003/Payout Computation residual).
-                match self.resolver.solo_fee.dev_fee_address.clone() {
-                    Some(dev) => {
-                        let dev_weight = entries
-                            .iter()
-                            .find(|(a, _)| *a == dev)
-                            .map(|(_, s)| *s)
-                            .unwrap_or(1);
-                        let miners: Vec<(String, u64)> =
-                            entries.into_iter().filter(|(a, _)| *a != dev).collect();
-                        self.lower_exact_entries(&dev, dev_weight, &miners, t_ref)
-                    }
-                    None => match self.fee_address.as_ref() {
-                        Some(fee) => self.lower_exact_entries(fee.as_str(), 1, &entries, t_ref),
-                        None => {
-                            warn!(miner = miner_address.as_str(),
-                                "jdp distribution source: solo miner but no pool fee address configured");
-                            None
-                        }
-                    },
-                }
+                let Some((fee_address, fee_weight)) =
+                    solo_fee_output(&entries, &self.resolver.solo_fee)
+                else {
+                    warn!(
+                        miner = miner_address.as_str(),
+                        "jdp distribution source: Solo without a fee pays only the miner, which \
+                         base-protocol Job Declaration serves — no ext 0x0003 distribution"
+                    );
+                    return TailoredDistribution::Unavailable;
+                };
+                let miners: Vec<(String, u64)> = entries
+                    .into_iter()
+                    .filter(|(a, _)| *a != fee_address)
+                    .collect();
+                self.lower_exact_entries(&fee_address, fee_weight, &miners, t_ref)
             }
         };
         match built {
@@ -850,6 +854,49 @@ mod tests {
         assert_ne!(
             jdp_distribution_for(Some(MiningMode::Solo)),
             jdp_distribution_for(Some(MiningMode::GroupSolo))
+        );
+    }
+
+    /// A Solo coinbase gets an ext 0x0003 distribution only through its fee
+    /// output; without one it pays the miner alone, which base-protocol Job
+    /// Declaration serves.
+    #[test]
+    fn a_solo_fee_output_is_found_only_when_the_coinbase_pays_one() {
+        const MINER: &str = "bc1qminer";
+        const DEV: &str = "bc1qdev";
+        let entries = |fee: &SoloFeeConfig| -> Vec<(String, u64)> {
+            solo_payouts(MINER, fee, TEST_REWARD)
+                .into_iter()
+                .map(|p| (p.address, p.sats))
+                .collect()
+        };
+
+        let no_fee = SoloFeeConfig::default();
+        assert_eq!(entries(&no_fee).len(), 1, "precondition: the miner alone");
+        assert_eq!(solo_fee_output(&entries(&no_fee), &no_fee), None);
+
+        let zero_fee = SoloFeeConfig {
+            dev_fee_address: Some(DEV.to_string()),
+            dev_fee_percent: 0.0,
+        };
+        assert_eq!(
+            entries(&zero_fee).len(),
+            1,
+            "precondition: a 0 % fee pays nobody"
+        );
+        assert_eq!(solo_fee_output(&entries(&zero_fee), &zero_fee), None);
+
+        let with_fee = SoloFeeConfig {
+            dev_fee_address: Some(DEV.to_string()),
+            dev_fee_percent: 1.0,
+        };
+        let paid = entries(&with_fee);
+        let (address, sats) = solo_fee_output(&paid, &with_fee).expect("the fee output");
+        assert_eq!(address, DEV);
+        assert!(sats > 0);
+        assert!(
+            paid.iter().any(|(a, s)| a == DEV && *s == sats),
+            "the fee output is the one the coinbase pays"
         );
     }
 
