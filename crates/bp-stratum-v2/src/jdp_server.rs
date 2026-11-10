@@ -69,11 +69,12 @@ pub enum AllocateOutcome {
     Ignored,
 }
 
-/// The pool's template-tx cache (`wtxid → raw_tx`); an empty map makes the
-/// handler request every tx via `ProvideMissingTransactions`.
-#[async_trait]
+/// The pool's template-tx cache (`wtxid → raw_tx`). Every declared wtxid it
+/// lacks is requested via `ProvideMissingTransactions`.
 pub trait TemplateTxProvider: Send + Sync {
-    async fn snapshot(&self) -> HashMap<[u8; 32], Vec<u8>>;
+    /// One slot per declared wtxid, holding a copy of the cached tx; only the
+    /// declared transactions are copied.
+    fn declared_txs(&self, wtxid_list: &[[u8; 32]]) -> DeclaredTxs;
 }
 
 /// The pool's view of the chain tip, from its own node.
@@ -249,10 +250,9 @@ impl JdpAllocateResolver for NoOpJdpHooks {
     }
 }
 
-#[async_trait]
 impl TemplateTxProvider for NoOpJdpHooks {
-    async fn snapshot(&self) -> HashMap<[u8; 32], Vec<u8>> {
-        HashMap::new()
+    fn declared_txs(&self, wtxid_list: &[[u8; 32]]) -> DeclaredTxs {
+        DeclaredTxs::against_template(wtxid_list, &HashMap::new())
     }
 }
 
@@ -688,9 +688,8 @@ async fn dispatch_jdp_inbound(
                       to declare a job",
                 );
             };
-            let template_txs = hooks.template_tx_provider.snapshot().await;
             // Computed once for node and handler: it clones megabytes of raw txs.
-            let txs = DeclaredTxs::against_template(&input.wtxid_list, &template_txs);
+            let txs = hooks.template_tx_provider.declared_txs(&input.wtxid_list);
             // SV2 JDP/Job Declarator Server: the node judges before anything is
             // registered, so a rejection needs no rollback. A declaration still
             // missing transactions is judged once the JDC supplied them.
@@ -716,6 +715,7 @@ async fn dispatch_jdp_inbound(
                     session_id,
                     &input,
                     &complete,
+                    0,
                     "jdp: node rejected the declared job — not accepting it",
                 )
                 .await
@@ -768,6 +768,7 @@ async fn dispatch_jdp_inbound(
                                 session_id,
                                 &pending.input,
                                 &complete,
+                                pending.txs.missing_positions().len(),
                                 "jdp: node rejected the completed declaration — not accepting it",
                             )
                             .await,
@@ -805,12 +806,14 @@ async fn dispatch_jdp_inbound(
 /// Ask the node about a declaration whose transactions the pool holds in full,
 /// and turn a rejection into the answer frame; `None` means the node accepts
 /// it. Like SRI's JDS, the node is asked first with what it holds, and the
-/// transactions are supplied only when it lacks some.
+/// transactions are supplied only when it lacks some. `requested_from_jdc`
+/// counts the transactions the pool's template lacked and the JDC supplied.
 async fn node_refuses_declaration(
     validator: &Arc<dyn DeclaredJobValidator>,
     session_id: u32,
     declared: &crate::jdp::client::DeclareMiningJobInput,
     txs: &[&[u8]],
+    requested_from_jdc: usize,
     log_message: &'static str,
 ) -> Option<JdpHandlerOutcome> {
     let ask = |supplied_txs| {
@@ -824,10 +827,27 @@ async fn node_refuses_declaration(
             supplied_txs,
         })
     };
-    let verdict = match ask(None).await {
-        JobVerdict::NeedsTransactions => ask(Some(txs)).await,
-        verdict => verdict,
+    let (verdict, node_asks) = match ask(None).await {
+        JobVerdict::NeedsTransactions => (ask(Some(txs)).await, 2u8),
+        verdict => (verdict, 1u8),
     };
+    // One line per judged declaration: how many transactions came from the
+    // template, how many the JDC had to supply, and whether the node needed
+    // a second lookup because it lacked some.
+    info!(
+        session_id,
+        request_id = declared.request_id,
+        declared_txs = declared.wtxid_list.len(),
+        from_template = declared.wtxid_list.len() - requested_from_jdc,
+        requested_from_jdc,
+        node_asks,
+        verdict = match &verdict {
+            JobVerdict::Accepted => "accepted",
+            JobVerdict::Rejected(code) => code.as_str(),
+            JobVerdict::NeedsTransactions => crate::jdp::client::ERR_MISSING_TXS,
+        },
+        "jdp: declaration judged by the node"
+    );
     let (error_code, error_details): (String, &[u8]) = match verdict {
         JobVerdict::Accepted => return None,
         JobVerdict::Rejected(code) => (code, b"declared job rejected by the pool's bitcoin node"),
@@ -1330,13 +1350,15 @@ mod tests {
     /// complete without a round-trip.
     struct TemplateWithTheDeclaredTx;
 
-    #[async_trait]
     impl TemplateTxProvider for TemplateWithTheDeclaredTx {
-        async fn snapshot(&self) -> HashMap<[u8; 32], Vec<u8>> {
-            HashMap::from([(
-                crate::jdp::tx_validation::wtxid_of(&DECLARED_TX),
-                DECLARED_TX.to_vec(),
-            )])
+        fn declared_txs(&self, wtxid_list: &[[u8; 32]]) -> DeclaredTxs {
+            DeclaredTxs::against_template(
+                wtxid_list,
+                &HashMap::from([(
+                    crate::jdp::tx_validation::wtxid_of(&DECLARED_TX),
+                    DECLARED_TX.to_vec(),
+                )]),
+            )
         }
     }
 

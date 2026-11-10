@@ -5,7 +5,6 @@
 //! miner who is exactly that output; [`ProductionJdpBlockSink`] books a pushed
 //! block only if its header proves work against the pool's target.
 
-use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -22,6 +21,7 @@ use bp_stratum_v2::jdp::client::{
 use bp_stratum_v2::jdp::dynamic_outputs::{
     declared_coinbase_tx, designated_output_blob, CandidateBacking,
 };
+use bp_stratum_v2::jdp::tx_validation::DeclaredTxs;
 use bp_stratum_v2::jdp_server::{
     AllocateOutcome, ChainTipProvider, JdpAllocateResolver, JdpFoundBlockSink, JdpServerHooks,
     PayoutDistributionSource, TemplateTxProvider,
@@ -224,16 +224,16 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
 
 // ─── 2. TdpTemplateTxProvider ────────────────────────────────────
 
-/// The newest template's `wtxid -> raw_witness_tx` map. Anything missing the
-/// JDC sends via `ProvideMissingTransactions`.
+/// Resolves declared wtxids against the newest template's transactions.
+/// Anything missing the JDC sends via `ProvideMissingTransactions`.
 pub(crate) struct TdpTemplateTxProvider {
     cache: Arc<TemplateTxCache>,
 }
 
-#[async_trait]
 impl TemplateTxProvider for TdpTemplateTxProvider {
-    async fn snapshot(&self) -> HashMap<[u8; 32], Vec<u8>> {
-        self.cache.current_template_txs().unwrap_or_default()
+    fn declared_txs(&self, wtxid_list: &[[u8; 32]]) -> DeclaredTxs {
+        self.cache
+            .with_current_template_txs(|txs| DeclaredTxs::against_template(wtxid_list, txs))
     }
 }
 

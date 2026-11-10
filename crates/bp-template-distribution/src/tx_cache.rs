@@ -44,9 +44,15 @@ impl TemplateTxCache {
         cache
     }
 
-    /// `None` until the first template's transactions have arrived.
-    pub fn current_template_txs(&self) -> Option<WtxidMap> {
-        self.latest.lock().ok()?.clone()
+    /// Runs `f` on the newest template's map under the lock, so a caller
+    /// copies only the entries it reads. The map is empty until the first
+    /// template's transactions have arrived.
+    pub fn with_current_template_txs<R>(&self, f: impl FnOnce(&WtxidMap) -> R) -> R {
+        let empty = WtxidMap::new();
+        match self.latest.lock() {
+            Ok(guard) => f(guard.as_ref().unwrap_or(&empty)),
+            Err(_) => f(&empty),
+        }
     }
 
     fn record(&self, raw_txs: Vec<Vec<u8>>) {
@@ -109,9 +115,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_cache_returns_none() {
+    fn an_empty_cache_shows_an_empty_map() {
         let cache = TemplateTxCache::empty();
-        assert!(cache.current_template_txs().is_none());
+        assert!(cache.with_current_template_txs(|txs| txs.is_empty()));
     }
 
     #[test]
@@ -124,7 +130,7 @@ mod tests {
 
         cache.record(vec![tx_a.clone(), tx_b.clone()]);
 
-        let current = cache.current_template_txs().expect("populated");
+        let current = cache.with_current_template_txs(WtxidMap::clone);
         assert_eq!(current.len(), 2);
         assert_eq!(current.get(&wtxid_a), Some(&tx_a));
         assert_eq!(current.get(&wtxid_b), Some(&tx_b));
@@ -140,7 +146,7 @@ mod tests {
         cache.record(vec![old.clone()]);
         cache.record(vec![new_a.clone(), new_b]);
 
-        let current = cache.current_template_txs().unwrap();
+        let current = cache.with_current_template_txs(WtxidMap::clone);
         assert_eq!(current.len(), 2);
         assert!(current.contains_key(&sha256d(&new_a)));
         assert!(!current.contains_key(&sha256d(&old)));
