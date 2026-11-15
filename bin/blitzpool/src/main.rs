@@ -56,6 +56,7 @@ mod stratum_v1;
 mod stratum_v2;
 mod stream_monitor;
 mod stream_trim;
+mod tip_median_time;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

@@ -3,7 +3,9 @@
 //! Bind the job a JDC MINES (`SetCustomMiningJob`) to the job it DECLARED,
 //! which base SV2 ties only by token: otherwise an unvalidated transaction set
 //! could earn window share for blocks that cannot land. The payout split is
-//! guarded by [`crate::jdp::payout_distribution`]; `nbits`/`min_ntime` are not bound.
+//! guarded by [`crate::jdp::payout_distribution`]; `nbits` and `min_ntime` are
+//! judged against the pool's tip in
+//! [`crate::mining::client::handle_set_custom_mining_job`], not bound here.
 
 use bitcoin::hashes::Hash;
 

@@ -94,6 +94,10 @@ pub struct BlockHeaderInfo {
     /// Block height. Present for blocks on the active chain.
     #[serde(default)]
     pub height: Option<u64>,
+    /// Median time past of this block (BIP-113): a block built on it needs a
+    /// greater nTime.
+    #[serde(default)]
+    pub mediantime: Option<u32>,
 }
 
 #[cfg(test)]
@@ -104,10 +108,11 @@ mod tests {
 
     #[test]
     fn block_header_in_chain_parses_positive_confirmations() {
-        let json = r#"{"hash":"00000000000000000001abcd","confirmations":5,"height":840000,"version":536870912}"#;
+        let json = r#"{"hash":"00000000000000000001abcd","confirmations":5,"height":840000,"version":536870912,"mediantime":1713571767}"#;
         let h: BlockHeaderInfo = serde_json::from_str(json).unwrap();
         assert_eq!(h.confirmations, 5);
         assert_eq!(h.height, Some(840000));
+        assert_eq!(h.mediantime, Some(1713571767));
     }
 
     #[test]

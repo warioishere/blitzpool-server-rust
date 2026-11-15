@@ -69,6 +69,11 @@ const PAIRS: &[(&str, &str, &str)] = &[
         mining::ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_NBITS,
         "SetCustomMiningJob.Error / invalid-nbits",
     ),
+    (
+        mining_client::ERR_INVALID_NTIME_START,
+        mining::ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_NTIME_START,
+        "SetCustomMiningJob.Error / invalid-ntime-start",
+    ),
     // `ERR_INVALID_CHANNEL_ID` on the mining side is raised for three
     // different messages (`SubmitShares.Error`, `UpdateChannel.Error`,
     // `SetCustomMiningJob.Error`). All three upstream constants are checked,

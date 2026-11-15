@@ -57,6 +57,12 @@ async fn get_block_header_reports_confirmations_orphan_and_not_found() {
         buried.confirmations
     );
     assert_eq!(buried.height, Some(u64::from(tip - 3)));
+    // The SV2 server judges a custom job's `ntime_start` by this field.
+    assert!(
+        buried.mediantime.is_some_and(|mtp| mtp > 0),
+        "getblockheader must report mediantime, got {:?}",
+        buried.mediantime
+    );
 
     // ── Unknown hash → Core error -5 (Block not found) ────────────────
     let bogus = "00".repeat(32);

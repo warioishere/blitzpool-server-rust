@@ -586,6 +586,7 @@ async fn run_mining_connection(
                     inbound,
                     &extranonce,
                     &bridge,
+                    hooks.chain_tip_time.as_ref(),
                     SystemClock.now_ms(),
                 );
                 // SV2 Overview/SetupConnection.Error: the error is sent "prior
@@ -1095,6 +1096,7 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
     inbound: InboundMiningFrame,
     extranonce: &ConnectionExtranonce,
     bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
+    chain_tip_time: &dyn crate::hooks::ChainTipTime,
     now_ms: u64,
 ) -> HandlerOutcome {
     let is_setup = matches!(inbound, InboundMiningFrame::SetupConnection(_));
@@ -1181,12 +1183,14 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
             };
             // Distributions are multi-use (ext 0x0003 push model) —
             // nothing to consume on acceptance.
+            let median_time_past = chain_tip_time.median_time_past(&input.prev_hash);
             let outcome = handle_set_custom_mining_job(
                 state,
                 &input,
                 bridge_job.as_ref(),
                 allocation.as_ref(),
                 distribution.as_ref(),
+                median_time_past,
                 now_ms,
             );
             // A token authorises exactly ONE custom job, consumed only on
@@ -1491,6 +1495,21 @@ mod tests {
     use std::sync::Arc;
 
     const ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+
+    /// Knows the median time past of the custom-job fixtures' tip
+    /// (`[0xAB; 32]`) and of no other block, so a lookup by the wrong hash
+    /// finds nothing.
+    struct FixedTipTime;
+
+    impl crate::hooks::ChainTipTime for FixedTipTime {
+        fn median_time_past(&self, block_hash: &[u8; 32]) -> Option<u32> {
+            (block_hash == &[0xAB; 32])
+                .then_some(crate::mining::client::tests::TIP_MTP)
+                .flatten()
+        }
+    }
+
+    use crate::mining::client::tests::TIP_NOW_MS;
 
     fn noise_cfg() -> NoiseConfig {
         NoiseConfig::new(
@@ -2332,7 +2351,14 @@ mod tests {
             flags: FLAG_REQUIRES_VERSION_ROLLING,
             vendor: "cgminer/4.11.1".to_string(),
         });
-        let _ = dispatch_inbound_frame(&mut s, setup, &fresh_extranonce(), &fresh_bridge(), 0);
+        let _ = dispatch_inbound_frame(
+            &mut s,
+            setup,
+            &fresh_extranonce(),
+            &fresh_bridge(),
+            &crate::hooks::NoOpHooks,
+            0,
+        );
         assert_eq!(s.user_agent.as_deref(), Some("cgminer/sv2"));
     }
 
@@ -2370,7 +2396,7 @@ mod tests {
             flags: FLAG_REQUIRES_VERSION_ROLLING,
             vendor: "t".to_string(),
         });
-        let _ = dispatch_inbound_frame(&mut s, setup, alloc, bridge, 0);
+        let _ = dispatch_inbound_frame(&mut s, setup, alloc, bridge, &crate::hooks::NoOpHooks, 0);
         assert!(s.setup_complete, "precondition: setup succeeded");
         s
     }
@@ -2404,7 +2430,14 @@ mod tests {
             flags: FLAG_REQUIRES_VERSION_ROLLING,
             vendor: "test".to_string(),
         });
-        let outcome = dispatch_inbound_frame(&mut s, inbound, &alloc, &bridge, 0);
+        let outcome = dispatch_inbound_frame(
+            &mut s,
+            inbound,
+            &alloc,
+            &bridge,
+            &crate::hooks::NoOpHooks,
+            0,
+        );
         assert!(matches!(
             outcome.outbound[0],
             crate::mining::client::OutboundFrame::SetupConnectionSuccess { .. }
@@ -2426,7 +2459,14 @@ mod tests {
             ntime: 0,
             version: 0,
         });
-        let outcome = dispatch_inbound_frame(&mut s, inbound, &alloc, &bridge, 0);
+        let outcome = dispatch_inbound_frame(
+            &mut s,
+            inbound,
+            &alloc,
+            &bridge,
+            &crate::hooks::NoOpHooks,
+            0,
+        );
         match &outcome.outbound[0] {
             crate::mining::client::OutboundFrame::SubmitSharesError { error_code, .. } => {
                 assert_eq!(error_code, "invalid-channel-id");
@@ -2476,14 +2516,23 @@ mod tests {
             open(),
             &alloc,
             &bridge,
+            &crate::hooks::NoOpHooks,
             0
         )));
         assert!(s.channels.is_empty(), "nothing opened before setup");
 
         let mut s = fresh_test_session();
-        let out = dispatch_inbound_frame(&mut s, setup(), &alloc, &bridge, 0);
+        let out = dispatch_inbound_frame(
+            &mut s,
+            setup(),
+            &alloc,
+            &bridge,
+            &crate::hooks::NoOpHooks,
+            0,
+        );
         assert!(!closes(&out), "the first setup is served");
-        let out = dispatch_inbound_frame(&mut s, open(), &alloc, &bridge, 0);
+        let out =
+            dispatch_inbound_frame(&mut s, open(), &alloc, &bridge, &crate::hooks::NoOpHooks, 0);
         assert!(!closes(&out), "control: an open after setup is served");
         assert_eq!(s.channels.len(), 1);
         assert!(closes(&dispatch_inbound_frame(
@@ -2491,6 +2540,7 @@ mod tests {
             setup(),
             &alloc,
             &bridge,
+            &crate::hooks::NoOpHooks,
             0
         )));
     }
@@ -2508,7 +2558,7 @@ mod tests {
             flags: FLAG_REQUIRES_VERSION_ROLLING,
             vendor: "t".to_string(),
         });
-        let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, 0);
+        let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, &crate::hooks::NoOpHooks, 0);
         let open = InboundMiningFrame::OpenStandardMiningChannel(
             crate::mining::client::OpenStandardMiningChannelInput {
                 request_id: 1,
@@ -2517,7 +2567,7 @@ mod tests {
                 max_target: [0xFF; 32],
             },
         );
-        let _ = dispatch_inbound_frame(&mut s, open, &alloc, &bridge, 0);
+        let _ = dispatch_inbound_frame(&mut s, open, &alloc, &bridge, &crate::hooks::NoOpHooks, 0);
         let cid = s.primary_channel.expect("channel opened");
         let before = shared.allocated_count();
         assert_eq!(before, 1, "one prefix allocated for the open channel");
@@ -2526,7 +2576,14 @@ mod tests {
             channel_id: cid,
             reason_code: "user-quit".to_string(),
         });
-        let _ = dispatch_inbound_frame(&mut s, inbound, &alloc, &bridge, 0);
+        let _ = dispatch_inbound_frame(
+            &mut s,
+            inbound,
+            &alloc,
+            &bridge,
+            &crate::hooks::NoOpHooks,
+            0,
+        );
         assert_eq!(
             shared.allocated_count(),
             before - 1,
@@ -2549,7 +2606,7 @@ mod tests {
             flags: FLAG_REQUIRES_VERSION_ROLLING,
             vendor: "t".to_string(),
         });
-        let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, 0);
+        let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, &crate::hooks::NoOpHooks, 0);
         let open = |user_identity: String| {
             InboundMiningFrame::OpenStandardMiningChannel(
                 crate::mining::client::OpenStandardMiningChannelInput {
@@ -2561,7 +2618,14 @@ mod tests {
             )
         };
 
-        let out = dispatch_inbound_frame(&mut s, open("not-an-address".into()), &alloc, &bridge, 0);
+        let out = dispatch_inbound_frame(
+            &mut s,
+            open("not-an-address".into()),
+            &alloc,
+            &bridge,
+            &crate::hooks::NoOpHooks,
+            0,
+        );
         assert!(
             matches!(
                 out.outbound[0],
@@ -2576,7 +2640,14 @@ mod tests {
             "the refused open holds no prefix"
         );
 
-        let _ = dispatch_inbound_frame(&mut s, open(format!("{ADDR}.w")), &alloc, &bridge, 0);
+        let _ = dispatch_inbound_frame(
+            &mut s,
+            open(format!("{ADDR}.w")),
+            &alloc,
+            &bridge,
+            &crate::hooks::NoOpHooks,
+            0,
+        );
         assert!(s.primary_channel.is_some(), "precondition: the retry opens");
         assert_eq!(shared.allocated_count(), 1, "the open channel holds one");
     }
@@ -2594,7 +2665,7 @@ mod tests {
             flags: FLAG_REQUIRES_VERSION_ROLLING,
             vendor: "t".to_string(),
         });
-        let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, 0);
+        let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, &crate::hooks::NoOpHooks, 0);
         let open = |request_id, user_identity: String| {
             InboundMiningFrame::OpenStandardMiningChannel(
                 crate::mining::client::OpenStandardMiningChannelInput {
@@ -2611,6 +2682,7 @@ mod tests {
             open(1, "not-an-address.w".to_string()),
             &alloc,
             &bridge,
+            &crate::hooks::NoOpHooks,
             0,
         );
         assert_eq!(
@@ -2618,8 +2690,14 @@ mod tests {
             Some(crate::mining::client::ERR_UNKNOWN_USER)
         );
 
-        let accepted =
-            dispatch_inbound_frame(&mut s, open(2, format!("{ADDR}.w")), &alloc, &bridge, 0);
+        let accepted = dispatch_inbound_frame(
+            &mut s,
+            open(2, format!("{ADDR}.w")),
+            &alloc,
+            &bridge,
+            &crate::hooks::NoOpHooks,
+            0,
+        );
         assert!(
             s.primary_channel.is_some(),
             "precondition: the open succeeded"
@@ -2642,7 +2720,7 @@ mod tests {
             flags: FLAG_REQUIRES_VERSION_ROLLING,
             vendor: "t".to_string(),
         });
-        let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, 0);
+        let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, &crate::hooks::NoOpHooks, 0);
         for req in 1..=2u32 {
             let open = InboundMiningFrame::OpenExtendedMiningChannel(
                 crate::mining::client::OpenExtendedMiningChannelInput {
@@ -2653,7 +2731,8 @@ mod tests {
                     min_extranonce_size: 8,
                 },
             );
-            let _ = dispatch_inbound_frame(&mut s, open, &alloc, &bridge, 0);
+            let _ =
+                dispatch_inbound_frame(&mut s, open, &alloc, &bridge, &crate::hooks::NoOpHooks, 0);
         }
         assert_eq!(shared.allocated_count(), 2, "two member prefixes allocated");
         let gid = s
@@ -2665,7 +2744,14 @@ mod tests {
             channel_id: gid,
             reason_code: "bye".to_string(),
         });
-        let _ = dispatch_inbound_frame(&mut s, inbound, &alloc, &bridge, 0);
+        let _ = dispatch_inbound_frame(
+            &mut s,
+            inbound,
+            &alloc,
+            &bridge,
+            &crate::hooks::NoOpHooks,
+            0,
+        );
         assert_eq!(
             shared.allocated_count(),
             0,
@@ -2691,7 +2777,8 @@ mod tests {
                 flags: FLAG_REQUIRES_VERSION_ROLLING,
                 vendor: "t".to_string(),
             });
-            let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, 0);
+            let _ =
+                dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, &crate::hooks::NoOpHooks, 0);
             let open = InboundMiningFrame::OpenStandardMiningChannel(
                 crate::mining::client::OpenStandardMiningChannelInput {
                     request_id: 1,
@@ -2700,7 +2787,8 @@ mod tests {
                     max_target: [0xFF; 32],
                 },
             );
-            let _ = dispatch_inbound_frame(&mut s, open, &alloc, &bridge, 0);
+            let _ =
+                dispatch_inbound_frame(&mut s, open, &alloc, &bridge, &crate::hooks::NoOpHooks, 0);
             let cid = s.primary_channel.expect("channel opened");
             prefixes.push(s.channels[&cid].extranonce_prefix.clone());
         }
@@ -2733,7 +2821,7 @@ mod tests {
             flags: FLAG_REQUIRES_VERSION_ROLLING | FLAG_REQUIRES_WORK_SELECTION,
             vendor: "t".to_string(),
         });
-        let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, 0);
+        let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, &crate::hooks::NoOpHooks, 0);
         // ext 0x0003/Negotiation: the TLV is honoured only when 0x0003 is
         // negotiated on the mining connection.
         let negotiate =
@@ -2743,7 +2831,14 @@ mod tests {
                     crate::extensions::SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
                 ],
             });
-        let _ = dispatch_inbound_frame(&mut s, negotiate, &alloc, &bridge, 0);
+        let _ = dispatch_inbound_frame(
+            &mut s,
+            negotiate,
+            &alloc,
+            &bridge,
+            &crate::hooks::NoOpHooks,
+            0,
+        );
         assert!(s
             .negotiated_extensions
             .contains(&crate::extensions::SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS));
@@ -2756,7 +2851,7 @@ mod tests {
                 min_extranonce_size: 8,
             },
         );
-        let _ = dispatch_inbound_frame(&mut s, open, &alloc, &bridge, 0);
+        let _ = dispatch_inbound_frame(&mut s, open, &alloc, &bridge, &crate::hooks::NoOpHooks, 0);
         let cid = s.primary_channel.expect("extended channel opened");
         // Custom jobs need a template to pin a block-candidate threshold to;
         // its scriptSig opens with the BIP-34 push of height 200, as the jobs do.
@@ -2837,7 +2932,8 @@ mod tests {
                 InboundMiningFrame::SetCustomMiningJob(make_input(req)),
                 &alloc,
                 &bridge,
-                0,
+                &FixedTipTime,
+                TIP_NOW_MS,
             );
             assert!(
                 matches!(
@@ -2855,7 +2951,8 @@ mod tests {
             InboundMiningFrame::SetCustomMiningJob(make_input(1)),
             &alloc,
             &bridge,
-            0,
+            &FixedTipTime,
+            TIP_NOW_MS,
         );
         match &out.outbound[0] {
             crate::mining::client::OutboundFrame::SetCustomMiningJobError {
@@ -2878,7 +2975,8 @@ mod tests {
             InboundMiningFrame::SetCustomMiningJob(make_input(3)),
             &alloc,
             &bridge,
-            0,
+            &FixedTipTime,
+            TIP_NOW_MS,
         );
         match &out.outbound[0] {
             crate::mining::client::OutboundFrame::SetCustomMiningJobError {
@@ -2922,7 +3020,8 @@ mod tests {
             InboundMiningFrame::SetCustomMiningJob(stale),
             &alloc,
             &bridge,
-            0,
+            &FixedTipTime,
+            TIP_NOW_MS,
         );
         match &out.outbound[0] {
             crate::mining::client::OutboundFrame::SetCustomMiningJobError {
@@ -2940,7 +3039,8 @@ mod tests {
             InboundMiningFrame::SetCustomMiningJob(good.clone()),
             &alloc,
             &bridge,
-            0,
+            &FixedTipTime,
+            TIP_NOW_MS,
         );
         assert!(
             matches!(
@@ -2957,7 +3057,8 @@ mod tests {
             InboundMiningFrame::SetCustomMiningJob(good),
             &alloc,
             &bridge,
-            0,
+            &FixedTipTime,
+            TIP_NOW_MS,
         );
         match &out.outbound[0] {
             crate::mining::client::OutboundFrame::SetCustomMiningJobError {
@@ -2970,6 +3071,61 @@ mod tests {
             }
             other => panic!("a token must authorise one custom job, got {other:?}"),
         }
+    }
+
+    /// The IO layer asks the hook for the median time past of the job's own
+    /// `prev_hash`: without it the job is refused retryably and its token stays
+    /// usable, with it the same job is served.
+    #[test]
+    fn dispatch_judges_a_custom_job_by_the_hooks_median_time_past() {
+        use crate::mining::client::tests::{
+            bridge_entry_for, custom_job_matching, solo_session_with_extended_channel,
+        };
+        use crate::tokens::Token;
+
+        let mut s = solo_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let alloc = fresh_extranonce();
+        let bridge = fresh_bridge();
+        let token = Token([0x5Bu8; 16]);
+        let entry = bridge_entry_for(token, ADDR, 42);
+        bridge
+            .write()
+            .unwrap()
+            .register(token, &entry.declared_job, 42);
+        let job = custom_job_matching(cid, &entry);
+
+        let out = dispatch_inbound_frame(
+            &mut s,
+            InboundMiningFrame::SetCustomMiningJob(job.clone()),
+            &alloc,
+            &bridge,
+            &crate::hooks::NoOpHooks,
+            TIP_NOW_MS,
+        );
+        match &out.outbound[0] {
+            crate::mining::client::OutboundFrame::SetCustomMiningJobError {
+                error_code, ..
+            } => assert_eq!(error_code, crate::mining::client::ERR_STALE_CHAIN_TIP),
+            other => panic!("expected stale-chain-tip without a median time past, got {other:?}"),
+        }
+
+        let out = dispatch_inbound_frame(
+            &mut s,
+            InboundMiningFrame::SetCustomMiningJob(job),
+            &alloc,
+            &bridge,
+            &FixedTipTime,
+            TIP_NOW_MS,
+        );
+        assert!(
+            matches!(
+                out.outbound[0],
+                crate::mining::client::OutboundFrame::SetCustomMiningJobSuccess { .. }
+            ),
+            "the same job with the median time past must be served, got {:?}",
+            out.outbound[0]
+        );
     }
 
     /// A Full-Template job's inherited distribution resolves in its declaring
@@ -2997,6 +3153,7 @@ mod tests {
             }),
             &alloc,
             &bridge,
+            &crate::hooks::NoOpHooks,
             0,
         );
         let _ = dispatch_inbound_frame(
@@ -3009,6 +3166,7 @@ mod tests {
             }),
             &alloc,
             &bridge,
+            &crate::hooks::NoOpHooks,
             0,
         );
         let _ = dispatch_inbound_frame(
@@ -3024,6 +3182,7 @@ mod tests {
             ),
             &alloc,
             &bridge,
+            &crate::hooks::NoOpHooks,
             0,
         );
         let cid = s.primary_channel.expect("extended channel opened");
@@ -3151,7 +3310,8 @@ mod tests {
             InboundMiningFrame::SetCustomMiningJob(make_input(1, token)),
             &alloc,
             &bridge,
-            0,
+            &FixedTipTime,
+            TIP_NOW_MS,
         );
         assert!(
             matches!(
@@ -3170,7 +3330,8 @@ mod tests {
             InboundMiningFrame::SetCustomMiningJob(make_input(2, SECOND_TOKEN)),
             &alloc,
             &bridge,
-            0,
+            &FixedTipTime,
+            TIP_NOW_MS,
         );
         match &out.outbound[0] {
             crate::mining::client::OutboundFrame::SetCustomMiningJobError {
@@ -3198,7 +3359,14 @@ mod tests {
                 nominal_hash_rate: 1_000_000.0,
                 maximum_target: [0xFF; 32],
             });
-        let outcome = dispatch_inbound_frame(&mut s, inbound, &alloc, &bridge, 0);
+        let outcome = dispatch_inbound_frame(
+            &mut s,
+            inbound,
+            &alloc,
+            &bridge,
+            &crate::hooks::NoOpHooks,
+            0,
+        );
         // Unknown channel → UpdateChannelError.
         assert!(matches!(
             outcome.outbound[0],

@@ -13,7 +13,7 @@ use bp_common::{normalize_btc_address, AddressId, StreamKind};
 use bp_jobs_lifecycle::LifecycleConfig;
 use bp_mining_job::{
     address_to_script, merkle_root_from_coinbase, MiningJob, MiningJobCache, MiningJobError,
-    PayoutEntry, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
+    PayoutEntry, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN, MAX_FUTURE_BLOCK_TIME,
 };
 use bp_share::{
     clamp_difficulty_to_max_target, difficulty_to_target, hash_rate_to_difficulty, sha256d,
@@ -146,6 +146,13 @@ pub const ERR_CUSTOM_JOB_REQUIRES_SOLO: &str = "custom-jobs-require-solo";
 /// `SetupConnection.flags` lack `REQUIRES_WORK_SELECTION`, which SV2
 /// Mining/SetCustomMiningJob makes a MUST.
 pub const ERR_WORK_SELECTION_NOT_DECLARED: &str = "work-selection-not-declared";
+
+/// `invalid-ntime-start` — a custom job's `ntime_start` (`min_ntime` here) is
+/// not a consensus-valid nTime for the block after its `prev_hash`: not above
+/// that block's median time past, or more than [`MAX_FUTURE_BLOCK_TIME`]
+/// ahead of the pool's clock. SV2 Mining/SetCustomMiningJob makes the check a
+/// MUST; the job's share window is anchored on this value.
+pub const ERR_INVALID_NTIME_START: &str = "invalid-ntime-start";
 
 /// `invalid-nbits` — a custom job on the pool's own tip whose `n_bits` is not
 /// what the pool served. The block-candidate threshold derives from it, so a
@@ -1900,7 +1907,8 @@ pub struct SetCustomMiningJobInput {
 }
 
 /// Handle `SetCustomMiningJob`, with the token context the IO layer resolved
-/// (`bridge_job`, `allocation`, `distribution`). What AUTHORISES the token
+/// (`bridge_job`, `allocation`, `distribution`) and the median time past of the
+/// block the job builds on (`None` while the pool does not know it yet). What AUTHORISES the token
 /// ([`crate::bridge::TokenBacking`]) and what PINS its payout split are two
 /// independent exhaustive `match`es; a token with no backing is refused.
 pub fn handle_set_custom_mining_job<C: Clock>(
@@ -1909,6 +1917,7 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     bridge_job: Option<&crate::bridge::BridgeJobRef>,
     allocation: Option<&crate::bridge::AllocatedTokenRef>,
     distribution: Option<&crate::bridge::DistributionAcceptance>,
+    median_time_past: Option<u32>,
     now_ms: u64,
 ) -> HandlerOutcome {
     let reject = |error_code: &str| {
@@ -1990,6 +1999,31 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     // made on the previous tip is still on hand after the tip changes.
     if input.prev_hash != tip {
         return reject(ERR_STALE_CHAIN_TIP);
+    }
+
+    // SV2 Mining/SetCustomMiningJob: the server MUST validate `ntime_start`
+    // against consensus for the block after `prev_hash`. The job's share
+    // window starts at it, so unchecked the client would choose that window.
+    // An unknown median time past (just after a tip change, or while the
+    // node does not answer) is refused retryably, never waved through.
+    let Some(median_time_past) = median_time_past else {
+        tracing::warn!(
+            channel_id = input.channel_id,
+            "sv2: custom job before the tip's median time past is known — rejecting retryably"
+        );
+        return reject(ERR_STALE_CHAIN_TIP);
+    };
+    let now_secs = u32::try_from(now_ms / 1_000).unwrap_or(u32::MAX);
+    let latest = now_secs.saturating_add(MAX_FUTURE_BLOCK_TIME);
+    if input.min_ntime <= median_time_past || input.min_ntime > latest {
+        tracing::warn!(
+            channel_id = input.channel_id,
+            ntime_start = input.min_ntime,
+            median_time_past,
+            latest,
+            "sv2: custom job's ntime_start is not a consensus-valid nTime — rejecting"
+        );
+        return reject(ERR_INVALID_NTIME_START);
     }
 
     // Same reason, for every backing: a declared job is bounded by its
@@ -2247,6 +2281,14 @@ pub(crate) mod tests {
     use bp_vardiff::TestClock;
     use std::collections::HashSet;
     use std::sync::Arc;
+
+    /// Median time past of the custom-job fixtures' tip, just below their
+    /// `min_ntime` (`0x6500_0001`).
+    pub(crate) const TIP_MTP: Option<u32> = Some(0x6500_0000);
+
+    /// The pool's clock at that tip, in milliseconds. Custom-job tests add
+    /// their own offsets to it.
+    pub(crate) const TIP_NOW_MS: u64 = 0x6500_0001 * 1_000;
 
     /// Test shim mirroring the handler's projection into the validator's inputs.
     fn validate_ext(
@@ -4441,7 +4483,15 @@ pub(crate) mod tests {
             s.work_selection = work_selection;
             let cid = s.primary_channel.unwrap();
             let input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
-            let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+            let out = handle_set_custom_mining_job(
+                &mut s,
+                &input,
+                None,
+                Some(&alloc),
+                None,
+                TIP_MTP,
+                TIP_NOW_MS + 1_000,
+            );
             match (&out.outbound[0], accept) {
                 (OutboundFrame::SetCustomMiningJobSuccess { .. }, true) => {}
                 (OutboundFrame::SetCustomMiningJobError { error_code, .. }, false) => {
@@ -4450,6 +4500,78 @@ pub(crate) mod tests {
                 (other, want) => {
                     panic!("work_selection={work_selection}: accept={want}, got {other:?}")
                 }
+            }
+        }
+    }
+
+    /// SV2 Mining/SetCustomMiningJob: `ntime_start` (`min_ntime` here) must be
+    /// a consensus-valid nTime for the block after `prev_hash`. Each row sits
+    /// on one side of an edge; the accepted rows are the control.
+    #[test]
+    fn a_custom_job_ntime_start_is_held_to_consensus() {
+        let alloc = base_allocation(REGTEST_ADDR, 42);
+        let outputs = [txout(312_500_000, designated_script(REGTEST_ADDR))];
+        let mtp: u32 = 0x6500_0000;
+        let now_secs: u32 = 0x6500_0100;
+        let latest = now_secs + MAX_FUTURE_BLOCK_TIME;
+        for (ntime_start, accept) in [
+            (mtp - 1, false),
+            (mtp, false),
+            (mtp + 1, true),
+            (latest, true),
+            (latest + 1, false),
+        ] {
+            let mut s = solo_session_with_extended_channel();
+            let cid = s.primary_channel.unwrap();
+            let mut input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
+            input.min_ntime = ntime_start;
+            let out = handle_set_custom_mining_job(
+                &mut s,
+                &input,
+                None,
+                Some(&alloc),
+                None,
+                Some(mtp),
+                u64::from(now_secs) * 1_000,
+            );
+            match (&out.outbound[0], accept) {
+                (OutboundFrame::SetCustomMiningJobSuccess { .. }, true) => {}
+                (OutboundFrame::SetCustomMiningJobError { error_code, .. }, false) => {
+                    assert_eq!(
+                        error_code, ERR_INVALID_NTIME_START,
+                        "ntime_start={ntime_start}"
+                    );
+                }
+                (other, want) => panic!("ntime_start={ntime_start}: accept={want}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Before the tip's median time past is known the job is refused with the
+    /// retryable code; the same job once it is known is the control.
+    #[test]
+    fn a_custom_job_before_the_tip_median_time_is_known_is_refused_retryably() {
+        let alloc = base_allocation(REGTEST_ADDR, 42);
+        let outputs = [txout(312_500_000, designated_script(REGTEST_ADDR))];
+        for (median_time_past, accept) in [(None, false), (TIP_MTP, true)] {
+            let mut s = solo_session_with_extended_channel();
+            let cid = s.primary_channel.unwrap();
+            let input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
+            let out = handle_set_custom_mining_job(
+                &mut s,
+                &input,
+                None,
+                Some(&alloc),
+                None,
+                median_time_past,
+                TIP_NOW_MS,
+            );
+            match (&out.outbound[0], accept) {
+                (OutboundFrame::SetCustomMiningJobSuccess { .. }, true) => {}
+                (OutboundFrame::SetCustomMiningJobError { error_code, .. }, false) => {
+                    assert_eq!(error_code, ERR_STALE_CHAIN_TIP);
+                }
+                (other, want) => panic!("mtp={median_time_past:?}: accept={want}, got {other:?}"),
             }
         }
     }
@@ -4464,7 +4586,15 @@ pub(crate) mod tests {
         s.work_selection = true;
         let cid = s.primary_channel.unwrap();
         let input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
-        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            None,
+            Some(&alloc),
+            None,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
+        );
         let job_id = match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobSuccess { job_id, .. } => *job_id,
             other => panic!("precondition: the custom job must be accepted, got {other:?}"),
@@ -5454,7 +5584,15 @@ pub(crate) mod tests {
         s.work_selection = true;
         let token = Token([1u8; 16]);
         let input = custom_job_input(99, token);
-        let out = handle_set_custom_mining_job(&mut s, &input, None, None, None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            None,
+            None,
+            None,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
+        );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_CHANNEL_ID);
@@ -5470,7 +5608,15 @@ pub(crate) mod tests {
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
         let input = custom_job_input(cid, token);
-        let out = handle_set_custom_mining_job(&mut s, &input, None, None, None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            None,
+            None,
+            None,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
+        );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_JOB_ID);
@@ -5502,7 +5648,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&entry)),
             None,
             None,
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         assert!(
             matches!(
@@ -5532,7 +5679,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&entry)),
             None,
             None,
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobSuccess {
@@ -5569,7 +5717,7 @@ pub(crate) mod tests {
         assert_eq!(ext.template_id, None, "custom job carries no template");
         assert_eq!(ext.prev_hash, [0xAB; 32]);
         assert_eq!(ext.version, 0x2000_0000);
-        assert_eq!(ext.created_at, 1_000);
+        assert_eq!(ext.created_at, TIP_NOW_MS + 1_000);
     }
 
     /// What the IO layer hands the handler, taken from the real registry so the
@@ -5603,7 +5751,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&entry)),
             None,
             None,
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         assert!(matches!(
             out.outbound[0],
@@ -5633,7 +5782,8 @@ pub(crate) mod tests {
                 Some(&job_ref_for(&entry)),
                 None,
                 None,
-                1_000,
+                TIP_MTP,
+                TIP_NOW_MS + 1_000,
             );
             match (&out.outbound[0], expected) {
                 (OutboundFrame::SetCustomMiningJobSuccess { .. }, None) => {}
@@ -5664,7 +5814,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&entry)),
             None,
             None,
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
@@ -5683,7 +5834,15 @@ pub(crate) mod tests {
         let mut s = jdc_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         let input = custom_job_input(cid, Token([0xEEu8; 16]));
-        let out = handle_set_custom_mining_job(&mut s, &input, None, None, None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            None,
+            None,
+            None,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
+        );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_MINING_JOB_TOKEN);
@@ -5771,7 +5930,15 @@ pub(crate) mod tests {
                 txout(312_500_000, designated_script(REGTEST_ADDR)),
             ],
         );
-        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            None,
+            Some(&alloc),
+            None,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
+        );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobSuccess { .. } => {}
             other => panic!("expected SetCustomMiningJobSuccess, got {other:?}"),
@@ -5789,7 +5956,15 @@ pub(crate) mod tests {
         let alloc = base_allocation(REGTEST_ADDR, 42);
         let stranger = designated_script("bcrt1qvs8k07ggszru23v9p42vpg4jxts9y2k8kkujja");
         let input = coinbase_only_job(cid, token, &[txout(312_500_000, stranger)]);
-        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            None,
+            Some(&alloc),
+            None,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
+        );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_JOB_PARAM_COINBASE_OUTPUTS);
@@ -5809,7 +5984,15 @@ pub(crate) mod tests {
         let other = "bcrt1qvs8k07ggszru23v9p42vpg4jxts9y2k8kkujja";
         let alloc = base_allocation(other, 42);
         let input = coinbase_only_job(cid, token, &[txout(312_500_000, designated_script(other))]);
-        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            None,
+            Some(&alloc),
+            None,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
+        );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
@@ -5839,7 +6022,15 @@ pub(crate) mod tests {
             let cid = s.primary_channel.unwrap();
             edit_template(&mut s, |t| t.coinbase_prefix = template_prefix.clone());
             let input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
-            let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+            let out = handle_set_custom_mining_job(
+                &mut s,
+                &input,
+                None,
+                Some(&alloc),
+                None,
+                TIP_MTP,
+                TIP_NOW_MS + 1_000,
+            );
             match (&out.outbound[0], expected) {
                 (OutboundFrame::SetCustomMiningJobSuccess { .. }, None) => {}
                 (OutboundFrame::SetCustomMiningJobError { error_code, .. }, Some(want)) => {
@@ -5866,7 +6057,15 @@ pub(crate) mod tests {
             let mut input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
             let len = crate::jdp::dynamic_outputs::MAX_COINBASE_SCRIPT_SIG_LEN - slot + extra;
             input.coinbase_prefix.resize(len, 0x00);
-            let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+            let out = handle_set_custom_mining_job(
+                &mut s,
+                &input,
+                None,
+                Some(&alloc),
+                None,
+                TIP_MTP,
+                TIP_NOW_MS + 1_000,
+            );
             match (&out.outbound[0], accepted) {
                 (OutboundFrame::SetCustomMiningJobSuccess { .. }, true) => {}
                 (OutboundFrame::SetCustomMiningJobError { error_code, .. }, false) => {
@@ -5896,7 +6095,15 @@ pub(crate) mod tests {
 
             let mut input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
             input.prev_hash = job_tip;
-            let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+            let out = handle_set_custom_mining_job(
+                &mut s,
+                &input,
+                None,
+                Some(&alloc),
+                None,
+                TIP_MTP,
+                TIP_NOW_MS + 1_000,
+            );
             match (&out.outbound[0], expected) {
                 (OutboundFrame::SetCustomMiningJobSuccess { .. }, None) => {}
                 (OutboundFrame::SetCustomMiningJobError { error_code, .. }, Some(want)) => {
@@ -5926,7 +6133,15 @@ pub(crate) mod tests {
             let mut input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
             input.n_bits = job_n_bits;
 
-            let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+            let out = handle_set_custom_mining_job(
+                &mut s,
+                &input,
+                None,
+                Some(&alloc),
+                None,
+                TIP_MTP,
+                TIP_NOW_MS + 1_000,
+            );
             match (&out.outbound[0], expected) {
                 (OutboundFrame::SetCustomMiningJobSuccess { .. }, None) => {}
                 (OutboundFrame::SetCustomMiningJobError { error_code, .. }, Some(want)) => {
@@ -5955,7 +6170,15 @@ pub(crate) mod tests {
         s.current_template = None;
         let mut input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
         input.n_bits = TRIVIAL;
-        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            None,
+            Some(&alloc),
+            None,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
+        );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 // Not `invalid-nbits`: the client is not at fault, and a JDC retries this one.
@@ -5981,7 +6204,15 @@ pub(crate) mod tests {
         let mut input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
         input.n_bits = POOL_N_BITS;
         input.prev_hash = [0xAB; 32];
-        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            None,
+            Some(&alloc),
+            None,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
+        );
         assert!(
             matches!(
                 out.outbound[0],
@@ -6022,7 +6253,15 @@ pub(crate) mod tests {
             input.prev_hash = job_tip;
             input.n_bits = job_n_bits;
 
-            let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+            let out = handle_set_custom_mining_job(
+                &mut s,
+                &input,
+                None,
+                Some(&alloc),
+                None,
+                TIP_MTP,
+                TIP_NOW_MS + 1_000,
+            );
             match &out.outbound[0] {
                 OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                     assert_eq!(error_code, want, "tip {job_tip:?} / n_bits {job_n_bits:#x}");
@@ -6053,7 +6292,15 @@ pub(crate) mod tests {
             token,
             &[txout(312_500_000, designated_script(REGTEST_ADDR))],
         );
-        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            None,
+            Some(&alloc),
+            None,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
+        );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_CUSTOM_JOB_REQUIRES_SOLO);
@@ -6078,7 +6325,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&entry)),
             None,
             None,
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
@@ -6110,7 +6358,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&entry)),
             None,
             None,
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
@@ -6218,7 +6467,8 @@ pub(crate) mod tests {
             None,
             Some(&distribution_allocation(REGTEST_ADDR, 1)),
             Some(&acc),
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         assert!(matches!(
             out.outbound[0],
@@ -6278,7 +6528,8 @@ pub(crate) mod tests {
                 Some(&job_ref_for(&bridge)),
                 None,
                 Some(&acc),
-                1_000,
+                TIP_MTP,
+                TIP_NOW_MS + 1_000,
             );
             assert!(
                 matches!(
@@ -6321,7 +6572,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&bridge)),
             None,
             Some(&acc),
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         assert!(matches!(
             out.outbound[0],
@@ -6348,7 +6600,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&bridge)),
             None,
             None,
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         assert!(matches!(
             out.outbound[0],
@@ -6371,7 +6624,15 @@ pub(crate) mod tests {
             Token([0x77u8; 16]),
             &[txout(312_500_000, designated_script(REGTEST_ADDR))],
         );
-        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            None,
+            Some(&alloc),
+            None,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
+        );
         assert!(matches!(
             out.outbound[0],
             OutboundFrame::SetCustomMiningJobSuccess { .. }
@@ -6411,7 +6672,8 @@ pub(crate) mod tests {
                 None,
                 Some(&distribution_allocation(alloc_addr, 1)),
                 Some(&acc),
-                1_000,
+                TIP_MTP,
+                TIP_NOW_MS + 1_000,
             );
             match (&out.outbound[0], expected) {
                 (OutboundFrame::SetCustomMiningJobSuccess { .. }, None) => {}
@@ -6437,7 +6699,15 @@ pub(crate) mod tests {
         input.distribution_id = Some(9);
         input.coinbase_tx_outputs = blob;
 
-        let out = handle_set_custom_mining_job(&mut s, &input, None, None, Some(&acc), 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            None,
+            None,
+            Some(&acc),
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
+        );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_MINING_JOB_TOKEN);
@@ -6467,7 +6737,8 @@ pub(crate) mod tests {
             None,
             Some(&distribution_allocation(REGTEST_ADDR, 1)),
             Some(&acc),
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         assert!(matches!(
             out.outbound[0],
@@ -6492,7 +6763,8 @@ pub(crate) mod tests {
             None,
             Some(&distribution_allocation(REGTEST_ADDR, 1)),
             Some(&acc),
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
@@ -6520,7 +6792,8 @@ pub(crate) mod tests {
             None,
             Some(&distribution_allocation(REGTEST_ADDR, 1)),
             Some(&acc),
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
@@ -6546,7 +6819,8 @@ pub(crate) mod tests {
             None,
             Some(&distribution_allocation(REGTEST_ADDR, 1)),
             Some(&crate::bridge::DistributionAcceptance::Stale),
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
@@ -6570,7 +6844,8 @@ pub(crate) mod tests {
             None,
             Some(&distribution_allocation(REGTEST_ADDR, 1)),
             Some(&crate::bridge::DistributionAcceptance::Unknown),
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
@@ -6597,7 +6872,8 @@ pub(crate) mod tests {
             None,
             Some(&distribution_allocation(REGTEST_ADDR, 1)),
             Some(&acc),
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
@@ -6627,7 +6903,8 @@ pub(crate) mod tests {
             None,
             Some(&distribution_allocation(REGTEST_ADDR, 1)),
             Some(&acc),
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
@@ -6658,7 +6935,8 @@ pub(crate) mod tests {
             None,
             Some(&distribution_allocation(REGTEST_ADDR, 1)),
             Some(&acc),
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         assert!(matches!(
             out.outbound[0],
@@ -6704,7 +6982,8 @@ pub(crate) mod tests {
                 None,
                 Some(&distribution_allocation(REGTEST_ADDR, 1)),
                 Some(&acc),
-                1_000,
+                TIP_MTP,
+                TIP_NOW_MS + 1_000,
             );
             match (&out.outbound[0], accepted_expected) {
                 (OutboundFrame::SetCustomMiningJobSuccess { .. }, true) => {}
@@ -6748,7 +7027,8 @@ pub(crate) mod tests {
             None,
             Some(&distribution_allocation(REGTEST_ADDR, 1)),
             Some(&acc),
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
@@ -6784,7 +7064,8 @@ pub(crate) mod tests {
                 None,
                 Some(&distribution_allocation(REGTEST_ADDR, 1)),
                 Some(&acc),
-                1_000,
+                TIP_MTP,
+                TIP_NOW_MS + 1_000,
             );
             match (&out.outbound[0], accept) {
                 (OutboundFrame::SetCustomMiningJobSuccess { .. }, true) => {}
@@ -6834,7 +7115,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&declared)),
             None,
             Some(&acc),
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         assert!(
             matches!(
@@ -6870,7 +7152,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&declared)),
             None,
             Some(&acc),
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         assert!(
             matches!(
@@ -6897,7 +7180,15 @@ pub(crate) mod tests {
         // Precondition: on the Solo stream this exact job IS served.
         let mut s = solo_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
-        let out = handle_set_custom_mining_job(&mut s, &job(cid), None, Some(&alloc), None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &job(cid),
+            None,
+            Some(&alloc),
+            None,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
+        );
         assert!(
             matches!(
                 out.outbound[0],
@@ -6910,7 +7201,15 @@ pub(crate) mod tests {
         let mut s = solo_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         s.accounting_stream = StreamKind::GroupSolo;
-        let out = handle_set_custom_mining_job(&mut s, &job(cid), None, Some(&alloc), None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &job(cid),
+            None,
+            Some(&alloc),
+            None,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
+        );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_CUSTOM_JOB_REQUIRES_SOLO);
@@ -6948,7 +7247,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&bridge)),
             None,
             Some(&acc),
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
@@ -6977,7 +7277,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&bridge)),
             None,
             Some(&acc),
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         assert!(matches!(
             out.outbound[0],
@@ -7000,7 +7301,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&bridge)),
             None,
             None, // unresolvable
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
@@ -7036,7 +7338,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&with_booking)),
             None,
             Some(&accepted(entry.clone())),
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         assert!(
             matches!(
@@ -7060,7 +7363,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&declared)),
             None,
             Some(&accepted(entry)),
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
@@ -7101,7 +7405,8 @@ pub(crate) mod tests {
             Some(&accepted(distribution_entry(
                 crate::bridge::DistributionAccounting::PoolWide,
             ))),
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
@@ -7135,7 +7440,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&declared)),
             None,
             Some(&accepted(entry)),
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         assert!(
             matches!(
@@ -7167,7 +7473,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&declared)),
             None,
             Some(&accepted(entry)),
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
@@ -7202,7 +7509,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&declared)),
             None,
             None, // settled / superseded — nothing resolves
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         assert!(
             matches!(
@@ -7241,7 +7549,8 @@ pub(crate) mod tests {
                 Some(&job_ref_for(&declared)),
                 None,
                 live.then_some(&acc),
-                1_000,
+                TIP_MTP,
+                TIP_NOW_MS + 1_000,
             );
             match &out.outbound[0] {
                 OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
@@ -7276,7 +7585,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&declared)),
             None,
             None, // settled / superseded
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
@@ -7309,7 +7619,8 @@ pub(crate) mod tests {
                 None,
                 Some(&distribution_allocation(REGTEST_ADDR, 1)),
                 Some(&acc),
-                1_000,
+                TIP_MTP,
+                TIP_NOW_MS + 1_000,
             );
             match &out.outbound[0] {
                 OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
@@ -7332,10 +7643,26 @@ pub(crate) mod tests {
         let entry = bridge_entry_for(token, REGTEST_ADDR, 42);
         let job_ref = job_ref_for(&entry);
         let input1 = custom_job_input(cid, token);
-        let out1 = handle_set_custom_mining_job(&mut s, &input1, Some(&job_ref), None, None, 1_000);
+        let out1 = handle_set_custom_mining_job(
+            &mut s,
+            &input1,
+            Some(&job_ref),
+            None,
+            None,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
+        );
         let mut input2 = custom_job_input(cid, token);
         input2.request_id = 2;
-        let out2 = handle_set_custom_mining_job(&mut s, &input2, Some(&job_ref), None, None, 2_000);
+        let out2 = handle_set_custom_mining_job(
+            &mut s,
+            &input2,
+            Some(&job_ref),
+            None,
+            None,
+            TIP_MTP,
+            TIP_NOW_MS + 2_000,
+        );
         let id1 = match out1.outbound[0] {
             OutboundFrame::SetCustomMiningJobSuccess { job_id, .. } => job_id,
             _ => unreachable!(),
@@ -7395,7 +7722,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&bridge)),
             None,
             Some(&accepted(entry.clone())),
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         assert!(
             matches!(
@@ -7418,7 +7746,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&bridge)),
             None,
             Some(&accepted(entry)),
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
@@ -7444,7 +7773,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&entry)),
             None,
             None,
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         assert!(
             matches!(
@@ -7462,7 +7792,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&entry)),
             None,
             None,
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
@@ -7498,7 +7829,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&entry)),
             None,
             None,
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         assert!(
             matches!(
@@ -7518,7 +7850,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&entry)),
             None,
             None,
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
@@ -7599,7 +7932,8 @@ pub(crate) mod tests {
             Some(&job_ref_for(&entry)),
             None,
             None,
-            1_000,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
         );
         assert!(
             matches!(
@@ -7623,7 +7957,15 @@ pub(crate) mod tests {
         entry.declared_job.coinbase_tx_prefix = vec![0x02, 0x00];
         let job_ref = job_ref_for(&entry);
         assert!(job_ref.binding.is_none(), "fixture must fail to project");
-        let out = handle_set_custom_mining_job(&mut s, &input, Some(&job_ref), None, None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            Some(&job_ref),
+            None,
+            None,
+            TIP_MTP,
+            TIP_NOW_MS + 1_000,
+        );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_JOB_PARAM_DECLARATION_MISMATCH);

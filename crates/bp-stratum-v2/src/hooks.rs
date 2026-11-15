@@ -68,6 +68,15 @@ pub trait CustomExtranonceSource: Send + Sync {
     fn lookup(&self, address: &str, worker: &str) -> Option<[u8; 4]>;
 }
 
+// ── ChainTipTime ────────────────────────────────────────────────────
+
+/// Median time past (BIP-113) of a block the node reported as tip: a block
+/// built on it needs a greater nTime. Sync on purpose: it reads a per-tip
+/// cache, never a node round-trip per lookup. `None` until the cache holds it.
+pub trait ChainTipTime: Send + Sync {
+    fn median_time_past(&self, block_hash: &[u8; 32]) -> Option<u32>;
+}
+
 // ── ServerHooks aggregator ──────────────────────────────────────────
 
 /// Composite hook handle for the SV2 mining server, cloned into every
@@ -81,6 +90,7 @@ pub struct MiningServerHooks {
     pub session_persistence: Arc<dyn SharedSessionPersistence>,
     pub device_status_sink: Arc<dyn DeviceStatusSink>,
     pub custom_extranonce: Arc<dyn CustomExtranonceSource>,
+    pub chain_tip_time: Arc<dyn ChainTipTime>,
 }
 
 impl MiningServerHooks {
@@ -95,14 +105,16 @@ impl MiningServerHooks {
             rejected_sink: shared.clone(),
             session_persistence: shared.clone(),
             device_status_sink: shared,
-            custom_extranonce: no_op,
+            custom_extranonce: no_op.clone(),
+            chain_tip_time: no_op,
         }
     }
 }
 
 // ── NoOpHooks ───────────────────────────────────────────────────────
 
-/// Ignores every event; pays 100% to the miner.
+/// Ignores every event; pays 100% to the miner. Knows no tip's median time
+/// past, so every custom job is refused with `stale-chain-tip`.
 pub struct NoOpHooks;
 
 #[async_trait::async_trait]
@@ -126,6 +138,12 @@ impl BlockSubmissionSink for NoOpHooks {
 
 impl CustomExtranonceSource for NoOpHooks {
     fn lookup(&self, _: &str, _: &str) -> Option<[u8; 4]> {
+        None
+    }
+}
+
+impl ChainTipTime for NoOpHooks {
+    fn median_time_past(&self, _: &[u8; 32]) -> Option<u32> {
         None
     }
 }
@@ -202,6 +220,7 @@ pub mod test_support {
                 session_persistence: arc.clone(),
                 device_status_sink: arc,
                 custom_extranonce: Arc::new(NoOpHooks),
+                chain_tip_time: Arc::new(NoOpHooks),
             }
         }
     }

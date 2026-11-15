@@ -160,6 +160,14 @@ pub(crate) fn build_per_port_servers(
     // coinbase.
     let extranonce = SharedExtranonceAllocator::new_default_on_worker(SV2_WORKER_ID);
 
+    // Judges every custom job's `ntime_start`; one cache shared across ports
+    // like the allocator, filled by one lookup per tip and TDP stream.
+    let chain_tip_time: Arc<dyn bp_stratum_v2::hooks::ChainTipTime> =
+        crate::tip_median_time::TipMedianTime::spawn(
+            foundation.bitcoin_rpc.clone(),
+            std::iter::once(tdp).chain(foundation.alt_tdp.values()),
+        );
+
     for sv1_port_config in sv1_port_configs {
         let hooks = build_port_hooks(
             sv1_port_config.payout_mode,
@@ -170,6 +178,7 @@ pub(crate) fn build_per_port_servers(
             device_status_sink.clone(),
             Arc::clone(&live_sessions),
             custom_extranonce.clone(),
+            chain_tip_time.clone(),
         );
 
         let templates = crate::stratum::PortTemplates::subscribe(tdp, foundation);
@@ -227,6 +236,7 @@ fn build_port_hooks(
     device_status_sink: Arc<dyn bp_share_hook::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
     custom_extranonce: Arc<dyn bp_stratum_v2::hooks::CustomExtranonceSource>,
+    chain_tip_time: Arc<dyn bp_stratum_v2::hooks::ChainTipTime>,
 ) -> MiningServerHooks {
     // Front-only path (Stratum spawns only on the front), where
     // `engines::spawn` always builds these composites.
@@ -249,6 +259,7 @@ fn build_port_hooks(
         ),
         device_status_sink,
         custom_extranonce,
+        chain_tip_time,
     }
 }
 
