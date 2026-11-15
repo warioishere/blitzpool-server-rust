@@ -100,10 +100,9 @@ async fn password_link(
                 .send_address_access(AddressAccessContext {
                     to_email: binding.email,
                     address: address.as_str().to_string(),
-                    access_url: format!(
-                        "{}/#/address-access/{}/{token}",
-                        base_url.trim_end_matches('/'),
-                        address.as_str()
+                    access_url: bp_common::pool_ui_link(
+                        base_url,
+                        &format!("address-access/{}/{token}", address.as_str()),
                     ),
                     expires_at_ms: expires_at,
                 })

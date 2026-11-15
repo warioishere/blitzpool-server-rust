@@ -11,7 +11,7 @@ use async_trait::async_trait;
 #[async_trait]
 pub trait EmailVerificationHooks: Send + Sync {
     /// Sent after `POST /api/email/register` succeeds — contains the
-    /// verification link (`POOL_BASE_URL/#/email/verify/<token>`)
+    /// verification link (`POOL_BASE_URL/email/verify/<token>`)
     /// the user clicks to confirm the binding.
     async fn send_verification(&self, ctx: VerificationContext);
 
@@ -23,7 +23,7 @@ pub trait EmailVerificationHooks: Send + Sync {
 
     /// Sent after `POST /api/address/password-link` for an address with a
     /// verified binding, to that bound email: the link
-    /// (`POOL_BASE_URL/#/address-access/<address>/<token>`) carries the
+    /// (`POOL_BASE_URL/address-access/<address>/<token>`) carries the
     /// address and its token.
     async fn send_address_access(&self, ctx: AddressAccessContext);
 }

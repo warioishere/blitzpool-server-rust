@@ -88,7 +88,7 @@ mod tests {
         JoinRequestAdminContext {
             requester_address: "bc1qjoiner".to_string(),
             group_name: "PoolPals".to_string(),
-            admin_url: "https://blitzpool.example/#/app/bc1qadmin/payout-group/admin".to_string(),
+            admin_url: "https://blitzpool.example/app/bc1qadmin/payout-group/admin".to_string(),
         }
     }
 
@@ -108,7 +108,7 @@ mod tests {
         assert!(c.html.contains(">Open admin panel</a>"));
         assert!(c
             .html
-            .contains("https://blitzpool.example/#/app/bc1qadmin/payout-group/admin"));
+            .contains("https://blitzpool.example/app/bc1qadmin/payout-group/admin"));
     }
 
     #[test]
@@ -119,7 +119,7 @@ mod tests {
 \n\
 bc1qjoiner\n\
 \n\
-Approve or reject it in the admin panel: https://blitzpool.example/#/app/bc1qadmin/payout-group/admin"
+Approve or reject it in the admin panel: https://blitzpool.example/app/bc1qadmin/payout-group/admin"
         );
     }
 

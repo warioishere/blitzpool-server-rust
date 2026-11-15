@@ -141,11 +141,11 @@ mod tests {
 
     #[test]
     fn a_link_shows_its_text_and_keeps_its_url_in_plain() {
-        let l = link("https://pool.example/#/app/x?a=1&b=2", "Admin-Panel öffnen");
+        let l = link("https://pool.example/app/x?a=1&b=2", "Admin-Panel öffnen");
         assert!(is_valid_telegram_html(&l), "{l}");
         assert_eq!(
             to_plain(&l),
-            "Admin-Panel öffnen (https://pool.example/#/app/x?a=1&b=2)"
+            "Admin-Panel öffnen (https://pool.example/app/x?a=1&b=2)"
         );
     }
 

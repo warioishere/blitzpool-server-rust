@@ -13,7 +13,7 @@ use subtle::ConstantTimeEq;
 #[derive(Debug, Clone)]
 pub struct AdminToken(String);
 
-/// Cleartext invitation token — embedded in `/#/invite/<token>` URLs.
+/// Cleartext invitation token — the token in open-invite and Blockparty join links.
 #[derive(Debug, Clone)]
 pub struct InvitationToken(String);
 

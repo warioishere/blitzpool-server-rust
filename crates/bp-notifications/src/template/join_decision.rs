@@ -155,7 +155,7 @@ mod tests {
         JoinDecisionContext {
             address: "bc1qjoiner".to_string(),
             group_name: "PoolPals".to_string(),
-            group_url: "https://blitzpool.example/#/app/bc1qjoiner/payout-group".to_string(),
+            group_url: "https://blitzpool.example/app/bc1qjoiner/payout-group".to_string(),
         }
     }
 
@@ -216,7 +216,7 @@ mod tests {
 \n\
 Address: bc1qjoiner\n\
 \n\
-Open team dashboard: https://blitzpool.example/#/app/bc1qjoiner/payout-group"
+Open team dashboard: https://blitzpool.example/app/bc1qjoiner/payout-group"
         );
     }
 

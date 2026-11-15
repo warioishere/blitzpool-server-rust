@@ -81,7 +81,6 @@ async fn register(
             StatusCode::SERVICE_UNAVAILABLE,
         ));
     };
-    let base_url = base_url.trim_end_matches('/');
 
     // FCFS-lock — same address with a verified DIFFERENT email refuses
     // + notifies the bound email.
@@ -110,7 +109,7 @@ async fn register(
     let expires_at = now + VERIFICATION_TTL_HOURS * 60 * 60 * 1000;
     bp_db::insert_email_verification(&state.pool, &token, &address, &email, now, expires_at)
         .await?;
-    let verify_url = format!("{base_url}/#/email/verify/{token}");
+    let verify_url = bp_common::pool_ui_link(base_url, &format!("email/verify/{token}"));
     state
         .email_verification_hooks
         .send_verification(VerificationContext {

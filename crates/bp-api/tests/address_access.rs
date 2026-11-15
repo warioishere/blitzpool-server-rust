@@ -105,7 +105,7 @@ fn address(seed: u8, kind: &str) -> String {
 fn link_parts(ctx: &AddressAccessContext) -> (String, String) {
     let rest = ctx
         .access_url
-        .strip_prefix(&format!("{BASE_URL}/#/address-access/"))
+        .strip_prefix(&format!("{BASE_URL}/address-access/"))
         .expect("link shape");
     let (address, token) = rest.split_once('/').expect("address/token");
     (address.to_string(), token.to_string())

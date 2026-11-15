@@ -273,11 +273,8 @@ impl JoinRequestService {
         .await?;
 
         if let Some(base) = self.config.pool_base_url.as_deref() {
-            let url = format!(
-                "{}/#/app/{}/payout-group",
-                base.trim_end_matches('/'),
-                address.as_str()
-            );
+            let url =
+                bp_common::pool_ui_link(base, &format!("app/{}/payout-group", address.as_str()));
             self.email
                 .send_join_decision(JoinDecisionEmailContext {
                     to_email: request.email,
@@ -321,7 +318,7 @@ impl JoinRequestService {
         .await?;
 
         if let Some(base) = self.config.pool_base_url.as_deref() {
-            let url = format!("{}/#/groups/public", base.trim_end_matches('/'));
+            let url = bp_common::pool_ui_link(base, "groups/public");
             self.email
                 .send_join_decision(JoinDecisionEmailContext {
                     to_email: request.email,

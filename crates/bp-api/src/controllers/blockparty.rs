@@ -610,10 +610,20 @@ struct JoinLinkBody {
 #[serde(rename_all = "camelCase")]
 struct JoinLinkResponse {
     token: String,
+    link: String,
+}
+
+/// The shareable page a join-link token opens, on the configured pool UI
+/// (same shape as a Group-Solo open-invite link). `None` without a base URL.
+fn join_link_url(state: &SharedState, token: &str) -> Option<String> {
+    state
+        .pool_base_url
+        .as_deref()
+        .map(|base| bp_common::pool_ui_link(base, &format!("blockparty/join/{token}")))
 }
 
 /// `POST /api/blockparty/:id/join-link` (admin) — create/replace the group's
-/// single self-service join link. UI builds `/blockparty/join/<token>` from it.
+/// single self-service join link.
 async fn create_join_link(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -628,7 +638,8 @@ async fn create_join_link(
     let token = svc
         .create_join_link(id, ttl, admin_token(&headers).as_deref())
         .await?;
-    Ok(Json(JoinLinkResponse { token }))
+    let link = join_link_url(&state, &token).unwrap_or_default();
+    Ok(Json(JoinLinkResponse { token, link }))
 }
 
 /// `DELETE /api/blockparty/:id/join-link` (admin) — revoke the join link.
@@ -648,6 +659,7 @@ async fn revoke_join_link(
 struct ActiveJoinLinkResponse {
     active: bool,
     token: Option<String>,
+    link: Option<String>,
     expires_at: Option<i64>,
 }
 
@@ -666,12 +678,14 @@ async fn active_join_link(
     Ok(Json(match active {
         Some((token, expires_at)) => ActiveJoinLinkResponse {
             active: true,
+            link: join_link_url(&state, &token),
             token: Some(token),
             expires_at: Some(expires_at),
         },
         None => ActiveJoinLinkResponse {
             active: false,
             token: None,
+            link: None,
             expires_at: None,
         },
     }))

@@ -369,10 +369,9 @@ impl NotificationDispatcher {
         let (telegram_subs, ntfy_sub, push_subs) = self.load_subs(&notice.admin_address).await;
         let route = route_join_request(telegram_subs, ntfy_sub, push_subs, self.transports());
         let admin_url = self.pool_base_url.as_deref().map(|base| {
-            format!(
-                "{}/#/app/{}/payout-group/admin",
-                base.trim_end_matches('/'),
-                notice.admin_address.as_str()
+            bp_common::pool_ui_link(
+                base,
+                &format!("app/{}/payout-group/admin", notice.admin_address.as_str()),
             )
         });
 
@@ -2165,7 +2164,7 @@ mod tests {
 
     #[test]
     fn join_request_text_names_the_team_and_links_the_admin_panel_when_known() {
-        let url = "https://blitzpool.example/#/app/bc1qadmin/payout-group/admin";
+        let url = "https://blitzpool.example/app/bc1qadmin/payout-group/admin";
         let en = join_request_text(Language::En, "Pool<Pals>", Some(url));
         assert!(html::is_valid_telegram_html(&en), "{en}");
         assert!(

@@ -442,7 +442,7 @@ async fn create_open_invite(
     let link = state
         .pool_base_url
         .as_deref()
-        .map(|base| format!("{}/#/invite/open/{}", base, created.token))
+        .map(|base| bp_common::pool_ui_link(base, &format!("invite/open/{}", created.token)))
         .unwrap_or_default();
     Ok((
         StatusCode::CREATED,
@@ -1645,10 +1645,9 @@ async fn open_invite_active(
                     .map_err(crate::controllers::invitation::invitation_to_api_error)?;
                 Ok(match active {
                     Some(a) => {
-                        let link = s
-                            .pool_base_url
-                            .as_deref()
-                            .map(|base| format!("{}/#/invite/open/{}", base, a.token));
+                        let link = s.pool_base_url.as_deref().map(|base| {
+                            bp_common::pool_ui_link(base, &format!("invite/open/{}", a.token))
+                        });
                         OpenActiveResponse {
                             active: true,
                             link,

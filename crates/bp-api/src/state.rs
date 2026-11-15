@@ -55,7 +55,7 @@ pub struct AppState {
     /// real SMTP-backed impl.
     pub email_verification_hooks: Arc<dyn EmailVerificationHooks>,
     /// Pool base URL for verification email links
-    /// (`<base>/#/email/verify/<token>`). When `None` the /email/register
+    /// (`<base>/email/verify/<token>`). When `None` the /email/register
     /// path returns `config-missing`.
     pub pool_base_url: Option<String>,
     /// Whether the email-send pipeline is enabled. When `false`,

@@ -96,7 +96,7 @@ mod tests {
     fn ctx() -> AddressAccessContext {
         AddressAccessContext {
             address: "bc1qexampleaddress".to_string(),
-            access_url: "https://blitzpool.example/#/address-access/bc1qexampleaddress/abc.def"
+            access_url: "https://blitzpool.example/address-access/bc1qexampleaddress/abc.def"
                 .to_string(),
             expires_at: Utc.with_ymd_and_hms(2026, 5, 16, 12, 34, 56).unwrap(),
         }
@@ -112,7 +112,7 @@ mod tests {
         assert!(c.html.contains("bc1qexampleaddress"));
         assert!(c.html.contains(">Set password</a>"));
         assert!(c.html.contains(
-            "href=\"https://blitzpool.example/#/address-access/bc1qexampleaddress/abc.def\""
+            "href=\"https://blitzpool.example/address-access/bc1qexampleaddress/abc.def\""
         ));
         assert!(c
             .html
@@ -127,7 +127,7 @@ mod tests {
 \n\
 Address: bc1qexampleaddress\n\
 \n\
-Set it here: https://blitzpool.example/#/address-access/bc1qexampleaddress/abc.def\n\
+Set it here: https://blitzpool.example/address-access/bc1qexampleaddress/abc.def\n\
 \n\
 Link expires Sat, 16 May 2026 12:34:56 GMT.\n\
 \n\
