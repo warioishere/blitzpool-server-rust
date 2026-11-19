@@ -93,7 +93,7 @@ async fn spawn_or_skip(redis_db: u8, finder_bonus_ppm: Option<i32>) -> Option<Ha
     let group_id = Uuid::new_v4();
     seed_group(&pool, group_id, finder_bonus_ppm).await;
 
-    // No per-group reset cron is armed: the seeded group has no preset.
+    // The reset loop leaves the seeded group alone: it has no preset.
     let config = GroupSoloEngineConfig {
         fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
         ..GroupSoloEngineConfig::default()
@@ -897,7 +897,7 @@ async fn concurrent_applies_of_one_block_book_it_once() {
     drop_harness(h).await;
 }
 
-// ── Test 6 — manual_reset triggers full wipe ───────────────────────
+// ── Test 6 — manual_reset wipes the round ──────────────────────────
 
 #[tokio::test]
 async fn manual_reset_wipes_group_state() {
@@ -1085,115 +1085,12 @@ async fn reader_best_difficulty_after_shares() {
     drop_harness(h).await;
 }
 
-// ── Test — reschedule_group arms / re-arms / tears down the reset cron ──
-
-/// Build a `PplnsGroupRow` carrying only the fields `reschedule_group` reads.
-fn reset_row(
-    id: Uuid,
-    active: bool,
-    dissolved_at: Option<i64>,
-    preset: Option<&str>,
-    interval_days: Option<i32>,
-    timezone: Option<&str>,
-) -> bp_db::PplnsGroupRow {
-    bp_db::PplnsGroupRow {
-        id,
-        name: format!("reset-{id}"),
-        creator_address: AddressId::new("test_eng_creator".to_string()).unwrap(),
-        admin_token_hash: "hash".to_string(),
-        active,
-        created_at: 0,
-        updated_at: 0,
-        dissolved_at,
-        round_reset_interval_days: interval_days,
-        round_reset_hour_local: None,
-        round_reset_timezone: timezone.map(str::to_string),
-        last_round_reset_at: None,
-        finder_bonus_sats: None,
-        finder_bonus_ppm: None,
-        round_reset_preset: preset.map(str::to_string),
-        is_public: false,
-        reset_round_on_block: false,
-        max_members: None,
-        payout_mode: "prop".to_string(),
-        coinbase_tag: None,
-    }
-}
-
+// ── Core-mode spawn — read path intact ─────────────────────────────
+// The Core (no background tasks) builds a group's distribution.
 #[tokio::test]
-async fn reschedule_group_arms_and_tears_down_reset_cron() {
-    let h = match spawn_or_skip(9, None).await {
-        Some(h) => h,
-        None => return,
-    };
-    let id = h.group_id;
-
-    // Startup arms crons for groups concurrent tests seed, so measure a delta.
-    let base = h.engine.reset_task_count();
-
-    // A valid preset arms exactly one cron.
-    h.engine
-        .reschedule_group(&reset_row(id, true, None, Some("daily"), None, Some("UTC")));
-    assert_eq!(h.engine.reset_task_count(), base + 1);
-
-    // A second valid config re-arms in place (old task torn down, one remains).
-    h.engine.reschedule_group(&reset_row(
-        id,
-        true,
-        None,
-        Some("custom"),
-        Some(7),
-        Some("UTC"),
-    ));
-    assert_eq!(h.engine.reset_task_count(), base + 1);
-
-    // Clearing the preset leaves the group unscheduled.
-    h.engine
-        .reschedule_group(&reset_row(id, true, None, None, None, None));
-    assert_eq!(h.engine.reset_task_count(), base);
-
-    // Re-arm, then dissolve → torn down again.
-    h.engine
-        .reschedule_group(&reset_row(id, true, None, Some("daily"), None, Some("UTC")));
-    assert_eq!(h.engine.reset_task_count(), base + 1);
-    h.engine.reschedule_group(&reset_row(
-        id,
-        true,
-        Some(123),
-        Some("daily"),
-        None,
-        Some("UTC"),
-    ));
-    assert_eq!(h.engine.reset_task_count(), base);
-
-    // Re-arm, then deactivate → torn down.
-    h.engine
-        .reschedule_group(&reset_row(id, true, None, Some("daily"), None, Some("UTC")));
-    assert_eq!(h.engine.reset_task_count(), base + 1);
-    h.engine.reschedule_group(&reset_row(
-        id,
-        false,
-        None,
-        Some("daily"),
-        None,
-        Some("UTC"),
-    ));
-    assert_eq!(h.engine.reset_task_count(), base);
-
-    drop_harness(h).await;
-}
-
-// ── Core-mode spawn — no startup reset crons, read path intact ─────
-// Differential: the same `daily` group arms a cron in the full engine and
-// none in the core engine, whose `build_distribution` still works.
-#[tokio::test]
-async fn spawn_core_skips_startup_reset_crons() {
+async fn spawn_core_builds_distributions() {
     let pool = match connect_pg_or_skip().await {
         Some(p) => p,
-        None => return,
-    };
-    let full_conn = match connect_redis_or_skip(20).await {
-        Some(c) => c,
         None => return,
     };
     let core_conn = match connect_redis_or_skip(21).await {
@@ -1210,24 +1107,9 @@ async fn spawn_core_skips_startup_reset_crons() {
         ..GroupSoloEngineConfig::default()
     };
 
-    // Full engine: startup arms the seeded group's reset cron.
-    let full = GroupSoloEngine::spawn(config(), full_conn, pool.clone())
-        .await
-        .expect("full spawn");
-    assert!(
-        full.reset_task_count() >= 1,
-        "full engine arms the seeded group's daily reset cron at startup"
-    );
-
-    // Core engine: same group, startup arms nothing.
     let core = GroupSoloEngine::spawn_core(config(), core_conn, pool.clone())
         .await
         .expect("core spawn");
-    assert_eq!(
-        core.reset_task_count(),
-        0,
-        "core mode ran no startup reset crons"
-    );
 
     // The Core's read path still produces a distribution.
     let addr = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
@@ -1253,7 +1135,6 @@ async fn spawn_core_skips_startup_reset_crons() {
         .iter()
         .any(|e| e.address == addr));
 
-    full.shutdown();
     core.shutdown();
     cleanup_group(&pool, group_id).await;
 }

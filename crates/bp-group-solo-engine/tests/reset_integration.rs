@@ -145,7 +145,7 @@ fn clock_at_ms(ms: i64) -> Arc<TestClock> {
 
 use chrono::TimeZone;
 
-// ── Test 1 — reset fires + wipes everything ────────────────────────
+// ── Test 1 — reset fires, wipes the round and stamps ───────────────
 
 #[tokio::test]
 async fn reset_scheduled_wipes_redis_pg_state_and_stamps() {
@@ -347,4 +347,78 @@ async fn reset_one_group_does_not_affect_another() {
     );
     cleanup_group(&pool, group_a).await;
     cleanup_group(&pool, group_b).await;
+}
+
+// ── Test 8 — the loop fires a group once per midnight ──────────────
+
+/// `reset_due_groups` resets a group whose 00:00 fell in the tick window and
+/// leaves it alone in the next window, even past the 60 s debounce. The
+/// group's timezone is one no sibling test seeds, so the window holds no
+/// other group's midnight and the loop touches only this group.
+#[tokio::test]
+async fn the_reset_loop_fires_a_group_once_per_midnight() {
+    let (pool, conn) = match connect_or_skip(7).await {
+        Some(x) => x,
+        None => return,
+    };
+    let group_id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO pplns_group
+             (id, name, "creatorAddress", "adminTokenHash", active,
+              "createdAt", "updatedAt", "isPublic", "lastRoundResetAt",
+              "roundResetPreset", "roundResetTimezone", "roundResetIntervalDays")
+           VALUES ($1, $2, $3, $4, true, 0, 0, false, NULL, 'daily', 'Pacific/Chatham', NULL)"#,
+    )
+    .bind(group_id)
+    .bind(format!("test-group-{group_id}"))
+    .bind(format!("test_grp_reset_creator_{group_id}"))
+    .bind(format!("hash-{group_id}"))
+    .execute(&pool)
+    .await
+    .expect("seed group");
+
+    let midnight = chrono_tz::Pacific::Chatham
+        .with_ymd_and_hms(2026, 3, 10, 0, 0, 0)
+        .single()
+        .expect("unambiguous midnight")
+        .with_timezone(&chrono::Utc);
+    let since = midnight - chrono::Duration::seconds(20);
+    let now = midnight + chrono::Duration::seconds(10);
+    let later = now + chrono::Duration::seconds(120);
+    let round = GroupRoundStore::new(conn);
+    let last_reset = || async {
+        let row: (Option<i64>,) =
+            sqlx::query_as(r#"SELECT "lastRoundResetAt" FROM pplns_group WHERE id = $1"#)
+                .bind(group_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        row.0
+    };
+
+    GroupResetRunner::new(
+        pool.clone(),
+        round.clone(),
+        clock_at_ms(now.timestamp_millis()),
+    )
+    .reset_due_groups(since, now)
+    .await
+    .expect("groups readable");
+    assert_eq!(
+        last_reset().await,
+        Some(now.timestamp_millis()),
+        "the window holding the group's 00:00 resets it"
+    );
+
+    GroupResetRunner::new(pool.clone(), round, clock_at_ms(later.timestamp_millis()))
+        .reset_due_groups(now, later)
+        .await
+        .expect("groups readable");
+    assert_eq!(
+        last_reset().await,
+        Some(now.timestamp_millis()),
+        "the next window, past the debounce, leaves it alone"
+    );
+
+    cleanup_group(&pool, group_id).await;
 }

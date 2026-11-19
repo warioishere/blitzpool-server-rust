@@ -190,7 +190,7 @@ async-channel = "1.5"
 # we keep epoch-ms `u64` on the wire and only render DateTime for cron
 # arithmetic.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-# IANA-TZ-aware datetime math for the per-group scheduled-reset cron
+# IANA-TZ-aware datetime math for the calendar round reset
 # (each group picks its own admin-local timezone for the calendar
 # boundary fires). `chrono-tz` ships the TZ database compiled in, no
 # OS dependency. Default features OK — pulls in just `chrono`.

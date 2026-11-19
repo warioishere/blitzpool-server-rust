@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Scheduled round-reset cron: fires at 00:00 in the group's TZ per
-//! `roundResetPreset` (daily, weekly on Monday, monthly on the 1st, or
-//! `custom` gated by `roundResetIntervalDays`). Wipes the full round except
-//! the dedup set and stamps `lastRoundResetAt`.
+//! Scheduled round reset at 00:00 in the group's TZ per `roundResetPreset`
+//! (daily, weekly on Monday, monthly on the 1st, or `custom` gated by
+//! `roundResetIntervalDays`). One loop serves every group and reads the
+//! groups from Postgres on each tick. The reset wipes the round's shares and
+//! rejects and stamps `lastRoundResetAt`; the dedup set and each member's
+//! last accepted share stay.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use bp_cron_utils::Clock;
-use bp_db::{find_group, update_pplns_group_last_reset_at, DbError, PplnsGroupRow};
+use bp_db::{
+    find_group, list_active_pplns_groups, update_pplns_group_last_reset_at, DbError, PplnsGroupRow,
+};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
 use chrono_tz::Tz;
 use sqlx::PgPool;
@@ -28,8 +32,12 @@ use crate::round::{GroupRoundStore, RoundError};
 pub const RESET_DEBOUNCE_MS: i64 = 60_000;
 
 /// Slack on the `custom` elapsed-check: across DST a day is 23 h or 25 h,
-/// so without it an N-day cron could miss its Nth daily fire.
+/// so without it an N-day schedule could miss its Nth daily fire.
 pub const DST_TOLERANCE_MS: i64 = 12 * 60 * 60 * 1000;
+
+/// How often the reset loop reads the groups: while it runs and Postgres
+/// answers, a reset fires within this interval of its 00:00.
+pub const RESET_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum ResetError {
@@ -49,11 +57,9 @@ pub enum ResetError {
 
 // ── Preset + schedule config ───────────────────────────────────────
 
-/// Snapshot of one group's reset schedule, derived from its
-/// `pplns_group` row at the time the cron task is spawned.
+/// One group's reset schedule, derived from its `pplns_group` row.
 #[derive(Clone, Debug)]
 pub struct ResetSchedule {
-    pub group_id: Uuid,
     pub preset: RoundResetPreset,
     pub timezone: Tz,
     /// Only meaningful for `Custom`.
@@ -65,7 +71,6 @@ impl ResetSchedule {
     /// nothing to schedule: no preset, no timezone, or `custom` without an
     /// interval.
     pub fn from_row_fields(
-        group_id: Uuid,
         preset: Option<&str>,
         timezone: Option<&str>,
         interval_days: Option<u32>,
@@ -85,7 +90,6 @@ impl ResetSchedule {
             return Ok(None);
         }
         Ok(Some(Self {
-            group_id,
             preset,
             timezone: tz,
             interval_days,
@@ -93,17 +97,16 @@ impl ResetSchedule {
     }
 }
 
-/// The calendar schedule a reset cron runs for `group`: only for an active,
-/// not dissolved Prop group (a Window group's preset is its window length).
+/// The calendar schedule the reset loop uses for `group`: only for a not
+/// dissolved Prop group (a Window group's preset is its window length).
 /// `Ok(None)` when its preset, timezone or interval make no schedule.
 pub fn scheduled_reset(group: &PplnsGroupRow) -> Result<Option<ResetSchedule>, ResetError> {
-    if group.dissolved_at.is_some() || !group.active {
+    if group.dissolved_at.is_some() {
         return Ok(None);
     }
     match PayoutMode::parse_or_default(&group.payout_mode) {
         PayoutMode::Window => Ok(None),
         PayoutMode::Prop => ResetSchedule::from_row_fields(
-            group.id,
             group.round_reset_preset.as_deref(),
             group.round_reset_timezone.as_deref(),
             group
@@ -138,6 +141,17 @@ pub fn compute_next_fire(
         }
     }
     candidate.with_timezone(&Utc)
+}
+
+/// Whether the schedule's next fire after `since` has arrived by `now`. Each
+/// fire falls in exactly one window of consecutive loop ticks.
+pub fn is_due(
+    schedule: &ResetSchedule,
+    last_reset_at_ms: Option<i64>,
+    since: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> bool {
+    compute_next_fire(schedule, last_reset_at_ms, since) <= now
 }
 
 /// Next 00:00 local time for the given preset, strictly after `now`.
@@ -246,8 +260,8 @@ impl<C: Clock> GroupResetRunner<C> {
             }
         }
 
-        // Custom-preset elapsed check. The cron task gates already; this
-        // keeps a standalone invocation from firing too early.
+        // Custom-preset elapsed check. The reset loop gates already
+        // (`is_due`); this keeps a standalone invocation from firing too early.
         if let (Some(preset_str), Some(interval_days)) = (
             group.round_reset_preset.as_deref(),
             group.round_reset_interval_days,
@@ -280,6 +294,35 @@ impl<C: Clock> GroupResetRunner<C> {
         info!(%group_id, "group-solo scheduled round-reset applied");
         Ok(true)
     }
+
+    /// Reset every group whose scheduled 00:00 fell in `(since, now]`. Each
+    /// group's schedule comes from its current row, so a settings change or
+    /// a dissolve applies here whichever process wrote it. `Err` only when
+    /// the groups could not be read; a failed single reset is logged.
+    pub async fn reset_due_groups(
+        &self,
+        since: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), ResetError> {
+        for group in list_active_pplns_groups(&self.pool).await? {
+            match scheduled_reset(&group) {
+                Ok(Some(schedule)) => {
+                    if is_due(&schedule, group.last_round_reset_at, since, now) {
+                        if let Err(e) = self.reset_scheduled(group.id).await {
+                            warn!(group_id = %group.id, error = %e, "round-reset firing failed");
+                        }
+                    }
+                }
+                Ok(None) => {}
+                // Only a row the settings validator did not write gets here,
+                // and the loop reads it every tick, hence debug.
+                Err(e) => {
+                    debug!(group_id = %group.id, error = %e, "invalid round-reset schedule; group skipped");
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 // Manual Clone: the derive would require `C: Clone`.
@@ -293,52 +336,29 @@ impl<C: Clock> Clone for GroupResetRunner<C> {
     }
 }
 
-// ── Background cron task ────────────────────────────────────────────
+// ── Background loop ─────────────────────────────────────────────────
 
-/// Spawn a per-group cron that sleeps to the next fire, resets, loops. The
-/// schedule is captured at spawn, so a config change re-spawns the task.
-pub fn spawn_per_group_task<C: Clock>(
+/// The one reset loop: every [`RESET_POLL_INTERVAL`] it resets the groups
+/// whose 00:00 passed since the previous tick. A failed read of the groups
+/// keeps that window open, so the next tick still sees its fires.
+pub fn spawn_reset_loop<C: Clock>(
     runner: GroupResetRunner<C>,
-    schedule: ResetSchedule,
     mut cancel_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let group_id = schedule.group_id;
-        info!(
-            %group_id,
-            preset = ?schedule.preset,
-            tz = %schedule.timezone,
-            interval_days = ?schedule.interval_days,
-            "spawned group-solo round-reset cron"
-        );
+        info!("group-solo round-reset loop started");
+        let mut since = runner.clock.now();
         loop {
-            // Fresh lastResetAt so the next fire matches the runner's gates.
-            let last_ms = match find_group(&runner.pool, group_id).await {
-                Ok(Some(g)) => g.last_round_reset_at,
-                Ok(None) => {
-                    info!(%group_id, "group dissolved — round-reset cron exits");
-                    return;
-                }
-                Err(e) => {
-                    warn!(%group_id, error = %e, "round-reset cron: find_group failed; retrying in 60s");
-                    if wait_or_cancel(Duration::from_secs(60), &mut cancel_rx).await {
-                        return;
-                    }
-                    continue;
-                }
-            };
-            let now = runner.clock.now();
-            let next = compute_next_fire(&schedule, last_ms, now);
-            let wait = (next - now).to_std().unwrap_or(Duration::from_secs(60));
-
-            if wait_or_cancel(wait, &mut cancel_rx).await {
-                info!(%group_id, "round-reset cron cancelled");
+            if wait_or_cancel(RESET_POLL_INTERVAL, &mut cancel_rx).await {
+                info!("group-solo round-reset loop stopped");
                 return;
             }
-            match runner.reset_scheduled(group_id).await {
-                Ok(true) => {} // logged in runner
-                Ok(false) => debug!(%group_id, "round-reset skipped by debounce / elapsed-gate"),
-                Err(e) => warn!(%group_id, error = %e, "round-reset firing failed"),
+            let now = runner.clock.now();
+            match runner.reset_due_groups(since, now).await {
+                Ok(()) => since = now,
+                Err(e) => {
+                    warn!(error = %e, "round-reset loop: reading the groups failed; retrying next tick");
+                }
             }
         }
     })
@@ -367,7 +387,6 @@ mod tests {
 
     fn schedule(preset: RoundResetPreset, tz: Tz, interval_days: Option<u32>) -> ResetSchedule {
         ResetSchedule {
-            group_id: Uuid::new_v4(),
             preset,
             timezone: tz,
             interval_days,
@@ -452,19 +471,18 @@ mod tests {
 
     #[test]
     fn reset_schedule_from_row_handles_missing_fields() {
-        let g = Uuid::new_v4();
-        assert!(ResetSchedule::from_row_fields(g, None, Some("UTC"), None)
+        assert!(ResetSchedule::from_row_fields(None, Some("UTC"), None)
             .unwrap()
             .is_none());
-        assert!(ResetSchedule::from_row_fields(g, Some("daily"), None, None)
+        assert!(ResetSchedule::from_row_fields(Some("daily"), None, None)
             .unwrap()
             .is_none());
         assert!(
-            ResetSchedule::from_row_fields(g, Some("custom"), Some("UTC"), Some(0))
+            ResetSchedule::from_row_fields(Some("custom"), Some("UTC"), Some(0))
                 .unwrap()
                 .is_none(),
         );
-        let sched = ResetSchedule::from_row_fields(g, Some("daily"), Some("UTC"), None)
+        let sched = ResetSchedule::from_row_fields(Some("daily"), Some("UTC"), None)
             .unwrap()
             .unwrap();
         assert_eq!(sched.preset, RoundResetPreset::Daily);
@@ -546,6 +564,94 @@ mod tests {
         let now = at_utc(2026, 9, 6, 15, 0);
         let next = compute_next_fire(&s, None, now);
         assert_eq!(next, at_utc(2026, 9, 7, 3, 0));
+    }
+
+    /// A 30 s tick window around 00:00 is due once, the next window is not.
+    #[test]
+    fn a_fire_is_due_in_exactly_one_tick_window() {
+        let s = schedule(RoundResetPreset::Daily, UTC, None);
+        let before = at_utc(2026, 5, 16, 23, 59) + ChronoDuration::seconds(40);
+        let after = at_utc(2026, 5, 17, 0, 0) + ChronoDuration::seconds(10);
+        let later = after + ChronoDuration::seconds(30);
+        assert!(is_due(&s, None, before, after), "the window holding 00:00");
+        assert!(!is_due(&s, None, after, later), "the following window");
+        assert!(!is_due(
+            &s,
+            None,
+            before - ChronoDuration::seconds(30),
+            before
+        ));
+    }
+
+    /// Weekly fires only on Monday: the same Tuesday window is due for a
+    /// daily group and not for a weekly one.
+    #[test]
+    fn the_preset_on_the_row_decides_whether_a_window_is_due() {
+        // 2026-05-19 is a Tuesday.
+        let since = at_utc(2026, 5, 18, 23, 59) + ChronoDuration::seconds(40);
+        let now = at_utc(2026, 5, 19, 0, 0) + ChronoDuration::seconds(10);
+        let daily = schedule(RoundResetPreset::Daily, UTC, None);
+        let weekly = schedule(RoundResetPreset::Weekly, UTC, None);
+        assert!(is_due(&daily, None, since, now));
+        assert!(!is_due(&weekly, None, since, now));
+    }
+
+    #[test]
+    fn a_custom_window_is_due_only_once_the_interval_elapsed() {
+        let s = schedule(RoundResetPreset::Custom, UTC, Some(3));
+        let since = at_utc(2026, 5, 16, 23, 59) + ChronoDuration::seconds(40);
+        let now = at_utc(2026, 5, 17, 0, 0) + ChronoDuration::seconds(10);
+        let one_day_ago = at_utc(2026, 5, 16, 0, 0).timestamp_millis();
+        let three_days_ago = at_utc(2026, 5, 14, 0, 0).timestamp_millis();
+        assert!(!is_due(&s, Some(one_day_ago), since, now));
+        assert!(is_due(&s, Some(three_days_ago), since, now));
+    }
+
+    fn group_row(
+        preset: Option<&str>,
+        payout_mode: &str,
+        dissolved_at: Option<i64>,
+    ) -> PplnsGroupRow {
+        PplnsGroupRow {
+            id: Uuid::new_v4(),
+            name: "g".to_string(),
+            creator_address: bp_common::AddressId::new("creator".to_string()).unwrap(),
+            admin_token_hash: "hash".to_string(),
+            active: dissolved_at.is_none(),
+            created_at: 0,
+            updated_at: 0,
+            dissolved_at,
+            round_reset_interval_days: None,
+            round_reset_hour_local: None,
+            round_reset_timezone: Some("UTC".to_string()),
+            last_round_reset_at: None,
+            finder_bonus_sats: None,
+            finder_bonus_ppm: None,
+            round_reset_preset: preset.map(str::to_string),
+            is_public: false,
+            reset_round_on_block: false,
+            max_members: None,
+            payout_mode: payout_mode.to_string(),
+            coinbase_tag: None,
+        }
+    }
+
+    /// The loop takes each group's schedule from its current row: a dissolved
+    /// group, a cleared preset and a Window group have none.
+    #[test]
+    fn only_a_live_prop_group_with_a_preset_has_a_schedule() {
+        assert!(scheduled_reset(&group_row(Some("daily"), "prop", None))
+            .unwrap()
+            .is_some());
+        assert!(scheduled_reset(&group_row(Some("daily"), "prop", Some(1)))
+            .unwrap()
+            .is_none());
+        assert!(scheduled_reset(&group_row(None, "prop", None))
+            .unwrap()
+            .is_none());
+        assert!(scheduled_reset(&group_row(Some("daily"), "window", None))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

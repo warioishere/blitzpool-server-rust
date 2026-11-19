@@ -14,8 +14,8 @@ use bp_api::email_hooks::{
 };
 use bp_common::AddressId;
 use bp_config::AppConfig;
+use bp_db::delete_pplns_group_block_history_for_group;
 use bp_db::Db;
-use bp_db::{delete_pplns_group_block_history_for_group, PplnsGroupRow};
 use bp_group_mgmt_engine::{
     EmailHooks, GroupServiceHooks, JoinDecisionEmailContext, JoinDecisionOutcome,
 };
@@ -292,8 +292,8 @@ pub(crate) struct ProductionGroupServiceHooks {
 impl GroupServiceHooks for ProductionGroupServiceHooks {
     async fn last_active_for_member(&self, group_id: Uuid, address: &AddressId) -> Option<i64> {
         // Redis is the only source (Group-Solo keeps no ledger row). `None`
-        // makes the caller fall back to `joined_at`, so after a Redis loss a
-        // long-standing member looks freshly joined.
+        // makes the caller measure inactivity from `joined_at`, so after a
+        // Redis loss a long-standing member looks inactive since joining.
         let group_solo = self.group_solo.as_ref()?;
         let group_key = group_id.to_string();
         match group_solo
@@ -382,15 +382,6 @@ impl GroupServiceHooks for ProductionGroupServiceHooks {
                 %group_id,
                 "group-hooks: on_group_dissolved delete history failed (best-effort)"
             ),
-        }
-    }
-
-    async fn apply_round_reset_config(&self, group: &PplnsGroupRow) {
-        // Re-arm this group's round-reset cron so a settings change takes
-        // effect without a restart: the old per-group task is replaced by a
-        // fresh one, or none if the preset was cleared or the group dissolved.
-        if let Some(group_solo) = self.group_solo.as_ref() {
-            group_solo.reschedule_group(group);
         }
     }
 }

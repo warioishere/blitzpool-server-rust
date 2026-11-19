@@ -690,11 +690,13 @@ impl From<bp_db::PplnsGroupRow> for GroupSummary {
     }
 }
 
-/// From the schedule a reset cron runs for the group
+/// From the schedule the reset loop uses for the group
 /// ([`scheduled_reset`](bp_group_solo_engine::reset::scheduled_reset)) and the
-/// cron's own
+/// loop's own
 /// [`compute_next_fire`](bp_group_solo_engine::reset::compute_next_fire), so
-/// the advertised instant is the one it fires at; `None` where no cron runs.
+/// the advertised instant is the 00:00 it fires at (it checks every
+/// [`RESET_POLL_INTERVAL`](bp_group_solo_engine::reset::RESET_POLL_INTERVAL));
+/// `None` where no reset is scheduled.
 fn next_reset_at(r: &bp_db::PplnsGroupRow) -> Option<i64> {
     use bp_group_solo_engine::reset::{compute_next_fire, scheduled_reset};
     let schedule = scheduled_reset(r).ok()??;
@@ -1997,10 +1999,10 @@ mod tests {
     use serde_json::Value;
     use uuid::Uuid;
 
-    /// A reset time only where a reset cron runs: an active Prop group with
+    /// A reset time only where the reset loop resets: an active Prop group with
     /// a schedule; never a Window group, never a dissolved one.
     #[test]
-    fn next_reset_at_only_where_a_reset_cron_runs() {
+    fn next_reset_at_only_where_the_reset_loop_resets() {
         let row = |mode: &str, dissolved_at: Option<i64>| bp_db::PplnsGroupRow {
             id: Uuid::nil(),
             name: "t".to_string(),

@@ -2,7 +2,7 @@
 
 //! `GroupService` — group lifecycle, membership, admin-token auth.
 //! Pure logic lives in `bp-group-mgmt`, DB writes in `bp-db`, Redis cleanup
-//! and cron scheduling behind [`GroupServiceHooks`]. The owned
+//! behind [`GroupServiceHooks`]. The owned
 //! [`AddressCache`] is rebuilt on every membership change.
 
 use std::sync::Arc;
@@ -222,10 +222,9 @@ impl GroupService {
         Ok(bp_db::find_pplns_group_members_for_group(&self.pool, group_id).await?)
     }
 
-    /// Last-active epoch-ms, Redis-first / PG-fallback like the kick guard in
-    /// [`Self::remove_member`]. Redis is stamped on every share, PG only at
-    /// block-found, so miners show active before their group's first block.
-    /// `None` if the member never submitted a share.
+    /// Last-active epoch-ms, the clock the kick guard in
+    /// [`Self::remove_member`] reads: stamped in Redis on every share, kept
+    /// across round resets. `None` if the member never submitted a share.
     pub async fn member_last_active(&self, group_id: Uuid, address: &AddressId) -> Option<i64> {
         self.hooks.last_active_for_member(group_id, address).await
     }
@@ -551,8 +550,6 @@ impl GroupService {
                 .await?
                 .ok_or(GroupServiceError::NotFound)?;
 
-        // Re-arm the cron job. Idempotent.
-        self.hooks.apply_round_reset_config(&updated).await;
         // The front serves the tag from its own cache.
         if tag_changed {
             if let Some(n) = self.change_notifier.get() {
@@ -578,7 +575,7 @@ impl GroupService {
         bp_db::update_pplns_group_dissolved(&mut *tx, group_id, now).await?;
         tx.commit().await.map_err(bp_db::DbError::from)?;
 
-        // Redis cleanup + scheduler tear-down outside the TX.
+        // Redis cleanup outside the TX.
         self.hooks.on_group_dissolved(group_id).await;
         self.rebuild_and_notify().await?;
         Ok(())

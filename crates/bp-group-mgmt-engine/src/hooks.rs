@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Group lifecycle side effects (Redis round-state cleanup, cron scheduling)
-//! behind traits, so the binary injects the real implementation and tests
+//! Group lifecycle side effects (Redis round-state cleanup) behind traits, so the binary injects the real implementation and tests
 //! use [`NoopHooks`].
 
 use async_trait::async_trait;
 use bp_common::AddressId;
-use bp_db::PplnsGroupRow;
 use uuid::Uuid;
 
 /// Hooks the `GroupService` calls during membership / lifecycle
@@ -30,14 +28,9 @@ pub trait GroupServiceHooks: Send + Sync {
         remaining_addresses: &[AddressId],
     );
 
-    /// Best-effort Redis + scheduler cleanup on group dissolve. Same
-    /// no-op-on-failure semantics as [`Self::on_member_removed`].
+    /// Best-effort Redis cleanup on group dissolve. Same no-op-on-failure
+    /// semantics as [`Self::on_member_removed`].
     async fn on_group_dissolved(&self, group_id: Uuid);
-
-    /// (Re-)apply the group's round-reset cron config. Idempotent —
-    /// callers may invoke after every round-reset config PATCH.
-    /// Receives the row as it sits in PG after the PATCH commits.
-    async fn apply_round_reset_config(&self, group: &PplnsGroupRow);
 }
 
 /// Lets `create_group` and `add_member` refuse an address already in a
@@ -116,8 +109,6 @@ impl GroupServiceHooks for NoopHooks {
     }
 
     async fn on_group_dissolved(&self, _group_id: Uuid) {}
-
-    async fn apply_round_reset_config(&self, _group: &PplnsGroupRow) {}
 }
 
 #[async_trait]

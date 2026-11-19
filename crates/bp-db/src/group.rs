@@ -374,9 +374,9 @@ where
     Ok(result.rows_affected())
 }
 
-/// Stamp `lastRoundResetAt` on a `pplns_group` row. Called by the
-/// scheduled cron after each fired reset; the 60s guard reads this
-/// column to prevent double-fire.
+/// Stamp `lastRoundResetAt` on a `pplns_group` row. Called after each
+/// scheduled round reset; the 60s guard reads this column to prevent
+/// double-fire.
 pub async fn update_pplns_group_last_reset_at<'e, E>(
     executor: E,
     group_id: Uuid,

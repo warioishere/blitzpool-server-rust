@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `GroupSoloEngine`: wires the round store, distribution builder and
-//! per-group reset crons. `on_block_found` books the payout history from the
+//! `GroupSoloEngine`: wires the round store, distribution builder and the
+//! calendar round-reset loop. `on_block_found` books the payout history from the
 //! block's OWN coinbase, never from what the pool intended to pay.
 
 use std::collections::HashMap;
@@ -16,7 +16,6 @@ use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use thiserror::Error;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -25,9 +24,7 @@ use crate::distribution::{
     BuiltDistribution, DistributionBuilder, DistributionConfig, DistributionError,
 };
 use crate::history::{apply_distribution, ApplyDistributionResult, AuditRow, LedgerError};
-use crate::reset::{
-    scheduled_reset, spawn_per_group_task, GroupResetRunner, ResetError, ResetSchedule,
-};
+use crate::reset::{spawn_reset_loop, GroupResetRunner, ResetError};
 
 use crate::round::{GroupRoundStore, RoundAtFind, RoundError, WINDOW_BUCKET_MS};
 
@@ -99,11 +96,8 @@ struct Inner {
     distribution_builder: DistributionBuilder,
     reset_runner: GroupResetRunner<SystemClock>,
     config: GroupSoloEngineConfig,
-    /// Per-group reset crons, each with its own cancel channel so
-    /// [`GroupSoloEngine::reschedule_group`] can re-arm one group alone.
-    reset_tasks: StdMutex<HashMap<Uuid, ResetTask>>,
-    /// Per-group `on_block_found` re-entrancy guard; async mutex because the
-    /// critical section awaits PG + Redis.
+    /// Stops the round-reset loop (only running where background tasks are).
+    cancel_tx: watch::Sender<bool>,
     /// Keeps Postgres off the per-share path. The mode is immutable but the
     /// window length is editable, hence the short [`MODE_CACHE_TTL`].
     mode_cache: StdMutex<HashMap<Uuid, CachedGroupMode>>,
@@ -166,24 +160,9 @@ pub(crate) fn group_mode_from_row(g: &PplnsGroupRow) -> (PayoutMode, i64) {
     (mode, window_ms)
 }
 
-/// A running per-group round-reset cron + its dedicated cancel channel.
-struct ResetTask {
-    cancel: watch::Sender<bool>,
-    #[allow(dead_code)] // retained so the task isn't detached/lost; cancel drives exit
-    join: JoinHandle<()>,
-}
-
-/// Spawn a per-group reset cron with its own cancel channel.
-fn spawn_reset_task(runner: GroupResetRunner<SystemClock>, schedule: ResetSchedule) -> ResetTask {
-    let (cancel, cancel_rx) = watch::channel(false);
-    let join = spawn_per_group_task(runner, schedule, cancel_rx);
-    ResetTask { cancel, join }
-}
-
 impl GroupSoloEngine {
-    /// Validate config, wire dependencies, and spawn a per-group
-    /// calendar-reset cron for every active group with a configured
-    /// preset.
+    /// Validate config, wire dependencies, and run the calendar round-reset
+    /// loop.
     pub async fn spawn(
         config: GroupSoloEngineConfig,
         redis: ConnectionManager,
@@ -192,7 +171,7 @@ impl GroupSoloEngine {
         Self::spawn_inner(config, redis, pool, true).await
     }
 
-    /// Core-mode constructor without the reset crons: the Core only builds
+    /// Core-mode constructor without the reset loop: the Core only builds
     /// distributions, and mutating rounds is the Satellite's job.
     pub async fn spawn_core(
         config: GroupSoloEngineConfig,
@@ -215,12 +194,10 @@ impl GroupSoloEngine {
         let clock = Arc::new(SystemClock);
         let reset_runner = GroupResetRunner::new(pool.clone(), round.clone(), clock.clone());
 
-        let mut reset_tasks: HashMap<Uuid, ResetTask> = HashMap::new();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        // The JoinHandle is not tracked: the loop exits on `cancel_tx`.
         if background_tasks {
-            for schedule in load_active_schedules(&pool).await? {
-                let group_id = schedule.group_id;
-                reset_tasks.insert(group_id, spawn_reset_task(reset_runner.clone(), schedule));
-            }
+            std::mem::drop(spawn_reset_loop(reset_runner.clone(), cancel_rx));
         }
 
         info!(
@@ -237,47 +214,11 @@ impl GroupSoloEngine {
                 distribution_builder,
                 reset_runner,
                 config,
-                reset_tasks: StdMutex::new(reset_tasks),
+                cancel_tx,
                 mode_cache: StdMutex::new(HashMap::new()),
                 window_trim_watermark: StdMutex::new(HashMap::new()),
             }),
         })
-    }
-
-    /// Re-arm one group's reset cron from its current row after a settings
-    /// save; the old task is always torn down first.
-    pub fn reschedule_group(&self, group: &PplnsGroupRow) {
-        let mut tasks = self
-            .inner
-            .reset_tasks
-            .lock()
-            .expect("reset_tasks mutex poisoned");
-        if let Some(old) = tasks.remove(&group.id) {
-            let _ = old.cancel.send(true);
-        }
-        match scheduled_reset(group) {
-            Ok(Some(schedule)) => {
-                tasks.insert(
-                    group.id,
-                    spawn_reset_task(self.inner.reset_runner.clone(), schedule),
-                );
-                info!(
-                    group_id = %group.id,
-                    preset = ?group.round_reset_preset,
-                    interval_days = ?group.round_reset_interval_days,
-                    "round-reset cron (re)scheduled from settings change"
-                );
-            }
-            Ok(None) => {
-                info!(group_id = %group.id,
-                    "round-reset cron unscheduled (dissolved, inactive, window mode or no preset)");
-            }
-            Err(e) => warn!(
-                group_id = %group.id,
-                error = %e,
-                "reschedule_group: invalid reset schedule; left unscheduled"
-            ),
-        }
     }
 
     /// Resolve a group's `(PayoutMode, window_ms)` through the cache. On a DB
@@ -687,18 +628,11 @@ impl GroupSoloEngine {
             .map_err(EngineError::from)
     }
 
-    /// Signal each per-group reset cron to exit. Best-effort.
+    /// Stop the round-reset loop. It is not joined, so a shutdown time-out is
+    /// the caller's concern.
     pub fn shutdown(&self) {
-        if let Ok(tasks) = self.inner.reset_tasks.lock() {
-            for task in tasks.values() {
-                let _ = task.cancel.send(true);
-            }
-        }
-    }
-
-    /// Number of armed per-group reset crons.
-    pub fn reset_task_count(&self) -> usize {
-        self.inner.reset_tasks.lock().map(|t| t.len()).unwrap_or(0)
+        // Err only when the loop already exited or never ran.
+        let _ = self.inner.cancel_tx.send(true);
     }
 
     // Accessors for hooks.rs / reader.rs.
@@ -714,43 +648,6 @@ impl GroupSoloEngine {
         &self.inner.round
     }
 }
-
-/// One `pplns_group` row's reset-config fields.
-type ResetConfigRow = (Uuid, Option<String>, Option<String>, Option<i32>);
-
-/// Reset schedules of every active PROP group with a preset; invalid rows
-/// are logged and skipped.
-async fn load_active_schedules(pool: &PgPool) -> Result<Vec<ResetSchedule>, EngineError> {
-    let rows: Vec<ResetConfigRow> = sqlx::query_as(
-        // A Window group's reset config is its window length, never a cron.
-        r#"SELECT id, "roundResetPreset", "roundResetTimezone", "roundResetIntervalDays"
-           FROM pplns_group
-           WHERE active = true
-             AND "dissolvedAt" IS NULL
-             AND "roundResetPreset" IS NOT NULL
-             AND "payoutMode" <> 'window'"#,
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| EngineError::Db(DbError::from(e)))?;
-
-    let mut out = Vec::new();
-    for (id, preset, tz, interval) in rows {
-        let interval_u32 = interval.and_then(|i| u32::try_from(i).ok());
-        match ResetSchedule::from_row_fields(id, preset.as_deref(), tz.as_deref(), interval_u32) {
-            Ok(Some(sched)) => out.push(sched),
-            Ok(None) => {} // silently-no-op: missing fields
-            Err(e) => {
-                warn!(group_id = %id, error = %e, "group reset schedule parse failed; skipping cron");
-            }
-        }
-    }
-    Ok(out)
-}
-
-// Background tasks exit on cancel; `shutdown` does not join them, so a
-// shutdown time-out is the caller's concern.
-const _SHUTDOWN_HOOK_DOC: Duration = Duration::from_secs(0);
 
 #[cfg(test)]
 mod tests {

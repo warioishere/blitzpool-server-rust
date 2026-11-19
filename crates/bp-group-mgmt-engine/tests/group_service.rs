@@ -53,7 +53,6 @@ struct TestHooksState {
     last_active: Option<i64>,
     member_removed: Vec<(Uuid, String, Vec<String>)>,
     group_dissolved: Vec<Uuid>,
-    round_reset_applied: Vec<Uuid>,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -72,7 +71,6 @@ impl TestHooks {
             last_active: g.last_active,
             member_removed: g.member_removed.clone(),
             group_dissolved: g.group_dissolved.clone(),
-            round_reset_applied: g.round_reset_applied.clone(),
         }
     }
 }
@@ -91,9 +89,6 @@ impl GroupServiceHooks for TestHooks {
     }
     async fn on_group_dissolved(&self, group_id: Uuid) {
         self.0.lock().unwrap().group_dissolved.push(group_id);
-    }
-    async fn apply_round_reset_config(&self, group: &bp_db::PplnsGroupRow) {
-        self.0.lock().unwrap().round_reset_applied.push(group.id);
     }
 }
 
@@ -665,7 +660,7 @@ async fn transfer_creator_rejects_non_member() {
 // ─── update_round_reset_config ───────────────────────────────────────────
 
 #[tokio::test]
-async fn update_round_reset_config_applies_and_fires_hook() {
+async fn update_round_reset_config_persists_the_settings() {
     let pool = match connect_or_skip().await {
         Some(p) => p,
         None => return,
@@ -702,8 +697,6 @@ async fn update_round_reset_config_applies_and_fires_hook() {
     assert_eq!(row.round_reset_timezone.as_deref(), Some("Europe/Berlin"));
     assert_eq!(row.finder_bonus_ppm, Some(160_000));
     assert!(row.is_public);
-    let snap = hooks.snapshot();
-    assert_eq!(snap.round_reset_applied, vec![g.group.id]);
     cleanup_group(&pool, g.group.id).await;
 }
 
