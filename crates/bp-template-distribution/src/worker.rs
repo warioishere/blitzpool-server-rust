@@ -5,7 +5,9 @@
 //! channels and the TDP's `async_channel`s; one `CancellationToken` stops the TDP
 //! and both bridges when the `TdpHandle` is dropped.
 
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use async_channel::{Receiver as AcReceiver, Sender as AcSender};
 use bitcoin_core_sv2::runtime_api::template_distribution_protocol as tdp_runtime;
@@ -71,7 +73,10 @@ fn run_thread(
 ) {
     let socket_path: PathBuf = config.socket_path.clone();
     let bitcoin_core_version = config.bitcoin_core_version;
-    let coinbase_constraints = config.coinbase_constraints;
+    // The reservation in force: seeded from config, replaced by every
+    // `SetCoinbaseConstraints`, and the one each (re)connect advertises, so a
+    // bitcoind restart keeps a raised reservation. Single-threaded worker.
+    let coinbase_constraints = Rc::new(Cell::new(config.coinbase_constraints));
     let fee_threshold = config.fee_threshold;
     let min_interval = config.min_interval_secs;
     let reconnect_backoff = config.reconnect_backoff;
@@ -155,7 +160,9 @@ fn run_thread(
 
             // The TDP distributes no templates before it has seen
             // CoinbaseOutputConstraints, so every connection gets them.
-            if let Err(e) = send_coinbase_constraints(&into_tdp_tx, coinbase_constraints).await {
+            if let Err(e) =
+                send_coinbase_constraints(&into_tdp_tx, coinbase_constraints.get()).await
+            {
                 if let Some(tx) = ready_tx.take() {
                     let _ = tx.send(Err(format!(
                         "failed to send initial CoinbaseOutputConstraints: {e}"
@@ -179,7 +186,12 @@ fn run_thread(
             let bridge_in_handle = {
                 let conn_cancel = conn_cancel.clone();
                 let into_tdp_tx = into_tdp_tx.clone();
-                tokio::task::spawn_local(bridge_in(submit_rx, into_tdp_tx, conn_cancel))
+                tokio::task::spawn_local(bridge_in(
+                    submit_rx,
+                    into_tdp_tx,
+                    conn_cancel,
+                    coinbase_constraints.clone(),
+                ))
             };
 
             if let Some(tx) = ready_tx.take() {
@@ -230,11 +242,17 @@ async fn send_coinbase_constraints(
     into_tdp_tx: &AcSender<TemplateDistributionOwned>,
     constraints: TdpCoinbaseConstraints,
 ) -> Result<(), String> {
-    let msg = TemplateDistributionOwned::CoinbaseOutputConstraints(CoinbaseOutputConstraints {
+    into_tdp_tx
+        .send(constraints_message(constraints))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+fn constraints_message(constraints: TdpCoinbaseConstraints) -> TemplateDistributionOwned {
+    TemplateDistributionOwned::CoinbaseOutputConstraints(CoinbaseOutputConstraints {
         coinbase_output_max_additional_size: constraints.max_additional_size,
         coinbase_output_max_additional_sigops: constraints.max_additional_sigops,
-    });
-    into_tdp_tx.send(msg).await.map_err(|e| e.to_string())
+    })
 }
 
 async fn bridge_out(
@@ -267,11 +285,13 @@ async fn bridge_out(
 }
 
 /// Forwards pool requests for one connection, then returns `submit_rx` so the
-/// pool-side sender stays valid across reconnects.
+/// pool-side sender stays valid across reconnects. A new reservation is kept
+/// in `in_force` for the next connection to advertise.
 async fn bridge_in(
     mut submit_rx: mpsc::Receiver<TdpRequest>,
     into_tdp_tx: AcSender<TemplateDistributionOwned>,
     cancel: CancellationToken,
+    in_force: Rc<Cell<TdpCoinbaseConstraints>>,
 ) -> mpsc::Receiver<TdpRequest> {
     loop {
         tokio::select! {
@@ -285,12 +305,14 @@ async fn bridge_in(
                         TdpRequest::SetCoinbaseConstraints {
                             max_additional_size,
                             max_additional_sigops,
-                        } => TemplateDistributionOwned::CoinbaseOutputConstraints(
-                            CoinbaseOutputConstraints {
-                                coinbase_output_max_additional_size: max_additional_size,
-                                coinbase_output_max_additional_sigops: max_additional_sigops,
-                            },
-                        ),
+                        } => {
+                            let constraints = TdpCoinbaseConstraints {
+                                max_additional_size,
+                                max_additional_sigops,
+                            };
+                            in_force.set(constraints);
+                            constraints_message(constraints)
+                        }
                         TdpRequest::RequestTransactionData { template_id } => {
                             TemplateDistributionOwned::RequestTransactionData(
                                 RequestTransactionData { template_id },
@@ -401,6 +423,49 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(1),
             "must wake on cancel, not wait the full backoff"
         );
+    }
+
+    /// A reservation set at runtime is the one the next connection
+    /// advertises, not the boot value.
+    #[tokio::test]
+    async fn a_runtime_reservation_is_kept_for_the_next_connection() {
+        let boot = TdpCoinbaseConstraints {
+            max_additional_size: 100,
+            max_additional_sigops: 0,
+        };
+        let in_force = Rc::new(Cell::new(boot));
+        let (submit_tx, submit_rx) = mpsc::channel(4);
+        let (into_tdp_tx, into_tdp_rx) = async_channel::unbounded();
+        let cancel = CancellationToken::new();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let bridge = tokio::task::spawn_local(bridge_in(
+                    submit_rx,
+                    into_tdp_tx,
+                    cancel.clone(),
+                    in_force.clone(),
+                ));
+                submit_tx
+                    .send(TdpRequest::SetCoinbaseConstraints {
+                        max_additional_size: 9_000,
+                        max_additional_sigops: 4,
+                    })
+                    .await
+                    .unwrap();
+                let forwarded = into_tdp_rx.recv().await.expect("forwarded to the TDP");
+                assert!(matches!(
+                    forwarded,
+                    TemplateDistributionOwned::CoinbaseOutputConstraints(c)
+                        if c.coinbase_output_max_additional_size == 9_000
+                ));
+                cancel.cancel();
+                bridge.await.unwrap();
+            })
+            .await;
+        let kept = in_force.get();
+        assert_eq!(kept.max_additional_size, 9_000, "not the boot value");
+        assert_eq!(kept.max_additional_sigops, 4);
     }
 
     #[test]

@@ -394,8 +394,8 @@ mod tests {
 #[derive(Debug, Clone)]
 pub enum TdpRequest {
     /// Re-advertise coinbase output constraints (size + sigops). The TDP
-    /// worker sends a default `CoinbaseOutputConstraints` at startup from
-    /// the config; this variant lets the pool change it later.
+    /// worker starts from the config's value; this variant changes it, and
+    /// the worker advertises the latest one on every (re)connect.
     SetCoinbaseConstraints {
         max_additional_size: u32,
         max_additional_sigops: u16,
