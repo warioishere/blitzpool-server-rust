@@ -3,7 +3,7 @@
 //! `BlockpartyService`: group lifecycle, token-gated mutations, routing cache.
 //! Invariant: every change to a party's `status` must also call
 //! [`BlockpartyCache::set_admin_status`], or routing drifts from the DB and
-//! pays a confirmed party's block to the pool fee (or skips its coinbase).
+//! refuses a confirmed party's admin (or skips its coinbase).
 
 use std::sync::Arc;
 
@@ -50,13 +50,6 @@ pub struct MarkMemberConfirmedResult {
     /// `Some` only when this confirmation minted a fresh token; a re-confirm
     /// with the existing token returns `None`.
     pub member_token: Option<String>,
-}
-
-/// The address that receives the WHOLE block reward when the admin of an
-/// unconfirmed party mines on the Solo fallback.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingPartyFeeRoute {
-    pub fee_address: AddressId,
 }
 
 // ─── Service struct ────────────────────────────────────────────────
@@ -144,15 +137,10 @@ impl BlockpartyService {
         self.cache.routable_group_id_for_admin(address).await
     }
 
-    /// `Some` when the admin's party is draft/confirming and a fee address
-    /// is configured; `None` means the plain Solo coinbase.
-    pub async fn pending_party_fee_route(
-        &self,
-        address: &AddressId,
-    ) -> Option<PendingPartyFeeRoute> {
-        let _gid = self.cache.pending_fee_route_admin(address).await?;
-        let fee_address = self.payouts.config.fee_address.clone()?;
-        Some(PendingPartyFeeRoute { fee_address })
+    /// `Some` when `address` administers a draft or confirming party: it
+    /// gets no work until every member has confirmed the splits.
+    pub async fn unready_group_id_for_admin(&self, address: &AddressId) -> Option<Uuid> {
+        self.cache.unready_group_id_for_admin(address).await
     }
 
     /// Group id of the non-dissolved party `address` is a member of.
@@ -305,6 +293,9 @@ impl BlockpartyService {
         self.cache
             .set_admin_status(&admin_addr, id, BlockpartyStatus::Draft)
             .await;
+        // The front closes the admin's live connections at once: a Draft
+        // party's admin gets no work.
+        self.notify_changed().await;
 
         Ok(BlockpartyCreateResult {
             group,

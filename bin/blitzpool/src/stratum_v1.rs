@@ -11,18 +11,16 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use bp_common::{AddressId, MiningMode};
 use bp_config::AppConfig;
-use bp_group_mgmt_engine::GroupService;
 use bp_mining_mode::MiningModeResult;
 use bp_share_hook::SharedSessionPersistence;
 use bp_stratum_v1::{PortConfig, ServerConfig, ServerHooks, SharedExtranonce, StratumV1Server};
 use thiserror::Error;
 use tracing::warn;
-use uuid::Uuid;
 
 use crate::block_sink::TdpBlockSubmissionSink;
 use crate::boot::FoundationHandles;
 use crate::engines::{BlitzpoolModeGate, EngineHandles};
-use crate::membership::Membership;
+use crate::membership::{membership_mode, BlockpartyAdminLookup, GroupLookup, Membership};
 
 /// Per-port SV1 server, one per enabled `[stratum]`/`[pplns]` port.
 /// [`crate::stratum::spawn`] binds one listener per port and dispatches on
@@ -229,52 +227,8 @@ fn build_port_hooks(
         ),
         payout_resolver,
         device_status_sink,
-    }
-}
-
-// ─── GroupLookup trait (group_id resolution) ──────────────────────
-
-/// Address → active-group-id lookup, a trait so unit tests need no
-/// `PgPool`.
-#[async_trait]
-pub(crate) trait GroupLookup: Send + Sync {
-    /// Cache-only lookup. Returns `Some(group_id)` only when the
-    /// address is in an **active** group; inactive groups + missing
-    /// addresses both yield `None`.
-    async fn group_for_address(&self, address: &AddressId) -> Option<Uuid>;
-}
-
-#[async_trait]
-impl GroupLookup for GroupService {
-    async fn group_for_address(&self, address: &AddressId) -> Option<Uuid> {
-        self.get_group_for_address(address)
-            .await
-            .filter(|e| e.active)
-            .map(|e| e.group_id)
-    }
-}
-
-// ─── BlockpartyAdminLookup trait (admin → routable-party-id) ───────
-
-/// Narrow admin lookup over `BlockpartyService`, like [`GroupLookup`]: "is this
-/// address the admin of a **routable** (Ready/Active) Blockparty?". Only
-/// the admin hashes in Blockparty; members are payout recipients, so the
-/// mode resolves admin-keyed.
-#[async_trait]
-pub(crate) trait BlockpartyAdminLookup: Send + Sync {
-    /// `Some(group_id)` only when `address` is the admin of a Ready/Active
-    /// party (see `BlockpartyStatus::is_routable`); `None` otherwise.
-    async fn routable_group_id_for_admin(&self, address: &AddressId) -> Option<Uuid>;
-}
-
-/// Adapter wrapping the production `Arc<BlockpartyService>` into the narrow
-/// [`BlockpartyAdminLookup`] surface.
-pub(crate) struct BlockpartyServiceAdminLookup(pub Arc<bp_blockparty_engine::BlockpartyService>);
-
-#[async_trait]
-impl BlockpartyAdminLookup for BlockpartyServiceAdminLookup {
-    async fn routable_group_id_for_admin(&self, address: &AddressId) -> Option<Uuid> {
-        self.0.routable_group_id_for_admin(address).await
+        admission: membership.admission(),
+        session_kicks: membership.session_kicks.clone(),
     }
 }
 
@@ -308,7 +262,7 @@ impl ModeGatePopulatingPersistence {
         let group_lookup: Arc<dyn GroupLookup> = membership.group.service.clone();
         let blockparty: Option<Arc<dyn BlockpartyAdminLookup>> = membership
             .blockparty_service()
-            .map(|bp| Arc::new(BlockpartyServiceAdminLookup(bp)) as Arc<dyn BlockpartyAdminLookup>);
+            .map(|bp| bp as Arc<dyn BlockpartyAdminLookup>);
         Arc::new(Self::new(
             port_payout_mode,
             engines.mode_gate.clone(),
@@ -344,20 +298,9 @@ impl ModeGatePopulatingPersistence {
             // port mode rather than panic.
             Err(_) => return mode_from_port(self.port_payout_mode),
         };
-        // Group-Solo membership wins (active group only).
-        if let Some(group_id) = self.group_lookup.group_for_address(&address_id).await {
-            return MiningModeResult::GroupSolo(group_id);
-        }
-        // Blockparty: the connecting address is the admin of a routable
-        // (Ready/Active) party. Only the admin hashes; the coinbase splits
-        // to the members. Resolved admin-keyed, independent of the port.
-        if let Some(bp) = self.blockparty.as_ref() {
-            if let Some(group_id) = bp.routable_group_id_for_admin(&address_id).await {
-                return MiningModeResult::Blockparty(group_id);
-            }
-        }
-        // Otherwise the port's payout mode (Solo / Pplns).
-        mode_from_port(self.port_payout_mode)
+        membership_mode(&*self.group_lookup, self.blockparty.as_deref(), &address_id)
+            .await
+            .unwrap_or_else(|| mode_from_port(self.port_payout_mode))
     }
 }
 
@@ -416,6 +359,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex as StdMutex;
     use tokio::sync::Mutex as AsyncMutex;
+    use uuid::Uuid;
 
     fn min_cfg(pplns: Option<PplnsConfig>) -> AppConfig {
         AppConfig {

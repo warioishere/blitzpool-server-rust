@@ -260,6 +260,8 @@ fn build_port_hooks(
         device_status_sink,
         custom_extranonce,
         chain_tip_time,
+        admission: membership.admission(),
+        session_kicks: membership.session_kicks.clone(),
     }
 }
 

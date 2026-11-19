@@ -34,9 +34,9 @@ impl BlockpartyStatus {
         matches!(self, Self::Ready | Self::Active)
     }
 
-    /// The admin's blocks pay 100 % to the pool fee, so the admin cannot
-    /// pocket the reward via solo before all members confirm the split.
-    pub const fn is_pending_fee_route(self) -> bool {
+    /// The admin gets no work at all until every member has confirmed the
+    /// splits, so the admin cannot mine the party's address as a Solo miner.
+    pub const fn refuses_work(self) -> bool {
         matches!(self, Self::Draft | Self::Confirming)
     }
 
@@ -93,12 +93,12 @@ mod tests {
     }
 
     #[test]
-    fn pending_fee_only_draft_confirming() {
-        assert!(BlockpartyStatus::Draft.is_pending_fee_route());
-        assert!(BlockpartyStatus::Confirming.is_pending_fee_route());
-        assert!(!BlockpartyStatus::Ready.is_pending_fee_route());
-        assert!(!BlockpartyStatus::Active.is_pending_fee_route());
-        assert!(!BlockpartyStatus::Dissolved.is_pending_fee_route());
+    fn only_draft_and_confirming_refuse_work() {
+        assert!(BlockpartyStatus::Draft.refuses_work());
+        assert!(BlockpartyStatus::Confirming.refuses_work());
+        assert!(!BlockpartyStatus::Ready.refuses_work());
+        assert!(!BlockpartyStatus::Active.refuses_work());
+        assert!(!BlockpartyStatus::Dissolved.refuses_work());
     }
 
     #[test]

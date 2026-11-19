@@ -10,9 +10,10 @@ use std::sync::Arc;
 use bp_common::{AddressId, StreamKind};
 use bp_mining_job::{PayoutEntry, ResolvedPayouts};
 use bp_share_hook::{
-    DeviceStatusSink, NoOpSink, SharedAcceptedShareSink, SharedRejectedShareSink,
+    DeviceStatusSink, MinerAdmission, NoOpSink, SharedAcceptedShareSink, SharedRejectedShareSink,
     SharedSessionPersistence,
 };
+use tokio::sync::broadcast;
 
 use crate::mining::submit::ShareAccept;
 
@@ -91,6 +92,11 @@ pub struct MiningServerHooks {
     pub device_status_sink: Arc<dyn DeviceStatusSink>,
     pub custom_extranonce: Arc<dyn CustomExtranonceSource>,
     pub chain_tip_time: Arc<dyn ChainTipTime>,
+    /// Refuses an address before any of its channels' sessions is registered.
+    pub admission: Arc<dyn MinerAdmission>,
+    /// Addresses whose mode changed; a connection mining for one closes, so
+    /// its mode and template stream are resolved afresh on reconnect.
+    pub session_kicks: broadcast::Sender<String>,
 }
 
 impl MiningServerHooks {
@@ -104,9 +110,11 @@ impl MiningServerHooks {
             accepted_sink: shared.clone(),
             rejected_sink: shared.clone(),
             session_persistence: shared.clone(),
-            device_status_sink: shared,
+            device_status_sink: shared.clone(),
             custom_extranonce: no_op.clone(),
             chain_tip_time: no_op,
+            admission: shared,
+            session_kicks: broadcast::channel(1).0,
         }
     }
 }
@@ -228,6 +236,8 @@ pub mod test_support {
                 device_status_sink: arc,
                 custom_extranonce: Arc::new(NoOpHooks),
                 chain_tip_time: Arc::new(NoOpHooks),
+                admission: Arc::new(NoOpSink),
+                session_kicks: broadcast::channel(1).0,
             }
         }
     }

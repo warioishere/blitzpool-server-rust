@@ -466,6 +466,7 @@ async fn main() -> ExitCode {
             group,
             blockparty,
             coinbase_tags,
+            session_kicks: tokio::sync::broadcast::channel(membership::SESSION_KICKS_CAPACITY).0,
         })
     } else {
         None
@@ -818,9 +819,7 @@ async fn main() -> ExitCode {
             let cache_conn = handles.dedicated_redis(&cfg.redis, "cache-sync").await;
             Some(crate::cache_sync::spawn(
                 cache_conn,
-                m.group.clone(),
-                m.blockparty_service(),
-                m.coinbase_tags.clone(),
+                m,
                 handles.db.pool().clone(),
                 engines.mode_gate.clone(),
                 settle_signal.registry_slot(),
@@ -887,6 +886,10 @@ async fn main() -> ExitCode {
                         dispatcher.clone(),
                         settle_signal.clone(),
                     ));
+                let jdp_admission = membership
+                    .as_ref()
+                    .expect("the front builds membership")
+                    .admission();
                 let jdp = match jdp::spawn(
                     &cfg,
                     jdp_bridge,
@@ -896,6 +899,7 @@ async fn main() -> ExitCode {
                     jdp_ledger_booker,
                     handles.redis.clone(),
                     settle_signal.clone(),
+                    jdp_admission,
                 )
                 .await
                 {

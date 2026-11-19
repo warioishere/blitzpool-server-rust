@@ -44,6 +44,7 @@ pub(crate) fn build_jdp_hooks(
     distribution_source: Arc<dyn PayoutDistributionSource>,
     settle: crate::settlement::SettlementSignal,
     job_validator: Option<Arc<dyn DeclaredJobValidator>>,
+    admission: Arc<dyn bp_share_hook::MinerAdmission>,
 ) -> JdpServerHooks {
     let block_sink: Arc<dyn JdpFoundBlockSink> = Arc::new(ProductionJdpBlockSink {
         booker: ledger_booker,
@@ -57,6 +58,7 @@ pub(crate) fn build_jdp_hooks(
             payout_resolver: payout_resolver as Arc<dyn bp_stratum_v2::hooks::PayoutResolver>,
             chain: Arc::new(tdp.clone()),
             network,
+            admission,
         }),
         template_tx_provider: Arc::new(TdpTemplateTxProvider {
             cache: template_tx_cache,
@@ -78,6 +80,7 @@ pub(crate) struct ProductionJdpAllocateResolver {
     payout_resolver: Arc<dyn bp_stratum_v2::hooks::PayoutResolver>,
     chain: Arc<dyn ChainView>,
     network: BitcoinNetwork,
+    admission: Arc<dyn bp_share_hook::MinerAdmission>,
 }
 
 #[async_trait]
@@ -90,6 +93,20 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
         let Some(miner_address) = parse_user_identifier_as_address(user_identifier) else {
             return AllocateOutcome::Ignored;
         };
+
+        // Before either protocol: an address the Stratum ports refuse gets no
+        // token either (e.g. the admin of a Blockparty that is not Ready,
+        // which still resolves as Solo).
+        if let Some(refusal) = self.admission.refusal(miner_address.as_str()).await {
+            warn!(
+                user_identifier,
+                reason = refusal.code(),
+                "JDP allocate: address refused"
+            );
+            return AllocateOutcome::Refused {
+                reason: refusal.message(),
+            };
+        }
 
         // ext 0x0003/Negotiation: `coinbase_tx_outputs` must be empty.
         if payout_distribution_negotiated {
@@ -131,8 +148,8 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
             };
         }
 
-        // Gate 2: the payout must be exactly this miner (e.g. a DRAFT
-        // Blockparty admin is Solo but routed to the pool fee address).
+        // Gate 2: the payout must be exactly this miner, the one shape the
+        // base protocol's single designated output can enforce.
         let Some(reward_sats) = self.chain.reference_revenue() else {
             warn!(
                 user_identifier,
@@ -167,7 +184,9 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
             }
             // Only checkable shape: shorting the output shorts the miner itself.
             [only] if only.address == miner_address.as_str() => only.address.clone(),
-            // Another payee: only "script paid" is checkable, so 1 sat would pass.
+            // Another payee: a second connection of this address registered it
+            // on a PPLNS port after Gate 1 read the gate. Only "script paid" is
+            // checkable, so 1 sat would pass.
             [only] => {
                 warn!(
                     user_identifier,
@@ -1363,6 +1382,7 @@ mod base_allocate_tests {
                 payout_resolver: payouts.clone(),
                 chain: Arc::new(TemplateAt(revenue)),
                 network: BitcoinNetwork::Regtest,
+                admission: Arc::new(bp_share_hook::NoOpSink),
             },
             payouts,
         )
@@ -1394,6 +1414,39 @@ mod base_allocate_tests {
         outputs[0].script_pubkey.clone()
     }
 
+    /// Refuses every address, as admission does for an unready party's admin.
+    struct RefuseAll;
+    #[async_trait::async_trait]
+    impl bp_share_hook::MinerAdmission for RefuseAll {
+        async fn refusal(&self, _: &str) -> Option<bp_share_hook::AdmissionRefusal> {
+            Some(bp_share_hook::AdmissionRefusal::BlockpartyNotReady)
+        }
+    }
+
+    /// An address admission refuses gets no token in either protocol, even
+    /// when it resolves as Solo and its payout is exactly itself.
+    #[tokio::test]
+    async fn an_unadmitted_address_gets_no_token_in_either_protocol() {
+        for negotiated in [false, true] {
+            let mut resolver = pays(&[(MINER, 312_500_000)]);
+            assert!(
+                matches!(
+                    resolver.resolve_allocate_context(MINER, negotiated).await,
+                    AllocateOutcome::Granted(_)
+                ),
+                "precondition: admitted, it gets a token (negotiated={negotiated})"
+            );
+            resolver.admission = Arc::new(RefuseAll);
+            assert!(
+                matches!(
+                    resolver.resolve_allocate_context(MINER, negotiated).await,
+                    AllocateOutcome::Refused { .. }
+                ),
+                "negotiated={negotiated}"
+            );
+        }
+    }
+
     /// One payee, the miner: designated at 0 sats.
     #[tokio::test]
     async fn a_single_payee_is_designated_at_zero_sats() {
@@ -1409,9 +1462,10 @@ mod base_allocate_tests {
         );
     }
 
-    /// MONEY: a block routed AWAY from the miner (e.g. a DRAFT Blockparty
-    /// admin) is refused: the designated output is only checked as paid, so
-    /// the JDC could pay it 1 sat and keep the block.
+    /// MONEY: a block routed AWAY from the miner (its address moved to a PPLNS
+    /// port by another connection after Gate 1) is refused: the designated
+    /// output is only checked as paid, so the JDC could pay it 1 sat and keep
+    /// the block.
     #[tokio::test]
     async fn a_block_routed_away_from_the_miner_is_refused_on_the_base_protocol() {
         let outcome = pays(&[(OTHER, 312_500_000)])
@@ -1419,8 +1473,8 @@ mod base_allocate_tests {
             .await;
         assert!(
             matches!(outcome, AllocateOutcome::Refused { .. }),
-            "a pending-party route must refuse the token, not designate a script the JDC \
-             can satisfy with 1 sat"
+            "a payout routed away from the miner must refuse the token, not designate a \
+             script the JDC can satisfy with 1 sat"
         );
     }
 
@@ -1630,8 +1684,8 @@ mod base_allocate_tests {
         );
     }
 
-    /// A Solo stream routed away from the miner (DRAFT Blockparty) still
-    /// reaches and fails the payout-list guard.
+    /// A payout routed away from the miner after Gate 1 passed it as Solo
+    /// still reaches and fails the payout-list guard.
     #[tokio::test]
     async fn a_solo_stream_routed_away_from_the_miner_is_still_refused() {
         let (resolver, payouts) = resolver_on(
@@ -1642,7 +1696,7 @@ mod base_allocate_tests {
         let outcome = resolver.resolve_allocate_context(MINER, false).await;
         assert!(
             matches!(outcome, AllocateOutcome::Refused { .. }),
-            "the pending-party route must still be caught by the payout list"
+            "a payout routed away from the miner must still be caught by the payout list"
         );
         assert_eq!(
             payouts.asked_at.lock().unwrap().len(),

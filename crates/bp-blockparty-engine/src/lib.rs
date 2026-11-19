@@ -17,5 +17,4 @@ pub use hooks::{BlockpartyHooks, NoopHooks};
 pub use payouts::{BlockpartyPayoutConfig, BlockpartyPayouts};
 pub use service::{
     BlockpartyCreateResult, BlockpartyService, CoinbaseReservation, MarkMemberConfirmedResult,
-    PendingPartyFeeRoute,
 };

@@ -40,8 +40,7 @@ pub(crate) struct ProductionPayoutResolver {
     pplns: Option<PplnsEngine>,
     group_solo: Option<GroupSoloEngine>,
     solo_fee: SoloFeeConfig,
-    /// When `None`, the Blockparty arm serves no job and the pending-fee guard
-    /// falls through to Solo.
+    /// When `None`, the Blockparty arm serves no job.
     blockparty: Option<Arc<BlockpartyService>>,
     /// Team and Blockparty coinbase tags; `None` adds none.
     coinbase_tags: Option<Arc<crate::coinbase_tags::CoinbaseTagCache>>,
@@ -74,22 +73,14 @@ impl ProductionPayoutResolver {
     /// Resolution core for SV1 and SV2.
     async fn resolve_internal(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts {
         match self.mode_gate.lookup_mode(miner_address) {
-            MiningModeResult::Solo => {
-                // An admin of an unconfirmed Blockparty routes as Solo but
-                // the coinbase pays the pool-fee address, so the admin cannot
-                // take the whole reward before members confirm the splits.
-                if let Some(route) = self
-                    .blockparty_pending_fee_route(miner_address, reward_sats)
-                    .await
-                {
-                    return ResolvedPayouts::unsnapshotted(route);
-                }
-                ResolvedPayouts::unsnapshotted(solo_payouts(
-                    miner_address,
-                    &self.solo_fee,
-                    reward_sats,
-                ))
-            }
+            // An admin of an unready Blockparty is refused at session start
+            // and kicked when it creates the party; until that kick lands, its
+            // connection mines Solo.
+            MiningModeResult::Solo => ResolvedPayouts::unsnapshotted(solo_payouts(
+                miner_address,
+                &self.solo_fee,
+                reward_sats,
+            )),
             MiningModeResult::Pplns => self.pplns_payouts(miner_address, reward_sats).await,
             // A Team or Blockparty mines its own coinbase, so it may tag it;
             // Solo and the pool-wide PPLNS coinbase carry the pool's alone.
@@ -335,19 +326,6 @@ impl ProductionPayoutResolver {
         }
     }
 
-    /// The whole reward to the pool fee when the address administers an
-    /// unconfirmed Blockparty; `None` falls through to the Solo coinbase.
-    async fn blockparty_pending_fee_route(
-        &self,
-        miner_address: &str,
-        reward_sats: u64,
-    ) -> Option<Vec<PayoutEntry>> {
-        let svc = self.blockparty.as_ref()?;
-        let addr = AddressId::new(miner_address.to_string()).ok()?;
-        let route = svc.pending_party_fee_route(&addr).await?;
-        Some(pending_fee_route_payouts(route, reward_sats))
-    }
-
     async fn group_solo_payouts(
         &self,
         miner_address: &str,
@@ -407,8 +385,8 @@ impl bp_stratum_v1::PayoutResolver for ProductionPayoutResolver {
     }
 
     fn resolve_stream(&self, miner_address: &str) -> bp_common::StreamKind {
-        // Same lookup as payout resolution, so a pending Blockparty admin
-        // routes to the Solo stream.
+        // Same gate lookup as payout resolution, so the template stream and
+        // the payout always name one mode.
         bp_common::StreamKind::for_mode(self.mode_gate.lookup_mode(miner_address).mode())
     }
 }
@@ -686,18 +664,6 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────
-
-/// The pending-fee route's coinbase: one output, the whole reward to the
-/// pool-fee address.
-fn pending_fee_route_payouts(
-    route: bp_blockparty_engine::PendingPartyFeeRoute,
-    reward_sats: u64,
-) -> Vec<PayoutEntry> {
-    vec![PayoutEntry {
-        address: route.fee_address.into_inner(),
-        sats: reward_sats,
-    }]
-}
 
 /// Engine entries as coinbase `PayoutEntry`s, carrying the exact sats the
 /// distributor computed; the coinbase builder never re-derives them from a percentage.
@@ -984,31 +950,6 @@ mod tests {
         assert_eq!(r.len(), 1, "no zero-value dev output");
         assert_eq!(r[0].address, "bc1qminer");
         assert_eq!(r[0].sats, TEST_REWARD);
-    }
-
-    /// The pending-fee route pays what the 100 % formula pays, for every
-    /// subsidy era plus fees up to the whole money supply.
-    #[test]
-    fn pending_fee_route_pays_what_the_percent_formula_paid() {
-        let fee = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
-        let mut rewards = vec![0u64, 1, 546, 2_100_000_000_000_000];
-        for era in 0..34u32 {
-            let subsidy = 5_000_000_000u64 >> era;
-            rewards.extend([subsidy, subsidy + 1, subsidy + 12_345_678]);
-        }
-        for reward in rewards {
-            let route = bp_blockparty_engine::PendingPartyFeeRoute {
-                fee_address: AddressId::new(fee.to_string()).unwrap(),
-            };
-            let paid = pending_fee_route_payouts(route, reward);
-            assert_eq!(paid.len(), 1);
-            assert_eq!(paid[0].address, fee);
-            assert_eq!(
-                paid[0].sats,
-                PayoutEntry::from_percent(fee, 100.0, reward).sats,
-                "reward {reward}"
-            );
-        }
     }
 
     const BP_ADMIN: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";

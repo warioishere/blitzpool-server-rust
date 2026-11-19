@@ -47,7 +47,7 @@ Sliding-window pooled mining with a **multi-output coinbase** and a **signed cre
 Friends mine together as a team; every block the team finds is split among the members in the coinbase. Each team picks its payout mode at creation, and it never changes: **Prop** splits by each member's shares in the current round (resetting the round after every block is opt-in), **Window** by the shares of the last N days. An optional finder bonus goes to the member who found the block. Members join through an invite link (with optional admin approval) or by request from the public team directory, after proving their address by email or by signature; the admin manages the team with an admin token. Configured as `[group_solo]`.
 
 ### 🎉 Blockparty
-A directed group sharing a hashpower rental. Each member gets a **fixed cut** (basis points) of every block the rented hashrate finds, paid on-chain. Every member confirms the split before the party goes live; trimmed/residual sats fold into the pool-fee output.
+A directed group sharing a hashpower rental. Each member gets a **fixed cut** (basis points) of every block the rented hashrate finds, paid on-chain. Every member confirms the split before the party goes live; until then the pool refuses the admin's address with `blockparty-not-ready`. Trimmed/residual sats fold into the pool-fee output.
 
 ---
 

@@ -90,6 +90,8 @@ pub(crate) async fn spawn(
     redis: redis::aio::ConnectionManager,
     // Created by the caller so the block sinks reach the same registry.
     settle: crate::settlement::SettlementSignal,
+    // The admission the Stratum ports ask, so a token is refused alike.
+    admission: Arc<dyn bp_share_hook::MinerAdmission>,
 ) -> Result<JdpHandles, JdpSpawnError> {
     if !cfg.sv2.jdp_enabled {
         info!("jdp: disabled (sv2.jdp_enabled = false)");
@@ -149,6 +151,7 @@ pub(crate) async fn spawn(
         distribution_source,
         settle.clone(),
         job_validator,
+        admission,
     );
 
     let distribution_interval = Duration::from_secs(

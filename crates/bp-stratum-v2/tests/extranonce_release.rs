@@ -161,6 +161,100 @@ async fn every_channel_session_ends_exactly_once() {
     server.shutdown().await;
 }
 
+/// Refuses every address, as admission does for an unready party's admin.
+struct RefuseAll;
+#[async_trait::async_trait]
+impl bp_share_hook::MinerAdmission for RefuseAll {
+    async fn refusal(&self, _: &str) -> Option<bp_share_hook::AdmissionRefusal> {
+        Some(bp_share_hook::AdmissionRefusal::BlockpartyNotReady)
+    }
+}
+
+/// An address admission refuses gets `OpenMiningChannel.Error` with the
+/// reason, no session, and its extranonce prefix back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unadmitted_address_is_refused_at_channel_open() {
+    let recording = RecordingHooks::new();
+    let mut hooks = recording.clone().into_server_hooks();
+    hooks.admission = Arc::new(RefuseAll);
+    let (server, _updates_tx) = spawn_server_with(sv2_extranonce(), hooks);
+    let (mut reader, mut writer) = connect_and_setup(&server).await;
+
+    let open = AnyMessageOwned::Mining(MiningOwned::OpenExtendedMiningChannel(
+        OpenExtendedMiningChannelOwned {
+            request_id: 7,
+            user_identity: format!("{REGTEST_ADDR}.rig1").try_into().unwrap(),
+            nominal_hash_rate: 5.0e12,
+            max_target: [0xFFu8; 32].into(),
+            min_extranonce_size: 8,
+        },
+    ));
+    write_any_message(&mut writer, open).await;
+    let mut code = None;
+    for _ in 0..16 {
+        match read_any_message(&mut reader).await {
+            AnyMessageOwned::Mining(MiningOwned::OpenMiningChannelError(e)) => {
+                assert_eq!(e.request_id, 7);
+                code = Some(String::from_utf8(e.error_code.as_ref().to_vec()).unwrap());
+                break;
+            }
+            AnyMessageOwned::Mining(MiningOwned::OpenExtendedMiningChannelSuccess(_)) => {
+                panic!("a refused address must not get its channel")
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(code.as_deref(), Some("blockparty-not-ready"));
+    wait_until(Duration::from_secs(5), || {
+        server.allocated_prefix_count() == 0
+    })
+    .await;
+    assert_eq!(server.allocated_prefix_count(), 0, "the prefix comes back");
+    assert!(
+        recording.registered.lock().unwrap().is_empty(),
+        "no session"
+    );
+
+    server.shutdown().await;
+}
+
+/// A kick for another address leaves the connection's sessions alone; a
+/// kick for its own address closes it, which ends its sessions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kick_closes_only_the_connections_of_its_address() {
+    let recording = RecordingHooks::new();
+    let (kicks, _) = tokio::sync::broadcast::channel(8);
+    let mut hooks = recording.clone().into_server_hooks();
+    hooks.session_kicks = kicks.clone();
+    let (server, _updates_tx) = spawn_server_with(sv2_extranonce(), hooks);
+    let (mut reader, mut writer) = connect_and_setup(&server).await;
+    open_channel(&mut reader, &mut writer, 1, "rig1").await;
+    wait_until(Duration::from_secs(5), || {
+        recording.registered.lock().unwrap().len() == 1
+    })
+    .await;
+
+    kicks.send("bcrt1qsomeoneelse".to_string()).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        recording.deregistered.lock().unwrap().is_empty(),
+        "another address's kick must leave this connection alone"
+    );
+
+    kicks.send(REGTEST_ADDR.to_string()).unwrap();
+    wait_until(Duration::from_secs(5), || {
+        recording.deregistered.lock().unwrap().len() == 1
+    })
+    .await;
+    assert_eq!(
+        recording.deregistered.lock().unwrap().len(),
+        1,
+        "its own address's kick closes the connection and ends its session"
+    );
+
+    server.shutdown().await;
+}
+
 /// Spawn a server on `extranonce` with an empty template snapshot. The
 /// template sender is handed back so the caller keeps it alive for the whole
 /// test.

@@ -29,6 +29,7 @@ use crate::client::{
     SessionEvent, SessionState,
 };
 use crate::config::{PortConfig, ServerConfig};
+use crate::frame::{write_error, ERR_UNAUTHORIZED_WORKER};
 use crate::hooks::ServerHooks;
 use crate::jobs::JobRegistry;
 use crate::notify::ActiveSV1Template;
@@ -454,11 +455,34 @@ async fn run_connection(
     vardiff_tick.tick().await;
     let setup_deadline = tokio::time::sleep(bp_common::SESSION_SETUP_DEADLINE);
     tokio::pin!(setup_deadline);
+    let mut session_kicks = hooks.session_kicks.subscribe();
 
     loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
+            kicked = session_kicks.recv() => match kicked {
+                Ok(address) => {
+                    if state
+                        .authorization
+                        .as_ref()
+                        .is_some_and(|auth| auth.address == address)
+                    {
+                        info!(
+                            session_id = %state.session_id_hex,
+                            address,
+                            "sv1: the address's mode changed; closing so it reconnects into it"
+                        );
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    warn!(session_id = %state.session_id_hex, missed, "sv1: missed session kicks");
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    unreachable!("this connection's own hooks hold a kick sender")
+                }
+            },
             _ = &mut setup_deadline, if !state.stratum_initialized => {
                 debug!(
                     session_id = %state.session_id_hex,
@@ -505,7 +529,7 @@ async fn run_connection(
                             );
                         }
                         let now = SystemClock.now_ms();
-                        let outcome = dispatch(
+                        let mut outcome = dispatch(
                             &mut state,
                             &server_config,
                             &port_config,
@@ -518,23 +542,24 @@ async fn run_connection(
                         // first job rides the right template. `state.stream` is set only
                         // on a successful swap, so block submit never targets a stream
                         // whose template_id the job does not carry.
-                        if outcome
-                            .events
-                            .iter()
-                            .any(|e| matches!(e, SessionEvent::Authorized { .. }))
-                        {
+                        let authorized = outcome.events.iter().find_map(|e| match e {
+                            SessionEvent::Authorized { address, worker } => {
+                                Some((address.clone(), worker.clone()))
+                            }
+                            _ => None,
+                        });
+                        if let Some((address, worker)) = authorized {
                             // Register before routing: `resolve_stream` reads the
                             // mode-gate this publishes, and would otherwise default to
                             // Solo. `apply_outcome` must not register again (double
                             // gate refcount).
-                            let authd = state.authorization.as_ref().map(|auth| {
-                                (
-                                    auth.address.clone(),
-                                    auth.worker.clone(),
-                                    state.subscription.as_ref().map(|s| s.user_agent.clone()),
-                                )
-                            });
-                            if let Some((address, worker, user_agent)) = authd {
+                            if let Some(refusal) = hooks.admission.refusal(&address).await {
+                                // No session: the authorize gets the refusal
+                                // instead of its success, and the connection closes.
+                                refuse_authorize(&mut state, &mut outcome, refusal);
+                            } else {
+                                let user_agent =
+                                    state.subscription.as_ref().map(|s| s.user_agent.clone());
                                 hooks
                                     .session_persistence
                                     .register_session(
@@ -894,6 +919,32 @@ pub(crate) async fn process_event<C: bp_vardiff::Clock>(
             false
         }
     }
+}
+
+/// Turn a just-accepted authorize into its admission refusal: the session
+/// is forgotten again, the miner gets `Unauthorized worker` with the reason,
+/// and the connection closes.
+fn refuse_authorize<C: Clock>(
+    state: &mut SessionState<C>,
+    outcome: &mut HandlerOutcome,
+    refusal: bp_share_hook::AdmissionRefusal,
+) {
+    let authorization = state
+        .authorization
+        .take()
+        .expect("an Authorized event follows the authorization it stored");
+    warn!(
+        session_id = %state.session_id_hex,
+        username = %authorization.raw_username,
+        reason = refusal.code(),
+        "sv1 authorize refused"
+    );
+    outcome.outbound_frames = vec![write_error(
+        &authorization.id,
+        ERR_UNAUTHORIZED_WORKER,
+        refusal.message(),
+    )];
+    outcome.events = vec![SessionEvent::Disconnect];
 }
 
 fn trim_trailing_newline(frame: &[u8]) -> std::borrow::Cow<'_, str> {
@@ -1598,6 +1649,167 @@ mod tests {
             "a subscribed session idling past the deadline must stay open"
         );
 
+        server.shutdown().await;
+    }
+
+    const AUTH_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+
+    /// Refuses every address, as admission does for an unready party's admin.
+    struct RefuseAll;
+    #[async_trait::async_trait]
+    impl bp_share_hook::MinerAdmission for RefuseAll {
+        async fn refusal(&self, _: &str) -> Option<bp_share_hook::AdmissionRefusal> {
+            Some(bp_share_hook::AdmissionRefusal::BlockpartyNotReady)
+        }
+    }
+
+    /// One connection on a server with `hooks`, subscribed and authorized for
+    /// `AUTH_ADDR`. Returns the lines read up to the authorize answer.
+    async fn connect_and_authorize(
+        hooks: ServerHooks,
+    ) -> (
+        StratumV1Server,
+        tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+        tokio::net::tcp::OwnedWriteHalf,
+        String,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let (_updates_tx, updates_rx) = broadcast::channel(8);
+        let server = StratumV1Server::spawn(
+            server_cfg(),
+            updates_rx,
+            bp_template_distribution::TemplateSnapshot::default(),
+            Vec::new(),
+            hooks,
+            SharedExtranonce::new(),
+            Arc::new(MiningJobCache::new()),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let s = server.clone();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            s.accept_connection(sock, port_cfg());
+        });
+        let (read, mut write) = TcpStream::connect(addr).await.unwrap().into_split();
+        let mut reader = BufReader::new(read);
+        write
+            .write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"t/1.0\"]}\n")
+            .await
+            .unwrap();
+        write
+            .write_all(
+                format!(
+                    "{{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"{AUTH_ADDR}.rig\",\"x\"]}}\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut answer = String::new();
+        for _ in 0..16 {
+            let mut line = String::new();
+            if reader.read_line(&mut line).await.unwrap() == 0 {
+                break;
+            }
+            if line.contains("\"id\":2") {
+                answer = line;
+                break;
+            }
+        }
+        (server, reader, write, answer)
+    }
+
+    /// An address admission refuses gets `Unauthorized worker` with the
+    /// reason at authorize, no session, and a closed connection.
+    #[tokio::test]
+    async fn an_unadmitted_address_is_refused_at_authorize() {
+        use tokio::io::AsyncBufReadExt;
+        let recording = RecordingHooks::new();
+        let mut hooks = recording.as_server_hooks();
+        hooks.admission = Arc::new(RefuseAll);
+        let (server, mut reader, _write, answer) = connect_and_authorize(hooks).await;
+
+        assert!(
+            answer.contains("24"),
+            "Unauthorized worker code, got {answer}"
+        );
+        assert!(answer.contains("Blockparty not ready"), "got {answer}");
+        let mut rest = String::new();
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_line(&mut rest),
+        )
+        .await;
+        assert!(
+            matches!(closed, Ok(Ok(0))),
+            "the connection closes, got {rest:?}"
+        );
+        assert!(
+            recording.registered.lock().unwrap().is_empty(),
+            "no session"
+        );
+        server.shutdown().await;
+    }
+
+    /// A kick for another address leaves the connection open; a kick for its
+    /// own address closes it.
+    #[tokio::test]
+    async fn a_kick_closes_only_the_connections_of_its_address() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (kicks, _) = broadcast::channel(8);
+        let hooks = ServerHooks {
+            session_kicks: kicks.clone(),
+            ..ServerHooks::no_op()
+        };
+        let (server, mut reader, mut write, answer) = connect_and_authorize(hooks).await;
+        assert!(
+            answer.contains("true"),
+            "precondition: authorized, got {answer}"
+        );
+
+        kicks.send("bcrt1qsomeoneelse".to_string()).unwrap();
+        write
+            .write_all(b"{\"id\":3,\"method\":\"mining.subscribe\",\"params\":[\"t/1.0\"]}\n")
+            .await
+            .unwrap();
+        let mut answered = false;
+        for _ in 0..16 {
+            let mut line = String::new();
+            if reader.read_line(&mut line).await.unwrap() == 0 {
+                break;
+            }
+            if line.contains("\"id\":3") {
+                answered = true;
+                break;
+            }
+        }
+        assert!(
+            answered,
+            "another address's kick must not close this connection"
+        );
+
+        kicks.send(AUTH_ADDR.to_string()).unwrap();
+        let mut closed = false;
+        for _ in 0..16 {
+            let mut line = String::new();
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                reader.read_line(&mut line),
+            )
+            .await
+            {
+                Ok(Ok(0)) => {
+                    closed = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(closed, "its own address's kick closes the connection");
         server.shutdown().await;
     }
 

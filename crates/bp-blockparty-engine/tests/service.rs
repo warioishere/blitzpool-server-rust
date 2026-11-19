@@ -141,9 +141,9 @@ async fn create_group_seeds_draft_and_routing_cache() {
     assert!(res.admin_token.starts_with("GRP-"));
 
     let admin_addr = addr(admin);
-    // Cache: routable=None (Draft), pending-fee=Some (Draft is pending).
+    // Cache: routable=None (Draft), unready=Some (a Draft admin gets no work).
     assert!(svc.routable_group_id_for_admin(&admin_addr).await.is_none());
-    assert!(svc.pending_party_fee_route(&admin_addr).await.is_some());
+    assert!(svc.unready_group_id_for_admin(&admin_addr).await.is_some());
 
     cleanup(&pool, name, admin).await;
 }
@@ -172,9 +172,9 @@ async fn add_member_flips_to_confirming_and_inserts_member_cache() {
     let g = svc.get_group(create.group.id).await.unwrap().unwrap();
     assert_eq!(g.status, "confirming");
 
-    // Admin cache: pending-fee=Some, routable=None.
+    // Admin cache: unready=Some, routable=None.
     let admin_addr = addr(admin);
-    assert!(svc.pending_party_fee_route(&admin_addr).await.is_some());
+    assert!(svc.unready_group_id_for_admin(&admin_addr).await.is_some());
     assert!(svc.routable_group_id_for_admin(&admin_addr).await.is_none());
     // Member cache: bob mapped.
     assert_eq!(svc.member_group_id(&addr(bob)).await, Some(create.group.id));
@@ -466,9 +466,9 @@ async fn mark_member_confirmed_promotes_to_ready_and_unblocks_routing() {
         .await
         .expect("add_member");
 
-    // Pre-confirm: pending-fee guard active.
+    // Pre-confirm: the admin gets no work.
     let admin_addr = addr(admin);
-    assert!(svc.pending_party_fee_route(&admin_addr).await.is_some());
+    assert!(svc.unready_group_id_for_admin(&admin_addr).await.is_some());
 
     // The admin is confirmed at creation, so bob's confirm makes it ready.
     let r = svc
@@ -481,8 +481,8 @@ async fn mark_member_confirmed_promotes_to_ready_and_unblocks_routing() {
     assert_eq!(g.status, "ready");
 
     assert!(
-        svc.pending_party_fee_route(&admin_addr).await.is_none(),
-        "READY cancels pending-fee guard"
+        svc.unready_group_id_for_admin(&admin_addr).await.is_none(),
+        "READY lets the admin mine"
     );
     assert_eq!(
         svc.routable_group_id_for_admin(&admin_addr).await,

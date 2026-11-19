@@ -449,13 +449,13 @@ pub struct MiningSessionState<C: Clock> {
     /// vendor normalises to nothing.
     pub user_agent: Option<String>,
     /// TDP template stream, fixed at OpenChannel so the block-submit handle
-    /// always matches the template the job was built on. A mid-connection mode
-    /// change does NOT move it; see [`Self::accounting_stream`].
+    /// always matches the template the job was built on; see
+    /// [`Self::accounting_stream`].
     pub stream: StreamKind,
-    /// Which accounting the shares enter, re-resolved on every `SetCustomMiningJob`.
-    /// Diverges from [`Self::stream`] after a live mode change or when the alt
-    /// stream is unwired. Every accounting question reads this one; only template
-    /// and submit routing read `stream`.
+    /// Which accounting the shares enter, fixed at OpenChannel like
+    /// [`Self::stream`]. Diverges from it only when the address's alt stream is
+    /// unwired and the connection stays on the PPLNS template. Every accounting
+    /// question reads this one; only template and submit routing read `stream`.
     pub accounting_stream: StreamKind,
     /// The template this connection's stream is on. Pool jobs are built from
     /// it and a custom job is held to its tip. `None` until the stream has
@@ -2207,8 +2207,8 @@ pub fn handle_set_custom_mining_job<C: Clock>(
                     Err(_) => return reject(ERR_INVALID_JOB_PARAM_COINBASE_OUTPUTS),
                 };
             // Judged against the accounting THIS connection's shares enter,
-            // `accounting_stream`: the template stream frozen at OpenChannel
-            // would reject the correct plan after a mode change. The owner
+            // `accounting_stream`: a miner left on the PPLNS template by an
+            // unwired alt stream still has its own mode's plan. The owner
             // check is the one cross-account guard in Coinbase-only mode.
             let entry = match crate::bridge::verify_against_distribution(
                 distribution,

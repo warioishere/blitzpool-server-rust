@@ -35,8 +35,8 @@ use crate::mining::client::{
     handle_close_channel, handle_open_extended_mining_channel, handle_open_standard_mining_channel,
     handle_request_extensions, handle_set_custom_mining_job, handle_setup_connection,
     handle_submit_shares_extended, handle_submit_shares_standard, handle_update_channel,
-    HandlerOutcome, MiningJobInputs, MiningSessionState, OutboundFrame, PortConfig, SessionEvent,
-    ERR_CHANNEL_CAPACITY_EXHAUSTED,
+    CloseChannelInput, HandlerOutcome, MiningJobInputs, MiningSessionState, OutboundFrame,
+    PortConfig, SessionEvent, ERR_CHANNEL_CAPACITY_EXHAUSTED,
 };
 use bp_template_distribution::{
     ActiveTemplate, RefreshPacer, TemplateAssembler, TemplateChange, REFRESH_SPREAD,
@@ -468,11 +468,30 @@ async fn run_mining_connection(
     vardiff_tick.tick().await;
     let setup_deadline = tokio::time::sleep(bp_common::SESSION_SETUP_DEADLINE);
     tokio::pin!(setup_deadline);
+    let mut session_kicks = hooks.session_kicks.subscribe();
 
     loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
+            kicked = session_kicks.recv() => match kicked {
+                Ok(address) => {
+                    if state.address.as_ref().is_some_and(|a| a.as_str() == address) {
+                        info!(
+                            session_id_hex = %session_id_hex,
+                            address,
+                            "sv2: the address's mode changed; closing so it reconnects into it"
+                        );
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    warn!(session_id_hex = %session_id_hex, missed, "sv2: missed session kicks");
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    unreachable!("this connection's own hooks hold a kick sender")
+                }
+            },
             _ = &mut setup_deadline, if !state.setup_complete => {
                 debug!(
                     "sv2 connection {session_id_hex}: no SetupConnection within {:?}; closing",
@@ -545,13 +564,6 @@ async fn run_mining_connection(
                     custom.distribution_id = tlvs
                         .as_deref()
                         .and_then(crate::extensions::parse_distribution_id_tlv);
-                    // Re-resolve accounting per frame: a solo miner joining a
-                    // group flips to Group-Solo without reconnecting. The
-                    // template stream stays as routed at OpenChannel.
-                    if let Some(address) = state.address.clone() {
-                        state.accounting_stream =
-                            hooks.payout_resolver.resolve_stream(&address);
-                    }
                 }
                 // Per-share trace, gated by `share_logs`: it would flood at
                 // production hashrate.
@@ -570,17 +582,18 @@ async fn run_mining_connection(
                 }
                 let is_submit =
                     matches!(inbound, InboundMiningFrame::SubmitSharesExtended(_));
-                // The dispatch consumes the frame; the identity is kept for the
-                // refusal log below.
-                let open_identity = match &inbound {
+                // The dispatch consumes the frame; its request id answers an
+                // admission refusal and its identity goes into the refusal logs.
+                let open_request = match &inbound {
                     InboundMiningFrame::OpenStandardMiningChannel(input) => {
-                        Some(input.user_identity.clone())
+                        Some((input.request_id, input.user_identity.clone()))
                     }
                     InboundMiningFrame::OpenExtendedMiningChannel(input) => {
-                        Some(input.user_identity.clone())
+                        Some((input.request_id, input.user_identity.clone()))
                     }
                     _ => None,
                 };
+                let open_identity = open_request.as_ref().map(|(_, identity)| identity);
                 // The pool-wide extranonce allocator is locked INSIDE the
                 // Open/Close dispatch arms only — the hot submit path never
                 // touches it, so share validation across connections does
@@ -596,12 +609,12 @@ async fn run_mining_connection(
                 // SV2 Overview/SetupConnection.Error: the error is sent "prior
                 // to closing the connection", so the disconnect is read here
                 // and acted on only after the outbound write.
-                let disconnect = outcome.events.iter().find_map(|e| match e {
+                let mut disconnect = outcome.events.iter().find_map(|e| match e {
                     SessionEvent::Disconnect { reason } => Some(reason.clone()),
                     _ => None,
                 });
                 if let (Some(user_identity), Some(error_code)) =
-                    (&open_identity, open_channel_refusal(&outcome.outbound))
+                    (open_identity, open_channel_refusal(&outcome.outbound))
                 {
                     warn!(
                         session_id_hex = %session_id_hex,
@@ -610,12 +623,46 @@ async fn run_mining_connection(
                         "sv2 channel open refused"
                     );
                 }
-                let newly_opened_channel = outcome.events.iter().find_map(|e| match e {
+                let mut newly_opened_channel = outcome.events.iter().find_map(|e| match e {
                     SessionEvent::ChannelOpened {
                         channel_id, kind, ..
                     } => Some((*channel_id, *kind)),
                     _ => None,
                 });
+                // Admission before the session is registered: a refused
+                // address gets its open answered with the refusal, and the
+                // connection closes (its address is locked for every channel).
+                let opened_address = outcome.events.iter().find_map(|e| match e {
+                    SessionEvent::ChannelOpened {
+                        channel_id,
+                        address,
+                        ..
+                    } => Some((*channel_id, address.clone())),
+                    _ => None,
+                });
+                if let Some((opened_id, address)) = opened_address {
+                    if let Some(refusal) = hooks.admission.refusal(address.as_str()).await {
+                        let (request_id, _) = open_request
+                            .as_ref()
+                            .expect("a channel opens only on an open frame");
+                        refuse_open(
+                            &mut state,
+                            &mut outcome,
+                            opened_id,
+                            *request_id,
+                            refusal,
+                            &extranonce,
+                        );
+                        warn!(
+                            session_id_hex = %session_id_hex,
+                            user_identity = ?open_identity,
+                            error_code = refusal.code(),
+                            "sv2 channel open refused"
+                        );
+                        newly_opened_channel = None;
+                        disconnect = Some(refusal.code().to_string());
+                    }
+                }
                 // One-time stream routing at OpenChannel, before the initial
                 // job is built. `state.stream` is set ONLY when the swap
                 // succeeds, so submits never route to a stream whose
@@ -936,6 +983,32 @@ async fn run_mining_connection(
     }
     let _ = writer.shutdown().await;
     Ok(())
+}
+
+/// Answer the just-opened `channel_id` with an admission refusal: the channel
+/// is closed again (prefix released, its session never registered) and the
+/// open `request_id` gets `OpenMiningChannel.Error`.
+fn refuse_open<C: bp_vardiff::Clock>(
+    state: &mut MiningSessionState<C>,
+    outcome: &mut HandlerOutcome,
+    channel_id: u32,
+    request_id: u32,
+    refusal: bp_share_hook::AdmissionRefusal,
+    extranonce: &ConnectionExtranonce,
+) {
+    handle_close_channel(
+        state,
+        &CloseChannelInput {
+            channel_id,
+            reason_code: refusal.code().to_string(),
+        },
+    );
+    extranonce.release(channel_id);
+    outcome.outbound = vec![OutboundFrame::OpenMiningChannelError {
+        request_id,
+        error_code: refusal.code().to_string(),
+    }];
+    outcome.events.clear();
 }
 
 /// The error code of the `OpenMiningChannel.Error` in `outbound`, if the

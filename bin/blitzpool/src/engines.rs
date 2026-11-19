@@ -435,29 +435,10 @@ impl BlitzpoolModeGate {
         }
     }
 
-    /// Connected `Solo` / `GroupSolo` addresses: the only modes a membership
-    /// change flips.
-    pub(crate) fn group_transition_candidates(&self) -> Vec<(String, MiningModeResult)> {
+    /// Every connected address with the mode its session registered.
+    pub(crate) fn connected(&self) -> Vec<(String, MiningModeResult)> {
         let guard = self.inner.lock().expect("mode-gate mutex poisoned");
-        guard
-            .iter()
-            .filter(|(_, e)| {
-                matches!(
-                    e.mode,
-                    MiningModeResult::Solo | MiningModeResult::GroupSolo(_)
-                )
-            })
-            .map(|(a, e)| (a.clone(), e.mode))
-            .collect()
-    }
-
-    /// Flip a connected address's mode without bumping its refcount. A no-op
-    /// for an unconnected address, so a disconnected entry is never resurrected.
-    pub(crate) fn override_mode(&self, address: &str, result: MiningModeResult) {
-        let mut guard = self.inner.lock().expect("mode-gate mutex poisoned");
-        if let Some(e) = guard.get_mut(address) {
-            e.mode = result;
-        }
+        guard.iter().map(|(a, e)| (a.clone(), e.mode)).collect()
     }
 }
 
@@ -1011,27 +992,25 @@ mod tests {
     }
 
     #[test]
-    fn override_mode_flips_connected_solo_to_group_without_touching_refcount() {
+    fn connected_lists_every_address_until_its_last_session_ends() {
         let gate = BlitzpoolModeGate::new();
-        gate.set_mode("bc1qsolo", MiningModeResult::Solo);
-        gate.set_mode("bc1qpplns", MiningModeResult::Pplns);
         let group_id = Uuid::new_v4();
-
-        let cands = gate.group_transition_candidates();
-        assert_eq!(cands.len(), 1);
-        assert_eq!(cands[0].0, "bc1qsolo");
-        assert_eq!(cands[0].1, MiningModeResult::Solo);
-
-        gate.override_mode("bc1qsolo", MiningModeResult::GroupSolo(group_id));
-        assert_eq!(mode_of(&gate, "bc1qsolo"), MiningMode::GroupSolo);
-        assert_eq!(gate.group_for_address("bc1qsolo"), Some(group_id));
-
-        // Refcount untouched: one disconnect still drops the entry.
+        gate.set_mode("bc1qsolo", MiningModeResult::Solo);
+        gate.set_mode("bc1qteam", MiningModeResult::GroupSolo(group_id));
+        let mut connected = gate.connected();
+        connected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            connected,
+            vec![
+                ("bc1qsolo".to_string(), MiningModeResult::Solo),
+                (
+                    "bc1qteam".to_string(),
+                    MiningModeResult::GroupSolo(group_id)
+                ),
+            ]
+        );
         gate.clear_mode("bc1qsolo");
-        assert_eq!(mode_of(&gate, "bc1qsolo"), MiningMode::Solo);
-
-        gate.override_mode("bc1qabsent", MiningModeResult::GroupSolo(group_id));
-        assert_eq!(mode_of(&gate, "bc1qabsent"), MiningMode::Solo);
+        assert_eq!(gate.connected().len(), 1);
     }
 
     #[test]

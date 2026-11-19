@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! In-memory routing cache, read on every share. Every status transition
-//! must call `set_admin_status`; a stale status routes a confirmed party's
-//! block to the pool fee, or skips its coinbase.
+//! must call `set_admin_status`; a stale status refuses a confirmed party's
+//! admin, or skips its coinbase.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,15 +51,10 @@ impl BlockpartyCache {
         entry.status.is_routable().then_some(entry.group_id)
     }
 
-    /// `Some` for a draft or confirming party: the Solo fallback then pays
-    /// the whole reward to the pool fee, so the admin cannot pocket it
-    /// before the members confirm the splits.
-    pub async fn pending_fee_route_admin(&self, address: &AddressId) -> Option<Uuid> {
+    /// `Some` for a draft or confirming party, whose admin gets no work.
+    pub async fn unready_group_id_for_admin(&self, address: &AddressId) -> Option<Uuid> {
         let entry = self.inner.read().await.admin.get(address).copied()?;
-        entry
-            .status
-            .is_pending_fee_route()
-            .then_some(entry.group_id)
+        entry.status.refuses_work().then_some(entry.group_id)
     }
 
     /// Any role, admin included.
@@ -170,40 +165,40 @@ mod tests {
         let admin = addr("bc1qadmin1");
         let gid = Uuid::new_v4();
 
-        // DRAFT → not routable but is pending-fee.
+        // DRAFT → not routable, refuses work.
         cache
             .set_admin_status(&admin, gid, BlockpartyStatus::Draft)
             .await;
         assert!(cache.routable_group_id_for_admin(&admin).await.is_none());
-        assert_eq!(cache.pending_fee_route_admin(&admin).await, Some(gid));
+        assert_eq!(cache.unready_group_id_for_admin(&admin).await, Some(gid));
 
         // CONFIRMING → same.
         cache
             .set_admin_status(&admin, gid, BlockpartyStatus::Confirming)
             .await;
         assert!(cache.routable_group_id_for_admin(&admin).await.is_none());
-        assert_eq!(cache.pending_fee_route_admin(&admin).await, Some(gid));
+        assert_eq!(cache.unready_group_id_for_admin(&admin).await, Some(gid));
 
-        // READY → routable, NOT pending-fee.
+        // READY → routable, takes work.
         cache
             .set_admin_status(&admin, gid, BlockpartyStatus::Ready)
             .await;
         assert_eq!(cache.routable_group_id_for_admin(&admin).await, Some(gid));
-        assert!(cache.pending_fee_route_admin(&admin).await.is_none());
+        assert!(cache.unready_group_id_for_admin(&admin).await.is_none());
 
-        // ACTIVE → routable, NOT pending-fee.
+        // ACTIVE → routable, takes work.
         cache
             .set_admin_status(&admin, gid, BlockpartyStatus::Active)
             .await;
         assert_eq!(cache.routable_group_id_for_admin(&admin).await, Some(gid));
-        assert!(cache.pending_fee_route_admin(&admin).await.is_none());
+        assert!(cache.unready_group_id_for_admin(&admin).await.is_none());
 
         // DISSOLVED → cleared from both maps.
         cache
             .set_admin_status(&admin, gid, BlockpartyStatus::Dissolved)
             .await;
         assert!(cache.routable_group_id_for_admin(&admin).await.is_none());
-        assert!(cache.pending_fee_route_admin(&admin).await.is_none());
+        assert!(cache.unready_group_id_for_admin(&admin).await.is_none());
         assert!(cache.member_group_id(&admin).await.is_none());
     }
 
@@ -271,7 +266,7 @@ mod tests {
         assert_eq!(cache.member_group_id(&bob).await, Some(gid));
         // Bob is not an admin — guards must both be None.
         assert!(cache.routable_group_id_for_admin(&bob).await.is_none());
-        assert!(cache.pending_fee_route_admin(&bob).await.is_none());
+        assert!(cache.unready_group_id_for_admin(&bob).await.is_none());
 
         cache.remove_member(&bob).await;
         assert!(cache.member_group_id(&bob).await.is_none());

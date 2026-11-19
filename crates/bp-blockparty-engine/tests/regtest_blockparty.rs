@@ -3,9 +3,9 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! E2E regtest: what a Blockparty admin's coinbase pays before and after the
-//! party is ready, with bitcoin-core validating each mined block so a coinbase
-//! that only looks right cannot pass. Skipped when `bitcoin-node` or Postgres
+//! E2E regtest: what a Ready Blockparty admin's coinbase pays, with
+//! bitcoin-core validating each mined block so a coinbase that only looks
+//! right cannot pass. Skipped when `bitcoin-node` or Postgres
 //! is absent.
 
 use std::sync::Arc;
@@ -80,13 +80,16 @@ async fn blockparty_ready_party_pays_members_and_history_is_idempotent() {
     let g = svc.get_group(group_id).await.unwrap().unwrap();
     assert_eq!(g.status, "ready", "READY after all members confirmed");
 
-    // Routing-cache invariant: READY enables routing, kills pending-fee guard.
+    // Routing-cache invariant: READY enables routing and lets the admin mine.
     let admin_addr_id = AddressId::new(addr_admin.clone()).unwrap();
     assert_eq!(
         svc.routable_group_id_for_admin(&admin_addr_id).await,
         Some(group_id)
     );
-    assert!(svc.pending_party_fee_route(&admin_addr_id).await.is_none());
+    assert!(svc
+        .unready_group_id_for_admin(&admin_addr_id)
+        .await
+        .is_none());
 
     // ── Boot bitcoin-core, attach TDP ────────────────────────────
     let (node, tdp, template, prev_hash) = boot_node_and_template(regtest_cfg).await;
@@ -164,89 +167,6 @@ async fn blockparty_ready_party_pays_members_and_history_is_idempotent() {
     assert_eq!(history.len(), 1, "exactly one history row after replay");
 
     // ── Teardown ─────────────────────────────────────────────────
-    tdp.shutdown().expect("TDP clean shutdown");
-    node.shutdown().await.expect("regtest clean shutdown");
-    cleanup_group(&pg, &name).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pending_party_admin_routes_block_to_pool_fee_accepted_by_core() {
-    let regtest_cfg = RegtestConfig::default();
-    if !regtest_cfg.is_available() {
-        eprintln!(
-            "skipping pending-guard regtest — {}",
-            regtest_cfg.unavailable_reason()
-        );
-        return;
-    }
-    let Some(pg) = connect_pg_or_skip().await else {
-        return;
-    };
-
-    let addr_admin = deterministic_p2wpkh_regtest([0xc1; 32]);
-    let addr_bob = deterministic_p2wpkh_regtest([0xc2; 32]);
-    let addr_fee = deterministic_p2wpkh_regtest([0xcf; 32]);
-    let name = format!("bp-regtest-pending-{}", uuid::Uuid::new_v4());
-    cleanup_blockparty_rows(&pg, &[&addr_admin, &addr_bob]).await;
-
-    let fee_addr_id = AddressId::new(addr_fee.clone()).expect("fee addr");
-    let svc = service(&pg, &addr_fee).await;
-
-    // Create + add member but DON'T confirm Bob. Status: CONFIRMING.
-    let create = svc
-        .create_group(&name, &addr_admin, 6_000)
-        .await
-        .expect("create_group");
-    svc.add_member(create.group.id, &addr_bob, 4_000, Some(&create.admin_token))
-        .await
-        .expect("add_member");
-    let g = svc.get_group(create.group.id).await.unwrap().unwrap();
-    assert_eq!(g.status, "confirming");
-
-    // Guards: pending-fee-route active, normal routing dormant.
-    let admin_id = AddressId::new(addr_admin.clone()).unwrap();
-    let route = svc
-        .pending_party_fee_route(&admin_id)
-        .await
-        .expect("pending-fee-route must be Some for CONFIRMING admin");
-    assert_eq!(route.fee_address, fee_addr_id);
-    assert!(svc.routable_group_id_for_admin(&admin_id).await.is_none());
-
-    // ── Mine the fee-route coinbase and make core validate it ────
-    let (node, tdp, template, prev_hash) = boot_node_and_template(regtest_cfg).await;
-    let payouts = vec![PayoutEntry {
-        address: route.fee_address.into_inner(),
-        // The template's own value, not a hardcoded subsidy, or core rejects
-        // it as `bad-cb-amount`.
-        sats: template.coinbase_tx_value_remaining,
-    }];
-    let _ = mine_and_submit_payouts(
-        &node,
-        &tdp,
-        &template,
-        &prev_hash,
-        &payouts,
-        "blockparty-pending-guard",
-        [0u8; 32],
-    )
-    .await;
-
-    // ── Promote to READY by confirming Bob, verify guard turns off ──
-    svc.mark_member_confirmed(create.group.id, &AddressId::new(addr_bob.clone()).unwrap())
-        .await
-        .expect("mark_member_confirmed");
-    let g = svc.get_group(create.group.id).await.unwrap().unwrap();
-    assert_eq!(g.status, "ready");
-    assert!(
-        svc.pending_party_fee_route(&admin_id).await.is_none(),
-        "READY must turn off the pending-fee guard"
-    );
-    assert_eq!(
-        svc.routable_group_id_for_admin(&admin_id).await,
-        Some(create.group.id),
-        "READY must enable the standard routing path"
-    );
-
     tdp.shutdown().expect("TDP clean shutdown");
     node.shutdown().await.expect("regtest clean shutdown");
     cleanup_group(&pg, &name).await;

@@ -11,11 +11,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bp_blockparty_engine::BlockpartyService;
 use bp_group_mgmt_engine::MembershipChangeNotifier;
+use bp_share_hook::MinerAdmission;
 use bp_share_stream::{
     cache_kind, CacheInvalidation, StreamConsumer, StreamProducer, CACHE_INVALIDATION_STREAM_KEY,
 };
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -26,6 +28,7 @@ use bp_mining_mode::MiningModeResult;
 use crate::coinbase_tags::CoinbaseTagCache;
 use crate::engines::BlitzpoolModeGate;
 use crate::group_service::SharedGroupService;
+use crate::membership::{membership_mode, BlockpartyAdminLookup, GroupLookup};
 
 /// Consumer group for the Front's invalidation drain. ⚠️ Exactly ONE front
 /// may consume it: a group splits entries between consumers, and a missed
@@ -89,9 +92,7 @@ impl CacheSyncHandle {
 /// rebuilds both regardless (the safety net).
 pub(crate) fn spawn(
     redis: ConnectionManager,
-    group: SharedGroupService,
-    blockparty: Option<Arc<BlockpartyService>>,
-    coinbase_tags: Arc<CoinbaseTagCache>,
+    membership: &crate::membership::Membership,
     pool: PgPool,
     gate: Arc<BlitzpoolModeGate>,
     // The Front's JDP payout registry, once `jdp::spawn` has attached it.
@@ -103,6 +104,15 @@ pub(crate) fn spawn(
 ) -> CacheSyncHandle {
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
+    let blockparty = membership.blockparty_service();
+    let coinbase_tags = membership.coinbase_tags.clone();
+    let sync = MembershipSync {
+        group: membership.group.clone(),
+        blockparty,
+        admission: membership.admission(),
+        gate,
+        kicks: membership.session_kicks.clone(),
+    };
     let task = tokio::spawn(async move {
         let consumer: StreamConsumer<CacheInvalidation> =
             StreamConsumer::new(redis, CACHE_INVALIDATION_STREAM_KEY, GROUP, CONSUMER);
@@ -121,8 +131,11 @@ pub(crate) fn spawn(
                 biased;
                 _ = task_cancel.cancelled() => break,
                 _ = backstop.tick() => {
-                    rebuild_group(&group, &gate).await;
-                    rebuild_blockparty(blockparty.as_ref()).await;
+                    let fresh = rebuild_group(&sync.group).await
+                        & rebuild_blockparty(sync.blockparty.as_ref()).await;
+                    if fresh {
+                        sync.kick_moved_sessions().await;
+                    }
                     rebuild_coinbase_tags(&coinbase_tags, &pool).await;
                 }
                 result = consumer.read_new(BATCH, BLOCK_MS) => match result {
@@ -143,12 +156,17 @@ pub(crate) fn spawn(
                             }
                             ids.push(entry.id.clone());
                         }
-                        // Coalesce: one rebuild per kind per batch.
+                        // Coalesce: one rebuild per kind per batch, then one
+                        // kick pass over the rebuilt caches.
+                        let mut fresh = true;
                         if want_group {
-                            rebuild_group(&group, &gate).await;
+                            fresh &= rebuild_group(&sync.group).await;
                         }
                         if want_blockparty {
-                            rebuild_blockparty(blockparty.as_ref()).await;
+                            fresh &= rebuild_blockparty(sync.blockparty.as_ref()).await;
+                        }
+                        if (want_group || want_blockparty) && fresh {
+                            sync.kick_moved_sessions().await;
                         }
                         // Teams and Blockpartys both set a tag.
                         if want_group || want_blockparty {
@@ -190,50 +208,86 @@ fn invalidate_payout_distributions(
     }
 }
 
-async fn rebuild_group(group: &SharedGroupService, gate: &Arc<BlitzpoolModeGate>) {
+/// `false` when the rebuild failed, so no kick acts on a stale cache.
+async fn rebuild_group(group: &SharedGroupService) -> bool {
     match group.service.rebuild_cache().await {
-        Ok(()) => info!("cache-sync: group address cache rebuilt"),
+        Ok(()) => {
+            info!("cache-sync: group address cache rebuilt");
+            true
+        }
         Err(err) => {
             warn!(%err, "cache-sync: group cache rebuild failed");
-            return;
+            false
         }
     }
-    reconcile_gate_modes(group, gate).await;
 }
 
-/// Flip the **live** mode gate of connected miners after a membership change
-/// so an approved join or a leave takes effect from the next share, without
-/// a reconnect: `Solo` in an active group becomes `GroupSolo`, `GroupSolo`
-/// in none becomes `Solo`.
-async fn reconcile_gate_modes(group: &SharedGroupService, gate: &Arc<BlitzpoolModeGate>) {
-    let cache = group.service.address_cache();
-    let (mut upgraded, mut downgraded) = (0u32, 0u32);
-    for (address, current) in gate.group_transition_candidates() {
-        let Ok(addr_id) = AddressId::new(address.clone()) else {
+/// What a rebuild and its kick pass read: the routing caches, the admission
+/// and the connected sessions' modes.
+struct MembershipSync {
+    group: SharedGroupService,
+    blockparty: Option<Arc<BlockpartyService>>,
+    admission: Arc<dyn MinerAdmission>,
+    gate: Arc<BlitzpoolModeGate>,
+    kicks: broadcast::Sender<String>,
+}
+
+impl MembershipSync {
+    async fn kick_moved_sessions(&self) {
+        kick_moved_sessions(
+            &self.gate,
+            &*self.group.service,
+            self.blockparty
+                .as_deref()
+                .map(|bp| bp as &dyn BlockpartyAdminLookup),
+            &*self.admission,
+            &self.kicks,
+        )
+        .await;
+    }
+}
+
+/// Whether a connection mining in `current` must close because a membership
+/// change moved it: `membership` is what its memberships give it now (an
+/// active team, the admin of a routable party), `refused` whether admission
+/// refuses it now. A port-mode connection stays only while it has neither.
+fn mode_moved(
+    current: MiningModeResult,
+    membership: Option<MiningModeResult>,
+    refused: bool,
+) -> bool {
+    match current {
+        MiningModeResult::GroupSolo(_) | MiningModeResult::Blockparty(_) => {
+            membership != Some(current)
+        }
+        MiningModeResult::Solo | MiningModeResult::Pplns => membership.is_some() || refused,
+    }
+}
+
+/// Close every connection whose mode a membership change moved, so it
+/// reconnects into its new mode and template stream together, or is refused.
+async fn kick_moved_sessions(
+    gate: &BlitzpoolModeGate,
+    group: &dyn GroupLookup,
+    blockparty: Option<&dyn BlockpartyAdminLookup>,
+    admission: &dyn MinerAdmission,
+    kicks: &broadcast::Sender<String>,
+) {
+    let mut kicked = 0u32;
+    for (address, current) in gate.connected() {
+        let Ok(address_id) = AddressId::new(address.clone()) else {
             continue;
         };
-        let active_group = cache
-            .get(&addr_id)
-            .await
-            .filter(|e| e.active)
-            .map(|e| e.group_id);
-        match (current, active_group) {
-            (MiningModeResult::Solo, Some(group_id)) => {
-                gate.override_mode(&address, MiningModeResult::GroupSolo(group_id));
-                upgraded += 1;
-            }
-            (MiningModeResult::GroupSolo(_), None) => {
-                gate.override_mode(&address, MiningModeResult::Solo);
-                downgraded += 1;
-            }
-            _ => {}
+        let membership = membership_mode(group, blockparty, &address_id).await;
+        let refused = admission.refusal(&address).await.is_some();
+        if mode_moved(current, membership, refused) {
+            // Errs only without a connection listening, which is fine.
+            let _ = kicks.send(address);
+            kicked += 1;
         }
     }
-    if upgraded > 0 || downgraded > 0 {
-        info!(
-            upgraded,
-            downgraded, "cache-sync: reconciled live mode gate to group membership"
-        );
+    if kicked > 0 {
+        info!(kicked, "cache-sync: closed connections whose mode changed");
     }
 }
 
@@ -244,20 +298,139 @@ async fn rebuild_coinbase_tags(tags: &CoinbaseTagCache, pool: &PgPool) {
     }
 }
 
-async fn rebuild_blockparty(blockparty: Option<&Arc<BlockpartyService>>) {
+/// `false` when the rebuild failed, so no kick acts on a stale cache.
+async fn rebuild_blockparty(blockparty: Option<&Arc<BlockpartyService>>) -> bool {
     let Some(bp) = blockparty else {
-        return;
+        return true;
     };
     match bp.rebuild_cache().await {
-        Ok(()) => info!("cache-sync: blockparty routing cache rebuilt"),
-        Err(err) => warn!(%err, "cache-sync: blockparty cache rebuild failed"),
+        Ok(()) => {
+            info!("cache-sync: blockparty routing cache rebuilt");
+            true
+        }
+        Err(err) => {
+            warn!(%err, "cache-sync: blockparty cache rebuild failed");
+            false
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use bp_test_support::{connect_redis_in_range_or_skip, redis_db};
+
+    /// A team or party connection stays only while that same membership
+    /// holds; a port-mode connection stays only while it has no membership
+    /// and is not refused.
+    #[test]
+    fn a_connection_closes_exactly_when_its_membership_moved() {
+        let team = MiningModeResult::GroupSolo(uuid::Uuid::new_v4());
+        let other_team = MiningModeResult::GroupSolo(uuid::Uuid::new_v4());
+        let party = MiningModeResult::Blockparty(uuid::Uuid::new_v4());
+        for port in [MiningModeResult::Solo, MiningModeResult::Pplns] {
+            assert!(!mode_moved(port, None, false), "nothing changed");
+            assert!(mode_moved(port, Some(team), false), "joined a team");
+            assert!(
+                mode_moved(port, Some(party), false),
+                "its party became Ready"
+            );
+            assert!(
+                mode_moved(port, None, true),
+                "it now administers an unready party"
+            );
+        }
+        assert!(!mode_moved(team, Some(team), false), "still in the team");
+        assert!(mode_moved(team, None, false), "left the team");
+        assert!(
+            mode_moved(team, Some(other_team), false),
+            "moved to another team"
+        );
+        assert!(
+            !mode_moved(party, Some(party), false),
+            "the party still routes"
+        );
+        assert!(mode_moved(party, None, false), "the party was dissolved");
+    }
+
+    /// Fixed memberships and refusals, standing in for the routing caches.
+    struct Fixed {
+        teams: std::collections::HashMap<&'static str, uuid::Uuid>,
+        parties: std::collections::HashMap<&'static str, uuid::Uuid>,
+        refused: Vec<&'static str>,
+    }
+    #[async_trait]
+    impl GroupLookup for Fixed {
+        async fn group_for_address(&self, address: &AddressId) -> Option<uuid::Uuid> {
+            self.teams.get(address.as_str()).copied()
+        }
+    }
+    #[async_trait]
+    impl BlockpartyAdminLookup for Fixed {
+        async fn routable_group_id_for_admin(&self, address: &AddressId) -> Option<uuid::Uuid> {
+            self.parties.get(address.as_str()).copied()
+        }
+    }
+    #[async_trait]
+    impl MinerAdmission for Fixed {
+        async fn refusal(&self, address: &str) -> Option<bp_share_hook::AdmissionRefusal> {
+            self.refused
+                .contains(&address)
+                .then_some(bp_share_hook::AdmissionRefusal::BlockpartyNotReady)
+        }
+    }
+
+    /// The kick pass reads each connected address's mode from the gate and
+    /// its memberships from the caches, and kicks exactly the moved ones.
+    #[tokio::test]
+    async fn the_kick_pass_kicks_exactly_the_connections_whose_mode_moved() {
+        const STAYS_SOLO: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+        const JOINED: &str = "bcrt1qvs8k07ggszru23v9p42vpg4jxts9y2k8kkujja";
+        const STAYS_TEAM: &str = "bcrt1qqyqszqgpqyqszqgpqyqszqgpqyqszqgpvxat9t";
+        const LEFT_TEAM: &str = "bcrt1qqgpqyqszqgpqyqszqgpqyqszqgpqyqszazmwwa";
+        const NOW_UNREADY_ADMIN: &str = "bcrt1qqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcruj60yu";
+        const STAYS_PARTY: &str = "bcrt1qqszqgpqyqszqgpqyqszqgpqyqszqgpqyuza2rq";
+        let team = uuid::Uuid::new_v4();
+        let party = uuid::Uuid::new_v4();
+        let gate = BlitzpoolModeGate::new();
+        gate.set_mode(STAYS_SOLO, MiningModeResult::Solo);
+        gate.set_mode(JOINED, MiningModeResult::Pplns);
+        gate.set_mode(STAYS_TEAM, MiningModeResult::GroupSolo(team));
+        gate.set_mode(LEFT_TEAM, MiningModeResult::GroupSolo(team));
+        gate.set_mode(NOW_UNREADY_ADMIN, MiningModeResult::Solo);
+        gate.set_mode(STAYS_PARTY, MiningModeResult::Blockparty(party));
+        let caches = Fixed {
+            teams: [(JOINED, team), (STAYS_TEAM, team)].into(),
+            parties: [(STAYS_PARTY, party)].into(),
+            refused: vec![NOW_UNREADY_ADMIN],
+        };
+        for address in [
+            STAYS_SOLO,
+            JOINED,
+            STAYS_TEAM,
+            LEFT_TEAM,
+            NOW_UNREADY_ADMIN,
+            STAYS_PARTY,
+        ] {
+            assert!(
+                AddressId::new(address.to_string()).is_ok(),
+                "precondition: {address} parses"
+            );
+        }
+        let (kicks, mut rx) = broadcast::channel(16);
+
+        kick_moved_sessions(&gate, &caches, Some(&caches), &caches, &kicks).await;
+
+        let mut kicked = Vec::new();
+        while let Ok(address) = rx.try_recv() {
+            kicked.push(address);
+        }
+        kicked.sort();
+        let mut expected = vec![JOINED, LEFT_TEAM, NOW_UNREADY_ADMIN];
+        expected.sort();
+        assert_eq!(kicked, expected);
+    }
 
     /// Published `group` + `blockparty` invalidations read back intact.
     #[tokio::test]

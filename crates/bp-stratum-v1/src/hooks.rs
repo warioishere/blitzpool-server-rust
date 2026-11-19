@@ -12,9 +12,10 @@ use bp_mining_job::{PayoutEntry, ResolvedPayouts};
 
 use bp_common::StreamKind;
 use bp_share_hook::{
-    DeviceStatusSink, NoOpSink, SharedAcceptedShareSink, SharedRejectedShareSink,
+    DeviceStatusSink, MinerAdmission, NoOpSink, SharedAcceptedShareSink, SharedRejectedShareSink,
     SharedSessionPersistence,
 };
+use tokio::sync::broadcast;
 
 use crate::submit::ShareAccept;
 
@@ -66,6 +67,11 @@ pub struct ServerHooks {
     pub session_persistence: Arc<dyn SharedSessionPersistence>,
     pub payout_resolver: Arc<dyn PayoutResolver>,
     pub device_status_sink: Arc<dyn DeviceStatusSink>,
+    /// Refuses an address before its session is registered.
+    pub admission: Arc<dyn MinerAdmission>,
+    /// Addresses whose mode changed; a connection mining for one closes, so
+    /// its mode and template stream are resolved afresh on reconnect.
+    pub session_kicks: broadcast::Sender<String>,
 }
 
 impl ServerHooks {
@@ -80,7 +86,9 @@ impl ServerHooks {
             rejected_sink: shared.clone(),
             session_persistence: shared.clone(),
             payout_resolver: n,
-            device_status_sink: shared,
+            device_status_sink: shared.clone(),
+            admission: shared,
+            session_kicks: broadcast::channel(1).0,
         }
     }
 }
@@ -146,6 +154,8 @@ pub(crate) mod test_support {
                 session_persistence: self.clone(),
                 payout_resolver: self.clone(),
                 device_status_sink: self.clone(),
+                admission: Arc::new(NoOpSink),
+                session_kicks: broadcast::channel(1).0,
             }
         }
     }

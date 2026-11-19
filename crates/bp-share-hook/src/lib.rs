@@ -244,6 +244,42 @@ pub trait DeviceStatusSink: Send + Sync {
     );
 }
 
+/// Why the pool refuses an address before it mines: at SV1 authorize, at
+/// SV2 channel open, at JDP token allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionRefusal {
+    /// The address administers a Blockparty that is not Ready: it gets no
+    /// work until every member has confirmed the splits.
+    BlockpartyNotReady,
+}
+
+impl AdmissionRefusal {
+    /// Machine-readable code: the SV2 `OpenMiningChannel.Error` code and
+    /// the log field.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::BlockpartyNotReady => "blockparty-not-ready",
+        }
+    }
+
+    /// Text for a person: the SV1 authorize error message.
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::BlockpartyNotReady => {
+                "Blockparty not ready: every member must confirm the splits first"
+            }
+        }
+    }
+}
+
+/// Whether an address may mine now. Asked before every session is
+/// registered (each SV1 authorize, each SV2 channel open, each JDP token)
+/// and for every connected address after a membership change.
+#[async_trait]
+pub trait MinerAdmission: Send + Sync {
+    async fn refusal(&self, address: &str) -> Option<AdmissionRefusal>;
+}
+
 /// Does nothing; the default when a server runs without production sinks.
 pub struct NoOpSink;
 
@@ -266,6 +302,13 @@ impl SharedSessionPersistence for NoOpSink {
 #[async_trait]
 impl DeviceStatusSink for NoOpSink {
     async fn on_device_event(&self, _: &str, _: &str, _: &str, _: Option<&str>, _: bool) {}
+}
+
+#[async_trait]
+impl MinerAdmission for NoOpSink {
+    async fn refusal(&self, _: &str) -> Option<AdmissionRefusal> {
+        None
+    }
 }
 
 #[cfg(test)]
