@@ -44,9 +44,13 @@ pub const KEY_BUCKETS: &str = "pplns:buckets";
 pub const KEY_WINDOW_LAST_SHARE: &str = "pplns:window:last-share";
 /// Coinbase distribution snapshot. See [`mod@snapshot`].
 pub const KEY_SNAPSHOT: &str = "pplns:snapshot";
-/// How many miners the most recently built PPLNS coinbase pays, with the
-/// snapshot's TTL so it lapses instead of going stale once no job is built.
+/// How many miners the most recently built PPLNS coinbase pays, kept for
+/// [`PUBLISHED_OUTPUTS_TTL_SECS`] so it lapses instead of going stale once no
+/// job is built.
 pub const KEY_PUBLISHED_OUTPUTS: &str = "pplns:published_outputs";
+/// How long [`KEY_PUBLISHED_OUTPUTS`] outlives the last build, so the API
+/// stops showing it soon after PPLNS builds stop.
+pub const PUBLISHED_OUTPUTS_TTL_SECS: u32 = 1_200;
 /// Dedup zset `share_id → counter` for exactly-once `record_share`. Capped
 /// to the newest `DEDUP_KEEP` entries by rank. A redelivered share whose
 /// id is still in this set is a no-op. See `RECORD_SHARE_LUA`.
@@ -591,27 +595,28 @@ impl WindowStore {
         })
     }
 
-    /// Redis handle for the snapshot write and the block-found read.
-    /// Record how many miners the coinbase just built pays.
-    pub async fn write_published_outputs(
-        &self,
-        count: usize,
-        ttl_seconds: u32,
-    ) -> Result<(), WindowError> {
+    /// Record how many miners the coinbase just built pays, kept for
+    /// [`PUBLISHED_OUTPUTS_TTL_SECS`].
+    pub async fn write_published_outputs(&self, count: usize) -> Result<(), WindowError> {
         let mut conn = self.conn.clone();
         let _: () = conn
-            .set_ex(KEY_PUBLISHED_OUTPUTS, count, u64::from(ttl_seconds))
+            .set_ex(
+                KEY_PUBLISHED_OUTPUTS,
+                count,
+                u64::from(PUBLISHED_OUTPUTS_TTL_SECS),
+            )
             .await?;
         Ok(())
     }
 
     /// How many miners the most recently built coinbase pays; `None` once no
-    /// coinbase was built within the snapshot TTL.
+    /// coinbase was built within [`PUBLISHED_OUTPUTS_TTL_SECS`].
     pub async fn read_published_outputs(&self) -> Result<Option<u32>, WindowError> {
         let mut conn = self.conn.clone();
         Ok(conn.get(KEY_PUBLISHED_OUTPUTS).await?)
     }
 
+    /// Redis handle for the snapshot write and the block-found read.
     pub fn connection_for_snapshot(&self) -> ConnectionManager {
         self.conn.clone()
     }

@@ -32,9 +32,12 @@ pub struct PplnsEngineConfig {
     /// `window_size = factor * network_difficulty`.
     pub window_factor: f64,
 
-    /// The TTL is what bounds the snapshot keyspace; twice the job GC
-    /// retention. Not sized against the confirmation window: a found block
-    /// carries its snapshot in the parked blob, so settlement never needs it.
+    /// The TTL is what bounds the snapshot keyspace. Sized to outlive every
+    /// job built on the snapshot: an active job lives until the next block,
+    /// and a block interval past the default 2 h is about one block in
+    /// 160,000 at a 10-minute mean (e^-12). Not sized against the confirmation
+    /// window: a found block carries its snapshot in the parked blob, so
+    /// settlement never needs it.
     pub snapshot_ttl_secs: u32,
 
     /// Shares per window bucket. Boot-time only on a populated window: raising
@@ -68,7 +71,7 @@ impl Default for PplnsEngineConfig {
             min_payout_sats: Sats(DEFAULT_MIN_PAYOUT_SATS as i64),
             coinbase_weight_budget: DEFAULT_COINBASE_WEIGHT_BUDGET,
             window_factor: 4.0,
-            snapshot_ttl_secs: 1_200,
+            snapshot_ttl_secs: 7_200,
             bucket_shares: crate::window::DEFAULT_BUCKET_SHARES,
             touch_flush_interval_secs: 60,
             dust_sweep_enabled: true,
