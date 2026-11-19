@@ -160,6 +160,8 @@ async fn run_block_submit_case(miner_extranonce_size: u8, rolled_version_bits: u
 
     let mut channel = ChannelState::new_extended(
         channel_id,
+        "00000001".to_string(),
+        "worker".to_string(),
         extranonce_prefix.clone(),
         miner_extranonce_size,
         job_difficulty,

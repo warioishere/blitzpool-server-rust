@@ -484,7 +484,6 @@ async fn a_nul_byte_in_a_worker_name_does_not_block_the_flush() {
             user_agent: Some(ua),
             is_block_candidate: false,
             hash_rate: 0.0,
-            channel_count: 1,
             ts_ms: 0,
             share_id: "",
             mode: bp_common::MiningMode::Solo,

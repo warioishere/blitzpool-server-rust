@@ -293,10 +293,6 @@ struct WorkerEntry {
     hash_rate: f64,
     #[serde(serialize_with = "crate::time_range::ser_opt_f64_jsnum")]
     current_difficulty: Option<f64>,
-    /// Mining channels on this worker's connection. `> 1` means a rental
-    /// proxy bundled several same-rig devices onto one connection, so the
-    /// UI renders the difficulty as aggregated instead of a single value.
-    channel_count: i32,
     start_time: String,
     last_seen: String,
     /// The stored custom extranonce prefix (8 hex chars), `null` for the
@@ -352,7 +348,6 @@ async fn by_address(
                             best_difficulty: format!("{:.2}", c.best_difficulty),
                             hash_rate: lf.hash_rate,
                             current_difficulty: lf.current_difficulty,
-                            channel_count: lf.channel_count.unwrap_or(1),
                             start_time: crate::time_range::format_iso_ms(c.start_time),
                             // No live hash → the freshest thing known is
                             // the session's own start.

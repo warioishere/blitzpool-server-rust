@@ -380,12 +380,19 @@ pub enum SessionEvent {
     /// A new mining channel opened.
     ChannelOpened {
         channel_id: u32,
+        session_id: String,
         address: AddressId,
         worker: String,
         kind: ChannelKind,
     },
-    /// Channel closed; the caller releases its extranonce prefix.
-    ChannelClosed { channel_id: u32, reason: String },
+    /// Channel closed; the caller releases its extranonce prefix and ends
+    /// the channel's session.
+    ChannelClosed {
+        channel_id: u32,
+        session_id: String,
+        worker: String,
+        reason: String,
+    },
     /// Channel difficulty changed (vardiff or `UpdateChannel`).
     DifficultyChanged { old: Difficulty, new: Difficulty },
     /// Share accepted, with the validation result for accounting and the
@@ -438,7 +445,6 @@ pub struct MiningSessionState<C: Clock> {
     pub session_id: u32,
     pub network: Network,
     pub address: Option<AddressId>,
-    pub worker_name: String,
     /// User agent derived from the SetupConnection `vendor`; `None` when the
     /// vendor normalises to nothing.
     pub user_agent: Option<String>,
@@ -529,7 +535,6 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             session_id,
             network: port.network,
             address: None,
-            worker_name: String::new(),
             user_agent: None,
             stream: StreamKind::Pplns,
             accounting_stream: StreamKind::Pplns,
@@ -580,6 +585,13 @@ impl<C: Clock + Clone> MiningSessionState<C> {
     /// Stamp the current clock reading as the last vardiff evaluation.
     pub fn mark_vardiff_checked(&mut self) {
         self.last_difficulty_check_ms = self.clock.now_ms();
+    }
+
+    /// The session id of `channel_id`: the connection's id offset by the
+    /// channel id, so every channel of the connection has its own and the
+    /// hex form keeps the 8 characters `client_entity.sessionId` holds.
+    pub fn channel_session_id(&self, channel_id: u32) -> String {
+        format!("{:08x}", self.session_id.wrapping_add(channel_id))
     }
 
     /// Register an opened channel with its vardiff engine; the first one
@@ -745,6 +757,8 @@ pub fn handle_open_standard_mining_channel<C: Clock + Clone>(
 
     let channel = ChannelState::new_standard(
         channel_id,
+        state.channel_session_id(channel_id),
+        ctx.worker.clone(),
         extranonce_prefix.clone(),
         ctx.assigned_difficulty,
         input.max_target,
@@ -764,6 +778,7 @@ pub fn handle_open_standard_mining_channel<C: Clock + Clone>(
         }],
         events: vec![SessionEvent::ChannelOpened {
             channel_id,
+            session_id: state.channel_session_id(channel_id),
             address: ctx.address,
             worker: ctx.worker,
             kind: ChannelKind::Standard,
@@ -834,6 +849,8 @@ pub fn handle_open_extended_mining_channel<C: Clock + Clone>(
 
     let channel = ChannelState::new_extended(
         channel_id,
+        state.channel_session_id(channel_id),
+        ctx.worker.clone(),
         extranonce_prefix.clone(),
         rollable_size,
         ctx.assigned_difficulty,
@@ -856,6 +873,7 @@ pub fn handle_open_extended_mining_channel<C: Clock + Clone>(
         }],
         events: vec![SessionEvent::ChannelOpened {
             channel_id,
+            session_id: state.channel_session_id(channel_id),
             address: ctx.address,
             worker: ctx.worker,
             kind: ChannelKind::Extended,
@@ -953,7 +971,6 @@ fn resolve_open_context<C: Clock>(
 
     if state.address.is_none() {
         state.address = Some(address.clone());
-        state.worker_name = worker.clone();
     }
 
     Ok(OpenContext {
@@ -1291,10 +1308,12 @@ pub fn handle_close_channel<C: Clock>(
             .unwrap_or_default();
         let mut events = Vec::with_capacity(members.len());
         for member_id in members {
-            if state.channels.remove(&member_id).is_some() {
+            if let Some(channel) = state.channels.remove(&member_id) {
                 state.vardiff.remove(&member_id);
                 events.push(SessionEvent::ChannelClosed {
                     channel_id: member_id,
+                    session_id: channel.session_id,
+                    worker: channel.worker,
                     reason: input.reason_code.clone(),
                 });
             }
@@ -1311,11 +1330,10 @@ pub fn handle_close_channel<C: Clock>(
         };
     }
 
-    if !state.channels.contains_key(&input.channel_id) {
+    let Some(channel) = state.channels.remove(&input.channel_id) else {
         // CloseChannel has no wire response.
         return HandlerOutcome::default();
-    }
-    state.channels.remove(&input.channel_id);
+    };
     state.vardiff.remove(&input.channel_id);
     // An emptied group persists; a re-opened same-size channel re-joins it.
     state.groups.remove_channel(input.channel_id);
@@ -1326,6 +1344,8 @@ pub fn handle_close_channel<C: Clock>(
         outbound: Vec::new(),
         events: vec![SessionEvent::ChannelClosed {
             channel_id: input.channel_id,
+            session_id: channel.session_id,
+            worker: channel.worker,
             reason: input.reason_code.clone(),
         }],
     }
@@ -2538,8 +2558,32 @@ pub(crate) mod tests {
         ));
         assert_eq!(s.channels.len(), 1);
         assert_eq!(s.primary_channel, Some(1));
-        assert_eq!(s.worker_name, "worker1");
+        assert_eq!(s.channels[&1].worker, "worker1");
         assert!(s.address.is_some());
+    }
+
+    /// Each channel is its own device: a second channel of the same address
+    /// keeps its own worker and gets its own session id (an sv2-ui tProxy
+    /// opens one channel per downstream device).
+    #[test]
+    fn each_channel_keeps_its_own_worker_and_session() {
+        let mut s = fresh_session();
+        handle_setup_connection(&mut s, &good_setup());
+        handle_open_standard_mining_channel(
+            &mut s,
+            &open_std(1, &format!("{REGTEST_ADDR}.rig1")),
+            vec![0x01, 0x02, 0x03, 0x04],
+        );
+        handle_open_standard_mining_channel(
+            &mut s,
+            &open_std(2, &format!("{REGTEST_ADDR}.rig2")),
+            vec![0x01, 0x02, 0x03, 0x05],
+        );
+        assert_eq!(s.channels.len(), 2, "precondition: both channels opened");
+        assert_eq!(s.channels[&1].worker, "rig1");
+        assert_eq!(s.channels[&2].worker, "rig2");
+        assert_ne!(s.channels[&1].session_id, s.channels[&2].session_id);
+        assert_eq!(s.channels[&1].session_id.len(), 8);
     }
 
     /// No worker, or an empty one, opens as "default": the session row and
@@ -2554,7 +2598,7 @@ pub(crate) mod tests {
                 &open_std(7, &identity),
                 vec![0x01, 0x02, 0x03, 0x04],
             );
-            assert_eq!(s.worker_name, "default", "{identity}");
+            assert_eq!(s.channels[&1].worker, "default", "{identity}");
         }
     }
 
@@ -2570,7 +2614,7 @@ pub(crate) mod tests {
                 &open_std(7, &format!("{REGTEST_ADDR}.{worker}")),
                 vec![0x01, 0x02, 0x03, 0x04],
             );
-            assert_eq!(s.worker_name, expected, "{worker:?}");
+            assert_eq!(s.channels[&1].worker, expected, "{worker:?}");
         }
     }
 

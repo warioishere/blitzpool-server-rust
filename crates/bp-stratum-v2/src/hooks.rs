@@ -163,7 +163,6 @@ pub mod test_support {
         pub session_id_hex: String,
         pub effective_difficulty: f64,
         pub is_block_candidate: bool,
-        pub channel_count: u32,
     }
 
     #[derive(Clone, Debug, PartialEq)]
@@ -173,6 +172,14 @@ pub mod test_support {
         pub session_id_hex: String,
         pub reason: RejectedReason,
         pub difficulty: f64,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct DeviceEventRecord {
+        pub address: String,
+        pub worker: String,
+        pub session_id: String,
+        pub online: bool,
     }
 
     #[derive(Clone, Debug, PartialEq)]
@@ -190,8 +197,8 @@ pub mod test_support {
         pub blocks_submitted: Arc<Mutex<Vec<AcceptedRecord>>>,
         pub registered: Arc<Mutex<Vec<RegisteredRecord>>>,
         pub deregistered: Arc<Mutex<Vec<String>>>,
-        /// (address, worker, online) per `on_device_event`.
-        pub device_events: Arc<Mutex<Vec<(String, String, bool)>>>,
+        /// One record per `on_device_event`.
+        pub device_events: Arc<Mutex<Vec<DeviceEventRecord>>>,
         /// Replaces the default 100%-to-the-miner payout list; see
         /// [`Self::with_payouts`].
         pub payouts_override: Arc<Mutex<Option<Vec<PayoutEntry>>>>,
@@ -261,9 +268,6 @@ pub mod test_support {
                     session_id_hex: session_id_hex.to_string(),
                     effective_difficulty: accept.effective_difficulty.as_f64(),
                     is_block_candidate: accept.is_block_candidate,
-                    // submit_block carries no channel count; the block
-                    // record only asserts the candidate path, not bundling.
-                    channel_count: 1,
                 });
         }
     }
@@ -280,7 +284,6 @@ pub mod test_support {
                     session_id_hex: share.session_id.to_string(),
                     effective_difficulty: share.effective_difficulty,
                     is_block_candidate: share.is_block_candidate,
-                    channel_count: share.channel_count,
                 });
         }
     }
@@ -334,15 +337,19 @@ pub mod test_support {
             &self,
             address: &str,
             worker: &str,
-            _session_id: &str,
+            session_id: &str,
             _user_agent: Option<&str>,
             online: bool,
         ) {
-            self.device_events.lock().expect("poisoned").push((
-                address.to_string(),
-                worker.to_string(),
-                online,
-            ));
+            self.device_events
+                .lock()
+                .expect("poisoned")
+                .push(DeviceEventRecord {
+                    address: address.to_string(),
+                    worker: worker.to_string(),
+                    session_id: session_id.to_string(),
+                    online,
+                });
         }
     }
 }
@@ -398,7 +405,6 @@ mod tests {
                 None,
                 &make_accept(),
                 0.0,
-                1,
             ))
             .await;
         let records = hooks.accepted.lock().unwrap();

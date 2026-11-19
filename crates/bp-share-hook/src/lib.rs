@@ -42,10 +42,6 @@ pub struct SharedAcceptedShare<'a> {
     /// before vardiff's first estimate.
     pub hash_rate: f64,
 
-    /// Channels on this session's connection; `> 1` when a rental proxy
-    /// bundles devices, so the UI shows the difficulty as aggregated.
-    pub channel_count: u32,
-
     /// Accept time (epoch ms), stamped once in the `shared_adapter`
     /// projections. Sinks MUST bucket on this and never re-stamp `now()`:
     /// they may run in another process and would mis-time backlogged shares.
@@ -107,17 +103,10 @@ pub struct SharedAcceptedShareOwned {
     pub user_agent: Option<String>,
     pub is_block_candidate: bool,
     pub hash_rate: f64,
-    /// A record without this field decodes as a single-channel session.
-    #[serde(default = "one_channel")]
-    pub channel_count: u32,
     pub ts_ms: i64,
     pub share_id: String,
     pub mode: MiningMode,
     pub group_id: Option<String>,
-}
-
-fn one_channel() -> u32 {
-    1
 }
 
 impl SharedAcceptedShareOwned {
@@ -132,7 +121,6 @@ impl SharedAcceptedShareOwned {
             user_agent: self.user_agent.as_deref(),
             is_block_candidate: self.is_block_candidate,
             hash_rate: self.hash_rate,
-            channel_count: self.channel_count,
             ts_ms: self.ts_ms,
             share_id: &self.share_id,
             mode: self.mode,
@@ -154,7 +142,6 @@ impl SharedAcceptedShare<'_> {
             user_agent: self.user_agent.map(str::to_string),
             is_block_candidate: self.is_block_candidate,
             hash_rate: self.hash_rate,
-            channel_count: self.channel_count,
             ts_ms: self.ts_ms,
             share_id: self.share_id.to_string(),
             mode: self.mode,
@@ -225,11 +212,13 @@ impl SharedRejectedShare<'_> {
     }
 }
 
-/// Per-session lifecycle: register on authorize, deregister on disconnect.
+/// Per-session lifecycle. An SV1 session is a connection: registered on
+/// authorize, deregistered on disconnect. An SV2 session is a channel:
+/// registered on open, deregistered on `CloseChannel` or connection end.
 #[async_trait]
 pub trait SharedSessionPersistence: Send + Sync {
-    /// Called after authorize. `user_agent` is the miner's firmware/vendor
-    /// string, stored on `client_entity.userAgent`.
+    /// Called when the session starts. `user_agent` is the miner's
+    /// firmware/vendor string, stored on `client_entity.userAgent`.
     async fn register_session(
         &self,
         session_id: &str,
@@ -237,7 +226,7 @@ pub trait SharedSessionPersistence: Send + Sync {
         worker: &str,
         user_agent: Option<&str>,
     );
-    /// Called when the connection closes (clean FIN or RST or timeout).
+    /// Called once when the session ends.
     async fn deregister_session(&self, session_id: &str);
 }
 
@@ -322,7 +311,6 @@ mod tests {
             submission_difficulty: 2048.0,
             is_block_candidate: false,
             hash_rate: 0.0,
-            channel_count: 1,
             ts_ms: 0,
             share_id: "",
             mode: MiningMode::Solo,
@@ -351,7 +339,6 @@ mod tests {
             submission_difficulty: 1e15,
             is_block_candidate: true,
             hash_rate: 0.0,
-            channel_count: 1,
             ts_ms: 0,
             share_id: "",
             mode: MiningMode::Solo,
@@ -371,7 +358,6 @@ mod tests {
             submission_difficulty: 2048.0,
             is_block_candidate: true,
             hash_rate: 1234.5,
-            channel_count: 3,
             ts_ms: 1_700_000_000_123,
             share_id: "ep7:42",
             mode: MiningMode::GroupSolo,
@@ -395,7 +381,6 @@ mod tests {
         assert_eq!(owned.submission_difficulty, 2048.0);
         assert!(owned.is_block_candidate);
         assert_eq!(owned.hash_rate, 1234.5);
-        assert_eq!(owned.channel_count, 3);
         assert_eq!(owned.ts_ms, 1_700_000_000_123);
         assert_eq!(owned.share_id, "ep7:42");
         assert_eq!(owned.mode, MiningMode::GroupSolo);

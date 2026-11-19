@@ -168,7 +168,6 @@ async fn accepted_share_with_unusable_difficulty_is_silently_discarded() {
             user_agent: None,
             is_block_candidate: false,
             hash_rate: 0.0,
-            channel_count: 1,
             ts_ms: 0,
             share_id: "",
             mode: bp_share_hook::MiningMode::Solo,

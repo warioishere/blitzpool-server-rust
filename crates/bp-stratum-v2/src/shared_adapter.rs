@@ -9,8 +9,7 @@ use bp_share_hook::{RejectedReason, SharedAcceptedShare, SharedRejectedShare};
 
 use crate::mining::submit::{RejectReason, ShareAccept};
 
-/// The shared view of an accepted SV2 share. `channel_count` is how many
-/// mining channels the connection holds (`> 1` for a bundled rig).
+/// The shared view of an accepted SV2 share.
 pub(crate) fn shared_accepted<'a>(
     address: &'a str,
     worker: &'a str,
@@ -18,7 +17,6 @@ pub(crate) fn shared_accepted<'a>(
     user_agent: Option<&'a str>,
     accept: &ShareAccept,
     hash_rate: f64,
-    channel_count: u32,
 ) -> SharedAcceptedShare<'a> {
     SharedAcceptedShare {
         address,
@@ -29,7 +27,6 @@ pub(crate) fn shared_accepted<'a>(
         submission_difficulty: accept.submission_difficulty.as_f64(),
         is_block_candidate: accept.is_block_candidate,
         hash_rate,
-        channel_count,
         ts_ms: bp_common::now_ms(),
         // Producer-assigned downstream at the single fan-out point; the
         // protocol side has no global share sequence and no mode-gate, so it
@@ -109,7 +106,6 @@ mod tests {
             Some("antminer/sv2"),
             &accept,
             0.0,
-            4,
         );
         assert_eq!(share.address, "bc1qbob");
         assert_eq!(share.worker, "rig2");
@@ -118,16 +114,12 @@ mod tests {
         assert_eq!(share.submission_difficulty, 8192.0);
         assert!(!share.is_block_candidate);
         assert_eq!(share.user_agent, Some("antminer/sv2"));
-        assert_eq!(
-            share.channel_count, 4,
-            "channel_count forwarded into shared view"
-        );
     }
 
     #[test]
     fn propagates_block_candidate_flag() {
         let accept = synthetic_accept(100.0, 1e15, true);
-        assert!(shared_accepted("a", "w", "s", None, &accept, 0.0, 1).is_block_candidate);
+        assert!(shared_accepted("a", "w", "s", None, &accept, 0.0).is_block_candidate);
     }
 
     /// `ts_ms` is stamped at accept time, not at a downstream sink.
@@ -135,7 +127,7 @@ mod tests {
     fn stamps_accept_time() {
         let before = bp_common::now_ms();
         let accept = synthetic_accept(512.0, 8192.0, false);
-        let ts = shared_accepted("a", "w", "s", None, &accept, 0.0, 1).ts_ms;
+        let ts = shared_accepted("a", "w", "s", None, &accept, 0.0).ts_ms;
         let after = bp_common::now_ms();
         assert!(
             ts >= before && ts <= after,

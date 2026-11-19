@@ -232,8 +232,6 @@ pub async fn last_share_ms_for_sessions<S: SessionKey>(
 pub struct LiveFields {
     pub hash_rate: f64,
     pub current_difficulty: Option<f64>,
-    /// `None` without the field — render as 1 channel.
-    pub channel_count: Option<i32>,
     /// Epoch-ms of the freshest accepted share.
     pub updated_at_ms: Option<i64>,
 }
@@ -249,7 +247,6 @@ fn parse_live_fields(pairs: Vec<(String, String)>, now_ms: i64) -> Option<LiveFi
         match field.as_str() {
             live_key::F_HASH_RATE => stored_rate = value.parse().ok(),
             live_key::F_CURRENT_DIFFICULTY => lf.current_difficulty = value.parse().ok(),
-            live_key::F_CHANNEL_COUNT => lf.channel_count = value.parse().ok(),
             live_key::F_UPDATED_AT_MS => lf.updated_at_ms = value.parse().ok(),
             _ => {}
         }
@@ -394,7 +391,6 @@ mod tests {
             ("hash_rate".into(), rate.into()),
             ("updated_at_ms".into(), updated_at.to_string()),
             ("current_difficulty".into(), "512".into()),
-            ("channel_count".into(), "2".into()),
         ]
     }
 
@@ -406,7 +402,6 @@ mod tests {
         assert_eq!(silent.hash_rate, 0.0, "past it the session is silent");
         // Silence zeroes only the rate; the rest of the session stays readable.
         assert_eq!(silent.current_difficulty, Some(512.0));
-        assert_eq!(silent.channel_count, Some(2));
         assert_eq!(silent.updated_at_ms, Some(NOW - HASHRATE_SILENCE_MS - 1));
     }
 
@@ -415,7 +410,6 @@ mod tests {
         // No timestamp: nothing says the session is hashing.
         let lf = parse_live_fields(vec![("hash_rate".into(), "7.5".into())], NOW).unwrap();
         assert_eq!(lf.hash_rate, 0.0);
-        assert_eq!(lf.channel_count, None);
         // Empty hash = missing key (HGETALL on a missing key is empty).
         assert_eq!(parse_live_fields(vec![], NOW), None);
         // Unknown fields are ignored, not an error.

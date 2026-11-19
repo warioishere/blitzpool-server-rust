@@ -616,17 +616,21 @@ async fn run_mining_connection(
                 // job is built. `state.stream` is set ONLY when the swap
                 // succeeds, so submits never route to a stream whose
                 // template_id the job does not carry.
-                if newly_opened_channel.is_some() {
-                    if let Some(addr) = state.address.as_ref() {
+                if let Some((opened_id, _)) = newly_opened_channel {
+                    if let (Some(addr), Some(channel)) =
+                        (state.address.as_ref(), state.channels.get(&opened_id))
+                    {
                         // Must precede the routing: `resolve_stream` reads the
                         // mode gate this publishes, and a miss defaults to Solo.
-                        // The only call per channel, so the refcount is taken once.
+                        // One session per channel, ended at its CloseChannel or
+                        // at the connection's end.
                         let address = addr.clone();
-                        let worker = state.worker_name.clone();
+                        let channel_session = channel.session_id.clone();
+                        let worker = channel.worker.clone();
                         hooks
                             .session_persistence
                             .register_session(
-                                &session_id_hex,
+                                &channel_session,
                                 address.as_str(),
                                 &worker,
                                 Some(session_user_agent(state.user_agent.as_deref())),
@@ -902,17 +906,16 @@ async fn run_mining_connection(
         }
     }
 
-    // A dropped TCP connection never sends `CloseChannel`, so every held
-    // prefix is released here. The loop arms only `break`, never `?`, so
-    // every exit reaches this.
-    for channel_id in state.channels.keys() {
-        extranonce.release(*channel_id);
+    // A dropped TCP connection never sends `CloseChannel`, so every open
+    // channel's prefix and session end here. The loop arms only `break`,
+    // never `?`, so every exit reaches this.
+    for channel in state.channels.values() {
+        extranonce.release(channel.channel_id);
+        hooks
+            .session_persistence
+            .deregister_session(&channel.session_id)
+            .await;
     }
-
-    hooks
-        .session_persistence
-        .deregister_session(&session_id_hex)
-        .await;
     let _ = writer.shutdown().await;
     Ok(())
 }
@@ -965,15 +968,17 @@ fn maybe_apply_custom_extranonce<C: bp_vardiff::Clock>(
 ) -> Option<[u8; 4]> {
     // Looked up BEFORE the Solo gate so a non-Solo connection carrying an
     // override is logged rather than silently dropped.
-    let prefix = {
+    let (prefix, worker, kind) = {
         let address = state.address.as_ref()?;
-        hooks
+        let channel = state.channels.get(&channel_id)?;
+        let prefix = hooks
             .custom_extranonce
-            .lookup(address.as_str(), &state.worker_name)?
+            .lookup(address.as_str(), &channel.worker)?;
+        (prefix, channel.worker.clone(), channel.kind)
     };
     if state.stream != StreamKind::Solo {
         warn!(
-            worker = %state.worker_name,
+            worker = %worker,
             stream = ?state.stream,
             "custom-extranonce override set for a non-Solo connection; ignoring \
              (the override applies only while mining Solo)"
@@ -982,13 +987,9 @@ fn maybe_apply_custom_extranonce<C: bp_vardiff::Clock>(
     }
     // Extended-only (the per-job prefix pin exists only there), checked BEFORE
     // arming so a Standard channel neither arms the watch nor drops it silently.
-    let kind = match state.channels.get(&channel_id) {
-        Some(c) => c.kind,
-        None => return None,
-    };
     if kind != crate::mining::channel::ChannelKind::Extended {
         warn!(
-            worker = %state.worker_name,
+            worker = %worker,
             channel_id,
             "custom-extranonce is Extended-channel only; the override for this Solo \
              worker does not apply to its Standard channel"
@@ -998,11 +999,12 @@ fn maybe_apply_custom_extranonce<C: bp_vardiff::Clock>(
     // Arms the per-template re-check, so a later change lands at the next
     // template without a reconnect.
     state.uses_custom_extranonce = true;
-    // Primary channel only: every channel resolves to the same override, so a
-    // second channel with it would duplicate the search space.
+    // Primary channel only: one override prefix per connection, so two
+    // channels of one worker never share a search space. Another worker's
+    // override on this connection applies once its channel is the primary.
     if Some(channel_id) != state.primary_channel {
         warn!(
-            worker = %state.worker_name,
+            worker = %worker,
             channel_id,
             "custom-extranonce applies to the primary channel only; this additional \
              channel keeps its pool-allocated prefix"
@@ -1034,22 +1036,23 @@ fn custom_extranonce_broadcast_frames<C: bp_vardiff::Clock>(
     if state.stream != StreamKind::Solo {
         return Vec::new();
     }
+    // Only the primary channel carries the override, as at channel-open
+    // (`maybe_apply_custom_extranonce`), looked up by that channel's worker.
+    let Some(primary) = state.primary_channel else {
+        return Vec::new();
+    };
     let prefix = {
-        let Some(address) = state.address.as_ref() else {
+        let (Some(address), Some(channel)) = (state.address.as_ref(), state.channels.get(&primary))
+        else {
             return Vec::new();
         };
         match hooks
             .custom_extranonce
-            .lookup(address.as_str(), &state.worker_name)
+            .lookup(address.as_str(), &channel.worker)
         {
             Some(p) => p,
             None => return Vec::new(),
         }
-    };
-    // Only the primary channel carries the override, as at channel-open
-    // (`maybe_apply_custom_extranonce`).
-    let Some(primary) = state.primary_channel else {
-        return Vec::new();
     };
     let mut frames = Vec::new();
     if let Some(channel) = state.channels.get_mut(&primary) {
@@ -1323,7 +1326,6 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
     hooks: &MiningServerHooks,
 ) {
     let address_str = state.address.as_ref().map(|a| a.as_str()).unwrap_or("");
-    let worker_str = state.worker_name.as_str();
 
     for event in events {
         match event {
@@ -1333,6 +1335,7 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
             SessionEvent::Disconnect { .. } => {}
             SessionEvent::ChannelOpened {
                 channel_id,
+                session_id,
                 address,
                 worker,
                 kind,
@@ -1354,6 +1357,7 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                 tracing::info!(
                     session_id_hex,
                     channel_id,
+                    channel_session = %session_id,
                     address = %address.as_str(),
                     worker = %worker,
                     kind = ?kind,
@@ -1369,41 +1373,50 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                     .on_device_event(
                         address.as_str(),
                         &worker,
-                        session_id_hex,
+                        &session_id,
                         Some(session_user_agent(state.user_agent.as_deref())),
                         true,
                     )
                     .await;
             }
-            SessionEvent::ChannelClosed { .. } => {
+            SessionEvent::ChannelClosed {
+                session_id, worker, ..
+            } => {
                 if !address_str.is_empty() {
                     hooks
                         .device_status_sink
                         .on_device_event(
                             address_str,
-                            worker_str,
-                            session_id_hex,
+                            &worker,
+                            &session_id,
                             Some(session_user_agent(state.user_agent.as_deref())),
                             false,
                         )
                         .await;
                 }
+                hooks
+                    .session_persistence
+                    .deregister_session(&session_id)
+                    .await;
             }
             SessionEvent::DifficultyChanged { .. } => {
                 // Per channel, since SV2 difficulty is per channel.
                 bp_metrics::record_stratum_difficulty_adjustment();
             }
             SessionEvent::ShareAccepted { channel_id, accept } => {
+                let channel = state.channels.get(&channel_id).expect(
+                    "the submit handler emits ShareAccepted only for an open channel, \
+                     and nothing closes one before its events are applied",
+                );
                 // ext 0x0002 Worker-ID: a per-share worker name overrides the
-                // channel default (ext 0x0002/Behavior Based on Negotiation).
+                // channel's (ext 0x0002/Behavior Based on Negotiation).
                 let effective_worker = accept
                     .effective_worker_name
                     .as_deref()
-                    .unwrap_or(worker_str);
-                let kind_label = match state.channels.get(&channel_id).map(|c| c.kind) {
-                    Some(crate::mining::channel::ChannelKind::Standard) => "Standard",
-                    Some(crate::mining::channel::ChannelKind::Extended) => "Extended",
-                    None => "Unknown",
+                    .unwrap_or(&channel.worker);
+                let kind_label = match channel.kind {
+                    crate::mining::channel::ChannelKind::Standard => "Standard",
+                    crate::mining::channel::ChannelKind::Extended => "Extended",
                 };
                 if accept.is_block_candidate {
                     tracing::info!(
@@ -1433,13 +1446,13 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                     .record_accepted(crate::shared_adapter::shared_accepted(
                         address_str,
                         effective_worker,
-                        session_id_hex,
+                        &channel.session_id,
                         state.user_agent.as_deref(),
                         &accept,
-                        // The per-session client row reports the whole
-                        // connection's rate, a bundled rig's total included.
-                        state.vardiff.values().map(|v| v.hash_rate()).sum::<f64>(),
-                        state.channels.len() as u32,
+                        state
+                            .vardiff
+                            .get(&channel_id)
+                            .map_or(0.0, |v| v.hash_rate()),
                     ))
                     .await;
                 if accept.is_block_candidate {
@@ -1451,7 +1464,7 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                             &accept,
                             address_str,
                             effective_worker,
-                            session_id_hex,
+                            &channel.session_id,
                             state.stream,
                         )
                         .await;
@@ -1459,21 +1472,17 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
             }
             SessionEvent::ShareRejected { channel_id, reject } => {
                 let address_opt = state.address.as_ref().map(|a| a.as_str());
-                let worker_opt = state.address.as_ref().map(|_| state.worker_name.as_str());
-                // Weighted with the channel's current difficulty, which vardiff moves.
-                let Some(difficulty) = state
-                    .channels
-                    .get(&channel_id)
-                    .map(|c| c.session_difficulty)
-                else {
+                let Some(channel) = state.channels.get(&channel_id) else {
                     continue;
                 };
+                let worker_opt = state.address.as_ref().map(|_| channel.worker.as_str());
+                // Weighted with the channel's current difficulty, which vardiff moves.
                 if let Some(share) = crate::shared_adapter::shared_rejected(
                     address_opt,
                     worker_opt,
-                    session_id_hex,
+                    &channel.session_id,
                     reject.reason,
-                    difficulty,
+                    channel.session_difficulty,
                 ) {
                     hooks.rejected_sink.record_rejected(share).await;
                 }
@@ -1486,6 +1495,7 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
 mod tests {
     use super::*;
     use crate::hooks::test_support::RecordingHooks;
+    use crate::mining::channel::ChannelState;
     use crate::mining::client::SessionEvent;
     use crate::mining::submit::{RejectReason, ShareAccept, ShareReject};
     use bp_jobs_lifecycle::JobClassification;
@@ -1540,7 +1550,6 @@ mod tests {
     fn fresh_session_with_address() -> MiningSessionState<Arc<TestClock>> {
         let mut s = MiningSessionState::new(Arc::new(TestClock::new(0)), 1, _port_cfg());
         s.address = Some(AddressId::new(ADDR.to_string()).unwrap());
-        s.worker_name = "wrk".to_string();
         s
     }
 
@@ -1578,6 +1587,8 @@ mod tests {
             channel_id,
             crate::mining::channel::ChannelState::new_extended(
                 channel_id,
+                "00000001".to_string(),
+                "wrk".to_string(),
                 prefix,
                 8,
                 Difficulty(1024.0),
@@ -1652,6 +1663,8 @@ mod tests {
             7,
             crate::mining::channel::ChannelState::new_standard(
                 7,
+                "00000001".to_string(),
+                "wrk".to_string(),
                 vec![0x00, 0x00, 0x00, 0x05],
                 Difficulty(1024.0),
                 [0xFF; 32],
@@ -1774,6 +1787,8 @@ mod tests {
             channel_id,
             crate::mining::channel::ChannelState::new_extended(
                 channel_id,
+                "00000001".to_string(),
+                "wrk".to_string(),
                 prefix,
                 8,
                 Difficulty(1024.0),
@@ -2015,11 +2030,25 @@ mod tests {
         }
     }
 
+    /// A Standard channel of `ADDR` with its own session and worker.
+    fn channel(channel_id: u32, session_id: &str, worker: &str) -> ChannelState {
+        ChannelState::new_standard(
+            channel_id,
+            session_id.to_string(),
+            worker.to_string(),
+            vec![0u8; 4],
+            Difficulty(1024.0),
+            [0xffu8; 32],
+            bp_jobs_lifecycle::LifecycleConfig::DEFAULT,
+        )
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn share_accepted_event_fires_accepted_sink() {
         let recording = RecordingHooks::new();
         let hooks = recording.clone().into_server_hooks();
-        let state = fresh_session_with_address();
+        let mut state = fresh_session_with_address();
+        state.channels.insert(1, channel(1, "0000000a", "wrk"));
         let events = vec![SessionEvent::ShareAccepted {
             channel_id: 1,
             accept: Box::new(accept()),
@@ -2029,75 +2058,75 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].address, ADDR);
         assert_eq!(records[0].worker, "wrk");
-        assert_eq!(records[0].session_id_hex, "sess-1");
+        assert_eq!(records[0].session_id_hex, "0000000a");
         assert!(recording.blocks_submitted.lock().unwrap().is_empty());
     }
 
-    /// Each accepted share carries the live open-channel count of its connection.
+    /// Two devices behind one proxy connection: a share (here a block) on the
+    /// second channel is that device's, under its own worker and session,
+    /// never the first channel's.
     #[tokio::test(flavor = "current_thread")]
-    async fn accepted_share_reports_open_channel_count() {
-        use crate::mining::channel::ChannelState;
-
-        let mk_channel = |cid: u32| {
-            ChannelState::new_standard(
-                cid,
-                vec![0u8; 4],
-                Difficulty(1024.0),
-                [0xffu8; 32],
-                bp_jobs_lifecycle::LifecycleConfig::DEFAULT,
-            )
-        };
-
-        // One channel (direct miner) → count 1.
+    async fn a_share_belongs_to_its_own_channels_worker_and_session() {
         let recording = RecordingHooks::new();
         let hooks = recording.clone().into_server_hooks();
         let mut state = fresh_session_with_address();
-        state.channels.insert(1, mk_channel(1));
+        state.channels.insert(1, channel(1, "0000000a", "rig1"));
+        state.channels.insert(2, channel(2, "0000000b", "rig2"));
+        let mut block = accept();
+        block.is_block_candidate = true;
         apply_session_events_generic(
             vec![SessionEvent::ShareAccepted {
-                channel_id: 1,
-                accept: Box::new(accept()),
+                channel_id: 2,
+                accept: Box::new(block),
             }],
             "sess-1",
             &state,
             &hooks,
         )
         .await;
-        assert_eq!(
-            recording.accepted.lock().unwrap()[0].channel_count,
-            1,
-            "a single-channel connection reports 1"
-        );
+        let records = recording.accepted.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].worker, "rig2");
+        assert_eq!(records[0].session_id_hex, "0000000b");
+        let blocks = recording.blocks_submitted.lock().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].worker, "rig2");
+        assert_eq!(blocks[0].session_id_hex, "0000000b");
+    }
 
-        // Three channels bundled on one connection → count 3.
+    /// Closing a channel ends exactly that channel's session, so every
+    /// `register_session` of a multi-channel connection is paired.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_closed_channel_ends_its_own_session() {
         let recording = RecordingHooks::new();
         let hooks = recording.clone().into_server_hooks();
-        let mut state = fresh_session_with_address();
-        for cid in 1..=3u32 {
-            state.channels.insert(cid, mk_channel(cid));
-        }
+        let state = fresh_session_with_address();
         apply_session_events_generic(
-            vec![SessionEvent::ShareAccepted {
-                channel_id: 1,
-                accept: Box::new(accept()),
+            vec![SessionEvent::ChannelClosed {
+                channel_id: 2,
+                session_id: "0000000b".to_string(),
+                worker: "rig2".to_string(),
+                reason: String::new(),
             }],
             "sess-1",
             &state,
             &hooks,
         )
         .await;
-        assert_eq!(
-            recording.accepted.lock().unwrap()[0].channel_count,
-            3,
-            "a bundled rig reports its open-channel count"
-        );
+        assert_eq!(*recording.deregistered.lock().unwrap(), vec!["0000000b"]);
+        let devices = recording.device_events.lock().unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].worker, "rig2");
+        assert_eq!(devices[0].session_id, "0000000b");
+        assert!(!devices[0].online, "offline flag");
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn block_candidate_event_also_fires_block_sink() {
         let recording = RecordingHooks::new();
         let hooks = recording.clone().into_server_hooks();
-        let state = fresh_session_with_address();
+        let mut state = fresh_session_with_address();
+        state.channels.insert(1, channel(1, "0000000a", "wrk"));
         let mut a = accept();
         a.is_block_candidate = true;
         let events = vec![SessionEvent::ShareAccepted {
@@ -2118,6 +2147,8 @@ mod tests {
             1,
             crate::mining::channel::ChannelState::new_standard(
                 1,
+                "00000001".to_string(),
+                "wrk".to_string(),
                 vec![0; 4],
                 Difficulty(1024.0),
                 [0xFF; 32],
@@ -2144,6 +2175,8 @@ mod tests {
         let mut state = fresh_session_with_address();
         let mut channel = crate::mining::channel::ChannelState::new_standard(
             1,
+            "00000001".to_string(),
+            "worker".to_string(),
             vec![0; 4],
             Difficulty(1024.0),
             [0xFF; 32],
@@ -2168,6 +2201,7 @@ mod tests {
         let state = fresh_session_with_address();
         let events = vec![SessionEvent::ChannelOpened {
             channel_id: 42,
+            session_id: "0000002a".to_string(),
             address: AddressId::new(ADDR.to_string()).unwrap(),
             worker: "worker-7".to_string(),
             kind: crate::mining::channel::ChannelKind::Standard,
@@ -2178,8 +2212,12 @@ mod tests {
         // Device-online event fired (address is the session's locked one).
         let devices = recording.device_events.lock().unwrap();
         assert_eq!(devices.len(), 1);
-        assert_eq!(devices[0].1, "worker-7");
-        assert!(devices[0].2, "online flag");
+        assert_eq!(devices[0].worker, "worker-7");
+        assert_eq!(
+            devices[0].session_id, "0000002a",
+            "the channel's own session"
+        );
+        assert!(devices[0].online, "online flag");
     }
 
     /// An empty event list makes no hook calls.

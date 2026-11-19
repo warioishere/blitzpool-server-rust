@@ -12,6 +12,7 @@ use bitcoin::Network;
 use bp_share::Difficulty;
 use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
 use bp_stratum_v2::extranonce::SharedExtranonceAllocator;
+use bp_stratum_v2::hooks::test_support::RecordingHooks;
 use bp_stratum_v2::hooks::MiningServerHooks;
 use bp_stratum_v2::mining::client::{PortConfig, FLAG_REQUIRES_VERSION_ROLLING};
 use bp_stratum_v2::noise::NoiseConfig;
@@ -21,7 +22,7 @@ use stratum_apps::key_utils::Secp256k1PublicKey;
 use stratum_apps::network_helpers::connect_with_noise;
 use stratum_apps::network_helpers::noise_stream::{NoiseTcpReadHalf, NoiseTcpWriteHalf};
 use stratum_core::common_messages_sv2::{Protocol, SetupConnectionOwned};
-use stratum_core::mining_sv2::OpenExtendedMiningChannelOwned;
+use stratum_core::mining_sv2::{CloseChannelOwned, OpenExtendedMiningChannelOwned};
 use stratum_core::parsers_sv2::{AnyMessageOwned, CommonMessagesOwned, MiningOwned};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
@@ -102,11 +103,76 @@ async fn two_ports_hand_out_distinct_prefixes() {
     port_b.shutdown().await;
 }
 
+/// Every session a connection registers ends exactly once: two channels open
+/// (one session each), one closes with `CloseChannel`, then the socket drops
+/// and teardown ends the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_channel_session_ends_exactly_once() {
+    let recording = RecordingHooks::new();
+    let (server, _updates_tx) =
+        spawn_server_with(sv2_extranonce(), recording.clone().into_server_hooks());
+    let (mut reader, mut writer) = connect_and_setup(&server).await;
+    let (rig1, _) = open_channel(&mut reader, &mut writer, 1, "rig1").await;
+    open_channel(&mut reader, &mut writer, 2, "rig2").await;
+    wait_until(Duration::from_secs(5), || {
+        recording.registered.lock().unwrap().len() == 2
+    })
+    .await;
+
+    let close = AnyMessageOwned::Mining(MiningOwned::CloseChannel(CloseChannelOwned {
+        channel_id: rig1,
+        reason_code: "test".to_string().try_into().unwrap(),
+    }));
+    write_any_message(&mut writer, close).await;
+    wait_until(Duration::from_secs(5), || {
+        recording.deregistered.lock().unwrap().len() == 1
+    })
+    .await;
+
+    drop(reader);
+    drop(writer);
+    wait_until(Duration::from_secs(5), || {
+        recording.deregistered.lock().unwrap().len() == 2
+    })
+    .await;
+    // Teardown has run; nothing may deregister a third time.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut registered: Vec<String> = recording
+        .registered
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| r.session_id_hex.clone())
+        .collect();
+    let mut deregistered = recording.deregistered.lock().unwrap().clone();
+    registered.sort();
+    deregistered.sort();
+    assert_eq!(registered.len(), 2, "one session per channel");
+    assert_ne!(
+        registered[0], registered[1],
+        "each channel has its own session"
+    );
+    assert_eq!(
+        registered, deregistered,
+        "every registered session ends exactly once"
+    );
+
+    server.shutdown().await;
+}
+
 /// Spawn a server on `extranonce` with an empty template snapshot. The
 /// template sender is handed back so the caller keeps it alive for the whole
 /// test.
 fn spawn_server(
     extranonce: SharedExtranonceAllocator,
+) -> (StratumV2MiningServer, broadcast::Sender<TemplateUpdate>) {
+    spawn_server_with(extranonce, MiningServerHooks::no_op())
+}
+
+fn spawn_server_with(
+    extranonce: SharedExtranonceAllocator,
+    hooks: MiningServerHooks,
 ) -> (StratumV2MiningServer, broadcast::Sender<TemplateUpdate>) {
     let (updates_tx, updates_rx) = broadcast::channel::<TemplateUpdate>(8);
     let noise_config =
@@ -117,7 +183,7 @@ fn spawn_server(
         updates_rx,
         bp_template_distribution::TemplateSnapshot::default(),
         Vec::new(),
-        MiningServerHooks::no_op(),
+        hooks,
         Arc::new(RwLock::new(JdpDeclaredJobRegistry::new())),
         extranonce,
         Arc::new(bp_mining_job::MiningJobCache::new()),
@@ -131,6 +197,15 @@ fn spawn_server(
 async fn open_extended_channel(
     server: &StratumV2MiningServer,
 ) -> (Vec<u8>, NoiseTcpReadHalf, NoiseTcpWriteHalf) {
+    let (mut reader, mut writer) = connect_and_setup(server).await;
+    let (_, prefix) = open_channel(&mut reader, &mut writer, 1, "worker-release").await;
+    (prefix, reader, writer)
+}
+
+/// Connect a miner to `server` through Noise and complete `SetupConnection`.
+async fn connect_and_setup(
+    server: &StratumV2MiningServer,
+) -> (NoiseTcpReadHalf, NoiseTcpWriteHalf) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     let port_config = PortConfig {
@@ -179,23 +254,34 @@ async fn open_extended_channel(
         ),
     }
 
+    (reader, writer)
+}
+
+/// Open an Extended channel for `worker` on a set-up connection. Returns the
+/// channel id and the prefix the pool assigned.
+async fn open_channel(
+    reader: &mut NoiseTcpReadHalf,
+    writer: &mut NoiseTcpWriteHalf,
+    request_id: u32,
+    worker: &str,
+) -> (u32, Vec<u8>) {
     let open = AnyMessageOwned::Mining(MiningOwned::OpenExtendedMiningChannel(
         OpenExtendedMiningChannelOwned {
-            request_id: 1,
-            user_identity: format!("{REGTEST_ADDR}.worker-release").try_into().unwrap(),
+            request_id,
+            user_identity: format!("{REGTEST_ADDR}.{worker}").try_into().unwrap(),
             nominal_hash_rate: 5.0e12,
             max_target: [0xFFu8; 32].into(),
             min_extranonce_size: 8,
         },
     ));
-    write_any_message(&mut writer, open).await;
+    write_any_message(writer, open).await;
 
     // Drain until the channel is open — SetTarget and friends may interleave.
     for _ in 0..16 {
         if let AnyMessageOwned::Mining(MiningOwned::OpenExtendedMiningChannelSuccess(s)) =
-            read_any_message(&mut reader).await
+            read_any_message(reader).await
         {
-            return (s.extranonce_prefix.as_ref().to_vec(), reader, writer);
+            return (s.channel_id, s.extranonce_prefix.as_ref().to_vec());
         }
     }
     panic!("OpenExtendedMiningChannelSuccess within 16 frames");

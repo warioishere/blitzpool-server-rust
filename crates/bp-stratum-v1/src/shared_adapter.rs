@@ -25,8 +25,6 @@ pub(crate) fn shared_accepted<'a>(
         submission_difficulty: accept.submission_difficulty,
         is_block_candidate: accept.is_block_candidate,
         hash_rate,
-        // SV1 is one device per connection — never bundled.
-        channel_count: 1,
         ts_ms: bp_common::now_ms(),
         // Stamped downstream at the fan-out point; the protocol side has no
         // share sequence and no mode gate.
@@ -149,7 +147,6 @@ mod tests {
         assert_eq!(share.submission_difficulty, 2048.0);
         assert!(!share.is_block_candidate);
         assert_eq!(share.user_agent, Some("bitaxe/1.0"));
-        assert_eq!(share.channel_count, 1, "SV1 is one device per connection");
     }
 
     #[test]

@@ -72,7 +72,6 @@ pub(crate) struct TouchEntry {
     pub share_diff: f64,
     pub current_diff: Option<f32>,
     pub hash_rate: Option<f64>,
-    pub channel_count: i32,
     pub updated_at_ms: i64,
 }
 
@@ -106,7 +105,6 @@ impl TouchBuffer {
         share_diff: f64,
         current_diff: Option<f32>,
         hash_rate: f64,
-        channel_count: i32,
         updated_at_ms: i64,
     ) {
         // Postgres sorts NaN above every number, so one would pin the
@@ -127,8 +125,6 @@ impl TouchBuffer {
             if hash_rate.is_some() {
                 e.hash_rate = hash_rate;
             }
-            // Latest wins: the freshest share reflects the current channel count.
-            e.channel_count = channel_count;
             if updated_at_ms > e.updated_at_ms {
                 e.updated_at_ms = updated_at_ms;
             }
@@ -139,7 +135,6 @@ impl TouchBuffer {
                     share_diff,
                     current_diff,
                     hash_rate,
-                    channel_count,
                     updated_at_ms,
                 },
             );
@@ -302,9 +297,9 @@ mod tests {
             client_name: "wkr".into(),
             session_id: "sess".into(),
         };
-        buf.record(kref(&key), 100.0, Some(8.0), 1.0e12, 1, 1000);
-        buf.record(kref(&key), 50.0, Some(16.0), 2.0e12, 1, 2000);
-        buf.record(kref(&key), 200.0, None, 0.0, 3, 1500);
+        buf.record(kref(&key), 100.0, Some(8.0), 1.0e12, 1000);
+        buf.record(kref(&key), 50.0, Some(16.0), 2.0e12, 2000);
+        buf.record(kref(&key), 200.0, None, 0.0, 1500);
 
         let snap = buf.take();
         assert_eq!(snap.len(), 1);
@@ -316,7 +311,6 @@ mod tests {
             Some(2.0e12),
             "latest positive rate; vardiff's 0 does not clobber it"
         );
-        assert_eq!(entry.channel_count, 3, "latest sample wins");
         assert_eq!(
             entry.updated_at_ms, 2000,
             "max timestamp (out-of-order safe)"
@@ -339,12 +333,11 @@ mod tests {
                 share_diff: 100.0,
                 current_diff: Some(8.0),
                 hash_rate: Some(1.0e12),
-                channel_count: 1,
                 updated_at_ms: 1000,
             },
         );
         // Meanwhile a new share landed.
-        buf.record(kref(&key), 50.0, Some(16.0), 2.0e12, 1, 2000);
+        buf.record(kref(&key), 50.0, Some(16.0), 2.0e12, 2000);
         // DB failed → hand the snapshot back.
         buf.restore(snap);
 
@@ -368,7 +361,7 @@ mod tests {
             client_name: "c".into(),
             session_id: "s".into(),
         };
-        buf.record(kref(&key), 1.0, None, 0.0, 1, 1);
+        buf.record(kref(&key), 1.0, None, 0.0, 1);
         assert_eq!(buf.len(), 1);
         let snap = buf.take();
         assert_eq!(snap.len(), 1);
@@ -384,13 +377,13 @@ mod tests {
             client_name: "wkr".into(),
             session_id: "sess".into(),
         };
-        b.record(kref(&k), f64::INFINITY, None, 0.0, 1, 1);
-        b.record(kref(&k), f64::NAN, None, 0.0, 1, 1);
+        b.record(kref(&k), f64::INFINITY, None, 0.0, 1);
+        b.record(kref(&k), f64::NAN, None, 0.0, 1);
         assert_eq!(b.len(), 0, "an unusable share_diff creates no entry");
 
         // A finite share with a non-finite vardiff target and rate keeps
         // the entry but drops the unusable fields.
-        b.record(kref(&k), 5.0, Some(f32::INFINITY), f64::NAN, 1, 1);
+        b.record(kref(&k), 5.0, Some(f32::INFINITY), f64::NAN, 1);
         assert_eq!(b.len(), 1);
         let snap = b.take();
         let e = snap.values().next().expect("entry");
@@ -408,11 +401,11 @@ mod tests {
             session_id: sid,
         };
         // The second share must find the first's entry via the borrowed ref.
-        buf.record(r("abc123"), 42.0, Some(8.0), 0.0, 1, 1000);
-        buf.record(r("abc123"), 99.0, None, 0.0, 1, 2000);
+        buf.record(r("abc123"), 42.0, Some(8.0), 0.0, 1000);
+        buf.record(r("abc123"), 99.0, None, 0.0, 2000);
         assert_eq!(buf.len(), 1, "same identity must coalesce, not duplicate");
         // A different session_id must be a distinct entry (no false hit).
-        buf.record(r("zzz999"), 1.0, None, 0.0, 1, 3000);
+        buf.record(r("zzz999"), 1.0, None, 0.0, 3000);
         assert_eq!(buf.len(), 2, "distinct identity is a separate entry");
 
         // Retrievable by the owned key: both hash and compare identically.

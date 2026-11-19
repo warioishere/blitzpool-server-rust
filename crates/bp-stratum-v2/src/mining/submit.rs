@@ -561,6 +561,8 @@ mod tests {
     fn std_channel() -> ChannelState {
         ChannelState::new_standard(
             1,
+            "00000001".to_string(),
+            "worker".to_string(),
             vec![0u8; 4],
             Difficulty(1024.0),
             max_target(),
@@ -571,6 +573,8 @@ mod tests {
     fn ext_channel() -> ChannelState {
         ChannelState::new_extended(
             2,
+            "00000001".to_string(),
+            "worker".to_string(),
             vec![0u8; 4],
             8,
             Difficulty(1024.0),

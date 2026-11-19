@@ -65,8 +65,8 @@ impl SharedSessionPersistence for SessionPersistenceHook {
 }
 
 /// Buffers every accepted share for the session's best (onto its row) and its
-/// `client:live:*` hash (TTL, current difficulty, vardiff's hashrate, channel
-/// count, freshest share), one write per session per flush.
+/// `client:live:*` hash (TTL, current difficulty, vardiff's hashrate,
+/// freshest share), one write per session per flush.
 #[derive(Clone)]
 pub struct ClientRowTouchSink {
     buffer: Arc<TouchBuffer>,
@@ -95,7 +95,6 @@ impl SharedAcceptedShareSink for ClientRowTouchSink {
             share.submission_difficulty,
             Some(share.effective_difficulty as f32),
             share.hash_rate,
-            share.channel_count as i32,
             // The front's accept time, not ours: a later stamp on a share that
             // arrives after the disconnect would make `kill_dead_clients`
             // revive a session that is already gone.

@@ -17,8 +17,6 @@ pub const KEY_SEP: char = '\u{1f}';
 pub const F_HASH_RATE: &str = "hash_rate";
 /// Hash field: latest vardiff target observed on an accepted share.
 pub const F_CURRENT_DIFFICULTY: &str = "current_difficulty";
-/// Hash field: channel count of the session's freshest share.
-pub const F_CHANNEL_COUNT: &str = "channel_count";
 /// Hash field: epoch-ms timestamp of the freshest accepted share.
 pub const F_UPDATED_AT_MS: &str = "updated_at_ms";
 

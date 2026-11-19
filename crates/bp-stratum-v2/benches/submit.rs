@@ -53,6 +53,8 @@ fn ext_channel() -> ChannelState {
     // channel_id=2, 4-byte extranonce prefix, 8-byte extranonce size.
     ChannelState::new_extended(
         2,
+        "00000001".to_string(),
+        "worker".to_string(),
         vec![0u8; 4],
         8,
         Difficulty(1024.0),

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bp_common::live_client_key::{
-    client_live_key, F_CHANNEL_COUNT, F_CURRENT_DIFFICULTY, F_HASH_RATE, F_UPDATED_AT_MS,
+    client_live_key, F_CURRENT_DIFFICULTY, F_HASH_RATE, F_UPDATED_AT_MS,
 };
 use bp_session_persistence::{
     SessionPersistenceConfig, SessionPersistenceEngine, SessionPersistenceEngineHandle,
@@ -74,7 +74,6 @@ fn share<'a>(
     session_id: &'a str,
     submission_difficulty: f64,
     effective_difficulty: f64,
-    channel_count: u32,
 ) -> SharedAcceptedShare<'a> {
     SharedAcceptedShare {
         address,
@@ -85,7 +84,6 @@ fn share<'a>(
         user_agent: Some("bitaxe"),
         is_block_candidate: false,
         hash_rate: 0.0,
-        channel_count,
         ts_ms: bp_common::now_ms(),
         share_id: "",
         mode: bp_share_hook::MiningMode::Solo,
@@ -139,7 +137,7 @@ async fn touch_flush_dual_writes_hash_and_ttl() {
     hook.register_session("sessL001", &address, "rig1", Some("bitaxe"))
         .await;
     handle.flush_births_now().await;
-    sink.record_accepted(share(&address, "rig1", "sessL001", 100.5, 64.0, 2))
+    sink.record_accepted(share(&address, "rig1", "sessL001", 100.5, 64.0))
         .await;
 
     let rows = handle.flush_touches_now().await;
@@ -158,7 +156,6 @@ async fn touch_flush_dual_writes_hash_and_ttl() {
         hash.get(F_CURRENT_DIFFICULTY).map(String::as_str),
         Some("64")
     );
-    assert_eq!(hash.get(F_CHANNEL_COUNT).map(String::as_str), Some("2"));
     let updated: i64 = hash
         .get(F_UPDATED_AT_MS)
         .expect("updated_at_ms present")
@@ -198,7 +195,7 @@ async fn a_late_consumed_share_keeps_its_acceptance_time() {
     let accepted_at = bp_common::now_ms() - 60_000;
     sink.record_accepted(SharedAcceptedShare {
         ts_ms: accepted_at,
-        ..share(&address, "rig1", "sessL009", 100.0, 64.0, 1)
+        ..share(&address, "rig1", "sessL009", 100.0, 64.0)
     })
     .await;
     handle.flush_touches_now().await;
@@ -240,9 +237,9 @@ async fn a_reset_zeroes_one_addresss_session_bests() {
     hook.register_session("sessC002", &other, "rig1", Some("bitaxe"))
         .await;
     handle.flush_births_now().await;
-    sink.record_accepted(share(&mine, "rig1", "sessC001", 100.5, 64.0, 2))
+    sink.record_accepted(share(&mine, "rig1", "sessC001", 100.5, 64.0))
         .await;
-    sink.record_accepted(share(&other, "rig1", "sessC002", 543.5, 32.0, 1))
+    sink.record_accepted(share(&other, "rig1", "sessC002", 543.5, 32.0))
         .await;
     handle.flush_touches_now().await;
     assert_eq!(
@@ -269,7 +266,7 @@ async fn a_reset_zeroes_one_addresss_session_bests() {
         "another miner's best is not collateral"
     );
 
-    sink.record_accepted(share(&mine, "rig1", "sessC001", 7.25, 64.0, 2))
+    sink.record_accepted(share(&mine, "rig1", "sessC001", 7.25, 64.0))
         .await;
     handle.flush_touches_now().await;
     assert_eq!(
@@ -305,20 +302,20 @@ async fn best_difficulty_is_monotone_across_flushes() {
         .await;
     handle.flush_births_now().await;
 
-    sink.record_accepted(share(&address, "rig1", "sessL002", 100.0, 64.0, 1))
+    sink.record_accepted(share(&address, "rig1", "sessL002", 100.0, 64.0))
         .await;
     handle.flush_touches_now().await;
     assert_eq!(row_best(&pool, "sessL002").await, 100.0);
 
-    sink.record_accepted(share(&address, "rig1", "sessL002", 50.0, 64.0, 3))
+    sink.record_accepted(share(&address, "rig1", "sessL002", 50.0, 128.0))
         .await;
     handle.flush_touches_now().await;
     assert_eq!(
         hgetall(&mut redis, &key)
             .await
-            .get(F_CHANNEL_COUNT)
+            .get(F_CURRENT_DIFFICULTY)
             .map(String::as_str),
-        Some("3"),
+        Some("128"),
         "second flush must have landed (latest-wins field)"
     );
     assert_eq!(
@@ -353,7 +350,7 @@ async fn a_session_keeps_its_best_when_its_live_key_expires() {
     hook.register_session("sessL010", &address, "rig1", None)
         .await;
     handle.flush_births_now().await;
-    sink.record_accepted(share(&address, "rig1", "sessL010", 123.0, 64.0, 1))
+    sink.record_accepted(share(&address, "rig1", "sessL010", 123.0, 64.0))
         .await;
     handle.flush_touches_now().await;
 
@@ -376,7 +373,7 @@ async fn a_session_keeps_its_best_when_its_live_key_expires() {
     );
 
     // Shares resume lower; the best stays.
-    sink.record_accepted(share(&address, "rig1", "sessL010", 5.0, 64.0, 1))
+    sink.record_accepted(share(&address, "rig1", "sessL010", 5.0, 64.0))
         .await;
     handle.flush_touches_now().await;
     assert_eq!(row_best(&pool, "sessL010").await, 123.0);
@@ -409,7 +406,7 @@ async fn touch_writes_vardiffs_rate_and_a_zero_keeps_it() {
     handle.flush_births_now().await;
     sink.record_accepted(SharedAcceptedShare {
         hash_rate: 5.0e12,
-        ..share(&address, "rig1", "sessL003", 100.0, 512.0, 1)
+        ..share(&address, "rig1", "sessL003", 100.0, 512.0)
     })
     .await;
     handle.flush_touches_now().await;
@@ -424,7 +421,7 @@ async fn touch_writes_vardiffs_rate_and_a_zero_keeps_it() {
     );
 
     // A share with vardiff's 0 keeps the stored rate.
-    sink.record_accepted(share(&address, "rig1", "sessL003", 100.0, 512.0, 1))
+    sink.record_accepted(share(&address, "rig1", "sessL003", 100.0, 512.0))
         .await;
     handle.flush_touches_now().await;
     assert_eq!(
@@ -516,7 +513,7 @@ async fn redis_down_does_not_hang_the_flush() {
     hook.register_session("sessL005", &address, "rig1", None)
         .await;
     handle.flush_births_now().await;
-    sink.record_accepted(share(&address, "rig1", "sessL005", 100.0, 64.0, 1))
+    sink.record_accepted(share(&address, "rig1", "sessL005", 100.0, 64.0))
         .await;
 
     let rows = tokio::time::timeout(Duration::from_secs(10), handle.flush_touches_now())
@@ -567,7 +564,7 @@ async fn live_reader_agrees_with_the_writer() {
             .await;
         sink.record_accepted(SharedAcceptedShare {
             hash_rate: per_session,
-            ..share(addr.as_str(), "rig1", sess, 100.0, 600.0, 1)
+            ..share(addr.as_str(), "rig1", sess, 100.0, 600.0)
         })
         .await;
     }
@@ -642,7 +639,7 @@ async fn composed_reader_returns_the_writers_fields_in_position() {
 
     sink.record_accepted(SharedAcceptedShare {
         hash_rate: 5.0e12,
-        ..share(&address, "rig1", "sessL009", 100.5, 64.0, 2)
+        ..share(&address, "rig1", "sessL009", 100.5, 64.0)
     })
     .await;
     handle.flush_touches_now().await;
@@ -659,7 +656,6 @@ async fn composed_reader_returns_the_writers_fields_in_position() {
     assert_eq!(live.len(), 2);
     let lf = live[0].as_ref().expect("flushed session has live fields");
     assert_eq!(lf.current_difficulty, Some(64.0));
-    assert_eq!(lf.channel_count, Some(2));
     assert_eq!(lf.hash_rate, 5.0e12, "the share's vardiff rate");
     assert!(lf.updated_at_ms.is_some());
     assert_eq!(live[1], None, "unknown session stays None in position");
@@ -699,7 +695,6 @@ async fn a_failed_best_write_still_refreshes_the_live_hash() {
             "sessL020",
             100.0,
             512.0,
-            1,
         ))
         .await;
     handle.flush_touches_now().await;
@@ -734,7 +729,7 @@ async fn a_nul_byte_in_one_worker_name_does_not_block_the_other_bests() {
     handle.flush_births_now().await;
 
     let sink = handle.client_row_touch_sink();
-    sink.record_accepted(share(&healthy, "rig1", "sessL030", 700.0, 512.0, 1))
+    sink.record_accepted(share(&healthy, "rig1", "sessL030", 700.0, 512.0))
         .await;
     sink.record_accepted(share(
         &format!("{prefix}bob"),
@@ -742,7 +737,6 @@ async fn a_nul_byte_in_one_worker_name_does_not_block_the_other_bests() {
         "sessL031",
         900.0,
         512.0,
-        1,
     ))
     .await;
     handle.flush_touches_now().await;

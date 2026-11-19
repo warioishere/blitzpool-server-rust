@@ -19,17 +19,15 @@ use crate::touch_buffer::{TouchEntry, TouchKey};
 /// Keys per script invocation, bounding one EVAL's server blocking time.
 const CHUNK: usize = 400;
 
-/// Touch write. `ARGV[1]` = TTL seconds, then a stride of 4 per key:
-/// current difficulty and hashrate ("" keeps the stored value), channel count,
-/// last-seen epoch-ms. The session's best lives on its Postgres row.
+/// Touch write. `ARGV[1]` = TTL seconds, then a stride of 3 per key:
+/// current difficulty and hashrate ("" keeps the stored value), last-seen
+/// epoch-ms. The session's best lives on its Postgres row.
 const TOUCH_LIVE_LUA: &str = r#"
 local ttl = tonumber(ARGV[1])
 for i = 1, #KEYS do
-    local base = 1 + (i - 1) * 4
+    local base = 1 + (i - 1) * 3
     local key = KEYS[i]
-    redis.call('HSET', key,
-        'channel_count', ARGV[base + 3],
-        'updated_at_ms', ARGV[base + 4])
+    redis.call('HSET', key, 'updated_at_ms', ARGV[base + 3])
     if ARGV[base + 1] ~= '' then
         redis.call('HSET', key, 'current_difficulty', ARGV[base + 1])
     end
@@ -48,19 +46,18 @@ struct Batch {
     args: Vec<String>,
 }
 
-/// Chunked touch batches, stride 4 (see [`TOUCH_LIVE_LUA`]).
+/// Chunked touch batches, stride 3 (see [`TOUCH_LIVE_LUA`]).
 fn build_touch_batches(snapshot: &HashMap<TouchKey, TouchEntry>) -> Vec<Batch> {
     let entries: Vec<(&TouchKey, &TouchEntry)> = snapshot.iter().collect();
     entries
         .chunks(CHUNK)
         .map(|chunk| {
             let mut keys = Vec::with_capacity(chunk.len());
-            let mut args = Vec::with_capacity(chunk.len() * 4);
+            let mut args = Vec::with_capacity(chunk.len() * 3);
             for (k, v) in chunk {
                 keys.push(client_live_key(&k.address, &k.client_name, &k.session_id));
                 args.push(v.current_diff.map(|d| d.to_string()).unwrap_or_default());
                 args.push(v.hash_rate.map(|r| r.to_string()).unwrap_or_default());
-                args.push(v.channel_count.to_string());
                 args.push(v.updated_at_ms.to_string());
             }
             Batch { keys, args }
@@ -126,9 +123,7 @@ impl LiveSessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bp_common::live_client_key::{
-        F_CHANNEL_COUNT, F_CURRENT_DIFFICULTY, F_HASH_RATE, F_UPDATED_AT_MS,
-    };
+    use bp_common::live_client_key::{F_CURRENT_DIFFICULTY, F_HASH_RATE, F_UPDATED_AT_MS};
     use bp_test_support::{connect_redis_in_range_or_skip, redis_db};
 
     fn key(n: usize) -> TouchKey {
@@ -144,7 +139,6 @@ mod tests {
             share_diff: 100.5,
             current_diff: Some(64.0),
             hash_rate: Some(5.0e12),
-            channel_count: 2,
             updated_at_ms: 1_700_000_000_000,
         }
     }
@@ -152,12 +146,7 @@ mod tests {
     // The Lua field-name literals match the shared schema constants.
     #[test]
     fn lua_field_names_match_the_shared_schema() {
-        for field in [
-            F_CURRENT_DIFFICULTY,
-            F_HASH_RATE,
-            F_CHANNEL_COUNT,
-            F_UPDATED_AT_MS,
-        ] {
+        for field in [F_CURRENT_DIFFICULTY, F_HASH_RATE, F_UPDATED_AT_MS] {
             assert!(
                 TOUCH_LIVE_LUA.contains(&format!("'{field}'")),
                 "touch script lost field {field}"
@@ -166,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn touch_batch_layout_is_stride_four_per_key() {
+    fn touch_batch_layout_is_stride_three_per_key() {
         let mut snap = HashMap::new();
         snap.insert(key(1), entry());
         let batches = build_touch_batches(&snap);
@@ -174,8 +163,8 @@ mod tests {
         assert_eq!(batches[0].keys.len(), 1);
         assert_eq!(
             batches[0].args,
-            vec!["64", "5000000000000", "2", "1700000000000"],
-            "stride must be current, hashrate, channels, updated_at"
+            vec!["64", "5000000000000", "1700000000000"],
+            "stride must be current, hashrate, updated_at"
         );
     }
 
@@ -243,6 +232,6 @@ mod tests {
         let batches = build_touch_batches(&snap);
         assert_eq!(batches.len(), 2, "CHUNK+1 entries need a second invocation");
         assert_eq!(batches[0].keys.len() + batches[1].keys.len(), CHUNK + 1);
-        assert_eq!(batches[0].args.len(), batches[0].keys.len() * 4);
+        assert_eq!(batches[0].args.len(), batches[0].keys.len() * 3);
     }
 }

@@ -27,6 +27,13 @@ pub struct ChannelState {
     pub channel_id: u32,
     pub kind: ChannelKind,
 
+    /// The channel's own session: each channel is one device with its own
+    /// worker name, client row and hashrate, as in the SV2 reference pool.
+    /// The connection shares only the address.
+    pub session_id: String,
+    /// Worker name from this channel's `user_identity`.
+    pub worker: String,
+
     /// Pool-assigned extranonce prefix. 4 bytes typical for Standard
     /// (the entire prefix); 4–8 bytes for Extended (variable, allocated
     /// by [`crate::extranonce::ConnectionExtranonce`]).
@@ -73,6 +80,8 @@ pub struct ChannelState {
 impl ChannelState {
     pub fn new_standard(
         channel_id: u32,
+        session_id: String,
+        worker: String,
         extranonce_prefix: Vec<u8>,
         session_difficulty: Difficulty,
         declared_max_target: [u8; 32],
@@ -81,6 +90,8 @@ impl ChannelState {
         Self {
             channel_id,
             kind: ChannelKind::Standard,
+            session_id,
+            worker,
             extranonce_prefix,
             extranonce_size: 0,
             session_difficulty,
@@ -94,8 +105,11 @@ impl ChannelState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_extended(
         channel_id: u32,
+        session_id: String,
+        worker: String,
         extranonce_prefix: Vec<u8>,
         extranonce_size: u8,
         session_difficulty: Difficulty,
@@ -105,6 +119,8 @@ impl ChannelState {
         Self {
             channel_id,
             kind: ChannelKind::Extended,
+            session_id,
+            worker,
             extranonce_prefix,
             extranonce_size,
             session_difficulty,
@@ -147,6 +163,8 @@ mod tests {
     fn standard_channel_starts_clean() {
         let ch = ChannelState::new_standard(
             1,
+            "00000001".to_string(),
+            "worker".to_string(),
             vec![0; 4],
             Difficulty(1024.0),
             max_target(),
@@ -165,6 +183,8 @@ mod tests {
     fn extended_channel_starts_clean() {
         let ch = ChannelState::new_extended(
             2,
+            "00000001".to_string(),
+            "worker".to_string(),
             vec![0; 4],
             8,
             Difficulty(1024.0),
@@ -187,6 +207,8 @@ mod tests {
         tgt[31] = 0xFF;
         let ch = ChannelState::new_standard(
             1,
+            "00000001".to_string(),
+            "worker".to_string(),
             vec![0; 4],
             Difficulty(1.0),
             tgt,
@@ -204,6 +226,8 @@ mod tests {
     fn full_extranonce_size_is_sum_of_prefix_and_rollable() {
         let ch = ChannelState::new_standard(
             1,
+            "00000001".to_string(),
+            "worker".to_string(),
             vec![0; 4],
             Difficulty(1.0),
             max_target(),
@@ -212,6 +236,8 @@ mod tests {
         assert_eq!(ch.full_extranonce_size(), 4);
         let ch = ChannelState::new_extended(
             2,
+            "00000001".to_string(),
+            "worker".to_string(),
             vec![0; 6],
             6,
             Difficulty(1.0),
