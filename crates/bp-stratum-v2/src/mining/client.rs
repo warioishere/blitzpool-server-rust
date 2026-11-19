@@ -1524,10 +1524,11 @@ fn standard_member_root_and_coinbase(
 
 // ── apply_template_broadcast ────────────────────────────────────────
 
-/// A [`TemplateBroadcast`] for a connection that set `REQUIRES_WORK_SELECTION`
-/// (SV2 Mining/SetupConnection): it mines only the jobs it sets with
-/// `SetCustomMiningJob`, so it gets no pool job. A block change retires its
-/// custom jobs on the old tip.
+/// A [`TemplateBroadcast`] that brings this connection no pool job: one that
+/// set `REQUIRES_WORK_SELECTION` (SV2 Mining/SetupConnection) mines only the
+/// jobs it sets with `SetCustomMiningJob`, and any other gets none while its
+/// payouts do not resolve. A block change still retires the jobs on the old
+/// tip and forgets the groups' jobs pinned to it.
 pub fn apply_template_change_without_jobs<C: Clock>(
     state: &mut MiningSessionState<C>,
     broadcast: &TemplateBroadcast,
@@ -1538,6 +1539,7 @@ pub fn apply_template_change_without_jobs<C: Clock>(
             for channel in state.channels.values_mut() {
                 retire_for_new_block(channel, &broadcast.template, now_ms);
             }
+            state.groups.forget_current_jobs();
         }
         TemplateChange::Refresh => {}
     }
@@ -4662,6 +4664,52 @@ pub(crate) mod tests {
         );
         assert!(out.outbound.is_empty(), "got {:?}", out.outbound);
         assert_eq!(retired_at(&s), Some(3_000));
+    }
+
+    /// A block change that brings no pool job retires the grouped member's
+    /// job and forgets the group's, so a member opening next gets a job on
+    /// the new tip, not the group's old one.
+    #[test]
+    fn a_block_change_without_jobs_forgets_the_groups_job() {
+        let mut s = fresh_session();
+        handle_setup_connection(&mut s, &good_setup());
+        let _ = handle_open_extended_mining_channel(
+            &mut s,
+            &open_ext(1, &format!("{REGTEST_ADDR}.w")),
+            vec![0xAA, 0xBB, 0xCC, 0xDD],
+        );
+        let cid = s.primary_channel.expect("channel opened");
+        let gid = s
+            .groups
+            .group_for_channel(cid)
+            .expect("precondition: grouped");
+        let mj = synthetic_mining_job_inputs();
+        let _ = apply_template_broadcast(
+            &mut s,
+            &broadcast(TemplateChange::NewBlock, [0xAB; 32]),
+            &mj,
+            1_000,
+            None,
+        );
+        assert!(
+            s.groups.get(gid).unwrap().current_job().is_some(),
+            "precondition: the group holds a job on the old tip"
+        );
+
+        let _ = apply_template_change_without_jobs(
+            &mut s,
+            &broadcast(TemplateChange::NewBlock, [0xCC; 32]),
+            2_000,
+        );
+        assert!(s.groups.get(gid).unwrap().current_job().is_none());
+        assert!(s.groups.get(gid).unwrap().current_job_id().is_none());
+        assert!(
+            s.channels[&cid]
+                .extended_jobs
+                .values()
+                .all(|j| j.retired_at == Some(2_000)),
+            "the member's old-tip jobs are retired"
+        );
     }
 
     /// The Extended scriptsig_len varint is sized for the channel's own extranonce, not 12.

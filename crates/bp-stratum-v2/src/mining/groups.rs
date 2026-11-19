@@ -123,6 +123,16 @@ impl GroupChannelRegistry {
         group_id
     }
 
+    /// Forget every group's current job, so the next member onboarding or
+    /// broadcast builds from the current template instead of reusing a job
+    /// pinned to a tip that just changed.
+    pub fn forget_current_jobs(&mut self) {
+        for group in self.groups.values_mut() {
+            group.current_job_id = None;
+            group.current_job = None;
+        }
+    }
+
     /// Drop a channel from its group on channel close.
     pub fn remove_channel(&mut self, channel_id: u32) {
         if let Some(group_id) = self.group_for_channel(channel_id) {

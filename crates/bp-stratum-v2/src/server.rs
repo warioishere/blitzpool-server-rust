@@ -86,8 +86,8 @@ impl ServerConfig {
 // ── Constants ───────────────────────────────────────────────────────
 
 /// Broadcast-channel capacity for the translator → per-connection
-/// fan-out. Lagged subscribers see `RecvError::Lagged` and recover
-/// via the `current_template` snapshot on their next iteration.
+/// fan-out. A lagged subscriber sends its next job as a block change, so a
+/// skipped tip change still reaches the miner.
 const TEMPLATE_BROADCAST_CAPACITY: usize = 32;
 
 // ── StratumV2MiningServer ───────────────────────────────────────────
@@ -456,6 +456,10 @@ async fn run_mining_connection(
     // A fee refresh reaches this connection within `REFRESH_SPREAD`, at its
     // own offset, so the pool does not send it to every miner at once.
     let mut refresh_pacer = RefreshPacer::new(u64::from(session_id), REFRESH_SPREAD);
+    // Set while the open channels hold no job on the current tip (payouts did
+    // not resolve at a block change or at open): the next job that builds
+    // must announce the tip, whatever the template change that carries it.
+    let mut owes_new_block = false;
 
     let mut vardiff_tick = tokio::time::interval(Duration::from_millis(state.vardiff_interval_ms));
     vardiff_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -764,17 +768,18 @@ async fn run_mining_connection(
                             }
                         }
                         Ok(None) => {
-                            // OpenChannel stores the address synchronously,
-                            // so this is not expected; log it.
                             warn!(
-                                "sv2 connection {session_id_hex}: no address after OpenChannel"
+                                "sv2 connection {session_id_hex}: no payouts for the initial \
+                                 job; the next template announces the tip"
                             );
+                            owes_new_block = true;
                         }
                         Err(err) => {
                             warn!(
                                 "sv2 connection {session_id_hex}: initial mining_job build \
                                  failed: {err}"
                             );
+                            owes_new_block = true;
                         }
                     }
                 }
@@ -820,7 +825,12 @@ async fn run_mining_connection(
             broadcast_recv = refresh_pacer.next(&mut template_rx) => {
                 let payload = match broadcast_recv {
                     Ok(p) => p,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    // A skipped broadcast may have been the block change: the
+                    // next job announces the tip and retires the old one.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        owes_new_block |= !state.channels.is_empty();
+                        continue;
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
                 state.current_template = Some(payload.template.clone());
@@ -842,15 +852,23 @@ async fn run_mining_connection(
                     .await
                     {
                         Ok(Some(j)) => Some(j),
-                        Ok(None) => continue,
-                        Err(err) => {
-                            warn!(
-                                "sv2 connection {session_id_hex}: resolve_template_mining_job_inputs failed: {err}"
+                        unresolved => {
+                            if let Err(err) = unresolved {
+                                warn!(
+                                    "sv2 connection {session_id_hex}: resolve_template_mining_job_inputs failed: {err}"
+                                );
+                            }
+                            apply_unresolved_broadcast(
+                                &mut state,
+                                &payload,
+                                SystemClock.now_ms(),
+                                &mut owes_new_block,
                             );
                             continue;
                         }
                     }
                 };
+                let payload = broadcast_for_job(payload, &mut owes_new_block);
                 // Runs BEFORE the job build so the new job pins a changed
                 // custom extranonce prefix.
                 let mut en_frames = custom_extranonce_broadcast_frames(&mut state, &hooks);
@@ -936,6 +954,35 @@ fn session_user_agent(user_agent: Option<&str>) -> &str {
 }
 
 // ── Dispatch + Outbound write helpers ───────────────────────────────
+
+/// The broadcast a connection's pool job goes out under: a block change
+/// (future job, then `SetNewPrevHash`) while the connection owes one, since
+/// a job carries no prev hash and the miner would hash the old tip.
+fn broadcast_for_job(payload: TemplateBroadcast, owes_new_block: &mut bool) -> TemplateBroadcast {
+    if std::mem::take(owes_new_block) {
+        TemplateBroadcast {
+            template: payload.template,
+            change: TemplateChange::NewBlock,
+        }
+    } else {
+        payload
+    }
+}
+
+/// A broadcast this connection gets no pool job for (its payouts did not
+/// resolve): a block change still retires the old tip's jobs and leaves the
+/// tip owed to the next job that builds.
+fn apply_unresolved_broadcast<C: bp_vardiff::Clock>(
+    state: &mut MiningSessionState<C>,
+    payload: &TemplateBroadcast,
+    now_ms: u64,
+    owes_new_block: &mut bool,
+) {
+    if payload.change == TemplateChange::NewBlock && !state.channels.is_empty() {
+        *owes_new_block = true;
+    }
+    apply_template_change_without_jobs(state, payload, now_ms);
+}
 
 /// Swap an Extended channel onto `prefix` and return the
 /// [`OutboundFrame::SetExtranoncePrefix`] the caller must write before the
@@ -2230,6 +2277,44 @@ mod tests {
         assert!(recording.accepted.lock().unwrap().is_empty());
         assert!(recording.rejected.lock().unwrap().is_empty());
         assert!(recording.registered.lock().unwrap().is_empty());
+    }
+
+    // ── Unresolved broadcasts and the owed block change ───────────
+
+    /// A block change that brings no pool job leaves the tip owed, and the
+    /// next job goes out as a block change once, even under a refresh. A
+    /// refresh without a job, or a connection without channels, owes nothing.
+    #[test]
+    fn an_unresolved_block_change_owes_the_next_job_a_tip() {
+        let broadcast = |change| TemplateBroadcast {
+            template: Arc::new(active_template_fixture()),
+            change,
+        };
+        let mut owes = false;
+        let mut idle = fresh_session_with_address();
+        apply_unresolved_broadcast(
+            &mut idle,
+            &broadcast(TemplateChange::NewBlock),
+            1,
+            &mut owes,
+        );
+        assert!(!owes, "no channel holds a job to go stale");
+
+        let mut s = solo_session_with_extended_channel(1, vec![0; 4]);
+        apply_unresolved_broadcast(&mut s, &broadcast(TemplateChange::Refresh), 1, &mut owes);
+        assert!(!owes, "a refresh keeps the tip");
+        apply_unresolved_broadcast(&mut s, &broadcast(TemplateChange::NewBlock), 2, &mut owes);
+        assert!(owes, "the block change is owed");
+
+        assert_eq!(
+            broadcast_for_job(broadcast(TemplateChange::Refresh), &mut owes).change,
+            TemplateChange::NewBlock
+        );
+        assert!(!owes, "announced once");
+        assert_eq!(
+            broadcast_for_job(broadcast(TemplateChange::Refresh), &mut owes).change,
+            TemplateChange::Refresh
+        );
     }
 
     // ── resolve_template_mining_job_inputs ────────────────────────
