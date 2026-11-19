@@ -32,6 +32,7 @@ bp-share-hook = { workspace = true }
 # Accepted-share Redis-stream transport (core producer / satellite consumer).
 bp-share-stream = { workspace = true }
 bp-mining-mode = { workspace = true }
+bp-mode-payouts = { workspace = true }
 bp-pplns = { workspace = true }
 hex = { workspace = true }
 getrandom = { workspace = true }
@@ -39,7 +40,6 @@ bp-pplns-engine = { workspace = true }
 # Durable coinbase-budget persistence (autoscaler).
 bp-coinbase-snapshot = { workspace = true }
 bp-group-solo-engine = { workspace = true }
-bp-blockparty = { workspace = true }
 bp-blockparty-engine = { workspace = true }
 bp-share-stats-sink = { workspace = true }
 bp-stats = { workspace = true }

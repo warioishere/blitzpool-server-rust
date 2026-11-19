@@ -332,24 +332,6 @@ impl PayoutInfoEntry {
     }
 }
 
-/// What the real coinbase pays at this revenue, or nothing if the §4
-/// evaluation fails.
-fn payout_info_at(
-    built: &bp_coinbase_snapshot::BuiltDistribution,
-    reward_sats: u64,
-) -> Vec<PayoutInfoEntry> {
-    built
-        .distribution
-        .payout_entries_at(reward_sats)
-        .map(|entries| {
-            entries
-                .into_iter()
-                .map(|(a, sats)| PayoutInfoEntry::of_reward(a.into_inner(), sats, reward_sats))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ClientBlockTemplateResponse {
@@ -404,8 +386,10 @@ async fn client_block_template(
                 // the preview shows the mode the pool is actually using.
                 let resolved = crate::mode::resolve_address_mode(&s, &addr).await?;
 
+                // Group-Solo names a finder from the window (see
+                // `preview_finder`); every other mode builds for the asker.
                 let mut previewed_finder: Option<String> = None;
-                let payouts: Vec<PayoutInfoEntry> = match resolved {
+                let job_for = match resolved {
                     MiningModeResult::GroupSolo(gid) => match s.group_solo.as_ref() {
                         Some(engine) => {
                             let window = engine
@@ -416,48 +400,30 @@ async fn client_block_template(
                                 .unwrap_or_default();
                             let finder = preview_finder(&addr, &window);
                             previewed_finder = Some(finder.as_str().to_string());
-                            match engine.build_distribution(gid, reward_sats, &finder).await {
-                                Ok(dist) => payout_info_at(&dist, reward_sats),
-                                Err(_) => Vec::new(),
-                            }
+                            finder
                         }
-                        None => Vec::new(),
+                        // Without the engine the build is empty; no finder to name.
+                        None => addr.clone(),
                     },
-                    MiningModeResult::Blockparty(gid) => match s.blockparty.as_ref() {
-                        Some(bp) => match bp
-                            .payouts()
-                            .build_payouts(gid, bp_common::Sats(reward_sats as i64))
-                            .await
-                        {
-                            Ok(Some(dist)) => dist
-                                .payouts
-                                .iter()
-                                .map(|p| PayoutInfoEntry {
-                                    address: p.address.as_str().to_string(),
-                                    percent: p.percent,
-                                    sats: p.sats.0 as u64,
-                                })
-                                .collect(),
-                            _ => Vec::new(),
-                        },
-                        None => Vec::new(),
-                    },
-                    MiningModeResult::Pplns => match s.pplns.as_ref() {
-                        Some(engine) => match engine.build_distribution(reward_sats).await {
-                            Ok(dist) => payout_info_at(&dist, reward_sats),
-                            Err(_) => Vec::new(),
-                        },
-                        None => Vec::new(),
-                    },
-                    MiningModeResult::Solo => {
-                        // Exactly what the payout resolver builds, solo fee
-                        // included, so the preview matches the real coinbase.
-                        bp_mining_job::solo_payouts(addr.as_str(), &s.solo_fee, reward_sats)
-                            .into_iter()
-                            .map(|p| PayoutInfoEntry::of_reward(p.address, p.sats, reward_sats))
-                            .collect()
-                    }
+                    MiningModeResult::Solo
+                    | MiningModeResult::Pplns
+                    | MiningModeResult::Blockparty(_) => addr.clone(),
                 };
+                // The pool's own per-mode build, so the preview pays what the
+                // job would.
+                let engines = bp_mode_payouts::ModeEngines {
+                    pplns: s.pplns.as_deref(),
+                    group_solo: s.group_solo.as_deref(),
+                    blockparty: s.blockparty.as_deref().map(|bp| bp.payouts()),
+                    solo_fee: &s.solo_fee,
+                };
+                let payouts: Vec<PayoutInfoEntry> = engines
+                    .payouts_at(resolved, &job_for, reward_sats)
+                    .await
+                    .entries
+                    .into_iter()
+                    .map(|p| PayoutInfoEntry::of_reward(p.address, p.sats, reward_sats))
+                    .collect();
 
                 let (coinbase_tx_hex, block_hex) = if payouts.is_empty() {
                     (String::new(), String::new())

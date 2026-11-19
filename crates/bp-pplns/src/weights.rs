@@ -71,6 +71,17 @@ impl WeightDistribution {
         self.entries.iter().filter(|e| e.wire_weight > 0)
     }
 
+    /// The published outputs as ext 0x0003 carries them, in §4 order:
+    /// `(address, weight, dust limit)`. Every §3.1 dust limit is the consensus
+    /// floor [`DUST_LIMIT_SATS`]: the pool's `min_payout` decides at build time
+    /// who is published at all, because a §4 prune would pay the pruned value
+    /// to the pool output. The pool output itself is `fee_address` at
+    /// `weight_p`.
+    pub fn wire_outputs(&self) -> impl Iterator<Item = (&AddressId, u64, u32)> {
+        self.published()
+            .map(|e| (&e.address, e.wire_weight, DUST_LIMIT_SATS as u32))
+    }
+
     /// `W = weight_P + Σ published wire weights` as the §4 denominator.
     pub fn wire_weight_total(&self) -> u128 {
         self.weight_p as u128
@@ -82,23 +93,21 @@ impl WeightDistribution {
 
     /// The pool's own coinbase at revenue `t` in §4 order: the pool output
     /// (`pay_P`, absorbing rounding and dust) first, then the kept miners.
-    /// The same evaluation a JDC runs with its own template revenue. Every
-    /// §3.1 dust limit is the consensus floor [`DUST_LIMIT_SATS`]: the pool's
-    /// `min_payout` decides at build time who is published at all, because a
-    /// §4 prune would pay the pruned value to the pool output.
+    /// The same evaluation a JDC runs with its own template revenue, over
+    /// [`Self::wire_outputs`].
     pub fn payout_entries_at(
         &self,
         t: u64,
     ) -> Result<Vec<(AddressId, u64)>, bp_share::WeightPayoutError> {
-        let published: Vec<&WeightEntry> = self.published().collect();
-        let weights: Vec<u64> = published.iter().map(|e| e.wire_weight).collect();
-        let dusts = vec![DUST_LIMIT_SATS as u32; published.len()];
+        let outputs: Vec<(&AddressId, u64, u32)> = self.wire_outputs().collect();
+        let weights: Vec<u64> = outputs.iter().map(|(_, weight, _)| *weight).collect();
+        let dusts: Vec<u32> = outputs.iter().map(|(_, _, dust)| *dust).collect();
         let amounts = bp_share::compute_payout_amounts(self.weight_p, &weights, &dusts, t)?;
-        let mut out = Vec::with_capacity(1 + published.len());
+        let mut out = Vec::with_capacity(1 + outputs.len());
         out.push((self.fee_address.clone(), amounts.pool_pay));
-        for (entry, pay) in published.iter().zip(&amounts.pays) {
+        for ((address, _, _), pay) in outputs.iter().zip(&amounts.pays) {
             if let Some(sats) = pay {
-                out.push((entry.address.clone(), *sats));
+                out.push(((*address).clone(), *sats));
             }
         }
         Ok(out)

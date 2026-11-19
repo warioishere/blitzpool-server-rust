@@ -590,6 +590,16 @@ pub struct SoloFeeConfig {
     pub dev_fee_percent: f64,
 }
 
+impl SoloFeeConfig {
+    /// The fee address as the coinbase pays it: trimmed, `None` when blank.
+    pub fn fee_address(&self) -> Option<&str> {
+        self.dev_fee_address
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+}
+
 impl Default for SoloFeeConfig {
     fn default() -> Self {
         Self {
@@ -607,11 +617,7 @@ pub fn solo_payouts(
     fee: &SoloFeeConfig,
     reward_sats: u64,
 ) -> Vec<PayoutEntry> {
-    let dev_addr = fee
-        .dev_fee_address
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let dev_addr = fee.fee_address();
     let percent = fee.dev_fee_percent;
     let full_to_miner = || {
         vec![PayoutEntry {

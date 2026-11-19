@@ -20,13 +20,13 @@ bp-coinbase-snapshot = { workspace = true }
 bp-group-solo-engine = { workspace = true }
 bp-group-mgmt = { workspace = true }
 bp-group-mgmt-engine = { workspace = true }
-bp-blockparty = { workspace = true }
 bp-blockparty-engine = { workspace = true }
 bp-template-distribution = { workspace = true }
 bp-bitcoin = { workspace = true }
 bp-geoip = { workspace = true }
 bp-config = { workspace = true }
 bp-mining-mode = { workspace = true }
+bp-mode-payouts = { workspace = true }
 
 # Async runtime + HTTP server.
 tokio = { workspace = true }

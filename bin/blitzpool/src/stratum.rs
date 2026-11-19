@@ -95,6 +95,7 @@ pub(crate) async fn spawn(
     foundation: &FoundationHandles,
     engines: &EngineHandles,
     membership: &Membership,
+    payout_resolver: Arc<crate::payout_resolver::ProductionPayoutResolver>,
     dispatcher: Option<Arc<NotificationDispatcher>>,
     gate: Option<(
         Arc<crate::device_status_gate::Gate>,
@@ -115,18 +116,9 @@ pub(crate) async fn spawn(
         return Ok(StratumHandles::empty());
     }
 
-    // One resolver for both protocols; each takes it as its own
-    // `PayoutResolver` trait.
-    let production_resolver = Arc::new(crate::payout_resolver::ProductionPayoutResolver::new(
-        engines.mode_gate.clone(),
-        engines.pplns.clone(),
-        engines.group_solo.clone(),
-        crate::payout_resolver::solo_fee_config(cfg),
-        membership.blockparty_service(),
-        Some(membership.coinbase_tags.clone()),
-    ));
-    let sv1_resolver: Arc<dyn bp_stratum_v1::PayoutResolver> = production_resolver.clone();
-    let sv2_resolver: Arc<dyn bp_stratum_v2::hooks::PayoutResolver> = production_resolver;
+    // Each protocol takes the one resolver as its own `PayoutResolver` trait.
+    let sv1_resolver: Arc<dyn bp_stratum_v1::PayoutResolver> = payout_resolver.clone();
+    let sv2_resolver: Arc<dyn bp_stratum_v2::hooks::PayoutResolver> = payout_resolver;
 
     // ONE pool-wide MiningJob cache for every SV1 and SV2 port server: they
     // share the TDP streams and the key is content-based, so identical

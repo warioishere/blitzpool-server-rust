@@ -356,6 +356,8 @@ pub mod redis_db {
     pub const GS_ROUND: u16 = 5 * RANGE;
     pub const GS_STREAM_EQUIV: u16 = 6 * RANGE;
     pub const PPLNS_DISTRIBUTION: u16 = 7 * RANGE;
+    /// Index 31 of this range is lent to the `bp-mode-payouts` lib tests:
+    /// don't claim it here.
     pub const PPLNS_ENGINE: u16 = 8 * RANGE;
     pub const PPLNS_STREAM_EQUIV: u16 = 9 * RANGE;
     pub const PPLNS_WINDOW: u16 = 10 * RANGE;

@@ -27,6 +27,7 @@ members = [
     "crates/bp-share-hook",
     "crates/bp-share-stream",
     "crates/bp-mining-mode",
+    "crates/bp-mode-payouts",
     "crates/bp-notifications",
     "crates/bp-stratum-v1",
     "crates/bp-stratum-v2",
@@ -249,6 +250,7 @@ bp-session-persistence = { path = "crates/bp-session-persistence" }
 bp-share-hook = { path = "crates/bp-share-hook" }
 bp-share-stream = { path = "crates/bp-share-stream" }
 bp-mining-mode = { path = "crates/bp-mining-mode" }
+bp-mode-payouts = { path = "crates/bp-mode-payouts" }
 bp-notifications = { path = "crates/bp-notifications" }
 bp-stratum-v1 = { path = "crates/bp-stratum-v1" }
 bp-stratum-v2 = { path = "crates/bp-stratum-v2" }

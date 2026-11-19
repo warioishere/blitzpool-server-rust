@@ -501,12 +501,26 @@ async fn main() -> ExitCode {
     // bridge would leave the mining side reading a registry nobody writes.
     let jdp_bridge = stratum_v2::build_bridge();
 
-    let stratum = match membership.as_ref().filter(|_| is_front) {
-        Some(m) => match stratum::spawn(
+    // One payout resolver for SV1, SV2 and JDP, so every protocol resolves
+    // the same coinbase for the same address.
+    let payout_resolver = membership.as_ref().filter(|_| is_front).map(|m| {
+        std::sync::Arc::new(crate::payout_resolver::ProductionPayoutResolver::new(
+            engines.mode_gate.clone(),
+            engines.pplns.clone(),
+            engines.group_solo.clone(),
+            crate::payout_resolver::solo_fee_config(&cfg),
+            m.blockparty_service(),
+            Some(m.coinbase_tags.clone()),
+        ))
+    });
+
+    let stratum = match membership.as_ref().zip(payout_resolver.clone()) {
+        Some((m, resolver)) => match stratum::spawn(
             &cfg,
             &handles,
             &engines,
             m,
+            resolver,
             dispatcher.clone(),
             device_status_gate.clone(),
             settle_signal.clone(),
@@ -856,19 +870,6 @@ async fn main() -> ExitCode {
                     &handles.redis,
                 )
                 .await;
-                // Built from the same `engines` + `cfg` as the Stratum one, so
-                // both resolve the same answer for the same address.
-                let jdp_payout_resolver =
-                    std::sync::Arc::new(crate::payout_resolver::ProductionPayoutResolver::new(
-                        engines.mode_gate.clone(),
-                        engines.pplns.clone(),
-                        engines.group_solo.clone(),
-                        crate::payout_resolver::solo_fee_config(&cfg),
-                        membership
-                            .as_ref()
-                            .and_then(membership::Membership::blockparty_service),
-                        membership.as_ref().map(|m| m.coinbase_tags.clone()),
-                    ));
                 // Supplies declared transactions the pool's templates already
                 // carry. Spawned before jdp::spawn so it subscribes before the
                 // first NewTemplate.
@@ -894,7 +895,9 @@ async fn main() -> ExitCode {
                     &cfg,
                     jdp_bridge,
                     tdp_handle,
-                    jdp_payout_resolver,
+                    payout_resolver
+                        .clone()
+                        .expect("the front builds a payout resolver with its membership"),
                     template_tx_cache,
                     jdp_ledger_booker,
                     handles.redis.clone(),

@@ -1,0 +1,29 @@
+[package]
+name = "bp-mode-payouts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bp-blockparty = { workspace = true }
+bp-blockparty-engine = { workspace = true }
+bp-coinbase-snapshot = { workspace = true }
+bp-common = { workspace = true }
+bp-group-solo-engine = { workspace = true }
+bp-mining-job = { workspace = true }
+bp-mining-mode = { workspace = true }
+bp-pplns = { workspace = true }
+bp-pplns-engine = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+bp-test-support = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }

@@ -544,7 +544,6 @@ dependencies = [
  "bitcoin_core_sv2",
  "bp-api",
  "bp-bitcoin",
- "bp-blockparty",
  "bp-blockparty-engine",
  "bp-client-live",
  "bp-coinbase-snapshot",
@@ -559,6 +558,7 @@ dependencies = [
  "bp-metrics",
  "bp-mining-job",
  "bp-mining-mode",
+ "bp-mode-payouts",
  "bp-notifications",
  "bp-pplns",
  "bp-pplns-engine",
@@ -658,7 +658,6 @@ dependencies = [
  "bip322",
  "bitcoin",
  "bp-bitcoin",
- "bp-blockparty",
  "bp-blockparty-engine",
  "bp-client-live",
  "bp-coinbase-snapshot",
@@ -671,6 +670,7 @@ dependencies = [
  "bp-group-solo-engine",
  "bp-mining-job",
  "bp-mining-mode",
+ "bp-mode-payouts",
  "bp-pplns-engine",
  "bp-share",
  "bp-stats",
@@ -948,6 +948,26 @@ version = "2.4.5"
 dependencies = [
  "bp-common",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "bp-mode-payouts"
+version = "2.4.5"
+dependencies = [
+ "bp-blockparty",
+ "bp-blockparty-engine",
+ "bp-coinbase-snapshot",
+ "bp-common",
+ "bp-group-solo-engine",
+ "bp-mining-job",
+ "bp-mining-mode",
+ "bp-pplns",
+ "bp-pplns-engine",
+ "bp-test-support",
+ "sqlx",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

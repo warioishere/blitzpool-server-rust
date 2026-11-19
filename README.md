@@ -177,7 +177,7 @@ Regtest-driven integration tests (TDP/IPC + RPC paths) spin up bitcoin-core via 
 
 ## Tech stack
 
-Rust workspace of **35 library crates** (`bp-*`) plus the `blitzpool` binary. Async on **tokio**; HTTP on **axum**; DB on **sqlx** (Postgres); **Redis** for the share/cache/stream bus. SV2 protocol primitives from the SRI `stratum-core`; bitcoin-core IPC bridge from `sv2-apps` (`bitcoin_core_sv2`) — see [`UPSTREAM_DEPS.md`](UPSTREAM_DEPS.md).
+Rust workspace of **36 library crates** (`bp-*`) plus the `blitzpool` binary. Async on **tokio**; HTTP on **axum**; DB on **sqlx** (Postgres); **Redis** for the share/cache/stream bus. SV2 protocol primitives from the SRI `stratum-core`; bitcoin-core IPC bridge from `sv2-apps` (`bitcoin_core_sv2`) — see [`UPSTREAM_DEPS.md`](UPSTREAM_DEPS.md).
 
 ---
 

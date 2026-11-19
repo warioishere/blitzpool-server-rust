@@ -1,20 +1,28 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Production coinbase payout resolver: gives SV1 and SV2 the per-mode coinbase
-//! distribution at every template broadcast, so the on-chain coinbase pays what
-//! the address's payout mode owes. Also the JDP ext 0x0003 distribution source.
+//! Production coinbase payout resolver: gives SV1 and SV2 the coinbase of the
+//! address's payout mode at every template broadcast, and is the JDP ext 0x0003
+//! distribution source. What each mode builds is `bp_mode_payouts`, shared
+//! with the API block preview; this module adds the mode gate, the coinbase
+//! tags and the ext 0x0003 wire shape.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bp_blockparty::CoinbaseDistributionEntry;
-use bp_blockparty_engine::{BlockpartyPayouts, BlockpartyService};
-use bp_coinbase_snapshot::BuiltDistribution;
-use bp_common::{AddressId, MiningMode, Sats};
+use bp_blockparty_engine::BlockpartyService;
+use bp_common::{AddressId, MiningMode};
 use bp_group_solo_engine::engine::GroupSoloEngine;
+use bp_mining_job::ResolvedPayouts;
+use bp_mining_job::SoloFeeConfig;
 use bp_mining_mode::MiningModeResult;
-// Re-exported so the wiring keeps one import path for the solo split.
-pub(crate) use bp_mining_job::SoloFeeConfig;
+use bp_mode_payouts::{ModeBuild, ModeEngines};
+use bp_pplns_engine::engine::PplnsEngine;
+use bp_stratum_v2::bridge::DistributionAccounting;
+use bp_stratum_v2::jdp_server::TailoredDistribution;
+use tracing::{debug, error, warn};
+use uuid::Uuid;
+
+use crate::engines::BlitzpoolModeGate;
 
 /// The Solo fee from `[solo]`, the one source for the Stratum, JDP and API
 /// resolvers so a preview and a real coinbase cannot disagree.
@@ -24,14 +32,6 @@ pub(crate) fn solo_fee_config(cfg: &bp_config::AppConfig) -> SoloFeeConfig {
         dev_fee_percent: cfg.solo.fee_percent.unwrap_or(0.0),
     }
 }
-use bp_mining_job::{solo_payouts, PayoutEntry, ResolvedPayouts};
-use bp_pplns_engine::engine::PplnsEngine;
-use bp_stratum_v2::bridge::DistributionAccounting;
-use bp_stratum_v2::jdp_server::TailoredDistribution;
-use tracing::{debug, error, warn};
-use uuid::Uuid;
-
-use crate::engines::BlitzpoolModeGate;
 
 /// The production `PayoutResolver` for SV1 and SV2.
 #[derive(Clone)]
@@ -70,117 +70,39 @@ impl ProductionPayoutResolver {
         self.coinbase_tags.as_ref()?.get(group_id)
     }
 
-    /// Resolution core for SV1 and SV2.
-    async fn resolve_internal(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts {
-        match self.mode_gate.lookup_mode(miner_address) {
-            // An admin of an unready Blockparty is refused at session start
-            // and kicked when it creates the party; until that kick lands, its
-            // connection mines Solo.
-            MiningModeResult::Solo => ResolvedPayouts::unsnapshotted(solo_payouts(
-                miner_address,
-                &self.solo_fee,
-                reward_sats,
-            )),
-            MiningModeResult::Pplns => self.pplns_payouts(miner_address, reward_sats).await,
-            // A Team or Blockparty mines its own coinbase, so it may tag it;
-            // Solo and the pool-wide PPLNS coinbase carry the pool's alone.
-            MiningModeResult::Blockparty(group_id) => blockparty_payouts(
-                self.blockparty.as_deref().map(BlockpartyService::payouts),
-                miner_address,
-                reward_sats,
-                group_id,
-            )
-            .await
-            .with_coinbase_tag(self.coinbase_tag(group_id)),
-            MiningModeResult::GroupSolo(group_id) => self
-                .group_solo_payouts(miner_address, reward_sats, group_id)
-                .await
-                .with_coinbase_tag(self.coinbase_tag(group_id)),
+    /// The engines this process holds, for the shared per-mode build.
+    fn engines(&self) -> ModeEngines<'_> {
+        ModeEngines {
+            pplns: self.pplns.as_ref(),
+            group_solo: self.group_solo.as_ref(),
+            blockparty: self.blockparty.as_deref().map(BlockpartyService::payouts),
+            solo_fee: &self.solo_fee,
         }
     }
-}
 
-/// A PPLNS or Group-Solo build as this template's coinbase list, evaluated with
-/// ext 0x0003/Payout Computation at this template's revenue, the same formula a
-/// JDC runs with its own. An unbookable build still stands: failing would hand
-/// this miner the whole block.
-fn lower_built(
-    scope: &'static str,
-    group_id: Option<Uuid>,
-    built: &BuiltDistribution,
-    miner_address: &str,
-    reward_sats: u64,
-) -> ResolvedPayouts {
-    if !built.bookable {
-        warn!(
-            scope,
-            ?group_id,
-            miner_address,
-            reward_sats,
-            "distribution built but not bookable — the coinbase stands, a block found on \
-             it cannot be booked automatically"
-        );
-    }
-    match built.distribution.payout_entries_at(reward_sats) {
-        Ok(entries) => ResolvedPayouts {
-            entries: entries
-                .into_iter()
-                .map(|(address, sats)| PayoutEntry {
-                    address: address.into_inner(),
-                    sats,
-                })
-                .collect(),
-            payouts_fingerprint: built.payouts_fingerprint(),
-            coinbase_tag: None,
-        },
-        Err(err) => {
+    /// Resolution core for SV1 and SV2: the gate's mode through the shared
+    /// per-mode build. An admin of an unready Blockparty is refused at
+    /// session start and kicked when it creates the party; until that kick
+    /// lands, its connection mines Solo.
+    async fn resolve_internal(&self, miner: &AddressId, reward_sats: u64) -> ResolvedPayouts {
+        let mode = self.mode_gate.lookup_mode(miner.as_str());
+        // A Team or Blockparty mines its own coinbase, so it may tag it;
+        // Solo and the pool-wide PPLNS coinbase carry the pool's alone.
+        let tag = match mode {
+            MiningModeResult::GroupSolo(group_id) | MiningModeResult::Blockparty(group_id) => {
+                self.coinbase_tag(group_id)
+            }
+            MiningModeResult::Solo | MiningModeResult::Pplns => None,
+        };
+        let resolved = self.engines().payouts_at(mode, miner, reward_sats).await;
+        if resolved.is_none() {
             error!(
-                %err,
-                scope,
-                ?group_id,
-                miner_address,
-                reward_sats,
-                "ext 0x0003/Payout Computation evaluation failed; serving NO JOB"
+                miner = miner.as_str(),
+                ?mode,
+                "no payout list; serving NO JOB"
             );
-            ResolvedPayouts::none()
         }
-    }
-}
-
-/// The members' split, or no job when it cannot be built: only the admin
-/// hashes, so a solo coinbase would pay the admin the whole block.
-async fn blockparty_payouts(
-    blockparty: Option<&BlockpartyPayouts>,
-    miner_address: &str,
-    reward_sats: u64,
-    group_id: Uuid,
-) -> ResolvedPayouts {
-    let Some(svc) = blockparty else {
-        error!(
-            miner_address,
-            "Blockparty mode in gate but service handle not wired; serving NO JOB"
-        );
-        return ResolvedPayouts::none();
-    };
-    match svc.build_payouts(group_id, Sats(reward_sats as i64)).await {
-        Ok(Some(result)) => ResolvedPayouts::unsnapshotted(entries_to_payouts(&result.payouts)),
-        Ok(None) => {
-            warn!(
-                miner_address,
-                %group_id,
-                "Blockparty group not found; serving NO JOB"
-            );
-            ResolvedPayouts::none()
-        }
-        Err(err) => {
-            warn!(
-                %err,
-                miner_address,
-                %group_id,
-                "Blockparty distribution build failed; serving NO JOB until it succeeds"
-            );
-            ResolvedPayouts::none()
-        }
+        resolved.with_coinbase_tag(tag)
     }
 }
 
@@ -202,24 +124,18 @@ enum JdpDistributionFor {
     Tailored(TailoredMode),
     /// Nothing at all — and deliberately not the pool-wide one either.
     Nothing,
-    /// The address's mode is not known yet. Unlike `Nothing` this is not a
-    /// decision; it resolves once a mining session registers.
-    ModeUnknown,
 }
 
 /// What the pool serves a mode over JDP: the one, pure place that decides it,
 /// so a new mode cannot reach a builder it was never classified for.
 /// Blockparty (a rental) is deliberately refused, including the pool-wide
 /// distribution, so it declares nothing the pool cannot account for.
-fn jdp_distribution_for(mode: Option<MiningMode>) -> JdpDistributionFor {
+fn jdp_distribution_for(mode: MiningMode) -> JdpDistributionFor {
     match mode {
-        // No port has declared the mode yet; a JDC allocates before its
-        // channel opens, so the gate's Solo default would be a guess.
-        None => JdpDistributionFor::ModeUnknown,
-        Some(MiningMode::Pplns) => JdpDistributionFor::PoolWide,
-        Some(MiningMode::Solo) => JdpDistributionFor::Tailored(TailoredMode::Solo),
-        Some(MiningMode::GroupSolo) => JdpDistributionFor::Tailored(TailoredMode::GroupSolo),
-        Some(MiningMode::Blockparty) => JdpDistributionFor::Nothing,
+        MiningMode::Pplns => JdpDistributionFor::PoolWide,
+        MiningMode::Solo => JdpDistributionFor::Tailored(TailoredMode::Solo),
+        MiningMode::GroupSolo => JdpDistributionFor::Tailored(TailoredMode::GroupSolo),
+        MiningMode::Blockparty => JdpDistributionFor::Nothing,
     }
 }
 
@@ -229,7 +145,7 @@ fn jdp_distribution_for(mode: Option<MiningMode>) -> JdpDistributionFor {
 /// Read from `entries`, the payout list `solo_payouts` builds the real Solo
 /// coinbase from, so the distribution and the coinbase cannot disagree.
 fn solo_fee_output(entries: &[(String, u64)], fee: &SoloFeeConfig) -> Option<(String, u64)> {
-    let fee_address = fee.dev_fee_address.as_deref()?;
+    let fee_address = fee.fee_address()?;
     entries
         .iter()
         .find(|(address, _)| address == fee_address)
@@ -247,141 +163,18 @@ fn accounting_for(tailored: TailoredMode, miner: &AddressId) -> DistributionAcco
     }
 }
 
-/// Did the build fail because nothing in the window holds a share? The one
-/// failure that must not become "no job": an empty window could never start.
-/// Any other failure stays no-job, as an unreadable window may hide claims.
-/// Group-Solo needs no equivalent: its builder always carries the finder.
-fn is_empty_share_window(err: &bp_pplns_engine::engine::EngineError) -> bool {
-    match err {
-        bp_pplns_engine::engine::EngineError::Distribution(inner) => matches!(
-            **inner,
-            bp_pplns_engine::distribution::DistributionError::WeightBuild(
-                bp_pplns::WeightBuildError::NoScoredMiners
-            )
-        ),
-        _ => false,
-    }
-}
-
-impl ProductionPayoutResolver {
-    async fn pplns_payouts(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts {
-        let Some(pplns) = self.pplns.as_ref() else {
-            error!(
-                miner_address,
-                "PPLNS mode in gate but `[pplns]` is absent from config; serving NO JOB"
-            );
-            return ResolvedPayouts::none();
-        };
-        // The pool-wide build is shared and cannot name a claimant; an empty
-        // window (`NoScoredMiners`) is answered per-miner below.
-        let built = match pplns.build_distribution(reward_sats).await {
-            Ok(result) => Some(result),
-            Err(err) if is_empty_share_window(&err) => {
-                // Empty window: the weight model would pay the whole block to
-                // the pool, and no job would deadlock it. This miner claims the
-                // block; nobody else has a claim and the pool takes only its fee.
-                match AddressId::new(miner_address.to_string()) {
-                    Ok(claimant) => {
-                        match pplns
-                            .build_bootstrap_distribution(reward_sats, &claimant)
-                            .await
-                        {
-                            Ok(result) => Some(result),
-                            Err(err) => {
-                                error!(
-                                    %err,
-                                    miner_address,
-                                    reward_sats,
-                                    "PPLNS window holds no scored miner and the bootstrap build \
-                                     failed too; serving NO JOB"
-                                );
-                                None
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        error!(
-                            %err,
-                            miner_address,
-                            "PPLNS window holds no scored miner and the asking address will not \
-                             parse; serving NO JOB"
-                        );
-                        None
-                    }
-                }
-            }
-            Err(err) => {
-                error!(
-                    %err,
-                    miner_address,
-                    reward_sats,
-                    "PPLNS distribution build failed; serving NO JOB until it succeeds"
-                );
-                None
-            }
-        };
-        match built {
-            Some(result) => lower_built("PPLNS", None, &result, miner_address, reward_sats),
-            None => ResolvedPayouts::none(),
-        }
-    }
-
-    async fn group_solo_payouts(
-        &self,
-        miner_address: &str,
-        reward_sats: u64,
-        group_id: Uuid,
-    ) -> ResolvedPayouts {
-        let Some(group_solo) = self.group_solo.as_ref() else {
-            error!(
-                miner_address,
-                %group_id,
-                "Group-Solo mode in gate but `[group_solo]` is absent from config; serving NO JOB"
-            );
-            return ResolvedPayouts::none();
-        };
-        // The connecting miner is the finder for the group's finder bonus.
-        let finder = match AddressId::new(miner_address.to_string()) {
-            Ok(a) => a,
-            Err(_) => {
-                error!(
-                    miner_address,
-                    "GroupSolo miner address failed AddressId parse; serving NO JOB"
-                );
-                return ResolvedPayouts::none();
-            }
-        };
-        match group_solo
-            .build_distribution(group_id, reward_sats, &finder)
-            .await
-        {
-            Ok(result) => lower_built(
-                "Group-Solo",
-                Some(group_id),
-                &result,
-                miner_address,
-                reward_sats,
-            ),
-            Err(err) => {
-                error!(
-                    %err,
-                    miner_address,
-                    %group_id,
-                    reward_sats,
-                    "Group-Solo distribution build failed; serving NO JOB until it succeeds"
-                );
-                ResolvedPayouts::none()
-            }
-        }
-    }
-}
-
 // ─── Trait impls ──────────────────────────────────────────────────
 
 #[async_trait]
 impl bp_stratum_v1::PayoutResolver for ProductionPayoutResolver {
     async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts {
-        self.resolve_internal(miner_address, reward_sats).await
+        match AddressId::new(miner_address) {
+            Ok(miner) => self.resolve_internal(&miner, reward_sats).await,
+            Err(err) => {
+                error!(%err, miner_address, "SV1 payout address will not parse; serving NO JOB");
+                ResolvedPayouts::none()
+            }
+        }
     }
 
     fn resolve_stream(&self, miner_address: &str) -> bp_common::StreamKind {
@@ -398,8 +191,7 @@ impl bp_stratum_v2::hooks::PayoutResolver for ProductionPayoutResolver {
         miner_address: &AddressId,
         reward_sats: u64,
     ) -> ResolvedPayouts {
-        self.resolve_internal(miner_address.as_str(), reward_sats)
-            .await
+        self.resolve_internal(miner_address, reward_sats).await
     }
 
     fn resolve_stream(&self, miner_address: &AddressId) -> bp_common::StreamKind {
@@ -450,13 +242,12 @@ impl ProductionDistributionSource {
         let pool_script = self.script_of(d.fee_address.as_str())?;
         let mut payouts = Vec::new();
         let mut dust_limits = Vec::new();
-        for entry in d.published() {
-            let script = self.script_of(entry.address.as_str())?;
+        for (address, weight, dust_limit) in d.wire_outputs() {
             payouts.push(bp_stratum_v2::jdp::payout_distribution::WeightedOutput {
-                script_pubkey: script,
-                weight: entry.wire_weight,
+                script_pubkey: self.script_of(address.as_str())?,
+                weight,
             });
-            dust_limits.push(bp_pplns::DUST_LIMIT_SATS as u32);
+            dust_limits.push(dust_limit);
         }
         Some(bp_stratum_v2::bridge::BuiltPayoutDistribution {
             pool_payout: bp_stratum_v2::jdp::payout_distribution::WeightedOutput {
@@ -533,25 +324,23 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
     async fn build_for_miner(&self, miner_address: &AddressId) -> TailoredDistribution {
         // Failures return `Unavailable`, never `PoolWide`, which would pay a
         // non-PPLNS block to the PPLNS window. `lookup_known`, not
-        // `lookup_mode`: this runs at allocate time, before a mining session
-        // exists, and `lookup_mode` would guess Solo.
-        let known = self.resolver.mode_gate.lookup_known(miner_address.as_str());
-        let mode = known.map(MiningModeResult::mode);
-        let tailored = match jdp_distribution_for(mode) {
-            JdpDistributionFor::ModeUnknown => {
-                debug!(
-                    miner = miner_address.as_str(),
-                    "jdp distribution source: no mining session for this address yet — \
-                     publishing nothing until its mode is known (the port decides it, and no \
-                     port has spoken)"
-                );
-                return TailoredDistribution::ModeUnknown;
-            }
+        // `lookup_mode`: a JDC allocates before its channel opens, so no port
+        // may have declared the mode yet, and `lookup_mode` would guess Solo.
+        let Some(known) = self.resolver.mode_gate.lookup_known(miner_address.as_str()) else {
+            debug!(
+                miner = miner_address.as_str(),
+                "jdp distribution source: no mining session for this address yet — \
+                 publishing nothing until its mode is known (the port decides it, and no \
+                 port has spoken)"
+            );
+            return TailoredDistribution::ModeUnknown;
+        };
+        let tailored = match jdp_distribution_for(known.mode()) {
             JdpDistributionFor::PoolWide => return TailoredDistribution::PoolWide,
             JdpDistributionFor::Nothing => {
                 warn!(
                     miner = miner_address.as_str(),
-                    mode = ?mode,
+                    mode = ?known,
                     "jdp distribution source: this mode is not served over JDP — serving NO \
                      distribution"
                 );
@@ -566,44 +355,29 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
             );
             return TailoredDistribution::Unavailable;
         };
-        let built = match tailored {
-            TailoredMode::GroupSolo => {
-                // `known` is GroupSolo here, but no `expect`: no panic on the money path.
-                let Some(MiningModeResult::GroupSolo(group_id)) = known else {
-                    return TailoredDistribution::Unavailable;
-                };
-                let Some(group_solo) = self.resolver.group_solo.as_ref() else {
-                    return TailoredDistribution::Unavailable;
-                };
-                match group_solo
-                    .build_distribution(group_id, t_ref, miner_address)
-                    .await
-                {
-                    Ok(result) => self.lower_weight_distribution(
-                        &result.distribution,
-                        Some(result.payouts_fingerprint()),
-                        result.bookable,
-                    ),
-                    Err(err) => {
-                        warn!(%err, miner = miner_address.as_str(),
-                            "jdp distribution source: group-solo build failed — no tailored distribution");
-                        None
-                    }
-                }
-            }
-            TailoredMode::Solo => {
+        // `known` is Solo or Group-Solo here (`jdp_distribution_for`), so the
+        // build is exact for Solo and weighted for Group-Solo.
+        let built = match self
+            .resolver
+            .engines()
+            .build(known, miner_address, t_ref)
+            .await
+        {
+            ModeBuild::Weighted(built) => self.lower_weight_distribution(
+                &built.distribution,
+                Some(built.payouts_fingerprint()),
+                built.bookable,
+            ),
+            ModeBuild::Exact(payouts) => {
                 let entries: Vec<(String, u64)> =
-                    solo_payouts(miner_address.as_str(), &self.resolver.solo_fee, t_ref)
-                        .into_iter()
-                        .map(|p| (p.address, p.sats))
-                        .collect();
+                    payouts.into_iter().map(|p| (p.address, p.sats)).collect();
                 let Some((fee_address, fee_weight)) =
                     solo_fee_output(&entries, &self.resolver.solo_fee)
                 else {
                     warn!(
                         miner = miner_address.as_str(),
                         "jdp distribution source: Solo without a fee pays only the miner, which \
-                         base-protocol Job Declaration serves — no ext 0x0003 distribution"
+                         base-protocol Job Declaration serves; no ext 0x0003 distribution"
                     );
                     return TailoredDistribution::Unavailable;
                 };
@@ -613,6 +387,7 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
                     .collect();
                 self.lower_exact_entries(&fee_address, fee_weight, &miners, t_ref)
             }
+            ModeBuild::NoJob => return TailoredDistribution::Unavailable,
         };
         match built {
             Some(b) => TailoredDistribution::Built {
@@ -663,24 +438,10 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
     }
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────
-
-/// Engine entries as coinbase `PayoutEntry`s, carrying the exact sats the
-/// distributor computed; the coinbase builder never re-derives them from a percentage.
-fn entries_to_payouts(entries: &[CoinbaseDistributionEntry]) -> Vec<PayoutEntry> {
-    entries
-        .iter()
-        .map(|e| PayoutEntry {
-            address: e.address.as_str().to_string(),
-            // Clamp so a negative `Sats` cannot wrap into a huge output.
-            sats: e.sats.0.max(0) as u64,
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bp_mining_job::solo_payouts;
 
     const TEST_REWARD: u64 = 5_000_000_000;
 
@@ -690,7 +451,7 @@ mod tests {
     /// the tag they added.
     #[tokio::test]
     async fn only_the_team_and_blockparty_arms_add_their_tag() {
-        let address = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+        let address = AddressId::new("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080").unwrap();
         let group = Uuid::new_v4();
         let tag = bp_common::CoinbaseTag::parse("Dezentralschweiz")
             .unwrap()
@@ -715,8 +476,8 @@ mod tests {
             (MiningModeResult::GroupSolo(group), true),
             (MiningModeResult::Blockparty(group), true),
         ] {
-            gate.set_mode(address, mode);
-            let resolved = resolver.resolve_internal(address, TEST_REWARD).await;
+            gate.set_mode(address.as_str(), mode);
+            let resolved = resolver.resolve_internal(&address, TEST_REWARD).await;
             assert_eq!(
                 resolved.coinbase_tag,
                 tagged.then(|| tag.clone()),
@@ -735,7 +496,7 @@ mod tests {
                 None,
                 None,
             )
-            .resolve_internal(address, TEST_REWARD)
+            .resolve_internal(&address, TEST_REWARD)
             .await
             .coinbase_tag
             .is_none(),
@@ -747,36 +508,22 @@ mod tests {
     #[test]
     fn jdp_answers_every_mode_with_exactly_one_distribution() {
         assert_eq!(
-            jdp_distribution_for(Some(MiningMode::Pplns)),
+            jdp_distribution_for(MiningMode::Pplns),
             JdpDistributionFor::PoolWide,
             "PPLNS rides the shared window — that IS its accounting"
         );
         assert_eq!(
-            jdp_distribution_for(Some(MiningMode::Solo)),
+            jdp_distribution_for(MiningMode::Solo),
             JdpDistributionFor::Tailored(TailoredMode::Solo)
         );
         assert_eq!(
-            jdp_distribution_for(Some(MiningMode::GroupSolo)),
+            jdp_distribution_for(MiningMode::GroupSolo),
             JdpDistributionFor::Tailored(TailoredMode::GroupSolo)
         );
         assert_eq!(
-            jdp_distribution_for(Some(MiningMode::Blockparty)),
+            jdp_distribution_for(MiningMode::Blockparty),
             JdpDistributionFor::Nothing,
             "a rental is not served over JDP, and must not fall back to pool-wide"
-        );
-
-        // No mining session yet (every JDC start): any answer would be a
-        // guess, so it is "not yet" and the caller retries.
-        assert_eq!(
-            jdp_distribution_for(None),
-            JdpDistributionFor::ModeUnknown,
-            "an undecided mode must not resolve to any distribution — it used to \
-             take the mode gate's Solo default and publish a Solo plan for it"
-        );
-        assert_ne!(
-            jdp_distribution_for(None),
-            jdp_distribution_for(Some(MiningMode::Solo)),
-            "unknown and Solo must stay distinct answers — collapsing them IS the bug"
         );
     }
 
@@ -796,14 +543,11 @@ mod tests {
             let probed = bp_common::StreamKind::for_mode(mode);
             // Via the same functions `build_for_miner` calls, so swapped arms
             // in `accounting_for` fail here.
-            let built = match jdp_distribution_for(Some(mode)) {
+            let built = match jdp_distribution_for(mode) {
                 JdpDistributionFor::PoolWide => Some(Acct::PoolWide),
                 JdpDistributionFor::Tailored(kind) => Some(accounting_for(kind, &miner)),
                 // Nothing built, nothing to disagree with.
                 JdpDistributionFor::Nothing => None,
-                JdpDistributionFor::ModeUnknown => {
-                    panic!("{mode:?} is a known mode; only `None` may answer ModeUnknown")
-                }
             };
             let Some(built) = built else { continue };
             assert!(
@@ -814,12 +558,57 @@ mod tests {
         }
     }
 
+    /// Revenue fixed; the allocate path never asks for chain demands.
+    struct RevenueOnly;
+    impl crate::jdp_hooks::ChainView for RevenueOnly {
+        fn demands(&self) -> Option<crate::jdp_hooks::ChainDemands> {
+            None
+        }
+        fn reference_revenue(&self) -> Option<u64> {
+            Some(TEST_REWARD)
+        }
+    }
+
+    /// An address with no mining session gets "not yet", never the gate's
+    /// Solo default: a Solo plan published for it would be a guess.
+    #[tokio::test]
+    async fn an_address_without_a_session_gets_no_distribution_yet() {
+        use bp_stratum_v2::jdp_server::PayoutDistributionSource;
+        let gate = Arc::new(BlitzpoolModeGate::new());
+        let source = ProductionDistributionSource {
+            resolver: Arc::new(ProductionPayoutResolver::new(
+                gate.clone(),
+                None,
+                None,
+                SoloFeeConfig::default(),
+                None,
+                None,
+            )),
+            chain: Arc::new(RevenueOnly),
+            redis: None,
+            network: bitcoin::Network::Regtest,
+        };
+        let miner = AddressId::new("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080").unwrap();
+        assert!(matches!(
+            source.build_for_miner(&miner).await,
+            TailoredDistribution::ModeUnknown
+        ));
+        gate.set_mode(miner.as_str(), MiningModeResult::Solo);
+        assert!(
+            matches!(
+                source.build_for_miner(&miner).await,
+                TailoredDistribution::Unavailable
+            ),
+            "control: once its session registers Solo, it is answered (no fee: base protocol)"
+        );
+    }
+
     /// Solo and Group-Solo map to distinct tailored builds.
     #[test]
     fn the_two_tailored_modes_are_distinct() {
         assert_ne!(
-            jdp_distribution_for(Some(MiningMode::Solo)),
-            jdp_distribution_for(Some(MiningMode::GroupSolo))
+            jdp_distribution_for(MiningMode::Solo),
+            jdp_distribution_for(MiningMode::GroupSolo)
         );
     }
 
@@ -863,6 +652,22 @@ mod tests {
         assert!(
             paid.iter().any(|(a, s)| a == DEV && *s == sats),
             "the fee output is the one the coinbase pays"
+        );
+
+        // `[solo].fee_address` is not trimmed by the config; the coinbase pays
+        // the trimmed address, so that is the fee output.
+        let padded = SoloFeeConfig {
+            dev_fee_address: Some(format!(" {DEV} ")),
+            dev_fee_percent: 1.0,
+        };
+        let paid = entries(&padded);
+        assert!(
+            paid.iter().any(|(a, _)| a == DEV),
+            "precondition: the coinbase pays the trimmed address"
+        );
+        assert_eq!(
+            solo_fee_output(&paid, &padded).map(|(a, _)| a).as_deref(),
+            Some(DEV)
         );
     }
 
@@ -950,139 +755,5 @@ mod tests {
         assert_eq!(r.len(), 1, "no zero-value dev output");
         assert_eq!(r[0].address, "bc1qminer");
         assert_eq!(r[0].sats, TEST_REWARD);
-    }
-
-    const BP_ADMIN: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
-
-    fn blockparty_payouts_on(pool: sqlx::PgPool) -> BlockpartyPayouts {
-        BlockpartyPayouts::new(
-            pool,
-            bp_blockparty_engine::BlockpartyPayoutConfig::default(),
-        )
-    }
-
-    /// The admin is the only one hashing, so a solo coinbase here would pay
-    /// the whole block to the admin and nothing to the members.
-    async fn assert_no_job(svc: Option<&BlockpartyPayouts>, group_id: Uuid, case: &str) {
-        let resolved = blockparty_payouts(svc, BP_ADMIN, TEST_REWARD, group_id).await;
-        assert!(
-            resolved.is_none(),
-            "{case}: must serve no job, got {:?}",
-            resolved.entries
-        );
-    }
-
-    #[tokio::test]
-    async fn a_blockparty_without_a_buildable_split_serves_no_job() {
-        let gid = Uuid::new_v4();
-        assert_no_job(None, gid, "service not wired").await;
-
-        let unreachable = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .acquire_timeout(std::time::Duration::from_millis(300))
-            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/nope")
-            .expect("a lazily-connected pool parses its url");
-        let svc = blockparty_payouts_on(unreachable);
-        assert!(
-            svc.build_payouts(gid, Sats(TEST_REWARD as i64))
-                .await
-                .is_err(),
-            "precondition: the split build must fail on this pool"
-        );
-        assert_no_job(Some(&svc), gid, "database error").await;
-    }
-
-    #[tokio::test]
-    async fn a_blockparty_whose_group_is_gone_serves_no_job() {
-        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
-            return;
-        };
-        let svc = blockparty_payouts_on(pool);
-        let gid = Uuid::new_v4();
-        assert!(
-            matches!(
-                svc.build_payouts(gid, Sats(TEST_REWARD as i64)).await,
-                Ok(None)
-            ),
-            "precondition: a fresh group id must resolve to no group"
-        );
-        assert_no_job(Some(&svc), gid, "group not found").await;
-    }
-
-    /// Pins what PPLNS and Group-Solo hand the job builder: the §4 list at
-    /// this revenue and the fingerprint, with or without the snapshot.
-    #[test]
-    fn a_built_distribution_lowers_to_its_payout_list() {
-        use std::collections::HashMap;
-        let a = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string()).unwrap();
-        let b = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq".to_string()).unwrap();
-        let fee = AddressId::new("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy".to_string()).unwrap();
-        let shares = HashMap::from([(a.clone(), 60.0), (b.clone(), 40.0)]);
-        let distribution = bp_pplns::build_weight_distribution(bp_pplns::WeightDistributionInput {
-            address_shares: &shares,
-            balances: &HashMap::new(),
-            fee_percent: 1.5,
-            fee_address: &fee,
-            coinbase_weight_budget: 50_000,
-            min_payout_sats: Sats(5_000),
-            finder_bonus_ppm: 0,
-            finder_address: None,
-            reference_revenue_sats: TEST_REWARD,
-            withheld_value: bp_pplns::WithheldValue::ToOtherMiners,
-        })
-        .unwrap();
-        let reward = TEST_REWARD + 12_345;
-        let expected: Vec<(String, u64)> = distribution
-            .payout_entries_at(reward)
-            .unwrap()
-            .into_iter()
-            .map(|(addr, sats)| (addr.into_inner(), sats))
-            .collect();
-        assert_eq!(
-            expected.len(),
-            3,
-            "precondition: pool output plus both miners"
-        );
-
-        for promised in [true, false] {
-            let built = BuiltDistribution {
-                distribution: distribution.clone(),
-                bookable: promised,
-            };
-            let resolved = lower_built("PPLNS", None, &built, "m", reward);
-            let got: Vec<(String, u64)> = resolved
-                .entries
-                .into_iter()
-                .map(|p| (p.address, p.sats))
-                .collect();
-            assert_eq!(
-                got, expected,
-                "the coinbase stands with or without the snapshot"
-            );
-            assert_eq!(resolved.payouts_fingerprint, distribution.fingerprint);
-        }
-    }
-
-    #[test]
-    fn entries_to_payouts_carries_exact_sats() {
-        use bp_common::Sats;
-        let entries = vec![
-            CoinbaseDistributionEntry {
-                address: AddressId::new("bc1qa".to_string()).unwrap(),
-                percent: 60.0,
-                sats: Sats(60_000_000),
-            },
-            CoinbaseDistributionEntry {
-                address: AddressId::new("bc1qb".to_string()).unwrap(),
-                percent: 40.0,
-                sats: Sats(40_000_000),
-            },
-        ];
-        let payouts = entries_to_payouts(&entries);
-        assert_eq!(payouts.len(), 2);
-        assert_eq!(payouts[0].address, "bc1qa");
-        assert_eq!(payouts[0].sats, 60_000_000);
-        assert_eq!(payouts[1].address, "bc1qb");
-        assert_eq!(payouts[1].sats, 40_000_000);
     }
 }
