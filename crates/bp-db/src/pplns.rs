@@ -245,15 +245,19 @@ where
     Ok(result.rows_affected())
 }
 
-/// Bulk UPDATE of `lastAcceptedShareAt`. A missing row is not created: the
-/// sweep has nothing to act on for a miner without a balance.
+/// One address's latest accepted share, for
+/// [`bulk_upsert_pplns_last_accepted_share_at`].
 #[derive(Clone, Debug)]
 pub struct TouchUpdate {
     pub address: String,
     pub last_accepted_share_at_ms: i64,
 }
 
-pub async fn bulk_update_pplns_last_accepted_share_at<'e, E>(
+/// Bulk upsert of `lastAcceptedShareAt`. A missing row is created with a zero
+/// balance, so a miner who stops before its first booked block still has its
+/// last share when that booking creates its balance, and the sweep can tell
+/// it is gone. An older stamp (a replayed backlog) never lowers a newer one.
+pub async fn bulk_upsert_pplns_last_accepted_share_at<'e, E>(
     executor: E,
     rows: &[TouchUpdate],
 ) -> Result<u64, DbError>
@@ -263,15 +267,21 @@ where
     if rows.is_empty() {
         return Ok(0);
     }
+    // Ascending address order, the lock order of this table (see
+    // `find_pplns_balances_for_addresses_locked`).
+    let mut rows: Vec<&TouchUpdate> = rows.iter().collect();
+    rows.sort_by(|a, b| a.address.cmp(&b.address));
     let addresses: Vec<String> = rows.iter().map(|r| r.address.clone()).collect();
     let stamps: Vec<i64> = rows.iter().map(|r| r.last_accepted_share_at_ms).collect();
 
     let result = sqlx::query!(
-        r#"UPDATE pplns_balance AS t
-           SET "lastAcceptedShareAt" = u.ts
-           FROM (SELECT UNNEST($1::text[]) AS address,
-                        UNNEST($2::bigint[]) AS ts) AS u
-           WHERE t.address = u.address"#,
+        r#"INSERT INTO pplns_balance (address, "lastAcceptedShareAt")
+           SELECT * FROM UNNEST($1::text[], $2::bigint[])
+           ON CONFLICT (address) DO UPDATE
+           SET "lastAcceptedShareAt" = GREATEST(
+               pplns_balance."lastAcceptedShareAt",
+               EXCLUDED."lastAcceptedShareAt"
+           )"#,
         &addresses,
         &stamps,
     )

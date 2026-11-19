@@ -10,8 +10,8 @@
 //! unreachable. Each test rolls its transaction back.
 
 use bp_db::{
-    bulk_insert_pplns_payout_history, bulk_update_pplns_last_accepted_share_at,
-    bulk_upsert_pplns_balances, BalanceUpsert, PayoutHistoryInsert, TouchUpdate,
+    bulk_insert_pplns_payout_history, bulk_upsert_pplns_balances,
+    bulk_upsert_pplns_last_accepted_share_at, BalanceUpsert, PayoutHistoryInsert, TouchUpdate,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
@@ -130,8 +130,10 @@ async fn bulk_upsert_balances_empty_is_noop() {
     tx.rollback().await.expect("rollback ok");
 }
 
+/// A touch creates the row of an address without one (zero balance, its last
+/// share stamped); on an existing row an older stamp never lowers a newer one.
 #[tokio::test]
-async fn bulk_update_last_accepted_share_at_skips_missing_rows() {
+async fn a_touch_creates_a_missing_row_and_never_lowers_its_stamp() {
     let pool = match connect_or_skip().await {
         Some(p) => p,
         None => return,
@@ -149,30 +151,59 @@ async fn bulk_update_last_accepted_share_at_skips_missing_rows() {
         .await
         .expect("seed ok");
 
-    let touches = vec![
-        TouchUpdate {
-            address: "test_touch_a".to_string(),
-            last_accepted_share_at_ms: 1_700_000_999_000,
-        },
-        TouchUpdate {
-            address: "test_touch_nonexistent".to_string(),
-            last_accepted_share_at_ms: 1_700_000_999_000,
-        },
-    ];
-    let affected = bulk_update_pplns_last_accepted_share_at(&mut *tx, &touches)
-        .await
-        .expect("touch ok");
-    // Only the existing row gets updated; the nonexistent address is a
-    // silent no-op.
-    assert_eq!(affected, 1);
-
-    let row: (Option<i64>,) = sqlx::query_as(
-        r#"SELECT "lastAcceptedShareAt" FROM pplns_balance WHERE address = 'test_touch_a'"#,
+    let touch = |address: &str, ts: i64| TouchUpdate {
+        address: address.to_string(),
+        last_accepted_share_at_ms: ts,
+    };
+    let affected = bulk_upsert_pplns_last_accepted_share_at(
+        &mut *tx,
+        &[
+            touch("test_touch_a", 1_700_000_999_000),
+            touch("test_touch_new", 1_700_000_999_000),
+        ],
     )
-    .fetch_one(&mut *tx)
     .await
-    .expect("select ok");
-    assert_eq!(row.0, Some(1_700_000_999_000));
+    .expect("touch ok");
+    assert_eq!(
+        affected, 2,
+        "the existing row is stamped, the missing one created"
+    );
+
+    let row_of = |address: &'static str| {
+        sqlx::query_as::<_, (i64, Option<i64>)>(
+            r#"SELECT "balanceSats", "lastAcceptedShareAt" FROM pplns_balance WHERE address = $1"#,
+        )
+        .bind(address)
+    };
+    assert_eq!(
+        row_of("test_touch_a")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("row a"),
+        (1_000, Some(1_700_000_999_000)),
+        "the balance is untouched"
+    );
+    assert_eq!(
+        row_of("test_touch_new")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("row new"),
+        (0, Some(1_700_000_999_000)),
+        "a missing row is created with a zero balance and its stamp"
+    );
+
+    bulk_upsert_pplns_last_accepted_share_at(&mut *tx, &[touch("test_touch_a", 1_700_000_000_500)])
+        .await
+        .expect("older touch ok");
+    assert_eq!(
+        row_of("test_touch_a")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("row a")
+            .1,
+        Some(1_700_000_999_000),
+        "an older stamp does not lower a newer one"
+    );
 
     tx.rollback().await.expect("rollback ok");
 }

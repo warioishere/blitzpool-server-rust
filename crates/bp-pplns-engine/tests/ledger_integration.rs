@@ -334,7 +334,7 @@ async fn coinbase_audit_row_roundtrips_via_apply_distribution() {
 // ── Test 5 — touch_buffer flush_once writes to PG ──────────────────
 
 #[tokio::test]
-async fn touch_buffer_flush_once_updates_existing_rows() {
+async fn touch_buffer_flush_once_stamps_every_marked_address() {
     let pool = match connect_or_skip().await {
         Some(p) => p,
         None => return,
@@ -342,7 +342,7 @@ async fn touch_buffer_flush_once_updates_existing_rows() {
     let prefix = "test_touch_flush_";
     cleanup(&pool, prefix, &[]).await;
 
-    // Seed two balance rows so the flush has rows to touch.
+    // Seed two balance rows; the third address has none yet.
     let seed_addr_a = format!("{prefix}aa");
     let seed_addr_b = format!("{prefix}bb");
     sqlx::query(
@@ -361,10 +361,7 @@ async fn touch_buffer_flush_once_updates_existing_rows() {
     buf.mark(&format!("{prefix}nonexistent"), 1_700_000_700_000);
 
     let n = flush_once(&pool, &buf).await.expect("flush ok");
-    assert_eq!(
-        n, 2,
-        "expected 2 rows updated (nonexistent address silently skipped)"
-    );
+    assert_eq!(n, 3, "two rows stamped, the missing one created");
     assert!(buf.is_empty(), "buffer drained after successful flush");
 
     let stamps: Vec<(String, Option<i64>)> = sqlx::query_as(
@@ -377,6 +374,7 @@ async fn touch_buffer_flush_once_updates_existing_rows() {
     .unwrap();
     assert_eq!(stamps[0].1, Some(1_700_000_500_000));
     assert_eq!(stamps[1].1, Some(1_700_000_600_000));
+    assert_eq!(stamps[2].1, Some(1_700_000_700_000));
 
     cleanup(&pool, prefix, &[]).await;
 }

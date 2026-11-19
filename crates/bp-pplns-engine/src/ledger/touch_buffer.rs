@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Buffers `lastAcceptedShareAt` per address and flushes it in one bulk
-//! `UPDATE` per interval: a PG write per share is too expensive on the hot
+//! upsert per interval: a PG write per share is too expensive on the hot
 //! path, and the abandoned-balance sweep tolerates a minute of drift.
 //! A failed flush is merged back newest-wins and retried on the next tick.
 
@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use bp_db::{bulk_update_pplns_last_accepted_share_at, DbError, TouchUpdate};
+use bp_db::{bulk_upsert_pplns_last_accepted_share_at, DbError, TouchUpdate};
 use sqlx::PgPool;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -82,13 +82,13 @@ impl TouchBuffer {
 
 // ── Background flush task ───────────────────────────────────────────
 
-/// Returns the rows updated; on error the snapshot is already rebuffered.
+/// Returns the rows written; on error the snapshot is already rebuffered.
 pub async fn flush_once(pool: &PgPool, buffer: &TouchBuffer) -> Result<u64, DbError> {
     let snapshot = buffer.drain();
     if snapshot.is_empty() {
         return Ok(0);
     }
-    match bulk_update_pplns_last_accepted_share_at(pool, &snapshot).await {
+    match bulk_upsert_pplns_last_accepted_share_at(pool, &snapshot).await {
         Ok(n) => Ok(n),
         Err(e) => {
             buffer.rebuffer(snapshot);
@@ -116,7 +116,7 @@ pub fn spawn_flush_task(
                 _ = tick.tick() => {
                     match flush_once(&pool, &buffer).await {
                         Ok(0) => {}
-                        Ok(n) => debug!(rows_updated = n, "pplns touch-buffer flush ok"),
+                        Ok(n) => debug!(rows_written = n, "pplns touch-buffer flush ok"),
                         Err(e) => warn!(error = %e, "pplns touch-buffer flush failed; rebuffered"),
                     }
                 }

@@ -7,9 +7,8 @@
 use std::sync::Arc;
 
 use bitcoin::Network;
-use bp_common::normalize_btc_address;
 use bp_mining_job::{
-    address_to_script, MiningJobCache, ResolvedPayouts, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
+    parse_pool_address, MiningJobCache, ResolvedPayouts, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
 };
 
 use crate::config::{
@@ -375,20 +374,21 @@ pub(crate) fn handle_authorize<C: Clock>(
         return out;
     }
 
-    // Every cache and PPLNS-window key depends on the normalized form.
-    request.address = normalize_btc_address(&request.address);
-
-    // `address_to_script` covers parse failure AND network mismatch.
-    if address_to_script(state.network, &request.address).is_err() {
-        tracing::warn!(
-            session_id_hex = %state.session_id_hex,
-            username = %request.raw_username,
-            reason = REJECT_INVALID_ADDR,
-            "sv1 authorize refused"
-        );
-        out.push_frame(write_error(&id, ERR_OTHER_UNKNOWN, REJECT_INVALID_ADDR));
-        out.push_event(SessionEvent::Disconnect);
-        return out;
+    // An address of this network in the form every store keys it by, as an
+    // SV2 channel's `AddressId`: every cache and PPLNS-window key depends on it.
+    match parse_pool_address(state.network, &request.address) {
+        Some(address) => request.address = address.into_inner(),
+        None => {
+            tracing::warn!(
+                session_id_hex = %state.session_id_hex,
+                username = %request.raw_username,
+                reason = REJECT_INVALID_ADDR,
+                "sv1 authorize refused"
+            );
+            out.push_frame(write_error(&id, ERR_OTHER_UNKNOWN, REJECT_INVALID_ADDR));
+            out.push_event(SessionEvent::Disconnect);
+            return out;
+        }
     }
 
     // The session stays on its first address, as an SV2 connection does: its
@@ -1184,6 +1184,37 @@ mod tests {
         assert!(state.authorization.is_some());
     }
 
+    /// A valid address of the network that no store can key (a 64-character
+    /// regtest P2WSH, past `AddressId`'s 62) is refused at authorize, as SV2
+    /// refuses it at channel open. A short one of the same network is the
+    /// control.
+    #[test]
+    fn an_address_no_store_can_key_is_refused_at_authorize() {
+        let too_long =
+            bitcoin::Address::p2wsh(&bitcoin::ScriptBuf::new(), bitcoin::KnownHrp::Regtest)
+                .to_string();
+        assert_eq!(too_long.len(), 64, "precondition: past the 62-char key");
+        let port = solo_port(16384.0);
+        let reg = empty_registry();
+        for (addr, admitted) in [(too_long.as_str(), false), (REGTEST_ADDR, true)] {
+            let mut state = fresh_state(TestClock::new(0), &port);
+            let out = handle_authorize(
+                &mut state,
+                &server_config(),
+                &port,
+                &reg,
+                None,
+                authorize_req(addr),
+                0,
+            );
+            let authorized = out
+                .events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Authorized { .. }));
+            assert_eq!(authorized, admitted, "{addr}");
+        }
+    }
+
     /// The first authorize fixes the session's address, as the first channel
     /// does on SV2: a later one for another address is refused and changes
     /// nothing, a repeat for the same address is answered without registering
@@ -1191,9 +1222,7 @@ mod tests {
     /// is the control that it is a valid one.
     #[test]
     fn a_later_authorize_cannot_move_the_session_to_another_address() {
-        let other_addr =
-            bitcoin::Address::p2wsh(&bitcoin::ScriptBuf::new(), bitcoin::KnownHrp::Regtest)
-                .to_string();
+        let other_addr = "bcrt1qvs8k07ggszru23v9p42vpg4jxts9y2k8kkujja".to_string();
         let port = solo_port(16384.0);
         let reg = empty_registry();
         let authorize = |state: &mut SessionState<Arc<TestClock>>, addr: &str| {

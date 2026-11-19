@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO pplns_balance (address, \"lastAcceptedShareAt\")\n           SELECT * FROM UNNEST($1::text[], $2::bigint[])\n           ON CONFLICT (address) DO UPDATE\n           SET \"lastAcceptedShareAt\" = GREATEST(\n               pplns_balance.\"lastAcceptedShareAt\",\n               EXCLUDED.\"lastAcceptedShareAt\"\n           )",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Int8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4a4710d2b48469a8ce065163a645cb8bd703caacfa12f8abd13884f459de3d86"
+}
