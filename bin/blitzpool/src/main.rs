@@ -832,7 +832,7 @@ async fn main() -> ExitCode {
                 cache_conn,
                 m,
                 handles.db.pool().clone(),
-                engines.mode_gate.clone(),
+                &engines,
                 settle_signal.registry_slot(),
             ))
         }
@@ -988,7 +988,7 @@ async fn wait_for_shutdown(
     device_status_sweeper: Option<crate::device_status_gate::DeviceStatusGateHandle>,
     join_request_consumer: Option<bp_share_stream::StreamConsumerHandle>,
     stream_monitor: Option<stream_monitor::StreamMonitorHandle>,
-    cache_sync: Option<cache_sync::CacheSyncHandle>,
+    cache_sync: Option<bp_share_stream::StreamConsumerHandle>,
     autoscaler: Option<coinbase_autoscaler::AutoscalerHandle>,
     block_confirmation: Option<block_confirmation::BlockConfirmationHandle>,
     engine_shutdown: EngineShutdownHandles,

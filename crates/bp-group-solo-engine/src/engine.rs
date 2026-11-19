@@ -263,6 +263,12 @@ impl GroupSoloEngine {
         (mode, window_ms)
     }
 
+    /// Drop all cached distributions, so the next build reads the round and
+    /// the group row again.
+    pub fn invalidate_distribution_cache(&self) {
+        self.inner.distribution_builder.invalidate_all();
+    }
+
     /// Call after a reset-cadence edit: on a window grow, a stale shorter
     /// length would make the record-path trim drop a bucket the larger window
     /// must keep.

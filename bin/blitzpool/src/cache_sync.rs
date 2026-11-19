@@ -11,14 +11,16 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bp_blockparty_engine::BlockpartyService;
 use bp_group_mgmt_engine::MembershipChangeNotifier;
+use bp_group_solo_engine::engine::GroupSoloEngine;
+use bp_pplns_engine::engine::PplnsEngine;
 use bp_share_hook::MinerAdmission;
 use bp_share_stream::{
-    cache_kind, CacheInvalidation, StreamConsumer, StreamProducer, CACHE_INVALIDATION_STREAM_KEY,
+    cache_kind, CacheInvalidation, ConsumerLoopConfig, EnsureMode, StreamConsumer,
+    StreamConsumerHandle, StreamEntryHandler, StreamProducer, CACHE_INVALIDATION_STREAM_KEY,
 };
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use tokio::sync::broadcast;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -26,7 +28,7 @@ use bp_common::AddressId;
 use bp_mining_mode::MiningModeResult;
 
 use crate::coinbase_tags::CoinbaseTagCache;
-use crate::engines::BlitzpoolModeGate;
+use crate::engines::{BlitzpoolModeGate, EngineHandles};
 use crate::group_service::SharedGroupService;
 use crate::membership::{membership_mode, BlockpartyAdminLookup, GroupLookup};
 
@@ -37,8 +39,6 @@ use crate::membership::{membership_mode, BlockpartyAdminLookup, GroupLookup};
 const GROUP: &str = "cache-sync-front";
 const CONSUMER: &str = "c1";
 const BATCH: usize = 32;
-const BLOCK_MS: usize = 1000;
-const ERROR_BACKOFF: Duration = Duration::from_millis(500);
 /// Full-rebuild safety net for any invalidation the consumer missed.
 /// Membership changes are not latency-critical; the stream handles the
 /// common case instantly.
@@ -72,139 +72,146 @@ impl MembershipChangeNotifier for StreamCacheNotifier {
     }
 }
 
-/// Live consumer + backstop task.
-pub(crate) struct CacheSyncHandle {
-    task: JoinHandle<()>,
-    cancel: CancellationToken,
-}
-
-impl CacheSyncHandle {
-    pub(crate) async fn shutdown(self) {
-        self.cancel.cancel();
-        if let Err(err) = self.task.await {
-            warn!(%err, "cache-sync: task join failed");
-        }
-    }
-}
-
-/// Spawn the Front-side cache-sync consumer + periodic backstop. Drains
-/// `cache:invalidate` and rebuilds the matching routing cache; on a timer,
-/// rebuilds both regardless (the safety net).
+/// Spawn the Front-side cache sync: the shared stream runner drains
+/// `cache:invalidate` (retrying the group until it exists, replaying its
+/// pending entries) and rebuilds the matching cache, and a timer rebuilds the
+/// membership caches regardless (the safety net).
 pub(crate) fn spawn(
     redis: ConnectionManager,
     membership: &crate::membership::Membership,
     pool: PgPool,
-    gate: Arc<BlitzpoolModeGate>,
+    engines: &EngineHandles,
     // The Front's JDP payout registry, once `jdp::spawn` has attached it.
-    // Empty on a Front without JDP enabled — a settlement then has nothing
-    // to invalidate here, which is correct, not a miss.
+    // Empty on a Front without JDP enabled: a settlement then drops the
+    // engine caches and has no published distribution to close.
     settle_registry: Arc<
         std::sync::OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>,
     >,
-) -> CacheSyncHandle {
+) -> StreamConsumerHandle {
+    let sync = Arc::new(CacheSync {
+        membership: MembershipSync {
+            group: membership.group.clone(),
+            blockparty: membership.blockparty_service(),
+            admission: membership.admission(),
+            gate: engines.mode_gate.clone(),
+            kicks: membership.session_kicks.clone(),
+        },
+        coinbase_tags: membership.coinbase_tags.clone(),
+        pool,
+        pplns: engines.pplns.clone(),
+        group_solo: engines.group_solo.clone(),
+        settle_registry,
+        rebuilding: tokio::sync::Mutex::new(()),
+    });
     let cancel = CancellationToken::new();
-    let task_cancel = cancel.clone();
-    let blockparty = membership.blockparty_service();
-    let coinbase_tags = membership.coinbase_tags.clone();
-    let sync = MembershipSync {
-        group: membership.group.clone(),
-        blockparty,
-        admission: membership.admission(),
-        gate,
-        kicks: membership.session_kicks.clone(),
-    };
-    let task = tokio::spawn(async move {
-        let consumer: StreamConsumer<CacheInvalidation> =
-            StreamConsumer::new(redis, CACHE_INVALIDATION_STREAM_KEY, GROUP, CONSUMER);
-        // Tail-start: the Front already warmed both caches from the DB at boot,
-        // so it only needs invalidations published AFTER that.
-        if let Err(err) = consumer.ensure_group_at_tail().await {
-            warn!(%err, "cache-sync: ensure_group failed; relying on periodic backstop only");
-        }
-
-        info!("cache-sync: live (stream + periodic backstop)");
-        let mut backstop = tokio::time::interval(BACKSTOP_INTERVAL);
-        backstop.tick().await; // consume the immediate first tick
-
+    // Tail-start: the Front already warmed every cache from the DB at boot,
+    // so it only needs invalidations published AFTER that.
+    let consumer: StreamConsumer<CacheInvalidation> =
+        StreamConsumer::new(redis, CACHE_INVALIDATION_STREAM_KEY, GROUP, CONSUMER);
+    let drain = tokio::spawn(consumer.run(
+        EnsureMode::FromTail,
+        ConsumerLoopConfig::new(BATCH, "cache-sync"),
+        cancel.clone(),
+        CacheSyncHandler(sync.clone()),
+    ));
+    let backstop_cancel = cancel.clone();
+    let backstop = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(BACKSTOP_INTERVAL);
+        tick.tick().await; // consume the immediate first tick
         loop {
             tokio::select! {
                 biased;
-                _ = task_cancel.cancelled() => break,
-                _ = backstop.tick() => {
-                    let fresh = rebuild_group(&sync.group).await
-                        & rebuild_blockparty(sync.blockparty.as_ref()).await;
-                    if fresh {
-                        sync.kick_moved_sessions().await;
-                    }
-                    rebuild_coinbase_tags(&coinbase_tags, &pool).await;
-                }
-                result = consumer.read_new(BATCH, BLOCK_MS) => match result {
-                    Ok(batch) => {
-                        if batch.is_empty() {
-                            continue;
-                        }
-                        let mut want_group = false;
-                        let mut want_blockparty = false;
-                        let mut want_settlement = false;
-                        let mut ids = Vec::with_capacity(batch.len());
-                        for entry in &batch {
-                            match entry.value.kind.as_str() {
-                                cache_kind::GROUP => want_group = true,
-                                cache_kind::BLOCKPARTY => want_blockparty = true,
-                                cache_kind::SETTLEMENT => want_settlement = true,
-                                other => warn!(kind = other, "cache-sync: unknown invalidation kind — ignored"),
-                            }
-                            ids.push(entry.id.clone());
-                        }
-                        // Coalesce: one rebuild per kind per batch, then one
-                        // kick pass over the rebuilt caches.
-                        let mut fresh = true;
-                        if want_group {
-                            fresh &= rebuild_group(&sync.group).await;
-                        }
-                        if want_blockparty {
-                            fresh &= rebuild_blockparty(sync.blockparty.as_ref()).await;
-                        }
-                        if (want_group || want_blockparty) && fresh {
-                            sync.kick_moved_sessions().await;
-                        }
-                        // Teams and Blockpartys both set a tag.
-                        if want_group || want_blockparty {
-                            rebuild_coinbase_tags(&coinbase_tags, &pool).await;
-                        }
-                        if want_settlement {
-                            invalidate_payout_distributions(&settle_registry);
-                        }
-                        if let Err(err) = consumer.ack(&ids).await {
-                            warn!(%err, "cache-sync: ack failed (will redeliver)");
-                        }
-                    }
-                    Err(err) => {
-                        warn!(%err, "cache-sync: read_new failed; backing off");
-                        tokio::time::sleep(ERROR_BACKOFF).await;
-                    }
-                },
+                _ = backstop_cancel.cancelled() => break,
+                _ = tick.tick() => sync.rebuild_memberships(true, true).await,
             }
         }
-        info!("cache-sync: stopped");
     });
-    CacheSyncHandle { task, cancel }
+    StreamConsumerHandle::new(vec![drain, backstop], cancel, "cache-sync")
 }
 
-/// ext 0x0003/Implementation Notes: a block settled on another process.
-/// Every distribution this Front published encodes pre-settlement balances,
-/// so their acceptance window closes now; declaring against them would pay
-/// those balances twice.
-fn invalidate_payout_distributions(
-    registry: &Arc<std::sync::OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>>,
+/// What the stream and the backstop act on.
+struct CacheSync {
+    membership: MembershipSync,
+    coinbase_tags: Arc<CoinbaseTagCache>,
+    pool: PgPool,
+    pplns: Option<PplnsEngine>,
+    group_solo: Option<GroupSoloEngine>,
+    settle_registry:
+        Arc<std::sync::OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>>,
+    /// One rebuild and kick pass at a time, so the stream and the backstop
+    /// never rebuild and kick from the same caches at once.
+    rebuilding: tokio::sync::Mutex<()>,
+}
+
+impl CacheSync {
+    /// Rebuild the asked membership caches, then kick the connections whose
+    /// mode they moved, then the coinbase tags both set.
+    async fn rebuild_memberships(&self, group: bool, blockparty: bool) {
+        let _one_at_a_time = self.rebuilding.lock().await;
+        let mut fresh = true;
+        if group {
+            fresh &= rebuild_group(&self.membership.group).await;
+        }
+        if blockparty {
+            fresh &= rebuild_blockparty(self.membership.blockparty.as_ref()).await;
+        }
+        if fresh {
+            self.membership.kick_moved_sessions().await;
+        }
+        rebuild_coinbase_tags(&self.coinbase_tags, &self.pool).await;
+    }
+
+    fn settlement(&self) {
+        drop_pre_settlement_state(
+            self.pplns.as_ref(),
+            self.group_solo.as_ref(),
+            &self.settle_registry,
+        );
+    }
+}
+
+/// ext 0x0003/Implementation Notes: a block settled on another process. The
+/// front's engine caches hold pre-settlement balances and rounds, so they are
+/// dropped first; then every distribution this Front published closes its
+/// acceptance window, since declaring against one would pay those balances
+/// twice, and the republish builds from fresh inputs.
+fn drop_pre_settlement_state(
+    pplns: Option<&PplnsEngine>,
+    group_solo: Option<&GroupSoloEngine>,
+    registry: &std::sync::OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>,
 ) {
+    if let Some(pplns) = pplns {
+        pplns.invalidate_distribution_cache();
+    }
+    if let Some(group_solo) = group_solo {
+        group_solo.invalidate_distribution_cache();
+    }
     match registry.get() {
         Some(handle) => {
             handle.settle();
             info!("cache-sync: settlement heard — published payout distributions invalidated");
         }
         // No JDP server on this process, so nothing published anything.
-        None => debug!("cache-sync: settlement heard but no payout registry here — ignored"),
+        None => {
+            debug!("cache-sync: settlement heard — engine caches dropped, no payout registry here")
+        }
+    }
+}
+
+struct CacheSyncHandler(Arc<CacheSync>);
+
+#[async_trait]
+impl StreamEntryHandler<CacheInvalidation> for CacheSyncHandler {
+    async fn handle(&self, value: CacheInvalidation) {
+        match value.kind.as_str() {
+            cache_kind::GROUP => self.0.rebuild_memberships(true, false).await,
+            cache_kind::BLOCKPARTY => self.0.rebuild_memberships(false, true).await,
+            cache_kind::SETTLEMENT => self.0.settlement(),
+            other => warn!(
+                kind = other,
+                "cache-sync: unknown invalidation kind — ignored"
+            ),
+        }
     }
 }
 
@@ -320,6 +327,80 @@ mod tests {
     use super::*;
 
     use bp_test_support::{connect_redis_in_range_or_skip, redis_db};
+
+    /// A share the payout process records changes what the front must build,
+    /// but the front's distribution cache keeps serving its cached build until a
+    /// settlement drops it. Two engines on one Redis database stand in for the
+    /// two processes; the cached build before the drop is the control.
+    #[tokio::test]
+    async fn a_settlement_drops_the_fronts_cached_distribution() {
+        use bp_pplns_engine::config::PplnsEngineConfig;
+        use bp_pplns_engine::window::NetworkDifficulty;
+        let Some(front_redis) =
+            connect_redis_in_range_or_skip(bp_test_support::redis_db::BLITZPOOL_BIN_2, 5).await
+        else {
+            return;
+        };
+        let Some(pg) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let fee = bp_test_support::deterministic_p2wpkh_regtest([0xD1; 32]);
+        let first = bp_test_support::deterministic_p2wpkh_regtest([0xD2; 32]);
+        let second = bp_test_support::deterministic_p2wpkh_regtest([0xD3; 32]);
+        let config = || PplnsEngineConfig {
+            fee_address: Some(AddressId::new(fee.clone()).unwrap()),
+            dust_sweep_enabled: false,
+            ..PplnsEngineConfig::default()
+        };
+        let spawn = |redis| {
+            bp_pplns_engine::engine::PplnsEngine::spawn_core(
+                config(),
+                redis,
+                pg.clone(),
+                NetworkDifficulty::new(1_000_000.0),
+            )
+        };
+        let front = spawn(front_redis.clone()).await.expect("front engine");
+        let payout = spawn(front_redis).await.expect("payout engine");
+        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        payout
+            .record_share(None, &first, 100.0, now_ms)
+            .await
+            .expect("first share");
+
+        const REWARD: u64 = 312_500_000;
+        let pays = |built: &bp_coinbase_snapshot::BuiltDistribution, address: &str| {
+            built
+                .distribution
+                .published()
+                .any(|e| e.address.as_str() == address)
+        };
+        let before = front.build_distribution(REWARD).await.expect("first build");
+        assert!(
+            pays(&before, &first),
+            "precondition: the first miner is paid"
+        );
+
+        payout
+            .record_share(None, &second, 100.0, now_ms)
+            .await
+            .expect("second share");
+        let cached = front
+            .build_distribution(REWARD)
+            .await
+            .expect("cached build");
+        assert!(
+            !pays(&cached, &second),
+            "control: the front still serves its cached build"
+        );
+
+        drop_pre_settlement_state(Some(&front), None, &std::sync::OnceLock::new());
+        let fresh = front.build_distribution(REWARD).await.expect("fresh build");
+        assert!(
+            pays(&fresh, &second),
+            "after the settlement the front builds from the current window"
+        );
+    }
 
     /// A team or party connection stays only while that same membership
     /// holds; a port-mode connection stays only while it has no membership
@@ -581,7 +662,7 @@ mod tests {
             settling.settle().await;
             for entry in consumer.read_new(16, 500).await.expect("read_new") {
                 if entry.value.kind == cache_kind::SETTLEMENT {
-                    invalidate_payout_distributions(&front_registry);
+                    drop_pre_settlement_state(None, None, &front_registry);
                     heard = true;
                 }
             }

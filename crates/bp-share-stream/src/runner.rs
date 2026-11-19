@@ -193,8 +193,7 @@ impl<T: DeserializeOwned + Send + 'static> StreamConsumer<T> {
     }
 }
 
-/// Consumer task(s) sharing one cancel token: one for
-/// [`StreamConsumer::spawn`], two for the accepted-share consumer groups.
+/// Tasks sharing one cancel token, stopped and joined together.
 pub struct StreamConsumerHandle {
     tasks: Vec<JoinHandle<()>>,
     cancel: CancellationToken,

@@ -222,8 +222,8 @@ impl PplnsEngine {
         self.inner.distribution_builder.live_budget()
     }
 
-    /// Drop all cached distributions, so a changed live budget takes effect on the
-    /// next build.
+    /// Drop all cached distributions and their inputs, so the next build reads
+    /// the window, the ledger and the live budget again.
     pub fn invalidate_distribution_cache(&self) {
         self.inner.distribution_builder.invalidate_all();
     }
