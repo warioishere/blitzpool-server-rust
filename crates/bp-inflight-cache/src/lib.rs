@@ -17,8 +17,16 @@ use tokio::sync::broadcast;
 type SharedResult<V, E> = Result<Arc<V>, Arc<E>>;
 
 enum Slot<V, E> {
-    InFlight(broadcast::Sender<SharedResult<V, E>>),
-    Cached { value: Arc<V>, expires_at: Instant },
+    /// A compute is running; `leader` tells whose, so a leader only ever
+    /// removes its own slot.
+    InFlight {
+        leader: u64,
+        tx: broadcast::Sender<SharedResult<V, E>>,
+    },
+    Cached {
+        value: Arc<V>,
+        expires_at: Instant,
+    },
 }
 
 /// Slot map plus a generation counter that every invalidation bumps, so a
@@ -27,6 +35,45 @@ enum Slot<V, E> {
 struct Inner<K, V, E> {
     slots: HashMap<K, Slot<V, E>>,
     generation: u64,
+    next_leader: u64,
+}
+
+impl<K: Hash + Eq, V, E> Inner<K, V, E> {
+    /// Remove `key`'s slot only while it is `leader`'s in-flight slot.
+    fn remove_own(&mut self, key: &K, leader: u64) {
+        if matches!(self.slots.get(key), Some(Slot::InFlight { leader: l, .. }) if *l == leader) {
+            self.slots.remove(key);
+        }
+    }
+}
+
+/// Held by a running leader. Dropped before the leader finishes (its future
+/// cancelled or panicking), it removes the leader's slot: the followers'
+/// channel closes and the next caller leads, instead of waiting for good.
+struct LeaderGuard<K: Hash + Eq, V, E> {
+    state: Arc<Mutex<Inner<K, V, E>>>,
+    key: K,
+    leader: u64,
+    finished: bool,
+}
+
+impl<K: Hash + Eq, V, E> Drop for LeaderGuard<K, V, E> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.remove_own(&self.key, self.leader);
+        }
+    }
+}
+
+enum Role<V, E> {
+    Follower(broadcast::Receiver<SharedResult<V, E>>),
+    Leader {
+        id: u64,
+        tx: broadcast::Sender<SharedResult<V, E>>,
+    },
 }
 
 /// Per-key in-flight dedup + TTL cache. Clones share state.
@@ -56,6 +103,7 @@ where
             state: Arc::new(Mutex::new(Inner {
                 slots: HashMap::new(),
                 generation: 0,
+                next_leader: 0,
             })),
             ttl,
         }
@@ -69,35 +117,50 @@ where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<V, E>>,
     {
-        let (receiver, generation_at_start) = {
+        let (role, generation_at_start) = {
             let mut state = self.state.lock().expect("inflight mutex poisoned");
             let generation_at_start = state.generation;
-            let receiver = match state.slots.get(&key) {
+            let role = match state.slots.get(&key) {
                 Some(Slot::Cached { value, expires_at }) if *expires_at > Instant::now() => {
                     return Ok(value.clone());
                 }
-                Some(Slot::InFlight(tx)) => Some(tx.subscribe()),
+                Some(Slot::InFlight { tx, .. }) => Role::Follower(tx.subscribe()),
                 _ => {
                     // No entry OR expired entry: this caller leads.
                     let (tx, _) = broadcast::channel::<SharedResult<V, E>>(1);
-                    state.slots.insert(key.clone(), Slot::InFlight(tx));
-                    None
+                    let id = state.next_leader;
+                    state.next_leader = state.next_leader.wrapping_add(1);
+                    state.slots.insert(
+                        key.clone(),
+                        Slot::InFlight {
+                            leader: id,
+                            tx: tx.clone(),
+                        },
+                    );
+                    Role::Leader { id, tx }
                 }
             };
-            (receiver, generation_at_start)
+            (role, generation_at_start)
         };
 
-        if let Some(mut rx) = receiver {
-            return match rx.recv().await {
-                Ok(result) => result,
-                Err(_) => {
-                    // The leader dropped the sender without sending, i.e. its
-                    // task panicked. A default-constructed E sends the caller
-                    // down its error path; the next call recomputes.
-                    Err(Arc::new(E::default()))
-                }
-            };
-        }
+        let (id, tx) = match role {
+            Role::Follower(mut rx) => {
+                return match rx.recv().await {
+                    Ok(result) => result,
+                    // The leader was cancelled or panicked before publishing.
+                    // A default-constructed E sends the caller down its error
+                    // path; the next call leads.
+                    Err(_) => Err(Arc::new(E::default())),
+                };
+            }
+            Role::Leader { id, tx } => (id, tx),
+        };
+        let mut guard = LeaderGuard {
+            state: self.state.clone(),
+            key: key.clone(),
+            leader: id,
+            finished: false,
+        };
 
         let outcome = compute().await;
         let shared: SharedResult<V, E> = match outcome {
@@ -106,9 +169,9 @@ where
         };
 
         // One lock, so an invalidation cannot slip between remove and insert.
-        let prev = {
+        {
             let mut state = self.state.lock().expect("inflight mutex poisoned");
-            let prev = state.slots.remove(&key);
+            state.remove_own(&key, id);
             // Cache only if no invalidation landed during the compute;
             // otherwise the value is already superseded.
             if let Ok(value) = &shared {
@@ -122,13 +185,11 @@ where
                     );
                 }
             }
-            prev
-        };
-        if let Some(Slot::InFlight(tx)) = prev {
-            // Errs with no followers. Followers get the result even when it
-            // was not cached: it is the value they queued for.
-            let _ = tx.send(shared.clone());
+            guard.finished = true;
         }
+        // Errs with no followers. Followers get the result even when it was
+        // not cached: it is the value they queued for.
+        let _ = tx.send(shared.clone());
         shared
     }
 
@@ -272,7 +333,8 @@ mod tests {
         );
     }
 
-    /// A mid-compute clear: the leader's result is returned but not cached.
+    /// A mid-compute clear: the leader's result reaches its caller and the
+    /// followers that queued before the clear, but is not cached.
     #[tokio::test]
     async fn clear_during_inflight_is_not_resurrected() {
         let cache: Arc<InflightResultCache<u64, u64, FakeError>> =
@@ -293,12 +355,27 @@ mod tests {
             })
         };
 
+        // A follower queued behind the leader before the clear.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let early_follower = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.get_or_compute(1, || async { Ok(99u64) }).await })
+        };
+
         // Land the clear while the leader is still computing.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
         cache.clear();
 
-        // The leader still returns its value to its own caller.
+        // The leader still returns its value to its own caller, and to the
+        // follower that queued for it.
         assert_eq!(*leader.await.unwrap().expect("leader ok"), 11);
+        assert_eq!(
+            *early_follower
+                .await
+                .unwrap()
+                .expect("follower gets the leader's value"),
+            11
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         // But it must not have been cached: the next caller recomputes.
@@ -318,6 +395,95 @@ mod tests {
             calls.load(Ordering::SeqCst),
             2,
             "clear during in-flight compute must force a recompute"
+        );
+    }
+
+    /// A leader whose future is dropped mid-compute (a client gone, a
+    /// timeout) frees its slot: its follower errors at once and the next
+    /// caller leads instead of waiting for good.
+    #[tokio::test]
+    async fn a_cancelled_leader_blocks_no_later_caller() {
+        let cache: Arc<InflightResultCache<u64, u64, FakeError>> =
+            Arc::new(InflightResultCache::new(Duration::from_secs(60)));
+        let leader = {
+            let cache = cache.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_compute(1, || async {
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                        Ok(1u64)
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let follower = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.get_or_compute(1, || async { Ok(9u64) }).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        leader.abort();
+
+        let followed = tokio::time::timeout(Duration::from_secs(1), follower)
+            .await
+            .expect("the follower must not wait for a dead leader")
+            .unwrap();
+        assert_eq!(
+            followed.expect_err("no result was published").as_ref(),
+            &FakeError::Unset
+        );
+        let next = tokio::time::timeout(
+            Duration::from_secs(1),
+            cache.get_or_compute(1, || async { Ok(2u64) }),
+        )
+        .await
+        .expect("the next caller must lead, not wait on the dead slot");
+        assert_eq!(*next.expect("ok"), 2);
+    }
+
+    /// A leader that finishes after a clear leaves the slot of the leader
+    /// that started after the clear alone: that one's followers get its own
+    /// result, not the superseded one.
+    #[tokio::test]
+    async fn a_superseded_leader_leaves_the_next_leaders_slot_alone() {
+        let cache: Arc<InflightResultCache<u64, u64, FakeError>> =
+            Arc::new(InflightResultCache::new(Duration::from_secs(60)));
+        let old = {
+            let cache = cache.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_compute(1, || async {
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        Ok(111u64)
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cache.clear();
+        let new = {
+            let cache = cache.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_compute(1, || async {
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                        Ok(222u64)
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let follower = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.get_or_compute(1, || async { Ok(999u64) }).await })
+        };
+
+        assert_eq!(*old.await.unwrap().expect("ok"), 111);
+        assert_eq!(*new.await.unwrap().expect("ok"), 222);
+        assert_eq!(
+            *follower.await.unwrap().expect("ok"),
+            222,
+            "the follower queued behind the new leader gets the new value"
         );
     }
 

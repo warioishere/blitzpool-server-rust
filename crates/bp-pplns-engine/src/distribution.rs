@@ -34,11 +34,11 @@ const SNAPSHOT_WRITE_RETRIES: u32 = 2;
 const SNAPSHOT_WRITE_BACKOFF: Duration = Duration::from_millis(40);
 
 /// Errors surfaced by [`DistributionBuilder::build`]. `Default` exists so
-/// the in-flight cache can build a placeholder when the leader panics.
+/// the in-flight cache can answer a follower whose leader never published.
 #[derive(Debug, Default, Error)]
 pub enum DistributionError {
-    /// The in-flight leader dropped without publishing (a panic mid-build);
-    /// the caller retries.
+    /// The in-flight leader was cancelled or panicked before publishing; the
+    /// caller retries.
     #[default]
     #[error("inflight leader dropped without publishing — retry")]
     LeaderDropped,

@@ -28,6 +28,8 @@ pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default, Error)]
 pub enum DistributionError {
+    /// The in-flight leader was cancelled or panicked before publishing; the
+    /// caller retries.
     #[default]
     #[error("inflight leader dropped without publishing — retry")]
     LeaderDropped,
