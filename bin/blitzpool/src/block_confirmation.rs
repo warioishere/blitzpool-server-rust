@@ -310,11 +310,14 @@ pub(crate) async fn settle_block(
             round_at_find,
         } => {
             let engine = settlers.group_solo.ok_or(SettleFailure::NoEngine)?;
+            let round_at_find = round_at_find
+                .clone()
+                .ok_or(SettleFailure::FoundTimeInputsMissing)?;
             // Books from the coinbase alone; the weight snapshot is PPLNS's.
             let block = bp_group_solo_engine::engine::FoundGroupBlock {
                 height,
                 hash: &pb.block_hash,
-                round_at_find: round_at_find.clone(),
+                round_at_find,
             };
             engine
                 .on_block_found(*group_id, block, actual)
@@ -347,7 +350,7 @@ pub(crate) async fn settle_block(
             let engine = settlers.pplns.ok_or(SettleFailure::NoEngine)?;
             let snapshot = weight_snapshot
                 .clone()
-                .ok_or(SettleFailure::SnapshotMissing)?;
+                .ok_or(SettleFailure::FoundTimeInputsMissing)?;
             engine
                 .on_block_found(height, actual, snapshot)
                 .await
@@ -366,23 +369,23 @@ pub(crate) enum SettleFailure {
     /// A Blockparty group that does not exist.
     #[error("blockparty group does not exist")]
     UnusableGroup,
-    /// A PPLNS block whose settlement inputs could not be read when it was
-    /// found; the snapshot key is gone by now.
-    #[error("pplns settlement inputs were not resolved at found-time")]
-    SnapshotMissing,
+    /// A block whose settlement inputs could not be read when it was found
+    /// (PPLNS's weight snapshot, Group-Solo's round); they are gone by now.
+    #[error("settlement inputs were not resolved at found-time")]
+    FoundTimeInputsMissing,
     #[error(transparent)]
     Engine(SettleError),
 }
 
 impl SettleFailure {
-    /// Will a retry fail the same way? A deleted group stays deleted and a
-    /// snapshot not resolved at found-time is gone, so both are terminal like
+    /// Will a retry fail the same way? A deleted group stays deleted and
+    /// inputs not resolved at found-time are gone, so both are terminal like
     /// the engines' own verdicts. A missing engine is not: another process
     /// may own the block.
     pub(crate) fn is_terminal(&self) -> bool {
         match self {
             SettleFailure::NoEngine => false,
-            SettleFailure::UnusableGroup | SettleFailure::SnapshotMissing => true,
+            SettleFailure::UnusableGroup | SettleFailure::FoundTimeInputsMissing => true,
             SettleFailure::Engine(e) => e.is_terminal(),
         }
     }
@@ -1786,6 +1789,83 @@ mod declared_block_booking_regtest {
         c.assert_no_ledger_rows().await;
 
         c.teardown().await;
+    }
+}
+
+#[cfg(test)]
+mod group_solo_settlement {
+    use std::collections::HashMap;
+
+    use bp_coinbase_snapshot::ActualCoinbase;
+    use bp_common::AddressId;
+
+    use super::{settle_block, SettleFailure, Settlers};
+    use crate::pending_blocks::{PendingBlock, PendingSettlement};
+
+    /// A Group-Solo block parked without its found-time round settles to the
+    /// terminal `FoundTimeInputsMissing`, which the watcher answers like any
+    /// terminal verdict; without the engine it is `NoEngine`, which the watcher
+    /// leaves parked (negative control).
+    #[tokio::test]
+    async fn a_group_block_without_its_found_time_round_is_terminal_once_settled() {
+        let Some(redis) = bp_test_support::connect_redis_in_range_or_skip(
+            bp_test_support::redis_db::BLITZPOOL_BIN_2,
+            4,
+        )
+        .await
+        else {
+            return;
+        };
+        let Some(pg) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let fee = bp_test_support::deterministic_p2wpkh_regtest([0xC3; 32]);
+        let engine = bp_group_solo_engine::engine::GroupSoloEngine::spawn_core(
+            bp_group_solo_engine::config::GroupSoloEngineConfig {
+                fee_address: Some(AddressId::new(fee).expect("fee addr")),
+                ..Default::default()
+            }
+            .try_new()
+            .expect("group-solo config"),
+            redis,
+            pg,
+        )
+        .await
+        .expect("GroupSoloEngine::spawn");
+        let pb = PendingBlock {
+            block_hash: "00".repeat(32),
+            found_at_ms: 1,
+            block_height: 900_000,
+            actual_coinbase: ActualCoinbase {
+                paid_by_address: HashMap::new(),
+                output_zero: None,
+                total_value_sats: 312_500_000,
+            },
+            settlement: PendingSettlement::GroupSolo {
+                group_id: uuid::Uuid::new_v4(),
+                round_at_find: None,
+            },
+        };
+
+        let without = Settlers {
+            pplns: None,
+            group_solo: None,
+            blockparty: None,
+        };
+        let parked = settle_block(&without, &pb).await;
+        assert!(matches!(parked, Err(SettleFailure::NoEngine)), "{parked:?}");
+
+        let with = Settlers {
+            pplns: None,
+            group_solo: Some(&engine),
+            blockparty: None,
+        };
+        let settled = settle_block(&with, &pb).await;
+        assert!(
+            matches!(&settled, Err(SettleFailure::FoundTimeInputsMissing)),
+            "{settled:?}"
+        );
+        assert!(settled.unwrap_err().is_terminal());
     }
 }
 

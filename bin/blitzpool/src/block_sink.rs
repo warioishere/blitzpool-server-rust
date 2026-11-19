@@ -29,9 +29,7 @@ use tracing::{error, info, warn};
 use crate::block_confirmation::{settle_block, SettleFailure};
 use crate::boot::FoundationHandles;
 use crate::engines::{BlitzpoolModeGate, EngineHandles};
-use crate::pending_blocks::{
-    is_pending_block, park_unbookable_block, put_pending_block, PendingBlock, PendingSettlement,
-};
+use crate::pending_blocks::{is_pending_block, put_pending_block, PendingBlock, PendingSettlement};
 
 /// Reads at a block's find before it counts as unreadable.
 const FIND_READ_ATTEMPTS: u32 = 3;
@@ -654,32 +652,6 @@ impl BlockFoundApplier {
             .unwrap_or(false)
     }
 
-    /// Keep a group-solo block whose found-time state could not be read in
-    /// the unbookable store, for the operator, instead of losing it.
-    async fn park_unbookable(&self, event: &BlockFoundEvent, group_id: uuid::Uuid) {
-        let (Some(redis), Some(actual)) = (self.redis.as_ref(), event.actual_coinbase.as_ref())
-        else {
-            error!(%group_id, height = event.height, block_hash = %event.block_hash,
-                "block-found: no Redis or no parsed coinbase — the block is NOT kept anywhere");
-            return;
-        };
-        let pending = PendingBlock {
-            block_hash: event.block_hash.clone(),
-            found_at_ms: chrono::Utc::now().timestamp_millis(),
-            block_height: event.height,
-            actual_coinbase: actual.clone(),
-            settlement: PendingSettlement::GroupSolo {
-                group_id,
-                round_at_find: Default::default(),
-            },
-        };
-        let mut conn = redis.clone();
-        if let Err(err) = park_unbookable_block(&mut conn, &pending).await {
-            error!(%err, %group_id, height = event.height, block_hash = %event.block_hash,
-                "block-found: unbookable-store write failed — the block is NOT kept anywhere");
-        }
-    }
-
     /// Fallback of [`Self::gate_or_apply`]; the same settlement the
     /// confirmation watcher runs, on the same blob it would have parked.
     async fn apply_now(&self, address_str: &str, reward: u64, pending: &PendingBlock) {
@@ -716,11 +688,12 @@ impl BlockFoundApplier {
                 mode = label,
                 "block-found: group gone — NOT booked"
             ),
-            Err(SettleFailure::SnapshotMissing) => warn!(
+            Err(SettleFailure::FoundTimeInputsMissing) => error!(
                 address = address_str,
                 height,
                 mode = label,
-                "block-found: settlement inputs not resolved at found-time — NOT booked"
+                "block-found: settlement inputs not resolved at found-time and the block \
+                 could not be parked; NOT booked and NOT kept anywhere"
             ),
             Err(SettleFailure::Engine(err)) => warn!(
                 %err, address = address_str, height,
@@ -830,29 +803,28 @@ impl BlockFoundApplier {
                         } else {
                             // Taken now, so booking leaves the shares mined
                             // while the block waits for its confirmations.
-                            match read_at_find("group-solo round", || engine.cut_round_at_find(group_id, block_hash)).await {
-                                Ok(round_at_find) => {
-                                    self.gate_or_apply(
-                                        address_str,
-                                        height,
-                                        reward,
-                                        block_hash,
-                                        event.actual_coinbase.as_ref(),
-                                        event.payouts_fingerprint,
-                                        PendingSettlement::GroupSolo {
-                                            group_id,
-                                            round_at_find,
-                                        },
-                                    )
-                                    .await;
-                                }
+                            let round_at_find = match read_at_find("group-solo round", || engine.cut_round_at_find(group_id, block_hash)).await {
+                                Ok(round_at_find) => Some(round_at_find),
                                 Err(err) => {
                                     error!(%err, %group_id, address = address_str, height,
                                         "block-found: group-solo round state unreadable at the \
-                                         find after retries — parked as unbookable, NOT booked");
-                                    self.park_unbookable(event, group_id).await;
+                                         find after retries; parking the block without it");
+                                    None
                                 }
-                            }
+                            };
+                            self.gate_or_apply(
+                                address_str,
+                                height,
+                                reward,
+                                block_hash,
+                                event.actual_coinbase.as_ref(),
+                                event.payouts_fingerprint,
+                                PendingSettlement::GroupSolo {
+                                    group_id,
+                                    round_at_find,
+                                },
+                            )
+                            .await;
                         }
                     }
                     (None, _) => warn!(
@@ -1452,8 +1424,10 @@ mod tests {
 
     /// One rule for every mode that books against a pool-built distribution:
     /// a block on a coinbase the pool did not build (no or zeroed fingerprint)
-    /// is not parked. A real fingerprint parks (negative control), and
-    /// Blockparty, which books what the coinbase paid its roster, parks without one.
+    /// is not parked. A real fingerprint parks (negative control), also for a
+    /// Group-Solo block whose round was unreadable at the find, so it waits for
+    /// its confirmations; Blockparty, which books what the coinbase paid its
+    /// roster, parks without one.
     #[tokio::test]
     async fn only_a_pool_built_coinbase_is_parked_for_booking() {
         let Some(mut conn) = bp_test_support::connect_redis_in_range_or_skip(
@@ -1495,7 +1469,7 @@ mod tests {
                 None,
                 PendingSettlement::GroupSolo {
                     group_id,
-                    round_at_find: Default::default(),
+                    round_at_find: None,
                 },
             ),
         ] {
@@ -1515,7 +1489,7 @@ mod tests {
                 Some([7u8; 32]),
                 PendingSettlement::GroupSolo {
                     group_id,
-                    round_at_find: Default::default(),
+                    round_at_find: None,
                 },
             ),
             ("bp-none", None, PendingSettlement::Blockparty { group_id }),

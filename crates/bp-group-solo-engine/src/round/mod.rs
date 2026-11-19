@@ -309,7 +309,7 @@ pub struct BestShare {
 /// handles the block-found event, so shares still on the share stream then
 /// fall on the wrong side of the cut; a member removed and re-added before
 /// the booking loses their new shares up to their found-time amount.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RoundAtFind {
     /// Per-address payout shares (the round, or the trimmed window).
     pub payout_shares: HashMap<String, f64>,

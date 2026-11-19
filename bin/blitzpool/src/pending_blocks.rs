@@ -49,8 +49,9 @@ pub(crate) enum PendingSettlement {
     GroupSolo {
         group_id: Uuid,
         /// The group's state at the find, which booking takes out of the
-        /// round.
-        round_at_find: bp_group_solo_engine::round::RoundAtFind,
+        /// round; `None` when it could not be read then, which nothing can
+        /// book automatically.
+        round_at_find: Option<bp_group_solo_engine::round::RoundAtFind>,
     },
     Blockparty {
         group_id: Uuid,
