@@ -204,9 +204,10 @@ After a config change, restart both pool processes:
 docker compose up -d --force-recreate front back
 ```
 
-A section that is removed again switches its mode off. For Team Mining the
-pool refuses to start while active teams still exist, so no member is
-silently moved to Solo; dissolve the teams first or keep `[group_solo]`.
+A section that is removed again switches its mode off. The pool refuses to
+start while groups of that mode still exist: Team Mining members would get
+no job, and a Blockparty admin would mine in the port's mode. Dissolve the
+teams or parties first, or keep `[group_solo]` / `[blockparty]`.
 
 ## Operating
 

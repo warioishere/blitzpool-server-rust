@@ -68,13 +68,13 @@ pub(crate) enum EngineError {
     #[error("group-solo config invalid: {0}")]
     GroupSoloConfig(#[from] bp_group_solo_engine::config::ConfigError),
     #[error(
-        "group-solo is disabled (no [group_solo] table in config) but {count} active \
-         group(s) exist; their members would mine as Solo. Add an empty [group_solo] \
-         table to keep them, or dissolve the groups first"
+        "{section} is disabled (no [{section}] table in config) but {count} live \
+         group(s) depend on it. Put the [{section}] table back to keep them, or \
+         dissolve the groups first"
     )]
-    GroupSoloDisabledWithActiveGroups { count: usize },
-    #[error("group-solo: active-group check failed: {0}")]
-    GroupSoloActiveGroups(#[from] bp_db::DbError),
+    ModeDisabledWithLiveGroups { section: &'static str, count: usize },
+    #[error("live-group check failed: {0}")]
+    LiveGroupCheck(#[from] bp_db::DbError),
     #[error("session-persistence engine spawn failed: {0}")]
     SessionPersistence(#[from] bp_session_persistence::error::SessionPersistenceError),
     #[error("invalid bitcoin address {0:?}: {1}")]
@@ -106,7 +106,7 @@ pub(crate) async fn spawn(
     let pplns = spawn_pplns(cfg, handles, read_only).await?;
     let group_solo = spawn_group_solo(cfg, handles, read_only).await?;
     let session_persistence = spawn_session_persistence(handles).await?;
-    let blockparty_payouts = blockparty_payouts(cfg, handles)?;
+    let blockparty_payouts = blockparty_payouts(cfg, handles.db.pool()).await?;
 
     let (accepted_sink, rejected_sink) = if cfg.has_role(Role::Front) {
         let core_epoch = fetch_core_epoch(&handles.redis).await?;
@@ -233,11 +233,12 @@ async fn spawn_group_solo(
     core: bool,
 ) -> Result<Option<GroupSoloEngine>, EngineError> {
     let Some(gs_cfg) = cfg.group_solo.as_ref() else {
-        // Switching the mode off must not silently turn existing groups'
-        // members into Solo miners.
+        // Switching the mode off would leave existing groups' members with no
+        // job (their mode stays Group-Solo, its engine would be gone).
         let active = bp_db::list_active_pplns_groups(handles.db.pool()).await?;
         if !active.is_empty() {
-            return Err(EngineError::GroupSoloDisabledWithActiveGroups {
+            return Err(EngineError::ModeDisabledWithLiveGroups {
+                section: "group_solo",
                 count: active.len(),
             });
         }
@@ -284,16 +285,25 @@ fn mode_fee_address(raw: &str) -> Result<AddressId, EngineError> {
 
 // ─── Blockparty payouts ──────────────────────────────────────────
 
-fn blockparty_payouts(
+async fn blockparty_payouts(
     cfg: &AppConfig,
-    handles: &FoundationHandles,
+    pool: &sqlx::PgPool,
 ) -> Result<Option<BlockpartyPayouts>, EngineError> {
     let Some(bp_cfg) = cfg.blockparty.as_ref() else {
+        // Switching the mode off must not route a live party's admin as a
+        // plain port miner, nor strand its parked blocks without an engine.
+        let live = bp_db::list_blockparty_groups_non_dissolved(pool).await?;
+        if !live.is_empty() {
+            return Err(EngineError::ModeDisabledWithLiveGroups {
+                section: "blockparty",
+                count: live.len(),
+            });
+        }
         info!("blockparty: feature disabled (no `[blockparty]` config block)");
         return Ok(None);
     };
     Ok(Some(BlockpartyPayouts::new(
-        handles.db.pool().clone(),
+        pool.clone(),
         BlockpartyPayoutConfig {
             fee_address: Some(mode_fee_address(&bp_cfg.fee_address)?),
             fee_percent: bp_cfg.fee_percent,
@@ -730,6 +740,40 @@ mod tests {
         assert_eq!(built.fee_percent, 1.0);
         assert_eq!(built.coinbase_weight_budget, 12_000);
         assert_eq!(built.min_payout_sats, Sats(7_000));
+    }
+
+    /// Without `[blockparty]` a live party refuses the boot: its admin would
+    /// otherwise mine as a plain port miner and its parked blocks would find
+    /// no engine.
+    #[tokio::test]
+    async fn blockparty_off_refuses_the_boot_while_a_party_is_live() {
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let cfg: AppConfig = toml::from_str(NO_PPLNS_CFG).expect("parse config");
+        assert!(cfg.blockparty.is_none(), "precondition: Blockparty is off");
+        let id = Uuid::new_v4();
+        let admin = AddressId::new(format!("bc1qboot{}", &id.simple().to_string()[..20]))
+            .expect("admin id");
+        bp_db::insert_blockparty_group(&pool, id, &format!("boot-{id}"), &admin, "h", "draft", 0)
+            .await
+            .expect("seed a live party");
+
+        let refused = blockparty_payouts(&cfg, &pool).await;
+        let _ = sqlx::query("DELETE FROM blockparty_group WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(EngineError::ModeDisabledWithLiveGroups {
+                    section: "blockparty",
+                    count
+                }) if count >= 1
+            ),
+            "a live party must refuse the boot"
+        );
     }
 
     // ── CompositeAcceptedShareSink: ArcSwap fan-out list ─────────────

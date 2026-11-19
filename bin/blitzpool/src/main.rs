@@ -1409,16 +1409,16 @@ fn print_engine_error_help(err: &EngineError) {
                  to run without Group-Solo."
             );
         }
-        EngineError::GroupSoloDisabledWithActiveGroups { .. } => {
+        EngineError::ModeDisabledWithLiveGroups { section, .. } => {
             eprintln!(
-                "hint: add an empty `[group_solo]` table to the config to keep \
-                 Group-Solo running for the existing groups."
+                "hint: put the `[{section}]` table back into the config to keep the \
+                 mode running for the existing groups."
             );
         }
-        EngineError::GroupSoloActiveGroups(_) => {
+        EngineError::LiveGroupCheck(_) => {
             eprintln!(
-                "hint: the active-group check reads `pplns_group` from Postgres; \
-                 check the `[database]` connection."
+                "hint: the live-group check reads `pplns_group` and `blockparty_group` \
+                 from Postgres; check the `[database]` connection."
             );
         }
         EngineError::SessionPersistence(_) => {
