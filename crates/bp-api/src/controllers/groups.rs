@@ -137,12 +137,6 @@ async fn invalidate_group_cache(state: &SharedState, id: Uuid) {
         let full = format!("{prefix}{id_str}");
         state.cache.invalidate_prefix(&full).await;
     }
-    // The round-reset cadence doubles as the Window payout length, so the
-    // engine's mode cache is dropped too; otherwise the trim would run on a
-    // stale window length until its TTL.
-    if let Some(engine) = state.group_solo.as_ref() {
-        engine.invalidate_mode_cache(id);
-    }
 }
 
 /// For membership changes, so the join-request lookup re-resolves immediately.

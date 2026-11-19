@@ -2,8 +2,9 @@
 
 //! Keep the PPLNS window's network difficulty current, so the window is
 //! `window_factor ×` today's difficulty, not the one at the last restart.
-//! Read over RPC because the `payout` role that trims has no TDP feed. A bad
-//! reading keeps the last good value: a zero window size disables trimming.
+//! Read over RPC, which every role has (the `payout` role that trims has no
+//! TDP feed). A bad reading keeps the last good value: a zero window size
+//! disables trimming.
 
 use std::time::Duration;
 
@@ -22,8 +23,8 @@ fn usable_difficulty(raw: f64) -> Option<f64> {
     (raw.is_finite() && raw > 0.0).then_some(raw)
 }
 
-/// Spawn the refresher. Payout role only — it is the only process whose
-/// window trims, and the only one whose `NetworkDifficulty` is read.
+/// Spawn the refresher for one process's PPLNS engine: payout trims by its
+/// window size, api and notify show it.
 pub(crate) fn spawn_refresh_task(
     rpc: BitcoinRpc,
     net_diff: NetworkDifficulty,
@@ -36,7 +37,7 @@ pub(crate) fn spawn_refresh_task(
         info!(
             interval_secs = interval.as_secs(),
             seeded = net_diff.get(),
-            "network-difficulty refresher: live (PPLNS window trim size)"
+            "network-difficulty refresher: live (PPLNS window size)"
         );
         loop {
             tick.tick().await;
@@ -49,7 +50,7 @@ pub(crate) fn spawn_refresh_task(
                         %err,
                         held = net_diff.get(),
                         "network-difficulty refresher: getmininginfo failed — keeping the last \
-                         good value so the window keeps trimming"
+                         good value"
                     );
                     continue;
                 }
@@ -59,7 +60,7 @@ pub(crate) fn spawn_refresh_task(
                     reading,
                     held = net_diff.get(),
                     "network-difficulty refresher: unusable reading — keeping the last good \
-                     value (a non-positive difficulty would switch trimming off)"
+                     value (a non-positive difficulty would zero the window size)"
                 );
                 continue;
             };
@@ -68,12 +69,12 @@ pub(crate) fn spawn_refresh_task(
                 continue;
             }
             net_diff.set(usable);
-            // Worth a line: it changes which shares the window holds, and
-            // therefore who a block pays.
+            // Worth a line: on payout it changes which shares the window
+            // holds, and therefore who a block pays.
             info!(
                 previous,
                 current = usable,
-                "network-difficulty refresher: PPLNS window trim size moved"
+                "network-difficulty refresher: PPLNS window size moved"
             );
         }
     })

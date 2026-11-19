@@ -350,6 +350,17 @@ pub enum DistributionScope<'a> {
     MinerAddress(&'a AddressId),
 }
 
+/// What a tailored publish does with the session's current plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TailoredPlan {
+    /// A rebuild for the same accounting: the current plan stays as the grace
+    /// slot (ext 0x0003/Grace Window).
+    Supersede,
+    /// The accounting moved: the plan built for the old one is dropped, not
+    /// superseded.
+    Replace,
+}
+
 /// Outcome of resolving a `distribution_id`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DistributionAcceptance {
@@ -480,21 +491,54 @@ impl JdpDeclaredJobRegistry {
 
     // ── Payout distributions (ext 0x0003 push model) ────────────────
 
-    /// Publish a pool-wide distribution; the prior latest becomes the grace slot.
-    pub fn publish_pool_wide(&mut self, entry: PayoutDistributionEntry) {
-        let epoch = self.settlement_epoch;
-        self.pool_wide_distribution.publish(Arc::new(entry), epoch);
+    /// The settlement epoch a distribution built from now on belongs to. A
+    /// builder reads it before the build and hands it to its publish.
+    pub fn settlement_epoch(&self) -> u64 {
+        self.settlement_epoch
     }
 
-    /// Publish a tailored distribution to one JDP session. Its grace slot holds
-    /// only the session's OWN previous entry, never the pool-wide (PPLNS) one,
-    /// which a Solo or Group-Solo coinbase must not pay.
-    pub fn publish_tailored(&mut self, jdp_session_id: u32, entry: PayoutDistributionEntry) {
-        let epoch = self.settlement_epoch;
+    /// Publish a pool-wide distribution built in `built_in_epoch`; the prior
+    /// latest becomes the grace slot. `false`, with nothing published, when a
+    /// settlement came between the build and now: the build carries
+    /// pre-settlement balances, and the current epoch would make it acceptable.
+    pub fn publish_pool_wide(
+        &mut self,
+        entry: PayoutDistributionEntry,
+        built_in_epoch: u64,
+    ) -> bool {
+        if built_in_epoch != self.settlement_epoch {
+            return false;
+        }
+        self.pool_wide_distribution
+            .publish(Arc::new(entry), built_in_epoch);
+        true
+    }
+
+    /// Publish a tailored distribution built in `built_in_epoch` to one JDP
+    /// session. Its grace slot holds only the session's OWN previous entry,
+    /// never the pool-wide (PPLNS) one, which a Solo or Group-Solo coinbase
+    /// must not pay. `None`, with nothing changed, when a settlement came
+    /// between the build and now (see [`Self::publish_pool_wide`]); otherwise
+    /// whether a [`TailoredPlan::Replace`] dropped a plan.
+    pub fn publish_tailored(
+        &mut self,
+        jdp_session_id: u32,
+        entry: PayoutDistributionEntry,
+        built_in_epoch: u64,
+        plan: TailoredPlan,
+    ) -> Option<bool> {
+        if built_in_epoch != self.settlement_epoch {
+            return None;
+        }
+        let dropped = match plan {
+            TailoredPlan::Supersede => false,
+            TailoredPlan::Replace => self.clear_tailored(jdp_session_id),
+        };
         self.tailored_distributions
             .entry(jdp_session_id)
             .or_default()
-            .publish(Arc::new(entry), epoch);
+            .publish(Arc::new(entry), built_in_epoch);
+        Some(dropped)
     }
 
     /// The current pool-wide distribution; `None` once a settlement invalidated
@@ -998,9 +1042,18 @@ mod tests {
     #[test]
     fn distribution_grace_window_latest_plus_previous() {
         let mut reg = JdpDeclaredJobRegistry::new();
-        reg.publish_pool_wide(distribution(1, DistributionAccounting::PoolWide, None));
-        reg.publish_pool_wide(distribution(2, DistributionAccounting::PoolWide, None));
-        reg.publish_pool_wide(distribution(3, DistributionAccounting::PoolWide, None));
+        reg.publish_pool_wide(
+            distribution(1, DistributionAccounting::PoolWide, None),
+            reg.settlement_epoch(),
+        );
+        reg.publish_pool_wide(
+            distribution(2, DistributionAccounting::PoolWide, None),
+            reg.settlement_epoch(),
+        );
+        reg.publish_pool_wide(
+            distribution(3, DistributionAccounting::PoolWide, None),
+            reg.settlement_epoch(),
+        );
         let scope = DistributionScope::JdpSession(7);
         assert_eq!(accepted_id(&reg.distribution_acceptance(3, scope)), Some(3));
         assert_eq!(accepted_id(&reg.distribution_acceptance(2, scope)), Some(2));
@@ -1018,7 +1071,10 @@ mod tests {
     #[test]
     fn a_denied_session_does_not_fall_back_to_the_pool_wide_distribution() {
         let mut reg = JdpDeclaredJobRegistry::new();
-        reg.publish_pool_wide(distribution(1, DistributionAccounting::PoolWide, None));
+        reg.publish_pool_wide(
+            distribution(1, DistributionAccounting::PoolWide, None),
+            reg.settlement_epoch(),
+        );
         let scope = DistributionScope::JdpSession(7);
         assert_eq!(accepted_id(&reg.distribution_acceptance(1, scope)), Some(1));
 
@@ -1039,13 +1095,18 @@ mod tests {
     #[test]
     fn publishing_a_tailored_distribution_lifts_the_denial() {
         let mut reg = JdpDeclaredJobRegistry::new();
-        reg.publish_pool_wide(distribution(1, DistributionAccounting::PoolWide, None));
+        reg.publish_pool_wide(
+            distribution(1, DistributionAccounting::PoolWide, None),
+            reg.settlement_epoch(),
+        );
         reg.deny_pool_wide(7);
         let owner = AddressId::new("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string())
             .expect("addr");
         reg.publish_tailored(
             7,
             distribution(2, DistributionAccounting::Solo(owner), Some(7)),
+            reg.settlement_epoch(),
+            TailoredPlan::Supersede,
         );
         reg.allow_pool_wide(7);
         let scope = DistributionScope::JdpSession(7);
@@ -1056,7 +1117,10 @@ mod tests {
     #[test]
     fn evicting_a_session_clears_its_pool_wide_denial() {
         let mut reg = JdpDeclaredJobRegistry::new();
-        reg.publish_pool_wide(distribution(1, DistributionAccounting::PoolWide, None));
+        reg.publish_pool_wide(
+            distribution(1, DistributionAccounting::PoolWide, None),
+            reg.settlement_epoch(),
+        );
         reg.deny_pool_wide(7);
         reg.evict_for_jdp_session(7);
         assert_eq!(
@@ -1070,10 +1134,15 @@ mod tests {
     fn settled_distribution_is_no_longer_current() {
         let mut reg = JdpDeclaredJobRegistry::new();
         let owner = addr();
-        reg.publish_pool_wide(distribution(1, DistributionAccounting::PoolWide, None));
+        reg.publish_pool_wide(
+            distribution(1, DistributionAccounting::PoolWide, None),
+            reg.settlement_epoch(),
+        );
         reg.publish_tailored(
             7,
             distribution(2, DistributionAccounting::Solo(owner.clone()), Some(7)),
+            reg.settlement_epoch(),
+            TailoredPlan::Supersede,
         );
         assert!(reg.current_pool_wide().is_some());
         assert!(reg.current_tailored(7).is_some());
@@ -1089,7 +1158,10 @@ mod tests {
         );
 
         // A fresh publish restores it.
-        reg.publish_pool_wide(distribution(3, DistributionAccounting::PoolWide, None));
+        reg.publish_pool_wide(
+            distribution(3, DistributionAccounting::PoolWide, None),
+            reg.settlement_epoch(),
+        );
         assert_eq!(reg.current_pool_wide().map(|e| e.distribution_id), Some(3));
     }
 
@@ -1101,7 +1173,10 @@ mod tests {
         let rounds = [(7u32, 8u32), (8, 7)].into_iter().flat_map(|p| [p; 16]);
         for (ghost_session, live_session) in rounds {
             let mut reg = JdpDeclaredJobRegistry::new();
-            reg.publish_pool_wide(distribution(1, DistributionAccounting::PoolWide, None));
+            reg.publish_pool_wide(
+                distribution(1, DistributionAccounting::PoolWide, None),
+                reg.settlement_epoch(),
+            );
             reg.publish_tailored(
                 ghost_session,
                 distribution(
@@ -1109,6 +1184,8 @@ mod tests {
                     DistributionAccounting::Solo(owner.clone()),
                     Some(ghost_session),
                 ),
+                reg.settlement_epoch(),
+                TailoredPlan::Supersede,
             );
             reg.publish_tailored(
                 live_session,
@@ -1117,6 +1194,8 @@ mod tests {
                     DistributionAccounting::Solo(owner.clone()),
                     Some(live_session),
                 ),
+                reg.settlement_epoch(),
+                TailoredPlan::Supersede,
             );
             let scope = DistributionScope::MinerAddress(&owner);
             assert_eq!(
@@ -1131,8 +1210,14 @@ mod tests {
     #[test]
     fn distribution_settlement_invalidates_all() {
         let mut reg = JdpDeclaredJobRegistry::new();
-        reg.publish_pool_wide(distribution(1, DistributionAccounting::PoolWide, None));
-        reg.publish_pool_wide(distribution(2, DistributionAccounting::PoolWide, None));
+        reg.publish_pool_wide(
+            distribution(1, DistributionAccounting::PoolWide, None),
+            reg.settlement_epoch(),
+        );
+        reg.publish_pool_wide(
+            distribution(2, DistributionAccounting::PoolWide, None),
+            reg.settlement_epoch(),
+        );
         reg.invalidate_all_distributions();
         let scope = DistributionScope::JdpSession(7);
         assert_eq!(
@@ -1144,7 +1229,10 @@ mod tests {
             reg.distribution_acceptance(1, scope),
             DistributionAcceptance::Unknown
         );
-        reg.publish_pool_wide(distribution(3, DistributionAccounting::PoolWide, None));
+        reg.publish_pool_wide(
+            distribution(3, DistributionAccounting::PoolWide, None),
+            reg.settlement_epoch(),
+        );
         assert_eq!(accepted_id(&reg.distribution_acceptance(3, scope)), Some(3));
         // Stale even though it now sits in the grace slot.
         assert_eq!(
@@ -1158,10 +1246,15 @@ mod tests {
     #[test]
     fn a_tailored_session_cannot_resolve_the_pool_wide_distribution() {
         let mut reg = JdpDeclaredJobRegistry::new();
-        reg.publish_pool_wide(distribution(1, DistributionAccounting::PoolWide, None));
+        reg.publish_pool_wide(
+            distribution(1, DistributionAccounting::PoolWide, None),
+            reg.settlement_epoch(),
+        );
         reg.publish_tailored(
             7,
             distribution(2, DistributionAccounting::Solo(addr()), Some(7)),
+            reg.settlement_epoch(),
+            TailoredPlan::Supersede,
         );
         let scope = DistributionScope::JdpSession(7);
         assert_eq!(accepted_id(&reg.distribution_acceptance(2, scope)), Some(2));
@@ -1172,7 +1265,10 @@ mod tests {
              accounting, and for Solo the block is then booked nowhere"
         );
         // Nor after the pool-wide slot moves on.
-        reg.publish_pool_wide(distribution(3, DistributionAccounting::PoolWide, None));
+        reg.publish_pool_wide(
+            distribution(3, DistributionAccounting::PoolWide, None),
+            reg.settlement_epoch(),
+        );
         assert_eq!(
             reg.distribution_acceptance(1, scope),
             DistributionAcceptance::Stale
@@ -1195,14 +1291,21 @@ mod tests {
     #[test]
     fn a_tailored_session_still_graces_its_own_previous_entry() {
         let mut reg = JdpDeclaredJobRegistry::new();
-        reg.publish_pool_wide(distribution(1, DistributionAccounting::PoolWide, None));
+        reg.publish_pool_wide(
+            distribution(1, DistributionAccounting::PoolWide, None),
+            reg.settlement_epoch(),
+        );
         reg.publish_tailored(
             7,
             distribution(2, DistributionAccounting::Solo(addr()), Some(7)),
+            reg.settlement_epoch(),
+            TailoredPlan::Supersede,
         );
         reg.publish_tailored(
             7,
             distribution(3, DistributionAccounting::Solo(addr()), Some(7)),
+            reg.settlement_epoch(),
+            TailoredPlan::Supersede,
         );
         let scope = DistributionScope::JdpSession(7);
         assert_eq!(accepted_id(&reg.distribution_acceptance(3, scope)), Some(3));
@@ -1217,10 +1320,15 @@ mod tests {
     #[test]
     fn miner_address_scope_matches_owner() {
         let mut reg = JdpDeclaredJobRegistry::new();
-        reg.publish_pool_wide(distribution(1, DistributionAccounting::PoolWide, None));
+        reg.publish_pool_wide(
+            distribution(1, DistributionAccounting::PoolWide, None),
+            reg.settlement_epoch(),
+        );
         reg.publish_tailored(
             7,
             distribution(2, DistributionAccounting::Solo(addr()), Some(7)),
+            reg.settlement_epoch(),
+            TailoredPlan::Supersede,
         );
         let owner = addr();
         let scope = DistributionScope::MinerAddress(&owner);
@@ -1235,13 +1343,21 @@ mod tests {
     #[test]
     fn tailored_slot_evicted_with_session() {
         let mut reg = JdpDeclaredJobRegistry::new();
-        reg.publish_pool_wide(distribution(1, DistributionAccounting::PoolWide, None));
+        reg.publish_pool_wide(
+            distribution(1, DistributionAccounting::PoolWide, None),
+            reg.settlement_epoch(),
+        );
         reg.publish_tailored(
             7,
             distribution(2, DistributionAccounting::Solo(addr()), Some(7)),
+            reg.settlement_epoch(),
+            TailoredPlan::Supersede,
         );
         assert!(reg.current_tailored(7).is_some());
-        reg.publish_pool_wide(distribution(3, DistributionAccounting::PoolWide, None));
+        reg.publish_pool_wide(
+            distribution(3, DistributionAccounting::PoolWide, None),
+            reg.settlement_epoch(),
+        );
         assert!(
             reg.current_tailored(7).is_some(),
             "a connected miner keeps its tailored slot"

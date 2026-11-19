@@ -211,7 +211,7 @@ fn to_pplns_engine_config(
 }
 
 /// Falls back to `1.0` so the engine still spawns; the window is under-sized
-/// until the payout role's refresh.
+/// until the process's refresh.
 async fn bootstrap_network_difficulty(handles: &FoundationHandles) -> NetworkDifficulty {
     match handles.bitcoin_rpc.get_mining_info().await {
         Ok(info) => NetworkDifficulty::new(info.difficulty),

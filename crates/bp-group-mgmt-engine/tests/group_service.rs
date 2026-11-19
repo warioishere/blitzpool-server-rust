@@ -700,6 +700,62 @@ async fn update_round_reset_config_persists_the_settings() {
     cleanup_group(&pool, g.group.id).await;
 }
 
+/// Counts the invalidations a service publishes, by kind.
+#[derive(Default)]
+struct CountingNotifier(Mutex<Vec<String>>);
+
+#[async_trait]
+impl bp_group_mgmt_engine::MembershipChangeNotifier for CountingNotifier {
+    async fn membership_changed(&self, kind: &str) {
+        self.0.lock().unwrap().push(kind.to_string());
+    }
+}
+
+/// A settings change without a tag publishes a `group` invalidation too: the
+/// front builds the team's coinbase from these settings.
+#[tokio::test]
+async fn a_settings_change_without_a_tag_reaches_the_front() {
+    let pool = match connect_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    let svc = GroupService::load(
+        pool.clone(),
+        Arc::new(TestHooks::new(None)),
+        14,
+        TEST_COINBASE_CAP,
+    )
+    .await
+    .expect("load group service");
+    let creator_addr = format!("bc1qrrnotify{}", Uuid::new_v4().simple());
+    bp_test_support::seed_signature_ownership(&pool, &creator_addr).await;
+    let g = svc
+        .create_group(&format!("rrnotify-{}", Uuid::new_v4()), &creator_addr)
+        .await
+        .expect("g");
+    let notifier = Arc::new(CountingNotifier::default());
+    svc.set_change_notifier(notifier.clone());
+
+    svc.update_round_reset_config(
+        g.group.id,
+        UpdateRoundResetSettings {
+            preset: PatchField::Untouched,
+            interval_days: PatchField::Untouched,
+            timezone: PatchField::Untouched,
+            finder_bonus_ppm: PatchField::Set(120_000),
+            is_public: PatchField::Untouched,
+            reset_round_on_block: PatchField::Untouched,
+            max_members: PatchField::Untouched,
+            coinbase_tag: PatchField::Untouched,
+        },
+        Some(&g.admin_token),
+    )
+    .await
+    .expect("update");
+    assert_eq!(*notifier.0.lock().unwrap(), vec!["group".to_string()]);
+    cleanup_group(&pool, g.group.id).await;
+}
+
 #[tokio::test]
 async fn update_round_reset_rejects_invalid_timezone() {
     let pool = match connect_or_skip().await {

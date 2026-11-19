@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
 
 use bp_common::{AddressId, MiningMode, Sats};
 use bp_cron_utils::SystemClock;
@@ -44,6 +43,8 @@ pub enum EngineError {
     Reset(#[from] ResetError),
     #[error("distribution: {0}")]
     Distribution(Arc<DistributionError>),
+    #[error("group {0} does not exist")]
+    GroupNotFound(Uuid),
     #[error(
         "group {group_id} block {block_height} coinbase pays {actual_reward} sats, less than \
          the {subsidy} sat subsidy the block was entitled to — it forfeited money, so nothing \
@@ -63,7 +64,9 @@ impl EngineError {
     /// is not lost: the operator reprocess books it from its own coinbase.
     pub fn is_terminal(&self) -> bool {
         match self {
-            EngineError::Config(_) | EngineError::RevenueBelowSubsidy { .. } => true,
+            EngineError::Config(_)
+            | EngineError::RevenueBelowSubsidy { .. }
+            | EngineError::GroupNotFound(_) => true,
             // Infrastructure: these clear on their own.
             EngineError::Redis(_)
             | EngineError::Round(_)
@@ -98,27 +101,15 @@ struct Inner {
     config: GroupSoloEngineConfig,
     /// Stops the round-reset loop (only running where background tasks are).
     cancel_tx: watch::Sender<bool>,
-    /// Keeps Postgres off the per-share path. The mode is immutable but the
-    /// window length is editable, hence the short [`MODE_CACHE_TTL`].
-    mode_cache: StdMutex<HashMap<Uuid, CachedGroupMode>>,
+    /// Keeps Postgres off the per-share path. A group's payout mode never
+    /// changes, so a looked-up mode is kept for the process's life; the
+    /// editable window length is read where it is used.
+    mode_cache: StdMutex<HashMap<Uuid, PayoutMode>>,
     /// Highest bucket already trimmed by the record path; buckets only age out
     /// whole, so trimming once per new bucket suffices. The payout read
     /// re-trims anyway, so this only bounds Redis and never affects correctness.
     window_trim_watermark: StdMutex<HashMap<Uuid, i64>>,
 }
-
-/// Cached payout mode + window length for one group. `window_ms` is 0 for
-/// [`PayoutMode::Prop`] (unused there).
-#[derive(Clone, Copy)]
-struct CachedGroupMode {
-    mode: PayoutMode,
-    window_ms: i64,
-    expires_at: Instant,
-}
-
-/// TTL for [`Inner::mode_cache`]: a window-length edit takes effect within a
-/// minute while the share path almost always hits the cache.
-const MODE_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// Trim on a group's first share (cold start catches up any aging) and when a
 /// share opens a strictly newer bucket; skip same-bucket and older shares.
@@ -126,16 +117,6 @@ fn should_trim_on_bucket(watermark: Option<i64>, bucket_id: i64) -> bool {
     match watermark {
         Some(last) => bucket_id > last,
         None => true,
-    }
-}
-
-/// Mode to use when the lookup hits a DB error. The mode is immutable, so even
-/// an expired cache entry is right, and reusing it keeps a `Window` group's
-/// shares out of the PROP keys the window read never sees.
-fn mode_on_lookup_error(cached: Option<CachedGroupMode>) -> (PayoutMode, i64) {
-    match cached {
-        Some(c) => (c.mode, c.window_ms),
-        None => (PayoutMode::Prop, 0),
     }
 }
 
@@ -221,63 +202,36 @@ impl GroupSoloEngine {
         })
     }
 
-    /// Resolve a group's `(PayoutMode, window_ms)` through the cache. On a DB
-    /// error the last entry is reused even if expired (see
-    /// `mode_on_lookup_error`); neither fallback is cached.
-    async fn resolve_group_mode(&self, group_id: Uuid) -> (PayoutMode, i64) {
-        let cached = {
-            let cache = self.inner.mode_cache.lock().expect("mode_cache poisoned");
-            cache.get(&group_id).copied()
-        };
-        if let Some(c) = cached {
-            if c.expires_at > Instant::now() {
-                return (c.mode, c.window_ms);
-            }
+    /// A group's payout mode, looked up once and then served from the cache.
+    /// A failed lookup or a missing group is an error, never a guessed mode: a
+    /// Window group's share or kick written to the PROP keys is lost to the
+    /// window read.
+    async fn resolve_group_mode(&self, group_id: Uuid) -> Result<PayoutMode, EngineError> {
+        if let Some(mode) = self
+            .inner
+            .mode_cache
+            .lock()
+            .expect("mode_cache poisoned")
+            .get(&group_id)
+        {
+            return Ok(*mode);
         }
-        let (mode, window_ms) = match find_group(&self.inner.pool, group_id).await {
-            Ok(Some(g)) => group_mode_from_row(&g),
-            Ok(None) => (PayoutMode::Prop, 0),
-            Err(e) => {
-                if cached.is_some() {
-                    warn!(%group_id, error = %e,
-                        "group payout-mode lookup failed — reusing last-known mode (not re-cached)");
-                } else {
-                    warn!(%group_id, error = %e,
-                        "group payout-mode lookup failed and no cached mode — defaulting to PROP");
-                }
-                return mode_on_lookup_error(cached);
-            }
-        };
+        let group = find_group(&self.inner.pool, group_id)
+            .await?
+            .ok_or(EngineError::GroupNotFound(group_id))?;
+        let mode = group_mode_from_row(&group).0;
         self.inner
             .mode_cache
             .lock()
             .expect("mode_cache poisoned")
-            .insert(
-                group_id,
-                CachedGroupMode {
-                    mode,
-                    window_ms,
-                    expires_at: Instant::now() + MODE_CACHE_TTL,
-                },
-            );
-        (mode, window_ms)
+            .insert(group_id, mode);
+        Ok(mode)
     }
 
     /// Drop all cached distributions, so the next build reads the round and
     /// the group row again.
     pub fn invalidate_distribution_cache(&self) {
         self.inner.distribution_builder.invalidate_all();
-    }
-
-    /// Call after a reset-cadence edit: on a window grow, a stale shorter
-    /// length would make the record-path trim drop a bucket the larger window
-    /// must keep.
-    pub fn invalidate_mode_cache(&self, group_id: Uuid) {
-        self.inner
-            .mode_cache
-            .lock()
-            .expect("mode_cache poisoned")
-            .remove(&group_id);
     }
 
     /// Bumps the watermark and returns `true` per [`should_trim_on_bucket`].
@@ -296,19 +250,31 @@ impl GroupSoloEngine {
         }
     }
 
-    /// Trim once per new bucket; only bounds Redis between payout reads.
+    /// Trim once per new bucket; only bounds Redis between payout reads. The
+    /// window length is read fresh, once per bucket: it is editable, and a
+    /// stale shorter length would drop a bucket a grown window must keep. An
+    /// unreadable length skips this trim, as the payout read trims anyway.
     async fn trim_window_at_bucket_boundary(
         &self,
         group_id: Uuid,
         now_ms: i64,
-        window_ms: i64,
     ) -> Result<(), EngineError> {
-        if self.advance_trim_watermark(group_id, now_ms) {
-            self.inner
-                .round
-                .trim_window(&group_id.to_string(), now_ms, window_ms)
-                .await?;
+        if !self.advance_trim_watermark(group_id, now_ms) {
+            return Ok(());
         }
+        let window_ms = match find_group(&self.inner.pool, group_id).await {
+            Ok(Some(g)) => group_mode_from_row(&g).1,
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                warn!(%group_id, error = %e,
+                    "group-solo: window length unreadable — trim skipped, the payout read trims");
+                return Ok(());
+            }
+        };
+        self.inner
+            .round
+            .trim_window(&group_id.to_string(), now_ms, window_ms)
+            .await?;
         Ok(())
     }
 
@@ -326,7 +292,7 @@ impl GroupSoloEngine {
         timestamp_ms: i64,
     ) -> Result<(), EngineError> {
         let group_key = group_id.to_string();
-        let (mode, window_ms) = self.resolve_group_mode(group_id).await;
+        let mode = self.resolve_group_mode(group_id).await?;
         let applied = match mode {
             PayoutMode::Prop => {
                 self.inner
@@ -343,7 +309,7 @@ impl GroupSoloEngine {
                 // Trim against the share's own accept time so an idle group
                 // still bounds its window.
                 if applied {
-                    self.trim_window_at_bucket_boundary(group_id, timestamp_ms, window_ms)
+                    self.trim_window_at_bucket_boundary(group_id, timestamp_ms)
                         .await?;
                 }
                 applied
@@ -383,7 +349,7 @@ impl GroupSoloEngine {
         shares: f64,
     ) -> Result<(), EngineError> {
         let group_key = group_id.to_string();
-        let (mode, window_ms) = self.resolve_group_mode(group_id).await;
+        let mode = self.resolve_group_mode(group_id).await?;
         match mode {
             PayoutMode::Prop => {
                 self.inner
@@ -397,7 +363,7 @@ impl GroupSoloEngine {
                     .round
                     .record_reject_windowed(&group_key, address, shares, now_ms)
                     .await?;
-                self.trim_window_at_bucket_boundary(group_id, now_ms, window_ms)
+                self.trim_window_at_bucket_boundary(group_id, now_ms)
                     .await?;
             }
         }
@@ -408,7 +374,7 @@ impl GroupSoloEngine {
     /// (mode-aware, see [`GroupRoundStore::forget_member`]) and forget any
     /// distribution built on it. Returns the diff-1-weighted amount removed.
     pub async fn forget_member(&self, group_id: Uuid, address: &str) -> Result<f64, EngineError> {
-        let (mode, _window_ms) = self.resolve_group_mode(group_id).await;
+        let mode = self.resolve_group_mode(group_id).await?;
         let removed = self
             .inner
             .round
@@ -689,27 +655,6 @@ mod tests {
         assert!(!should_trim_on_bucket(Some(100), 100));
         assert!(should_trim_on_bucket(Some(100), 101));
         assert!(!should_trim_on_bucket(Some(100), 7));
-    }
-
-    #[test]
-    fn lookup_error_reuses_cached_mode_never_misroutes_window() {
-        assert_eq!(mode_on_lookup_error(None), (PayoutMode::Prop, 0));
-        // An expired Window entry is still reused, never the PROP keys.
-        let win = CachedGroupMode {
-            mode: PayoutMode::Window,
-            window_ms: 7 * 24 * 60 * 60 * 1000,
-            expires_at: Instant::now(),
-        };
-        assert_eq!(
-            mode_on_lookup_error(Some(win)),
-            (PayoutMode::Window, 7 * 24 * 60 * 60 * 1000)
-        );
-        let prop = CachedGroupMode {
-            mode: PayoutMode::Prop,
-            window_ms: 0,
-            expires_at: Instant::now(),
-        };
-        assert_eq!(mode_on_lookup_error(Some(prop)), (PayoutMode::Prop, 0));
     }
 
     /// Every paid output besides the pool's becomes a row, the fee address

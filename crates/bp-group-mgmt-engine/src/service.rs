@@ -70,8 +70,9 @@ pub struct GroupService {
     /// addresses already in a Blockparty. `OnceLock` so it attaches via
     /// `&self`: the Blockparty service cannot be passed to `new`.
     blockparty_reader: Arc<std::sync::OnceLock<Arc<dyn crate::hooks::BlockpartyMembershipReader>>>,
-    /// When set, every membership mutation publishes a `"group"`
-    /// invalidation so a separate Stratum Front rebuilds its routing cache.
+    /// When set, every membership mutation and settings change publishes a
+    /// `"group"` invalidation so a separate Stratum Front rebuilds its routing
+    /// cache and drops its Group-Solo builds.
     change_notifier: Arc<std::sync::OnceLock<Arc<dyn crate::hooks::MembershipChangeNotifier>>>,
 }
 
@@ -542,7 +543,6 @@ impl GroupService {
         let resolved = resolve_after_patch(&group, &settings);
         validate_resolved_round_reset(&resolved)?;
 
-        let tag_changed = settings.coinbase_tag != PatchField::Untouched;
         let patch = settings_to_db_patch(settings);
         let now = now_ms();
         let updated =
@@ -550,11 +550,10 @@ impl GroupService {
                 .await?
                 .ok_or(GroupServiceError::NotFound)?;
 
-        // The front serves the tag from its own cache.
-        if tag_changed {
-            if let Some(n) = self.change_notifier.get() {
-                n.membership_changed("group").await;
-            }
+        // The front serves the tag from its own cache and builds the team's
+        // coinbase from these settings (finder bonus, window length).
+        if let Some(n) = self.change_notifier.get() {
+            n.membership_changed("group").await;
         }
 
         Ok(updated)

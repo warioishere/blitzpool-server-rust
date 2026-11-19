@@ -597,17 +597,16 @@ async fn main() -> ExitCode {
         None
     };
 
-    // Keep the PPLNS window's trim size on the current network difficulty.
-    // Payout only, where `record_share` trims; from RPC, as payout has no TDP.
-    let _net_diff_refresh = match (cfg.has_role(Role::Payout), engines.pplns.as_ref()) {
-        (true, Some(pplns)) => Some(crate::network_difficulty::spawn_refresh_task(
+    // Keep every PPLNS engine's window size on the current network
+    // difficulty: payout trims by it, api and notify show it, the front holds
+    // one and does not read it. From RPC, which every role has.
+    let _net_diff_refresh = engines.pplns.as_ref().map(|pplns| {
+        crate::network_difficulty::spawn_refresh_task(
             handles.bitcoin_rpc.clone(),
             pplns.window().network_difficulty(),
             crate::network_difficulty::REFRESH_INTERVAL,
-        )),
-        // No PPLNS engine ⇒ no window to trim. Any other role never trims.
-        _ => None,
-    };
+        )
+    });
 
     // Best-effort backup of PPLNS + Group-Solo Redis state to Postgres for a
     // manual `--restore-redis-state`. Own connection, so the SCAN/DUMP burst

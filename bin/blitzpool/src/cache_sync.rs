@@ -145,12 +145,17 @@ struct CacheSync {
 
 impl CacheSync {
     /// Rebuild the asked membership caches, then kick the connections whose
-    /// mode they moved, then the coinbase tags both set.
+    /// mode they moved, then the coinbase tags both set. Every group rebuild
+    /// (a change or the backstop) also drops the Group-Solo builds, which may
+    /// still pay a team's old members and settings.
     async fn rebuild_memberships(&self, group: bool, blockparty: bool) {
         let _one_at_a_time = self.rebuilding.lock().await;
         let mut fresh = true;
         if group {
             fresh &= rebuild_group(&self.membership.group).await;
+            if let Some(group_solo) = self.group_solo.as_ref() {
+                group_solo.invalidate_distribution_cache();
+            }
         }
         if blockparty {
             fresh &= rebuild_blockparty(self.membership.blockparty.as_ref()).await;
@@ -601,30 +606,34 @@ mod tests {
 
         // ── The `front`: a JDP server with a published distribution ──
         let bridge = Arc::new(std::sync::RwLock::new(JdpDeclaredJobRegistry::new()));
-        bridge
-            .write()
-            .unwrap()
-            .publish_pool_wide(PayoutDistributionEntry {
-                distribution_id: 1,
-                built: bp_stratum_v2::bridge::BuiltPayoutDistribution {
-                    pool_payout: WeightedOutput {
-                        script_pubkey: vec![0x51],
-                        weight: 1,
+        {
+            let mut guard = bridge.write().unwrap();
+            let epoch = guard.settlement_epoch();
+            guard.publish_pool_wide(
+                PayoutDistributionEntry {
+                    distribution_id: 1,
+                    built: bp_stratum_v2::bridge::BuiltPayoutDistribution {
+                        pool_payout: WeightedOutput {
+                            script_pubkey: vec![0x51],
+                            weight: 1,
+                        },
+                        payouts: vec![WeightedOutput {
+                            script_pubkey: vec![0x00, 0x14, 0xAA],
+                            weight: 100,
+                        }],
+                        dust_limits: vec![546],
+                        additional_outputs: vec![],
+                        reference_reward_sats: 312_500_000,
+                        payouts_fingerprint: Some([1u8; 32]),
+                        bookable: true,
                     },
-                    payouts: vec![WeightedOutput {
-                        script_pubkey: vec![0x00, 0x14, 0xAA],
-                        weight: 100,
-                    }],
-                    dust_limits: vec![546],
-                    additional_outputs: vec![],
-                    reference_reward_sats: 312_500_000,
-                    payouts_fingerprint: Some([1u8; 32]),
-                    bookable: true,
+                    accounting: bp_stratum_v2::bridge::DistributionAccounting::PoolWide,
+                    jdp_session_id: None,
+                    published_at_ms: 1_001,
                 },
-                accounting: bp_stratum_v2::bridge::DistributionAccounting::PoolWide,
-                jdp_session_id: None,
-                published_at_ms: 1_001,
-            });
+                epoch,
+            );
+        }
         let noise = NoiseConfig::new(
             "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
                 .parse()

@@ -3088,7 +3088,11 @@ mod tests {
             )
             .unwrap(),
         );
-        bridge.write().unwrap().publish_pool_wide(entry);
+        {
+            let mut guard = bridge.write().unwrap();
+            let epoch = guard.settlement_epoch();
+            guard.publish_pool_wide(entry, epoch);
+        }
         // One allocate token per job: a token authorises exactly one
         // `SetCustomMiningJob`; multi-use is the distribution's property.
         for req in 1..=3u8 {
@@ -3463,12 +3467,23 @@ mod tests {
             .expect("fixture declaration must project");
         {
             let mut guard = bridge.write().unwrap();
-            guard.publish_tailored(OLD_SESSION, declared_against);
+            let epoch = guard.settlement_epoch();
+            guard.publish_tailored(
+                OLD_SESSION,
+                declared_against,
+                epoch,
+                crate::bridge::TailoredPlan::Supersede,
+            );
             // A NEWER slot for the same address; `MinerAddress` scope would
             // answer from this one.
             let mut newer = tailored(6, 9_000);
             newer.jdp_session_id = Some(NEW_SESSION);
-            guard.publish_tailored(NEW_SESSION, newer);
+            guard.publish_tailored(
+                NEW_SESSION,
+                newer,
+                epoch,
+                crate::bridge::TailoredPlan::Supersede,
+            );
             guard.register(token, &declared_job, OLD_SESSION);
             // Same declaration under its own token, since a token authorises
             // exactly one custom job.

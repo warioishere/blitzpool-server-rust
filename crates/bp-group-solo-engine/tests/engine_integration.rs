@@ -1457,11 +1457,43 @@ async fn window_mode_kick_drops_the_member_from_the_payout_source() {
     drop_harness(h).await;
 }
 
-// ── Window mode — growing the window invalidates the stale mode cache ──
+// ── A share for a group the database does not know ─────────────────────
+// Refused, not written under a guessed PROP mode: a Window group's share in the
+// PROP keys is lost to the window read. The harness's own group is the control.
+#[tokio::test]
+async fn a_share_for_an_unknown_group_is_refused_not_guessed() {
+    let h = match spawn_or_skip(9, None).await {
+        Some(h) => h,
+        None => return,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let unknown = uuid::Uuid::new_v4();
+    let err = h
+        .engine
+        .record_share(None, unknown, "bc1qunknowngroup", 10.0, 10.0, now)
+        .await
+        .expect_err("a group the database does not know must be refused");
+    assert!(
+        matches!(err, bp_group_solo_engine::engine::EngineError::GroupNotFound(g) if g == unknown),
+        "{err:?}"
+    );
+    h.engine
+        .record_share(None, h.group_id, "bc1qknowngroup", 10.0, 10.0, now)
+        .await
+        .expect("control: the seeded group records its share");
+
+    drop_harness(h).await;
+}
+
+// ── Window mode — the record-path trim reads a grown window fresh ──
 // A stale 1-day length would make the record-path trim delete a 25h-old
 // bucket the grown 30-day window must keep, and no read can bring it back.
+// Nothing tells this engine about the edit: it is made on another process.
 #[tokio::test]
-async fn window_grow_invalidates_mode_cache_keeps_in_window_bucket() {
+async fn a_grown_window_keeps_its_bucket_through_the_record_path_trim() {
     let h = match spawn_or_skip(10, None).await {
         Some(h) => h,
         None => return,
@@ -1480,7 +1512,7 @@ async fn window_grow_invalidates_mode_cache_keeps_in_window_bucket() {
         .as_millis() as i64;
     let t_mid = now - 25 * bkt;
 
-    // Caches 1 day; its own trim runs at its own timestamp, so it survives.
+    // Trims against 1 day at its own timestamp, so it survives.
     h.engine
         .record_share(None, h.group_id, "bc1qmid", 40.0, 40.0, t_mid)
         .await
@@ -1492,8 +1524,6 @@ async fn window_grow_invalidates_mode_cache_keeps_in_window_bucket() {
         .execute(&h.pool)
         .await
         .expect("grow window to monthly");
-    // The API calls this on every settings edit.
-    h.engine.invalidate_mode_cache(h.group_id);
 
     // Crosses a bucket boundary, so the record-path trim fires against 30 days.
     h.engine
@@ -1509,7 +1539,7 @@ async fn window_grow_invalidates_mode_cache_keeps_in_window_bucket() {
         .expect("round stats");
     assert!(
         (stats.per_address.get("bc1qmid").copied().unwrap_or(0.0) - 40.0).abs() < 1e-9,
-        "25h-old share kept after window grew to 30 days (stale 1d cache invalidated)"
+        "25h-old share kept after the window grew to 30 days"
     );
     assert!(
         (stats.per_address.get("bc1qnew").copied().unwrap_or(0.0) - 60.0).abs() < 1e-9,

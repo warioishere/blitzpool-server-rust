@@ -454,7 +454,11 @@ async fn jdp_push_distribution_end_to_end() {
 
     // ── ext 0x0003/Grace Window: slide the pool-wide distribution twice ───
     for id in [FIRST_ID + 1, FIRST_ID + 2] {
-        bridge.write().unwrap().publish_pool_wide(entry_with_id(id));
+        {
+            let mut guard = bridge.write().unwrap();
+            let epoch = guard.settlement_epoch();
+            guard.publish_pool_wide(entry_with_id(id), epoch);
+        }
     }
 
     // Declare #12 referencing k-2 → stale. The allocate that pays for it
@@ -1695,6 +1699,133 @@ async fn a_tailored_session_that_becomes_pplns_drops_its_tailored_slot() {
     )
     .await;
     expect_declare_success(read_jdc(&mut reader).await, 10);
+
+    accept_handle.abort();
+    server.shutdown().await;
+}
+
+/// A Solo source whose first tailored build has a settlement land in its
+/// middle, and marks that build so it can be recognised afterwards.
+struct SettlesDuringFirstTailoredBuild {
+    inner: FlippableSource,
+    handle: std::sync::OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>,
+    tailored_builds: AtomicU64,
+}
+
+/// Fingerprint byte that marks the build a settlement landed in.
+const SPANNED_SETTLEMENT: u8 = 0xEE;
+
+#[async_trait]
+impl PayoutDistributionSource for SettlesDuringFirstTailoredBuild {
+    async fn build_pool_wide(&self) -> Option<BuiltPayoutDistribution> {
+        self.inner.build_pool_wide().await
+    }
+
+    async fn build_for_miner(&self, miner_address: &AddressId) -> TailoredDistribution {
+        if self.tailored_builds.fetch_add(1, Ordering::SeqCst) > 0 {
+            return self.inner.build_for_miner(miner_address).await;
+        }
+        let handle = loop {
+            if let Some(handle) = self.handle.get() {
+                break handle;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        handle.settle();
+        let mut built = self.inner.built();
+        if let Some(fingerprint) = built.payouts_fingerprint.as_mut() {
+            fingerprint[1] = SPANNED_SETTLEMENT;
+        }
+        TailoredDistribution::Built {
+            accounting: bp_stratum_v2::bridge::DistributionAccounting::Solo(
+                self.inner.miner.clone(),
+            ),
+            built: Box::new(built),
+        }
+    }
+
+    async fn current_mode(&self, miner_address: &AddressId) -> Option<StreamKind> {
+        self.inner.current_mode(miner_address).await
+    }
+
+    async fn next_distribution_id(&self) -> Option<u64> {
+        self.inner.next_distribution_id().await
+    }
+}
+
+/// A tailored build that a settlement lands in the middle of carries
+/// pre-settlement balances: it is never acceptable, and the session gets a
+/// fresh build instead (the control that the tailored path ran at all).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tailored_build_spanning_a_settlement_is_never_acceptable() {
+    let bridge = Arc::new(RwLock::new(JdpDeclaredJobRegistry::new()));
+    let miner = AddressId::new(REGTEST_ADDR.to_string()).expect("miner address");
+    let source = Arc::new(SettlesDuringFirstTailoredBuild {
+        inner: FlippableSource {
+            answer: std::sync::Mutex::new(GateAnswer::Solo),
+            next_id: AtomicU64::new(FIRST_ID),
+            generation: AtomicU64::new(0),
+            miner: miner.clone(),
+        },
+        handle: std::sync::OnceLock::new(),
+        tailored_builds: AtomicU64::new(0),
+    });
+    let mut hooks = JdpServerHooks::no_op();
+    hooks.distribution_source = source.clone();
+    hooks.chain_tip = Arc::new(FixedPrevHash);
+    hooks.allocate_resolver = Arc::new(BaseModeAllocateResolver);
+    let server = StratumV2JdpServer::spawn(
+        NoiseConfig::new(TEST_PUB.parse().unwrap(), TEST_PRV.parse().unwrap()),
+        hooks,
+        bridge.clone(),
+        Duration::from_millis(200),
+    );
+    let _ = source.handle.set(server.distribution_handle());
+    wait_until(Duration::from_secs(5), || {
+        bridge.read().unwrap().current_pool_wide().is_some()
+    })
+    .await;
+    let (addr, accept_handle) = accept_loop(server.clone()).await;
+    let (mut reader, mut writer, _pool_wide_id) = negotiated_jdc(addr).await;
+    let _token = allocate(&mut reader, &mut writer, 2).await;
+
+    // The tailored (Solo) fingerprints acceptable under the miner's own scope,
+    // over every id handed out so far.
+    let accepted_fingerprints = || -> Vec<[u8; 32]> {
+        let last = source.inner.next_id.load(Ordering::SeqCst);
+        let guard = bridge.read().unwrap();
+        (FIRST_ID..last)
+            .filter_map(|id| {
+                match guard.distribution_acceptance(
+                    id,
+                    bp_stratum_v2::bridge::DistributionScope::MinerAddress(&miner),
+                ) {
+                    bp_stratum_v2::bridge::DistributionAcceptance::Accepted(entry)
+                        if matches!(
+                            entry.accounting,
+                            bp_stratum_v2::bridge::DistributionAccounting::Solo(_)
+                        ) =>
+                    {
+                        entry.built.payouts_fingerprint
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    };
+    wait_until(Duration::from_secs(5), || {
+        source.tailored_builds.load(Ordering::SeqCst) >= 2 && !accepted_fingerprints().is_empty()
+    })
+    .await;
+    let accepted = accepted_fingerprints();
+    assert!(
+        !accepted.is_empty(),
+        "control: the session holds a fresh tailored distribution"
+    );
+    assert!(
+        accepted.iter().all(|f| f[1] != SPANNED_SETTLEMENT),
+        "the build that spanned the settlement must not be acceptable: {accepted:?}"
+    );
 
     accept_handle.abort();
     server.shutdown().await;

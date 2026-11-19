@@ -384,6 +384,13 @@ impl StratumV2JdpServer {
                     _ = tick.tick() => false,
                 };
                 force_pending |= forced;
+                // Read before the build: a settlement landing during it makes
+                // the build pre-settlement, and the publish below drops it.
+                let built_in_epoch = inner
+                    .bridge
+                    .read()
+                    .expect("bridge RwLock poisoned")
+                    .settlement_epoch();
                 let Some(built) = inner.hooks.distribution_source.build_pool_wide().await else {
                     continue;
                 };
@@ -399,7 +406,7 @@ impl StratumV2JdpServer {
                     warn!("jdp publisher: distribution-id allocator unavailable — publish skipped");
                     continue;
                 };
-                last_fingerprint = built.payouts_fingerprint;
+                let fingerprint = built.payouts_fingerprint;
                 let entry = PayoutDistributionEntry {
                     distribution_id,
                     built,
@@ -407,11 +414,21 @@ impl StratumV2JdpServer {
                     jdp_session_id: None,
                     published_at_ms: SystemClock.now_ms(),
                 };
-                inner
+                let published = inner
                     .bridge
                     .write()
                     .expect("bridge RwLock poisoned")
-                    .publish_pool_wide(entry);
+                    .publish_pool_wide(entry, built_in_epoch);
+                if !published {
+                    // The settlement's own refresh is pending, so the next
+                    // pass rebuilds from post-settlement inputs.
+                    debug!(
+                        distribution_id,
+                        "jdp publisher: build spanned a settlement — dropped for a rebuild"
+                    );
+                    continue;
+                }
+                last_fingerprint = fingerprint;
                 force_pending = false;
                 let _ = inner.dist_watch.send(distribution_id);
                 debug!(
@@ -1928,10 +1945,11 @@ mod tests {
             .negotiated_extensions
             .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS));
 
-        bridge
-            .write()
-            .unwrap()
-            .publish_pool_wide(test_distribution(1));
+        {
+            let mut guard = bridge.write().unwrap();
+            let epoch = guard.settlement_epoch();
+            guard.publish_pool_wide(test_distribution(1), epoch);
+        }
         let outcome = dispatch_jdp_inbound(&mut state, request(2), &hooks, &bridge, 1, 2_000).await;
         match &outcome.outbound[0] {
             JdpOutboundFrame::RequestExtensionsSuccess {
@@ -1943,6 +1961,90 @@ mod tests {
         assert!(state
             .negotiated_extensions
             .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS));
+    }
+
+    /// A pool-wide build that a settlement lands in the middle of carries
+    /// pre-settlement balances: it is never published, so no JDC can declare
+    /// against it, and the settlement's own pass publishes a fresh build (the
+    /// control that the publisher runs at all).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_build_spanning_a_settlement_is_never_published() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct SettlesDuringFirstBuild {
+            handle: std::sync::OnceLock<DistributionInvalidationHandle>,
+            builds: AtomicU64,
+            ids: AtomicU64,
+        }
+        #[async_trait]
+        impl PayoutDistributionSource for SettlesDuringFirstBuild {
+            async fn build_pool_wide(&self) -> Option<BuiltPayoutDistribution> {
+                let build = self.builds.fetch_add(1, Ordering::SeqCst) + 1;
+                if build == 1 {
+                    // The server hands out its handle only once spawned.
+                    let handle = loop {
+                        if let Some(handle) = self.handle.get() {
+                            break handle;
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    };
+                    handle.settle();
+                }
+                Some(test_distribution(build).built)
+            }
+            async fn build_for_miner(&self, _: &AddressId) -> TailoredDistribution {
+                TailoredDistribution::ModeUnknown
+            }
+            async fn current_mode(&self, _: &AddressId) -> Option<bp_common::StreamKind> {
+                None
+            }
+            async fn next_distribution_id(&self) -> Option<u64> {
+                Some(self.ids.fetch_add(1, Ordering::SeqCst) + 1)
+            }
+        }
+        let source = Arc::new(SettlesDuringFirstBuild {
+            handle: std::sync::OnceLock::new(),
+            builds: AtomicU64::new(0),
+            ids: AtomicU64::new(0),
+        });
+        let mut hooks = JdpServerHooks::no_op();
+        hooks.distribution_source = source.clone();
+        let bridge = fresh_bridge();
+        let server = StratumV2JdpServer::spawn(
+            noise_cfg(),
+            hooks,
+            bridge.clone(),
+            Duration::from_secs(3600),
+        );
+        let _ = source.handle.set(server.distribution_handle());
+
+        let mut current = None;
+        for _ in 0..200 {
+            current = bridge
+                .read()
+                .unwrap()
+                .current_pool_wide()
+                .map(|e| e.distribution_id);
+            if current.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            current,
+            Some(2),
+            "the settlement's pass publishes the fresh build"
+        );
+        assert!(
+            !matches!(
+                bridge
+                    .read()
+                    .unwrap()
+                    .distribution_acceptance(1, DistributionScope::JdpSession(7)),
+                DistributionAcceptance::Accepted(_)
+            ),
+            "the build that spanned the settlement must not be acceptable"
+        );
+        server.shutdown().await;
     }
 
     /// The declare's mode is looked up for the TOKEN's address, not the

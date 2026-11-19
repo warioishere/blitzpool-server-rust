@@ -41,8 +41,9 @@ pub trait BlockpartyMembershipReader: Send + Sync {
     async fn is_member(&self, address: &AddressId) -> bool;
 }
 
-/// Fired after a membership change so OTHER processes (the Stratum Front)
-/// rebuild their routing cache; `kind` is `"group"` / `"blockparty"`.
+/// Fired after a membership or settings change so OTHER processes (the
+/// Stratum Front) rebuild their routing cache; `kind` is `"group"` /
+/// `"blockparty"`.
 /// Must swallow its own failures: a missed invalidation is caught by the
 /// Front's periodic rebuild, never an error on the mutation path.
 #[async_trait]

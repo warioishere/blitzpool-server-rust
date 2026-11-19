@@ -5,6 +5,7 @@
 //! into [`PayoutSession`].
 
 use super::*;
+use crate::bridge::TailoredPlan;
 
 /// What a session is being served. "Served nothing" is split in two because
 /// the cures differ: a failed build is retried throttled, an unknown mode
@@ -166,10 +167,43 @@ async fn republish_tailored(
         .observe(&plan.served, session_id_hex, miner, now);
 }
 
-/// Build and push a fresh distribution for `miner` from the mode gate. Only
-/// reached through [`republish_tailored`].
+/// Build and push a fresh distribution for `miner` from the mode gate, again
+/// whenever a settlement lands during the build: such a build carries
+/// pre-settlement balances, and the bridge refuses to publish it. Only reached
+/// through [`republish_tailored`].
 #[allow(clippy::too_many_arguments)]
 async fn rebuild_tailored_plan(
+    hooks: &JdpServerHooks,
+    bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
+    writer: &mut NoiseTcpWriteHalf,
+    session_id: u32,
+    session_id_hex: &str,
+    miner: &AddressId,
+    serving: &SessionDistribution,
+    last_pool_wide_written: &mut Option<u64>,
+) -> SessionDistribution {
+    loop {
+        if let Some(served) = try_rebuild_tailored_plan(
+            hooks,
+            bridge,
+            writer,
+            session_id,
+            session_id_hex,
+            miner,
+            serving,
+            last_pool_wide_written,
+        )
+        .await
+        {
+            return served;
+        }
+    }
+}
+
+/// One build and push for [`rebuild_tailored_plan`]; `None` when a settlement
+/// landed during the build and nothing was published.
+#[allow(clippy::too_many_arguments)]
+async fn try_rebuild_tailored_plan(
     hooks: &JdpServerHooks,
     bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
     writer: &mut NoiseTcpWriteHalf,
@@ -180,7 +214,11 @@ async fn rebuild_tailored_plan(
     serving: &SessionDistribution,
     // Updated in place so the pool-wide catch-up knows whether to push.
     last_pool_wide_written: &mut Option<u64>,
-) -> SessionDistribution {
+) -> Option<SessionDistribution> {
+    let built_in_epoch = bridge
+        .read()
+        .expect("bridge RwLock poisoned")
+        .settlement_epoch();
     let (accounting, built) = match hooks.distribution_source.build_for_miner(miner).await {
         TailoredDistribution::Built { accounting, built } => (accounting, *built),
         // Pool-wide (PPLNS). All three or the session is stranded: drop a
@@ -195,7 +233,7 @@ async fn rebuild_tailored_plan(
                 if had_tailored {
                     debug!(
                         "jdp {session_id_hex} tailored slot dropped — this miner is on the \
-                         pool-wide distribution now"
+                     pool-wide distribution now"
                     );
                 }
                 guard.current_pool_wide()
@@ -225,7 +263,9 @@ async fn rebuild_tailored_plan(
                     debug!("jdp {session_id_hex} on the pool-wide distribution, none published yet")
                 }
             }
-            return SessionDistribution::Served(DistributionAccounting::PoolWide);
+            return Some(SessionDistribution::Served(
+                DistributionAccounting::PoolWide,
+            ));
         }
         // Unknown mode: publish nothing and keep pool-wide denied; either
         // guess is a money error.
@@ -241,31 +281,31 @@ async fn rebuild_tailored_plan(
                     .expect("bridge RwLock poisoned")
                     .deny_pool_wide(session_id);
             }
-            return SessionDistribution::AwaitingMode;
+            return Some(SessionDistribution::AwaitingMode);
         }
         TailoredDistribution::Unavailable => {
             warn!(
                 miner = miner.as_str(),
                 "jdp {session_id_hex} tailored republish unavailable — \
-                 refusing to fall back to the pool-wide distribution"
+             refusing to fall back to the pool-wide distribution"
             );
             bridge
                 .write()
                 .expect("bridge RwLock poisoned")
                 .deny_pool_wide(session_id);
-            return SessionDistribution::Denied;
+            return Some(SessionDistribution::Denied);
         }
     };
     let Some(distribution_id) = hooks.distribution_source.next_distribution_id().await else {
         warn!(
             "jdp {session_id_hex} tailored republish skipped — \
-             distribution-id allocator unavailable"
+         distribution-id allocator unavailable"
         );
         bridge
             .write()
             .expect("bridge RwLock poisoned")
             .deny_pool_wide(session_id);
-        return SessionDistribution::Denied;
+        return Some(SessionDistribution::Denied);
     };
     let entry = PayoutDistributionEntry {
         distribution_id,
@@ -275,12 +315,24 @@ async fn rebuild_tailored_plan(
         published_at_ms: SystemClock.now_ms(),
     };
     let wire = wire_from_entry(&entry);
+    // Only a changed accounting drops the plan: a same-accounting rebuild
+    // supersedes and keeps ext 0x0003/Grace Window.
+    let mode_moved = serving.accounting().is_some_and(|was| *was != accounting);
+    let plan = if mode_moved {
+        TailoredPlan::Replace
+    } else {
+        TailoredPlan::Supersede
+    };
     {
         let mut guard = bridge.write().expect("bridge RwLock poisoned");
-        // Drop under the publish lock, and only on a changed accounting: a
-        // same-accounting rebuild supersedes and keeps ext 0x0003/Grace Window.
-        if serving.accounting().is_some_and(|was| *was != accounting) {
-            let dropped = guard.clear_tailored(session_id);
+        let Some(dropped) = guard.publish_tailored(session_id, entry, built_in_epoch, plan) else {
+            debug!(
+                distribution_id,
+                "jdp {session_id_hex} tailored build spanned a settlement — rebuilding"
+            );
+            return None;
+        };
+        if mode_moved {
             info!(
                 miner = miner.as_str(),
                 was = ?serving.accounting(),
@@ -290,7 +342,6 @@ async fn rebuild_tailored_plan(
                  dropped, not superseded"
             );
         }
-        guard.publish_tailored(session_id, entry);
         guard.allow_pool_wide(session_id);
     }
     if let Err(err) =
@@ -302,7 +353,7 @@ async fn rebuild_tailored_plan(
     // return to pool-wide needs a fresh push.
     *last_pool_wide_written = None;
     debug!(distribution_id, "jdp {session_id_hex} tailored republished");
-    SessionDistribution::Served(accounting)
+    Some(SessionDistribution::Served(accounting))
 }
 
 /// A frame's ext 0x0003 context, read before the handler can change it.
