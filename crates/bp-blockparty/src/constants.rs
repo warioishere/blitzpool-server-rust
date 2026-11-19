@@ -7,7 +7,8 @@ pub const MIN_PERCENT_BP: i32 = 100;
 /// A sole admin member takes the whole miner cut.
 pub const MAX_PERCENT_BP: i32 = 10_000;
 
-/// Required sum of all members' `percentBp`, enforced by the service layer.
+/// Required sum of all members' `percentBp`: a party becomes routable
+/// (Ready) only with exactly this sum.
 pub const TOTAL_PERCENT_BP: i32 = 10_000;
 
 pub const NAME_MIN_LEN: usize = 3;

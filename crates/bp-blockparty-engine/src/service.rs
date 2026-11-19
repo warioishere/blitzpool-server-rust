@@ -751,7 +751,8 @@ impl BlockpartyService {
         Ok(())
     }
 
-    /// Draft to confirming, only once the splits sum to 100 %.
+    /// Draft to confirming, only once the splits are complete: every member
+    /// at least the minimum split and the sum exactly the full cut.
     pub async fn transition_to_confirming(
         &self,
         group_id: Uuid,
@@ -774,8 +775,7 @@ impl BlockpartyService {
         if members.is_empty() {
             return Err(BlockpartyServiceError::NoMembers);
         }
-        let sum: i32 = members.iter().map(|m| m.percent_bp).sum();
-        if sum != TOTAL_PERCENT_BP {
+        if !splits_are_complete(&members) {
             return Err(BlockpartyServiceError::InvalidSplitsSum);
         }
         let now = now_ms();
@@ -975,7 +975,8 @@ struct RecomputeOutcome {
     admin_address: AddressId,
 }
 
-/// Confirming becomes ready once all members are confirmed; other statuses are
+/// Confirming becomes ready once all members are confirmed and the splits
+/// are complete ([`splits_are_complete`]); other statuses are
 /// untouched (`None`). Ready never falls back: nothing can unconfirm a member
 /// of a party past Confirming, which is not editable. Runs in the caller's TX
 /// so the status always matches the roster it was read from, and the confirm
@@ -998,7 +999,9 @@ async fn recompute_status_in_tx(
 
     let members = bp_db::list_blockparty_members_for_group(&mut *conn, group_id).await?;
     let all_confirmed = !members.is_empty() && members.iter().all(|m| m.confirmed_at.is_some());
-    let target = if all_confirmed {
+    // Routable only once the splits pay out exactly the miner cut: a short
+    // sum would hand the rest to the pool output, an excess overpay.
+    let target = if all_confirmed && splits_are_complete(&members) {
         BlockpartyStatus::Ready
     } else {
         BlockpartyStatus::Confirming
@@ -1027,6 +1030,14 @@ fn validate_name(name: &str) -> Result<(), BlockpartyServiceError> {
         return Err(BlockpartyServiceError::InvalidName);
     }
     Ok(())
+}
+
+/// Every member's split at least [`MIN_PERCENT_BP`] (a joined member's 0 bp
+/// placeholder is not a split yet) and the sum exactly [`TOTAL_PERCENT_BP`],
+/// so the coinbase pays the miner cut out in full and no more.
+fn splits_are_complete(members: &[BlockpartyMemberRow]) -> bool {
+    members.iter().all(|m| m.percent_bp >= MIN_PERCENT_BP)
+        && members.iter().map(|m| m.percent_bp).sum::<i32>() == TOTAL_PERCENT_BP
 }
 
 fn validate_percent_bp(bp: i32) -> Result<(), BlockpartyServiceError> {

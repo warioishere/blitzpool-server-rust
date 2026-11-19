@@ -945,6 +945,106 @@ async fn update_splits_confirms_admin_and_resets_non_admin() {
     cleanup(&pool, name, admin).await;
 }
 
+/// On the production path (join link, the member confirms) a party whose
+/// splits miss the full cut stays Confirming; once the admin completes the
+/// splits and the member confirms them, it turns Ready.
+#[tokio::test]
+async fn a_party_turns_ready_only_with_complete_splits() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let name = "bp-test-splitsum-11";
+    let admin = "bc1qadminsplitsum11";
+    let carol = "bc1qcarolsplitsum11";
+    cleanup(&pool, name, admin).await;
+    let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+        .bind(carol)
+        .execute(&pool)
+        .await;
+
+    let svc = svc(&pool).await;
+    let create = svc.create_group(name, admin, 5_000).await.expect("create");
+    let gid = create.group.id;
+    let token = Some(create.admin_token.as_str());
+    let link = svc
+        .create_join_link(gid, OpenInviteTtl::SevenDays, token)
+        .await
+        .expect("create_join_link");
+    let (carol_token, _) = svc.join_via_link(&link, carol).await.expect("join");
+    svc.confirm_as_member(gid, &addr(carol), Some(&carol_token))
+        .await
+        .expect("confirm");
+    let g = svc.get_group(gid).await.unwrap().unwrap();
+    assert_eq!(
+        g.status, "confirming",
+        "5000 + 0 bp is not the full cut, even with everyone confirmed"
+    );
+
+    svc.update_splits(gid, &[(addr(carol), 5_000)], token)
+        .await
+        .expect("update_splits");
+    svc.confirm_as_member(gid, &addr(carol), Some(&carol_token))
+        .await
+        .expect("re-confirm");
+    let g = svc.get_group(gid).await.unwrap().unwrap();
+    assert_eq!(g.status, "ready", "5000 + 5000 bp, everyone confirmed");
+
+    cleanup(&pool, name, admin).await;
+    let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+        .bind(carol)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM blockparty_join_link WHERE token = $1")
+        .bind(&link)
+        .execute(&pool)
+        .await;
+}
+
+/// A sole admin at the full cut plus a member who joined by link (0 bp
+/// placeholder) sums to 10000 already; the party still stays Confirming,
+/// because the member holds no split yet.
+#[tokio::test]
+async fn a_joined_member_without_a_split_keeps_the_party_confirming() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let name = "bp-test-splitmin-12";
+    let admin = "bc1qadminsplitmin12";
+    let dave = "bc1qdavesplitmin12";
+    cleanup(&pool, name, admin).await;
+    let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+        .bind(dave)
+        .execute(&pool)
+        .await;
+
+    let svc = svc(&pool).await;
+    let create = svc.create_group(name, admin, 10_000).await.expect("create");
+    let gid = create.group.id;
+    let link = svc
+        .create_join_link(gid, OpenInviteTtl::SevenDays, Some(&create.admin_token))
+        .await
+        .expect("create_join_link");
+    let (dave_token, _) = svc.join_via_link(&link, dave).await.expect("join");
+    svc.confirm_as_member(gid, &addr(dave), Some(&dave_token))
+        .await
+        .expect("confirm");
+    let g = svc.get_group(gid).await.unwrap().unwrap();
+    assert_eq!(
+        g.status, "confirming",
+        "10000 + 0 bp sums right, but the member has no split"
+    );
+
+    cleanup(&pool, name, admin).await;
+    let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+        .bind(dave)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM blockparty_join_link WHERE token = $1")
+        .bind(&link)
+        .execute(&pool)
+        .await;
+}
+
 #[tokio::test]
 async fn update_rental_hint_sets_cleans_and_clears() {
     let Some(pool) = connect_or_skip().await else {
