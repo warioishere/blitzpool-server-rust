@@ -53,11 +53,9 @@ pub(crate) fn build_per_port_servers(
     engines: &EngineHandles,
     membership: &Membership,
     payout_resolver: Arc<dyn bp_stratum_v1::PayoutResolver>,
-    dispatcher: Option<Arc<bp_notifications::dispatcher::NotificationDispatcher>>,
     device_status_sink: Arc<dyn bp_share_hook::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
     job_cache: Arc<bp_mining_job::MiningJobCache>,
-    settle: crate::settlement::SettlementSignal,
 ) -> Result<Vec<Sv1PortServer>, StratumV1SpawnError> {
     let Some(tdp) = foundation.tdp.as_ref() else {
         warn!("stratum-v1: TDP missing (--skip-tdp); skipping SV1 server construction");
@@ -69,17 +67,9 @@ pub(crate) fn build_per_port_servers(
         .validate()
         .map_err(|e| StratumV1SpawnError::ServerConfig(e.to_string()))?;
 
-    // Submits the solution via TDP and fans the block-found event to the
-    // per-mode engines and the notification dispatcher.
-    let block_sink = TdpBlockSubmissionSink::wired(
-        tdp.clone(),
-        cfg,
-        foundation,
-        engines,
-        dispatcher.clone(),
-        settle,
-    )
-    .into_sv1_arc();
+    // Submits the solution via TDP and publishes the block-found event.
+    let block_sink =
+        TdpBlockSubmissionSink::wired(tdp.clone(), cfg, foundation, engines).into_sv1_arc();
 
     let port_configs = build_port_configs(cfg);
     for pc in &port_configs {

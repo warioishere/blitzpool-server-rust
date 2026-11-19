@@ -127,11 +127,9 @@ pub(crate) fn build_per_port_servers(
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
     payout_resolver: Arc<dyn PayoutResolver>,
     custom_extranonce: Arc<dyn bp_stratum_v2::hooks::CustomExtranonceSource>,
-    dispatcher: Option<Arc<bp_notifications::dispatcher::NotificationDispatcher>>,
     device_status_sink: Arc<dyn bp_share_hook::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
     job_cache: Arc<bp_mining_job::MiningJobCache>,
-    settle: crate::settlement::SettlementSignal,
 ) -> Vec<Sv2PortServer> {
     let Some(tdp) = foundation.tdp.as_ref() else {
         warn!("stratum-v2: TDP missing (--skip-tdp); skipping SV2 server construction");
@@ -142,16 +140,10 @@ pub(crate) fn build_per_port_servers(
     let network = crate::boot::bitcoin_network(cfg.network);
     // SV1's port enumeration is the canonical port list.
     let sv1_port_configs = stratum_v1::build_port_configs(cfg);
-    // TDP submit plus engine ledger and dispatcher fan-out, as for SV1.
-    let block_sink: Arc<dyn Sv2BlockSink> = crate::block_sink::TdpBlockSubmissionSink::wired(
-        tdp.clone(),
-        cfg,
-        foundation,
-        engines,
-        dispatcher.clone(),
-        settle,
-    )
-    .into_sv2_arc();
+    // TDP submit plus the block-found publish, as for SV1.
+    let block_sink: Arc<dyn Sv2BlockSink> =
+        crate::block_sink::TdpBlockSubmissionSink::wired(tdp.clone(), cfg, foundation, engines)
+            .into_sv2_arc();
 
     let mut out: Vec<Sv2PortServer> = Vec::with_capacity(sv1_port_configs.len());
 

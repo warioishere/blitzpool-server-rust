@@ -418,12 +418,6 @@ impl BlitzpoolModeGate {
         guard.get(address).map(|e| e.mode)
     }
 
-    /// Solo records no payout rows, so a Solo block without them is normal;
-    /// in every other mode a missing row is a real miss.
-    pub(crate) fn keeps_a_payout_ledger(&self, address: &str) -> bool {
-        !matches!(self.lookup_mode(address), MiningModeResult::Solo)
-    }
-
     /// Group-Solo `group_id` only: a Blockparty address carries one too, but
     /// it is not a Group-Solo group.
     pub(crate) fn group_for_address(&self, address: &str) -> Option<Uuid> {

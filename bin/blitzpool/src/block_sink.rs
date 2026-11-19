@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use bp_bitcoin::BitcoinRpc;
 use bp_coinbase_snapshot::ActualCoinbase;
 use bp_common::{AddressId, MiningMode, StreamKind};
-use bp_config::{AppConfig, Role};
+use bp_config::AppConfig;
 use bp_group_solo_engine::engine::GroupSoloEngine;
 use bp_mining_mode::MiningModeResult;
 use bp_notifications::dispatcher::{BlockFoundNotice, NotificationDispatcher};
@@ -31,13 +31,14 @@ use crate::boot::FoundationHandles;
 use crate::engines::{BlitzpoolModeGate, EngineHandles};
 use crate::pending_blocks::{is_pending_block, put_pending_block, PendingBlock, PendingSettlement};
 
-/// Reads at a block's find before it counts as unreadable.
-const FIND_READ_ATTEMPTS: u32 = 3;
-const FIND_READ_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
+/// Attempts at a block's find before a step counts as failed.
+const FIND_ATTEMPTS: u32 = 3;
+const FIND_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// A read a found block's booking depends on, retried so a store or node
-/// RPC blip at the find does not leave the block unbooked.
-async fn read_at_find<T, E, F, Fut>(what: &'static str, mut read: F) -> Result<T, E>
+/// A step a found block's booking depends on (a read, the stream publish),
+/// retried so a store or node RPC blip at the find does not leave the block
+/// unbooked.
+async fn retry_at_find<T, E, F, Fut>(what: &'static str, mut step: F) -> Result<T, E>
 where
     E: std::fmt::Display,
     F: FnMut() -> Fut,
@@ -45,11 +46,11 @@ where
 {
     let mut attempt = 1;
     loop {
-        match read().await {
-            Err(err) if attempt < FIND_READ_ATTEMPTS => {
-                warn!(%err, attempt, what, "block-found: unreadable at the find; retrying");
+        match step().await {
+            Err(err) if attempt < FIND_ATTEMPTS => {
+                warn!(%err, attempt, what, "block-found: failed at the find; retrying");
                 attempt += 1;
-                tokio::time::sleep(FIND_READ_RETRY_PAUSE).await;
+                tokio::time::sleep(FIND_RETRY_PAUSE).await;
             }
             result => return result,
         }
@@ -139,9 +140,8 @@ struct BlockFoundInputs {
 }
 
 /// `BlockSubmissionSink` for SV1 and SV2: submits every block candidate to
-/// Core via TDP and fans the block-found out to the per-mode ledger and the
-/// [`NotificationDispatcher`]. The TDP submit is the authoritative path; a
-/// missing engine or dispatcher only skips its step.
+/// Core via TDP and publishes the block-found for payout and notify. The TDP
+/// submit is the authoritative path.
 pub(crate) struct TdpBlockSubmissionSink {
     /// PPLNS stream handle, and the fallback when an alt stream isn't wired.
     tdp: TdpHandle,
@@ -151,10 +151,12 @@ pub(crate) struct TdpBlockSubmissionSink {
     mode_gate: Arc<BlitzpoolModeGate>,
     bitcoin_rpc: BitcoinRpc,
     pool: PgPool,
-    /// Runs the same apply in-process on the Core or on a Satellite.
+    /// On the front only its PPLNS engine is set, for the snapshot read at
+    /// the find; a sink without a producer runs the whole apply in-process.
     applier: BlockFoundApplier,
-    /// Publishes block-found events for the Satellites; on a publish failure
-    /// the front applies in-process. `None` without a front role.
+    /// Publishes block-found events for the Satellites. Every [`Self::wired`]
+    /// sink has one; `None` only in a sink built without it, as the regtests
+    /// build theirs, which applies in-process.
     block_found_producer: Option<StreamProducer<BlockFoundEvent>>,
     /// For decoding the submitted coinbase into [`ActualCoinbase`].
     network: bitcoin::Network,
@@ -162,7 +164,7 @@ pub(crate) struct TdpBlockSubmissionSink {
 
 /// The relocatable half of block-found handling: per-mode ledger writes,
 /// the PPLNS pending store and notifications. Reads only the Core-stamped
-/// [`BlockFoundEvent`], so it runs identically on the Core and on a Satellite.
+/// [`BlockFoundEvent`], so it runs on a Satellite from the stream.
 #[derive(Default, Clone)]
 pub(crate) struct BlockFoundApplier {
     pplns: Option<PplnsEngine>,
@@ -197,18 +199,17 @@ impl TdpBlockSubmissionSink {
         }
     }
 
-    /// The one way SV1, SV2 and the JDP booker build their sink, so a block
-    /// books the same way whichever found it. A front always produces onto the
-    /// block-found stream: front and payout never share a process.
+    /// The one way the front's SV1, SV2 and JDP booker build their sink, so a
+    /// block is published the same way whichever found it. Payout applies it
+    /// from the stream (front and payout never share a process), so the front
+    /// holds only the PPLNS engine, whose snapshot it reads at the find.
     pub(crate) fn wired(
         tdp: TdpHandle,
         cfg: &AppConfig,
         foundation: &FoundationHandles,
         engines: &EngineHandles,
-        dispatcher: Option<Arc<NotificationDispatcher>>,
-        settle: crate::settlement::SettlementSignal,
     ) -> Self {
-        let sink = Self::new(
+        Self::new(
             tdp,
             engines.mode_gate.clone(),
             foundation.bitcoin_rpc.clone(),
@@ -216,32 +217,11 @@ impl TdpBlockSubmissionSink {
         )
         .with_network(crate::boot::bitcoin_network(cfg.network))
         .with_alt_streams(foundation.alt_tdp.clone())
-        .with_fanout(
-            engines.pplns.clone(),
-            engines.group_solo.clone(),
-            dispatcher,
-        )
-        .with_blockparty(engines.blockparty_payouts.clone())
-        .with_redis(foundation.redis.clone())
-        .with_settle_handle(settle);
-        if cfg.has_role(Role::Front) {
-            sink.with_block_found_producer(StreamProducer::new(
-                foundation.redis.clone(),
-                BLOCK_FOUND_STREAM_KEY,
-            ))
-        } else {
-            sink
-        }
-    }
-
-    /// ext 0x0003/Implementation Notes: a Stratum-path block invalidates the
-    /// published distributions exactly like a JDP-declared one.
-    pub(crate) fn with_settle_handle(
-        mut self,
-        signal: crate::settlement::SettlementSignal,
-    ) -> Self {
-        self.applier.settle = Some(signal);
-        self
+        .with_fanout(engines.pplns.clone(), None, None)
+        .with_block_found_producer(StreamProducer::new(
+            foundation.redis.clone(),
+            BLOCK_FOUND_STREAM_KEY,
+        ))
     }
 
     pub(crate) fn with_network(mut self, network: bitcoin::Network) -> Self {
@@ -257,6 +237,8 @@ impl TdpBlockSubmissionSink {
         self
     }
 
+    /// The pending store for a sink that applies in-process.
+    #[cfg(test)]
     pub(crate) fn with_redis(mut self, redis: ConnectionManager) -> Self {
         self.applier.redis = Some(redis);
         self
@@ -286,14 +268,6 @@ impl TdpBlockSubmissionSink {
                 &self.tdp
             }
         }
-    }
-
-    pub(crate) fn with_blockparty(
-        mut self,
-        blockparty: Option<bp_blockparty_engine::BlockpartyPayouts>,
-    ) -> Self {
-        self.applier.blockparty = blockparty;
-        self
     }
 
     pub(crate) fn with_fanout(
@@ -365,7 +339,7 @@ impl TdpBlockSubmissionSink {
     /// the block then reaches no ledger and reconcile reports it.
     async fn derive_block_height(&self, rpc: &BitcoinRpc, header_hex: &str) -> Option<i32> {
         let prev_hash = prev_hash_display_from_header(header_hex)?;
-        match read_at_find("parent block header", || rpc.get_block_header(&prev_hash)).await {
+        match retry_at_find("parent block header", || rpc.get_block_header(&prev_hash)).await {
             Ok(parent) => match parent.height {
                 Some(parent_height) => Some((parent_height + 1) as i32),
                 None => {
@@ -381,9 +355,9 @@ impl TdpBlockSubmissionSink {
     }
 
     /// Front-side block-found: resolves mode and height, writes `blocks_entity`
-    /// and publishes the [`BlockFoundEvent`]. `false` means nothing at all was
-    /// written, so a deduping caller must not mark the block handled; past the
-    /// fan-out every step is PG-idempotent and a redelivery finishes the job.
+    /// and publishes the [`BlockFoundEvent`]. `false` means the event was not
+    /// published, so a deduping caller must not mark the block handled: a
+    /// redelivery publishes it, and the `blocks_entity` write is idempotent.
     async fn emit_block_found(&self, found: BlockFoundInputs) -> bool {
         let BlockFoundInputs {
             address,
@@ -409,14 +383,19 @@ impl TdpBlockSubmissionSink {
         };
 
         // The Redis-independent record the ledger can be reconciled against.
-        // Best-effort: a failure must not abort the apply below.
+        // Best-effort: a failure must not abort the publish below. Only a
+        // mode the gate knows is recorded; the reconcile reports a block
+        // recorded without one.
         if let Err(err) = bp_db::insert_found_block(
             &self.pool,
-            height as i64,
-            &address,
-            &worker,
-            &session_id,
-            &block_data,
+            bp_db::FoundBlockInsert {
+                height: height as i64,
+                miner_address: &address,
+                worker: &worker,
+                session_id: &session_id,
+                block_data: &block_data,
+                mode: self.mode_gate.lookup_known(&address).map(|r| r.mode()),
+            },
         )
         .await
         {
@@ -442,29 +421,41 @@ impl TdpBlockSubmissionSink {
             actual_coinbase,
         };
 
-        // On a publish failure apply in-process, so a Redis blip never drops
-        // the ledger write; the apply is PG-idempotent.
+        // Only payout books and only notify notifies, both from the stream:
+        // a block whose publish keeps failing stays unbooked until a
+        // redelivery publishes it, and the block reconcile reports it when it
+        // owed a booking.
         match self.block_found_producer.as_ref() {
-            Some(producer) => match producer.publish(&event).await {
-                Ok(id) => info!(
-                    address = %event.address,
-                    height = event.height,
-                    entry_id = %id,
-                    "block-found: published to stream for Satellite apply"
-                ),
-                Err(err) => {
-                    warn!(
-                        %err,
-                        address = %event.address,
-                        height = event.height,
-                        "block-found: stream publish failed — applying in-process as fallback"
-                    );
-                    self.applier.apply_block_found(&event).await;
+            Some(producer) => {
+                match retry_at_find("block-found publish", || producer.publish(&event)).await {
+                    Ok(id) => {
+                        info!(
+                            address = %event.address,
+                            height = event.height,
+                            entry_id = %id,
+                            "block-found: published to stream for Satellite apply"
+                        );
+                        true
+                    }
+                    Err(err) => {
+                        error!(
+                            %err,
+                            address = %event.address,
+                            height = event.height,
+                            block_hash = %event.block_hash,
+                            "block-found: stream publish failed after retries — NOT booked \
+                             and NOT notified; the block reconcile reports it if it owed a \
+                             booking"
+                        );
+                        false
+                    }
                 }
-            },
-            None => self.applier.apply_block_found(&event).await,
+            }
+            None => {
+                self.applier.apply_block_found(&event).await;
+                true
+            }
         }
-        true
     }
 
     /// Resolve PPLNS's settlement inputs at the block-found instant: the
@@ -493,7 +484,7 @@ impl TdpBlockSubmissionSink {
                     None
                 })?;
                 let fingerprint = pool_built(payouts_fingerprint)?;
-                match read_at_find("pplns snapshot", || {
+                match retry_at_find("pplns snapshot", || {
                     engine.weight_snapshot_for_block_found(&fingerprint)
                 })
                 .await
@@ -803,7 +794,7 @@ impl BlockFoundApplier {
                         } else {
                             // Taken now, so booking leaves the shares mined
                             // while the block waits for its confirmations.
-                            let round_at_find = match read_at_find("group-solo round", || engine.cut_round_at_find(group_id, block_hash)).await {
+                            let round_at_find = match retry_at_find("group-solo round", || engine.cut_round_at_find(group_id, block_hash)).await {
                                 Ok(round_at_find) => Some(round_at_find),
                                 Err(err) => {
                                     error!(%err, %group_id, address = address_str, height,

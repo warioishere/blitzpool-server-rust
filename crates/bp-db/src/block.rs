@@ -2,6 +2,7 @@
 
 //! Block-found history: `blocks_entity`, an append-only block-find log.
 
+use bp_common::MiningMode;
 use sqlx::{postgres::PgPool, FromRow};
 
 use crate::DbError;
@@ -19,28 +20,42 @@ pub struct FoundBlockRow {
     pub session_id: String,
 }
 
-/// Append a found-block record once the solution is submitted. `block_data`
-/// is the 80-byte header hex and is never exposed by the API.
+/// One found block as the front records it.
+#[derive(Clone, Copy, Debug)]
+pub struct FoundBlockInsert<'a> {
+    pub height: i64,
+    pub miner_address: &'a str,
+    pub worker: &'a str,
+    pub session_id: &'a str,
+    /// The 80-byte header hex; never exposed by the API.
+    pub block_data: &'a str,
+    /// The payout mode the block was mined in; `None` when it is not known.
+    pub mode: Option<MiningMode>,
+}
+
+/// Append a found-block record once the solution is submitted. Idempotent per
+/// block (height and header): a redelivered find writes no second row.
 pub async fn insert_found_block<'e, E>(
     executor: E,
-    height: i64,
-    miner_address: &str,
-    worker: &str,
-    session_id: &str,
-    block_data: &str,
+    found: FoundBlockInsert<'_>,
 ) -> Result<(), DbError>
 where
     E: sqlx::PgExecutor<'e>,
 {
     sqlx::query!(
         r#"INSERT INTO blocks_entity
-             (height, "minerAddress", worker, "sessionId", "blockData")
-           VALUES ($1, $2, $3, $4, $5)"#,
-        height,
-        miner_address,
-        worker,
-        session_id,
-        block_data,
+             (height, "minerAddress", worker, "sessionId", "blockData", mode)
+           SELECT $1::bigint, $2::varchar, $3::varchar, $4::varchar, $5::varchar,
+                  $6::varchar
+           WHERE NOT EXISTS (
+             SELECT 1 FROM blocks_entity WHERE height = $1 AND "blockData" = $5
+           )"#,
+        found.height,
+        found.miner_address,
+        found.worker,
+        found.session_id,
+        found.block_data,
+        found.mode.map(MiningMode::as_str),
     )
     .execute(executor)
     .await
@@ -48,16 +63,24 @@ where
     Ok(())
 }
 
-/// The miner address the pool recorded for the block at `height`, or `None`
-/// when it has no record of one. The chain-to-ledger reconciliation uses the
-/// address to resolve the payout mode (Solo keeps no ledger). Dev-seed rows
-/// are excluded: a bootstrap fixture is not evidence of a real block.
-pub async fn found_block_miner_at_height(
+/// What the pool recorded for the block at `height`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoundBlockAtHeight {
+    pub miner_address: String,
+    /// `None` for a row without a mode the build knows.
+    pub mode: Option<MiningMode>,
+}
+
+/// The pool's record of the block at `height`, or `None` when it has none.
+/// The chain-to-ledger reconciliation reads the mode from it (Solo keeps no
+/// ledger). Dev-seed rows are excluded: a bootstrap fixture is not evidence of
+/// a real block.
+pub async fn found_block_at_height(
     pool: &PgPool,
     height: i64,
-) -> Result<Option<String>, DbError> {
-    sqlx::query_scalar!(
-        r#"SELECT "minerAddress" AS "miner_address!"
+) -> Result<Option<FoundBlockAtHeight>, DbError> {
+    let row = sqlx::query!(
+        r#"SELECT "minerAddress" AS "miner_address!", mode
            FROM blocks_entity
            WHERE height = $1 AND "minerAddress" NOT LIKE 'synthseed%'
            LIMIT 1"#,
@@ -65,11 +88,17 @@ pub async fn found_block_miner_at_height(
     )
     .fetch_optional(pool)
     .await
-    .map_err(DbError::from)
+    .map_err(DbError::from)?;
+    Ok(row.map(|r| FoundBlockAtHeight {
+        miner_address: r.miner_address,
+        // A mode this build does not know reads as unknown, like a row
+        // without one.
+        mode: r.mode.and_then(|m| m.parse().ok()),
+    }))
 }
 
 /// `true` when a payout ledger booked value for `height`; unlike
-/// [`found_block_miner_at_height`] this proves miners were credited. Only rows
+/// [`found_block_at_height`] this proves miners were credited. Only rows
 /// that moved value count. Solo blocks keep no ledger, so their absence here
 /// is not a miss.
 pub async fn payout_recorded_at_height(pool: &PgPool, height: i32) -> Result<bool, DbError> {

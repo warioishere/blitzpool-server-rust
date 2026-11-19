@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO blocks_entity\n             (height, \"minerAddress\", worker, \"sessionId\", \"blockData\", mode)\n           SELECT $1::bigint, $2::varchar, $3::varchar, $4::varchar, $5::varchar,\n                  $6::varchar\n           WHERE NOT EXISTS (\n             SELECT 1 FROM blocks_entity WHERE height = $1 AND \"blockData\" = $5\n           )",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "dcb70447b296d226420d04a72ba8fdc7d62cadf3a186f978642a44bb0d0df667"
+}

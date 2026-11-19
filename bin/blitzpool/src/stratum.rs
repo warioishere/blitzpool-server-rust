@@ -9,7 +9,6 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use bp_config::AppConfig;
-use bp_notifications::dispatcher::NotificationDispatcher;
 use bp_stratum_v1::{PortConfig as Sv1PortConfig, StratumV1Server};
 use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
 use bp_stratum_v2::server::StratumV2MiningServer;
@@ -96,15 +95,10 @@ pub(crate) async fn spawn(
     engines: &EngineHandles,
     membership: &Membership,
     payout_resolver: Arc<crate::payout_resolver::ProductionPayoutResolver>,
-    dispatcher: Option<Arc<NotificationDispatcher>>,
     gate: Option<(
         Arc<crate::device_status_gate::Gate>,
         crate::device_status_gate::SubscribedAddresses,
     )>,
-    // ext 0x0003/Implementation Notes: a block booked through a Stratum
-    // sink's immediate apply must invalidate the published payout
-    // distributions exactly like a JDP-declared one.
-    settle: crate::settlement::SettlementSignal,
     // THE JDP bridge: the same `Arc` the JDP server registers into. The JDP
     // server writes declared jobs and allocations, `SetCustomMiningJob`
     // here reads them; a second instance would fail every custom job with
@@ -144,11 +138,9 @@ pub(crate) async fn spawn(
         engines,
         membership,
         sv1_resolver,
-        dispatcher.clone(),
         Arc::clone(&device_status),
         Arc::clone(&live_sessions),
         job_cache.clone(),
-        settle.clone(),
     )?;
     let noise_config = stratum_v2::build_noise_config(cfg)?;
     // SV2 miners and JD clients pin this key; this line is where an operator
@@ -170,11 +162,9 @@ pub(crate) async fn spawn(
         bridge,
         sv2_resolver,
         custom_extranonce,
-        dispatcher,
         device_status,
         Arc::clone(&live_sessions),
         job_cache,
-        settle,
     );
 
     // Pair SV1 + SV2 servers by port. Both enumerate ports via SV1's

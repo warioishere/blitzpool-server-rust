@@ -44,8 +44,8 @@ pub use address_ownership::{
 };
 pub use address_token::{find_token_revoked_before, raise_token_revoked_before};
 pub use block::{
-    find_found_blocks, found_block_miner_at_height, insert_found_block, payout_recorded_at_height,
-    FoundBlockRow,
+    find_found_blocks, found_block_at_height, insert_found_block, payout_recorded_at_height,
+    FoundBlockAtHeight, FoundBlockInsert, FoundBlockRow,
 };
 pub use blockparty::{
     delete_blockparty_join_link, delete_blockparty_member, delete_blockparty_members_for_group,

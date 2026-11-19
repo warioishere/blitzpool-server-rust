@@ -931,8 +931,9 @@ async fn public_blocks(State(state): State<SharedState>) -> Result<JsonBytes, Ap
                 let mut blocks = Vec::with_capacity(rows.len());
                 for r in rows {
                     let finder_address =
-                        bp_db::found_block_miner_at_height(&s.pool, i64::from(r.block_height))
-                            .await?;
+                        bp_db::found_block_at_height(&s.pool, i64::from(r.block_height))
+                            .await?
+                            .map(|found| found.miner_address);
                     blocks.push(PublicTeamBlock {
                         block_height: r.block_height,
                         found_at: crate::time_range::format_iso_ms(r.created_at),

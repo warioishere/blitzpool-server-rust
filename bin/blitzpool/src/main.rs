@@ -521,9 +521,7 @@ async fn main() -> ExitCode {
             &engines,
             m,
             resolver,
-            dispatcher.clone(),
             device_status_gate.clone(),
-            settle_signal.clone(),
             jdp_bridge.clone(),
         )
         .await
@@ -665,7 +663,6 @@ async fn main() -> ExitCode {
                 handles.db.pool().clone(),
                 handles.redis.clone(),
                 markers,
-                engines.mode_gate.clone(),
                 crate::block_reconcile::DEFAULT_INTERVAL,
                 crate::block_reconcile::DEFAULT_LOOKBACK,
             )),
@@ -884,8 +881,6 @@ async fn main() -> ExitCode {
                         &cfg,
                         &handles,
                         &engines,
-                        dispatcher.clone(),
-                        settle_signal.clone(),
                     ));
                 let jdp_admission = membership
                     .as_ref()

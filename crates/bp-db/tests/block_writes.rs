@@ -5,7 +5,8 @@
 //! Integration tests for found-block persistence and for
 //! `payout_recorded_at_height`.
 
-use bp_db::{find_found_blocks, insert_found_block};
+use bp_common::MiningMode;
+use bp_db::{find_found_blocks, found_block_at_height, insert_found_block, FoundBlockInsert};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
 const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
@@ -51,11 +52,14 @@ async fn insert_persists_all_columns() {
 
     insert_found_block(
         &pool,
-        840_001,
-        ADDR,
-        "rig0.worker1",
-        "ab12cd34",
-        "deadbeef01020304",
+        FoundBlockInsert {
+            height: 840_001,
+            miner_address: ADDR,
+            worker: "rig0.worker1",
+            session_id: "ab12cd34",
+            block_data: "deadbeef01020304",
+            mode: Some(MiningMode::GroupSolo),
+        },
     )
     .await
     .expect("insert_found_block");
@@ -71,6 +75,16 @@ async fn insert_persists_all_columns() {
     assert_eq!(row.miner_address, ADDR);
     assert_eq!(row.worker, "rig0.worker1");
     assert_eq!(row.session_id, "ab12cd34");
+    let at_height = found_block_at_height(&pool, 840_001)
+        .await
+        .expect("found_block_at_height")
+        .expect("a row at the height");
+    assert_eq!(at_height.miner_address, ADDR);
+    assert_eq!(
+        at_height.mode,
+        Some(MiningMode::GroupSolo),
+        "the mode reads back"
+    );
 
     cleanup(&pool, ADDR).await;
 }
@@ -83,16 +97,19 @@ async fn insert_multiple_rows_same_height() {
     const ADDR: &str = "bc1qblockwritetest0002";
     cleanup(&pool, ADDR).await;
 
-    // No UNIQUE constraint on (height, minerAddress) — plain INSERT should
-    // allow two rows at the same height.
-    for i in 0u32..2 {
+    // Two blocks at one height (two headers, as a reorg makes) are two rows;
+    // the same block found twice (a redelivery) stays one.
+    for (i, header) in ["aabbccdd", "eeff0011", "aabbccdd"].into_iter().enumerate() {
         insert_found_block(
             &pool,
-            777_000,
-            ADDR,
-            &format!("rig{i}.worker1"),
-            &format!("sess{i:04}"),
-            "aabbccdd",
+            FoundBlockInsert {
+                height: 777_000,
+                miner_address: ADDR,
+                worker: &format!("rig{i}.worker1"),
+                session_id: &format!("sess{i:04}"),
+                block_data: header,
+                mode: Some(MiningMode::Pplns),
+            },
         )
         .await
         .expect("insert_found_block");
@@ -100,7 +117,11 @@ async fn insert_multiple_rows_same_height() {
 
     let rows = find_found_blocks(&pool).await.expect("find_found_blocks");
     let our_rows: Vec<_> = rows.iter().filter(|r| r.miner_address == ADDR).collect();
-    assert_eq!(our_rows.len(), 2, "both rows must be present");
+    assert_eq!(
+        our_rows.len(),
+        2,
+        "one row per block, none for the redelivery"
+    );
 
     cleanup(&pool, ADDR).await;
 }
