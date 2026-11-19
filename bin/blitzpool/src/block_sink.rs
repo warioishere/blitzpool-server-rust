@@ -37,8 +37,8 @@ use crate::pending_blocks::{
 const FIND_READ_ATTEMPTS: u32 = 3;
 const FIND_READ_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// A read a found block's booking depends on, retried so a Redis or
-/// Postgres blip at the find does not leave the block unbooked.
+/// A read a found block's booking depends on, retried so a store or node
+/// RPC blip at the find does not leave the block unbooked.
 async fn read_at_find<T, E, F, Fut>(what: &'static str, mut read: F) -> Result<T, E>
 where
     E: std::fmt::Display,
@@ -361,29 +361,22 @@ impl TdpBlockSubmissionSink {
         Arc::new(self)
     }
 
-    /// Parent height + 1, not `tip + 1`: `submit_solution` may already have
-    /// connected the block, making the tip one too high. The tip is only the
-    /// fallback, so a height hiccup never drops the block-found.
+    /// Parent height + 1. Never `tip + 1`: `submit_solution` may already have
+    /// connected the block, and a height one too high would book this block
+    /// over the next one. `None` when the parent's height stays unreadable;
+    /// the block then reaches no ledger and reconcile reports it.
     async fn derive_block_height(&self, rpc: &BitcoinRpc, header_hex: &str) -> Option<i32> {
-        if let Some(prev_hash) = prev_hash_display_from_header(header_hex) {
-            match rpc.get_block_header(&prev_hash).await {
-                Ok(h) => match h.height {
-                    Some(parent_height) => return Some((parent_height + 1) as i32),
-                    None => warn!(
-                        prev_hash,
-                        "block-found: parent header has no height; falling back to get_block_count"
-                    ),
-                },
-                Err(err) => warn!(
-                    %err, prev_hash,
-                    "block-found: get_block_header(parent) failed; falling back to get_block_count"
-                ),
-            }
-        }
-        match rpc.get_block_count().await {
-            Ok(tip) => Some(tip.saturating_add(1) as i32),
+        let prev_hash = prev_hash_display_from_header(header_hex)?;
+        match read_at_find("parent block header", || rpc.get_block_header(&prev_hash)).await {
+            Ok(parent) => match parent.height {
+                Some(parent_height) => Some((parent_height + 1) as i32),
+                None => {
+                    warn!(prev_hash, "block-found: parent header carries no height");
+                    None
+                }
+            },
             Err(err) => {
-                warn!(%err, "block-found: get_block_count fallback failed");
+                warn!(%err, prev_hash, "block-found: parent header unreadable");
                 None
             }
         }

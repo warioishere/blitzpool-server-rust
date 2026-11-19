@@ -29,7 +29,7 @@ pub(crate) struct PendingBlock {
     pub block_hash: String,
     /// Wall clock (epoch ms) when the block was found.
     pub found_at_ms: i64,
-    /// Block height (chain tip + 1 at find time).
+    /// Block height (the parent's height + 1).
     pub block_height: i32,
     /// What the block's coinbase actually paid — settlement's ground truth.
     pub actual_coinbase: ActualCoinbase,
