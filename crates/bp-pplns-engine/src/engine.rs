@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bp_common::{AddressId, InvalidAddressError, Sats};
+use bp_common::{AddressId, InvalidAddressError, MiningMode, Sats};
 use bp_db::{DbError, PplnsBalanceRow};
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
@@ -341,7 +341,7 @@ impl PplnsEngine {
         let mut set: std::collections::HashSet<String> =
             snapshot.entries.iter().map(|e| e.address.clone()).collect();
         // Paid addresses outside the snapshot too: lifetime totals must not miss them.
-        set.extend(actual.paid_by_address.keys().cloned());
+        set.extend(actual.paid_to_payees(MiningMode::Pplns).into_keys());
         set.remove(&snapshot.fee_address);
         let mut addresses: Vec<String> = set.into_iter().collect();
         addresses.sort();
@@ -363,7 +363,8 @@ impl PplnsEngine {
             .iter()
             .map(|e| e.address.as_str())
             .collect();
-        let paid_to = |address: &str| actual.paid_by_address.get(address).copied().unwrap_or(0);
+        let paid_by_address = actual.paid_to_payees(MiningMode::Pplns);
+        let paid_to = |address: &str| paid_by_address.get(address).copied().unwrap_or(0);
         // Current balance and lifetime total; a missing row is zero on both.
         let row_of = |address: &str| {
             existing
@@ -421,7 +422,7 @@ impl PplnsEngine {
 
         // Outputs paying an address the snapshot does not know: book the payment
         // into the lifetime total without inventing a claim.
-        for (addr_str, &paid) in &actual.paid_by_address {
+        for (addr_str, &paid) in &paid_by_address {
             if paid == 0
                 || *addr_str == snapshot.fee_address
                 || in_snapshot.contains(addr_str.as_str())
@@ -547,6 +548,7 @@ mod tests {
                 ("zero_outsider", 0),
                 (FEE, 7_000),
             ]),
+            output_zero: None,
             total_value_sats: 1_000_000,
         };
         let existing: HashMap<String, PplnsBalanceRow> = [

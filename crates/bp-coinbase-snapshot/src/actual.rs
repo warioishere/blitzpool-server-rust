@@ -7,44 +7,68 @@
 use std::collections::HashMap;
 
 use bitcoin::{Address, Network, Transaction};
+use bp_common::MiningMode;
 
 /// The per-address payment record of one real coinbase.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ActualCoinbase {
-    /// Address → sats the coinbase paid it, EXCLUDING the pool output
-    /// (`pay_P`, output 0 by §4 order), so a fee address that also mines
-    /// shows only its miner output. Aggregated per address, so a script
-    /// paid twice counts once with the sum.
+    /// Address → sats the coinbase paid it, every output but output 0.
+    /// Aggregated per address, so a script paid twice counts once with the
+    /// sum. Booking reads it through [`Self::paid_to_payees`], which decides
+    /// per mode what output 0 is.
     pub paid_by_address: HashMap<String, u64>,
+    /// Output 0 as `(address, sats)`, when it pays an address a non-zero
+    /// value.
+    pub output_zero: Option<(String, u64)>,
     /// `Σ` of ALL output values = the block's actual revenue `T`.
     pub total_value_sats: u64,
 }
 
 impl ActualCoinbase {
-    /// Decompose a real coinbase transaction. Output 0 is the pool
-    /// output by the §4 output order. Outputs whose script
-    /// has no address form (OP_RETURN, witness commitment) carry no
-    /// value under §4 and are counted only into `total_value_sats`.
+    /// Decompose a real coinbase transaction. Outputs whose script has no
+    /// address form (OP_RETURN, witness commitment) carry no value under §4
+    /// and are counted only into `total_value_sats`.
     pub fn from_coinbase(coinbase: &Transaction, network: Network) -> Self {
         let mut paid_by_address: HashMap<String, u64> = HashMap::new();
+        let mut output_zero = None;
         let mut total_value_sats = 0u64;
         for (index, output) in coinbase.output.iter().enumerate() {
             let sats = output.value.to_sat();
             total_value_sats = total_value_sats.saturating_add(sats);
-            if index == 0 {
-                continue;
-            }
             if sats == 0 {
                 continue;
             }
-            if let Ok(address) = Address::from_script(&output.script_pubkey, network) {
+            let Ok(address) = Address::from_script(&output.script_pubkey, network) else {
+                continue;
+            };
+            if index == 0 {
+                output_zero = Some((address.to_string(), sats));
+            } else {
                 *paid_by_address.entry(address.to_string()).or_insert(0) += sats;
             }
         }
         Self {
             paid_by_address,
+            output_zero,
             total_value_sats,
         }
+    }
+
+    /// What the coinbase paid each payee of `mode`. Output 0 of a weight-model
+    /// coinbase is the pool output, not a payee's; Solo and Blockparty
+    /// reserve no position, so their output 0 is whoever it pays (the fee
+    /// output when there is one, else the miner or a member).
+    pub fn paid_to_payees(&self, mode: MiningMode) -> HashMap<String, u64> {
+        let mut paid = self.paid_by_address.clone();
+        match mode {
+            MiningMode::Pplns | MiningMode::GroupSolo => {}
+            MiningMode::Solo | MiningMode::Blockparty => {
+                if let Some((address, sats)) = &self.output_zero {
+                    *paid.entry(address.clone()).or_insert(0) += sats;
+                }
+            }
+        }
+        paid
     }
 
     /// The one hard settlement gate, shared by every engine that books from
@@ -97,6 +121,35 @@ mod tests {
     const MINER: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
     const FEE: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
 
+    /// Output 0 is the weight model's pool output, never a payee's there; a
+    /// Solo or Blockparty coinbase without a fee output pays a payee at 0.
+    #[test]
+    fn output_zero_is_a_payee_only_outside_the_weight_model() {
+        const MEMBER_B: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+        let tx = coinbase_with(vec![
+            TxOut {
+                value: Amount::from_sat(600),
+                script_pubkey: p2wpkh(MINER),
+            },
+            TxOut {
+                value: Amount::from_sat(400),
+                script_pubkey: p2wpkh(MEMBER_B),
+            },
+        ]);
+        let actual = ActualCoinbase::from_coinbase(&tx, Network::Bitcoin);
+        assert_eq!(actual.output_zero, Some((MINER.to_string(), 600)));
+        for mode in [MiningMode::Solo, MiningMode::Blockparty] {
+            let paid = actual.paid_to_payees(mode);
+            assert_eq!(paid.get(MINER), Some(&600), "{mode:?}");
+            assert_eq!(paid.get(MEMBER_B), Some(&400), "{mode:?}");
+        }
+        for mode in [MiningMode::Pplns, MiningMode::GroupSolo] {
+            let paid = actual.paid_to_payees(mode);
+            assert_eq!(paid.get(MINER), None, "{mode:?}: output 0 is the pool's");
+            assert_eq!(paid.get(MEMBER_B), Some(&400), "{mode:?}");
+        }
+    }
+
     #[test]
     fn decomposes_pool_miners_and_zero_outputs() {
         let tx = coinbase_with(vec![
@@ -123,6 +176,7 @@ mod tests {
     fn percent_of_total_is_share_of_actual_revenue() {
         let actual = ActualCoinbase {
             paid_by_address: HashMap::new(),
+            output_zero: None,
             total_value_sats: 3_125_004_321,
         };
         for paid in [0u64, 1, 546, 1_000_000, 1_562_502_160, 3_125_004_321] {
@@ -133,6 +187,7 @@ mod tests {
         }
         let empty = ActualCoinbase {
             paid_by_address: HashMap::new(),
+            output_zero: None,
             total_value_sats: 0,
         };
         assert_eq!(empty.percent_of_total(600), 0.0);

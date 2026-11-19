@@ -59,8 +59,8 @@ pub(crate) enum PendingSettlement {
 
 impl PendingSettlement {
     /// Whether the mode books against a distribution the pool built, so a
-    /// coinbase without one has nothing to book. Blockparty recomputes its
-    /// split from the roster instead.
+    /// coinbase without one has nothing to book. Blockparty books what the
+    /// coinbase paid its roster, whoever built it.
     pub(crate) fn needs_pool_distribution(&self) -> bool {
         match self {
             Self::Pplns { .. } | Self::GroupSolo { .. } => true,
@@ -192,6 +192,7 @@ mod tests {
             block_height: 840_000,
             actual_coinbase: ActualCoinbase {
                 paid_by_address: [("bc1qminer".to_string(), 600)].into(),
+                output_zero: None,
                 total_value_sats: 1_000,
             },
             settlement: PendingSettlement::Blockparty { group_id },
@@ -229,6 +230,7 @@ mod tests {
                 block_height: 900_000,
                 actual_coinbase: ActualCoinbase {
                     paid_by_address: Default::default(),
+                    output_zero: None,
                     total_value_sats: 0,
                 },
                 settlement: PendingSettlement::Pplns {

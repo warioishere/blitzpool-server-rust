@@ -14,7 +14,8 @@ pub use constants::{
     NAME_MIN_LEN, TOTAL_PERCENT_BP,
 };
 pub use distribution::{
-    build_blockparty_distribution, BlockpartyDistributionInput, BlockpartyDistributionResult,
-    BlockpartyMemberInput, BlockpartySplitSnapshot, CoinbaseDistributionEntry,
+    build_blockparty_distribution, splits_paid, BlockpartyDistributionInput,
+    BlockpartyDistributionResult, BlockpartyMemberInput, BlockpartySplitSnapshot,
+    CoinbaseDistributionEntry,
 };
 pub use status::{BlockpartyStatus, ParseBlockpartyStatusError};

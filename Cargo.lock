@@ -727,6 +727,7 @@ dependencies = [
  "async-trait",
  "bitcoin",
  "bp-blockparty",
+ "bp-coinbase-snapshot",
  "bp-common",
  "bp-db",
  "bp-group-mgmt",

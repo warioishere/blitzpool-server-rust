@@ -3,12 +3,14 @@
 //! The DB-only half of Blockparty: the coinbase split and the block-history
 //! row. It carries no routing cache, so every process may hold one.
 
+use std::collections::HashMap;
+
 use bp_blockparty::{
-    build_blockparty_distribution, BlockpartyDistributionInput, BlockpartyDistributionResult,
-    BlockpartyMemberInput,
+    build_blockparty_distribution, splits_paid, BlockpartyDistributionInput,
+    BlockpartyDistributionResult, BlockpartyMemberInput,
 };
 use bp_common::{now_ms, AddressId};
-use bp_db::{BlockpartyBlockHistoryRow, BlockpartySplitSnapshot};
+use bp_db::{BlockpartyBlockHistoryRow, BlockpartyMemberRow};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -64,15 +66,8 @@ impl BlockpartyPayouts {
             return Ok(None);
         }
         let members = bp_db::list_blockparty_members_for_group(&self.pool, group_id).await?;
-        let inputs: Vec<BlockpartyMemberInput<'_>> = members
-            .iter()
-            .map(|m| BlockpartyMemberInput {
-                address: &m.address,
-                percent_bp: m.percent_bp,
-            })
-            .collect();
         let result = build_blockparty_distribution(BlockpartyDistributionInput {
-            members: &inputs,
+            members: &member_inputs(&members),
             block_reward_sats,
             pool_fee_address: self.config.fee_address.as_ref(),
             pool_fee_percent: self.config.fee_percent,
@@ -81,18 +76,33 @@ impl BlockpartyPayouts {
         Ok(Some(result))
     }
 
-    /// Idempotent via UNIQUE(groupId, blockHash): `None` on replay.
-    #[allow(clippy::too_many_arguments)]
+    /// Book a found block from its own coinbase: each member's sats as
+    /// `paid_to` (what the coinbase paid each address) reports them, the pool
+    /// fee as the rest of `coinbase_value_sats`. The roster cannot change
+    /// while the party is routable, so it is the one the coinbase was built
+    /// from. Idempotent via UNIQUE(groupId, blockHash): `None` on replay;
+    /// [`BlockpartyServiceError::NotFound`] when the group row does not exist.
     pub async fn on_block_found(
         &self,
         group_id: Uuid,
         block_height: i32,
         block_hash: &str,
         coinbase_value_sats: bp_common::Sats,
-        pool_fee_sats: bp_common::Sats,
-        splits: &[BlockpartySplitSnapshot],
+        paid_to: &HashMap<String, u64>,
         found_at: Option<i64>,
     ) -> Result<Option<BlockpartyBlockHistoryRow>, BlockpartyServiceError> {
+        if bp_db::find_blockparty_group(&self.pool, group_id)
+            .await?
+            .is_none()
+        {
+            return Err(BlockpartyServiceError::NotFound);
+        }
+        let members = bp_db::list_blockparty_members_for_group(&self.pool, group_id).await?;
+        let splits = splits_paid(&member_inputs(&members), |address| {
+            paid_to.get(address.as_str()).copied().unwrap_or(0)
+        });
+        let members_paid: i64 = splits.iter().map(|s| s.sats).sum();
+        let pool_fee_sats = bp_common::Sats(coinbase_value_sats.0 - members_paid);
         let now = now_ms();
         let row = bp_db::insert_blockparty_block_history(
             &self.pool,
@@ -102,10 +112,20 @@ impl BlockpartyPayouts {
             found_at.unwrap_or(now),
             coinbase_value_sats,
             pool_fee_sats,
-            splits,
+            &splits,
             now,
         )
         .await?;
         Ok(row)
     }
+}
+
+fn member_inputs(members: &[BlockpartyMemberRow]) -> Vec<BlockpartyMemberInput<'_>> {
+    members
+        .iter()
+        .map(|m| BlockpartyMemberInput {
+            address: &m.address,
+            percent_bp: m.percent_bp,
+        })
+        .collect()
 }

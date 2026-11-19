@@ -481,9 +481,8 @@ impl TdpBlockSubmissionSink {
         height: i32,
     ) -> Option<bp_pplns_engine::window::snapshot::StoredWeightSnapshot> {
         match mode {
-            // Solo writes no ledger, Blockparty recomputes its fixed shares
-            // from the DB, Group-Solo books from the coinbase alone. None of
-            // them has a snapshot to carry.
+            // Solo writes no ledger, Blockparty and Group-Solo book from the
+            // coinbase alone. None of them has a snapshot to carry.
             MiningModeResult::Solo
             | MiningModeResult::Blockparty(_)
             | MiningModeResult::GroupSolo(_) => None,
@@ -890,24 +889,7 @@ impl BlockFoundApplier {
             }
         };
         let height = event.height;
-        // What the coinbase paid, so each payee hears its own amount.
-        let paid = event
-            .actual_coinbase
-            .as_ref()
-            .map(|actual| {
-                actual
-                    .paid_by_address
-                    .iter()
-                    .filter_map(|(a, sats)| Some((AddressId::new(a.clone()).ok()?, *sats)))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let notice = BlockFoundNotice {
-            height: height as u64,
-            mode: event.mode,
-            finder,
-            paid,
-        };
+        let notice = block_found_notice(event, finder);
         dispatcher.notify_block_found(&notice).await;
         info!(
             address = address_str,
@@ -1127,6 +1109,28 @@ impl Sv2BlockSubmissionSink for TdpBlockSubmissionSink {
             stream,
         )
         .await;
+    }
+}
+
+/// The notice for a found block: what its coinbase paid each payee of its
+/// mode, so each hears its own amount.
+fn block_found_notice(event: &BlockFoundEvent, finder: AddressId) -> BlockFoundNotice {
+    let paid = event
+        .actual_coinbase
+        .as_ref()
+        .map(|actual| {
+            actual
+                .paid_to_payees(event.mode)
+                .into_iter()
+                .filter_map(|(a, sats)| Some((AddressId::new(a).ok()?, sats)))
+                .collect()
+        })
+        .unwrap_or_default();
+    BlockFoundNotice {
+        height: event.height as u64,
+        mode: event.mode,
+        finder,
+        paid,
     }
 }
 
@@ -1379,6 +1383,27 @@ mod tests {
         }
     }
 
+    /// A Solo miner without a fee output is paid at output 0 and hears its
+    /// amount; a PPLNS coinbase's output 0 is the pool output, not a payee.
+    #[test]
+    fn a_notice_names_what_the_coinbase_paid_each_payee_of_its_mode() {
+        const MINER: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        let finder = AddressId::new(MINER).unwrap();
+        let mut event = record_only_event();
+        event.actual_coinbase = Some(ActualCoinbase {
+            paid_by_address: HashMap::new(),
+            output_zero: Some((MINER.to_string(), 312_500_000)),
+            total_value_sats: 312_500_000,
+        });
+        event.mode = MiningMode::Solo;
+        assert_eq!(
+            block_found_notice(&event, finder.clone()).paid,
+            vec![(finder.clone(), 312_500_000)]
+        );
+        event.mode = MiningMode::Pplns;
+        assert!(block_found_notice(&event, finder).paid.is_empty());
+    }
+
     /// Pins the JSON round-trip of the Core-stamped event fields.
     #[test]
     fn block_found_event_json_round_trips_with_stamped_fields() {
@@ -1428,7 +1453,7 @@ mod tests {
     /// One rule for every mode that books against a pool-built distribution:
     /// a block on a coinbase the pool did not build (no or zeroed fingerprint)
     /// is not parked. A real fingerprint parks (negative control), and
-    /// Blockparty, which recomputes its split from the roster, parks without one.
+    /// Blockparty, which books what the coinbase paid its roster, parks without one.
     #[tokio::test]
     async fn only_a_pool_built_coinbase_is_parked_for_booking() {
         let Some(mut conn) = bp_test_support::connect_redis_in_range_or_skip(
@@ -1445,6 +1470,7 @@ mod tests {
         };
         let actual = ActualCoinbase {
             paid_by_address: Default::default(),
+            output_zero: None,
             total_value_sats: 312_500_000,
         };
         let group_id = uuid::Uuid::new_v4();

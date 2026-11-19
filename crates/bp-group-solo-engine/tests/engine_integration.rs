@@ -193,6 +193,7 @@ fn actual_paying_exactly(
     }
     bp_coinbase_snapshot::ActualCoinbase {
         paid_by_address,
+        output_zero: None,
         total_value_sats: t,
     }
 }

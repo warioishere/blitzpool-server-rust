@@ -41,8 +41,8 @@ impl BlockpartyStatus {
     }
 
     /// The admin may change members or splits. Never while routable: a block
-    /// is booked by recomputing the split from the roster, which matches the
-    /// coinbase only because the roster cannot change once jobs pay it.
+    /// is booked against the roster, which names the coinbase's members only
+    /// because it cannot change once jobs pay it.
     pub const fn is_editable(self) -> bool {
         matches!(self, Self::Draft | Self::Confirming)
     }

@@ -23,7 +23,8 @@ pub struct BlockpartySplitSnapshot {
     pub address: String,
     pub percent_bp: i32,
     pub sats: i64,
-    /// Below the dust floor and rolled into the pool fee; `sats` is 0.
+    /// The coinbase paid it nothing (its share fell below the dust floor);
+    /// `sats` is 0.
     #[serde(default, skip_serializing_if = "is_false")]
     pub trimmed: bool,
 }
@@ -52,11 +53,8 @@ pub struct BlockpartyDistributionInput<'a> {
 
 #[derive(Clone, Debug)]
 pub struct BlockpartyDistributionResult {
-    /// One entry per input member, same order.
-    pub splits: Vec<BlockpartySplitSnapshot>,
-    /// Base fee plus trimmed amounts plus rounding.
-    pub pool_fee_sats: Sats,
-    /// Coinbase outputs, pool fee first then non-trimmed members.
+    /// Coinbase outputs, pool fee first then non-trimmed members. The pool
+    /// fee output carries the base fee plus trimmed amounts plus rounding.
     pub payouts: Vec<CoinbaseDistributionEntry>,
 }
 
@@ -66,8 +64,6 @@ pub fn build_blockparty_distribution(
     let reward = input.block_reward_sats.0;
     if reward <= 0 {
         return BlockpartyDistributionResult {
-            splits: Vec::new(),
-            pool_fee_sats: Sats(0),
             payouts: Vec::new(),
         };
     }
@@ -81,11 +77,7 @@ pub fn build_blockparty_distribution(
             }],
             None => Vec::new(),
         };
-        return BlockpartyDistributionResult {
-            splits: Vec::new(),
-            pool_fee_sats: Sats(reward),
-            payouts,
-        };
+        return BlockpartyDistributionResult { payouts };
     }
 
     let dust = input.min_payout_sats.0.max(DUST_LIMIT_SATS as i64);
@@ -95,25 +87,20 @@ pub fn build_blockparty_distribution(
     let base_pool_fee = ((reward as f64 * input.pool_fee_percent) / 100.0).floor() as i64;
     let miner_cut = reward - base_pool_fee;
 
-    let mut splits = Vec::with_capacity(input.members.len());
-    let mut paid_to_members: i64 = 0;
-    for m in input.members {
-        let nominal = ((miner_cut as i128 * m.percent_bp as i128) / 10_000) as i64;
-        let (sats, trimmed) = if nominal < dust {
-            (0, true)
-        } else {
-            paid_to_members += nominal;
-            (nominal, false)
-        };
-        splits.push(BlockpartySplitSnapshot {
-            address: m.address.as_str().to_owned(),
-            percent_bp: m.percent_bp,
-            sats,
-            trimmed,
-        });
-    }
-
-    let pool_fee = reward - paid_to_members;
+    // A share below the dust floor is trimmed to 0.
+    let member_sats: Vec<i64> = input
+        .members
+        .iter()
+        .map(|m| {
+            let nominal = ((miner_cut as i128 * m.percent_bp as i128) / 10_000) as i64;
+            if nominal < dust {
+                0
+            } else {
+                nominal
+            }
+        })
+        .collect();
+    let pool_fee = reward - member_sats.iter().sum::<i64>();
 
     let mut payouts = Vec::with_capacity(input.members.len() + 1);
     if pool_fee > 0 {
@@ -125,21 +112,38 @@ pub fn build_blockparty_distribution(
             });
         }
     }
-    for (m, s) in input.members.iter().zip(splits.iter()) {
-        if s.sats > 0 {
+    for (m, &sats) in input.members.iter().zip(&member_sats) {
+        if sats > 0 {
             payouts.push(CoinbaseDistributionEntry {
                 address: m.address.clone(),
-                percent: (s.sats as f64 / reward as f64) * 100.0,
-                sats: Sats(s.sats),
+                percent: (sats as f64 / reward as f64) * 100.0,
+                sats: Sats(sats),
             });
         }
     }
 
-    BlockpartyDistributionResult {
-        splits,
-        pool_fee_sats: Sats(pool_fee),
-        payouts,
-    }
+    BlockpartyDistributionResult { payouts }
+}
+
+/// The split a found block's coinbase actually paid, one entry per member in
+/// roster order: its sats as `paid_to` reports them, marked trimmed when the
+/// coinbase paid it nothing.
+pub fn splits_paid(
+    members: &[BlockpartyMemberInput<'_>],
+    paid_to: impl Fn(&AddressId) -> u64,
+) -> Vec<BlockpartySplitSnapshot> {
+    members
+        .iter()
+        .map(|m| {
+            let sats = paid_to(m.address);
+            BlockpartySplitSnapshot {
+                address: m.address.as_str().to_owned(),
+                percent_bp: m.percent_bp,
+                sats: sats as i64,
+                trimmed: sats == 0,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -153,6 +157,15 @@ mod tests {
 
     fn fee_addr() -> AddressId {
         addr("bc1qfeeaddress")
+    }
+
+    /// What the outputs pay `address`; 0 when no output pays it.
+    fn paid(r: &BlockpartyDistributionResult, address: &AddressId) -> i64 {
+        r.payouts
+            .iter()
+            .filter(|p| &p.address == address)
+            .map(|p| p.sats.0)
+            .sum()
     }
 
     fn input<'a>(
@@ -180,8 +193,6 @@ mod tests {
         }];
         let fee = fee_addr();
         let r = build_blockparty_distribution(input(&members, Some(&fee), 0, 2.0, 5_000));
-        assert!(r.splits.is_empty());
-        assert_eq!(r.pool_fee_sats, Sats(0));
         assert!(r.payouts.is_empty());
     }
 
@@ -190,7 +201,6 @@ mod tests {
         let reward = 312_500_000;
         let fee = fee_addr();
         let r = build_blockparty_distribution(input(&[], Some(&fee), reward, 2.0, 5_000));
-        assert_eq!(r.pool_fee_sats, Sats(reward));
         assert_eq!(r.payouts.len(), 1);
         assert_eq!(r.payouts[0].sats, Sats(reward));
         assert_eq!(r.payouts[0].address, fee);
@@ -225,16 +235,13 @@ mod tests {
         let expect_b = (miner_cut as i128 * 3_000 / 10_000) as i64;
         let expect_c = (miner_cut as i128 * 2_000 / 10_000) as i64;
 
-        assert_eq!(r.splits[0].sats, expect_a);
-        assert_eq!(r.splits[1].sats, expect_b);
-        assert_eq!(r.splits[2].sats, expect_c);
-        assert!(!r.splits[0].trimmed);
-        assert!(!r.splits[1].trimmed);
-        assert!(!r.splits[2].trimmed);
+        assert_eq!(paid(&r, &a), expect_a);
+        assert_eq!(paid(&r, &b), expect_b);
+        assert_eq!(paid(&r, &c), expect_c);
 
         let total_out: i64 = r.payouts.iter().map(|p| p.sats.0).sum();
         assert_eq!(total_out, reward, "outputs must sum exactly to reward");
-        assert_eq!(r.pool_fee_sats.0, reward - (expect_a + expect_b + expect_c));
+        assert_eq!(paid(&r, &fee), reward - (expect_a + expect_b + expect_c));
     }
 
     #[test]
@@ -256,15 +263,11 @@ mod tests {
         let fee = fee_addr();
         let r = build_blockparty_distribution(input(&members, Some(&fee), reward, 2.0, 5_000));
 
-        assert!(r.splits[1].trimmed);
-        assert_eq!(r.splits[1].sats, 0);
-        assert!(!r.splits[0].trimmed);
+        assert_eq!(paid(&r, &b), 0, "trimmed: no output");
+        assert!(paid(&r, &a) > 0);
 
         let base_fee = (reward as f64 * 2.0 / 100.0).floor() as i64;
-        assert!(
-            r.pool_fee_sats.0 > base_fee,
-            "trimmed sats roll into pool fee"
-        );
+        assert!(paid(&r, &fee) > base_fee, "trimmed sats roll into pool fee");
 
         let total_out: i64 = r.payouts.iter().map(|p| p.sats.0).sum();
         assert_eq!(total_out, reward);
@@ -289,7 +292,7 @@ mod tests {
         ];
         let fee = fee_addr();
         let r = build_blockparty_distribution(input(&members, Some(&fee), reward, 2.0, 100));
-        assert!(r.splits[1].trimmed);
+        assert_eq!(paid(&r, &b), 0, "trimmed: no output");
         assert_eq!(DUST_LIMIT_SATS, 546);
     }
 

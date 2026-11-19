@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use bp_common::{AddressId, Sats};
+use bp_common::{AddressId, MiningMode, Sats};
 use bp_cron_utils::SystemClock;
 use bp_db::{find_group, DbError, PplnsGroupRow};
 use bp_group_mgmt::group::{window_duration_ms, PayoutMode, RoundResetPreset};
@@ -586,7 +586,7 @@ fn history_rows_from_coinbase(
 ) -> Vec<AuditRow> {
     let mut rows: Vec<AuditRow> = Vec::new();
 
-    for (addr_str, paid) in &actual.paid_by_address {
+    for (addr_str, paid) in &actual.paid_to_payees(MiningMode::GroupSolo) {
         if *paid == 0 {
             continue;
         }
@@ -719,6 +719,7 @@ mod tests {
                 (FEE_AS_MEMBER.to_string(), 100_000_000),
                 (UNPAID.to_string(), 0),
             ]),
+            output_zero: None,
             total_value_sats: 312_500_000,
         };
         let rows = history_rows_from_coinbase(Uuid::nil(), &actual, &HashMap::new(), 0);

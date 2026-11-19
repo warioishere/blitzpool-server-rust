@@ -131,30 +131,56 @@ async fn blockparty_ready_party_pays_members_and_history_is_idempotent() {
     )
     .await;
 
-    // ── on_block_found: write history + verify idempotency ───────
+    // ── on_block_found: book the coinbase core accepted ──────────
+    let coinbase_tx: bitcoin::Transaction =
+        bitcoin::consensus::deserialize(&mined.witness_coinbase).expect("coinbase decodes");
+    let actual = bp_coinbase_snapshot::ActualCoinbase::from_coinbase(
+        &coinbase_tx,
+        bitcoin::Network::Regtest,
+    );
+    let paid_to = actual.paid_to_payees(bp_common::MiningMode::Blockparty);
     let first = svc
         .payouts()
         .on_block_found(
             group_id,
             mined.height as i32,
             &mined.block_hash_hex,
-            Sats(reward_sats as i64),
-            dist.pool_fee_sats,
-            &dist.splits,
+            Sats(actual.total_value_sats as i64),
+            &paid_to,
             None,
         )
         .await
-        .expect("on_block_found first call");
-    assert!(first.is_some(), "first call must insert history row");
+        .expect("on_block_found first call")
+        .expect("first call must insert history row");
+    let built_for = |address: &str| -> i64 {
+        dist.payouts
+            .iter()
+            .filter(|p| p.address.as_str() == address)
+            .map(|p| p.sats.0)
+            .sum()
+    };
+    assert_eq!(first.splits.0.len(), 2, "precondition: both members booked");
+    for split in &first.splits.0 {
+        assert_eq!(
+            split.sats,
+            built_for(&split.address),
+            "the booked split is what the accepted coinbase paid {}",
+            split.address
+        );
+    }
+    assert_eq!(
+        first.pool_fee_sats.0 + first.splits.0.iter().map(|s| s.sats).sum::<i64>(),
+        actual.total_value_sats as i64,
+        "the rest of the coinbase is the pool fee"
+    );
     let replay = svc
         .payouts()
         .on_block_found(
             group_id,
             mined.height as i32,
             &mined.block_hash_hex,
-            Sats(reward_sats as i64),
-            dist.pool_fee_sats,
-            &dist.splits,
+            Sats(actual.total_value_sats as i64),
+            &paid_to,
             None,
         )
         .await

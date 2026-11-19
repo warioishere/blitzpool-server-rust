@@ -324,29 +324,24 @@ pub(crate) async fn settle_block(
         }
         PendingSettlement::Blockparty { group_id } => {
             let payouts = settlers.blockparty.ok_or(SettleFailure::NoEngine)?;
-            let group_uuid = *group_id;
-            // The split is recomputed from the roster, which cannot change
-            // while the party is routable, so it is the one the coinbase paid.
-            let reward = bp_common::Sats(actual.total_value_sats as i64);
-            let blockparty_err = |e| SettleFailure::Engine(SettleError::Blockparty(e));
-            let dist = payouts
-                .build_payouts(group_uuid, reward)
-                .await
-                .map_err(blockparty_err)?
-                .ok_or(SettleFailure::UnusableGroup)?;
+            // What the coinbase paid each member; the rest is the pool fee.
             payouts
                 .on_block_found(
-                    group_uuid,
+                    *group_id,
                     height,
                     &pb.block_hash,
-                    reward,
-                    dist.pool_fee_sats,
-                    &dist.splits,
+                    bp_common::Sats(actual.total_value_sats as i64),
+                    &actual.paid_to_payees(bp_common::MiningMode::Blockparty),
                     Some(pb.found_at_ms),
                 )
                 .await
                 .map(|row| u64::from(row.is_some()))
-                .map_err(blockparty_err)
+                .map_err(|e| match e {
+                    bp_blockparty_engine::BlockpartyServiceError::NotFound => {
+                        SettleFailure::UnusableGroup
+                    }
+                    e => SettleFailure::Engine(SettleError::Blockparty(e)),
+                })
         }
         PendingSettlement::Pplns { weight_snapshot } => {
             let engine = settlers.pplns.ok_or(SettleFailure::NoEngine)?;
@@ -1809,7 +1804,7 @@ mod blockparty_settlement {
     const FOUND_AT_MS: i64 = 1_700_000_000_123;
 
     /// A parked Blockparty block settles through the shared watcher path: one
-    /// history row with the roster's split, keyed and timestamped by the
+    /// history row with what its coinbase paid each member, keyed and timestamped by the
     /// parked blob, and nothing more on replay. A process without the
     /// Blockparty payouts leaves it parked (negative control).
     #[tokio::test]
@@ -1850,8 +1845,14 @@ mod blockparty_settlement {
                 min_payout_sats: Sats(5_000),
             },
         );
+        // The coinbase pays the admin at output 0 and the member after it,
+        // with no fee output: not the split the roster and the 2 % fee would
+        // compute, so only booking from the coinbase reads these amounts.
+        let admin_paid = REWARD * 6_000 / 10_000;
+        let member_paid = REWARD - admin_paid;
         let actual = ActualCoinbase {
-            paid_by_address: HashMap::new(),
+            paid_by_address: HashMap::from([(member.clone(), member_paid)]),
+            output_zero: Some((admin.clone(), admin_paid)),
             total_value_sats: REWARD,
         };
         let pb = PendingBlock {
@@ -1891,20 +1892,19 @@ mod blockparty_settlement {
             "found_at comes from the parked blob"
         );
         assert_eq!(row.coinbase_value_sats, Sats(REWARD as i64));
-        // 2 % base fee, then 60/40 of the miners' cut.
-        let cut = REWARD as i64 - REWARD as i64 * 2 / 100;
         let paid: HashMap<&str, i64> = row
             .splits
             .0
             .iter()
             .map(|s| (s.address.as_str(), s.sats))
             .collect();
-        assert_eq!(paid[admin.as_str()], cut * 6_000 / 10_000);
-        assert_eq!(paid[member.as_str()], cut * 4_000 / 10_000);
         assert_eq!(
-            row.pool_fee_sats.0 + paid.values().sum::<i64>(),
-            REWARD as i64
+            paid[admin.as_str()],
+            admin_paid as i64,
+            "output 0 paid the admin"
         );
+        assert_eq!(paid[member.as_str()], member_paid as i64);
+        assert_eq!(row.pool_fee_sats, Sats(0), "the coinbase paid no fee");
 
         assert_eq!(
             settle_block(&with, &pb).await.expect("replay"),

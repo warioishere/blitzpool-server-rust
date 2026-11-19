@@ -675,12 +675,12 @@ async fn on_block_found_is_idempotent_on_duplicate_hash() {
 
     let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 10_000).await.expect("create");
-    let splits = vec![bp_db::BlockpartySplitSnapshot {
-        address: admin.to_owned(),
-        percent_bp: 10_000,
-        sats: 312_500_000,
-        trimmed: false,
-    }];
+    // What the coinbase paid: the admin, and the pool fee to an address that
+    // is not a member.
+    let paid_to = std::collections::HashMap::from([
+        (admin.to_owned(), 306_250_000u64),
+        ("bc1qpoolfeeaddrx".to_owned(), 6_250_000u64),
+    ]);
     let hash = "0000000000000000abcdef1234567890abcdef1234567890abcdef1234567890";
 
     let r1 = svc
@@ -690,13 +690,27 @@ async fn on_block_found_is_idempotent_on_duplicate_hash() {
             900_000,
             hash,
             Sats(312_500_000),
-            Sats(0),
-            &splits,
+            &paid_to,
             Some(1_700_000_000_000),
         )
         .await
-        .expect("first insert");
-    assert!(r1.is_some());
+        .expect("first insert")
+        .expect("a first booking inserts its row");
+    assert_eq!(
+        r1.splits.0,
+        vec![bp_db::BlockpartySplitSnapshot {
+            address: admin.to_owned(),
+            percent_bp: 10_000,
+            sats: 306_250_000,
+            trimmed: false,
+        }],
+        "the member's sats are what the coinbase paid it"
+    );
+    assert_eq!(
+        r1.pool_fee_sats,
+        Sats(6_250_000),
+        "the rest is the pool fee"
+    );
 
     let r2 = svc
         .payouts()
@@ -705,8 +719,7 @@ async fn on_block_found_is_idempotent_on_duplicate_hash() {
             900_000,
             hash,
             Sats(312_500_000),
-            Sats(0),
-            &splits,
+            &paid_to,
             Some(1_700_000_000_000),
         )
         .await
@@ -803,8 +816,8 @@ async fn ready_transition_sizes_coinbase_reservation_to_roster() {
 }
 
 /// Ready already routes shares into the party coinbase, and a block is booked
-/// by recomputing the split from the roster, so the roster must be frozen from
-/// Ready on. The same edit succeeds while confirming (negative control).
+/// against the roster (who the members are, at what percent), so the roster
+/// must be frozen from Ready on. The same edit succeeds while confirming (negative control).
 #[tokio::test]
 async fn a_ready_party_refuses_every_roster_edit() {
     let Some(pool) = connect_or_skip().await else {
