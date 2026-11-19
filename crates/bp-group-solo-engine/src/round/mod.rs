@@ -749,10 +749,11 @@ impl GroupRoundStore {
         Ok(settled == 1)
     }
 
-    /// Scheduled (calendar-aligned) reset: the round starts over, including
-    /// `last-accepted-share-at`. The best share and the shares since the
-    /// last block stay; only the group's own block starts them over (see
-    /// [`Self::reset_best_share_for`], [`Self::settle_block`]).
+    /// Scheduled (calendar-aligned) reset: the round's shares and rejects
+    /// start over. `last-accepted-share-at` stays, as on a booked block: it
+    /// is the kick-inactivity clock, not round state. The best share and the
+    /// shares since the last block stay; only the group's own block starts
+    /// them over (see [`Self::reset_best_share_for`], [`Self::settle_block`]).
     pub async fn reset_for_calendar(&self, group_id: &str) -> Result<(), RoundError> {
         self.wipe_round(group_id, false).await
     }
@@ -768,11 +769,11 @@ impl GroupRoundStore {
         let mut keys = vec![
             key_by_address(group_id),
             key_rejected_shares(group_id),
-            key_last_accepted_share_at(group_id),
             // NOT `key_applied`: an un-ACKed satellite batch would otherwise
             // be reapplied into the fresh round on redelivery.
         ];
         if dissolve {
+            keys.push(key_last_accepted_share_at(group_id));
             keys.push(key_best_share(group_id));
             keys.push(key_shares_since_block(group_id));
             keys.push(key_settled_blocks(group_id));
