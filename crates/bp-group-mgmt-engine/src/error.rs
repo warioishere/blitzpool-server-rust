@@ -163,8 +163,6 @@ pub enum JoinRequestServiceError {
     RejectCooldown { hours_left: u32 },
     #[error("join request for this address already pending")]
     RequestPending,
-    #[error("group has been dissolved")]
-    GroupDissolved,
     #[error("group-service error: {0}")]
     GroupService(#[from] GroupServiceError),
     #[error("database error: {0}")]
@@ -182,7 +180,6 @@ impl JoinRequestServiceError {
             Self::TooManyPending => "too-many-pending",
             Self::RejectCooldown { .. } => "reject-cooldown",
             Self::RequestPending => "request-pending",
-            Self::GroupDissolved => "group-dissolved",
             Self::GroupService(e) => e.code(),
             Self::Db(_) => "internal-error",
         }

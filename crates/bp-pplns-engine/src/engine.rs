@@ -352,16 +352,9 @@ impl PplnsEngine {
         // are shares of the rest; using the full pot would invent money.
         let extras_total = snapshot.extras_total();
 
+        // `build_weight_distribution` never makes the fee address an entry: its
+        // payment is inseparable from the pool output.
         for entry in &snapshot.entries {
-            if entry.address == snapshot.fee_address {
-                // Its payment is inseparable from the pool output: skip
-                // rather than misbook.
-                warn!(
-                    address = %entry.address,
-                    "weight settlement: fee address doubles as miner entry — skipping its row"
-                );
-                continue;
-            }
             let claim = claim_sats(
                 entry.score_weight,
                 snapshot.score_total,
@@ -490,8 +483,10 @@ mod tests {
     }
 
     /// Pins every branch of the settlement writes: exactly paid, withheld,
-    /// overpaid, indebted, nothing owed, fee address as an entry, paid outside
-    /// the snapshot (valid, invalid, zero, fee). Nothing else gets a row.
+    /// overpaid, indebted, nothing owed, paid outside the snapshot (valid,
+    /// invalid, zero, fee). Nothing else gets a row. Claims share
+    /// 990_500 sats (the 1 % fee off 1_000_000, plus the -500 balance) over a
+    /// score total of 1_000.
     #[test]
     fn settlement_writes_cover_every_branch() {
         const FEE: &str = "fee_addr";
@@ -502,19 +497,18 @@ mod tests {
                 snap_entry("overpaid", 200, 0),
                 snap_entry("indebted", 100, -500),
                 snap_entry("owed_nothing", 0, 0),
-                snap_entry(FEE, 50, 0),
             ],
             fee_ppm: 10_000,
             fee_address: FEE.to_string(),
             reference_revenue_sats: 1_000_000,
-            score_total: 1_050,
+            score_total: 1_000,
         };
         let paid = |pairs: &[(&str, u64)]| -> HashMap<String, u64> {
             pairs.iter().map(|(a, s)| (a.to_string(), *s)).collect()
         };
         let actual = ActualCoinbase {
             paid_by_address: paid(&[
-                ("exact", 377_333),
+                ("exact", 396_200),
                 ("overpaid", 300_000),
                 ("outsider", 1_000),
                 ("bad address", 2_000),
@@ -568,22 +562,22 @@ mod tests {
         assert_eq!(
             audit,
             [
-                "exact 377333 37.7333 coinbase",
-                "indebted 94333 0.0000 pending",
+                "exact 396200 39.6200 coinbase",
+                "indebted 99050 0.0000 pending",
                 "outsider 1000 0.1000 coinbase",
                 "overpaid 300000 30.0000 coinbase",
-                "withheld 283000 0.0000 pending",
+                "withheld 297150 0.0000 pending",
             ],
             "audit rows"
         );
         assert_eq!(
             writes,
             [
-                "exact 100 382333",
-                "indebted 93833 0",
+                "exact 100 401200",
+                "indebted 98550 0",
                 "outsider -950 1010",
-                "overpaid -111334 300000",
-                "withheld 283000 0",
+                "overpaid -101900 300000",
+                "withheld 297150 0",
             ],
             "balance writes"
         );

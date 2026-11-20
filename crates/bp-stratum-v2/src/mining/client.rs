@@ -29,7 +29,9 @@ use crate::extensions::{
 
 use super::channel::{ChannelKind, ChannelState};
 use super::groups::GroupChannelRegistry;
-use super::jobs::{cleanup_retired_extended_jobs, retire_extended_jobs, ExtendedJob};
+use super::jobs::{
+    cleanup_retired_extended_jobs, retire_extended_jobs, ExtendedJob, StandardTemplateSnapshot,
+};
 #[cfg(test)]
 use super::submit::ExtranonceBytes;
 use super::submit::{
@@ -569,8 +571,10 @@ impl<C: Clock + Clone> MiningSessionState<C> {
         }
     }
 
-    /// Put this connection on `stream`, template routing and accounting
-    /// together, so a caller cannot set one and leave the other on the boot value.
+    /// Test setup: put the connection on `stream` for template routing and
+    /// accounting at once. Production routes once at OpenChannel and may set
+    /// the accounting stream alone when the swap fails.
+    #[cfg(test)]
     pub fn set_stream(&mut self, stream: StreamKind) {
         self.stream = stream;
         self.accounting_stream = stream;
@@ -936,12 +940,8 @@ fn resolve_open_context<C: Clock>(
                 .max(state.min_difficulty.as_f64()),
         )
     } else {
-        Difficulty(
-            state
-                .initial_difficulty
-                .as_f64()
-                .max(state.min_difficulty.as_f64()),
-        )
+        // Already floored at `min_difficulty` in `MiningSessionState::new`.
+        state.initial_difficulty
     };
     let clamped = clamp_difficulty_to_max_target(floored, &Target::from_le_bytes(max_target_bytes));
     let assigned_difficulty = if clamped.as_f64() > MAX_REASONABLE_DIFFICULTY {
@@ -1098,9 +1098,6 @@ pub fn handle_submit_shares_standard<C: Clock>(
         validation,
     )
 }
-
-/// Re-export of [`crate::mining::jobs::StandardTemplateSnapshot`].
-pub use crate::mining::jobs::StandardTemplateSnapshot;
 
 // ── Handler: SubmitSharesExtended ───────────────────────────────────
 
@@ -2007,7 +2004,12 @@ pub fn handle_set_custom_mining_job<C: Clock>(
         return reject(ERR_INVALID_MINING_JOB_TOKEN);
     };
 
-    let channel_addr = state.address.as_ref().map(|a| a.as_str()).unwrap_or("");
+    // The channel looked up above exists, so the first open set the address.
+    let channel_addr = state
+        .address
+        .as_ref()
+        .expect("a channel exists, so the address is set")
+        .as_str();
 
     // A job on a past tip cannot produce a block, yet its shares would be
     // credited; off Solo that takes from everyone else in the window. Checked

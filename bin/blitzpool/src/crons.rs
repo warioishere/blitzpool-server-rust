@@ -82,10 +82,6 @@ fn staggered_interval(period: Duration, stagger: Duration) -> tokio::time::Inter
 /// all and awaits the locally owned loops; the helper-spawned crons run
 /// detached.
 pub(crate) struct CronHandles {
-    inner: Option<Inner>,
-}
-
-struct Inner {
     // ── Maintenance crons (`payout`/accounting role); `None` when this
     //    process does not run maintenance. ──
     /// Locally owned loops use a `CancellationToken`; the helper crons in
@@ -125,75 +121,69 @@ struct Inner {
 impl CronHandles {
     /// Log a one-line summary of which crons are live.
     pub(crate) fn log_summary(&self) {
-        match &self.inner {
-            None => info!("crons summary: not spawned"),
-            Some(inner) => info!(
-                maintenance = inner.ran_maintenance,
-                kill_dead = inner.kill_dead_cancel.is_some(),
-                old_stats_cleanup = inner.old_stats_cancel.is_some(),
-                invitation_expiry = inner.invitation_expiry_shutdown.is_some(),
-                join_request_expiry = inner.join_request_expiry_shutdown.is_some(),
-                stale_push_cleanup = inner.stale_push_cancel.is_some(),
-                notifications = inner.ran_notifications,
-                network_difficulty = inner.network_difficulty_shutdown.is_some(),
-                network_difficulty_push = inner.network_difficulty_has_push,
-                hourly_stats = inner.hourly_stats_shutdown.is_some(),
-                hourly_stats_telegram = inner.hourly_stats_telegram,
-                hourly_stats_ntfy = inner.hourly_stats_ntfy,
-                best_difficulty = inner.best_difficulty_shutdown.is_some(),
-                team_best = inner.team_best_shutdown.is_some(),
-                "crons summary"
-            ),
-        }
+        info!(
+            maintenance = self.ran_maintenance,
+            kill_dead = self.kill_dead_cancel.is_some(),
+            old_stats_cleanup = self.old_stats_cancel.is_some(),
+            invitation_expiry = self.invitation_expiry_shutdown.is_some(),
+            join_request_expiry = self.join_request_expiry_shutdown.is_some(),
+            stale_push_cleanup = self.stale_push_cancel.is_some(),
+            notifications = self.ran_notifications,
+            network_difficulty = self.network_difficulty_shutdown.is_some(),
+            network_difficulty_push = self.network_difficulty_has_push,
+            hourly_stats = self.hourly_stats_shutdown.is_some(),
+            hourly_stats_telegram = self.hourly_stats_telegram,
+            hourly_stats_ntfy = self.hourly_stats_ntfy,
+            best_difficulty = self.best_difficulty_shutdown.is_some(),
+            team_best = self.team_best_shutdown.is_some(),
+            "crons summary"
+        );
     }
 
     /// Signal every cron to stop and await the locally owned loops.
-    pub(crate) async fn shutdown(mut self) {
-        let Some(inner) = self.inner.take() else {
-            return;
-        };
+    pub(crate) async fn shutdown(self) {
         // Maintenance group (cancel first so no tick fires mid-shutdown).
-        if let Some(c) = inner.kill_dead_cancel {
+        if let Some(c) = self.kill_dead_cancel {
             c.cancel();
         }
-        if let Some(c) = inner.old_stats_cancel {
+        if let Some(c) = self.old_stats_cancel {
             c.cancel();
         }
-        if let Some(c) = inner.stale_push_cancel {
+        if let Some(c) = self.stale_push_cancel {
             c.cancel();
         }
-        if let Some(tx) = inner.invitation_expiry_shutdown {
+        if let Some(tx) = self.invitation_expiry_shutdown {
             let _ = tx.send(true);
         }
-        if let Some(tx) = inner.join_request_expiry_shutdown {
+        if let Some(tx) = self.join_request_expiry_shutdown {
             let _ = tx.send(true);
         }
         // Notification group.
-        if let Some(tx) = inner.network_difficulty_shutdown {
+        if let Some(tx) = self.network_difficulty_shutdown {
             let _ = tx.send(true);
         }
-        if let Some(tx) = inner.hourly_stats_shutdown {
+        if let Some(tx) = self.hourly_stats_shutdown {
             let _ = tx.send(true);
         }
-        if let Some(tx) = inner.best_difficulty_shutdown {
+        if let Some(tx) = self.best_difficulty_shutdown {
             let _ = tx.send(true);
         }
-        if let Some(tx) = inner.team_best_shutdown {
+        if let Some(tx) = self.team_best_shutdown {
             let _ = tx.send(true);
         }
         // Only the locally owned loops are joinable; the helper crons are
         // detached and end on their next select iteration.
-        if let Some(join) = inner.kill_dead_join {
+        if let Some(join) = self.kill_dead_join {
             if let Err(err) = join.await {
                 warn!(%err, "crons: kill_dead_clients join failed");
             }
         }
-        if let Some(join) = inner.old_stats_join {
+        if let Some(join) = self.old_stats_join {
             if let Err(err) = join.await {
                 warn!(%err, "crons: old_stats_cleanup join failed");
             }
         }
-        if let Some(join) = inner.stale_push_join {
+        if let Some(join) = self.stale_push_join {
             if let Err(err) = join.await {
                 warn!(%err, "crons: stale_push_cleanup join failed");
             }
@@ -204,7 +194,7 @@ impl CronHandles {
 /// Spawn the background crons. Ticks and cutoffs are constants, not config;
 /// `run_maintenance` and `run_notifications` gate the two role groups.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn spawn(
+pub(crate) fn spawn(
     foundation: &FoundationHandles,
     hooks: &ProductionHooks,
     listeners: &ListenerHandles,
@@ -322,25 +312,23 @@ pub(crate) async fn spawn(
     };
 
     CronHandles {
-        inner: Some(Inner {
-            kill_dead_cancel,
-            kill_dead_join,
-            old_stats_cancel,
-            old_stats_join,
-            stale_push_cancel,
-            stale_push_join,
-            invitation_expiry_shutdown,
-            join_request_expiry_shutdown,
-            network_difficulty_shutdown,
-            hourly_stats_shutdown,
-            best_difficulty_shutdown,
-            team_best_shutdown,
-            network_difficulty_has_push,
-            hourly_stats_telegram,
-            hourly_stats_ntfy,
-            ran_maintenance: run_maintenance,
-            ran_notifications: run_notifications,
-        }),
+        kill_dead_cancel,
+        kill_dead_join,
+        old_stats_cancel,
+        old_stats_join,
+        stale_push_cancel,
+        stale_push_join,
+        invitation_expiry_shutdown,
+        join_request_expiry_shutdown,
+        network_difficulty_shutdown,
+        hourly_stats_shutdown,
+        best_difficulty_shutdown,
+        team_best_shutdown,
+        network_difficulty_has_push,
+        hourly_stats_telegram,
+        hourly_stats_ntfy,
+        ran_maintenance: run_maintenance,
+        ran_notifications: run_notifications,
     }
 }
 

@@ -46,21 +46,6 @@ pub struct ClientStatisticsRecord {
 }
 
 impl BufferRecord for ClientStatisticsRecord {
-    fn is_zero(&self) -> bool {
-        self.shares == 0.0
-            && self.rejected_job_not_found_count == 0.0
-            && self.rejected_job_not_found_diff1 == 0.0
-            && self.rejected_duplicate_share_count == 0.0
-            && self.rejected_duplicate_share_diff1 == 0.0
-            && self.rejected_low_difficulty_share_count == 0.0
-            && self.rejected_low_difficulty_share_diff1 == 0.0
-            && self.rejected_version_rolling_count == 0.0
-            && self.rejected_version_rolling_diff1 == 0.0
-            && self.rejected_stale_count == 0.0
-            && self.rejected_stale_diff1 == 0.0
-            && self.max_difficulty == 0.0
-    }
-
     fn add_assign(&mut self, rhs: &Self) {
         self.shares += rhs.shares;
         self.rejected_job_not_found_count += rhs.rejected_job_not_found_count;

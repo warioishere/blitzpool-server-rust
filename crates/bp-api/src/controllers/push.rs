@@ -211,7 +211,11 @@ async fn register(
     headers: HeaderMap,
     Json(body): Json<RegisterBody>,
 ) -> Result<Json<RegisterResponse>, ApiError> {
-    let (address, endpoint) = require_address_and(body.address, body.endpoint, "endpoint")?;
+    let (address, endpoint) = require_address_and(
+        body.address,
+        body.endpoint,
+        "missing-fields-address-endpoint",
+    )?;
     require_address_token(&state, &headers, address.as_str()).await?;
     let platform = normalise_platform(body.platform, "unknown");
     validate_miner_address(&state, &address).await?;
@@ -353,7 +357,11 @@ async fn configure(
     headers: HeaderMap,
     Json(body): Json<ConfigureBody>,
 ) -> Result<Json<OkResponse>, ApiError> {
-    let (address, endpoint) = require_address_and(body.address, body.endpoint, "endpoint")?;
+    let (address, endpoint) = require_address_and(
+        body.address,
+        body.endpoint,
+        "missing-fields-address-endpoint",
+    )?;
     require_address_token(&state, &headers, address.as_str()).await?;
     bp_db::update_push_subscription_preferences(
         &state.pool,
@@ -395,7 +403,8 @@ async fn register_fcm(
     headers: HeaderMap,
     Json(body): Json<FcmRegisterBody>,
 ) -> Result<Json<FcmRegisterResponse>, ApiError> {
-    let (address, token) = require_address_and(body.address, body.token, "token")?;
+    let (address, token) =
+        require_address_and(body.address, body.token, "missing-fields-address-token")?;
     require_address_token(&state, &headers, address.as_str()).await?;
     let platform = normalise_platform(body.platform, "fcm");
     validate_miner_address(&state, &address).await?;
@@ -466,12 +475,12 @@ fn parse_address(raw: Option<String>) -> Result<AddressId, ApiError> {
 }
 
 /// Pull the (address, secondary) pair out of an `Option<String>` body,
-/// returning 400 with `"Missing required fields: address, <name>"` when
-/// either is absent. Empty trimmed strings count as missing.
+/// returning 400 with `missing_code` when either is absent. Empty trimmed
+/// strings count as missing.
 fn require_address_and(
     raw_address: Option<String>,
     raw_secondary: Option<String>,
-    secondary_name: &'static str,
+    missing_code: &'static str,
 ) -> Result<(AddressId, String), ApiError> {
     let address_str = raw_address
         .map(|s| s.trim().to_string())
@@ -480,12 +489,7 @@ fn require_address_and(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     if address_str.is_none() || secondary.is_none() {
-        let code: &'static str = match secondary_name {
-            "endpoint" => "missing-fields-address-endpoint",
-            "token" => "missing-fields-address-token",
-            _ => "missing-fields",
-        };
-        return Err(push_error(code, StatusCode::BAD_REQUEST));
+        return Err(push_error(missing_code, StatusCode::BAD_REQUEST));
     }
     let address = AddressId::new(address_str.unwrap()).map_err(|_| ApiError::InvalidAddress)?;
     Ok((address, secondary.unwrap()))

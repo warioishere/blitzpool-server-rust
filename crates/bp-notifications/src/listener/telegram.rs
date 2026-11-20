@@ -79,13 +79,9 @@ pub fn spawn_telegram_listener(
                     match result {
                         Ok(updates) => {
                             for update in updates {
-                                if let Some(next) =
-                                    process_update(&handler, update, bot_username.as_deref()).await
-                                {
-                                    if next > offset {
-                                        offset = next;
-                                    }
-                                }
+                                let next =
+                                    process_update(&handler, update, bot_username.as_deref()).await;
+                                offset = offset.max(next);
                             }
                         }
                         Err(e) => {
@@ -188,7 +184,7 @@ async fn process_update(
     handler: &CommandHandler,
     update: Update,
     bot_username: Option<&str>,
-) -> Option<i64> {
+) -> i64 {
     let next_offset = update.update_id + 1;
     if let Some(message) = update.message {
         if let Some(text) = message.text.as_deref() {
@@ -210,11 +206,11 @@ async fn process_update(
                     reply_to: message.reply_to_message.as_ref().map(|m| m.message_id),
                 };
                 if handler.answer_telegram_question(plain, text).await {
-                    return Some(next_offset);
+                    return next_offset;
                 }
             }
             let Some(command) = command_for_this_bot(text, group.is_none(), bot_username) else {
-                return Some(next_offset);
+                return next_offset;
             };
             debug!(
                 target: "bp_notifications::listener::telegram",
@@ -259,7 +255,7 @@ async fn process_update(
             )
             .await;
     }
-    Some(next_offset)
+    next_offset
 }
 
 #[derive(Debug, Deserialize)]

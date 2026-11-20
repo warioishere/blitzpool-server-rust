@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT height AS \"height!\",\n                  \"minerAddress\" AS \"miner_address!\",\n                  worker AS \"worker!\",\n                  \"sessionId\" AS \"session_id!\"\n           FROM blocks_entity\n           WHERE \"minerAddress\" NOT LIKE 'synthseed%'",
+  "query": "SELECT height AS \"height!\",\n                  \"minerAddress\" AS \"miner_address!\",\n                  worker AS \"worker!\",\n                  \"sessionId\" AS \"session_id!\"\n           FROM blocks_entity",
   "describe": {
     "columns": [
       {
@@ -58,5 +58,5 @@
       false
     ]
   },
-  "hash": "aa7c5f6b63a4c0fffa53a02dbb336262611bb8839c464145bd14bd288a512e30"
+  "hash": "8ca9f2cff7b65de71b5b23ff583de19af1fe313c9e71dbb66394097f4f7710ea"
 }

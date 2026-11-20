@@ -106,33 +106,17 @@ impl TemplateUpdate {
                 merkle_path: t
                     .merkle_path
                     .iter_bytes()
-                    .map(|h| {
-                        let mut out = [0u8; 32];
-                        // Each merkle node is a 32-byte U256 — guard against
-                        // unexpected lengths by padding/truncating.
-                        let len = h.len().min(32);
-                        out[..len].copy_from_slice(&h[..len]);
-                        out
-                    })
+                    // binary_sv2 builds a U256 only from exactly 32 bytes.
+                    .map(|h| <[u8; 32]>::try_from(h).expect("a merkle node is a 32-byte U256"))
                     .collect(),
             })),
             TemplateDistributionOwned::SetNewPrevHash(p) => {
-                let mut prev = [0u8; 32];
-                let pref = p.prev_hash.as_bytes();
-                let plen = pref.len().min(32);
-                prev[..plen].copy_from_slice(&pref[..plen]);
-
-                let mut tgt = [0u8; 32];
-                let tref = p.target.as_bytes();
-                let tlen = tref.len().min(32);
-                tgt[..tlen].copy_from_slice(&tref[..tlen]);
-
                 Some(Self::SetNewPrevHash(SetNewPrevHash {
                     template_id: p.template_id,
-                    prev_hash: prev,
+                    prev_hash: *p.prev_hash.as_array(),
                     header_timestamp: p.ntime_start,
                     n_bits: p.n_bits,
-                    target: tgt,
+                    target: *p.target.as_array(),
                 }))
             }
             TemplateDistributionOwned::RequestTransactionDataSuccess(s) => Some(

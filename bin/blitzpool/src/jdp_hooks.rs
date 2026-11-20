@@ -547,13 +547,9 @@ impl JdpFoundBlockSink for ProductionJdpBlockSink {
         );
         log_booking_status(&miner_address, backing);
 
-        let bookable = match backing {
-            CandidateBacking::Bookable(_) => true,
-            CandidateBacking::UnbookableDistribution { .. } | CandidateBacking::BaseProtocol => {
-                false
-            }
-        };
-        if !bookable && !backing.paid_a_published_distribution() {
+        // A base-protocol block is the mining side's to record; proving it here
+        // would be work for nothing.
+        if !backing.paid_a_published_distribution() {
             return;
         }
         // The node may already hold this block as its tip by now;

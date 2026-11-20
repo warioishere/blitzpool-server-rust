@@ -59,7 +59,7 @@ pub(crate) fn spawn(
     // settlement, so the published distributions must be invalidated with it
     // or a JDC keeps mining pre-settlement weights. The watcher runs on the
     // `payout` role and the registry on `front`, hence a signal, not a handle.
-    settle: Option<crate::settlement::SettlementSignal>,
+    settle: crate::settlement::SettlementSignal,
 ) -> BlockConfirmationHandle {
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
@@ -94,12 +94,12 @@ pub(crate) fn spawn(
                 biased;
                 _ = cancel.cancelled() => break,
                 _ = tick.tick() => {
-                    reconcile(&bitcoin_rpc, &redis, &settlers, confirmation_depth, settle.as_ref(), &mut last_unbookable).await;
+                    reconcile(&bitcoin_rpc, &redis, &settlers, confirmation_depth, &settle, &mut last_unbookable).await;
                 }
                 ev = next_tip_signal(&mut rx) => match ev {
                     // A new chain tip — re-check every parked block's depth.
                     Ok(TemplateUpdate::SetNewPrevHash(_)) => {
-                        reconcile(&bitcoin_rpc, &redis, &settlers, confirmation_depth, settle.as_ref(), &mut last_unbookable).await;
+                        reconcile(&bitcoin_rpc, &redis, &settlers, confirmation_depth, &settle, &mut last_unbookable).await;
                     }
                     // NewTemplate / tx-data responses aren't new-block ticks.
                     Ok(_) => {}
@@ -231,7 +231,7 @@ async fn reconcile(
     settlers: &Settlers<'_>,
     confirmation_depth: u32,
     // See `spawn`: a gated apply IS a settlement event.
-    settle: Option<&crate::settlement::SettlementSignal>,
+    settle: &crate::settlement::SettlementSignal,
     last_unbookable: &mut Option<u64>,
 ) {
     let depth = i64::from(confirmation_depth);
@@ -243,9 +243,7 @@ async fn reconcile(
 
         match applied {
             Ok(history_inserted) => {
-                if let Some(signal) = settle {
-                    signal.settle().await;
-                }
+                settle.settle().await;
                 info!(
                     block_hash = %pb.block_hash,
                     height = pb.block_height,
@@ -853,7 +851,7 @@ mod declared_block_booking_regtest {
                     blockparty: None,
                 },
                 DEPTH,
-                None,
+                &crate::settlement::SettlementSignal::local_only(),
                 &mut last_unbookable,
             )
             .await;
@@ -1552,7 +1550,7 @@ mod declared_block_booking_regtest {
                     blockparty: None,
                 },
                 DEPTH,
-                None,
+                &crate::settlement::SettlementSignal::local_only(),
                 &mut last_unbookable,
             )
             .await;

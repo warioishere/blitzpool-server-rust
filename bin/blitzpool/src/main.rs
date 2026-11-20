@@ -349,8 +349,9 @@ async fn main() -> ExitCode {
     let is_api = cfg.has_role(Role::Api);
     let is_accounting = cfg.has_role(Role::Payout) || cfg.has_role(Role::Stats);
     let is_notify = cfg.has_role(Role::Notify);
+    // Front and payout never share a process (refused above), so a front is
+    // the producer of the share and block streams.
     let consumes_streams = is_accounting && !is_front;
-    let produces_streams = is_front && !cfg.has_role(Role::Payout);
     // A front produces the notify events (block-found, device-status) for a
     // separate notify process to consume.
     let consumes_notify_streams = is_notify && !is_front;
@@ -590,8 +591,7 @@ async fn main() -> ExitCode {
             dispatcher.clone(),
             is_accounting,
             is_notify,
-        )
-        .await;
+        );
         crons.log_summary();
         Some(crons)
     } else {
@@ -617,7 +617,7 @@ async fn main() -> ExitCode {
             engines.blockparty_payouts.clone(),
             engines.subsidy_halving_interval,
             depth,
-            Some(settle_signal.clone()),
+            settle_signal.clone(),
         ))
     } else {
         None
@@ -832,7 +832,7 @@ async fn main() -> ExitCode {
 
     // The always-on front watches consumer lag so a lagging or down satellite
     // is noticed; budget is 10% of the stream cap, well before MAXLEN trims.
-    let stream_monitor = if produces_streams {
+    let stream_monitor = if is_front {
         Some(crate::stream_monitor::spawn(
             handles.redis.clone(),
             vec![
@@ -849,7 +849,7 @@ async fn main() -> ExitCode {
 
     // Runtime-stall watchdog + Redis PING probe, to tell a slow per-share XADD
     // apart as "executor starved" vs "ConnectionManager slow".
-    let _runtime_diag = if produces_streams && cfg.debug.submit_latency {
+    let _runtime_diag = if is_front && cfg.debug.submit_latency {
         Some(crate::runtime_diag::spawn(handles.redis.clone()))
     } else {
         None
@@ -872,20 +872,19 @@ async fn main() -> ExitCode {
         None => None,
     };
 
-    let any_consume = consumes_streams || consumes_notify_streams;
-    match (produces_streams, any_consume) {
-        (false, true) => tracing::info!(
+    // A front only produces: both consumer flags exclude it.
+    if is_front {
+        tracing::info!(
+            "stream summary: producing (this core XADDs accepted/rejected/block-found/device-status)"
+        );
+    } else if consumes_streams || consumes_notify_streams {
+        tracing::info!(
             engine = consumes_streams,
             notify = consumes_notify_streams,
             "stream summary: consuming (accounting drains accepted/rejected/block-found-ledger; notify drains block-found-notify/device-status)"
-        ),
-        (true, false) => tracing::info!(
-            "stream summary: producing (this core XADDs accepted/rejected/block-found/device-status)"
-        ),
-        (false, false) => tracing::info!(
-            "stream summary: no stream role (read-only process — serves from Postgres)"
-        ),
-        (true, true) => tracing::info!("stream summary: producing + consuming"),
+        );
+    } else {
+        tracing::info!("stream summary: no stream role (read-only process — serves from Postgres)");
     }
 
     // JDP and the coinbase-budget autoscaler need the TDP feed. `jdp` stays a

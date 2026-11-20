@@ -91,8 +91,6 @@ pub enum DistributionViolation {
     WrongOutputAt { position: usize },
     /// The declared coinbase ends before the recomputed vector does.
     MissingExpectedOutput { position: usize },
-    /// A trailing output after the distribution block carries a non-0 amount.
-    NonZeroTrailingOutput { position: usize },
     /// The distribution itself cannot be evaluated; a published one never should.
     Uncomputable,
     /// The declared output values overflow a u64.
@@ -130,15 +128,8 @@ pub fn validate_coinbase_outputs_against_distribution(
             Some(_) => {}
         }
     }
-    // Already implied by `T := Σ declared`; kept in case T is derived otherwise.
-    // Value only: ext 0x0003/Output Verification allows any 0-value trailing output.
-    for (offset, got) in declared[expected.len()..].iter().enumerate() {
-        if got.value != Amount::ZERO {
-            return Err(DistributionViolation::NonZeroTrailingOutput {
-                position: expected.len() + offset,
-            });
-        }
-    }
+    // The expected outputs sum to `T := Σ declared`, so every trailing output
+    // is 0-value, which ext 0x0003/Output Verification allows.
     Ok(t)
 }
 

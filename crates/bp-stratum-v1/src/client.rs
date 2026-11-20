@@ -56,7 +56,6 @@ pub(crate) struct SessionState<C: Clock> {
     pub suggested_difficulty: Option<SuggestDifficultyRequest>,
 
     // Stratum lifecycle
-    pub stratum_initialized: bool,
     pub used_suggested_difficulty: bool,
 
     // Difficulty; each job also keeps the one it was sent at
@@ -122,7 +121,6 @@ impl<C: Clock> SessionState<C> {
             authorization: None,
             suggested_difficulty: None,
 
-            stratum_initialized: false,
             used_suggested_difficulty: false,
 
             initial_difficulty: initial,
@@ -283,6 +281,7 @@ pub(crate) fn handle_subscribe<C: Clock>(
     // extranonce1 is the pool-wide prefix, not the session id: submit
     // rebuilds the coinbase from this same value.
     let already_subscribed = state.subscription.is_some();
+    let is_cpuminer = request.user_agent == "cpuminer";
     state.subscription = Some(request);
     let subscription_id = state.subscription.as_ref().expect("just set").id.clone();
     let extranonce1_hex = hex::encode(state.extranonce1);
@@ -296,28 +295,32 @@ pub(crate) fn handle_subscribe<C: Clock>(
 
     // Init right after subscribe, as ckpool does, not gated on
     // mining.extranonce.subscribe. A re-subscribe skips it.
-    if !state.stratum_initialized && !already_subscribed {
-        flush_init(state, port_config, current_template, now_ms, &mut out);
+    if !already_subscribed {
+        flush_init(
+            state,
+            is_cpuminer,
+            port_config,
+            current_template,
+            now_ms,
+            &mut out,
+        );
     }
     out
 }
 
 fn flush_init<C: Clock>(
     state: &mut SessionState<C>,
+    is_cpuminer: bool,
     _port_config: &PortConfig,
     current_template: Option<&ActiveSV1Template>,
     _now_ms: u64,
     out: &mut HandlerOutcome,
 ) {
-    state.stratum_initialized = true;
-
-    if let Some(sub) = &state.subscription {
-        if sub.user_agent == "cpuminer" && state.initial_difficulty < CPUMINER_HIGH_DIFF_THRESHOLD {
-            let new_diff = CPUMINER_FALLBACK_DIFFICULTY;
-            state.session_difficulty = new_diff;
-            state.vardiff.note_difficulty_assigned(new_diff);
-            out.push_event(SessionEvent::DifficultyChanged);
-        }
+    if is_cpuminer && state.initial_difficulty < CPUMINER_HIGH_DIFF_THRESHOLD {
+        let new_diff = CPUMINER_FALLBACK_DIFFICULTY;
+        state.session_difficulty = new_diff;
+        state.vardiff.note_difficulty_assigned(new_diff);
+        out.push_event(SessionEvent::DifficultyChanged);
     }
 
     if state.suggested_difficulty.is_none() {
@@ -514,7 +517,7 @@ pub(crate) fn handle_submit<C: Clock>(
         ));
         return out;
     }
-    if !state.stratum_initialized {
+    if state.subscription.is_none() {
         out.push_frame(write_error(
             &id,
             crate::frame::ERR_NOT_SUBSCRIBED,
@@ -622,7 +625,7 @@ pub(crate) fn apply_new_template<C: Clock>(
     now_ms: u64,
 ) -> HandlerOutcome {
     let mut out = HandlerOutcome::default();
-    if !state.stratum_initialized {
+    if state.subscription.is_none() {
         return out;
     }
     // Every template, not only `clean_jobs`: a no-op on the current tip, and
@@ -896,11 +899,15 @@ mod tests {
         // initial_diff < cpuminer_high_diff_threshold (1_000_000) → pin to 0.1.
         let port = solo_port(16384.0);
         let mut state = fresh_state(TestClock::new(0), &port);
-        state.subscription = Some(subscribe_req(Some("cpuminer/2.5")));
-        let mut out = HandlerOutcome::default();
-        flush_init(&mut state, &port, None, 0, &mut out);
-
-        let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
+        let out = handle_subscribe(
+            &mut state,
+            &port,
+            None,
+            subscribe_req(Some("cpuminer/2.5")),
+            0,
+        );
+        // Frame 0 is the subscribe answer, frame 1 the opening difficulty.
+        let s = std::str::from_utf8(&out.outbound_frames[1]).unwrap();
         assert!(s.contains("\"params\":[0.1]"));
         assert_eq!(state.session_difficulty, 0.1);
     }
@@ -910,10 +917,15 @@ mod tests {
         // initial_diff == high-threshold → fallback skipped, session keeps 1_000_000.
         let port = solo_port(1_000_000.0);
         let mut state = fresh_state(TestClock::new(0), &port);
-        state.subscription = Some(subscribe_req(Some("cpuminer/2.5")));
-        let mut out = HandlerOutcome::default();
-        flush_init(&mut state, &port, None, 0, &mut out);
-        let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
+        let out = handle_subscribe(
+            &mut state,
+            &port,
+            None,
+            subscribe_req(Some("cpuminer/2.5")),
+            0,
+        );
+        // Frame 0 is the subscribe answer, frame 1 the opening difficulty.
+        let s = std::str::from_utf8(&out.outbound_frames[1]).unwrap();
         assert!(s.contains("\"params\":[1000000]"));
         assert_eq!(state.session_difficulty, 1_000_000.0);
     }
@@ -1416,7 +1428,7 @@ mod tests {
     fn submit_before_authorize_rejects_with_unauthorized_worker() {
         let port = solo_port(16384.0);
         let mut state = fresh_state(TestClock::new(0), &port);
-        state.stratum_initialized = true;
+        state.subscription = Some(subscribe_req(None));
         let reg = empty_registry();
         let out = handle_submit(&mut state, &reg, submit_req("1"), 0);
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
@@ -1428,7 +1440,7 @@ mod tests {
         let port = solo_port(16384.0);
         let mut state = fresh_state(TestClock::new(0), &port);
         state.authorization = Some(Authorization::for_tests(REGTEST_ADDR));
-        // stratum_initialized stays false.
+        // No subscription.
         let reg = empty_registry();
         let out = handle_submit(&mut state, &reg, submit_req("1"), 0);
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
@@ -1456,7 +1468,7 @@ mod tests {
         let sc = server_config();
         let port = solo_port(16384.0);
         let mut state = SessionState::new(clock.clone(), &sc, &port, "abcd1234".to_string());
-        state.stratum_initialized = true;
+        state.subscription = Some(subscribe_req(None));
         for _ in 0..30 {
             state.vardiff.note_share_accepted(16384.0);
             clock.advance_ms(10_000);
@@ -1480,7 +1492,7 @@ mod tests {
         let sc = server_config();
         let port = solo_port(1_000_000.0); // a high-diff port
         let mut state = SessionState::new(clock.clone(), &sc, &port, "abcd1234".to_string());
-        state.stratum_initialized = true;
+        state.subscription = Some(subscribe_req(None));
         state.authorization = Some(Authorization::for_tests(REGTEST_ADDR));
         clock.advance_ms(600_000);
         let out = vardiff_check_now(&mut state, &clock);
@@ -1735,7 +1747,7 @@ mod tests {
     fn new_template_after_init_keeps_dedup_on_clean_jobs() {
         let port = solo_port(16384.0);
         let mut state = fresh_state(TestClock::new(0), &port);
-        state.stratum_initialized = true;
+        state.subscription = Some(subscribe_req(None));
         state.authorization = Some(Authorization::for_tests(REGTEST_ADDR));
         const OLD_TIP: [u8; 32] = [0x5A; 32];
         state.share_cache.seen.record(OLD_TIP, [0x11; 32]);
@@ -1770,7 +1782,7 @@ mod tests {
     fn new_template_with_clean_jobs_false_does_not_clear_dedup() {
         let port = solo_port(16384.0);
         let mut state = fresh_state(TestClock::new(0), &port);
-        state.stratum_initialized = true;
+        state.subscription = Some(subscribe_req(None));
         state.authorization = Some(Authorization::for_tests(REGTEST_ADDR));
         let tip = template_for_regtest().prev_hash;
         state.share_cache.seen.record(tip, [0x11; 32]);
@@ -1800,10 +1812,10 @@ mod tests {
     }
 
     #[test]
-    fn new_template_skips_emit_when_stratum_not_initialized() {
+    fn new_template_skips_emit_before_subscribe() {
         let port = solo_port(16384.0);
         let mut state = fresh_state(TestClock::new(0), &port);
-        // stratum_initialized stays false.
+        // No subscription.
         let reg = empty_registry();
         let template = Arc::new(template_for_regtest());
         let payouts = solo_payouts_fixture(REGTEST_ADDR);
@@ -1843,7 +1855,7 @@ mod tests {
         let mut owner = SessionState::new(clock.clone(), &sc, &port, "aaaa0001".to_string());
         let mut other = SessionState::new(clock.clone(), &sc, &port, "bbbb0002".to_string());
         for state in [&mut owner, &mut other] {
-            state.stratum_initialized = true;
+            state.subscription = Some(subscribe_req(None));
             state.authorization = Some(Authorization::for_tests(REGTEST_ADDR));
         }
         let out = apply_new_template(

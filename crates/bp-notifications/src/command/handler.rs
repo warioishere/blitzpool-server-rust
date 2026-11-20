@@ -244,59 +244,61 @@ impl CommandHandler {
             }
         }
         // Telegram inline-keyboard commands send their own message (with a
-        // `reply_markup`) instead of a plain-text reply.
-        if let Transport::Telegram {
-            chat_id,
-            thread_id,
-            group,
-        } = transport
-        {
-            let in_group = group.is_some();
-            match command {
-                Command::ShowAddresses | Command::Remove { address: None } => {
-                    self.send_address_keyboard(*chat_id, *thread_id, in_group, lang)
-                        .await;
-                    return;
-                }
-                Command::Settings(switch) => {
-                    self.send_settings(*chat_id, *thread_id, in_group, lang, *switch)
-                        .await;
-                    return;
-                }
-                // A group gets the usage line, not a question every member
-                // could answer with an address of their own.
-                Command::Subscribe { address: None } if !in_group => {
-                    self.ask_for_address(*chat_id, *thread_id, lang).await;
-                    return;
-                }
-                _ => {}
-            }
-        }
+        // `reply_markup`) and return instead of a plain-text reply.
         let reply = match command {
             Command::Start => self.handle_start(transport, lang).await,
             Command::Help => super::help_text(lang, self.menu_view(transport).await),
             Command::Subscribe {
                 address: Some(address),
             } => self.handle_subscribe(transport, lang, address).await,
-            // A private Telegram chat is asked for the address above (early
-            // return); a group and ntfy get the usage line.
-            Command::Subscribe { address: None } if is_group(transport) => {
-                group_subscribe_usage_text(lang).to_string()
-            }
-            Command::Subscribe { address: None } => subscribe_usage_text(lang).to_string(),
+            // A group gets the usage line, not a question every member could
+            // answer with an address of their own.
+            Command::Subscribe { address: None } => match transport {
+                Transport::Telegram {
+                    chat_id,
+                    thread_id,
+                    group: None,
+                } => {
+                    self.ask_for_address(*chat_id, *thread_id, lang).await;
+                    return;
+                }
+                Transport::Telegram { group: Some(_), .. } => {
+                    group_subscribe_usage_text(lang).to_string()
+                }
+                Transport::Ntfy { .. } => subscribe_usage_text(lang).to_string(),
+            },
             Command::Remove {
                 address: Some(address),
             } => self.handle_remove(transport, lang, address).await,
-            // Telegram offers the address keyboard above (early return);
-            // an ntfy topic removes itself by name.
-            Command::Remove { address: None } => remove_usage_text(lang).to_string(),
-            Command::ShowAddresses => self.handle_show_addresses(transport, lang).await,
+            // Telegram offers the address keyboard; an ntfy topic removes
+            // itself by name.
+            Command::ShowAddresses | Command::Remove { address: None } => match transport {
+                Transport::Telegram {
+                    chat_id,
+                    thread_id,
+                    group,
+                } => {
+                    self.send_address_keyboard(*chat_id, *thread_id, group.is_some(), lang)
+                        .await;
+                    return;
+                }
+                Transport::Ntfy { address } if matches!(command, Command::ShowAddresses) => {
+                    self.ntfy_show_addresses(address, lang).await
+                }
+                Transport::Ntfy { .. } => remove_usage_text(lang).to_string(),
+            },
             Command::Settings(switch) => match transport {
+                Transport::Telegram {
+                    chat_id,
+                    thread_id,
+                    group,
+                } => {
+                    self.send_settings(*chat_id, *thread_id, group.is_some(), lang, *switch)
+                        .await;
+                    return;
+                }
                 Transport::Ntfy { address } => {
                     self.ntfy_settings_text(address, lang, *switch).await
-                }
-                Transport::Telegram { .. } => {
-                    unreachable!("Telegram gets the settings keyboard above")
                 }
             },
             Command::Toggle(switch, toggle) => {
@@ -1083,29 +1085,15 @@ impl CommandHandler {
         Ok(removed)
     }
 
-    async fn handle_show_addresses(&self, transport: &Transport, lang: Language) -> String {
-        match transport {
-            Transport::Telegram { chat_id, .. } => {
-                match find_telegram_subscriptions_by_chat(&self.pool, *chat_id).await {
-                    Ok(subs) if !subs.is_empty() => {
-                        list_addresses(lang, subs.iter().map(|s| s.address.as_str()))
-                    }
-                    Ok(_) => no_address_text(lang).to_string(),
-                    Err(e) => {
-                        warn!(target: "bp_notifications::command", error = %e, "show_addresses");
-                        db_error_text(lang).to_string()
-                    }
-                }
-            }
-            Transport::Ntfy { address } => {
-                match find_ntfy_subscription_by_address(&self.pool, address).await {
-                    Ok(Some(_)) => list_addresses(lang, std::iter::once(address.as_str())),
-                    Ok(None) => no_address_text(lang).to_string(),
-                    Err(e) => {
-                        warn!(target: "bp_notifications::command", error = %e, "ntfy show_addresses");
-                        db_error_text(lang).to_string()
-                    }
-                }
+    /// An ntfy topic's `/addresses`: the one address it is named after, if
+    /// subscribed. Telegram answers with the address keyboard instead.
+    async fn ntfy_show_addresses(&self, address: &AddressId, lang: Language) -> String {
+        match find_ntfy_subscription_by_address(&self.pool, address).await {
+            Ok(Some(_)) => list_addresses(lang, std::iter::once(address.as_str())),
+            Ok(None) => no_address_text(lang).to_string(),
+            Err(e) => {
+                warn!(target: "bp_notifications::command", error = %e, "ntfy show_addresses");
+                db_error_text(lang).to_string()
             }
         }
     }

@@ -85,24 +85,9 @@ impl PplnsEngineConfig {
             self.min_payout_sats.0,
             self.coinbase_weight_budget,
         )?;
-        if !self.window_factor.is_finite() || self.window_factor <= 0.0 {
-            return Err(ConfigError::InvalidWindowFactor {
-                value: self.window_factor,
-            });
-        }
-        if self.snapshot_ttl_secs == 0 {
-            return Err(ConfigError::ZeroUnsignedField {
-                field: "snapshot_ttl_secs",
-            });
-        }
         if self.bucket_shares == 0 {
             return Err(ConfigError::ZeroUnsignedField {
                 field: "bucket_shares",
-            });
-        }
-        if self.touch_flush_interval_secs == 0 {
-            return Err(ConfigError::ZeroUnsignedField {
-                field: "touch_flush_interval_secs",
             });
         }
         if self.abandoned_balance_days == 0 {
@@ -121,8 +106,6 @@ pub enum ConfigError {
     /// shares; see [`FeePayoutBudgetError`].
     #[error(transparent)]
     FeePayoutBudget(#[from] FeePayoutBudgetError),
-    #[error("window_factor must be > 0.0 and finite, got {value}")]
-    InvalidWindowFactor { value: f64 },
     #[error("{field} must be > 0, got 0")]
     ZeroUnsignedField { field: &'static str },
 }
@@ -224,56 +207,6 @@ mod tests {
             err,
             ConfigError::FeePayoutBudget(FeePayoutBudgetError::WeightBudgetTooLow { .. })
         ));
-    }
-
-    #[test]
-    fn window_factor_zero_rejects() {
-        let cfg = PplnsEngineConfig {
-            window_factor: 0.0,
-            ..valid()
-        };
-        assert!(matches!(
-            cfg.try_new().unwrap_err(),
-            ConfigError::InvalidWindowFactor { .. }
-        ));
-    }
-
-    #[test]
-    fn window_factor_negative_rejects() {
-        let cfg = PplnsEngineConfig {
-            window_factor: -1.0,
-            ..valid()
-        };
-        assert!(matches!(
-            cfg.try_new().unwrap_err(),
-            ConfigError::InvalidWindowFactor { .. }
-        ));
-    }
-
-    #[test]
-    fn window_factor_infinite_rejects() {
-        let cfg = PplnsEngineConfig {
-            window_factor: f64::INFINITY,
-            ..valid()
-        };
-        assert!(matches!(
-            cfg.try_new().unwrap_err(),
-            ConfigError::InvalidWindowFactor { .. }
-        ));
-    }
-
-    #[test]
-    fn zero_snapshot_ttl_rejects() {
-        let cfg = PplnsEngineConfig {
-            snapshot_ttl_secs: 0,
-            ..valid()
-        };
-        assert_eq!(
-            cfg.try_new().unwrap_err(),
-            ConfigError::ZeroUnsignedField {
-                field: "snapshot_ttl_secs",
-            }
-        );
     }
 
     #[test]

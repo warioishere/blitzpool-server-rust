@@ -936,7 +936,8 @@ pub(crate) const REJECT_REASON_KEYS: &[&str] = &[
     "VersionRollingNotAllowed",
 ];
 
-/// Stored rows carry camel-case or kebab-case reasons; the UI expects camel-case.
+/// Maps a stored reason onto its key in [`REJECT_REASON_KEYS`]; anything else
+/// counts as `OtherUnknown`.
 pub(crate) fn normalise_reject_reason(raw: &str) -> &'static str {
     match raw {
         "OtherUnknown" => "OtherUnknown",
@@ -947,9 +948,6 @@ pub(crate) fn normalise_reject_reason(raw: &str) -> &'static str {
         "UnauthorizedWorker" => "UnauthorizedWorker",
         "NotSubscribed" => "NotSubscribed",
         "Stale" => "Stale",
-        "job-not-found" => "JobNotFound",
-        "duplicate-share" => "DuplicateShare",
-        "low-difficulty" | "low-difficulty-share" => "LowDifficultyShare",
         _ => "OtherUnknown",
     }
 }
@@ -1127,14 +1125,7 @@ async fn shares(State(state): State<SharedState>) -> Result<JsonBytes, ApiError>
                 let now = bp_common::now_ms();
                 const DAY: i64 = 24 * 60 * 60 * 1000;
                 // With no block ever found, epoch yields the cumulative total.
-                let last_block_at: Option<i64> = sqlx::query_scalar(
-                    r#"SELECT MAX("createdAt") FROM blocks_entity WHERE "deletedAt" IS NULL"#,
-                )
-                .fetch_one(&s.pool)
-                .await
-                .ok()
-                .flatten();
-                let since_block = last_block_at.unwrap_or(0);
+                let since_block = bp_db::last_found_block_at(&s.pool).await?.unwrap_or(0);
                 // One read back to the earliest window; each sum filters it.
                 let rows = bp_db::find_pool_share_statistics_since(
                     &s.pool,
@@ -1393,9 +1384,9 @@ mod slot_json_tests {
     #[test]
     fn rejected_json_is_unchanged() {
         let samples = vec![
-            (T0, ("job-not-found", 2.0)),
+            (T0, ("JobNotFound", 2.0)),
             (T0, ("JobNotFound", 1.0)),
-            (T0, ("low-difficulty", 0.1_f32 as f64)),
+            (T0, ("LowDifficultyShare", 0.1_f32 as f64)),
             (T0, ("something-new", 3.0)),
             (T0 + S + 7, ("Stale", 4.0)),
             (T0 + 3 * S, ("Stale", 50.0)),
@@ -1643,17 +1634,7 @@ mod tests {
     }
 
     #[test]
-    fn normalise_reject_reason_covers_legacy_kebab_forms() {
-        assert_eq!(normalise_reject_reason("job-not-found"), "JobNotFound");
-        assert_eq!(normalise_reject_reason("duplicate-share"), "DuplicateShare");
-        assert_eq!(
-            normalise_reject_reason("low-difficulty"),
-            "LowDifficultyShare"
-        );
-        assert_eq!(
-            normalise_reject_reason("low-difficulty-share"),
-            "LowDifficultyShare"
-        );
+    fn normalise_reject_reason_counts_an_unknown_reason_as_other() {
         assert_eq!(normalise_reject_reason("totally-unknown"), "OtherUnknown");
     }
 

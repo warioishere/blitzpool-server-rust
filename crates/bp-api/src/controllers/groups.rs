@@ -1790,9 +1790,7 @@ fn jr_to_api_error(e: bp_group_mgmt_engine::JoinRequestServiceError) -> ApiError
     let code = e.code();
     let status = match e {
         J::NotFound => StatusCode::NOT_FOUND,
-        J::AlreadyMember | J::AddressInGroup | J::RequestPending | J::GroupDissolved => {
-            StatusCode::CONFLICT
-        }
+        J::AlreadyMember | J::AddressInGroup | J::RequestPending => StatusCode::CONFLICT,
         J::EmailNotVerified | J::TooManyPending | J::RejectCooldown { .. } => StatusCode::FORBIDDEN,
         J::InvalidAddress => StatusCode::BAD_REQUEST,
         J::GroupService(g) => return ApiError::from(g),
@@ -1976,7 +1974,7 @@ mod slot_json_tests {
     #[test]
     fn group_rejected_json_is_unchanged() {
         let samples = vec![
-            (T0, ("job-not-found", 2.0, 0.25)),
+            (T0, ("JobNotFound", 2.0, 0.25)),
             (T0, ("JobNotFound", 1.0, 1.5)),
             (T0, ("something-new", 3.0, 3.0)),
             (T0 + S + 7, ("Stale", 4.0, 0.1_f32 as f64)),

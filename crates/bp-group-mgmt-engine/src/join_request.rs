@@ -231,9 +231,6 @@ impl JoinRequestService {
             bp_db::find_pplns_group_join_request_pending_in_group(&self.pool, request_id, group_id)
                 .await?
                 .ok_or(JoinRequestServiceError::NotFound)?;
-        if group.dissolved_at.is_some() {
-            return Err(JoinRequestServiceError::GroupDissolved);
-        }
 
         let address = request.address.clone();
         let admin_hash = TokenHash::of_str(admin_token.unwrap_or(""));

@@ -20,9 +20,6 @@ pub struct PoolSharesRecord {
 }
 
 impl BufferRecord for PoolSharesRecord {
-    fn is_zero(&self) -> bool {
-        self.accepted == 0.0 && self.rejected == 0.0 && self.max_difficulty == 0.0
-    }
     fn add_assign(&mut self, rhs: &Self) {
         self.accepted += rhs.accepted;
         self.rejected += rhs.rejected;

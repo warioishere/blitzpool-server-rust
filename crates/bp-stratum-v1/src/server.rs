@@ -322,7 +322,7 @@ async fn run_connection(
                     unreachable!("this connection's own hooks hold a kick sender")
                 }
             },
-            _ = &mut setup_deadline, if !state.stratum_initialized => {
+            _ = &mut setup_deadline, if state.subscription.is_none() => {
                 debug!(
                     session_id = %state.session_id_hex,
                     "sv1: no mining.subscribe within {:?}; closing",
@@ -406,35 +406,35 @@ async fn run_connection(
                                         Some(state.recorded_user_agent()),
                                     )
                                     .await;
-                                if state.stream.is_pplns() {
-                                    let resolved =
-                                        hooks.payout_resolver.resolve_stream(&address);
-                                    if !resolved.is_pplns() {
-                                        if let Some(alt) = alt_streams.remove(&resolved) {
-                                            template_rx = alt.rx;
-                                            refresh_pacer.clear();
-                                            current_template = alt.initial;
-                                            state.stream = resolved;
-                                            debug!(
-                                                session_id = %state.session_id_hex,
-                                                stream = resolved.as_label(),
-                                                "sv1: connection routed to alt template stream"
-                                            );
-                                        } else {
-                                            warn!(
-                                                session_id = %state.session_id_hex,
-                                                stream = resolved.as_label(),
-                                                "sv1: address resolved to an alt stream that isn't \
-                                                 wired; staying on the PPLNS stream"
-                                            );
-                                        }
-                                    } else {
+                                // The one routing of the session: it boots on the
+                                // PPLNS stream and authorizes once.
+                                let resolved =
+                                    hooks.payout_resolver.resolve_stream(&address);
+                                if !resolved.is_pplns() {
+                                    if let Some(alt) = alt_streams.remove(&resolved) {
+                                        template_rx = alt.rx;
+                                        refresh_pacer.clear();
+                                        current_template = alt.initial;
+                                        state.stream = resolved;
                                         debug!(
                                             session_id = %state.session_id_hex,
                                             stream = resolved.as_label(),
-                                            "sv1: connection routed to pplns template stream"
+                                            "sv1: connection routed to alt template stream"
+                                        );
+                                    } else {
+                                        warn!(
+                                            session_id = %state.session_id_hex,
+                                            stream = resolved.as_label(),
+                                            "sv1: address resolved to an alt stream that isn't \
+                                             wired; staying on the PPLNS stream"
                                         );
                                     }
+                                } else {
+                                    debug!(
+                                        session_id = %state.session_id_hex,
+                                        stream = resolved.as_label(),
+                                        "sv1: connection routed to pplns template stream"
+                                    );
                                 }
                             }
                         }
@@ -711,11 +711,12 @@ pub(crate) async fn process_event<C: bp_vardiff::Clock>(
             true
         }
         SessionEvent::ShareAccepted(accept) => {
-            let (address, worker) = state
+            // `handle_submit` refuses a share before authorize.
+            let auth = state
                 .authorization
                 .as_ref()
-                .map(|a| (a.address.as_str(), a.worker.as_str()))
-                .unwrap_or(("", ""));
+                .expect("an accepted share follows the authorization handle_submit requires");
+            let (address, worker) = (auth.address.as_str(), auth.worker.as_str());
             hooks
                 .accepted_sink
                 .record_accepted(crate::shared_adapter::shared_accepted(

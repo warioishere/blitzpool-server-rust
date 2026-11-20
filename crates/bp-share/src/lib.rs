@@ -576,20 +576,11 @@ fn hash_rate_to_target(hash_rate: f64, shares_per_minute: f64) -> Target {
     if !sh.is_finite() || sh <= 0.0 {
         return Target::MAX;
     }
+    // `sh` is at least 1 here, so the quotient is below 2^255 and fits.
     let sh_big = BigUint::from(sh as u64);
-    if sh_big.is_zero() {
-        return Target::MAX;
-    }
     let numerator = &*TWO_TO_256 - &sh_big;
     let denominator = sh_big + 1u32;
-    let target_big = numerator / denominator;
-    let max_u256 = &*TWO_TO_256 - 1u32;
-    let clamped = if target_big > max_u256 {
-        max_u256
-    } else {
-        target_big
-    };
-    Target(biguint_to_le_bytes_32(&clamped))
+    Target(biguint_to_le_bytes_32(&(numerator / denominator)))
 }
 
 pub fn hash_rate_to_difficulty(hash_rate: f64, shares_per_minute: f64) -> Difficulty {
@@ -610,11 +601,9 @@ pub fn clamp_difficulty_to_max_target(diff: Difficulty, max_target: &Target) -> 
     }
     let computed = difficulty_to_target(diff);
     let computed_big = le_bytes_to_biguint(&computed.0);
+    // A non-zero target gives a finite, positive difficulty.
     if computed_big > max_big {
-        let clamped = target_to_difficulty(max_target);
-        if clamped.0.is_finite() && clamped.0 > 0.0 {
-            return clamped;
-        }
+        return target_to_difficulty(max_target);
     }
     diff
 }

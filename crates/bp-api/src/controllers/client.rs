@@ -980,8 +980,7 @@ mod tests {
     }
 
     /// `/api/client/:address/rejected` — every known reason pre-filled,
-    /// legacy kebab-case folded into its camel-case key, unknown reasons
-    /// into `OtherUnknown`.
+    /// unknown reasons into `OtherUnknown`.
     #[test]
     fn rejected_json_is_unchanged() {
         assert_eq!(
@@ -992,7 +991,7 @@ mod tests {
 
     fn reject_samples() -> Vec<(i64, (&'static str, f64, f64))> {
         vec![
-            (T0, ("job-not-found", 2.0, 0.25)),
+            (T0, ("JobNotFound", 2.0, 0.25)),
             (T0, ("JobNotFound", 1.0, 1.5)),
             (T0, ("something-new", 3.0, 3.0)),
             (T0 + S + 7, ("Stale", 4.0, 0.1_f32 as f64)),

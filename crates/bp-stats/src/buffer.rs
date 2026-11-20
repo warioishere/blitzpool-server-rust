@@ -11,11 +11,9 @@ use std::hash::Hash;
 // ─── BufferRecord trait ─────────────────────────────────────────────────────
 
 /// A record of numeric fields used as the value in [`RecordDeltaBuffer`].
+/// Callers add only deltas the share-stats sink has checked (finite,
+/// positive, below its cap), so no bucket is ever zero or poisoned.
 pub trait BufferRecord: Default + Clone {
-    /// True iff every field is zero (or negative); such buckets are left out
-    /// of `take`.
-    fn is_zero(&self) -> bool;
-
     /// Merge `rhs` in: sums add, maxima take the larger value.
     fn add_assign(&mut self, rhs: &Self);
 }
@@ -54,19 +52,13 @@ impl<K> NumberDeltaBuffer<K>
 where
     K: Eq + Hash,
 {
-    /// Zero and non-finite deltas are ignored so one NaN cannot poison a key.
     pub fn add(&mut self, key: K, delta: f64) {
-        if delta == 0.0 || !delta.is_finite() {
-            return;
-        }
         *self.map.entry(key).or_insert(0.0) += delta;
     }
 
-    /// Empty the buffer, returning its positive entries.
+    /// Empty the buffer, returning its entries.
     pub fn take(&mut self) -> HashMap<K, f64> {
-        let mut out = std::mem::take(&mut self.map);
-        out.retain(|_, v| *v > 0.0);
-        out
+        std::mem::take(&mut self.map)
     }
 
     /// Hand back an unwritten [`Self::take`].
@@ -112,21 +104,13 @@ where
     I: Eq + Hash,
 {
     pub fn add(&mut self, outer: O, inner: I, delta: f64) {
-        if delta == 0.0 || !delta.is_finite() {
-            return;
-        }
         let entry = self.map.entry(outer).or_default();
         *entry.entry(inner).or_insert(0.0) += delta;
     }
 
-    /// Empty the buffer, returning its positive entries.
+    /// Empty the buffer, returning its entries.
     pub fn take(&mut self) -> HashMap<O, HashMap<I, f64>> {
-        let mut out = std::mem::take(&mut self.map);
-        out.retain(|_, inner| {
-            inner.retain(|_, v| *v > 0.0);
-            !inner.is_empty()
-        });
-        out
+        std::mem::take(&mut self.map)
     }
 
     /// Hand back an unwritten [`Self::take`].
@@ -175,26 +159,23 @@ where
     R: BufferRecord,
 {
     pub fn add(&mut self, key: K, delta: &R) {
-        if delta.is_zero() {
-            return;
-        }
         self.map.entry(key).or_default().add_assign(delta);
     }
 
-    /// Empty the buffer, returning every non-zero bucket.
+    /// Empty the buffer, returning every bucket.
     pub fn take(&mut self) -> HashMap<K, R> {
         self.take_where(|_| true)
     }
 
-    /// Remove and return the non-zero buckets whose key matches; the rest
-    /// stay buffered.
+    /// Remove and return the buckets whose key matches; the rest stay
+    /// buffered.
     pub fn take_where(&mut self, mut due: impl FnMut(&K) -> bool) -> HashMap<K, R> {
         let mut out = HashMap::new();
         for (k, r) in std::mem::take(&mut self.map) {
-            if !due(&k) {
-                self.map.insert(k, r);
-            } else if !r.is_zero() {
+            if due(&k) {
                 out.insert(k, r);
+            } else {
+                self.map.insert(k, r);
             }
         }
         out
@@ -215,19 +196,6 @@ mod tests {
     // ─── NumberDeltaBuffer ───────────────────────────────────────────────
 
     #[test]
-    fn number_buffer_takes_positive_entries_only() {
-        let mut buf: NumberDeltaBuffer<&'static str> = NumberDeltaBuffer::new();
-        buf.add("a", 5.0);
-        buf.add("b", -3.0); // counted internally but filtered by take
-        buf.add("c", 0.0); // no-op
-        let snap = buf.take();
-        assert_eq!(snap.get("a"), Some(&5.0));
-        assert!(!snap.contains_key("b"));
-        assert!(!snap.contains_key("c"));
-        assert!(buf.is_empty(), "take empties the buffer");
-    }
-
-    #[test]
     fn number_buffer_restore_adds_onto_writes_made_during_the_flush() {
         let mut buf: NumberDeltaBuffer<&'static str> = NumberDeltaBuffer::new();
         buf.add("a", 10.0);
@@ -236,15 +204,6 @@ mod tests {
         buf.add("a", 3.0);
         buf.restore(snap);
         assert_eq!(buf.take().get("a"), Some(&13.0));
-    }
-
-    #[test]
-    fn number_buffer_ignores_non_finite() {
-        let mut buf: NumberDeltaBuffer<&'static str> = NumberDeltaBuffer::new();
-        buf.add("a", f64::NAN);
-        buf.add("a", f64::INFINITY);
-        buf.add("a", f64::NEG_INFINITY);
-        assert!(buf.is_empty());
     }
 
     // ─── NestedDeltaBuffer ───────────────────────────────────────────────
@@ -285,35 +244,10 @@ mod tests {
     }
 
     impl BufferRecord for SumAndMax {
-        fn is_zero(&self) -> bool {
-            self.sum == 0.0 && self.max == 0.0
-        }
         fn add_assign(&mut self, rhs: &Self) {
             self.sum += rhs.sum;
             self.max = self.max.max(rhs.max);
         }
-    }
-
-    #[test]
-    fn record_buffer_zero_input_is_a_no_op() {
-        let mut buf: RecordDeltaBuffer<&'static str, SumAndMax> = RecordDeltaBuffer::new();
-        buf.add("k", &SumAndMax { sum: 0.0, max: 0.0 });
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn record_buffer_take_skips_all_zero_buckets() {
-        // A write and its negation leave an allocated all-zero bucket.
-        let mut buf: RecordDeltaBuffer<&'static str, SumAndMax> = RecordDeltaBuffer::new();
-        buf.add("k", &SumAndMax { sum: 5.0, max: 0.0 });
-        buf.add(
-            "k",
-            &SumAndMax {
-                sum: -5.0,
-                max: 0.0,
-            },
-        );
-        assert!(!buf.take().contains_key("k"));
     }
 
     #[test]

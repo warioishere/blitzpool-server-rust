@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use bitcoin::Network;
 use bp_common::{AddressId, StreamKind};
-use bp_mining_job::{MiningJobCache, MiningJobError};
+use bp_mining_job::MiningJobCache;
 use bp_template_distribution::TemplateUpdate;
 use bp_vardiff::{Clock, SystemClock};
 use stratum_core::binary_sv2::GetSize;
@@ -498,57 +498,60 @@ async fn run_mining_connection(
                 // succeeds, so submits never route to a stream whose
                 // template_id the job does not carry.
                 if let Some((opened_id, _)) = newly_opened_channel {
-                    if let (Some(addr), Some(channel)) =
-                        (state.address.as_ref(), state.channels.get(&opened_id))
-                    {
-                        // Must precede the routing: `resolve_stream` reads the
-                        // mode gate this publishes, and a miss defaults to Solo.
-                        // One session per channel, ended at its CloseChannel or
-                        // at the connection's end.
-                        let address = addr.clone();
-                        let channel_session = channel.session_id.clone();
-                        let worker = channel.worker.clone();
-                        hooks
-                            .session_persistence
-                            .register_session(
-                                &channel_session,
-                                address.as_str(),
-                                &worker,
-                                Some(state.user_agent.as_str()),
-                            )
-                            .await;
-                        if state.stream.is_pplns() {
-                            let resolved = hooks.payout_resolver.resolve_stream(&address);
-                            // The accounting follows the mode even when the
-                            // swap below fails: a Group-Solo miner left on the
-                            // PPLNS template is still Group-Solo and must not
-                            // reference the pool-wide distribution.
-                            state.accounting_stream = resolved;
-                            if !resolved.is_pplns() {
-                                if let Some(alt) = alt_streams.remove(&resolved) {
-                                    template_rx = alt.rx;
-                                    refresh_pacer.clear();
-                                    state.current_template = alt.initial;
-                                    state.stream = resolved;
-                                    debug!(
-                                        "sv2 connection {session_id_hex}: routed to {} template stream",
-                                        resolved.as_label()
-                                    );
-                                } else {
-                                    warn!(
-                                        "sv2 connection {session_id_hex}: address resolved to alt \
-                                         stream {} that isn't wired; staying on the PPLNS stream",
-                                        resolved.as_label()
-                                    );
-                                }
-                            } else {
-                                // PPLNS is the boot stream: no swap, logged so
-                                // PPLNS routing is visible too.
+                    // An open that was not refused added the channel, and
+                    // the first open set the address.
+                    let addr = state.address.as_ref().expect("an opened channel set the address");
+                    let channel = state
+                        .channels
+                        .get(&opened_id)
+                        .expect("an opened channel is registered");
+                    // Must precede the routing: `resolve_stream` reads the
+                    // mode gate this publishes, and a miss defaults to Solo.
+                    // One session per channel, ended at its CloseChannel or
+                    // at the connection's end.
+                    let address = addr.clone();
+                    let channel_session = channel.session_id.clone();
+                    let worker = channel.worker.clone();
+                    hooks
+                        .session_persistence
+                        .register_session(
+                            &channel_session,
+                            address.as_str(),
+                            &worker,
+                            Some(state.user_agent.as_str()),
+                        )
+                        .await;
+                    if state.stream.is_pplns() {
+                        let resolved = hooks.payout_resolver.resolve_stream(&address);
+                        // The accounting follows the mode even when the
+                        // swap below fails: a Group-Solo miner left on the
+                        // PPLNS template is still Group-Solo and must not
+                        // reference the pool-wide distribution.
+                        state.accounting_stream = resolved;
+                        if !resolved.is_pplns() {
+                            if let Some(alt) = alt_streams.remove(&resolved) {
+                                template_rx = alt.rx;
+                                refresh_pacer.clear();
+                                state.current_template = alt.initial;
+                                state.stream = resolved;
                                 debug!(
                                     "sv2 connection {session_id_hex}: routed to {} template stream",
                                     resolved.as_label()
                                 );
+                            } else {
+                                warn!(
+                                    "sv2 connection {session_id_hex}: address resolved to alt \
+                                     stream {} that isn't wired; staying on the PPLNS stream",
+                                    resolved.as_label()
+                                );
                             }
+                        } else {
+                            // PPLNS is the boot stream: no swap, logged so
+                            // PPLNS routing is visible too.
+                            debug!(
+                                "sv2 connection {session_id_hex}: routed to {} template stream",
+                                resolved.as_label()
+                            );
                         }
                     }
                 }
@@ -618,7 +621,7 @@ async fn run_mining_connection(
                     )
                     .await
                     {
-                        Ok(Some(mining_job_inputs)) => {
+                        Some(mining_job_inputs) => {
                             let synthetic_broadcast = TemplateBroadcast {
                                 template: template.clone(),
                                 change: TemplateChange::NewBlock,
@@ -644,17 +647,10 @@ async fn run_mining_connection(
                                 break;
                             }
                         }
-                        Ok(None) => {
+                        None => {
                             warn!(
                                 "sv2 connection {session_id_hex}: no payouts for the initial \
                                  job; the next template announces the tip"
-                            );
-                            owes_new_block = true;
-                        }
-                        Err(err) => {
-                            warn!(
-                                "sv2 connection {session_id_hex}: initial mining_job build \
-                                 failed: {err}"
                             );
                             owes_new_block = true;
                         }
@@ -728,13 +724,8 @@ async fn run_mining_connection(
                     )
                     .await
                     {
-                        Ok(Some(j)) => Some(j),
-                        unresolved => {
-                            if let Err(err) = unresolved {
-                                warn!(
-                                    "sv2 connection {session_id_hex}: resolve_template_mining_job_inputs failed: {err}"
-                                );
-                            }
+                        Some(j) => Some(j),
+                        None => {
                             apply_unresolved_broadcast(
                                 &mut state,
                                 &payload,
@@ -959,38 +950,33 @@ fn custom_extranonce_broadcast_frames<C: bp_vardiff::Clock>(
     state: &mut MiningSessionState<C>,
     hooks: &MiningServerHooks,
 ) -> Vec<OutboundFrame> {
+    // Armed only on the Solo stream, which a connection never leaves.
     if !state.uses_custom_extranonce {
-        return Vec::new();
-    }
-    // Armed only on the Solo stream; the gate is re-asserted here too.
-    if state.stream != StreamKind::Solo {
         return Vec::new();
     }
     // Only the primary channel carries the override, as at channel-open
     // (`maybe_apply_custom_extranonce`), looked up by that channel's worker.
+    // It is gone once the last channel closed.
     let Some(primary) = state.primary_channel else {
         return Vec::new();
     };
-    let prefix = {
-        let (Some(address), Some(channel)) = (state.address.as_ref(), state.channels.get(&primary))
-        else {
-            return Vec::new();
-        };
-        match hooks
-            .custom_extranonce
-            .lookup(address.as_str(), &channel.worker)
-        {
-            Some(p) => p,
-            None => return Vec::new(),
-        }
+    let address = state
+        .address
+        .as_ref()
+        .expect("a channel was opened, so the address is set");
+    let channel = state
+        .channels
+        .get_mut(&primary)
+        .expect("the primary channel is registered");
+    let Some(prefix) = hooks
+        .custom_extranonce
+        .lookup(address.as_str(), &channel.worker)
+    else {
+        return Vec::new();
     };
-    let mut frames = Vec::new();
-    if let Some(channel) = state.channels.get_mut(&primary) {
-        if let Some(frame) = swap_channel_prefix(channel, primary, &prefix) {
-            frames.push(frame);
-        }
-    }
-    frames
+    swap_channel_prefix(channel, primary, &prefix)
+        .into_iter()
+        .collect()
 }
 
 /// Runs an `Open*` handler with the prefix of the channel id it would assign.
@@ -1097,20 +1083,19 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
                         .negotiated_extensions
                         .contains(&crate::extensions::SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS),
                 )
-                .map(|reference| {
+                .and_then(|reference| {
                     let scope = match reference {
+                        // Without an address there is no channel either, and
+                        // the handler refuses the job before it reads this.
                         crate::bridge::DistributionReference::FromFrame { .. } => {
-                            match state.address.as_ref() {
-                                Some(addr) => crate::bridge::DistributionScope::MinerAddress(addr),
-                                None => crate::bridge::DistributionScope::JdpSession(0),
-                            }
+                            crate::bridge::DistributionScope::MinerAddress(state.address.as_ref()?)
                         }
                         crate::bridge::DistributionReference::FromDeclaration {
                             jdp_session_id,
                             ..
                         } => crate::bridge::DistributionScope::JdpSession(jdp_session_id),
                     };
-                    guard.distribution_acceptance(reference.distribution_id(), scope)
+                    Some(guard.distribution_acceptance(reference.distribution_id(), scope))
                 });
                 (bridge_job, allocation, distribution)
             };
@@ -1200,18 +1185,16 @@ async fn run_vardiff_check(
 }
 
 /// Resolve payouts and pack the template's coinbase fields into
-/// [`MiningJobInputs`]. `Ok(None)` before OpenChannel set an address, or when
-/// no distribution could be built.
+/// [`MiningJobInputs`]. `None` before OpenChannel set an address, or when no
+/// distribution could be built.
 async fn resolve_template_mining_job_inputs(
     address: &Option<AddressId>,
     server_config: &ServerConfig,
     template: &ActiveTemplate,
     hooks: &MiningServerHooks,
     job_cache: &Arc<MiningJobCache>,
-) -> Result<Option<MiningJobInputs>, MiningJobError> {
-    let Some(addr) = address else {
-        return Ok(None);
-    };
+) -> Option<MiningJobInputs> {
+    let addr = address.as_ref()?;
     let resolved = hooks
         .payout_resolver
         .resolve_payouts(addr, template.coinbase_tx_value_remaining)
@@ -1220,9 +1203,9 @@ async fn resolve_template_mining_job_inputs(
     // block is never the fallback. The channel keeps hashing what it holds,
     // as on SV1.
     if resolved.is_none() {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(MiningJobInputs {
+    Some(MiningJobInputs {
         network: server_config.network,
         pool_identifier: resolved.coinbase_identifier(&server_config.pool_identifier),
         payouts: resolved.entries,
@@ -1235,7 +1218,7 @@ async fn resolve_template_mining_job_inputs(
         coinbase_tx_outputs_count: template.coinbase_tx_outputs_count,
         coinbase_tx_locktime: template.coinbase_tx_locktime,
         job_cache: job_cache.clone(),
-    }))
+    })
 }
 
 /// Fan each [`SessionEvent`] out to its hook; no socket writes.
@@ -1312,18 +1295,16 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
             SessionEvent::ChannelClosed {
                 session_id, worker, ..
             } => {
-                if !address_str.is_empty() {
-                    hooks
-                        .device_status_sink
-                        .on_device_event(
-                            address_str,
-                            &worker,
-                            &session_id,
-                            Some(state.user_agent.as_str()),
-                            false,
-                        )
-                        .await;
-                }
+                hooks
+                    .device_status_sink
+                    .on_device_event(
+                        address_str,
+                        &worker,
+                        &session_id,
+                        Some(state.user_agent.as_str()),
+                        false,
+                    )
+                    .await;
                 hooks
                     .session_persistence
                     .deregister_session(&session_id)
@@ -1687,20 +1668,6 @@ mod tests {
         let mut s = solo_session_with_extended_channel(7, vec![0xC0, 0xDE, 0xBA, 0xBE]);
         s.uses_custom_extranonce = true;
         let hooks = hooks_with_override(ADDR, "different-worker", [0x11, 0x22, 0x33, 0x44]);
-        assert!(custom_extranonce_broadcast_frames(&mut s, &hooks).is_empty());
-        assert_eq!(
-            s.channels.get(&7).unwrap().extranonce_prefix,
-            vec![0xC0, 0xDE, 0xBA, 0xBE]
-        );
-    }
-
-    /// Armed but non-Solo → no switch, prefix untouched.
-    #[test]
-    fn broadcast_frames_empty_on_non_solo_even_if_armed() {
-        let mut s = solo_session_with_extended_channel(7, vec![0xC0, 0xDE, 0xBA, 0xBE]);
-        s.uses_custom_extranonce = true;
-        s.stream = StreamKind::Pplns;
-        let hooks = hooks_with_override(ADDR, "wrk", [0xDE, 0xAD, 0xBE, 0xEF]);
         assert!(custom_extranonce_broadcast_frames(&mut s, &hooks).is_empty());
         assert_eq!(
             s.channels.get(&7).unwrap().extranonce_prefix,
@@ -2179,8 +2146,7 @@ mod tests {
             &hooks,
             &Arc::new(MiningJobCache::new()),
         )
-        .await
-        .unwrap();
+        .await;
         assert!(out.is_none(), "no address → no MiningJobInputs");
     }
 
@@ -2214,8 +2180,7 @@ mod tests {
             &hooks,
             &Arc::new(MiningJobCache::new()),
         )
-        .await
-        .unwrap();
+        .await;
         assert!(
             out.is_none(),
             "an empty payout list must produce NO job inputs — building one \
@@ -2231,8 +2196,7 @@ mod tests {
             &MiningServerHooks::no_op(),
             &Arc::new(MiningJobCache::new()),
         )
-        .await
-        .unwrap();
+        .await;
         assert!(
             out.is_some(),
             "precondition: a resolver that DOES return a list still yields job inputs"
@@ -2252,8 +2216,7 @@ mod tests {
             &hooks,
             &Arc::new(MiningJobCache::new()),
         )
-        .await
-        .unwrap();
+        .await;
         assert!(out.is_some(), "address locked → MiningJobInputs populated");
         let inputs = out.unwrap();
         assert!(

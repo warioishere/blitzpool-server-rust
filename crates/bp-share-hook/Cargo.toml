@@ -19,10 +19,9 @@ bp-common = { workspace = true }
 # Owned share records derive Serialize/Deserialize so they can be the wire
 # unit on the Core→Satellite share stream (bp-share-stream).
 serde = { workspace = true }
-# Canonical RejectedReason enum (3-variant: JobNotFound / DuplicateShare /
-# LowDifficulty) shared with the bp-stats accumulators. SV1 and SV2
-# adapters map their protocol-specific 4-variant enums into this stable
-# 3-variant form before invoking SharedRejectedShareSink.
+# Canonical RejectedReason enum shared with the bp-stats accumulators. SV1
+# and SV2 adapters map their protocol-specific reject reasons into it before
+# invoking SharedRejectedShareSink.
 bp-stats = { workspace = true }
 
 [dev-dependencies]

@@ -82,7 +82,7 @@ pub async fn found_block_at_height(
     let row = sqlx::query!(
         r#"SELECT "minerAddress" AS "miner_address!", mode
            FROM blocks_entity
-           WHERE height = $1 AND "minerAddress" NOT LIKE 'synthseed%'
+           WHERE height = $1
            LIMIT 1"#,
         height,
     )
@@ -125,19 +125,24 @@ pub async fn payout_recorded_at_height(pool: &PgPool, height: i32) -> Result<boo
     Ok(found)
 }
 
+/// When the pool's latest block was found, in Unix ms; `None` before the first.
+pub async fn last_found_block_at(pool: &PgPool) -> Result<Option<i64>, DbError> {
+    sqlx::query_scalar!(r#"SELECT MAX("createdAt") FROM blocks_entity"#)
+        .fetch_one(pool)
+        .await
+        .map_err(DbError::from)
+}
+
 /// All rows from `blocks_entity` projected down to
 /// `{height, minerAddress, worker, sessionId}`, unordered.
 pub async fn find_found_blocks(pool: &PgPool) -> Result<Vec<FoundBlockRow>, DbError> {
-    // Dev-seed rows (`synthseed*`) are bootstrap fixtures and must not show
-    // up as found blocks in the API.
     sqlx::query_as!(
         FoundBlockRow,
         r#"SELECT height AS "height!",
                   "minerAddress" AS "miner_address!",
                   worker AS "worker!",
                   "sessionId" AS "session_id!"
-           FROM blocks_entity
-           WHERE "minerAddress" NOT LIKE 'synthseed%'"#,
+           FROM blocks_entity"#,
     )
     .fetch_all(pool)
     .await

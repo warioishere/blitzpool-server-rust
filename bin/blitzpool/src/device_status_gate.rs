@@ -156,15 +156,8 @@ impl ReportedStateStore for RedisReportedState {
                 };
                 match conn.get::<_, Option<String>>(&raw).await {
                     Ok(Some(v)) => {
-                        // Values are session counts; "online"/"offline"
-                        // are the legacy form, still read so persisted
-                        // keys stay valid.
-                        let sessions = match v.as_str() {
-                            "online" => 1,
-                            "offline" => 0,
-                            other => other.parse().unwrap_or(0),
-                        };
-                        out.insert(device, sessions);
+                        // The value is the session count `store` writes.
+                        out.insert(device, v.parse().unwrap_or(0));
                     }
                     Ok(None) => {}
                     Err(err) => {
