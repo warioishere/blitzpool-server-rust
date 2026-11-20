@@ -550,7 +550,7 @@ mod tests {
     /// The constraint behind [`GROUP`]: two consumers in ONE group split the entries.
     #[tokio::test]
     async fn two_consumers_in_one_group_split_the_entries() {
-        let Some(redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 1).await else {
+        let Some(redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN_2, 7).await else {
             eprintln!("redis unreachable — skipping consumer-group semantics test");
             return;
         };
