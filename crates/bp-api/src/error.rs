@@ -197,7 +197,7 @@ impl From<bp_group_mgmt_engine::GroupServiceError> for ApiError {
 
 /// Map `bp_blockparty_engine::BlockpartyServiceError` to an `ApiError`.
 /// Wire codes pass through verbatim; the HTTP status comes from the
-/// variant discriminant so 401/403/404/409/424/500 land correctly.
+/// variant discriminant so 400/401/403/404/409/500 land correctly.
 impl From<bp_blockparty_engine::BlockpartyServiceError> for ApiError {
     fn from(e: bp_blockparty_engine::BlockpartyServiceError) -> Self {
         use bp_blockparty_engine::BlockpartyServiceError as B;
@@ -206,7 +206,9 @@ impl From<bp_blockparty_engine::BlockpartyServiceError> for ApiError {
             B::MissingToken | B::InvalidToken | B::MissingMemberToken | B::InvalidMemberToken => {
                 StatusCode::UNAUTHORIZED
             }
-            B::MemberNotConfirmed | B::DissolveCooldown => StatusCode::FORBIDDEN,
+            B::MemberNotConfirmed | B::DissolveCooldown | B::EmailNotVerified => {
+                StatusCode::FORBIDDEN
+            }
             B::NotFound | B::NotMember => StatusCode::NOT_FOUND,
             B::NameTaken
             | B::AdminAddressTaken
@@ -216,7 +218,6 @@ impl From<bp_blockparty_engine::BlockpartyServiceError> for ApiError {
             | B::AdminCannotBeRemoved
             | B::NotEditable
             | B::InvalidState => StatusCode::CONFLICT,
-            B::EmailNotVerified => StatusCode::FAILED_DEPENDENCY,
             B::InvalidName
             | B::InvalidAddress
             | B::InvalidPercent
@@ -288,5 +289,27 @@ mod body_tests {
 
         let bad = body_of(ApiError::BadRequest("amount must be positive")).await;
         assert_eq!(bad["message"], "bad request: amount must be positive");
+    }
+}
+
+#[cfg(test)]
+mod verification_gate_tests {
+    use super::*;
+    use crate::controllers::{groups::jr_to_api_error, invitation::invitation_to_api_error};
+
+    /// The four onboarding refusals of an address with neither a confirmed
+    /// email nor a signature proof map to one answer, Team and Blockparty alike.
+    #[test]
+    fn every_unverified_address_refusal_maps_to_the_same_answer() {
+        let refusals = [
+            ApiError::from(bp_group_mgmt_engine::GroupServiceError::EmailNotVerified),
+            invitation_to_api_error(bp_group_mgmt_engine::InvitationServiceError::EmailNotVerified),
+            jr_to_api_error(bp_group_mgmt_engine::JoinRequestServiceError::EmailNotVerified),
+            ApiError::from(bp_blockparty_engine::BlockpartyServiceError::EmailNotVerified),
+        ];
+        for refusal in refusals {
+            assert_eq!(refusal.code(), "email-not-verified");
+            assert_eq!(refusal.into_response().status(), StatusCode::FORBIDDEN);
+        }
     }
 }

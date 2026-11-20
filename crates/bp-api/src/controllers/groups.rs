@@ -1775,7 +1775,7 @@ async fn join_requests_by_address(
     Ok(JsonBytes(bytes))
 }
 
-fn jr_to_api_error(e: bp_group_mgmt_engine::JoinRequestServiceError) -> ApiError {
+pub(crate) fn jr_to_api_error(e: bp_group_mgmt_engine::JoinRequestServiceError) -> ApiError {
     use axum::http::StatusCode;
     use bp_group_mgmt_engine::JoinRequestServiceError as J;
     let code = e.code();
