@@ -209,10 +209,11 @@ impl TdpBlockSubmissionSink {
         }
     }
 
-    /// The one way the front's SV1, SV2 and JDP booker build their sink, so a
-    /// block is published the same way whichever found it. Payout applies it
-    /// from the stream (front and payout never share a process), so the front
-    /// holds only the PPLNS engine, whose snapshot it reads at the find.
+    /// The front's sink, built once and shared by its SV1, SV2 and JDP
+    /// servers, so a block is published the same way whichever found it.
+    /// Payout applies it from the stream (front and payout never share a
+    /// process), so the front holds only the PPLNS engine, whose snapshot it
+    /// reads at the find.
     pub(crate) fn wired(
         tdp: TdpHandle,
         cfg: &AppConfig,
@@ -334,14 +335,6 @@ impl TdpBlockSubmissionSink {
             actual_coinbase: None,
         })
         .await
-    }
-
-    pub(crate) fn into_sv1_arc(self) -> Arc<dyn Sv1BlockSubmissionSink> {
-        Arc::new(self)
-    }
-
-    pub(crate) fn into_sv2_arc(self) -> Arc<dyn Sv2BlockSubmissionSink> {
-        Arc::new(self)
     }
 
     /// Parent height + 1. Never `tip + 1`: `submit_solution` may already have

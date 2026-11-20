@@ -14,21 +14,12 @@ use bp_config::AppConfig;
 use bp_mining_mode::MiningModeResult;
 use bp_share_hook::SharedSessionPersistence;
 use bp_stratum_v1::{PortConfig, ServerConfig, ServerHooks, SharedExtranonce, StratumV1Server};
+use bp_template_distribution::TdpHandle;
 use thiserror::Error;
-use tracing::warn;
 
-use crate::block_sink::TdpBlockSubmissionSink;
 use crate::boot::FoundationHandles;
 use crate::engines::{BlitzpoolModeGate, EngineHandles};
 use crate::membership::{membership_mode, BlockpartyAdminLookup, GroupLookup, Membership};
-
-/// Per-port SV1 server, one per enabled `[stratum]`/`[pplns]` port.
-/// [`crate::stratum::spawn`] binds one listener per port and dispatches on
-/// the opening bytes to this server or the SV2 one.
-pub(crate) struct Sv1PortServer {
-    pub(crate) port_config: PortConfig,
-    pub(crate) server: StratumV1Server,
-}
 
 #[derive(Debug, Error)]
 pub(crate) enum StratumV1SpawnError {
@@ -42,35 +33,89 @@ pub(crate) enum StratumV1SpawnError {
     },
 }
 
-/// Build one [`StratumV1Server`] per port with its
-/// [`bp_stratum_v1::ServerHooks`]. Empty when TDP is unavailable
-/// (`--skip-tdp`): no template source, no jobs. The accept loop is in
-/// [`crate::stratum::spawn`].
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_per_port_servers(
-    cfg: &AppConfig,
-    foundation: &FoundationHandles,
-    engines: &EngineHandles,
-    membership: &Membership,
+/// What every SV1 port server shares: the validated [`ServerConfig`], the
+/// pool-wide extranonce1 allocator and the hooks that are the same on every
+/// port. [`crate::stratum::spawn`] calls [`Self::spawn_port`] once per port,
+/// next to the SV2 server for the same port.
+pub(crate) struct Sv1Servers<'a> {
+    server_config: ServerConfig,
+    extranonce: SharedExtranonce,
+    tdp: &'a TdpHandle,
+    foundation: &'a FoundationHandles,
+    engines: &'a EngineHandles,
+    membership: &'a Membership,
+    block_sink: Arc<dyn bp_stratum_v1::BlockSubmissionSink>,
     payout_resolver: Arc<dyn bp_stratum_v1::PayoutResolver>,
     device_status_sink: Arc<dyn bp_share_hook::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
     job_cache: Arc<bp_mining_job::MiningJobCache>,
-) -> Result<Vec<Sv1PortServer>, StratumV1SpawnError> {
-    let Some(tdp) = foundation.tdp.as_ref() else {
-        warn!("stratum-v1: TDP missing (--skip-tdp); skipping SV1 server construction");
-        return Ok(vec![]);
-    };
+}
 
-    let server_config = build_server_config(cfg);
-    server_config
-        .validate()
-        .map_err(|e| StratumV1SpawnError::ServerConfig(e.to_string()))?;
+impl<'a> Sv1Servers<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        cfg: &AppConfig,
+        tdp: &'a TdpHandle,
+        foundation: &'a FoundationHandles,
+        engines: &'a EngineHandles,
+        membership: &'a Membership,
+        block_sink: Arc<dyn bp_stratum_v1::BlockSubmissionSink>,
+        payout_resolver: Arc<dyn bp_stratum_v1::PayoutResolver>,
+        device_status_sink: Arc<dyn bp_share_hook::DeviceStatusSink>,
+        live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
+        job_cache: Arc<bp_mining_job::MiningJobCache>,
+    ) -> Result<Self, StratumV1SpawnError> {
+        let server_config = build_server_config(cfg);
+        server_config
+            .validate()
+            .map_err(|e| StratumV1SpawnError::ServerConfig(e.to_string()))?;
+        Ok(Self {
+            server_config,
+            // One pool-wide extranonce1 allocator across every SV1 port, so
+            // no two miners share a prefix. Worker 1 keeps SV1 disjoint from
+            // SV2's worker 0.
+            extranonce: SharedExtranonce::new(),
+            tdp,
+            foundation,
+            engines,
+            membership,
+            block_sink,
+            payout_resolver,
+            device_status_sink,
+            live_sessions,
+            job_cache,
+        })
+    }
 
-    // Submits the solution via TDP and publishes the block-found event.
-    let block_sink =
-        TdpBlockSubmissionSink::wired(tdp.clone(), cfg, foundation, engines).into_sv1_arc();
+    /// Spawn the SV1 server for one port.
+    pub(crate) fn spawn_port(&self, port_config: &PortConfig) -> StratumV1Server {
+        let hooks = build_port_hooks(
+            port_config.payout_mode,
+            self.block_sink.clone(),
+            self.payout_resolver.clone(),
+            self.engines,
+            self.membership,
+            self.device_status_sink.clone(),
+            Arc::clone(&self.live_sessions),
+        );
+        let templates = crate::stratum::PortTemplates::subscribe(self.tdp, self.foundation);
+        StratumV1Server::spawn(
+            self.server_config.clone(),
+            templates.updates_rx,
+            templates.initial_snapshot,
+            templates.alt_streams,
+            hooks,
+            self.extranonce.clone(),
+            self.job_cache.clone(),
+        )
+    }
+}
 
+/// [`build_port_configs`], each checked with [`PortConfig::validate`]. The
+/// one port list both protocols serve.
+pub(crate) fn validated_port_configs(
+    cfg: &AppConfig,
+) -> Result<Vec<PortConfig>, StratumV1SpawnError> {
     let port_configs = build_port_configs(cfg);
     for pc in &port_configs {
         pc.validate()
@@ -79,41 +124,7 @@ pub(crate) fn build_per_port_servers(
                 source,
             })?;
     }
-
-    let mut out: Vec<Sv1PortServer> = Vec::with_capacity(port_configs.len());
-
-    // One pool-wide extranonce1 allocator across every SV1 port, so no two
-    // miners share a prefix. Worker 1 keeps SV1 disjoint from SV2's worker 0.
-    let extranonce = SharedExtranonce::new();
-
-    for port_config in port_configs {
-        let hooks = build_port_hooks(
-            port_config.payout_mode,
-            block_sink.clone(),
-            payout_resolver.clone(),
-            engines,
-            membership,
-            device_status_sink.clone(),
-            Arc::clone(&live_sessions),
-        );
-
-        let templates = crate::stratum::PortTemplates::subscribe(tdp, foundation);
-        let server = StratumV1Server::spawn(
-            server_config.clone(),
-            templates.updates_rx,
-            templates.initial_snapshot,
-            templates.alt_streams,
-            hooks,
-            extranonce.clone(),
-            job_cache.clone(),
-        );
-        out.push(Sv1PortServer {
-            port_config,
-            server,
-        });
-    }
-
-    Ok(out)
+    Ok(port_configs)
 }
 
 // ─── ServerConfig + PortConfig builders ──────────────────────────
@@ -136,7 +147,7 @@ pub(crate) fn build_server_config(cfg: &AppConfig) -> ServerConfig {
 /// 2 Solo ports, plus 2 PPLNS ports when PPLNS is enabled. The PPLNS
 /// high-diff port uses `[stratum]`'s `high_diff_start_difficulty`, one
 /// high-diff threshold for both modes.
-pub(crate) fn build_port_configs(cfg: &AppConfig) -> Vec<PortConfig> {
+fn build_port_configs(cfg: &AppConfig) -> Vec<PortConfig> {
     let mut ports = Vec::with_capacity(4);
 
     // Solo (low-diff)
@@ -197,8 +208,8 @@ fn build_port_hooks(
     device_status_sink: Arc<dyn bp_share_hook::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
 ) -> ServerHooks {
-    // Front-only path: `build_per_port_servers` runs only when Stratum spawns
-    // (the front), where `engines::spawn` always builds these.
+    // Front-only path: SV1 servers are built only when Stratum spawns (the
+    // front), where `engines::spawn` always builds these.
     ServerHooks {
         block_sink,
         accepted_sink: engines

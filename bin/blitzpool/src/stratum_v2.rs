@@ -11,6 +11,7 @@ use bp_common::MiningMode;
 use bp_config::AppConfig;
 use bp_jobs_lifecycle::LifecycleConfig;
 use bp_share::Difficulty;
+use bp_stratum_v1::PortConfig as Sv1PortConfig;
 use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
 use bp_stratum_v2::extranonce::{SharedExtranonceAllocator, SV2_WORKER_ID};
 use bp_stratum_v2::hooks::{
@@ -19,23 +20,15 @@ use bp_stratum_v2::hooks::{
 use bp_stratum_v2::mining::client::PortConfig as Sv2PortConfig;
 use bp_stratum_v2::noise::NoiseConfig;
 use bp_stratum_v2::server::{ServerConfig as Sv2ServerConfig, StratumV2MiningServer};
+use bp_template_distribution::TdpHandle;
 use stratum_apps::key_utils::{Secp256k1PublicKey, Secp256k1SecretKey};
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::boot::FoundationHandles;
 use crate::engines::EngineHandles;
 use crate::membership::Membership;
-use crate::stratum_v1::{self, ModeGatePopulatingPersistence};
-
-/// Per-port SV2 mining server, like [`crate::stratum_v1::Sv1PortServer`].
-/// Carries the SV2 `PortConfig` the unified accept loop passes to
-/// `accept_connection`.
-pub(crate) struct Sv2PortServer {
-    pub(crate) port: u16,
-    pub(crate) port_config: Sv2PortConfig,
-    pub(crate) server: StratumV2MiningServer,
-}
+use crate::stratum_v1::ModeGatePopulatingPersistence;
 
 #[derive(Debug, Error)]
 pub(crate) enum StratumV2SpawnError {
@@ -114,89 +107,121 @@ pub(crate) fn build_server_config(cfg: &AppConfig) -> Sv2ServerConfig {
     sc
 }
 
-/// Build one [`StratumV2MiningServer`] per SV1 port; both share the port's
-/// listener in [`crate::stratum`]. Empty when TDP is unavailable
-/// (`--skip-tdp`), like SV1.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_per_port_servers(
-    cfg: &AppConfig,
-    foundation: &FoundationHandles,
-    engines: &EngineHandles,
-    membership: &Membership,
+/// What every SV2 port server shares: the server config, the noise keys,
+/// the JDP bridge, the pool-wide extranonce allocator, the custom-job
+/// `ntime` judge and the hooks that are the same on every port.
+/// [`crate::stratum::spawn`] calls [`Self::spawn_port`] once per port, next
+/// to the SV1 server for the same port.
+pub(crate) struct Sv2Servers<'a> {
+    cfg: &'a AppConfig,
+    server_config: Sv2ServerConfig,
     noise_config: NoiseConfig,
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
+    extranonce: SharedExtranonceAllocator,
+    chain_tip_time: Arc<dyn bp_stratum_v2::hooks::ChainTipTime>,
+    tdp: &'a TdpHandle,
+    foundation: &'a FoundationHandles,
+    engines: &'a EngineHandles,
+    membership: &'a Membership,
+    block_sink: Arc<dyn Sv2BlockSink>,
     payout_resolver: Arc<dyn PayoutResolver>,
     custom_extranonce: Arc<dyn bp_stratum_v2::hooks::CustomExtranonceSource>,
     device_status_sink: Arc<dyn bp_share_hook::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
     job_cache: Arc<bp_mining_job::MiningJobCache>,
-) -> Vec<Sv2PortServer> {
-    let Some(tdp) = foundation.tdp.as_ref() else {
-        warn!("stratum-v2: TDP missing (--skip-tdp); skipping SV2 server construction");
-        return vec![];
-    };
+}
 
-    let server_config = build_server_config(cfg);
-    let network = crate::boot::bitcoin_network(cfg.network);
-    // SV1's port enumeration is the canonical port list.
-    let sv1_port_configs = stratum_v1::build_port_configs(cfg);
-    // TDP submit plus the block-found publish, as for SV1.
-    let block_sink: Arc<dyn Sv2BlockSink> =
-        crate::block_sink::TdpBlockSubmissionSink::wired(tdp.clone(), cfg, foundation, engines)
-            .into_sv2_arc();
-
-    let mut out: Vec<Sv2PortServer> = Vec::with_capacity(sv1_port_configs.len());
-
-    // One extranonce allocator across every SV2 port: separate ones would
-    // start at the same prefix, and two PPLNS ports would hash the same
-    // coinbase.
-    let extranonce = SharedExtranonceAllocator::new_default_on_worker(SV2_WORKER_ID);
-
-    // Judges every custom job's `ntime_start`; one cache shared across ports
-    // like the allocator, filled by one lookup per tip and TDP stream.
-    let chain_tip_time: Arc<dyn bp_stratum_v2::hooks::ChainTipTime> =
-        crate::tip_median_time::TipMedianTime::spawn(
-            foundation.bitcoin_rpc.clone(),
-            std::iter::once(tdp).chain(foundation.alt_tdp.values()),
-        );
-
-    for sv1_port_config in sv1_port_configs {
-        let hooks = build_port_hooks(
-            sv1_port_config.payout_mode,
-            payout_resolver.clone(),
-            block_sink.clone(),
+impl<'a> Sv2Servers<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        cfg: &'a AppConfig,
+        tdp: &'a TdpHandle,
+        foundation: &'a FoundationHandles,
+        engines: &'a EngineHandles,
+        membership: &'a Membership,
+        noise_config: NoiseConfig,
+        bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
+        block_sink: Arc<dyn Sv2BlockSink>,
+        payout_resolver: Arc<dyn PayoutResolver>,
+        custom_extranonce: Arc<dyn bp_stratum_v2::hooks::CustomExtranonceSource>,
+        device_status_sink: Arc<dyn bp_share_hook::DeviceStatusSink>,
+        live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
+        job_cache: Arc<bp_mining_job::MiningJobCache>,
+    ) -> Self {
+        // Judges every custom job's `ntime_start`; one cache shared across
+        // ports like the allocator, filled by one lookup per tip and TDP
+        // stream.
+        let chain_tip_time: Arc<dyn bp_stratum_v2::hooks::ChainTipTime> =
+            crate::tip_median_time::TipMedianTime::spawn(
+                foundation.bitcoin_rpc.clone(),
+                std::iter::once(tdp).chain(foundation.alt_tdp.values()),
+            );
+        Self {
+            cfg,
+            server_config: build_server_config(cfg),
+            noise_config,
+            bridge,
+            // One extranonce allocator across every SV2 port: separate ones
+            // would start at the same prefix, and two PPLNS ports would hash
+            // the same coinbase.
+            extranonce: SharedExtranonceAllocator::new_default_on_worker(SV2_WORKER_ID),
+            chain_tip_time,
+            tdp,
+            foundation,
             engines,
             membership,
-            device_status_sink.clone(),
-            Arc::clone(&live_sessions),
-            custom_extranonce.clone(),
-            chain_tip_time.clone(),
+            block_sink,
+            payout_resolver,
+            custom_extranonce,
+            device_status_sink,
+            live_sessions,
+            job_cache,
+        }
+    }
+
+    /// Spawn the SV2 server for the port `sv1_port_config` describes, plus
+    /// the SV2 [`PortConfig`](Sv2PortConfig) the accept loop hands to each
+    /// connection.
+    pub(crate) fn spawn_port(
+        &self,
+        sv1_port_config: &Sv1PortConfig,
+    ) -> (Sv2PortConfig, StratumV2MiningServer) {
+        let hooks = build_port_hooks(
+            sv1_port_config.payout_mode,
+            self.payout_resolver.clone(),
+            self.block_sink.clone(),
+            self.engines,
+            self.membership,
+            self.device_status_sink.clone(),
+            Arc::clone(&self.live_sessions),
+            self.custom_extranonce.clone(),
+            self.chain_tip_time.clone(),
         );
 
-        let templates = crate::stratum::PortTemplates::subscribe(tdp, foundation);
+        let templates = crate::stratum::PortTemplates::subscribe(self.tdp, self.foundation);
         let server = StratumV2MiningServer::spawn(
-            server_config.clone(),
-            noise_config.clone(),
+            self.server_config.clone(),
+            self.noise_config.clone(),
             templates.updates_rx,
             templates.initial_snapshot,
             templates.alt_streams,
             hooks,
-            bridge.clone(),
-            extranonce.clone(),
-            job_cache.clone(),
+            self.bridge.clone(),
+            self.extranonce.clone(),
+            self.job_cache.clone(),
         );
         // The same per-port config drives SV1 and SV2. start_difficulty is
         // the first SetTarget; the floor is the one SV1 applies too.
         let min_diff = sv1_port_config.effective_minimum_difficulty();
         let initial_diff = sv1_port_config.effective_initial_difficulty();
         let sv2_port_config = Sv2PortConfig {
-            network,
+            network: crate::boot::bitcoin_network(self.cfg.network),
             min_difficulty: Difficulty(min_diff),
             initial_difficulty: Difficulty(initial_diff),
             target_shares_per_minute: sv1_port_config.target_shares_per_minute,
-            vardiff_interval_ms: cfg.stratum.difficulty_check_interval_ms,
+            vardiff_interval_ms: self.cfg.stratum.difficulty_check_interval_ms,
             job_lifecycle: LifecycleConfig {
-                retention_ms: cfg.stratum.job_retention_ms,
+                retention_ms: self.cfg.stratum.job_retention_ms,
                 ..LifecycleConfig::DEFAULT
             },
         };
@@ -207,13 +232,8 @@ pub(crate) fn build_per_port_servers(
             initial_diff = sv2_port_config.initial_difficulty.as_f64(),
             "stratum-v2: mining server constructed"
         );
-        out.push(Sv2PortServer {
-            port: sv1_port_config.port,
-            port_config: sv2_port_config,
-            server,
-        });
+        (sv2_port_config, server)
     }
-    out
 }
 
 // ─── MiningServerHooks composition ────────────────────────────────

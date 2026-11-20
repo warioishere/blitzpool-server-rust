@@ -493,7 +493,8 @@ async fn main() -> ExitCode {
 
     // ext 0x0003/Implementation Notes settlement fan-out: `payout` books while
     // `front` holds the JDP registry, so every booking path signals both.
-    // Created before the Stratum block sinks, which settle on immediate apply.
+    // Created before the confirmation watcher and the block-found applier,
+    // which settle through it.
     let settle_signal = crate::settlement::SettlementSignal::new(handles.redis.clone());
 
     // One JDP bridge shared by both servers: JDP registers declared jobs, the
@@ -514,8 +515,24 @@ async fn main() -> ExitCode {
         ))
     });
 
-    let stratum = match membership.as_ref().zip(payout_resolver.clone()) {
-        Some((m, resolver)) => match stratum::spawn(
+    // The front's TDP feed with its one block sink: SV1 and SV2 submit
+    // through it and JDP books through it, so a block is published the same
+    // way whichever found it. `None` off the front and under `--skip-tdp`.
+    let front_tdp = handles.tdp.clone().filter(|_| is_front).map(|tdp| {
+        let block_sink = std::sync::Arc::new(crate::block_sink::TdpBlockSubmissionSink::wired(
+            tdp.clone(),
+            &cfg,
+            &handles,
+            &engines,
+        ));
+        (tdp, block_sink)
+    });
+
+    let stratum = match (
+        membership.as_ref().zip(payout_resolver.clone()),
+        front_tdp.as_ref(),
+    ) {
+        (Some((m, resolver)), Some((tdp, block_sink))) => match stratum::spawn(
             &cfg,
             &handles,
             &engines,
@@ -523,6 +540,8 @@ async fn main() -> ExitCode {
             resolver,
             device_status_gate.clone(),
             jdp_bridge.clone(),
+            tdp,
+            block_sink.clone(),
         )
         .await
         {
@@ -534,7 +553,13 @@ async fn main() -> ExitCode {
                 return ExitCode::from(8);
             }
         },
-        None => None,
+        (Some(_), None) => {
+            tracing::warn!(
+                "stratum: TDP missing (--skip-tdp); skipping unified SV1+SV2 listener bind"
+            );
+            Some(stratum::StratumHandles::empty())
+        }
+        (None, _) => None,
     };
     log_stratum_summary(stratum.as_ref(), is_front);
 
@@ -866,8 +891,8 @@ async fn main() -> ExitCode {
     // JDP and the coinbase-budget autoscaler need the TDP feed. `jdp` stays a
     // disabled handle without it, so shutdown is uniform.
     let (jdp, autoscaler) = if is_front {
-        match handles.tdp.clone() {
-            Some(tdp_handle) => {
+        match front_tdp {
+            Some((tdp_handle, jdp_ledger_booker)) => {
                 let autoscaler = coinbase_autoscaler::maybe_spawn(
                     cfg.pplns.as_ref(),
                     engines.pplns.as_ref(),
@@ -881,15 +906,6 @@ async fn main() -> ExitCode {
                 let template_tx_cache = std::sync::Arc::new(
                     bp_template_distribution::TemplateTxCache::spawn(&tdp_handle),
                 );
-                // Same constructor as the Stratum sinks, so a declared block
-                // books through the same path as a pool-built one.
-                let jdp_ledger_booker =
-                    std::sync::Arc::new(crate::block_sink::TdpBlockSubmissionSink::wired(
-                        tdp_handle.clone(),
-                        &cfg,
-                        &handles,
-                        &engines,
-                    ));
                 let jdp_admission = membership
                     .as_ref()
                     .expect("the front builds membership")

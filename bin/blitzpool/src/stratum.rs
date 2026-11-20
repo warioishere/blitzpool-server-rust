@@ -12,6 +12,7 @@ use bp_config::AppConfig;
 use bp_stratum_v1::{PortConfig as Sv1PortConfig, StratumV1Server};
 use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
 use bp_stratum_v2::server::StratumV2MiningServer;
+use bp_template_distribution::TdpHandle;
 use socket2::{SockRef, TcpKeepalive};
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
@@ -20,6 +21,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::block_sink::TdpBlockSubmissionSink;
 use crate::boot::FoundationHandles;
 use crate::engines::EngineHandles;
 use crate::membership::Membership;
@@ -40,7 +42,9 @@ pub(crate) struct StratumHandles {
 }
 
 impl StratumHandles {
-    fn empty() -> Self {
+    /// No listeners: the front without a TDP feed (`--skip-tdp`) has no
+    /// templates and so no jobs to serve.
+    pub(crate) fn empty() -> Self {
         Self {
             ports: vec![],
             listener_tasks: vec![],
@@ -85,9 +89,8 @@ pub(crate) enum StratumSpawnError {
     },
 }
 
-/// Spawn the unified SV1+SV2 stratum listeners. Returns an empty handle
-/// when TDP is unavailable (`--skip-tdp`): without templates there are no
-/// jobs to serve.
+/// Spawn the unified SV1+SV2 stratum listeners on `tdp`'s templates.
+/// `block_sink` is the front's one block sink, shared with the JDP server.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn(
     cfg: &AppConfig,
@@ -104,12 +107,9 @@ pub(crate) async fn spawn(
     // here reads them; a second instance would fail every custom job with
     // `invalid-mining-job-token`.
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
+    tdp: &TdpHandle,
+    block_sink: Arc<TdpBlockSubmissionSink>,
 ) -> Result<StratumHandles, StratumSpawnError> {
-    if foundation.tdp.is_none() {
-        warn!("stratum: TDP missing (--skip-tdp); skipping unified SV1+SV2 listener bind");
-        return Ok(StratumHandles::empty());
-    }
-
     // Each protocol takes the one resolver as its own `PayoutResolver` trait.
     let sv1_resolver: Arc<dyn bp_stratum_v1::PayoutResolver> = payout_resolver.clone();
     let sv2_resolver: Arc<dyn bp_stratum_v2::hooks::PayoutResolver> = payout_resolver;
@@ -132,16 +132,19 @@ pub(crate) async fn spawn(
 
     let device_status = crate::device_status::stratum_sinks(gate, foundation.redis.clone());
 
-    let sv1_servers = stratum_v1::build_per_port_servers(
+    let sv1 = stratum_v1::Sv1Servers::new(
         cfg,
+        tdp,
         foundation,
         engines,
         membership,
+        block_sink.clone(),
         sv1_resolver,
         Arc::clone(&device_status),
         Arc::clone(&live_sessions),
         job_cache.clone(),
     )?;
+    let port_configs = stratum_v1::validated_port_configs(cfg)?;
     let noise_config = stratum_v2::build_noise_config(cfg)?;
     // SV2 miners and JD clients pin this key; this line is where an operator
     // reads it.
@@ -153,13 +156,15 @@ pub(crate) async fn spawn(
     // it self-refreshes off PG. Shared across every SV2 port.
     let custom_extranonce: Arc<dyn bp_stratum_v2::hooks::CustomExtranonceSource> =
         crate::custom_extranonce::CustomExtranonceCache::spawn(foundation.db.pool().clone()).await;
-    let sv2_servers = stratum_v2::build_per_port_servers(
+    let sv2 = stratum_v2::Sv2Servers::new(
         cfg,
+        tdp,
         foundation,
         engines,
         membership,
         noise_config,
         bridge,
+        block_sink,
         sv2_resolver,
         custom_extranonce,
         device_status,
@@ -167,28 +172,17 @@ pub(crate) async fn spawn(
         job_cache,
     );
 
-    // Pair SV1 + SV2 servers by port. Both enumerate ports via SV1's
-    // `build_port_configs`; the asserts fail loudly on divergence instead
-    // of mis-dispatching.
-    assert_eq!(
-        sv1_servers.len(),
-        sv2_servers.len(),
-        "sv1 + sv2 must enumerate the same port set"
-    );
-
     let cancel = CancellationToken::new();
-    let mut listener_tasks: Vec<JoinHandle<()>> = Vec::with_capacity(sv1_servers.len());
-    let mut ports: Vec<u16> = Vec::with_capacity(sv1_servers.len());
-    let mut sv1_server_handles: Vec<StratumV1Server> = Vec::with_capacity(sv1_servers.len());
-    let mut sv2_server_handles: Vec<StratumV2MiningServer> = Vec::with_capacity(sv2_servers.len());
+    let mut listener_tasks: Vec<JoinHandle<()>> = Vec::with_capacity(port_configs.len());
+    let mut ports: Vec<u16> = Vec::with_capacity(port_configs.len());
+    let mut sv1_server_handles: Vec<StratumV1Server> = Vec::with_capacity(port_configs.len());
+    let mut sv2_server_handles: Vec<StratumV2MiningServer> = Vec::with_capacity(port_configs.len());
 
-    for (sv1, sv2) in sv1_servers.into_iter().zip(sv2_servers) {
-        assert_eq!(
-            sv1.port_config.port, sv2.port,
-            "sv1 + sv2 port enumeration drift at index"
-        );
+    for port_config in port_configs {
+        let sv1_server = sv1.spawn_port(&port_config);
+        let (sv2_port_config, sv2_server) = sv2.spawn_port(&port_config);
 
-        let bind_addr: std::net::SocketAddr = ([0, 0, 0, 0], sv1.port_config.port).into();
+        let bind_addr: std::net::SocketAddr = ([0, 0, 0, 0], port_config.port).into();
         let listener =
             TcpListener::bind(bind_addr)
                 .await
@@ -197,21 +191,22 @@ pub(crate) async fn spawn(
                     source,
                 })?;
         info!(
-            port = sv1.port_config.port,
-            payout_mode = ?sv1.port_config.payout_mode,
+            port = port_config.port,
+            payout_mode = ?port_config.payout_mode,
             "stratum: unified SV1+SV2 listener bound"
         );
 
+        let port = port_config.port;
         let dispatch = PortDispatch {
-            sv1_server: sv1.server.clone(),
-            sv1_port_config: sv1.port_config.clone(),
-            sv2_server: sv2.server.clone(),
-            sv2_port_config: sv2.port_config,
+            sv1_server: sv1_server.clone(),
+            sv1_port_config: port_config,
+            sv2_server: sv2_server.clone(),
+            sv2_port_config,
         };
         let task = tokio::spawn(accept_loop(
             listener,
             "stratum",
-            sv1.port_config.port,
+            port,
             cancel.clone(),
             move |socket, peer| {
                 // Peeking and dispatching must not block subsequent accepts.
@@ -222,9 +217,9 @@ pub(crate) async fn spawn(
             },
         ));
         listener_tasks.push(task);
-        ports.push(sv1.port_config.port);
-        sv1_server_handles.push(sv1.server);
-        sv2_server_handles.push(sv2.server);
+        ports.push(port);
+        sv1_server_handles.push(sv1_server);
+        sv2_server_handles.push(sv2_server);
     }
 
     Ok(StratumHandles {

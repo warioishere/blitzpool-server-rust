@@ -18,8 +18,7 @@ use tracing::{debug, warn};
 #[derive(Clone)]
 pub(crate) struct SettlementSignal {
     /// Filled by `jdp::spawn`, so only on a `front`. `OnceLock` because the
-    /// Stratum sinks and the confirmation watcher are built BEFORE the JDP
-    /// server exists.
+    /// confirmation watcher is built BEFORE the JDP server exists.
     local: Arc<OnceLock<DistributionInvalidationHandle>>,
     /// `None` only without Redis (tests). ⚠️ Does NOT reach a second front:
     /// all fronts share one consumer group, see `cache_sync::GROUP`.
