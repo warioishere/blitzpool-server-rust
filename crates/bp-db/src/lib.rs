@@ -128,8 +128,8 @@ pub use notification::{
     update_telegram_sub_device_flag, update_telegram_sub_group_admin_flag,
     update_telegram_sub_team_best_flag, upsert_ntfy_subscription, upsert_push_subscription,
     upsert_telegram_chat_language, upsert_telegram_subscription, NtfySubscriptionRow,
-    PushPreferenceUpdate, PushSubscriptionRow, TeamBestNtfyRecipient, TeamBestTelegramRecipient,
-    TelegramSubscriptionRow,
+    PushPreferenceUpdate, PushSubscriptionRow, PushType, TeamBestNtfyRecipient,
+    TeamBestTelegramRecipient, TelegramSubscriptionRow, UnknownPushType,
 };
 pub use pool_stats::{
     find_network_difficulty_tracker, find_pool_mode_hashrate_since,

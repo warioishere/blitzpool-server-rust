@@ -20,8 +20,7 @@ use crate::middleware::require_address_token;
 use crate::state::SharedState;
 use crate::time_range::format_iso_ms;
 
-const UNIFIED_PUSH: &str = "unified_push";
-const FCM: &str = "fcm";
+use bp_db::PushType;
 const MIN_FCM_TOKEN_LEN: usize = 100;
 
 pub(crate) fn routes() -> Router<SharedState> {
@@ -224,7 +223,7 @@ async fn register(
         &address,
         endpoint.as_str(),
         platform.as_str(),
-        UNIFIED_PUSH,
+        PushType::UnifiedPush,
     )
     .await
     .map_err(|_| push_error("registration-failed", StatusCode::BAD_REQUEST))?;
@@ -318,7 +317,7 @@ async fn status(
         .map(|s| StatusSubscription {
             id: s.id,
             platform: s.platform.clone(),
-            subscription_type: s.subscription_type.clone(),
+            subscription_type: s.subscription_type.as_str().to_string(),
             created_at: format_iso_ms(s.created_at),
             last_notification_at: s.last_notification_at.map(format_iso_ms),
             best_diff_notifications_enabled: s.best_diff_notifications_enabled,
@@ -416,13 +415,13 @@ async fn register_fcm(
         &address,
         token.as_str(),
         platform.as_str(),
-        FCM,
+        PushType::Fcm,
     )
     .await
     .map_err(|_| push_error("registration-failed", StatusCode::BAD_REQUEST))?;
     Ok(Json(FcmRegisterResponse {
         success: true,
-        subscription_type: "fcm",
+        subscription_type: PushType::Fcm.as_str(),
         subscription: subscription_summary(&row),
     }))
 }
@@ -444,11 +443,16 @@ async fn unregister_fcm(
     let address = parse_address(body.address)?;
     require_address_token(&state, &headers, address.as_str()).await?;
     if let Some(token) = body.token.as_deref().filter(|t| !t.is_empty()) {
-        bp_db::delete_push_subscription_by_endpoint_and_type(&state.pool, &address, token, FCM)
-            .await
-            .map_err(|_| push_error("unregister-failed", StatusCode::BAD_REQUEST))?;
+        bp_db::delete_push_subscription_by_endpoint_and_type(
+            &state.pool,
+            &address,
+            token,
+            PushType::Fcm,
+        )
+        .await
+        .map_err(|_| push_error("unregister-failed", StatusCode::BAD_REQUEST))?;
     } else {
-        bp_db::delete_push_subscriptions_by_address_and_type(&state.pool, &address, FCM)
+        bp_db::delete_push_subscriptions_by_address_and_type(&state.pool, &address, PushType::Fcm)
             .await
             .map_err(|_| push_error("unregister-failed", StatusCode::BAD_REQUEST))?;
     }

@@ -131,7 +131,7 @@ async fn the_group_admin_switch_starts_on_and_flips_alone() {
 
     // App push: a preference write naming only this switch leaves the rest,
     // and one that leaves it out leaves it.
-    upsert_push_subscription(&pool, &a, ENDPOINT, "android", "fcm")
+    upsert_push_subscription(&pool, &a, ENDPOINT, "android", bp_db::PushType::Fcm)
         .await
         .expect("push upsert");
     let push = || async {

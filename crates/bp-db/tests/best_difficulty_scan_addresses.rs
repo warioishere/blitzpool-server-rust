@@ -107,7 +107,7 @@ async fn best_diff_scan_covers_every_transport() {
         &addr(PUSH_ONLY),
         "https://push.example/bdscan",
         "android",
-        "unified_push",
+        bp_db::PushType::UnifiedPush,
     )
     .await
     .expect("push sub");

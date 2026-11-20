@@ -21,7 +21,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
 use crate::adapter::{FcmAdapter, PushKind, PushPayload, WebPushAdapter};
-use crate::dispatcher::{push_fcm, push_web, PUSH_TYPE_FCM, PUSH_TYPE_UNIFIED};
+use crate::dispatcher::push_one;
 
 const MEMPOOL_API: &str = "https://mempool.space/api/v1/mining/hashrate/3d";
 
@@ -208,18 +208,7 @@ async fn fan_out_change(
                 warn!(target: "bp_notifications::cron::network_difficulty", error = %e, id, "bump lastNotificationAt");
             }
         }
-        let kind = sub.subscription_type.as_str();
-        if kind.eq_ignore_ascii_case(PUSH_TYPE_FCM) {
-            if let Some(adapter) = fcm {
-                push_fcm(adapter, pool, &address, &sub, &payload, "FCM send").await;
-            }
-        } else if kind.eq_ignore_ascii_case(PUSH_TYPE_UNIFIED) {
-            if let Some(adapter) = web_push {
-                push_web(adapter, pool, &address, &sub, &payload, "UnifiedPush send").await;
-            }
-        } else {
-            warn!(target: "bp_notifications::cron::network_difficulty", kind, "unknown subscription_type — skipped");
-        }
+        push_one(fcm, web_push, pool, &address, &sub, &payload).await;
     }
     Ok(())
 }
@@ -264,7 +253,7 @@ mod tests {
                     best_diff_notifications_enabled: true,
                     device_notifications_enabled: true,
                     block_notifications_enabled: true,
-                    subscription_type: PUSH_TYPE_UNIFIED.to_string(),
+                    subscription_type: bp_db::PushType::UnifiedPush,
                     network_diff_notifications_enabled: true,
                     group_admin_notifications_enabled: true,
                 },

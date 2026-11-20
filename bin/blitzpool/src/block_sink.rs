@@ -615,8 +615,10 @@ fn pool_built(fingerprint: Option<[u8; 32]>) -> Option<[u8; 32]> {
 }
 
 impl BlockFoundApplier {
-    /// `settle` is an argument, not a builder step, so no applier can book a
-    /// block without invalidating the published distributions.
+    /// `settle` is an argument, not a builder step, so every applier states
+    /// whether its bookings invalidate the published distributions: the
+    /// payout ledger's does; `None` is for an applier that only notifies, or
+    /// a test.
     pub(crate) fn new(
         pplns: Option<PplnsEngine>,
         group_solo: Option<GroupSoloEngine>,

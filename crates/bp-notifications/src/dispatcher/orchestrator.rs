@@ -10,7 +10,7 @@ use bp_db::{
     find_push_subscriptions_by_address, find_telegram_subscriptions_by_address,
     find_telegram_subscriptions_by_chat, list_blockparty_members_for_group, move_telegram_chat,
     update_push_subscription_last_notification, DbError, NtfySubscriptionRow, PushSubscriptionRow,
-    TelegramSubscriptionRow,
+    PushType, TelegramSubscriptionRow,
 };
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
@@ -32,12 +32,6 @@ use crate::format::{
 use crate::template::{render_join_request_admin, JoinRequestAdminContext};
 
 use super::device_gate::{DeviceAggregate, DeviceNotice, DevicePartial};
-
-// Canonical stored `subscriptionType` values (lowercase, as written by
-// the `/api/push/*` register endpoints). Comparisons below are
-// case-insensitive so a row stored in any casing still routes.
-pub(crate) const PUSH_TYPE_UNIFIED: &str = "unified_push";
-pub(crate) const PUSH_TYPE_FCM: &str = "fcm";
 
 /// Timezone device-status timestamps are rendered in.
 const DEVICE_TIMEZONE: chrono_tz::Tz = chrono_tz::Europe::Zurich;
@@ -563,16 +557,14 @@ impl NotificationDispatcher {
                 }) as TaskFuture);
             }
         }
-        let push_of = |kind: &str| -> Vec<PushSubscriptionRow> {
+        let push_of = |kind: PushType| -> Vec<PushSubscriptionRow> {
             push_subs
                 .iter()
-                .filter(|s| {
-                    s.subscription_type.eq_ignore_ascii_case(kind) && s.device_notifications_enabled
-                })
+                .filter(|s| s.subscription_type == kind && s.device_notifications_enabled)
                 .cloned()
                 .collect()
         };
-        let fcm_dev = push_of(PUSH_TYPE_FCM);
+        let fcm_dev = push_of(PushType::Fcm);
         if !fcm_dev.is_empty() {
             tasks.push(Box::pin(fan_push(
                 self.clone_push_handles(),
@@ -582,7 +574,7 @@ impl NotificationDispatcher {
                 fcm_payload(),
             )) as TaskFuture);
         }
-        let unified_dev = push_of(PUSH_TYPE_UNIFIED);
+        let unified_dev = push_of(PushType::UnifiedPush);
         if !unified_dev.is_empty() {
             tasks.push(Box::pin(fan_push(
                 self.clone_push_handles(),
@@ -693,10 +685,9 @@ fn route_join_request(
     let ntfy = ntfy.filter(|_| transports.ntfy);
     let push: Vec<_> = push
         .into_iter()
-        .filter(|sub| {
-            let kind = sub.subscription_type.as_str();
-            (kind.eq_ignore_ascii_case(PUSH_TYPE_FCM) && transports.fcm)
-                || (kind.eq_ignore_ascii_case(PUSH_TYPE_UNIFIED) && transports.web_push)
+        .filter(|sub| match sub.subscription_type {
+            PushType::Fcm => transports.fcm,
+            PushType::UnifiedPush => transports.web_push,
         })
         .collect();
     let mail = telegram.iter().all(|s| s.group_chat) && ntfy.is_none() && push.is_empty();
@@ -1344,26 +1335,47 @@ async fn fan_push(
         let address = address.clone();
         let handles = handles.clone();
         async move {
-            let kind = sub.subscription_type.as_str();
-            if kind.eq_ignore_ascii_case(PUSH_TYPE_UNIFIED) {
-                if let Some(adapter) = handles.web_push {
-                    push_web(&adapter, &pool, &address, &sub, &payload, "unified push").await;
-                }
-            } else if kind.eq_ignore_ascii_case(PUSH_TYPE_FCM) {
-                if let Some(adapter) = handles.fcm {
-                    push_fcm(&adapter, &pool, &address, &sub, &payload, "fcm push").await;
-                }
-            } else {
-                debug!(target: "bp_notifications::dispatcher", kind, "unknown push subscription_type — ignored");
-            }
+            push_one(
+                handles.fcm.as_deref(),
+                handles.web_push.as_deref(),
+                &pool,
+                &address,
+                &sub,
+                &payload,
+            )
+            .await;
         }
     });
     join_all(tasks).await;
 }
 
+/// Deliver one push through the adapter its subscription type names; a
+/// type whose adapter this process does not run is skipped.
+pub(crate) async fn push_one(
+    fcm: Option<&FcmAdapter>,
+    web_push: Option<&WebPushAdapter>,
+    pool: &PgPool,
+    address: &AddressId,
+    sub: &PushSubscriptionRow,
+    payload: &PushPayload,
+) {
+    match sub.subscription_type {
+        PushType::Fcm => {
+            if let Some(adapter) = fcm {
+                push_fcm(adapter, pool, address, sub, payload, "fcm push").await;
+            }
+        }
+        PushType::UnifiedPush => {
+            if let Some(adapter) = web_push {
+                push_web(adapter, pool, address, sub, payload, "unified push").await;
+            }
+        }
+    }
+}
+
 /// One FCM delivery: an invalid token soft-deletes the subscription, a sent
 /// push stamps its last notification, any other error is logged as `what`.
-pub(crate) async fn push_fcm(
+async fn push_fcm(
     adapter: &FcmAdapter,
     pool: &PgPool,
     address: &AddressId,
@@ -1381,7 +1393,7 @@ pub(crate) async fn push_fcm(
 }
 
 /// [`push_fcm`] for a UnifiedPush endpoint.
-pub(crate) async fn push_web(
+async fn push_web(
     adapter: &WebPushAdapter,
     pool: &PgPool,
     address: &AddressId,
@@ -1856,26 +1868,6 @@ mod tests {
         );
     }
 
-    /// Push routing matches the stored lowercase `subscriptionType` in any casing.
-    #[test]
-    fn push_type_constants_lowercase_and_match_case_insensitively() {
-        assert_eq!(PUSH_TYPE_UNIFIED, "unified_push");
-        assert_eq!(PUSH_TYPE_FCM, "fcm");
-        for v in ["unified_push", "UNIFIED_PUSH", "Unified_Push"] {
-            assert!(
-                v.eq_ignore_ascii_case(PUSH_TYPE_UNIFIED),
-                "{v} should match unified"
-            );
-        }
-        for v in ["fcm", "FCM", "Fcm"] {
-            assert!(
-                v.eq_ignore_ascii_case(PUSH_TYPE_FCM),
-                "{v} should match fcm"
-            );
-        }
-        assert!(!"ntfy".eq_ignore_ascii_case(PUSH_TYPE_UNIFIED));
-    }
-
     fn device_event(is_online: bool, is_returning: bool) -> DeviceStatusEvent {
         DeviceStatusEvent {
             address: AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4")
@@ -2067,7 +2059,7 @@ mod tests {
         }
     }
 
-    fn push_sub(kind: &str, group_admin: bool) -> PushSubscriptionRow {
+    fn push_sub(kind: PushType, group_admin: bool) -> PushSubscriptionRow {
         PushSubscriptionRow {
             created_at: 0,
             updated_at: 0,
@@ -2079,7 +2071,7 @@ mod tests {
             best_diff_notifications_enabled: true,
             device_notifications_enabled: true,
             block_notifications_enabled: true,
-            subscription_type: kind.to_string(),
+            subscription_type: kind,
             network_diff_notifications_enabled: true,
             group_admin_notifications_enabled: group_admin,
         }
@@ -2101,8 +2093,8 @@ mod tests {
             vec![telegram_sub(true)],
             Some(ntfy_sub(true)),
             vec![
-                push_sub(PUSH_TYPE_FCM, true),
-                push_sub(PUSH_TYPE_UNIFIED, true),
+                push_sub(PushType::Fcm, true),
+                push_sub(PushType::UnifiedPush, true),
             ],
             ALL,
         );
@@ -2119,7 +2111,7 @@ mod tests {
         let all_off = route_join_request(
             vec![telegram_sub(false)],
             Some(ntfy_sub(false)),
-            vec![push_sub(PUSH_TYPE_FCM, false)],
+            vec![push_sub(PushType::Fcm, false)],
             ALL,
         );
         assert!(
@@ -2131,7 +2123,7 @@ mod tests {
         let one_on = route_join_request(
             vec![telegram_sub(false)],
             None,
-            vec![push_sub(PUSH_TYPE_UNIFIED, true)],
+            vec![push_sub(PushType::UnifiedPush, true)],
             ALL,
         );
         assert!(one_on.telegram.is_empty());
@@ -2166,7 +2158,7 @@ mod tests {
         let route = route_join_request(
             vec![telegram_sub(true)],
             Some(ntfy_sub(true)),
-            vec![push_sub(PUSH_TYPE_FCM, true)],
+            vec![push_sub(PushType::Fcm, true)],
             none,
         );
         assert!(route.mail);
@@ -2177,14 +2169,14 @@ mod tests {
             Vec::new(),
             None,
             vec![
-                push_sub(PUSH_TYPE_UNIFIED, true),
-                push_sub(PUSH_TYPE_FCM, true),
+                push_sub(PushType::UnifiedPush, true),
+                push_sub(PushType::Fcm, true),
             ],
             fcm_only,
         );
         assert!(!route.mail);
         assert_eq!(route.push.len(), 1);
-        assert_eq!(route.push[0].subscription_type, PUSH_TYPE_FCM);
+        assert_eq!(route.push[0].subscription_type, PushType::Fcm);
     }
 
     /// The app reads `title|body|` as title and body; a third non-empty part

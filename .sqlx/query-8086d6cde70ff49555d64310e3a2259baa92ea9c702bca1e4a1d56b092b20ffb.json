@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            endpoint AS \"endpoint!\",\n            platform AS \"platform!\",\n            \"lastNotificationAt\" AS \"last_notification_at?\",\n            \"bestDiffNotificationsEnabled\" AS \"best_diff_notifications_enabled!\",\n            \"deviceNotificationsEnabled\" AS \"device_notifications_enabled!\",\n            \"blockNotificationsEnabled\" AS \"block_notifications_enabled!\",\n            \"subscriptionType\" AS \"subscription_type!\",\n            \"networkDiffNotificationsEnabled\" AS \"network_diff_notifications_enabled!\",\n            \"groupAdminNotificationsEnabled\" AS \"group_admin_notifications_enabled!\"\n           FROM push_subscription_entity\n           WHERE address = $1 AND \"deletedAt\" IS NULL",
+  "query": "INSERT INTO push_subscription_entity (\n                address, endpoint, platform, \"subscriptionType\",\n                \"bestDiffNotificationsEnabled\", \"deviceNotificationsEnabled\",\n                \"blockNotificationsEnabled\", \"networkDiffNotificationsEnabled\",\n                \"createdAt\", \"updatedAt\"\n            )\n            VALUES ($1, $2, $3, $4, TRUE, TRUE, TRUE, TRUE, $5, $5)\n            ON CONFLICT (address, endpoint, \"subscriptionType\") DO UPDATE\n            SET platform = EXCLUDED.platform,\n                \"deletedAt\" = NULL,\n                \"updatedAt\" = $5\n            RETURNING\n                \"createdAt\" AS \"created_at!\",\n                \"updatedAt\" AS \"updated_at!\",\n                id AS \"id!\",\n                address AS \"address!: AddressId\",\n                endpoint AS \"endpoint!\",\n                platform AS \"platform!\",\n                \"lastNotificationAt\" AS \"last_notification_at?\",\n                \"bestDiffNotificationsEnabled\" AS \"best_diff_notifications_enabled!\",\n                \"deviceNotificationsEnabled\" AS \"device_notifications_enabled!\",\n                \"blockNotificationsEnabled\" AS \"block_notifications_enabled!\",\n                \"subscriptionType\" AS \"subscription_type!: PushType\",\n                \"networkDiffNotificationsEnabled\" AS \"network_diff_notifications_enabled!\",\n                \"groupAdminNotificationsEnabled\" AS \"group_admin_notifications_enabled!\"",
   "describe": {
     "columns": [
       {
@@ -115,7 +115,7 @@
       },
       {
         "ordinal": 10,
-        "name": "subscription_type!",
+        "name": "subscription_type!: PushType",
         "type_info": "Varchar",
         "origin": {
           "Table": {
@@ -149,7 +149,11 @@
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Varchar",
+        "Text",
+        "Varchar",
+        "Varchar",
+        "Int8"
       ]
     },
     "nullable": [
@@ -168,5 +172,5 @@
       false
     ]
   },
-  "hash": "83b5d02199f775a60b57a5c19aace7562c620150cb1816d5c8d337f05fe845ad"
+  "hash": "8086d6cde70ff49555d64310e3a2259baa92ea9c702bca1e4a1d56b092b20ffb"
 }

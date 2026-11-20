@@ -228,6 +228,65 @@ pub async fn find_ntfy_subscription_by_address(
     .map_err(DbError::from)
 }
 
+/// How a push subscription is delivered, stored lowercase in
+/// `subscriptionType`; a text no variant has fails the read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushType {
+    /// UnifiedPush / Web-Push: `endpoint` is a URL.
+    UnifiedPush,
+    /// Firebase Cloud Messaging: `endpoint` is a device token.
+    Fcm,
+}
+
+impl PushType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnifiedPush => "unified_push",
+            Self::Fcm => "fcm",
+        }
+    }
+}
+
+/// A `subscriptionType` text no [`PushType`] has.
+#[derive(Debug)]
+pub struct UnknownPushType(String);
+
+impl std::fmt::Display for UnknownPushType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown push subscription type: {}", self.0)
+    }
+}
+
+impl std::error::Error for UnknownPushType {}
+
+impl std::str::FromStr for PushType {
+    type Err = UnknownPushType;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "unified_push" => Ok(Self::UnifiedPush),
+            "fcm" => Ok(Self::Fcm),
+            other => Err(UnknownPushType(other.to_owned())),
+        }
+    }
+}
+
+bp_common::impl_pg_text_enum!(PushType);
+
+#[cfg(test)]
+mod push_type_tests {
+    use super::PushType;
+
+    #[test]
+    fn the_stored_text_round_trips_and_nothing_else_parses() {
+        for t in [PushType::UnifiedPush, PushType::Fcm] {
+            assert_eq!(t.as_str().parse::<PushType>().unwrap(), t);
+        }
+        for bad in ["FCM", "web", ""] {
+            assert!(bad.parse::<PushType>().is_err(), "{bad}");
+        }
+    }
+}
+
 #[derive(Clone, Debug, FromRow)]
 pub struct PushSubscriptionRow {
     #[sqlx(rename = "createdAt")]
@@ -247,11 +306,8 @@ pub struct PushSubscriptionRow {
     pub device_notifications_enabled: bool,
     #[sqlx(rename = "blockNotificationsEnabled")]
     pub block_notifications_enabled: bool,
-    /// `"unified_push"` or `"fcm"` (lowercase, as written by the
-    /// `/api/push/*` register endpoints). Kept as a raw string because no
-    /// caller branches on it; consumers compare case-insensitively.
     #[sqlx(rename = "subscriptionType")]
-    pub subscription_type: String,
+    pub subscription_type: PushType,
     #[sqlx(rename = "networkDiffNotificationsEnabled")]
     pub network_diff_notifications_enabled: bool,
     #[sqlx(rename = "groupAdminNotificationsEnabled")]
@@ -278,7 +334,7 @@ pub async fn find_push_subscriptions_by_address(
             "bestDiffNotificationsEnabled" AS "best_diff_notifications_enabled!",
             "deviceNotificationsEnabled" AS "device_notifications_enabled!",
             "blockNotificationsEnabled" AS "block_notifications_enabled!",
-            "subscriptionType" AS "subscription_type!",
+            "subscriptionType" AS "subscription_type!: PushType",
             "networkDiffNotificationsEnabled" AS "network_diff_notifications_enabled!",
             "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!"
            FROM push_subscription_entity
@@ -345,7 +401,7 @@ pub async fn upsert_push_subscription(
     address: &AddressId,
     endpoint: &str,
     platform: &str,
-    subscription_type: &str,
+    subscription_type: PushType,
 ) -> Result<PushSubscriptionRow, DbError> {
     let now_ms: i64 = chrono::Utc::now().timestamp_millis();
     sqlx::query_as!(
@@ -372,13 +428,13 @@ pub async fn upsert_push_subscription(
                 "bestDiffNotificationsEnabled" AS "best_diff_notifications_enabled!",
                 "deviceNotificationsEnabled" AS "device_notifications_enabled!",
                 "blockNotificationsEnabled" AS "block_notifications_enabled!",
-                "subscriptionType" AS "subscription_type!",
+                "subscriptionType" AS "subscription_type!: PushType",
                 "networkDiffNotificationsEnabled" AS "network_diff_notifications_enabled!",
                 "groupAdminNotificationsEnabled" AS "group_admin_notifications_enabled!""#,
         address.as_str(),
         endpoint,
         platform,
-        subscription_type,
+        subscription_type.as_str(),
         now_ms,
     )
     .fetch_one(pool)
@@ -394,7 +450,7 @@ pub async fn delete_push_subscription_by_endpoint_and_type(
     pool: &PgPool,
     address: &AddressId,
     endpoint: &str,
-    subscription_type: &str,
+    subscription_type: PushType,
 ) -> Result<u64, DbError> {
     let now_ms: i64 = chrono::Utc::now().timestamp_millis();
     let result = sqlx::query!(
@@ -406,7 +462,7 @@ pub async fn delete_push_subscription_by_endpoint_and_type(
              AND "deletedAt" IS NULL"#,
         address.as_str(),
         endpoint,
-        subscription_type,
+        subscription_type.as_str(),
         now_ms,
     )
     .execute(pool)
@@ -442,7 +498,7 @@ pub async fn delete_push_subscriptions_by_address(
 pub async fn delete_push_subscriptions_by_address_and_type(
     pool: &PgPool,
     address: &AddressId,
-    subscription_type: &str,
+    subscription_type: PushType,
 ) -> Result<u64, DbError> {
     let now_ms: i64 = chrono::Utc::now().timestamp_millis();
     let result = sqlx::query!(
@@ -452,7 +508,7 @@ pub async fn delete_push_subscriptions_by_address_and_type(
              AND "subscriptionType" = $2
              AND "deletedAt" IS NULL"#,
         address.as_str(),
-        subscription_type,
+        subscription_type.as_str(),
         now_ms,
     )
     .execute(pool)

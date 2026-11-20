@@ -48,7 +48,7 @@ async fn insert_sub(
             "bestDiffNotificationsEnabled", "deviceNotificationsEnabled",
             "blockNotificationsEnabled", "networkDiffNotificationsEnabled",
             "createdAt", "updatedAt", "lastNotificationAt")
-           VALUES ($1, $2, 'test', 'FCM', FALSE, FALSE, FALSE, FALSE, $3, $3, $4)
+           VALUES ($1, $2, 'test', 'fcm', FALSE, FALSE, FALSE, FALSE, $3, $3, $4)
            ON CONFLICT (address, endpoint, "subscriptionType") DO UPDATE
            SET "createdAt" = EXCLUDED."createdAt",
                "updatedAt" = EXCLUDED."updatedAt",
