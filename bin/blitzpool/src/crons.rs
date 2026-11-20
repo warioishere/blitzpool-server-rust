@@ -247,6 +247,7 @@ pub(crate) fn spawn(
                 ..NetworkDifficultyCronConfig::default()
             },
             pool.clone(),
+            foundation.bitcoin_rpc.clone(),
             hooks.fcm.clone(),
             hooks.web_push.clone(),
         ))

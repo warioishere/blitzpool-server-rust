@@ -985,6 +985,7 @@ dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
  "bitcoin",
+ "bp-bitcoin",
  "bp-blockparty",
  "bp-client-live",
  "bp-common",

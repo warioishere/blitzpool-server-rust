@@ -30,10 +30,9 @@ use tracing::warn;
 use crate::format::html::{addr, bold, esc, row, title, title_for};
 use crate::format::{format_number_suffix, format_sats, paid_members, Language};
 
-const MEMPOOL_CURRENT_DIFF: &str = "https://mempool.space/api/v1/mining/hashrate/3d";
 const MEMPOOL_NEXT_ADJUST: &str = "https://mempool.space/api/v1/difficulty-adjustment";
 
-// ── HTTP client for the mempool.space-backed read commands (5 s timeout).
+// ── HTTP client for the mempool.space-backed /nextdifficulty (5 s timeout).
 
 fn default_http_client() -> Client {
     bp_http::client_builder()
@@ -70,36 +69,20 @@ fn format_pool_hashrate(lang: Language, total_h_per_s: f64) -> String {
 
 // ── /difficulty ──────────────────────────────────────────────────────
 
-pub(super) async fn build_current_difficulty(lang: Language) -> String {
-    let client = default_http_client();
-    match fetch_current_difficulty(&client).await {
-        Ok(diff) => format_current_difficulty(lang, diff),
-        Err(e) => {
-            warn!(target: "bp_notifications::command::read", error = %e, "current_difficulty");
+/// The node's difficulty as the network-difficulty cron last stored it.
+pub(super) async fn build_current_difficulty(pool: &PgPool, lang: Language) -> String {
+    match bp_db::find_network_difficulty_tracker(pool).await {
+        Ok(Some(row)) => format_current_difficulty(lang, row.current_difficulty),
+        result => {
+            if let Err(e) = result {
+                warn!(target: "bp_notifications::command::read", error = %e, "current_difficulty");
+            }
             match lang {
                 Language::De => "Konnte die Difficulty nicht abrufen.".to_string(),
                 Language::En => "Could not fetch difficulty.".to_string(),
             }
         }
     }
-}
-
-async fn fetch_current_difficulty(client: &Client) -> Result<f64, String> {
-    #[derive(Deserialize)]
-    struct CurrentDifficulty {
-        #[serde(rename = "currentDifficulty")]
-        current_difficulty: f64,
-    }
-    let resp = client
-        .get(MEMPOOL_CURRENT_DIFF)
-        .send()
-        .await
-        .map_err(|e| format!("request: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("status {}", resp.status().as_u16()));
-    }
-    let body: CurrentDifficulty = resp.json().await.map_err(|e| format!("body: {e}"))?;
-    Ok(body.current_difficulty)
 }
 
 fn format_current_difficulty(lang: Language, raw: f64) -> String {
@@ -1397,6 +1380,19 @@ fn no_workers_text(lang: Language, address: &AddressId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/difficulty` shows the node's difficulty the cron stored.
+    #[tokio::test]
+    async fn difficulty_shows_the_stored_node_difficulty() {
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        bp_db::upsert_network_difficulty_tracker(&pool, 123.45e12, 1)
+            .await
+            .expect("seed tracker");
+        let text = build_current_difficulty(&pool, Language::En).await;
+        assert!(text.contains("123.45 T"), "{text}");
+    }
     use crate::format::html::{is_valid_telegram_html, to_plain};
 
     /// The plain text of a reply, after checking Telegram takes its HTML.

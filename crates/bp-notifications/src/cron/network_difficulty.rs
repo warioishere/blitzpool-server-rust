@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Mempool-space network-difficulty poller: on a relative change above
-//! `DIFF_CHANGE_THRESHOLD` it persists the value and pushes it to all FCM
-//! and UnifiedPush subscribers.
+//! Network-difficulty poller: reads the node's difficulty (`getmininginfo`),
+//! the source every other part of the pool uses, persists it as the tracker
+//! row the API and the bot read, and on a relative change above
+//! `DIFF_CHANGE_THRESHOLD` pushes it to all FCM and UnifiedPush subscribers.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use bp_bitcoin::BitcoinRpc;
 use bp_common::AddressId;
 use bp_db::{
     find_addresses_with_push_subscription, find_network_difficulty_tracker,
     upsert_network_difficulty_tracker, PushSubscriptionRow,
 };
 use chrono::Utc;
-use reqwest::Client;
-use serde::Deserialize;
 use sqlx::PgPool;
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
@@ -22,8 +22,6 @@ use tracing::{info, warn};
 
 use crate::adapter::{FcmAdapter, PushKind, PushPayload, WebPushAdapter};
 use crate::dispatcher::push_one;
-
-const MEMPOOL_API: &str = "https://mempool.space/api/v1/mining/hashrate/3d";
 
 // 0.01% relative threshold — only notify when difficulty shifts meaningfully.
 const DIFF_CHANGE_THRESHOLD: f64 = 0.0001;
@@ -54,21 +52,12 @@ impl Default for NetworkDifficultyCronConfig {
 pub fn spawn_network_difficulty_cron(
     config: NetworkDifficultyCronConfig,
     pool: PgPool,
+    rpc: BitcoinRpc,
     fcm: Option<Arc<FcmAdapter>>,
     web_push: Option<Arc<WebPushAdapter>>,
 ) -> watch::Sender<bool> {
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
-        let client = match bp_http::client_builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(target: "bp_notifications::cron::network_difficulty", error = %e, "client build failed");
-                return;
-            }
-        };
         let start = tokio::time::Instant::now() + config.tick_interval + config.startup_offset;
         let mut ticker = tokio::time::interval_at(start, config.tick_interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -79,7 +68,7 @@ pub fn spawn_network_difficulty_cron(
                     if *shutdown_rx.borrow() { break; }
                 }
                 _ = ticker.tick() => {
-                    if let Err(e) = run_once(&client, &pool, fcm.as_deref(), web_push.as_deref()).await {
+                    if let Err(e) = run_once(&rpc, &pool, fcm.as_deref(), web_push.as_deref()).await {
                         warn!(target: "bp_notifications::cron::network_difficulty", error = %e, "tick failed");
                     }
                 }
@@ -91,12 +80,12 @@ pub fn spawn_network_difficulty_cron(
 }
 
 async fn run_once(
-    client: &Client,
+    rpc: &BitcoinRpc,
     pool: &PgPool,
     fcm: Option<&FcmAdapter>,
     web_push: Option<&WebPushAdapter>,
 ) -> Result<(), String> {
-    let new_diff = fetch_current_difficulty(client).await?;
+    let new_diff = node_difficulty(rpc).await?;
     let previous = match find_network_difficulty_tracker(pool).await {
         Ok(opt) => opt.map(|row| row.current_difficulty),
         Err(e) => return Err(format!("tracker read: {e}")),
@@ -122,25 +111,19 @@ async fn run_once(
     Ok(())
 }
 
-async fn fetch_current_difficulty(client: &Client) -> Result<f64, String> {
-    let response = client
-        .get(MEMPOOL_API)
-        .send()
+/// The node's current difficulty; a non-finite or non-positive reading is
+/// refused, so the tracker keeps its last good value.
+async fn node_difficulty(rpc: &BitcoinRpc) -> Result<f64, String> {
+    let difficulty = rpc
+        .get_mining_info()
         .await
-        .map_err(|e| format!("mempool.space request: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!("mempool.space {}", response.status().as_u16()));
+        .map_err(|e| format!("getmininginfo: {e}"))?
+        .difficulty;
+    if difficulty.is_finite() && difficulty > 0.0 {
+        Ok(difficulty)
+    } else {
+        Err(format!("getmininginfo: unusable difficulty {difficulty}"))
     }
-    #[derive(Deserialize)]
-    struct ApiResponse {
-        #[serde(rename = "currentDifficulty")]
-        current_difficulty: f64,
-    }
-    let body: ApiResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("mempool.space body: {e}"))?;
-    Ok(body.current_difficulty)
 }
 
 async fn fan_out_change(

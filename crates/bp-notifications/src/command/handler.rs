@@ -1240,7 +1240,9 @@ impl CommandHandler {
         };
         let result = match read {
             ReadCommand::PoolHashrate => Ok(super::read::build_pool_hashrate(redis, lang).await),
-            ReadCommand::Difficulty => Ok(super::read::build_current_difficulty(lang).await),
+            ReadCommand::Difficulty => {
+                Ok(super::read::build_current_difficulty(&self.pool, lang).await)
+            }
             ReadCommand::NextDifficulty => Ok(super::read::build_next_difficulty(lang).await),
             ReadCommand::PplnsTop => match &self.pplns_engine {
                 Some(engine) => Ok(super::read::build_pplns_top(engine, lang).await),
