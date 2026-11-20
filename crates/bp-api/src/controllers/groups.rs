@@ -355,8 +355,6 @@ struct GroupCoinbaseCapacity {
     max_members: u64,
     /// Engine-wide, identical for every group.
     weight_budget: u32,
-    /// The pool output consumes one member slot.
-    has_fee_output: bool,
 }
 
 /// Uses [`max_coinbase_outputs`](bp_pplns_engine::max_coinbase_outputs), the
@@ -373,8 +371,6 @@ async fn coinbase_capacity(
     Ok(Json(GroupCoinbaseCapacity {
         max_members: bp_pplns_engine::max_coinbase_outputs(cfg.coinbase_weight_budget),
         weight_budget: cfg.coinbase_weight_budget,
-        // The pool output is structural, so reserved even at 0 % fee.
-        has_fee_output: true,
     }))
 }
 

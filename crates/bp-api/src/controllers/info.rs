@@ -1189,10 +1189,10 @@ struct FoundBlockEntry {
 struct UserAgentEntry {
     user_agent: Option<String>,
     count: i64,
-    #[serde(serialize_with = "crate::time_range::ser_opt_f32_jsnum")]
-    best_difficulty: Option<f32>,
-    #[serde(serialize_with = "crate::time_range::ser_opt_f64_jsnum")]
-    total_hash_rate: Option<f64>,
+    #[serde(serialize_with = "crate::time_range::ser_f32_jsnum")]
+    best_difficulty: f32,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
+    total_hash_rate: f64,
 }
 
 #[derive(Serialize)]
@@ -1278,8 +1278,8 @@ async fn info(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
                         .map(|a| UserAgentEntry {
                             user_agent: a.user_agent,
                             count: a.count,
-                            best_difficulty: Some(a.best_difficulty as f32),
-                            total_hash_rate: Some(a.total_hash_rate),
+                            best_difficulty: a.best_difficulty as f32,
+                            total_hash_rate: a.total_hash_rate,
                         })
                         .collect(),
                     high_scores: scores
