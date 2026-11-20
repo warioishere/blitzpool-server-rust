@@ -19,7 +19,7 @@ use sqlx::{postgres::PgPoolOptions, PgPool};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 async fn connect_or_skip() -> Option<PgPool> {
     let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());

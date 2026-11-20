@@ -13,7 +13,7 @@ use bp_db::{
 };
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 /// Above every real row, so the seeded entry is deterministically inside
 /// the query's `LIMIT 10` no matter what else the shared test DB holds.

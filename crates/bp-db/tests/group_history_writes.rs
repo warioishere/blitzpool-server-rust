@@ -13,7 +13,7 @@ use bp_db::{
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use uuid::Uuid;
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 const ADDR_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
 const ADDR_B: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
 

@@ -18,7 +18,7 @@ use tokio::sync::broadcast;
 
 /// Overridden by `BP_REDIS_URL` / `BP_PG_URL`.
 pub const REDIS_DEFAULT_URL: &str = "redis://127.0.0.1:16379";
-pub const PG_DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+pub const PG_DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 /// Turns every Redis/Postgres skip into a failure. A skipped test passes, so
 /// a run meant as evidence sets this to prove the services were reached.

@@ -17,7 +17,7 @@ use bp_stats::{ClientStatisticsKey, ClientStatisticsRecord, TimeSlot};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use tokio::sync::Mutex;
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 static SPEC_PORT_LOCK: Mutex<()> = Mutex::const_new(());
 

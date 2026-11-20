@@ -15,7 +15,7 @@ use bp_db::{
 };
 use sqlx::{postgres::PgPoolOptions, AssertSqlSafe, PgPool};
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 const TEST_CHAT_ID: i64 = 990_000_779;
 
 const TELEGRAM_ONLY: &str = "bdscan_telegram_only";

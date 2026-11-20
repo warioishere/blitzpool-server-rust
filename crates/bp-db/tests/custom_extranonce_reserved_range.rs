@@ -7,7 +7,7 @@
 
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 /// First prefix above SV1's partition — `0x02000000`.
 const FIRST_UNRESERVED: i64 = 33_554_432;

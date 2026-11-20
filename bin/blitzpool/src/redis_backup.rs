@@ -264,7 +264,7 @@ mod tests {
     use super::*;
     use redis::AsyncCommands;
 
-    const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+    const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
     const RETENTION_MS: i64 = 48 * 3600 * 1000;
 
     /// Job state (per-job snapshots, the published-output count, the rebuild

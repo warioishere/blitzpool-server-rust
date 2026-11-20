@@ -10,7 +10,7 @@
 use bp_db::delete_stale_push_subscriptions;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 const ADDR: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
 
 async fn connect_or_skip() -> Option<PgPool> {

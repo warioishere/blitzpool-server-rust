@@ -14,7 +14,7 @@ use bp_db::{
 };
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 // Each test uses a distinct chat id so the two tests stay isolated when
 // the harness runs them concurrently against the shared local PG.
 const TEST_CHAT_ID: i64 = 990_000_777;

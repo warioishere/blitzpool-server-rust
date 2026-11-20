@@ -24,7 +24,7 @@ use redis::{aio::ConnectionManager, Client};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
 const REDIS_URL: &str = "redis://127.0.0.1:16379";
-const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 struct Harness {
     pool: PgPool,

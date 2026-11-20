@@ -14,7 +14,7 @@ use bp_share_hook::SharedSessionPersistence;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use tokio::sync::Mutex;
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 static ENGINE_LOCK: Mutex<()> = Mutex::const_new(());
 

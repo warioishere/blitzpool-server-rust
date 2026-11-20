@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use sqlx::migrate::{MigrateError, Migrator};
 use sqlx::{postgres::PgPoolOptions, AssertSqlSafe, Executor, PgPool};
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 async fn connect(url: &str) -> Option<PgPool> {
     match tokio::time::timeout(

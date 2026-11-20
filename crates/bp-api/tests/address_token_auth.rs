@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use tower::ServiceExt;
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 const SECRET: &str = "test-secret-for-bp-api";
 const ADDRESS: &str = "bc1qtokenvectoraddress";

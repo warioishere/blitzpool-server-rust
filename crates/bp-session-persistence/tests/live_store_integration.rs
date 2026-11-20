@@ -21,7 +21,7 @@ use bp_test_support::{connect_redis_in_range_or_skip, redis_db, redis_db_in_rang
 use redis::aio::ConnectionManager;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
-const DEFAULT_PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+const DEFAULT_PG_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 async fn pg_or_skip() -> Option<PgPool> {
     let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_PG_URL.to_string());

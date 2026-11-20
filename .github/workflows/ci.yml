@@ -90,7 +90,7 @@ jobs:
         image: postgres:18-alpine
         env:
           POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: public_pool
+          POSTGRES_DB: blitzpool
         ports:
           # Host port 15433 = the default the tests connect to
           # (bp-test-support PG_DEFAULT_URL / BP_PG_URL).
@@ -123,7 +123,7 @@ jobs:
           PGPASSWORD: postgres
         run: |
           for f in crates/bp-db/migrations/*.sql; do
-            psql -h localhost -p 15433 -U postgres -d public_pool -v ON_ERROR_STOP=1 -f "$f"
+            psql -h localhost -p 15433 -U postgres -d blitzpool -v ON_ERROR_STOP=1 -f "$f"
           done
       # No --all-targets here: that would also RUN the criterion benches, which
       # reject `--test-threads`. Benches/examples are still COMPILE-checked by the

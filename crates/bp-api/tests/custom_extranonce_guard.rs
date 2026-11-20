@@ -14,7 +14,7 @@ use bp_api::{build_router, AppState};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use tower::ServiceExt;
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 // Two distinct valid mainnet bech32 addresses (BIP-173 test vectors).
 const GROUPED_ADDR: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";

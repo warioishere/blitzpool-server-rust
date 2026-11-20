@@ -14,7 +14,7 @@ use sqlx::{postgres::PgPoolOptions, PgPool};
 use uuid::Uuid;
 
 const REDIS_URL: &str = "redis://127.0.0.1:16379";
-const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 /// Pool-output recipient; the weight model needs one.
 const FEE_ADDR: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";

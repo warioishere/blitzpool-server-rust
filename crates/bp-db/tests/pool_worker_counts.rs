@@ -6,7 +6,7 @@
 use bp_db::{find_pool_worker_counts_since, PoolWorkerCounts};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 // Printing why an integration test skipped is what stderr is for here.
 #[allow(clippy::print_stderr)]

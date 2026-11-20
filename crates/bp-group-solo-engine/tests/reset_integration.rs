@@ -17,7 +17,7 @@ use sqlx::{postgres::PgPoolOptions, PgPool};
 use uuid::Uuid;
 
 const REDIS_URL: &str = "redis://127.0.0.1:16379";
-const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 async fn connect_or_skip(redis_db: u8) -> Option<(PgPool, ConnectionManager)> {
     let pg_url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());

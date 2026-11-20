@@ -15,7 +15,7 @@ use bp_db::{
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use uuid::Uuid;
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 const NAME_PREFIX: &str = "bp-test-teambest-";
 /// Chats: both members of the Team, one member with the switch off, an
 /// address in no Team, a member of the Team that is dissolved.

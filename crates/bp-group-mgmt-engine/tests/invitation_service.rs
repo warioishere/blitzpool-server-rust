@@ -14,7 +14,7 @@ use bp_group_mgmt_engine::{
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use uuid::Uuid;
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 /// Coinbase ceiling high enough to stay out of the way here.
 const TEST_COINBASE_CAP: u64 = 10_000;

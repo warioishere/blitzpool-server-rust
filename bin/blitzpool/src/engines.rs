@@ -662,7 +662,7 @@ mod tests {
         host = "localhost"
         user = "postgres"
         password = "postgres"
-        database = "public_pool"
+        database = "blitzpool"
 
         [redis]
         host = "localhost"

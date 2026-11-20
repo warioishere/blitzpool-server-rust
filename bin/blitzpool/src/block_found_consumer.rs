@@ -108,7 +108,7 @@ mod tests {
     use super::*;
     use crate::block_sink::{BlockFoundApplier, BlockFoundEvent, Booking};
 
-    const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+    const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
     const ADDR: &str = "bcrt1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l";
 
     fn solo_event() -> BlockFoundEvent {

@@ -18,7 +18,7 @@ use bp_group_mgmt_engine::AddressCache as PplnsAddressCache;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use tower::ServiceExt;
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 const NAME: &str = "join-link-url-test";
 const ADMIN: &str = "bc1qjoinlinkurltestadmin";
 

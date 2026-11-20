@@ -535,7 +535,7 @@ mod regtest {
     use bp_regtest_harness::RegtestNode;
     use sqlx::postgres::PgPoolOptions;
 
-    const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+    const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
     async fn pg_or_skip() -> Option<PgPool> {
         let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
