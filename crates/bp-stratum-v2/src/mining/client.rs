@@ -1634,7 +1634,7 @@ pub fn apply_template_broadcast<C: Clock>(
                     template_snapshot,
                     coinbase_stratum,
                     *mining_job.payouts_fingerprint(),
-                    Some(template.template_id),
+                    template.template_id,
                     now_ms,
                 );
 

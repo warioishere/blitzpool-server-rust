@@ -106,15 +106,22 @@ pub struct StandardJobEntry {
     pub template_snapshot: StandardTemplateSnapshot,
     /// Full non-witness coinbase, known at send-time because a Standard
     /// channel has no miner-rolled extranonce; lets the validator build the
-    /// block's coinbase without the `MiningJob`. Empty for `SetCustomMiningJob`.
+    /// block's coinbase without the `MiningJob`.
     pub coinbase_stratum: Vec<u8>,
     /// See `ExtendedJob::payouts_fingerprint`.
     pub payouts_fingerprint: [u8; 32],
-    /// `None` for `SetCustomMiningJob`-derived jobs (no pool template).
-    pub template_id: Option<u64>,
+    /// The pool template the job was built on: a Standard channel carries no
+    /// custom jobs.
+    pub template_id: u64,
     pub created_at_ms: u64,
     pub retired_at_ms: Option<u64>,
 }
+
+/// The smallest well-formed non-witness transaction (version, no inputs, no
+/// outputs, locktime): a stand-in coinbase for tests whose shares may be block
+/// candidates, which a production Standard job never stores empty.
+#[cfg(test)]
+pub(crate) const TEST_COINBASE_STRATUM: &[u8] = &[0x02, 0, 0, 0, 0x00, 0x00, 0, 0, 0, 0];
 
 /// Standard-channel jobs keyed by `job_id`. On block change [`Self::retire`]
 /// stamps entries instead of deleting them, so an in-flight share is credited
@@ -148,7 +155,7 @@ impl StandardJobMaps {
         template_snapshot: StandardTemplateSnapshot,
         coinbase_stratum: Vec<u8>,
         payouts_fingerprint: [u8; 32],
-        template_id: Option<u64>,
+        template_id: u64,
         now_ms: u64,
     ) {
         self.entries.insert(
@@ -167,6 +174,8 @@ impl StandardJobMaps {
     }
 
     #[cfg(test)]
+    /// A job like `record_send` stores, with [`TEST_COINBASE_STRATUM`] and
+    /// template 1.
     pub(crate) fn record_send_for_test(
         &mut self,
         job_id: u32,
@@ -180,9 +189,9 @@ impl StandardJobMaps {
             difficulty,
             merkle_root,
             template_snapshot,
-            Vec::new(),
+            TEST_COINBASE_STRATUM.to_vec(),
             [0u8; 32],
-            None,
+            1,
             now_ms,
         );
     }

@@ -195,11 +195,10 @@ pub struct StandardJobContext<'a> {
     /// The job's `min_ntime`; bounds the share's `ntime`.
     pub ntime_start: u32,
     pub classification: JobClassification,
-    /// `None` for `SetCustomMiningJob`-derived jobs.
-    pub template_id: Option<u64>,
+    /// The pool template the job was built on.
+    pub template_id: u64,
     /// Non-witness coinbase matching the merkle root the miner hashed, from
-    /// [`crate::mining::jobs::StandardJobEntry::coinbase_stratum`]. Empty for
-    /// a `SetCustomMiningJob`-declared job.
+    /// [`crate::mining::jobs::StandardJobEntry::coinbase_stratum`].
     pub coinbase_stratum: &'a [u8],
     /// See `ShareAccept::payouts_fingerprint`.
     pub payouts_fingerprint: [u8; 32],
@@ -349,9 +348,7 @@ pub fn validate_submit_standard(
         Err(rejected) => return rejected,
     };
 
-    // An empty `coinbase_stratum` (a `SetCustomMiningJob` job) yields no
-    // coinbase rather than malformed bytes for bitcoind.
-    let witness_coinbase = if judged.is_block_candidate && !job_ctx.coinbase_stratum.is_empty() {
+    let witness_coinbase = if judged.is_block_candidate {
         assemble_witness_coinbase(job_ctx.coinbase_stratum)
     } else {
         Vec::new()
@@ -363,7 +360,7 @@ pub fn validate_submit_standard(
         header: judged.header,
         hash: judged.pow.submission_hash,
         is_block_candidate: judged.is_block_candidate,
-        template_id: job_ctx.template_id,
+        template_id: Some(job_ctx.template_id),
         jdp_claims_the_block: false,
         payouts_fingerprint: job_ctx.payouts_fingerprint,
         witness_coinbase,
@@ -636,8 +633,8 @@ mod tests {
             n_bits: 0x1d00_ffff,
             ntime_start: 0x6500_0000,
             classification: class,
-            template_id: None,
-            coinbase_stratum: &[],
+            template_id: 1,
+            coinbase_stratum: crate::mining::jobs::TEST_COINBASE_STRATUM,
             coinbase_tx_value_remaining: 5_000_000_000,
         }
     }
@@ -1021,7 +1018,13 @@ mod tests {
         ctx.n_bits = TRIVIAL_N_BITS;
         let out = std_validate(&mut ch, &std_submission(), easy_diff(), &merkle, &ctx);
         match out {
-            ShareValidation::Accepted(a) => assert!(a.is_block_candidate),
+            ShareValidation::Accepted(a) => {
+                assert!(a.is_block_candidate);
+                assert!(
+                    !a.witness_coinbase.is_empty(),
+                    "a block candidate carries its coinbase"
+                );
+            }
             _ => panic!("expected Accept"),
         }
     }
