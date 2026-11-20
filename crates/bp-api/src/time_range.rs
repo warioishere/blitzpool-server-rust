@@ -119,6 +119,22 @@ pub fn sum_into_slots(
     fold_into_slots(boundaries, samples, |sum: &mut f64, v| *sum += v)
 }
 
+/// The hashrate chart every chart endpoint serves: one point per boundary
+/// ([`chart_slot_boundaries`]), from samples of difficulty-1 share sums; an
+/// empty slot is `0`.
+pub fn hashrate_chart(
+    boundaries: &[i64],
+    samples: impl IntoIterator<Item = (i64, f64)>,
+) -> Vec<ChartPoint> {
+    sum_into_slots(boundaries, samples)
+        .into_iter()
+        .map(|(b, diff1)| ChartPoint {
+            label: format_iso_ms(b),
+            data: slot_hashrate(diff1),
+        })
+        .collect()
+}
+
 /// The `/accepted` shape: one `{"accepted": sum}` bucket per slot.
 pub fn accepted_slot_data(
     boundaries: &[i64],

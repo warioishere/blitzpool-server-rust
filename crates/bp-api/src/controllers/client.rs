@@ -61,8 +61,8 @@ use crate::controllers::info::{
     client_reject_samples, rejected_by_reason_slots, RejectSlotsResponse,
 };
 use crate::time_range::{
-    accepted_slot_data, chart_slot_boundaries, fold_into_slots, max_difficulty_slot_data,
-    sum_into_slots, ChartPoint, Range, SlotDataResponse,
+    accepted_slot_data, chart_slot_boundaries, fold_into_slots, hashrate_chart,
+    max_difficulty_slot_data, slot_hashrate, ChartPoint, Range, SlotDataResponse,
 };
 use axum::extract::Query;
 use serde::Deserialize;
@@ -73,8 +73,6 @@ use std::collections::{BTreeMap, HashSet};
 struct RangeQuery {
     range: Option<String>,
 }
-
-use crate::time_range::slot_hashrate;
 
 async fn chart(
     State(state): State<SharedState>,
@@ -96,27 +94,13 @@ async fn chart(
                 since,
             )
             .await?;
-            Ok(chart_points(
+            Ok(hashrate_chart(
                 &chart_slot_boundaries(since),
                 rows.iter().map(|r| (r.time, r.shares as f64)),
             ))
         })
         .await?;
     Ok(JsonBytes(bytes))
-}
-
-/// Hashrate per slot, rounded to a whole H/s, one point per boundary.
-fn chart_points(
-    boundaries: &[i64],
-    samples: impl IntoIterator<Item = (i64, f64)>,
-) -> Vec<ChartPoint> {
-    sum_into_slots(boundaries, samples)
-        .into_iter()
-        .map(|(b, shares)| ChartPoint {
-            label: crate::time_range::format_iso_ms(b),
-            data: slot_hashrate(shares),
-        })
-        .collect()
 }
 
 async fn accepted(
@@ -491,39 +475,43 @@ async fn by_worker(
 
             let now = bp_common::now_ms();
             let since = now - range.window_ms();
-            let cutoff = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
             let rows = find_client_statistics_since_for_addresses(
                 &s.pool,
                 std::slice::from_ref(&addr),
                 since,
             )
             .await?;
-            let mut grouped: BTreeMap<i64, WorkerChartEntry> = BTreeMap::new();
-            for r in rows
-                .iter()
-                .filter(|r| r.client_name == worker && r.time < cutoff)
-            {
-                let entry = grouped.entry(r.time).or_insert_with(|| WorkerChartEntry {
-                    label: crate::time_range::format_iso_ms(r.time),
-                    ..Default::default()
-                });
-                entry.accepted += r.shares as f64;
-                entry.rejected_job_not_found += r.rejected_job_not_found_count as f64;
-                entry.rejected_job_not_found_diff1 += r.rejected_job_not_found_diff1 as f64;
-                entry.rejected_duplicated_share += r.rejected_duplicate_share_count as f64;
-                entry.rejected_duplicated_share_diff1 += r.rejected_duplicate_share_diff1 as f64;
-                entry.rejected_low_difficulty_share += r.rejected_low_difficulty_share_count as f64;
-                entry.rejected_low_difficulty_share_diff1 +=
-                    r.rejected_low_difficulty_share_diff1 as f64;
-                entry.rejected_version_rolling += r.rejected_version_rolling_count as f64;
-                entry.rejected_version_rolling_diff1 += r.rejected_version_rolling_diff1 as f64;
-                entry.rejected_stale += r.rejected_stale_count as f64;
-                entry.rejected_stale_diff1 += r.rejected_stale_diff1 as f64;
-            }
-            for e in grouped.values_mut() {
-                e.data = slot_hashrate(e.accepted);
-            }
-            let chart_data: Vec<WorkerChartEntry> = grouped.into_values().collect();
+            // The slot grid every chart uses, so an idle slot reads 0.
+            let slots = fold_into_slots(
+                &chart_slot_boundaries(since),
+                rows.iter()
+                    .filter(|r| r.client_name == worker)
+                    .map(|r| (r.time, r)),
+                |entry: &mut WorkerChartEntry, r| {
+                    entry.accepted += r.shares as f64;
+                    entry.rejected_job_not_found += r.rejected_job_not_found_count as f64;
+                    entry.rejected_job_not_found_diff1 += r.rejected_job_not_found_diff1 as f64;
+                    entry.rejected_duplicated_share += r.rejected_duplicate_share_count as f64;
+                    entry.rejected_duplicated_share_diff1 +=
+                        r.rejected_duplicate_share_diff1 as f64;
+                    entry.rejected_low_difficulty_share +=
+                        r.rejected_low_difficulty_share_count as f64;
+                    entry.rejected_low_difficulty_share_diff1 +=
+                        r.rejected_low_difficulty_share_diff1 as f64;
+                    entry.rejected_version_rolling += r.rejected_version_rolling_count as f64;
+                    entry.rejected_version_rolling_diff1 += r.rejected_version_rolling_diff1 as f64;
+                    entry.rejected_stale += r.rejected_stale_count as f64;
+                    entry.rejected_stale_diff1 += r.rejected_stale_diff1 as f64;
+                },
+            );
+            let chart_data: Vec<WorkerChartEntry> = slots
+                .into_iter()
+                .map(|(b, mut entry)| {
+                    entry.label = crate::time_range::format_iso_ms(b);
+                    entry.data = slot_hashrate(entry.accepted);
+                    entry
+                })
+                .collect();
             Ok(WorkerResponse {
                 name: worker,
                 best_difficulty,
@@ -571,26 +559,18 @@ async fn by_session(
                 let now = bp_common::now_ms();
                 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
                 let since = now - DAY_MS;
-                let cutoff = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
                 let rows = find_client_statistics_since_for_addresses(
                     &s.pool,
                     std::slice::from_ref(&addr),
                     since,
                 )
                 .await?;
-                let mut grouped: BTreeMap<i64, f64> = BTreeMap::new();
-                for r in rows.iter().filter(|r| {
-                    r.client_name == worker && r.session_id == session && r.time < cutoff
-                }) {
-                    *grouped.entry(r.time).or_insert(0.0) += r.shares as f64;
-                }
-                let chart_data: Vec<ChartPoint> = grouped
-                    .into_iter()
-                    .map(|(t, shares)| ChartPoint {
-                        label: crate::time_range::format_iso_ms(t),
-                        data: slot_hashrate(shares),
-                    })
-                    .collect();
+                let chart_data = hashrate_chart(
+                    &chart_slot_boundaries(since),
+                    rows.iter()
+                        .filter(|r| r.client_name == worker && r.session_id == session)
+                        .map(|r| (r.time, r.shares as f64)),
+                );
 
                 Ok(SessionResponse {
                     session_id: row.session_id,
@@ -954,7 +934,7 @@ mod tests {
     #[test]
     fn chart_json_is_unchanged() {
         assert_eq!(
-            json(&chart_points(&BOUNDARIES, share_samples())),
+            json(&hashrate_chart(&BOUNDARIES, share_samples())),
             r#"[{"label":"2023-11-14T22:20:00.000Z","data":11453246},{"label":"2023-11-14T22:30:00.000Z","data":14316558},{"label":"2023-11-14T22:40:00.000Z","data":0}]"#
         );
     }

@@ -1802,11 +1802,9 @@ use crate::controllers::info::{
     client_reject_samples, rejected_by_reason_slots, RejectSlotsResponse,
 };
 use crate::time_range::{
-    accepted_slot_data, chart_slot_boundaries, max_difficulty_slot_data, ChartPoint, Range,
-    SlotDataResponse,
+    accepted_slot_data, chart_slot_boundaries, hashrate_chart, max_difficulty_slot_data,
+    ChartPoint, Range, SlotDataResponse,
 };
-
-use crate::time_range::slot_hashrate;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1836,23 +1834,13 @@ async fn group_chart(
         .get_or_fetch::<Vec<ChartPoint>, _, ApiError>(key, TtlKind::GroupChart, async move {
             let now = bp_common::now_ms();
             let since = now - range.window_ms();
-            let cutoff = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
             let addrs = collect_group_member_addresses(&s, id).await?;
-            // Sparse: only slots that received shares get a point.
-            let mut slot_shares: std::collections::BTreeMap<i64, f64> =
-                std::collections::BTreeMap::new();
             let rows =
                 bp_db::find_client_statistics_since_for_addresses(&s.pool, &addrs, since).await?;
-            for r in rows.iter().filter(|r| r.time < cutoff) {
-                *slot_shares.entry(r.time).or_insert(0.0) += r.shares as f64;
-            }
-            Ok(slot_shares
-                .into_iter()
-                .map(|(t, shares)| ChartPoint {
-                    label: crate::time_range::format_iso_ms(t),
-                    data: slot_hashrate(shares),
-                })
-                .collect())
+            Ok(hashrate_chart(
+                &chart_slot_boundaries(since),
+                rows.iter().map(|r| (r.time, r.shares as f64)),
+            ))
         })
         .await?;
     Ok(JsonBytes(bytes))

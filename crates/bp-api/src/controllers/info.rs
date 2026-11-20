@@ -806,8 +806,8 @@ fn format_uptime(ms: u64) -> String {
 // The in-progress slot is excluded so the chart never ends half-filled.
 
 use crate::time_range::{
-    accepted_slot_data, chart_slot_boundaries, fold_into_slots, max_difficulty_slot_data,
-    ChartPoint, Range, SlotDataResponse,
+    accepted_slot_data, chart_slot_boundaries, fold_into_slots, hashrate_chart,
+    max_difficulty_slot_data, ChartPoint, Range, SlotDataResponse,
 };
 use axum::extract::Query;
 use serde::Deserialize;
@@ -818,8 +818,6 @@ use std::collections::BTreeMap;
 struct RangeQuery {
     range: Option<String>,
 }
-
-use crate::time_range::slot_hashrate;
 
 async fn chart(
     State(state): State<SharedState>,
@@ -833,17 +831,11 @@ async fn chart(
         .get_or_fetch::<Vec<ChartPoint>, _, ApiError>(key, TtlKind::Chart, async move {
             let now = bp_common::now_ms();
             let since = now - range.window_ms();
-            let cutoff = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
             let rows = bp_db::find_pool_share_statistics_since(&s.pool, since).await?;
-            // The UI fills gaps itself.
-            Ok(rows
-                .into_iter()
-                .filter(|r| r.time < cutoff)
-                .map(|r| ChartPoint {
-                    label: crate::time_range::format_iso_ms(r.time),
-                    data: slot_hashrate(r.accepted as f64),
-                })
-                .collect())
+            Ok(hashrate_chart(
+                &chart_slot_boundaries(since),
+                rows.iter().map(|r| (r.time, r.accepted as f64)),
+            ))
         })
         .await?;
     Ok(JsonBytes(bytes))
@@ -1321,26 +1313,19 @@ async fn chart_mode(
         Ok(m) => m,
         Err(_) => return Ok(Json(Vec::new())),
     };
-    // Narrower than the shared `Range::parse`: {1d, 3d, 7d}, default `7d`.
-    let (window_ms, _slot) = match q.range.as_deref().unwrap_or("7d") {
-        "1d" => (24 * 60 * 60 * 1000_i64, 600_000_i64),
-        "3d" => (3 * 24 * 60 * 60 * 1000_i64, 600_000_i64),
-        _ => (7 * 24 * 60 * 60 * 1000_i64, 600_000_i64),
-    };
-    let since = bp_common::now_ms() - window_ms;
-    let cutoff_slot = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
+    // Defaults to the week the stats page shows.
+    let range = Range::parse(Some(q.range.as_deref().unwrap_or("7d")))?;
+    let since = bp_common::now_ms() - range.window_ms();
     let rows = find_pool_mode_hashrate_since(&state.pool, mode, since).await?;
-    Ok(Json(
-        rows.into_iter()
-            .filter(|r| r.time < cutoff_slot)
-            .map(|r| ChartPoint {
-                label: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(r.time)
-                    .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-                    .unwrap_or_default(),
-                data: slot_hashrate(r.diff as f64),
-            })
-            .collect(),
-    ))
+    // A mode nobody mined in the window answers `[]`: the stats page reads an
+    // empty series as "mode inactive" and leaves it out of the chart.
+    if rows.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+    Ok(Json(hashrate_chart(
+        &chart_slot_boundaries(since),
+        rows.iter().map(|r| (r.time, r.diff as f64)),
+    )))
 }
 
 #[cfg(test)]

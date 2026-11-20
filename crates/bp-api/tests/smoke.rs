@@ -209,10 +209,9 @@ async fn invitation_returns_503_when_service_unwired() {
 }
 
 #[tokio::test]
-async fn info_chart_empty_db_returns_empty_array() {
-    // `/api/info/chart` emits sparse data: one ChartPoint per DB row
-    // that falls in the window, no pre-filled zero buckets. Empty
-    // DB therefore returns `[]`, not the slot-aligned skeleton.
+async fn info_chart_empty_db_answers_a_zero_per_slot() {
+    // `/api/info/chart` answers one point per slot of the window, as every
+    // chart does; with no rows each one is zero.
     let Some(pool) = connect_or_skip().await else {
         return;
     };
@@ -227,13 +226,13 @@ async fn info_chart_empty_db_returns_empty_array() {
         .await
         .expect("oneshot");
     assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let arr = json.as_array().expect("array");
+    assert!(!arr.is_empty(), "one point per slot");
     assert!(
-        arr.is_empty(),
-        "expected empty array, got {} entries",
-        arr.len()
+        arr.iter().all(|p| p["data"].as_f64() == Some(0.0)),
+        "an empty window is all zero: {json}"
     );
 }
 
@@ -596,18 +595,22 @@ async fn worker_chart_breaks_rejects_down_by_every_reason() {
         .await
         .expect("oneshot");
     let status = resp.status();
-    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
 
     // Clean up before asserting, so a failure doesn't poison the next run.
     purge_probe(&pool, addr, worker, session).await;
 
     assert_eq!(status, StatusCode::OK);
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    // The slot the row was seeded in; the others of the window are zero.
     let entry = json["chartData"]
         .as_array()
-        .and_then(|a| a.first())
+        .and_then(|a| {
+            a.iter()
+                .find(|e| e["accepted"].as_f64().is_some_and(|v| v > 0.0))
+        })
         .cloned()
-        .unwrap_or_else(|| panic!("no chartData in {json}"));
+        .unwrap_or_else(|| panic!("no seeded slot in {json}"));
 
     let n = |k: &str| -> f64 {
         entry
