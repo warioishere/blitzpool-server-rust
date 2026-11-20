@@ -279,6 +279,9 @@ async fn run_connection(
         }
     }
     let mut current_template = initial_template;
+    // Set while the next notify must clean the miner's jobs; see
+    // `TemplateBroadcast::for_next_job`.
+    let mut owes_new_block = false;
     // A fee refresh reaches this connection within `REFRESH_SPREAD`, at its
     // own offset, so the pool does not send it to every miner at once.
     let mut refresh_pacer = RefreshPacer::new(
@@ -510,12 +513,16 @@ async fn run_connection(
             broadcast = refresh_pacer.next(&mut template_rx) => {
                 let payload = match broadcast {
                     Ok(p) => p,
+                    // A skipped broadcast may have been the block change: the
+                    // next notify cleans the jobs.
                     Err(broadcast::error::RecvError::Lagged(_)) => {
+                        owes_new_block |= state.authorization.is_some();
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
                 current_template = Some(payload.template.clone());
+                let payload = payload.for_next_job(&mut owes_new_block);
                 let clean_jobs = matches!(payload.change, TemplateChange::NewBlock);
                 let payouts = resolve_payouts_for_state(&state, &hooks, &payload.template).await;
                 let outcome = apply_new_template(
@@ -529,6 +536,11 @@ async fn run_connection(
                     clean_jobs,
                     SystemClock.now_ms(),
                 );
+                // A block change that sent no notify (no payouts, or the job
+                // build failed) leaves the tip owed to the next one.
+                if clean_jobs && outcome.outbound_frames.is_empty() {
+                    owes_new_block = state.authorization.is_some();
+                }
                 if !apply_outcome(
                     outcome,
                     &mut state,
@@ -1368,7 +1380,7 @@ mod tests {
     }
 
     /// One connection on a server with `hooks`, subscribed and authorized for
-    /// `AUTH_ADDR`. Returns the lines read up to the authorize answer.
+    /// `AUTH_ADDR`. Returns the authorize answer, and the server's TDP feed.
     async fn connect_and_authorize(
         hooks: ServerHooks,
     ) -> (
@@ -1376,11 +1388,12 @@ mod tests {
         tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
         tokio::net::tcp::OwnedWriteHalf,
         String,
+        broadcast::Sender<TemplateUpdate>,
     ) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::{TcpListener, TcpStream};
 
-        let (_updates_tx, updates_rx) = broadcast::channel(8);
+        let (updates_tx, updates_rx) = broadcast::channel(8);
         let server = StratumV1Server::spawn(
             server_cfg(),
             updates_rx,
@@ -1423,7 +1436,120 @@ mod tests {
                 break;
             }
         }
-        (server, reader, write, answer)
+        (server, reader, write, answer, updates_tx)
+    }
+
+    /// Pays the miner while `paying`, else resolves no payouts (no job) and
+    /// counts it in `unpaid`.
+    #[derive(Default)]
+    struct SwitchablePayouts {
+        paying: std::sync::atomic::AtomicBool,
+        unpaid: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SwitchablePayouts {
+        fn pay(&self, paying: bool) {
+            self.paying
+                .store(paying, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Wait until `n` templates in all were resolved without payouts.
+        async fn await_unpaid(&self, n: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while self.unpaid.load(std::sync::atomic::Ordering::SeqCst) < n {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the jobless template must be resolved within 5 s");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl bp_mining_job::PayoutResolver for SwitchablePayouts {
+        async fn resolve_payouts(
+            &self,
+            miner_address: &bp_common::AddressId,
+            reward_sats: u64,
+        ) -> ResolvedPayouts {
+            if !self.paying.load(std::sync::atomic::Ordering::SeqCst) {
+                self.unpaid
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return ResolvedPayouts::unsnapshotted(Vec::new());
+            }
+            ResolvedPayouts::unsnapshotted(vec![bp_mining_job::PayoutEntry {
+                address: miner_address.as_str().to_string(),
+                sats: reward_sats,
+            }])
+        }
+    }
+
+    /// The `clean_jobs` flag of the next `mining.notify` on `reader`.
+    async fn next_notify_clean_jobs(
+        reader: &mut tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+    ) -> bool {
+        use tokio::io::AsyncBufReadExt;
+        loop {
+            let mut line = String::new();
+            let read = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                reader.read_line(&mut line),
+            )
+            .await
+            .expect("a mining.notify within 5 s")
+            .unwrap();
+            assert!(read > 0, "connection closed before a mining.notify");
+            let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if frame["method"] == "mining.notify" {
+                return frame["params"][8].as_bool().expect("clean_jobs flag");
+            }
+        }
+    }
+
+    /// A block change that brings the miner no job leaves the tip owed: the
+    /// next notify cleans the jobs even though it carries only a refresh. A
+    /// refresh that brings no job either keeps the debt.
+    #[tokio::test]
+    async fn a_block_change_without_a_job_owes_the_next_notify_clean_jobs() {
+        let payouts = Arc::new(SwitchablePayouts::default());
+        payouts.pay(true);
+        let mut hooks = ServerHooks::no_op();
+        hooks.payout_resolver = payouts.clone();
+        let (server, mut reader, _write, answer, updates_tx) = connect_and_authorize(hooks).await;
+        assert!(
+            answer.contains("true"),
+            "precondition: authorized, got {answer}"
+        );
+
+        updates_tx.send(dummy_new_template(1, true)).unwrap();
+        updates_tx.send(dummy_prev_hash_with(1, 0xAB)).unwrap();
+        assert!(next_notify_clean_jobs(&mut reader).await, "block 1 cleans");
+
+        // Block 2, then a refresh on its tip, both resolve no payouts: no
+        // notify goes out for either.
+        payouts.pay(false);
+        updates_tx.send(dummy_new_template(2, true)).unwrap();
+        updates_tx.send(dummy_prev_hash_with(2, 0xCD)).unwrap();
+        payouts.await_unpaid(1).await;
+        updates_tx.send(dummy_new_template(3, false)).unwrap();
+        payouts.await_unpaid(2).await;
+
+        // The first job since block 2 owes the tip.
+        payouts.pay(true);
+        updates_tx.send(dummy_new_template(4, false)).unwrap();
+        assert!(
+            next_notify_clean_jobs(&mut reader).await,
+            "the first job after a jobless block change must clean the old tip's jobs"
+        );
+
+        // Announced once: the next refresh keeps the jobs.
+        updates_tx.send(dummy_new_template(5, false)).unwrap();
+        assert!(
+            !next_notify_clean_jobs(&mut reader).await,
+            "a plain refresh keeps them"
+        );
+
+        server.shutdown().await;
     }
 
     /// An address admission refuses gets `Unauthorized worker` with the
@@ -1434,7 +1560,7 @@ mod tests {
         let recording = RecordingHooks::new();
         let mut hooks = recording.as_server_hooks();
         hooks.admission = Arc::new(RefuseAll);
-        let (server, mut reader, _write, answer) = connect_and_authorize(hooks).await;
+        let (server, mut reader, _write, answer, _updates_tx) = connect_and_authorize(hooks).await;
 
         assert!(
             answer.contains("24"),
@@ -1468,7 +1594,8 @@ mod tests {
             session_kicks: kicks.clone(),
             ..ServerHooks::no_op()
         };
-        let (server, mut reader, mut write, answer) = connect_and_authorize(hooks).await;
+        let (server, mut reader, mut write, answer, _updates_tx) =
+            connect_and_authorize(hooks).await;
         assert!(
             answer.contains("true"),
             "precondition: authorized, got {answer}"

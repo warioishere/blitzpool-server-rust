@@ -40,6 +40,24 @@ impl<A> Clone for TemplateBroadcast<A> {
     }
 }
 
+impl<A> TemplateBroadcast<A> {
+    /// The broadcast a connection's next job goes out under: a block change
+    /// while `owes_new_block` is set, which this clears. A connection owes one
+    /// when it skipped broadcasts, got no job for a block change, or (SV2) got
+    /// no first job at channel open; its next job must then announce the tip,
+    /// or the miner keeps hashing the old one.
+    pub fn for_next_job(self, owes_new_block: &mut bool) -> Self {
+        if std::mem::take(owes_new_block) {
+            Self {
+                template: self.template,
+                change: TemplateChange::NewBlock,
+            }
+        } else {
+            self
+        }
+    }
+}
+
 /// One connection's claim on a stream: its own broadcast receiver plus the
 /// template to boot from.
 pub struct StreamHandle<A> {
@@ -343,6 +361,27 @@ mod tests {
 
         cancel.cancel();
         streams.drain(WAIT).await;
+    }
+
+    /// An owed block change turns the next job's broadcast into one, once;
+    /// without one owed, the broadcast passes unchanged.
+    #[test]
+    fn for_next_job_announces_an_owed_block_change_once() {
+        let refresh = || TemplateBroadcast {
+            template: Arc::new(7u32),
+            change: TemplateChange::Refresh,
+        };
+        let mut owes = true;
+        assert_eq!(
+            refresh().for_next_job(&mut owes).change,
+            TemplateChange::NewBlock
+        );
+        assert!(!owes, "announced once");
+        assert_eq!(
+            refresh().for_next_job(&mut owes).change,
+            TemplateChange::Refresh
+        );
+        assert_eq!(*refresh().for_next_job(&mut owes).template, 7);
     }
 
     /// Cancelling stops every translator promptly.

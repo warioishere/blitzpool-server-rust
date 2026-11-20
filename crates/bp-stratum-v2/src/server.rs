@@ -754,7 +754,7 @@ async fn run_mining_connection(
                         }
                     }
                 };
-                let payload = broadcast_for_job(payload, &mut owes_new_block);
+                let payload = payload.for_next_job(&mut owes_new_block);
                 // Runs BEFORE the job build so the new job pins a changed
                 // custom extranonce prefix.
                 let mut en_frames = custom_extranonce_broadcast_frames(&mut state, &hooks);
@@ -860,20 +860,6 @@ fn open_channel_refusal(outbound: &[OutboundFrame]) -> Option<&str> {
 }
 
 // ── Dispatch + Outbound write helpers ───────────────────────────────
-
-/// The broadcast a connection's pool job goes out under: a block change
-/// (future job, then `SetNewPrevHash`) while the connection owes one, since
-/// a job carries no prev hash and the miner would hash the old tip.
-fn broadcast_for_job(payload: TemplateBroadcast, owes_new_block: &mut bool) -> TemplateBroadcast {
-    if std::mem::take(owes_new_block) {
-        TemplateBroadcast {
-            template: payload.template,
-            change: TemplateChange::NewBlock,
-        }
-    } else {
-        payload
-    }
-}
 
 /// A broadcast this connection gets no pool job for (its payouts did not
 /// resolve): a block change still retires the old tip's jobs and leaves the
@@ -2185,12 +2171,16 @@ mod tests {
         assert!(owes, "the block change is owed");
 
         assert_eq!(
-            broadcast_for_job(broadcast(TemplateChange::Refresh), &mut owes).change,
+            broadcast(TemplateChange::Refresh)
+                .for_next_job(&mut owes)
+                .change,
             TemplateChange::NewBlock
         );
         assert!(!owes, "announced once");
         assert_eq!(
-            broadcast_for_job(broadcast(TemplateChange::Refresh), &mut owes).change,
+            broadcast(TemplateChange::Refresh)
+                .for_next_job(&mut owes)
+                .change,
             TemplateChange::Refresh
         );
     }
