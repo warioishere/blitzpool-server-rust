@@ -38,8 +38,13 @@ use super::submit::{
     ShareAccept, ShareReject, ShareValidation, StandardJobContext, SubmitSharesExtendedInput,
     SubmitSharesStandardInput,
 };
-use super::translator::TemplateBroadcast;
 use bp_template_distribution::TemplateChange;
+
+/// What the translators broadcast to the per-connection tasks. Job frames are
+/// built per channel here, since each depends on the channel's extranonce
+/// prefix.
+pub type TemplateBroadcast =
+    bp_template_distribution::TemplateBroadcast<bp_template_distribution::ActiveTemplate>;
 
 // ── SetupConnection flags ──────────────────────────────────────────
 // (BIP-310 / SV2 Mining/SetupConnection Flags for Mining Protocol)
@@ -3825,7 +3830,6 @@ pub(crate) mod tests {
 
     // ── apply_template_broadcast ───────────────────────────────────
 
-    use crate::mining::translator::TemplateBroadcast;
     use bp_mining_job::PayoutEntry;
     use bp_template_distribution::{ActiveTemplate, TemplateChange};
 

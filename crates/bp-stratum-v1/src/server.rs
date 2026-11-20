@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! SV1 server: a translator task per template stream turns TDP updates into
-//! [`ActiveSV1Template`] broadcasts plus a snapshot for new connections, and one
-//! task per connection drives its [`SessionState`]. One [`CancellationToken`]
-//! stops them all.
+//! SV1 server: a translator task per template stream ([`TemplateStreams`])
+//! turns TDP updates into [`ActiveSV1Template`] broadcasts plus a snapshot for
+//! new connections, and one task per connection drives its [`SessionState`].
+//! One [`CancellationToken`] stops them all.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bp_common::SharedExtranonceAllocator;
 use bp_common::StreamKind;
@@ -35,7 +35,7 @@ use crate::jobs::JobRegistry;
 use crate::notify::ActiveSV1Template;
 use bp_mining_job::{MiningJobCache, ResolvedPayouts};
 use bp_template_distribution::{
-    PacedBroadcast, RefreshPacer, TemplateAssembler, TemplateChange, REFRESH_SPREAD,
+    RefreshPacer, StreamHandle, TemplateChange, TemplateStreams, REFRESH_SPREAD,
 };
 use bp_vardiff::{Clock, SystemClock};
 
@@ -100,22 +100,8 @@ impl Drop for PrefixGuard {
     }
 }
 
-/// Broadcast payload from translator → per-connection tasks.
-#[derive(Clone, Debug)]
-pub(crate) struct TemplateBroadcast {
-    /// `Arc` so each connected session gets a refcount bump, not a deep copy.
-    pub template: Arc<ActiveSV1Template>,
-    pub change: TemplateChange,
-}
-
-impl PacedBroadcast for TemplateBroadcast {
-    fn template_change(&self) -> TemplateChange {
-        self.change
-    }
-}
-
-/// A lagged connection skips the missed broadcasts and continues with the next one.
-const TEMPLATE_BROADCAST_CAPACITY: usize = 32;
+/// What the translators broadcast to the per-connection tasks.
+pub(crate) type TemplateBroadcast = bp_template_distribution::TemplateBroadcast<ActiveSV1Template>;
 
 /// Cheap to clone. [`Self::shutdown`] is the only clean way to stop the translators.
 #[derive(Clone)]
@@ -127,76 +113,14 @@ struct Inner {
     server_config: Arc<ServerConfig>,
     registry: Arc<JobRegistry>,
     hooks: ServerHooks,
-    // PPLNS stream: every connection boots here before its payout mode resolves.
-    pplns_stream: TemplateStream,
-    // Fixed-reservation streams; a connection switches onto one at
-    // `mining.authorize` when its address resolves to that mode.
-    alt_streams: HashMap<StreamKind, TemplateStream>,
+    /// A connection boots on the PPLNS stream and switches onto an alt one at
+    /// `mining.authorize` when its address resolves to that mode.
+    templates: TemplateStreams<ActiveSV1Template>,
     extranonce: SharedExtranonce,
     /// Shared across ports: they ride the same TDP streams, so cache keys match
     /// and a coinbase is built once per template, not once per connection.
     job_cache: Arc<MiningJobCache>,
     cancel: CancellationToken,
-    /// One translator per stream, PPLNS first; drained once on shutdown.
-    translator_joins: Mutex<Vec<JoinHandle<()>>>,
-}
-
-/// One template stream: the broadcast sender connections subscribe to + the
-/// current-template snapshot a freshly-routed connection boots from.
-struct TemplateStream {
-    template_tx: broadcast::Sender<TemplateBroadcast>,
-    current_template: Arc<Mutex<Option<Arc<ActiveSV1Template>>>>,
-}
-
-impl TemplateStream {
-    /// Start the stream's translator off its TDP feed. All translators drive
-    /// the same registry; safe because `cleanup_for_tip` is keyed on
-    /// prev-hash and thus order-independent across streams.
-    fn spawn(
-        updates_rx: broadcast::Receiver<TemplateUpdate>,
-        initial_snapshot: bp_template_distribution::TemplateSnapshot,
-        registry: &Arc<JobRegistry>,
-        job_cache: &Arc<MiningJobCache>,
-        cancel: &CancellationToken,
-    ) -> (Self, JoinHandle<()>) {
-        let (template_tx, _) = broadcast::channel(TEMPLATE_BROADCAST_CAPACITY);
-        let current_template = Arc::new(Mutex::new(None::<Arc<ActiveSV1Template>>));
-        let join = tokio::spawn(run_translator(
-            updates_rx,
-            initial_snapshot,
-            template_tx.clone(),
-            current_template.clone(),
-            registry.clone(),
-            job_cache.clone(),
-            cancel.clone(),
-        ));
-        let stream = Self {
-            template_tx,
-            current_template,
-        };
-        (stream, join)
-    }
-
-    fn current(&self) -> Option<Arc<ActiveSV1Template>> {
-        self.current_template
-            .lock()
-            .expect("current_template mutex poisoned")
-            .clone()
-    }
-
-    /// A connection's own subscription plus the snapshot to boot from.
-    fn handle(&self) -> StreamHandle {
-        StreamHandle {
-            rx: self.template_tx.subscribe(),
-            initial: self.current(),
-        }
-    }
-}
-
-/// One connection's receiver plus boot snapshot for a stream.
-struct StreamHandle {
-    rx: broadcast::Receiver<TemplateBroadcast>,
-    initial: Option<Arc<ActiveSV1Template>>,
 }
 
 impl StratumV1Server {
@@ -220,33 +144,38 @@ impl StratumV1Server {
         let registry = Arc::new(JobRegistry::from_server_config(&server_config));
         let cancel = CancellationToken::new();
 
-        let (pplns_stream, pplns_join) =
-            TemplateStream::spawn(updates_rx, initial_snapshot, &registry, &job_cache, &cancel);
-        let mut translator_joins = vec![pplns_join];
-        let mut alt_map = HashMap::with_capacity(alt_streams.len());
-        for (kind, alt_updates_rx, alt_initial_snapshot) in alt_streams {
-            let (stream, join) = TemplateStream::spawn(
-                alt_updates_rx,
-                alt_initial_snapshot,
-                &registry,
-                &job_cache,
-                &cancel,
-            );
-            translator_joins.push(join);
-            alt_map.insert(kind, stream);
-        }
+        let on_active = {
+            let registry = Arc::clone(&registry);
+            let job_cache = Arc::clone(&job_cache);
+            move |active: &ActiveSV1Template| {
+                // Before the broadcast, so a fast subscriber's new job is never
+                // raced by a trailing pass; keeps the registry bounded. Every
+                // stream's translator drives the one registry, which is safe
+                // because `cleanup_for_tip` is keyed on prev-hash.
+                registry.cleanup_for_tip(&active.prev_hash, SystemClock.now_ms());
+                // Runs even with no miner connected, so stale entries do not
+                // wait for the next lookup.
+                job_cache.prune_expired();
+            }
+        };
+        let templates = TemplateStreams::spawn(
+            "sv1",
+            updates_rx,
+            initial_snapshot,
+            alt_streams,
+            &cancel,
+            on_active,
+        );
 
         Self {
             inner: Arc::new(Inner {
                 server_config,
                 registry,
                 hooks,
-                pplns_stream,
-                alt_streams: alt_map,
+                templates,
                 extranonce,
                 job_cache,
                 cancel,
-                translator_joins: Mutex::new(translator_joins),
             }),
         }
     }
@@ -258,23 +187,20 @@ impl StratumV1Server {
     /// Lets a caller gate accepting connections on a template being ready, so
     /// every new miner gets a `mining.notify` right after the handshake.
     pub fn current_template(&self) -> Option<Arc<ActiveSV1Template>> {
-        self.inner.pplns_stream.current()
+        self.inner.templates.current()
     }
 
     pub fn accept_connection(&self, socket: TcpStream, port_config: PortConfig) -> JoinHandle<()> {
         let server_config = self.inner.server_config.clone();
         let registry = self.inner.registry.clone();
         let hooks = self.inner.hooks.clone();
-        let StreamHandle {
-            rx: template_rx,
-            initial: initial_template,
-        } = self.inner.pplns_stream.handle();
-        let alt_streams: HashMap<StreamKind, StreamHandle> = self
-            .inner
-            .alt_streams
-            .iter()
-            .map(|(kind, alt)| (*kind, alt.handle()))
-            .collect();
+        let (
+            StreamHandle {
+                rx: template_rx,
+                initial: initial_template,
+            },
+            alt_streams,
+        ) = self.inner.templates.handles();
         let cancel = self.inner.cancel.clone();
         let extranonce = self.inner.extranonce.clone();
         let job_cache = self.inner.job_cache.clone();
@@ -298,97 +224,10 @@ impl StratumV1Server {
     /// translator up to [`ServerConfig::shutdown_drain_timeout`].
     pub async fn shutdown(&self) {
         self.inner.cancel.cancel();
-        let handles = std::mem::take(
-            &mut *self
-                .inner
-                .translator_joins
-                .lock()
-                .expect("translator_joins mutex poisoned"),
-        );
-        let drain_timeout = self.inner.server_config.shutdown_drain_timeout;
-        for h in handles {
-            match tokio::time::timeout(drain_timeout, h).await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => warn!("sv1 translator task panicked during shutdown: {err}"),
-                Err(_) => warn!("sv1 translator didn't drain within {drain_timeout:?}, detaching"),
-            }
-        }
-    }
-}
-
-// ── Translator task ──────────────────────────────────────────────────
-
-async fn run_translator(
-    mut updates_rx: broadcast::Receiver<TemplateUpdate>,
-    initial_snapshot: bp_template_distribution::TemplateSnapshot,
-    template_tx: broadcast::Sender<TemplateBroadcast>,
-    current_template: Arc<Mutex<Option<Arc<ActiveSV1Template>>>>,
-    registry: Arc<JobRegistry>,
-    job_cache: Arc<MiningJobCache>,
-    cancel: CancellationToken,
-) {
-    let mut assembler = TemplateAssembler::<ActiveSV1Template>::new();
-
-    // Without this, current_template stays None until the next block: the
-    // startup pair usually goes out before this subscriber exists.
-    if let Some((active, change)) = assembler.bootstrap_from_snapshot(initial_snapshot) {
-        let active = Arc::new(active);
-        {
-            let mut guard = current_template
-                .lock()
-                .expect("current_template mutex poisoned");
-            *guard = Some(active.clone());
-        }
-        registry.cleanup_for_tip(&active.prev_hash, SystemClock.now_ms());
-        let _ = template_tx.send(TemplateBroadcast {
-            template: active,
-            change,
-        });
-    }
-
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                debug!("sv1 translator shutting down");
-                return;
-            }
-            update = updates_rx.recv() => {
-                let update = match update {
-                    Ok(u) => u,
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        // Recovers with the next NewTemplate/SetNewPrevHash pair.
-                        warn!("sv1 translator lagged {n} TDP updates");
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        debug!("sv1 translator: TDP source closed");
-                        return;
-                    }
-                };
-                if let Some(change) = assembler.apply(&update) {
-                    if let Some(active) = assembler.current().cloned() {
-                        let active = Arc::new(active);
-                        {
-                            let mut guard = current_template
-                                .lock()
-                                .expect("current_template mutex poisoned");
-                            *guard = Some(active.clone());
-                        }
-                        // Before the send, so a fast subscriber's new job is
-                        // never raced by a trailing pass. This keeps the registry bounded.
-                        registry.cleanup_for_tip(&active.prev_hash, SystemClock.now_ms());
-                        // Runs even with no miner connected, so stale entries
-                        // do not wait for the next lookup.
-                        job_cache.prune_expired();
-                        // Errors only without subscribers; new connections use the snapshot.
-                        let _ = template_tx.send(TemplateBroadcast {
-                            template: active,
-                            change,
-                        });
-                    }
-                }
-            }
-        }
+        self.inner
+            .templates
+            .drain(self.inner.server_config.shutdown_drain_timeout)
+            .await;
     }
 }
 
@@ -404,7 +243,7 @@ async fn run_connection(
     registry: Arc<JobRegistry>,
     mut template_rx: broadcast::Receiver<TemplateBroadcast>,
     initial_template: Option<Arc<ActiveSV1Template>>,
-    mut alt_streams: HashMap<StreamKind, StreamHandle>,
+    mut alt_streams: HashMap<StreamKind, StreamHandle<ActiveSV1Template>>,
     hooks: ServerHooks,
     socket: TcpStream,
     cancel: CancellationToken,
@@ -1031,10 +870,6 @@ mod tests {
         })
     }
 
-    fn dummy_prev_hash(template_id: u64) -> TemplateUpdate {
-        dummy_prev_hash_with(template_id, 0xAB)
-    }
-
     fn dummy_prev_hash_with(template_id: u64, prev_byte: u8) -> TemplateUpdate {
         TemplateUpdate::SetNewPrevHash(SetNewPrevHash {
             template_id,
@@ -1087,122 +922,24 @@ mod tests {
 
     // ── Translator task ───────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn translator_paires_new_template_and_set_new_prev_hash() {
-        let (updates_tx, updates_rx) = broadcast::channel(8);
-        let (template_tx, mut template_rx) = broadcast::channel(8);
-        let current = Arc::new(Mutex::new(None));
-        let cancel = CancellationToken::new();
-        let join = tokio::spawn(run_translator(
-            updates_rx,
-            bp_template_distribution::TemplateSnapshot::default(),
-            template_tx,
-            current.clone(),
-            Arc::new(JobRegistry::from_server_config(&server_cfg())),
-            Arc::new(MiningJobCache::new()),
-            cancel.clone(),
-        ));
-
-        // NewTemplate(future) alone → no broadcast (cached).
-        updates_tx.send(dummy_new_template(1, true)).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert!(template_rx.try_recv().is_err());
-
-        // SetNewPrevHash → pair, broadcast NewBlock.
-        updates_tx.send(dummy_prev_hash(1)).unwrap();
-        let payload =
-            tokio::time::timeout(std::time::Duration::from_millis(100), template_rx.recv())
-                .await
-                .expect("must broadcast")
-                .expect("must succeed");
-        assert_eq!(payload.change, TemplateChange::NewBlock);
-        assert_eq!(payload.template.template_id, 1);
-        // Snapshot updated.
-        assert!(current.lock().unwrap().is_some());
-
-        cancel.cancel();
-        join.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn translator_emits_refresh_on_non_future_template() {
-        let (updates_tx, updates_rx) = broadcast::channel(8);
-        let (template_tx, mut template_rx) = broadcast::channel(8);
-        let current = Arc::new(Mutex::new(None));
-        let cancel = CancellationToken::new();
-        let join = tokio::spawn(run_translator(
-            updates_rx,
-            bp_template_distribution::TemplateSnapshot::default(),
-            template_tx,
-            current.clone(),
-            Arc::new(JobRegistry::from_server_config(&server_cfg())),
-            Arc::new(MiningJobCache::new()),
-            cancel.clone(),
-        ));
-
-        // Pair to activate.
-        updates_tx.send(dummy_new_template(1, true)).unwrap();
-        updates_tx.send(dummy_prev_hash(1)).unwrap();
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), template_rx.recv())
-            .await
-            .unwrap();
-
-        // Now a non-future template → Refresh.
-        updates_tx.send(dummy_new_template(2, false)).unwrap();
-        let payload =
-            tokio::time::timeout(std::time::Duration::from_millis(100), template_rx.recv())
-                .await
-                .expect("refresh must broadcast")
-                .unwrap();
-        assert_eq!(payload.change, TemplateChange::Refresh);
-        assert_eq!(payload.template.template_id, 2);
-
-        cancel.cancel();
-        join.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn translator_exits_on_cancel() {
-        let (_updates_tx, updates_rx) = broadcast::channel(8);
-        let (template_tx, _template_rx) = broadcast::channel(8);
-        let current = Arc::new(Mutex::new(None));
-        let cancel = CancellationToken::new();
-        let join = tokio::spawn(run_translator(
-            updates_rx,
-            bp_template_distribution::TemplateSnapshot::default(),
-            template_tx,
-            current,
-            Arc::new(JobRegistry::from_server_config(&server_cfg())),
-            Arc::new(MiningJobCache::new()),
-            cancel.clone(),
-        ));
-        cancel.cancel();
-        // Must exit promptly.
-        tokio::time::timeout(std::time::Duration::from_millis(200), join)
-            .await
-            .expect("translator must exit on cancel")
-            .unwrap();
-    }
-
-    /// Pins that a block change retires old-tip jobs and a later same-tip pass spares new ones.
+    /// The server's translator retires old-tip jobs on a block change, and a
+    /// later same-tip pass spares new ones.
     #[tokio::test]
     async fn translator_retires_previous_tip_entries_on_new_block() {
         use crate::jobs::JobClassification;
 
         let (updates_tx, updates_rx) = broadcast::channel(8);
-        let (template_tx, mut template_rx) = broadcast::channel(8);
-        let current = Arc::new(Mutex::new(None));
-        let registry = Arc::new(JobRegistry::from_server_config(&server_cfg()));
-        let cancel = CancellationToken::new();
-        let join = tokio::spawn(run_translator(
+        let server = StratumV1Server::spawn(
+            server_cfg(),
             updates_rx,
             bp_template_distribution::TemplateSnapshot::default(),
-            template_tx,
-            current,
-            registry.clone(),
+            Vec::new(),
+            ServerHooks::no_op(),
+            SharedExtranonce::new(),
             Arc::new(MiningJobCache::new()),
-            cancel.clone(),
-        ));
+        );
+        let registry = Arc::clone(server.job_registry());
+        let mut template_rx = server.inner.templates.subscribe();
 
         // Block 1 (prev 0xAB) → a connection registers a job on it.
         updates_tx.send(dummy_new_template(1, true)).unwrap();
@@ -1253,8 +990,7 @@ mod tests {
             "a later same-tip pass must not retire fresh new-tip jobs"
         );
 
-        cancel.cancel();
-        join.await.unwrap();
+        server.shutdown().await;
     }
 
     // ── process_event hook fan-out ────────────────────────────────────
@@ -1436,30 +1172,6 @@ mod tests {
     }
 
     // ── Smoke test: spawn + shutdown ─────────────────────────────────
-
-    /// A translator that never exits must not hold the shutdown.
-    #[tokio::test]
-    async fn shutdown_detaches_a_translator_that_does_not_drain() {
-        let (_updates_tx, updates_rx) = broadcast::channel(8);
-        let server = StratumV1Server::spawn(
-            server_cfg(),
-            updates_rx,
-            bp_template_distribution::TemplateSnapshot::default(),
-            Vec::new(),
-            ServerHooks::no_op(),
-            SharedExtranonce::new(),
-            Arc::new(MiningJobCache::new()),
-        );
-        server
-            .inner
-            .translator_joins
-            .lock()
-            .unwrap()
-            .push(tokio::spawn(std::future::pending::<()>()));
-        tokio::time::timeout(std::time::Duration::from_secs(10), server.shutdown())
-            .await
-            .expect("shutdown must give up on a translator after the drain timeout");
-    }
 
     #[tokio::test]
     async fn server_spawn_and_shutdown_is_clean() {

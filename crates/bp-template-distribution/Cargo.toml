@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 bitcoin_core_sv2 = { workspace = true }
+bp-common = { workspace = true }
 stratum-core = { workspace = true }
 async-channel = { workspace = true }
 bp-share = { workspace = true }

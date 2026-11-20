@@ -615,7 +615,7 @@ pub(crate) fn apply_vardiff_check<C: Clock>(
     out
 }
 
-// ── New-template event (server-driven; see translator in notify.rs) ──
+// ── New-template event (server-driven, from the template broadcast) ──
 
 /// Push a notify for a [`bp_template_distribution::TemplateChange`].
 /// `clean_jobs` is true on a new prevhash.

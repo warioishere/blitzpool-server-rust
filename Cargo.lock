@@ -1229,6 +1229,7 @@ version = "2.4.5"
 dependencies = [
  "async-channel",
  "bitcoin_core_sv2",
+ "bp-common",
  "bp-regtest-harness",
  "bp-share",
  "stratum-core",

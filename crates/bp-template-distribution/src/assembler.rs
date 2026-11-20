@@ -182,11 +182,11 @@ impl<A: ActiveFromTemplate> TemplateAssembler<A> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::message::{RequestTransactionDataError, RequestTransactionDataSuccess};
 
-    fn new_template(template_id: u64, future: bool) -> NewTemplate {
+    pub(crate) fn new_template(template_id: u64, future: bool) -> NewTemplate {
         NewTemplate {
             template_id,
             future_template: future,
@@ -202,7 +202,7 @@ mod tests {
         }
     }
 
-    fn set_new_prev_hash(template_id: u64, n_bits: u32) -> SetNewPrevHash {
+    pub(crate) fn set_new_prev_hash(template_id: u64, n_bits: u32) -> SetNewPrevHash {
         SetNewPrevHash {
             template_id,
             prev_hash: [0xAB; 32],

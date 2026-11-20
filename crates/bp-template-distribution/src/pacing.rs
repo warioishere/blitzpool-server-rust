@@ -10,26 +10,21 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::time::Instant;
 
-use crate::TemplateChange;
+use crate::{TemplateBroadcast, TemplateChange};
 
 /// The window a refresh is spread over. Every connection gets its refresh
 /// within this time of the template's arrival.
 pub const REFRESH_SPREAD: Duration = Duration::from_secs(1);
 
-/// A broadcast payload that says which kind of template change it carries.
-pub trait PacedBroadcast: Clone {
-    fn template_change(&self) -> TemplateChange;
-}
-
 /// One connection's view of the template broadcast. Hand it the receiver in
 /// the connection's `select!` instead of calling `recv` directly.
 #[derive(Debug)]
-pub struct RefreshPacer<T> {
+pub struct RefreshPacer<A> {
     delay: Duration,
-    held: Option<(T, Instant)>,
+    held: Option<(TemplateBroadcast<A>, Instant)>,
 }
 
-impl<T: PacedBroadcast> RefreshPacer<T> {
+impl<A> RefreshPacer<A> {
     /// `seed` picks this connection's delay inside `spread`. It must be spread
     /// evenly itself; both servers pass their random session id.
     pub fn new(seed: u64, spread: Duration) -> Self {
@@ -55,8 +50,8 @@ impl<T: PacedBroadcast> RefreshPacer<T> {
     /// being dropped.
     pub async fn next(
         &mut self,
-        rx: &mut broadcast::Receiver<T>,
-    ) -> Result<T, broadcast::error::RecvError> {
+        rx: &mut broadcast::Receiver<TemplateBroadcast<A>>,
+    ) -> Result<TemplateBroadcast<A>, broadcast::error::RecvError> {
         loop {
             let due = self.held.as_ref().map(|(_, at)| *at);
             tokio::select! {
@@ -69,7 +64,7 @@ impl<T: PacedBroadcast> RefreshPacer<T> {
                             return Err(err);
                         }
                     };
-                    match broadcast.template_change() {
+                    match broadcast.change {
                         TemplateChange::NewBlock => {
                             self.held = None;
                             return Ok(broadcast);
@@ -95,33 +90,31 @@ impl<T: PacedBroadcast> RefreshPacer<T> {
 mod tests {
     use super::*;
 
-    #[derive(Clone, Debug, PartialEq)]
-    struct Evt {
-        change: TemplateChange,
-        n: u32,
-    }
+    use std::sync::Arc;
 
-    impl PacedBroadcast for Evt {
-        fn template_change(&self) -> TemplateChange {
-            self.change
-        }
-    }
+    /// A broadcast whose template is just a number, to tell them apart.
+    type Evt = TemplateBroadcast<u32>;
 
     fn refresh(n: u32) -> Evt {
         Evt {
+            template: Arc::new(n),
             change: TemplateChange::Refresh,
-            n,
         }
     }
 
     fn new_block(n: u32) -> Evt {
         Evt {
+            template: Arc::new(n),
             change: TemplateChange::NewBlock,
-            n,
         }
     }
 
-    fn pacer_with_delay(delay_ms: u64) -> RefreshPacer<Evt> {
+    /// What a test compares a broadcast by.
+    fn seen(broadcast: Evt) -> (TemplateChange, u32) {
+        (broadcast.change, *broadcast.template)
+    }
+
+    fn pacer_with_delay(delay_ms: u64) -> RefreshPacer<u32> {
         let pacer = RefreshPacer::new(delay_ms, REFRESH_SPREAD);
         assert_eq!(pacer.delay, Duration::from_millis(delay_ms));
         pacer
@@ -129,7 +122,7 @@ mod tests {
 
     /// Nothing comes out of `next` within `wait`.
     async fn assert_nothing_within(
-        pacer: &mut RefreshPacer<Evt>,
+        pacer: &mut RefreshPacer<u32>,
         rx: &mut broadcast::Receiver<Evt>,
         wait: Duration,
     ) {
@@ -143,7 +136,7 @@ mod tests {
         let mut pacer = pacer_with_delay(700);
         let start = Instant::now();
         tx.send(new_block(1)).unwrap();
-        assert_eq!(pacer.next(&mut rx).await.unwrap(), new_block(1));
+        assert_eq!(seen(pacer.next(&mut rx).await.unwrap()), seen(new_block(1)));
         assert_eq!(start.elapsed(), Duration::ZERO);
     }
 
@@ -153,7 +146,7 @@ mod tests {
         let mut pacer = pacer_with_delay(700);
         let start = Instant::now();
         tx.send(refresh(1)).unwrap();
-        assert_eq!(pacer.next(&mut rx).await.unwrap(), refresh(1));
+        assert_eq!(seen(pacer.next(&mut rx).await.unwrap()), seen(refresh(1)));
         assert_eq!(start.elapsed(), Duration::from_millis(700));
     }
 
@@ -168,7 +161,7 @@ mod tests {
             tx.send(new_block(2)).unwrap();
             tx
         });
-        assert_eq!(pacer.next(&mut rx).await.unwrap(), new_block(2));
+        assert_eq!(seen(pacer.next(&mut rx).await.unwrap()), seen(new_block(2)));
         assert_eq!(start.elapsed(), Duration::from_millis(300));
         let _tx = sender.await.unwrap();
         // The stale refresh is gone: nothing comes at its old time or after.
@@ -186,7 +179,7 @@ mod tests {
             tx.send(refresh(2)).unwrap();
             tokio::time::sleep(Duration::from_secs(10)).await;
         });
-        assert_eq!(pacer.next(&mut rx).await.unwrap(), refresh(2));
+        assert_eq!(seen(pacer.next(&mut rx).await.unwrap()), seen(refresh(2)));
         assert_eq!(start.elapsed(), Duration::from_millis(700));
     }
 
@@ -202,7 +195,7 @@ mod tests {
             _ = pacer.next(&mut rx) => panic!("not due yet"),
             _ = tokio::time::sleep(Duration::from_millis(200)) => {}
         }
-        assert_eq!(pacer.next(&mut rx).await.unwrap(), refresh(1));
+        assert_eq!(seen(pacer.next(&mut rx).await.unwrap()), seen(refresh(1)));
         assert_eq!(start.elapsed(), Duration::from_millis(700));
     }
 
@@ -251,7 +244,7 @@ mod tests {
         let mut pacer = RefreshPacer::new(42, Duration::ZERO);
         let start = Instant::now();
         tx.send(refresh(1)).unwrap();
-        assert_eq!(pacer.next(&mut rx).await.unwrap(), refresh(1));
+        assert_eq!(seen(pacer.next(&mut rx).await.unwrap()), seen(refresh(1)));
         assert_eq!(start.elapsed(), Duration::ZERO);
     }
 
@@ -267,7 +260,7 @@ mod tests {
             x ^= x << 13;
             x ^= x >> 17;
             x ^= x << 5;
-            let delay = RefreshPacer::<Evt>::new(u64::from(x), REFRESH_SPREAD).delay;
+            let delay = RefreshPacer::<u32>::new(u64::from(x), REFRESH_SPREAD).delay;
             assert!(delay < REFRESH_SPREAD);
             slices[(delay.as_millis() / 100) as usize] += 1;
         }

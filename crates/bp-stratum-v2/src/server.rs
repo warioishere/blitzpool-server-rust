@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! SV2 mining-port server: translator tasks fan templates out, one task per
-//! connection runs Noise-XK and calls the pure handlers in [`crate::mining::client`].
+//! SV2 mining-port server: translator tasks ([`TemplateStreams`]) fan templates
+//! out, one task per connection runs Noise-XK and calls the pure handlers in
+//! [`crate::mining::client`].
 //! Shares are judged against the template pinned on the job at send-time, so a
 //! block change cannot reclassify an in-flight share (pool rule, not a spec MUST).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use bitcoin::Network;
@@ -39,10 +40,10 @@ use crate::mining::client::{
     PortConfig, SessionEvent, ERR_CHANNEL_CAPACITY_EXHAUSTED,
 };
 use bp_template_distribution::{
-    ActiveTemplate, RefreshPacer, TemplateAssembler, TemplateChange, REFRESH_SPREAD,
+    ActiveTemplate, RefreshPacer, StreamHandle, TemplateChange, TemplateStreams, REFRESH_SPREAD,
 };
 
-use crate::mining::translator::TemplateBroadcast;
+use crate::mining::client::TemplateBroadcast;
 use crate::noise::{accept_pool_noise, NoiseConfig, NoiseTcpWriteHalf};
 use crate::server_codec::{decode_mining_inbound, encode_mining_outbound, InboundMiningFrame};
 
@@ -83,13 +84,6 @@ impl ServerConfig {
     }
 }
 
-// ── Constants ───────────────────────────────────────────────────────
-
-/// Broadcast-channel capacity for the translator → per-connection
-/// fan-out. A lagged subscriber sends its next job as a block change, so a
-/// skipped tip change still reaches the miner.
-const TEMPLATE_BROADCAST_CAPACITY: usize = 32;
-
 // ── StratumV2MiningServer ───────────────────────────────────────────
 
 /// Cheap-to-clone handle. [`Self::shutdown`] is the only clean way to stop
@@ -104,13 +98,9 @@ struct Inner {
     noise_config: NoiseConfig,
     hooks: MiningServerHooks,
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
-    // PPLNS stream (PPLNS-autoscaled) — every connection boots here before
-    // its payout mode is resolved.
-    pplns_stream: TemplateStream,
-    // Fixed-reservation alt streams (Solo / GroupSolo / Blockparty) keyed by
-    // StreamKind — a connection switches onto one when its OpenChannel address
-    // resolves to that mode. Each fed by its own translator off its TDP handle.
-    alt_streams: HashMap<StreamKind, TemplateStream>,
+    /// A connection boots on the PPLNS stream (PPLNS-autoscaled) and switches
+    /// onto an alt one when its OpenChannel address resolves to that mode.
+    templates: TemplateStreams<ActiveTemplate>,
     // POOL-WIDE extranonce-prefix allocator, shared by every port. Standard
     // channels cannot roll their own extranonce, and ports share a coinbase,
     // so a second allocator would hand out the same prefixes and two miners
@@ -121,65 +111,6 @@ struct Inner {
     // the whole pool rather than per channel per broadcast.
     job_cache: Arc<MiningJobCache>,
     cancel: CancellationToken,
-    /// One translator per stream, PPLNS first; drained once on shutdown.
-    translator_joins: Mutex<Vec<JoinHandle<()>>>,
-}
-
-/// One template stream: the broadcast sender per-connection tasks subscribe
-/// to + the current-template snapshot a freshly-routed connection boots from.
-struct TemplateStream {
-    template_tx: broadcast::Sender<TemplateBroadcast>,
-    current_template: Arc<Mutex<Option<Arc<ActiveTemplate>>>>,
-}
-
-impl TemplateStream {
-    /// Start the stream's translator off its TDP feed.
-    fn spawn(
-        updates_rx: broadcast::Receiver<TemplateUpdate>,
-        initial_snapshot: bp_template_distribution::TemplateSnapshot,
-        job_cache: &Arc<MiningJobCache>,
-        cancel: &CancellationToken,
-    ) -> (Self, JoinHandle<()>) {
-        let (template_tx, _) = broadcast::channel(TEMPLATE_BROADCAST_CAPACITY);
-        let current_template = Arc::new(Mutex::new(None::<Arc<ActiveTemplate>>));
-        let join = tokio::spawn(run_translator(
-            updates_rx,
-            initial_snapshot,
-            template_tx.clone(),
-            current_template.clone(),
-            job_cache.clone(),
-            cancel.clone(),
-        ));
-        let stream = Self {
-            template_tx,
-            current_template,
-        };
-        (stream, join)
-    }
-
-    fn current(&self) -> Option<Arc<ActiveTemplate>> {
-        self.current_template
-            .lock()
-            .expect("current_template mutex poisoned")
-            .clone()
-    }
-
-    /// A connection's own subscription plus the snapshot to boot from.
-    fn handle(&self) -> StreamHandle {
-        StreamHandle {
-            rx: self.template_tx.subscribe(),
-            initial: self.current(),
-        }
-    }
-}
-
-/// A single connection's claim on one alt stream — its own broadcast receiver
-/// plus the snapshot to boot from. The per-connection task holds a
-/// `HashMap<StreamKind, StreamHandle>` and `remove`s the matching entry when
-/// it swaps onto that stream.
-struct StreamHandle {
-    rx: broadcast::Receiver<TemplateBroadcast>,
-    initial: Option<Arc<ActiveTemplate>>,
 }
 
 impl StratumV2MiningServer {
@@ -205,17 +136,21 @@ impl StratumV2MiningServer {
         let server_config = Arc::new(server_config);
         let cancel = CancellationToken::new();
 
-        let (pplns_stream, pplns_join) =
-            TemplateStream::spawn(updates_rx, initial_snapshot, &job_cache, &cancel);
-        let mut translator_joins = vec![pplns_join];
-        // One translator per alt stream, each off its own TDP handle.
-        let mut alt_map = HashMap::with_capacity(alt_streams.len());
-        for (kind, alt_updates_rx, alt_initial_snapshot) in alt_streams {
-            let (stream, join) =
-                TemplateStream::spawn(alt_updates_rx, alt_initial_snapshot, &job_cache, &cancel);
-            translator_joins.push(join);
-            alt_map.insert(kind, stream);
-        }
+        let on_active = {
+            let job_cache = Arc::clone(&job_cache);
+            // Job-cache aging heartbeat: lookups prune too, but this also runs
+            // when no channel is open, so old entries do not wait for the next
+            // lookup.
+            move |_: &ActiveTemplate| job_cache.prune_expired()
+        };
+        let templates = TemplateStreams::spawn(
+            "sv2",
+            updates_rx,
+            initial_snapshot,
+            alt_streams,
+            &cancel,
+            on_active,
+        );
 
         Self {
             inner: Arc::new(Inner {
@@ -223,12 +158,10 @@ impl StratumV2MiningServer {
                 noise_config,
                 hooks,
                 bridge,
-                pplns_stream,
-                alt_streams: alt_map,
+                templates,
                 extranonce,
                 job_cache,
                 cancel,
-                translator_joins: Mutex::new(translator_joins),
             }),
         }
     }
@@ -236,14 +169,14 @@ impl StratumV2MiningServer {
     /// Snapshot of the latest assembled template. `None` until the
     /// translator pairs its first `NewTemplate` + `SetNewPrevHash`.
     pub fn current_template(&self) -> Option<Arc<ActiveTemplate>> {
-        self.inner.pplns_stream.current()
+        self.inner.templates.current()
     }
 
     /// Subscribe to template broadcasts. Each subscriber sees its own
     /// copy. Used by tests + the per-connection task; production
     /// `accept_connection` does this internally.
     pub fn subscribe_templates(&self) -> broadcast::Receiver<TemplateBroadcast> {
-        self.inner.pplns_stream.template_tx.subscribe()
+        self.inner.templates.subscribe()
     }
 
     /// Extranonce prefixes held across every server sharing the allocator.
@@ -260,19 +193,15 @@ impl StratumV2MiningServer {
         let noise_config = self.inner.noise_config.clone();
         let hooks = self.inner.hooks.clone();
         let bridge = self.inner.bridge.clone();
-        let StreamHandle {
-            rx: template_rx,
-            initial: initial_template,
-        } = self.inner.pplns_stream.handle();
-        // Per-connection handle on every alt stream: a fresh broadcast
-        // subscription + the current-template snapshot. The connection swaps
-        // onto exactly one of these (if any) once its mode resolves.
-        let alt_streams: HashMap<StreamKind, StreamHandle> = self
-            .inner
-            .alt_streams
-            .iter()
-            .map(|(kind, alt)| (*kind, alt.handle()))
-            .collect();
+        // The connection swaps onto at most one alt stream, once its mode
+        // resolves.
+        let (
+            StreamHandle {
+                rx: template_rx,
+                initial: initial_template,
+            },
+            alt_streams,
+        ) = self.inner.templates.handles();
         let cancel = self.inner.cancel.clone();
         let extranonce = ConnectionExtranonce::new(self.inner.extranonce.clone());
         let job_cache = self.inner.job_cache.clone();
@@ -301,26 +230,15 @@ impl StratumV2MiningServer {
         })
     }
 
-    /// Cancel the translator + every running connection. Idempotent.
-    /// First call awaits the translator's clean teardown up to
+    /// Cancel the translators + every running connection. Idempotent.
+    /// First call awaits each translator's clean teardown up to
     /// [`ServerConfig::shutdown_drain_timeout`].
     pub async fn shutdown(&self) {
         self.inner.cancel.cancel();
-        let handles = std::mem::take(
-            &mut *self
-                .inner
-                .translator_joins
-                .lock()
-                .expect("translator_joins mutex poisoned"),
-        );
-        let drain_timeout = self.inner.server_config.shutdown_drain_timeout;
-        for h in handles {
-            match tokio::time::timeout(drain_timeout, h).await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => warn!("sv2 translator task panicked during shutdown: {err}"),
-                Err(_) => warn!("sv2 translator didn't drain within {drain_timeout:?}, detaching"),
-            }
-        }
+        self.inner
+            .templates
+            .drain(self.inner.server_config.shutdown_drain_timeout)
+            .await;
     }
 
     /// Generate a session id from 4 OS-CSPRNG bytes interpreted as a
@@ -330,85 +248,6 @@ impl StratumV2MiningServer {
         let mut bytes = [0u8; 4];
         getrandom::fill(&mut bytes).unwrap_or_default();
         u32::from_be_bytes(bytes)
-    }
-}
-
-// ── Translator task ─────────────────────────────────────────────────
-
-/// Assemble TDP updates into templates and re-broadcast them, keeping
-/// `current_template` so a fresh connection boots without waiting for the
-/// next TDP message. Exits on `cancel` or when `updates_rx` closes.
-async fn run_translator(
-    mut updates_rx: broadcast::Receiver<TemplateUpdate>,
-    initial_snapshot: bp_template_distribution::TemplateSnapshot,
-    template_tx: broadcast::Sender<TemplateBroadcast>,
-    current_template: Arc<Mutex<Option<Arc<ActiveTemplate>>>>,
-    job_cache: Arc<MiningJobCache>,
-    cancel: CancellationToken,
-) {
-    let mut assembler = TemplateAssembler::<ActiveTemplate>::new();
-
-    // Bootstrap from the TdpHandle snapshot: the startup template pair can
-    // be broadcast before this subscriber exists, and the snapshot holds it
-    // for replay.
-    if let Some((active, change)) = assembler.bootstrap_from_snapshot(initial_snapshot) {
-        // Wrap once; the snapshot store and every broadcast subscriber
-        // then share this allocation via Arc refcounting.
-        let active = Arc::new(active);
-        {
-            let mut guard = current_template
-                .lock()
-                .expect("current_template mutex poisoned");
-            *guard = Some(active.clone());
-        }
-        let _ = template_tx.send(TemplateBroadcast {
-            template: active,
-            change,
-        });
-    }
-
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                debug!("sv2 translator shutting down");
-                return;
-            }
-            update = updates_rx.recv() => {
-                let update = match update {
-                    Ok(u) => u,
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("sv2 translator lagged {n} TDP updates");
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        debug!("sv2 translator: TDP source closed");
-                        return;
-                    }
-                };
-                if let Some(change) = assembler.apply(&update) {
-                    if let Some(active) = assembler.current().cloned() {
-                        let active = Arc::new(active);
-                        {
-                            let mut guard = current_template
-                                .lock()
-                                .expect("current_template mutex poisoned");
-                            *guard = Some(active.clone());
-                        }
-                        // Job-cache aging heartbeat: lookups prune too, but
-                        // this also runs when no channel is open, so old
-                        // entries do not wait for the next lookup.
-                        job_cache.prune_expired();
-                        // Broadcast::send errors only when there are no
-                        // subscribers — freshly-accepted connections
-                        // pick up via the snapshot.
-                        let _ = template_tx.send(TemplateBroadcast {
-                            template: active,
-                            change,
-                        });
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -425,7 +264,7 @@ async fn run_mining_connection(
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
     mut template_rx: broadcast::Receiver<TemplateBroadcast>,
     initial_template: Option<Arc<ActiveTemplate>>,
-    mut alt_streams: HashMap<StreamKind, StreamHandle>,
+    mut alt_streams: HashMap<StreamKind, StreamHandle<ActiveTemplate>>,
     extranonce: ConnectionExtranonce,
     job_cache: Arc<MiningJobCache>,
     socket: TcpStream,
@@ -2080,6 +1919,7 @@ mod tests {
             Arc::new(MiningJobCache::new()),
         );
         let mut rx = server.subscribe_templates();
+        assert!(server.current_template().is_none());
         tdp_tx
             .send(TemplateUpdate::NewTemplate(nt(1, true)))
             .unwrap();
@@ -2092,36 +1932,7 @@ mod tests {
             .expect("broadcast not closed");
         assert_eq!(payload.template.template_id, 1);
         assert_eq!(payload.template.prev_hash, [0xAB; 32]);
-        assert!(server.current_template().is_some());
-        server.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn translator_holds_current_template_snapshot() {
-        let (tdp_tx, tdp_rx) = broadcast::channel::<TemplateUpdate>(8);
-        let bridge = Arc::new(RwLock::new(JdpDeclaredJobRegistry::new()));
-        let server = StratumV2MiningServer::spawn(
-            server_cfg(),
-            noise_cfg(),
-            tdp_rx,
-            bp_template_distribution::TemplateSnapshot::default(),
-            Vec::new(),
-            MiningServerHooks::no_op(),
-            bridge,
-            fresh_allocator(),
-            Arc::new(MiningJobCache::new()),
-        );
-        assert!(server.current_template().is_none());
-        tdp_tx
-            .send(TemplateUpdate::NewTemplate(nt(7, true)))
-            .unwrap();
-        tdp_tx
-            .send(TemplateUpdate::SetNewPrevHash(snph(7)))
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let snap = server.current_template();
-        assert!(snap.is_some());
-        assert_eq!(snap.unwrap().template_id, 7);
+        assert_eq!(server.current_template().map(|t| t.template_id), Some(1));
         server.shutdown().await;
     }
 
