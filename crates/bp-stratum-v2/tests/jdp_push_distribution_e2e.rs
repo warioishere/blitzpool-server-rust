@@ -18,9 +18,8 @@ use bp_stratum_v2::extensions::{
     encode_distribution_id_tlv, SetPayoutDistribution, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
 };
 use bp_stratum_v2::jdp::client::{
-    parse_user_identifier_as_address, AllocateTokenContext, DeclarationRef, PushSolutionInput,
-    ERR_INVALID_MINING_JOB_TOKEN, ERR_INVALID_PAYOUT_DISTRIBUTION, ERR_STALE_PAYOUT_DISTRIBUTION,
-    FLAG_DECLARE_TX_DATA,
+    AllocateTokenContext, DeclarationRef, PushSolutionInput, ERR_INVALID_MINING_JOB_TOKEN,
+    ERR_INVALID_PAYOUT_DISTRIBUTION, ERR_STALE_PAYOUT_DISTRIBUTION, FLAG_DECLARE_TX_DATA,
 };
 use bp_stratum_v2::jdp::dynamic_outputs::{
     designated_output_blob, CandidateBacking, PayoutBooking,
@@ -154,7 +153,9 @@ impl JdpAllocateResolver for BaseModeAllocateResolver {
         user_identifier: &str,
         payout_distribution_negotiated: bool,
     ) -> AllocateOutcome {
-        let Some(miner_address) = parse_user_identifier_as_address(user_identifier) else {
+        let Some((miner_address, _worker)) =
+            bp_mining_job::parse_miner_identity(bitcoin::Network::Regtest, user_identifier)
+        else {
             return AllocateOutcome::Ignored;
         };
         let coinbase_outputs = if payout_distribution_negotiated {

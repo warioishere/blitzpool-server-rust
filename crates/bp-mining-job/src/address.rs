@@ -29,6 +29,18 @@ pub fn parse_pool_address(network: Network, raw: &str) -> Option<AddressId> {
     AddressId::normalized(trimmed).ok()
 }
 
+/// A miner's `user_identity` (`address[.worker]`, as SV2 channels and JDP
+/// token requests carry it): the address part as an address of `network`,
+/// keyed like [`parse_pool_address`], and the worker part as sent, as SV1
+/// keeps it. `None` when the address part is no address of `network`.
+pub fn parse_miner_identity(
+    network: Network,
+    user_identity: &str,
+) -> Option<(AddressId, Option<&str>)> {
+    let (address, worker) = bp_common::split_user_identity(user_identity);
+    Some((parse_pool_address(network, address)?, worker))
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum AddressError {
     #[error("failed to parse address: {0}")]
@@ -40,6 +52,30 @@ pub enum AddressError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The address part decides, against the network; the worker part rides
+    /// along.
+    #[test]
+    fn parse_miner_identity_splits_and_checks_the_network() {
+        const ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+        let parse = |raw: &str| {
+            parse_miner_identity(Network::Regtest, raw)
+                .map(|(a, w)| (a.into_inner(), w.map(str::to_owned)))
+        };
+        assert_eq!(parse(ADDR), Some((ADDR.to_string(), None)));
+        assert_eq!(
+            parse(&format!(" {ADDR}.gitgab ")),
+            Some((ADDR.to_string(), Some("gitgab ".to_owned())))
+        );
+        assert_eq!(
+            parse(&format!("{ADDR}.rig.1")),
+            Some((ADDR.to_string(), Some("rig.1".to_owned())))
+        );
+        assert_eq!(parse(".worker"), None);
+        assert_eq!(parse(&"x".repeat(200)), None);
+        // A real address of another network.
+        assert_eq!(parse("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"), None);
+    }
 
     #[test]
     fn parse_pool_address_keys_a_real_address_of_the_network() {

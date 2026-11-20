@@ -15,9 +15,7 @@ use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::Hash;
 use bitcoin::Network as BitcoinNetwork;
 use bp_common::{AddressId, StreamKind};
-use bp_stratum_v2::jdp::client::{
-    parse_user_identifier_as_address, AllocateTokenContext, DeclarationRef, PushSolutionInput,
-};
+use bp_stratum_v2::jdp::client::{AllocateTokenContext, DeclarationRef, PushSolutionInput};
 use bp_stratum_v2::jdp::dynamic_outputs::{
     declared_coinbase_tx, designated_output_blob, CandidateBacking,
 };
@@ -90,7 +88,11 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
         user_identifier: &str,
         payout_distribution_negotiated: bool,
     ) -> AllocateOutcome {
-        let Some(miner_address) = parse_user_identifier_as_address(user_identifier) else {
+        // An address of this network, as the Stratum ports require: SV2 refuses
+        // any other at channel open, so its token could never bind to a job.
+        let Some((miner_address, _worker)) =
+            bp_mining_job::parse_miner_identity(self.network, user_identifier)
+        else {
             return AllocateOutcome::Ignored;
         };
 
@@ -168,7 +170,7 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
         )
         .await;
 
-        let designated = match payouts.entries.as_slice() {
+        match payouts.entries.as_slice() {
             // `ResolvedPayouts::none()`: the "serve no job" verdict.
             [] => {
                 warn!(
@@ -183,7 +185,7 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
                 };
             }
             // Only checkable shape: shorting the output shorts the miner itself.
-            [only] if only.address == miner_address.as_str() => only.address.clone(),
+            [only] if only.address == miner_address.as_str() => {}
             // Another payee: a second connection of this address registered it
             // on a PPLNS port after Gate 1 read the gate. Only "script paid" is
             // checkable, so 1 sat would pass.
@@ -213,31 +215,14 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
             }
         };
 
-        let Ok(designated) = AddressId::new(designated) else {
-            warn!(
-                user_identifier,
-                "JDP allocate: resolver named an unusable payout address; refusing"
-            );
-            return AllocateOutcome::Refused {
-                reason: "payout address unusable",
-            };
-        };
-        // 0 sats per SV2 JDP/AllocateMiningJobToken.Success.
-        match bp_mining_job::address_to_script(self.network, designated.as_str()) {
-            Ok(script) => AllocateOutcome::Granted(AllocateTokenContext {
-                miner_address,
-                coinbase_outputs: designated_output_blob(&script),
-            }),
-            Err(err) => {
-                warn!(
-                    %err,
-                    user_identifier, "JDP allocate: payout address does not encode; refusing"
-                );
-                AllocateOutcome::Refused {
-                    reason: "payout address does not encode on this network",
-                }
-            }
-        }
+        // The designated output is the miner's own address, 0 sats per SV2
+        // JDP/AllocateMiningJobToken.Success.
+        let script = bp_mining_job::address_to_script(self.network, miner_address.as_str())
+            .expect("parse_miner_identity checked the address against this network");
+        AllocateOutcome::Granted(AllocateTokenContext {
+            miner_address,
+            coinbase_outputs: designated_output_blob(&script),
+        })
     }
 }
 
@@ -1412,6 +1397,24 @@ mod base_allocate_tests {
              valued output would then push the coinbase past what the block pays"
         );
         outputs[0].script_pubkey.clone()
+    }
+
+    /// A token only for an address of the pool's network, with 0x0003 as
+    /// without: SV2 refuses any other at channel open, so its token could
+    /// never bind to a job.
+    #[tokio::test]
+    async fn an_address_of_another_network_gets_no_token() {
+        let resolver = pays(&[(MINER, TEMPLATE_REVENUE)]);
+        for negotiated in [true, false] {
+            granted(resolver.resolve_allocate_context(MINER, negotiated).await);
+            let mainnet = resolver
+                .resolve_allocate_context("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", negotiated)
+                .await;
+            assert!(
+                matches!(mainnet, AllocateOutcome::Ignored),
+                "negotiated = {negotiated}: a mainnet address on regtest must get no token"
+            );
+        }
     }
 
     /// Refuses every address, as admission does for an unready party's admin.

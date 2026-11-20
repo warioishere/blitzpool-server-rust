@@ -30,9 +30,9 @@ use crate::extensions::{
 use crate::jdp::client::{
     completion_refused, declaration_refusal, declare_refused_by_session, handle_allocate_token,
     handle_declare_mining_job, handle_provide_missing_transactions_success, handle_push_solution,
-    handle_request_extensions, handle_setup_connection, parse_user_identifier_as_address,
-    AllocateTokenContext, DeclarationContext, DeclarationRef, JdpHandlerOutcome, JdpOutboundFrame,
-    JdpSessionEvent, JdpSessionState, PushSolutionInput,
+    handle_request_extensions, handle_setup_connection, AllocateTokenContext, DeclarationContext,
+    DeclarationRef, JdpHandlerOutcome, JdpOutboundFrame, JdpSessionEvent, JdpSessionState,
+    PushSolutionInput,
 };
 use crate::jdp::dynamic_outputs::CandidateBacking;
 use crate::jdp::tx_validation::DeclaredTxs;
@@ -65,7 +65,8 @@ pub enum AllocateOutcome {
     Refused {
         reason: &'static str,
     },
-    /// Nothing resolvable (unparseable `user_identifier`); dropped silently.
+    /// Nothing resolvable (no address of the pool's network in
+    /// `user_identifier`); dropped silently.
     Ignored,
 }
 
@@ -227,7 +228,10 @@ impl JdpAllocateResolver for NoOpJdpHooks {
         user_identifier: &str,
         payout_distribution_negotiated: bool,
     ) -> AllocateOutcome {
-        let Some(addr) = parse_user_identifier_as_address(user_identifier) else {
+        // The no-op hooks run on regtest, the network of every test address.
+        let Some((addr, _worker)) =
+            bp_mining_job::parse_miner_identity(bitcoin::Network::Regtest, user_identifier)
+        else {
             return AllocateOutcome::Ignored;
         };
         if payout_distribution_negotiated {
@@ -237,15 +241,12 @@ impl JdpAllocateResolver for NoOpJdpHooks {
             });
         }
         // SV2 JDP/AllocateMiningJobToken.Success wants ONE designated 0-sat
-        // output; empty would refuse every job. No network check: none configured.
-        let Ok(parsed) = addr.as_str().parse::<bitcoin::Address<_>>() else {
-            return AllocateOutcome::Ignored;
-        };
+        // output; empty would refuse every job.
+        let script = bp_mining_job::address_to_script(bitcoin::Network::Regtest, addr.as_str())
+            .expect("parsed against regtest above");
         AllocateOutcome::Granted(AllocateTokenContext {
             miner_address: addr,
-            coinbase_outputs: crate::jdp::dynamic_outputs::designated_output_blob(
-                &parsed.assume_checked().script_pubkey(),
-            ),
+            coinbase_outputs: crate::jdp::dynamic_outputs::designated_output_blob(&script),
         })
     }
 }

@@ -9,11 +9,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bitcoin::Network;
-use bp_common::{normalize_btc_address, AddressId, StreamKind};
+use bp_common::{AddressId, StreamKind};
 use bp_jobs_lifecycle::LifecycleConfig;
 use bp_mining_job::{
-    address_to_script, merkle_root_from_coinbase, MiningJob, MiningJobCache, MiningJobError,
-    PayoutEntry, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN, MAX_FUTURE_BLOCK_TIME,
+    merkle_root_from_coinbase, MiningJob, MiningJobCache, MiningJobError, PayoutEntry,
+    TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN, MAX_FUTURE_BLOCK_TIME,
 };
 use bp_share::{
     clamp_difficulty_to_max_target, difficulty_to_target, hash_rate_to_difficulty, sha256d,
@@ -82,8 +82,8 @@ pub const MAX_EXTENDED_ROLLABLE: usize = 16;
 
 // ── Wire error codes (SV2 spec setup/open-channel error strings) ────
 
-/// `unknown-user` — the address parsed out of `user_identity` failed
-/// `bp_common::normalize_btc_address` validation.
+/// `unknown-user` — the address part of `user_identity` is no address of the
+/// pool's network ([`bp_mining_job::parse_miner_identity`]).
 pub const ERR_UNKNOWN_USER: &str = "unknown-user";
 
 /// `max-target-out-of-range` — miner's declared `max_target` is below
@@ -916,19 +916,8 @@ fn resolve_open_context<C: Clock>(
         error_code: code.to_string(),
     };
 
-    let (address_part, worker_part) = bp_common::split_user_identity(user_identity);
-    if address_part.is_empty() {
-        return Err(err(ERR_UNKNOWN_USER));
-    }
-
-    // `normalize_btc_address` only normalizes whitespace/casing;
-    // `address_to_script` verifies the address parses and matches the network.
-    let normalized = normalize_btc_address(address_part);
-    if normalized.is_empty() {
-        return Err(err(ERR_UNKNOWN_USER));
-    }
-    address_to_script(state.network, &normalized).map_err(|_| err(ERR_UNKNOWN_USER))?;
-    let address = AddressId::new(normalized).map_err(|_| err(ERR_UNKNOWN_USER))?;
+    let (address, worker_part) = bp_mining_job::parse_miner_identity(state.network, user_identity)
+        .ok_or_else(|| err(ERR_UNKNOWN_USER))?;
 
     // Later channels MUST resolve to the first channel's address.
     if let Some(existing) = &state.address {
@@ -2387,7 +2376,7 @@ pub(crate) mod tests {
         }
     }
 
-    // Regtest bech32 address — passes bp_common::normalize_btc_address.
+    // Regtest bech32 address, valid for `parse_miner_identity` on regtest.
     const REGTEST_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
     // ── SetupConnection ────────────────────────────────────────────

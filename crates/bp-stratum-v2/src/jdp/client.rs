@@ -8,7 +8,6 @@
 use std::collections::HashSet;
 
 use bitcoin::hex::DisplayHex;
-use bp_common::normalize_btc_address;
 use bp_common::AddressId;
 
 use crate::codec_common::SetupConnectionInput;
@@ -492,22 +491,6 @@ pub fn handle_allocate_token(
             expires_at_ms,
         }],
     }
-}
-
-/// Parse `user_identifier` as a BTC address of any network; the network check
-/// is the resolver's job.
-pub fn parse_user_identifier_as_address(user_identifier: &str) -> Option<AddressId> {
-    let trimmed = user_identifier.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    // `address.worker`: a trailing `.worker` would fail `address_to_script`.
-    let (address_part, _worker) = bp_common::split_user_identity(trimmed);
-    if address_part.is_empty() {
-        return None;
-    }
-    let normalised = normalize_btc_address(address_part);
-    AddressId::new(normalised).ok()
 }
 
 // ── Handler: DeclareMiningJob ───────────────────────────────────────
@@ -1423,29 +1406,6 @@ pub(crate) mod tests {
             out.outbound.is_empty() && out.events.is_empty(),
             "an allocate the pool cannot answer must produce no frame and no event"
         );
-    }
-
-    // ── parse_user_identifier_as_address ──────────────────────────
-
-    #[test]
-    fn parse_user_identifier_accepts_bech32_address() {
-        let out = parse_user_identifier_as_address(ADDR);
-        assert_eq!(out.map(|a| a.as_str().to_string()), Some(ADDR.to_string()));
-    }
-
-    #[test]
-    fn parse_user_identifier_rejects_garbage() {
-        let out = parse_user_identifier_as_address(&"x".repeat(200));
-        assert!(out.is_none());
-    }
-
-    #[test]
-    fn parse_user_identifier_strips_worker_suffix() {
-        let out = parse_user_identifier_as_address(&format!("{ADDR}.gitgab"));
-        assert_eq!(out.map(|a| a.as_str().to_string()), Some(ADDR.to_string()));
-        let out2 = parse_user_identifier_as_address(&format!("{ADDR}.rig.1"));
-        assert_eq!(out2.map(|a| a.as_str().to_string()), Some(ADDR.to_string()));
-        assert!(parse_user_identifier_as_address(".worker").is_none());
     }
 
     // ── DeclareMiningJob ───────────────────────────────────────────
