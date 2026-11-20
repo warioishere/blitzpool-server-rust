@@ -26,7 +26,6 @@ use crate::codec_common::SetupConnectionInput;
 use crate::extensions::{
     RequestExtensions, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS, SV2_EXTENSION_TYPE_WORKER_ID,
 };
-use crate::protocol_version::{negotiate_version, MIN_PROTOCOL_VERSION};
 
 use super::channel::{ChannelKind, ChannelState};
 use super::groups::GroupChannelRegistry;
@@ -619,12 +618,14 @@ impl<C: Clock + Clone> MiningSessionState<C> {
 
 /// `SetupConnection.Error` plus the request to close. The frame goes out before
 /// the close (SV2 Overview/SetupConnection.Error), or the client never learns why.
-fn setup_rejected(error_code: &str, reason: String) -> HandlerOutcome {
+fn setup_rejected(refusal: crate::codec_common::SetupRefusal) -> HandlerOutcome {
     let mut outcome = HandlerOutcome::with_frame(OutboundFrame::SetupConnectionError {
         flags: 0,
-        error_code: error_code.to_string(),
+        error_code: refusal.error_code.to_string(),
     });
-    outcome.events.push(SessionEvent::Disconnect { reason });
+    outcome.events.push(SessionEvent::Disconnect {
+        reason: refusal.reason,
+    });
     outcome
 }
 
@@ -647,38 +648,23 @@ pub(crate) fn vendor_user_agent(vendor: &str, work_selection: bool) -> String {
     }
 }
 
-/// Handle `SetupConnection`: a version range without a common version or an
-/// unknown sub-protocol is refused; otherwise `SetupConnectionSuccess`, whose
-/// `flags` are the server capability bits, built fresh.
+/// Handle `SetupConnection`: refused per [`crate::codec_common::setup_verdict`];
+/// otherwise `SetupConnectionSuccess`, whose `flags` are the server capability
+/// bits, built fresh.
 pub fn handle_setup_connection<C: Clock>(
     state: &mut MiningSessionState<C>,
     input: &SetupConnectionInput,
 ) -> HandlerOutcome {
-    let Some(used_version) = negotiate_version(input.min_version, input.max_version) else {
-        return setup_rejected(
-            crate::codec_common::ERR_PROTOCOL_VERSION_MISMATCH,
-            format!(
-                "version range {}–{} does not include {MIN_PROTOCOL_VERSION}",
-                input.min_version, input.max_version
-            ),
-        );
-    };
-
     // Mining (0) and TDP-only (2) are accepted. A TDP-only session gets no
     // mining jobs (`apply_template_broadcast` returns early) and is never
     // grouped.
-    match input.protocol {
-        PROTOCOL_MINING => {}
-        PROTOCOL_TEMPLATE_DISTRIBUTION => {
-            state.is_tdp_client = true;
-        }
-        other => {
-            return setup_rejected(
-                crate::codec_common::ERR_UNSUPPORTED_PROTOCOL,
-                format!("protocol {other} is not served on this port"),
-            );
-        }
-    }
+    let used_version = match crate::codec_common::setup_verdict(input, |protocol| {
+        protocol == PROTOCOL_MINING || protocol == PROTOCOL_TEMPLATE_DISTRIBUTION
+    }) {
+        Ok(version) => version,
+        Err(refusal) => return setup_rejected(refusal),
+    };
+    state.is_tdp_client = input.protocol == PROTOCOL_TEMPLATE_DISTRIBUTION;
 
     state.setup_complete = true;
     state.requires_standard_jobs = (input.flags & FLAG_REQUIRES_STANDARD_JOBS) != 0;
@@ -713,31 +699,29 @@ pub fn handle_request_extensions<C: Clock>(
     state: &mut MiningSessionState<C>,
     input: &RequestExtensions,
 ) -> HandlerOutcome {
-    let mut supported = Vec::new();
-    let mut unsupported = Vec::new();
-    for &ext in &input.requested_extensions {
-        if is_mining_extension_supported(ext) {
-            supported.push(ext);
-            if !state.negotiated_extensions.contains(&ext) {
-                state.negotiated_extensions.push(ext);
+    match crate::codec_common::negotiate_extensions(
+        &input.requested_extensions,
+        is_mining_extension_supported,
+    ) {
+        crate::codec_common::ExtensionsVerdict::Success { supported } => {
+            for &ext in &supported {
+                if !state.negotiated_extensions.contains(&ext) {
+                    state.negotiated_extensions.push(ext);
+                }
             }
-        } else {
-            unsupported.push(ext);
+            HandlerOutcome::with_frame(OutboundFrame::RequestExtensionsSuccess {
+                request_id: input.request_id,
+                supported_extensions: supported,
+            })
+        }
+        crate::codec_common::ExtensionsVerdict::Error { unsupported } => {
+            HandlerOutcome::with_frame(OutboundFrame::RequestExtensionsError {
+                request_id: input.request_id,
+                unsupported_extensions: unsupported,
+                required_extensions: Vec::new(),
+            })
         }
     }
-
-    if supported.is_empty() && !input.requested_extensions.is_empty() {
-        return HandlerOutcome::with_frame(OutboundFrame::RequestExtensionsError {
-            request_id: input.request_id,
-            unsupported_extensions: unsupported,
-            required_extensions: Vec::new(),
-        });
-    }
-
-    HandlerOutcome::with_frame(OutboundFrame::RequestExtensionsSuccess {
-        request_id: input.request_id,
-        supported_extensions: supported,
-    })
 }
 
 // ── Handler: OpenStandardMiningChannel ──────────────────────────────
@@ -2497,6 +2481,26 @@ pub(crate) mod tests {
         ));
         assert!(s.is_tdp_client, "TDP-only flag must be set");
         assert!(s.setup_complete);
+    }
+
+    /// JDP on the mining port with a version range the pool does not speak:
+    /// the protocol is checked first, and the refusal carries flags 0.
+    #[test]
+    fn setup_connection_refuses_the_protocol_before_the_version() {
+        let mut s = fresh_session();
+        let mut input = good_setup();
+        input.protocol = 1;
+        input.min_version = 3;
+        input.max_version = 3;
+        let out = handle_setup_connection(&mut s, &input);
+        match &out.outbound[0] {
+            OutboundFrame::SetupConnectionError { flags, error_code } => {
+                assert_eq!(error_code, crate::codec_common::ERR_UNSUPPORTED_PROTOCOL);
+                assert_eq!(*flags, 0);
+            }
+            _ => panic!("expected error"),
+        }
+        assert!(!s.setup_complete);
     }
 
     /// Any other sub-protocol gets `unsupported-protocol`.

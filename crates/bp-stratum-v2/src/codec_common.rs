@@ -184,6 +184,63 @@ pub struct SetupConnectionInput {
     pub vendor: String,
 }
 
+/// Why a `SetupConnection` is refused: the error code and a reason for the log.
+/// The `SetupConnection.Error` carries `flags` 0, a condition aside from
+/// unsupported flags (SV2 Overview/SetupConnection.Error): neither server
+/// refuses a connection over its feature flags.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetupRefusal {
+    pub error_code: &'static str,
+    pub reason: String,
+}
+
+/// The protocol version a `SetupConnection` gets, or why it is refused. The
+/// protocol is checked before the version, as SRI's pool and JDS do; `serves`
+/// says which `protocol` values this port accepts.
+pub fn setup_verdict(
+    input: &SetupConnectionInput,
+    serves: impl Fn(u8) -> bool,
+) -> Result<u16, SetupRefusal> {
+    if !serves(input.protocol) {
+        return Err(SetupRefusal {
+            error_code: ERR_UNSUPPORTED_PROTOCOL,
+            reason: format!("protocol {} is not served on this port", input.protocol),
+        });
+    }
+    crate::protocol_version::negotiate_version(input.min_version, input.max_version).ok_or_else(
+        || SetupRefusal {
+            error_code: ERR_PROTOCOL_VERSION_MISMATCH,
+            reason: format!(
+                "version range {}–{} does not include {}",
+                input.min_version,
+                input.max_version,
+                crate::protocol_version::MIN_PROTOCOL_VERSION
+            ),
+        },
+    )
+}
+
+/// The answer to a `RequestExtensions` (ext 0x0001).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExtensionsVerdict {
+    /// Every requested extension `offers` accepts; empty for an empty request.
+    Success { supported: Vec<u16> },
+    /// A non-empty request with none of them offered.
+    Error { unsupported: Vec<u16> },
+}
+
+/// Split `requested` by `offers`: `Error` only when a non-empty request has
+/// nothing this server offers, else `Success` with the offered ones.
+pub fn negotiate_extensions(requested: &[u16], offers: impl Fn(u16) -> bool) -> ExtensionsVerdict {
+    let (supported, unsupported): (Vec<u16>, Vec<u16>) =
+        requested.iter().copied().partition(|&ext| offers(ext));
+    if supported.is_empty() && !requested.is_empty() {
+        ExtensionsVerdict::Error { unsupported }
+    } else {
+        ExtensionsVerdict::Success { supported }
+    }
+}
+
 /// The unused string fields are still checked: a non-UTF-8 one refuses the
 /// connection setup.
 pub(crate) fn decode_setup_connection(
@@ -264,4 +321,68 @@ pub(crate) fn request_extensions_error(
             },
         )),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup(protocol: u8, min_version: u16, max_version: u16) -> SetupConnectionInput {
+        SetupConnectionInput {
+            protocol,
+            min_version,
+            max_version,
+            flags: 0,
+            vendor: String::new(),
+        }
+    }
+
+    /// The protocol is checked before the version: a request wrong on both
+    /// counts is refused as `unsupported-protocol`.
+    #[test]
+    fn setup_verdict_checks_the_protocol_before_the_version() {
+        let serves_mining = |protocol: u8| protocol == 0;
+        assert_eq!(setup_verdict(&setup(0, 2, 2), serves_mining), Ok(2));
+        assert_eq!(
+            setup_verdict(&setup(0, 3, 3), serves_mining)
+                .unwrap_err()
+                .error_code,
+            ERR_PROTOCOL_VERSION_MISMATCH
+        );
+        assert_eq!(
+            setup_verdict(&setup(1, 2, 2), serves_mining)
+                .unwrap_err()
+                .error_code,
+            ERR_UNSUPPORTED_PROTOCOL
+        );
+        assert_eq!(
+            setup_verdict(&setup(1, 3, 3), serves_mining)
+                .unwrap_err()
+                .error_code,
+            ERR_UNSUPPORTED_PROTOCOL
+        );
+    }
+
+    /// `Error` only for a non-empty request with nothing offered; otherwise
+    /// `Success` with the offered extensions, in request order.
+    #[test]
+    fn negotiate_extensions_errs_only_when_nothing_requested_is_offered() {
+        let offers = |ext: u16| ext == 2 || ext == 3;
+        assert_eq!(
+            negotiate_extensions(&[], offers),
+            ExtensionsVerdict::Success { supported: vec![] }
+        );
+        assert_eq!(
+            negotiate_extensions(&[3, 9, 2], offers),
+            ExtensionsVerdict::Success {
+                supported: vec![3, 2]
+            }
+        );
+        assert_eq!(
+            negotiate_extensions(&[9, 8], offers),
+            ExtensionsVerdict::Error {
+                unsupported: vec![9, 8]
+            }
+        );
+    }
 }

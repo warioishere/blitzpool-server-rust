@@ -12,7 +12,6 @@ use bp_common::AddressId;
 
 use crate::codec_common::SetupConnectionInput;
 use crate::extensions::{RequestExtensions, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS};
-use crate::protocol_version::{negotiate_version, MIN_PROTOCOL_VERSION};
 use crate::tokens::{Token, TokenAllocError, TokenStore};
 
 use crate::bridge::DistributionAcceptance;
@@ -360,34 +359,28 @@ impl JdpSessionState {
 
 // ── Handler: SetupConnection ────────────────────────────────────────
 
-/// Handle a JDP `SetupConnection`: wrong protocol or version → error +
-/// Disconnect; else success echoing only the `DECLARE_TX_DATA` bit.
+/// Handle a JDP `SetupConnection`: refused per
+/// [`crate::codec_common::setup_verdict`] with error + Disconnect; else success
+/// echoing only the `DECLARE_TX_DATA` bit.
 pub fn handle_setup_connection(
     state: &mut JdpSessionState,
     input: &SetupConnectionInput,
 ) -> JdpHandlerOutcome {
-    if input.protocol != PROTOCOL_JOB_DECLARATION {
-        let mut outcome = JdpHandlerOutcome::with_frame(JdpOutboundFrame::SetupConnectionError {
-            flags: input.flags,
-            error_code: crate::codec_common::ERR_UNSUPPORTED_PROTOCOL.to_string(),
-        });
-        outcome.push_event(JdpSessionEvent::Disconnect {
-            reason: format!("protocol mismatch: got {}", input.protocol),
-        });
-        return outcome;
-    }
-    let Some(used_version) = negotiate_version(input.min_version, input.max_version) else {
-        let mut outcome = JdpHandlerOutcome::with_frame(JdpOutboundFrame::SetupConnectionError {
-            flags: input.flags,
-            error_code: crate::codec_common::ERR_PROTOCOL_VERSION_MISMATCH.to_string(),
-        });
-        outcome.push_event(JdpSessionEvent::Disconnect {
-            reason: format!(
-                "version range {}–{} doesn't include {}",
-                input.min_version, input.max_version, MIN_PROTOCOL_VERSION
-            ),
-        });
-        return outcome;
+    let used_version = match crate::codec_common::setup_verdict(input, |protocol| {
+        protocol == PROTOCOL_JOB_DECLARATION
+    }) {
+        Ok(version) => version,
+        Err(refusal) => {
+            let mut outcome =
+                JdpHandlerOutcome::with_frame(JdpOutboundFrame::SetupConnectionError {
+                    flags: 0,
+                    error_code: refusal.error_code.to_string(),
+                });
+            outcome.push_event(JdpSessionEvent::Disconnect {
+                reason: refusal.reason,
+            });
+            return outcome;
+        }
     };
 
     let negotiated_flags = input.flags & FLAG_DECLARE_TX_DATA;
@@ -414,31 +407,28 @@ pub fn handle_request_extensions(
     input: &RequestExtensions,
     distribution_available: bool,
 ) -> JdpHandlerOutcome {
-    let mut supported: Vec<u16> = Vec::new();
-    let mut unsupported: Vec<u16> = Vec::new();
-    for ext in &input.requested_extensions {
-        let offerable = is_jdp_extension_supported(*ext)
-            && (*ext != SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS || distribution_available);
-        if offerable {
-            supported.push(*ext);
-            state.negotiated_extensions.insert(*ext);
-        } else {
-            unsupported.push(*ext);
+    let offers = |ext: u16| {
+        is_jdp_extension_supported(ext)
+            && (ext != SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS || distribution_available)
+    };
+    match crate::codec_common::negotiate_extensions(&input.requested_extensions, offers) {
+        crate::codec_common::ExtensionsVerdict::Success { supported } => {
+            state
+                .negotiated_extensions
+                .extend(supported.iter().copied());
+            JdpHandlerOutcome::with_frame(JdpOutboundFrame::RequestExtensionsSuccess {
+                request_id: input.request_id,
+                supported_extensions: supported,
+            })
+        }
+        crate::codec_common::ExtensionsVerdict::Error { unsupported } => {
+            JdpHandlerOutcome::with_frame(JdpOutboundFrame::RequestExtensionsError {
+                request_id: input.request_id,
+                unsupported_extensions: unsupported,
+                required_extensions: Vec::new(),
+            })
         }
     }
-
-    if supported.is_empty() && !input.requested_extensions.is_empty() {
-        return JdpHandlerOutcome::with_frame(JdpOutboundFrame::RequestExtensionsError {
-            request_id: input.request_id,
-            unsupported_extensions: unsupported,
-            required_extensions: Vec::new(),
-        });
-    }
-
-    JdpHandlerOutcome::with_frame(JdpOutboundFrame::RequestExtensionsSuccess {
-        request_id: input.request_id,
-        supported_extensions: supported,
-    })
 }
 
 // ── Handler: AllocateMiningJobToken ─────────────────────────────────
@@ -1162,8 +1152,11 @@ pub(crate) mod tests {
         input.protocol = 0; // mining, not JDP
         let out = handle_setup_connection(&mut s, &input);
         match &out.outbound[0] {
-            JdpOutboundFrame::SetupConnectionError { error_code, .. } => {
+            JdpOutboundFrame::SetupConnectionError { flags, error_code } => {
                 assert_eq!(error_code, crate::codec_common::ERR_UNSUPPORTED_PROTOCOL);
+                // The request set DECLARE_TX_DATA, which the pool supports:
+                // the refusal is not about flags.
+                assert_eq!(*flags, 0);
             }
             _ => panic!("expected SetupConnectionError"),
         }
@@ -1182,11 +1175,12 @@ pub(crate) mod tests {
         input.max_version = 3;
         let out = handle_setup_connection(&mut s, &input);
         match &out.outbound[0] {
-            JdpOutboundFrame::SetupConnectionError { error_code, .. } => {
+            JdpOutboundFrame::SetupConnectionError { flags, error_code } => {
                 assert_eq!(
                     error_code,
                     crate::codec_common::ERR_PROTOCOL_VERSION_MISMATCH
                 );
+                assert_eq!(*flags, 0);
             }
             _ => panic!("expected SetupConnectionError"),
         }

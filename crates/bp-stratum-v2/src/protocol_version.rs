@@ -2,7 +2,8 @@
 
 //! The SV2 protocol versions this pool speaks and the `SetupConnection` range
 //! negotiation. One place, so the mining and JDP listeners cannot speak
-//! different versions; each sub-protocol still sends its own refusal.
+//! different versions; [`crate::codec_common::setup_verdict`] turns a failed
+//! negotiation into the refusal both send.
 
 /// Minimum SV2 protocol version served. SV2 Overview/SetupConnection pins
 /// `min_version`/`max_version` at 2 for the current specification.
@@ -14,7 +15,7 @@ pub const MAX_PROTOCOL_VERSION: u16 = 2;
 
 /// Negotiate a client's `[min_version, max_version]` against what this pool
 /// serves: the highest version both speak, or `None` when the ranges do not
-/// intersect (the caller then sends its own `SetupConnection.Error`).
+/// intersect (refused by [`crate::codec_common::setup_verdict`]).
 pub fn negotiate_version(min_version: u16, max_version: u16) -> Option<u16> {
     negotiate_against(
         min_version,
