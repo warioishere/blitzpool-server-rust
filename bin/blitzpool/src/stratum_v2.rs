@@ -10,13 +10,12 @@ use std::sync::{Arc, RwLock};
 use bp_common::MiningMode;
 use bp_config::AppConfig;
 use bp_jobs_lifecycle::LifecycleConfig;
+use bp_mining_job::PayoutResolver;
 use bp_share::Difficulty;
 use bp_stratum_v1::PortConfig as Sv1PortConfig;
 use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
 use bp_stratum_v2::extranonce::{SharedExtranonceAllocator, SV2_WORKER_ID};
-use bp_stratum_v2::hooks::{
-    BlockSubmissionSink as Sv2BlockSink, MiningServerHooks, PayoutResolver,
-};
+use bp_stratum_v2::hooks::{BlockSubmissionSink as Sv2BlockSink, MiningServerHooks};
 use bp_stratum_v2::mining::client::PortConfig as Sv2PortConfig;
 use bp_stratum_v2::noise::NoiseConfig;
 use bp_stratum_v2::server::{ServerConfig as Sv2ServerConfig, StratumV2MiningServer};

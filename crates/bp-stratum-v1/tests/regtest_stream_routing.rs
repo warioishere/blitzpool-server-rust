@@ -12,12 +12,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bitcoin::Network;
-use bp_common::StreamKind;
-use bp_mining_job::{PayoutEntry, ResolvedPayouts};
+use bp_common::{AddressId, StreamKind};
+use bp_mining_job::{PayoutEntry, PayoutResolver, ResolvedPayouts};
 use bp_regtest_harness::{RegtestConfig, RegtestNode};
 use bp_stratum_v1::{
-    BlockSubmissionSink, PayoutResolver, PortConfig, ServerConfig, ServerHooks, ShareAccept,
-    SharedExtranonce, StratumV1Server,
+    BlockSubmissionSink, PortConfig, ServerConfig, ServerHooks, ShareAccept, SharedExtranonce,
+    StratumV1Server,
 };
 use bp_template_distribution::{TdpCoinbaseConstraints, TdpConfig, TdpHandle};
 use bp_test_support::poll_for_height;
@@ -69,11 +69,15 @@ struct FixedResolver {
 
 #[async_trait]
 impl PayoutResolver for FixedResolver {
-    async fn resolve_payouts(&self, _miner_address: &str, reward_sats: u64) -> ResolvedPayouts {
+    async fn resolve_payouts(
+        &self,
+        _miner_address: &AddressId,
+        reward_sats: u64,
+    ) -> ResolvedPayouts {
         ResolvedPayouts::unsnapshotted(split_reward(&self.addresses, reward_sats))
     }
 
-    fn resolve_stream(&self, _miner_address: &str) -> StreamKind {
+    fn resolve_stream(&self, _miner_address: &AddressId) -> StreamKind {
         self.stream
     }
 }

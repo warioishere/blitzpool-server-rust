@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use bitcoin::Network;
+use bp_common::AddressId;
 use bp_mining_job::{
     parse_pool_address, MiningJobCache, ResolvedPayouts, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
 };
@@ -51,7 +52,7 @@ pub(crate) struct SessionState<C: Clock> {
 
     // Handshake messages — populated as they arrive
     pub subscription: Option<SubscribeRequest>,
-    pub authorization: Option<AuthorizeRequest>,
+    pub authorization: Option<Authorization>,
     pub suggested_difficulty: Option<SuggestDifficultyRequest>,
 
     // Stratum lifecycle
@@ -147,15 +148,42 @@ pub(crate) fn random_session_id_hex() -> String {
 
 // ── Session-level outcomes ───────────────────────────────────────────
 
+/// A session's accepted `mining.authorize`.
+#[derive(Clone, Debug)]
+pub(crate) struct Authorization {
+    /// The request's id, answered if admission refuses the authorize.
+    pub id: RpcId,
+    /// The `address.worker` string the miner sent, for logs.
+    pub raw_username: String,
+    /// The address in the form every store keys it by.
+    pub address: AddressId,
+    /// Cleaned by [`bp_common::clean_worker_name`]; `"worker"` when that
+    /// leaves nothing.
+    pub worker: String,
+}
+
+#[cfg(test)]
+impl Authorization {
+    /// The authorization a test session holds after authorizing `address`
+    /// with worker `w`.
+    pub(crate) fn for_tests(address: &str) -> Self {
+        Self {
+            id: RpcId::from(2),
+            raw_username: format!("{address}.w"),
+            address: AddressId::new(address).expect("test address fits an AddressId"),
+            worker: "w".to_string(),
+        }
+    }
+}
+
 /// What a handler decided beyond its wire frames; the server task drives the
 /// hooks from these without re-deriving state.
 #[derive(Debug)]
 pub(crate) enum SessionEvent {
     /// Diagnostic only; no hooks fire on it.
     Subscribed,
-    /// `address` is already normalized.
     Authorized {
-        address: String,
+        address: AddressId,
         worker: String,
     },
     DifficultyChanged,
@@ -352,7 +380,7 @@ pub(crate) fn handle_authorize<C: Clock>(
     _port_config: &PortConfig,
     _registry: &Arc<JobRegistry>,
     _current_template: Option<&ActiveSV1Template>,
-    mut request: AuthorizeRequest,
+    request: AuthorizeRequest,
     _now_ms: u64,
 ) -> HandlerOutcome {
     let mut out = HandlerOutcome::default();
@@ -376,8 +404,8 @@ pub(crate) fn handle_authorize<C: Clock>(
 
     // An address of this network in the form every store keys it by, as an
     // SV2 channel's `AddressId`: every cache and PPLNS-window key depends on it.
-    match parse_pool_address(state.network, &request.address) {
-        Some(address) => request.address = address.into_inner(),
+    let address = match parse_pool_address(state.network, &request.address) {
+        Some(address) => address,
         None => {
             tracing::warn!(
                 session_id_hex = %state.session_id_hex,
@@ -389,14 +417,14 @@ pub(crate) fn handle_authorize<C: Clock>(
             out.push_event(SessionEvent::Disconnect);
             return out;
         }
-    }
+    };
 
     // The session stays on its first address, as an SV2 connection does: its
     // template stream and registered session were chosen for that address.
     // A repeat for the same address changes nothing, so the session is not
     // registered twice.
     if let Some(existing) = &state.authorization {
-        if existing.address == request.address {
+        if existing.address == address {
             out.push_frame(write_authorize_response(&id));
         } else {
             tracing::warn!(
@@ -414,11 +442,16 @@ pub(crate) fn handle_authorize<C: Clock>(
         return out;
     }
 
-    state.authorization = Some(request.clone());
+    state.authorization = Some(Authorization {
+        id: id.clone(),
+        raw_username: request.raw_username,
+        address: address.clone(),
+        worker: request.worker.clone(),
+    });
     out.push_frame(write_authorize_response(&id));
     out.push_event(SessionEvent::Authorized {
-        address: request.address.clone(),
-        worker: request.worker.clone(),
+        address,
+        worker: request.worker,
     });
 
     // The IO layer sends the first notify on `Authorized` after resolving
@@ -951,7 +984,7 @@ mod tests {
         // touches no registry; the IO layer builds it after resolving payouts.
         let port = solo_port(16384.0);
         let mut state = fresh_state(TestClock::new(0), &port);
-        state.authorization = Some(authorize_req(REGTEST_ADDR));
+        state.authorization = Some(Authorization::for_tests(REGTEST_ADDR));
         let reg = empty_registry();
         let template = template_for_regtest();
         let out = handle_subscribe(
@@ -1255,7 +1288,10 @@ mod tests {
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert!(s.contains(REJECT_ADDRESS_LOCKED), "got {s}");
         assert!(!registered(&out));
-        assert_eq!(state.authorization.as_ref().unwrap().address, REGTEST_ADDR);
+        assert_eq!(
+            state.authorization.as_ref().unwrap().address.as_str(),
+            REGTEST_ADDR
+        );
 
         let out = authorize(&mut state, REGTEST_ADDR);
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
@@ -1383,7 +1419,7 @@ mod tests {
     fn submit_before_subscribe_init_rejects_with_not_subscribed() {
         let port = solo_port(16384.0);
         let mut state = fresh_state(TestClock::new(0), &port);
-        state.authorization = Some(authorize_req(REGTEST_ADDR));
+        state.authorization = Some(Authorization::for_tests(REGTEST_ADDR));
         // stratum_initialized stays false.
         let reg = empty_registry();
         let out = handle_submit(&mut state, &reg, submit_req("1"), 0);
@@ -1437,7 +1473,7 @@ mod tests {
         let port = solo_port(1_000_000.0); // a high-diff port
         let mut state = SessionState::new(clock.clone(), &sc, &port, "abcd1234".to_string());
         state.stratum_initialized = true;
-        state.authorization = Some(authorize_req(REGTEST_ADDR));
+        state.authorization = Some(Authorization::for_tests(REGTEST_ADDR));
         clock.advance_ms(600_000);
         let out = vardiff_check_now(&mut state, &clock);
         assert!(out.outbound_frames.is_empty(), "no notify yet, no retarget");
@@ -1497,7 +1533,7 @@ mod tests {
     fn stale_rejects_at_the_usual_cadence_hold_the_session() {
         let clock = Arc::new(TestClock::new(0));
         let (mut state, sc, port) = measured_session(&clock);
-        state.authorization = Some(authorize_req(REGTEST_ADDR));
+        state.authorization = Some(Authorization::for_tests(REGTEST_ADDR));
         let reg = empty_registry();
         let out = apply_new_template(
             &mut state,
@@ -1537,7 +1573,7 @@ mod tests {
     fn unknown_job_rejects_do_not_count_as_arrivals() {
         let clock = Arc::new(TestClock::new(0));
         let (mut state, _, _) = measured_session(&clock);
-        state.authorization = Some(authorize_req(REGTEST_ADDR));
+        state.authorization = Some(Authorization::for_tests(REGTEST_ADDR));
         let reg = empty_registry();
         let job_ids: Vec<String> = (0..40).map(|i| format!("{i:x}")).collect();
         for job_id in &job_ids {
@@ -1563,7 +1599,7 @@ mod tests {
     fn duplicate_rejects_do_not_count_as_arrivals() {
         let clock = Arc::new(TestClock::new(0));
         let (mut state, sc, port) = measured_session(&clock);
-        state.authorization = Some(authorize_req(REGTEST_ADDR));
+        state.authorization = Some(Authorization::for_tests(REGTEST_ADDR));
         let reg = empty_registry();
         let out = apply_new_template(
             &mut state,
@@ -1692,7 +1728,7 @@ mod tests {
         let port = solo_port(16384.0);
         let mut state = fresh_state(TestClock::new(0), &port);
         state.stratum_initialized = true;
-        state.authorization = Some(authorize_req(REGTEST_ADDR));
+        state.authorization = Some(Authorization::for_tests(REGTEST_ADDR));
         const OLD_TIP: [u8; 32] = [0x5A; 32];
         state.share_cache.seen.record(OLD_TIP, [0x11; 32]);
 
@@ -1727,7 +1763,7 @@ mod tests {
         let port = solo_port(16384.0);
         let mut state = fresh_state(TestClock::new(0), &port);
         state.stratum_initialized = true;
-        state.authorization = Some(authorize_req(REGTEST_ADDR));
+        state.authorization = Some(Authorization::for_tests(REGTEST_ADDR));
         let tip = template_for_regtest().prev_hash;
         state.share_cache.seen.record(tip, [0x11; 32]);
 
@@ -1800,7 +1836,7 @@ mod tests {
         let mut other = SessionState::new(clock.clone(), &sc, &port, "bbbb0002".to_string());
         for state in [&mut owner, &mut other] {
             state.stratum_initialized = true;
-            state.authorization = Some(authorize_req(REGTEST_ADDR));
+            state.authorization = Some(Authorization::for_tests(REGTEST_ADDR));
         }
         let out = apply_new_template(
             &mut owner,

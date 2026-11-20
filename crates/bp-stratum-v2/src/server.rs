@@ -2432,7 +2432,7 @@ mod tests {
     async fn resolve_template_mining_job_inputs_returns_none_when_the_resolver_serves_no_job() {
         struct NoJobResolver;
         #[async_trait::async_trait]
-        impl crate::hooks::PayoutResolver for NoJobResolver {
+        impl bp_mining_job::PayoutResolver for NoJobResolver {
             async fn resolve_payouts(
                 &self,
                 _: &AddressId,

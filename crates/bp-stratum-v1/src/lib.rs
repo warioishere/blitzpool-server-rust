@@ -19,7 +19,7 @@ mod submit;
 pub use config::{PortConfig, ServerConfig, DEFAULT_POOL_IDENTIFIER};
 pub use error::StratumV1Error;
 pub use frame::parse_request;
-pub use hooks::{BlockSubmissionSink, PayoutResolver, ServerHooks};
+pub use hooks::{BlockSubmissionSink, ServerHooks};
 pub use notify::{build_notify_frame, swap_endian_words, ActiveSV1Template};
 pub use server::{SharedExtranonce, StratumV1Server};
 pub use submit::ShareAccept;

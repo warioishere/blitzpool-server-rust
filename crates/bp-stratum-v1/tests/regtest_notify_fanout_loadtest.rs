@@ -14,12 +14,10 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bitcoin::Network;
-use bp_common::StreamKind;
-use bp_mining_job::{PayoutEntry, ResolvedPayouts};
+use bp_common::{AddressId, StreamKind};
+use bp_mining_job::{PayoutEntry, PayoutResolver, ResolvedPayouts};
 use bp_regtest_harness::{RegtestConfig, RegtestNode};
-use bp_stratum_v1::{
-    PayoutResolver, PortConfig, ServerConfig, ServerHooks, SharedExtranonce, StratumV1Server,
-};
+use bp_stratum_v1::{PortConfig, ServerConfig, ServerHooks, SharedExtranonce, StratumV1Server};
 use bp_template_distribution::{TdpCoinbaseConstraints, TdpConfig, TdpHandle, REFRESH_SPREAD};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -34,14 +32,18 @@ struct SoloResolver;
 
 #[async_trait]
 impl PayoutResolver for SoloResolver {
-    async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts {
+    async fn resolve_payouts(
+        &self,
+        miner_address: &AddressId,
+        reward_sats: u64,
+    ) -> ResolvedPayouts {
         ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
-            address: miner_address.to_string(),
+            address: miner_address.as_str().to_string(),
             sats: reward_sats,
         }])
     }
 
-    fn resolve_stream(&self, _miner_address: &str) -> StreamKind {
+    fn resolve_stream(&self, _miner_address: &AddressId) -> StreamKind {
         StreamKind::Solo
     }
 }

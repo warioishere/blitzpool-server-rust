@@ -466,7 +466,7 @@ async fn run_connection(
                     if state
                         .authorization
                         .as_ref()
-                        .is_some_and(|auth| auth.address == address)
+                        .is_some_and(|auth| auth.address.as_str() == address)
                     {
                         info!(
                             session_id = %state.session_id_hex,
@@ -553,7 +553,7 @@ async fn run_connection(
                             // mode-gate this publishes, and would otherwise default to
                             // Solo. `apply_outcome` must not register again (double
                             // gate refcount).
-                            if let Some(refusal) = hooks.admission.refusal(&address).await {
+                            if let Some(refusal) = hooks.admission.refusal(address.as_str()).await {
                                 // No session: the authorize gets the refusal
                                 // instead of its success, and the connection closes.
                                 refuse_authorize(&mut state, &mut outcome, refusal);
@@ -564,7 +564,7 @@ async fn run_connection(
                                     .session_persistence
                                     .register_session(
                                         &state.session_id_hex,
-                                        &address,
+                                        address.as_str(),
                                         &worker,
                                         user_agent.as_deref(),
                                     )
@@ -854,7 +854,13 @@ pub(crate) async fn process_event<C: bp_vardiff::Clock>(
             let user_agent = state.subscription.as_ref().map(|s| s.user_agent.as_str());
             hooks
                 .device_status_sink
-                .on_device_event(&address, &worker, &state.session_id_hex, user_agent, true)
+                .on_device_event(
+                    address.as_str(),
+                    &worker,
+                    &state.session_id_hex,
+                    user_agent,
+                    true,
+                )
                 .await;
             true
         }
@@ -986,8 +992,7 @@ mod tests {
         }
     }
 
-    use crate::client::SessionState;
-    use crate::frame::{AuthorizeRequest, RpcId};
+    use crate::client::{Authorization, SessionState};
     use crate::hooks::test_support::RecordingHooks;
     use crate::notify::ActiveSV1Template;
     use bitcoin::Network;
@@ -1330,7 +1335,8 @@ mod tests {
         let hooks = rec.as_server_hooks();
         let keep = process_event(
             SessionEvent::Authorized {
-                address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".into(),
+                address: bp_common::AddressId::new("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
+                    .unwrap(),
                 worker: "w".into(),
             },
             &state,
@@ -1357,13 +1363,9 @@ mod tests {
     async fn accepted_share_fans_out_to_accepted_sink_only_when_not_block() {
         let port = port_cfg();
         let mut state = fresh_state(&port);
-        state.authorization = Some(AuthorizeRequest {
-            id: RpcId::from(2),
-            raw_username: "addr.w".into(),
-            address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".into(),
-            worker: "w".into(),
-            password: None,
-        });
+        state.authorization = Some(Authorization::for_tests(
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
+        ));
         let rec = RecordingHooks::new();
         let hooks = rec.as_server_hooks();
         let keep = process_event(
@@ -1384,13 +1386,9 @@ mod tests {
     async fn accepted_block_candidate_also_fires_block_sink() {
         let port = port_cfg();
         let mut state = fresh_state(&port);
-        state.authorization = Some(AuthorizeRequest {
-            id: RpcId::from(2),
-            raw_username: "addr.w".into(),
-            address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".into(),
-            worker: "w".into(),
-            password: None,
-        });
+        state.authorization = Some(Authorization::for_tests(
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
+        ));
         let rec = RecordingHooks::new();
         let hooks = rec.as_server_hooks();
         let _ = process_event(
@@ -1410,13 +1408,9 @@ mod tests {
     async fn rejected_share_fans_out_to_rejected_sink() {
         let port = port_cfg();
         let mut state = fresh_state(&port);
-        state.authorization = Some(AuthorizeRequest {
-            id: RpcId::from(2),
-            raw_username: "addr.w".into(),
-            address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".into(),
-            worker: "w".into(),
-            password: None,
-        });
+        state.authorization = Some(Authorization::for_tests(
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
+        ));
         let rec = RecordingHooks::new();
         let hooks = rec.as_server_hooks();
         let _ = process_event(

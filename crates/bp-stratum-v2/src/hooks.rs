@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use bp_common::{AddressId, StreamKind};
-use bp_mining_job::{PayoutEntry, ResolvedPayouts};
+use bp_mining_job::{PayoutEntry, PayoutResolver, ResolvedPayouts};
 use bp_share_hook::{
     DeviceStatusSink, MinerAdmission, NoOpSink, SharedAcceptedShareSink, SharedRejectedShareSink,
     SharedSessionPersistence,
@@ -16,32 +16,6 @@ use bp_share_hook::{
 use tokio::sync::broadcast;
 
 use crate::mining::submit::ShareAccept;
-
-// ── PayoutResolver ──────────────────────────────────────────────────
-
-/// Resolve a miner address to a coinbase payout list per template broadcast,
-/// feeding [`bp_mining_job::build_mining_job_from_tdp`]. Production evaluates
-/// the address's mode; [`NoOpHooks`] pays 100% to the miner.
-#[async_trait::async_trait]
-pub trait PayoutResolver: Send + Sync {
-    /// Exact output sats per entry, placed verbatim, plus the fingerprint of
-    /// the distribution they came from (zeroed = books without a snapshot).
-    async fn resolve_payouts(&self, miner_address: &AddressId, reward_sats: u64)
-        -> ResolvedPayouts;
-
-    /// Which TDP template stream this address mines on, resolved once at
-    /// OpenChannel from the in-memory mode cache.
-    fn resolve_stream(&self, _miner_address: &AddressId) -> StreamKind {
-        StreamKind::Pplns
-    }
-
-    /// [`Self::resolve_stream`], with `None` for "not known yet": the mode cache
-    /// learns an address from its mining session, which the JDP allocate path
-    /// normally precedes.
-    fn resolve_stream_known(&self, miner_address: &AddressId) -> Option<StreamKind> {
-        Some(self.resolve_stream(miner_address))
-    }
-}
 
 // ── BlockSubmissionSink ─────────────────────────────────────────────
 

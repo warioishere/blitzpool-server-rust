@@ -12,8 +12,8 @@ use async_trait::async_trait;
 use bp_blockparty_engine::BlockpartyService;
 use bp_common::{AddressId, MiningMode};
 use bp_group_solo_engine::engine::GroupSoloEngine;
-use bp_mining_job::ResolvedPayouts;
 use bp_mining_job::SoloFeeConfig;
+use bp_mining_job::{PayoutResolver, ResolvedPayouts};
 use bp_mining_mode::MiningModeResult;
 use bp_mode_payouts::{ModeBuild, ModeEngines};
 use bp_pplns_engine::engine::PplnsEngine;
@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::engines::BlitzpoolModeGate;
 
-/// The production `PayoutResolver` for SV1 and SV2.
+/// The production [`PayoutResolver`] for SV1, SV2 and JDP.
 #[derive(Clone)]
 pub(crate) struct ProductionPayoutResolver {
     mode_gate: Arc<BlitzpoolModeGate>,
@@ -71,7 +71,7 @@ impl ProductionPayoutResolver {
         }
     }
 
-    /// Resolution core for SV1 and SV2: the gate's mode through the shared
+    /// Resolution core for SV1, SV2 and JDP: the gate's mode through the shared
     /// per-mode build. An admin of an unready Blockparty is refused at
     /// session start and kicked when it creates the party; until that kick
     /// lands, its connection mines Solo.
@@ -157,26 +157,7 @@ fn accounting_for(tailored: TailoredMode, miner: &AddressId) -> DistributionAcco
 // ─── Trait impls ──────────────────────────────────────────────────
 
 #[async_trait]
-impl bp_stratum_v1::PayoutResolver for ProductionPayoutResolver {
-    async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts {
-        match AddressId::new(miner_address) {
-            Ok(miner) => self.resolve_internal(&miner, reward_sats).await,
-            Err(err) => {
-                error!(%err, miner_address, "SV1 payout address will not parse; serving NO JOB");
-                ResolvedPayouts::none()
-            }
-        }
-    }
-
-    fn resolve_stream(&self, miner_address: &str) -> bp_common::StreamKind {
-        // Same gate lookup as payout resolution, so the template stream and
-        // the payout always name one mode.
-        bp_common::StreamKind::for_mode(self.mode_gate.lookup_mode(miner_address).mode())
-    }
-}
-
-#[async_trait]
-impl bp_stratum_v2::hooks::PayoutResolver for ProductionPayoutResolver {
+impl PayoutResolver for ProductionPayoutResolver {
     async fn resolve_payouts(
         &self,
         miner_address: &AddressId,
@@ -186,6 +167,8 @@ impl bp_stratum_v2::hooks::PayoutResolver for ProductionPayoutResolver {
     }
 
     fn resolve_stream(&self, miner_address: &AddressId) -> bp_common::StreamKind {
+        // Same gate lookup as payout resolution, so the template stream and
+        // the payout always name one mode.
         bp_common::StreamKind::for_mode(self.mode_gate.lookup_mode(miner_address.as_str()).mode())
     }
 
@@ -395,10 +378,7 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
         // The same `lookup_known` `build_for_miner` decides from, so the loop
         // never sees a mode change the builder disagrees with; no session is
         // undecided, not Solo, so a rig blip does not tear up a plan.
-        bp_stratum_v2::hooks::PayoutResolver::resolve_stream_known(
-            self.resolver.as_ref(),
-            miner_address,
-        )
+        PayoutResolver::resolve_stream_known(self.resolver.as_ref(), miner_address)
     }
 
     async fn next_distribution_id(&self) -> Option<u64> {

@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Side-effect hooks of the SV1 server: block submission and payout
-//! resolution are SV1 traits; shares, sessions and device status go to the
-//! `bp_share_hook` traits shared with SV2. [`ServerHooks::no_op`] makes the
-//! crate usable without production wiring.
+//! Side-effect hooks of the SV1 server: block submission is an SV1 trait;
+//! payout resolution is [`bp_mining_job::PayoutResolver`], and shares,
+//! sessions and device status go to the `bp_share_hook` traits, all shared
+//! with SV2. [`ServerHooks::no_op`] makes the crate usable without
+//! production wiring.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bp_mining_job::{PayoutEntry, ResolvedPayouts};
+use bp_mining_job::{PayoutEntry, PayoutResolver, ResolvedPayouts};
 
-use bp_common::StreamKind;
+use bp_common::{AddressId, StreamKind};
 use bp_share_hook::{
     DeviceStatusSink, MinerAdmission, NoOpSink, SharedAcceptedShareSink, SharedRejectedShareSink,
     SharedSessionPersistence,
@@ -18,25 +19,6 @@ use bp_share_hook::{
 use tokio::sync::broadcast;
 
 use crate::submit::ShareAccept;
-
-// ── PayoutResolver ───────────────────────────────────────────────────
-
-/// The mode-aware coinbase payout list for an authorized miner, resolved
-/// on every template broadcast and after authorize. `reward_sats` is the
-/// template's `coinbase_tx_value_remaining`.
-#[async_trait]
-pub trait PayoutResolver: Send + Sync {
-    /// Resolve the payout list plus the fingerprint of the
-    /// distribution it came from (zeroed = books without a snapshot).
-    async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts;
-
-    /// The template stream this address mines on, fixed at
-    /// `mining.authorize`. Defaults to `StreamKind::Pplns` (single stream);
-    /// sync because the mode lookup is an in-memory cache hit.
-    fn resolve_stream(&self, _miner_address: &str) -> StreamKind {
-        StreamKind::Pplns
-    }
-}
 
 // ── Block submission ─────────────────────────────────────────────────
 
@@ -105,9 +87,13 @@ impl BlockSubmissionSink for NoOpHooks {
 
 #[async_trait]
 impl PayoutResolver for NoOpHooks {
-    async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts {
+    async fn resolve_payouts(
+        &self,
+        miner_address: &AddressId,
+        reward_sats: u64,
+    ) -> ResolvedPayouts {
         ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
-            address: miner_address.to_string(),
+            address: miner_address.as_str().to_string(),
             sats: reward_sats,
         }])
     }
@@ -220,9 +206,13 @@ pub(crate) mod test_support {
 
     #[async_trait]
     impl PayoutResolver for RecordingHooks {
-        async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts {
+        async fn resolve_payouts(
+            &self,
+            miner_address: &AddressId,
+            reward_sats: u64,
+        ) -> ResolvedPayouts {
             ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
-                address: miner_address.to_string(),
+                address: miner_address.as_str().to_string(),
                 sats: reward_sats,
             }])
         }

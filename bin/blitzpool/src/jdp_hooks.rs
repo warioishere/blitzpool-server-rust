@@ -53,7 +53,7 @@ pub(crate) fn build_jdp_hooks(
     });
     JdpServerHooks {
         allocate_resolver: Arc::new(ProductionJdpAllocateResolver {
-            payout_resolver: payout_resolver as Arc<dyn bp_stratum_v2::hooks::PayoutResolver>,
+            payout_resolver: payout_resolver as Arc<dyn bp_mining_job::PayoutResolver>,
             chain: Arc::new(tdp.clone()),
             network,
             admission,
@@ -75,7 +75,7 @@ pub(crate) fn build_jdp_hooks(
 /// snapshot, so the reward must be [`ChainView::reference_revenue`], never an
 /// estimate.
 pub(crate) struct ProductionJdpAllocateResolver {
-    payout_resolver: Arc<dyn bp_stratum_v2::hooks::PayoutResolver>,
+    payout_resolver: Arc<dyn bp_mining_job::PayoutResolver>,
     chain: Arc<dyn ChainView>,
     network: BitcoinNetwork,
     admission: Arc<dyn bp_share_hook::MinerAdmission>,
@@ -122,7 +122,7 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
         // side refuses others, fatally for a JDC), checked before resolving so a
         // refused allocate cannot rewrite the PPLNS snapshot. Unknown is served;
         // `match`, not `!= Solo`, so a new stream kind is classified deliberately.
-        let servable = match bp_stratum_v2::hooks::PayoutResolver::resolve_stream_known(
+        let servable = match bp_mining_job::PayoutResolver::resolve_stream_known(
             &*self.payout_resolver,
             &miner_address,
         ) {
@@ -163,7 +163,7 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
                 reason: "no template yet — nothing to resolve a payout list against",
             };
         };
-        let payouts = bp_stratum_v2::hooks::PayoutResolver::resolve_payouts(
+        let payouts = bp_mining_job::PayoutResolver::resolve_payouts(
             &*self.payout_resolver,
             &miner_address,
             reward_sats,
@@ -1292,7 +1292,7 @@ mod base_allocate_tests {
     }
 
     #[async_trait]
-    impl bp_stratum_v2::hooks::PayoutResolver for FixedPayouts {
+    impl bp_mining_job::PayoutResolver for FixedPayouts {
         async fn resolve_payouts(
             &self,
             _miner_address: &AddressId,

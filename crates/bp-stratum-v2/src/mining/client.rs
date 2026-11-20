@@ -1385,7 +1385,7 @@ pub fn apply_vardiff_check<C: Clock>(state: &mut MiningSessionState<C>) -> Handl
 
 /// Pre-resolved inputs for [`apply_template_broadcast`]: coinbase template plus
 /// the payouts the IO layer resolved once per template via
-/// [`crate::hooks::PayoutResolver`]. Each channel gets a [`MiningJob`] sized for
+/// [`bp_mining_job::PayoutResolver`]. Each channel gets a [`MiningJob`] sized for
 /// its own extranonce slot.
 #[derive(Clone, Debug)]
 pub struct MiningJobInputs {

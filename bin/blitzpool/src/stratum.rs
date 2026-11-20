@@ -110,10 +110,6 @@ pub(crate) async fn spawn(
     tdp: &TdpHandle,
     block_sink: Arc<TdpBlockSubmissionSink>,
 ) -> Result<StratumHandles, StratumSpawnError> {
-    // Each protocol takes the one resolver as its own `PayoutResolver` trait.
-    let sv1_resolver: Arc<dyn bp_stratum_v1::PayoutResolver> = payout_resolver.clone();
-    let sv2_resolver: Arc<dyn bp_stratum_v2::hooks::PayoutResolver> = payout_resolver;
-
     // ONE pool-wide MiningJob cache for every SV1 and SV2 port server: they
     // share the TDP streams and the key is content-based, so identical
     // builds are one entry.
@@ -139,7 +135,7 @@ pub(crate) async fn spawn(
         engines,
         membership,
         block_sink.clone(),
-        sv1_resolver,
+        payout_resolver.clone(),
         Arc::clone(&device_status),
         Arc::clone(&live_sessions),
         job_cache.clone(),
@@ -165,7 +161,7 @@ pub(crate) async fn spawn(
         noise_config,
         bridge,
         block_sink,
-        sv2_resolver,
+        payout_resolver,
         custom_extranonce,
         device_status,
         Arc::clone(&live_sessions),
