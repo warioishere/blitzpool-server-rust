@@ -18,8 +18,8 @@ pub struct SharedAcceptedShare<'a> {
     pub address: &'a str,
 
     /// Worker name from `address.workername`, the same name the session row
-    /// carries. Never empty: without one, SV1 authorizes as "worker" and SV2
-    /// opens the channel as "default".
+    /// carries. Never empty: without one, both protocols use
+    /// [`bp_common::DEFAULT_WORKER_NAME`].
     pub worker: &'a str,
 
     pub session_id: &'a str,

@@ -923,10 +923,7 @@ fn resolve_open_context<C: Clock>(
         }
     }
 
-    let worker = match worker_part.map(bp_common::clean_worker_name) {
-        Some(w) if !w.is_empty() => w,
-        _ => "default".to_string(),
-    };
+    let worker = bp_common::worker_name(worker_part);
 
     // A positive `nominal_hash_rate` is honoured, bounded only by
     // `min_difficulty`: flooring it at the port's start difficulty would pin a
@@ -2604,10 +2601,11 @@ pub(crate) mod tests {
         assert_eq!(s.channels[&1].session_id.len(), 8);
     }
 
-    /// No worker, or an empty one, opens as "default": the session row and
-    /// every share carry that name, so the stats sinks never see "".
+    /// No worker, or an empty one, opens as "worker", the name SV1 gives a
+    /// nameless miner: the session row and every share carry it, so the stats
+    /// sinks never see "".
     #[test]
-    fn a_channel_without_a_worker_name_opens_as_default() {
+    fn a_channel_without_a_worker_name_opens_as_worker() {
         for identity in [REGTEST_ADDR.to_string(), format!("{REGTEST_ADDR}.")] {
             let mut s = fresh_session();
             handle_setup_connection(&mut s, &good_setup());
@@ -2616,15 +2614,15 @@ pub(crate) mod tests {
                 &open_std(7, &identity),
                 vec![0x01, 0x02, 0x03, 0x04],
             );
-            assert_eq!(s.channels[&1].worker, "default", "{identity}");
+            assert_eq!(s.channels[&1].worker, "worker", "{identity}");
         }
     }
 
     /// The worker part of `user_identity` is cleaned as on SV1; one of
-    /// nothing but control characters opens as "default".
+    /// nothing but control characters opens as "worker".
     #[test]
     fn a_channel_worker_name_is_cleaned() {
-        for (worker, expected) in [("rig\n1\u{202E}", "rig1"), ("\r\n", "default")] {
+        for (worker, expected) in [("rig\n1\u{202E}", "rig1"), ("\r\n", "worker")] {
             let mut s = fresh_session();
             handle_setup_connection(&mut s, &good_setup());
             handle_open_standard_mining_channel(

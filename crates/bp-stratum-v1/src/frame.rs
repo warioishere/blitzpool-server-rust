@@ -188,7 +188,7 @@ pub struct AuthorizeRequest {
     /// trim / bech32-lowercase / validation happens downstream.
     pub address: String,
     /// Substring after the first `.`, cleaned by
-    /// [`bp_common::clean_worker_name`]; `"worker"` when that leaves nothing.
+    /// [`bp_common::worker_name`].
     pub worker: String,
     pub password: Option<String>,
 }
@@ -501,19 +501,10 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
                 });
             }
             let raw_username = arr[0].as_str().unwrap().to_string();
-            // "addr." gets the no-dot default: the share path writes under a
-            // non-empty name, so a "" client row would go stale and
-            // `kill_dead_clients` would sweep a live session.
-            let (address, worker) = match bp_common::split_user_identity(&raw_username) {
-                (a, Some(w)) => (a, bp_common::clean_worker_name(w)),
-                (a, None) => (a, String::new()),
-            };
+            // "addr." gets the no-dot default, see `bp_common::worker_name`.
+            let (address, worker) = bp_common::split_user_identity(&raw_username);
             let address = address.to_string();
-            let worker = if worker.is_empty() {
-                "worker".to_string()
-            } else {
-                worker
-            };
+            let worker = bp_common::worker_name(worker);
             let password = arr.get(1).and_then(|v| v.as_str()).map(String::from);
             Ok(SV1Request::Authorize(AuthorizeRequest {
                 id,

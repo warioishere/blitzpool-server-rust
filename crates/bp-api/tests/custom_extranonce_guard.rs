@@ -29,6 +29,7 @@ const ATOMIC_ADDR: &str = "bc1q2vfxp232rx0z9rzn0hay9jptagk8c86d9w4l7k";
 const DUP_ADDR: &str = "bc1qha7546x08qwudehuc724np522c2n65m4sseeae";
 const HEADER_ADDR: &str = "bc1qyr9dx2zjg7rdla2dwc20za975w2gxtr4q39arj";
 const CLIENT_VIEW_ADDR: &str = "bc1qcpmga8eqxzwz4nmnew6v6xkapggs3sqzpu4fp0";
+const NAMES_ADDR: &str = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh";
 
 async fn connect_or_skip() -> Option<PgPool> {
     let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
@@ -318,6 +319,45 @@ async fn set_batch_can_swap_two_workers_prefixes() {
 
     let _ = sqlx::query("DELETE FROM pplns_custom_extranonce WHERE address = $1")
         .bind(SWAP_ADDR)
+        .execute(&pool)
+        .await;
+}
+
+/// A worker name is stored as the core resolves it (`bp_common::worker_name`):
+/// cleaned of control characters, and "worker" when empty, so the override
+/// matches the miner's channel.
+#[tokio::test]
+async fn set_stores_worker_names_as_the_core_resolves_them() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let _ = sqlx::query("DELETE FROM pplns_custom_extranonce WHERE address = $1")
+        .bind(NAMES_ADDR)
+        .execute(&pool)
+        .await;
+    seed_token(&pool, NAMES_ADDR, "tok-names").await;
+
+    let batch = format!(
+        r#"{{"address":"{NAMES_ADDR}","workers":[{{"worker":"rig\n1","extranonce":"0f000001"}},{{"worker":"","extranonce":"0f000002"}}]}}"#
+    );
+    let (st, js) = post_json_auth(
+        build_router(minimal_state(pool.clone())),
+        "/api/address/extranonce/set",
+        batch,
+        Some("tok-names"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "batch must apply; got {js}");
+    assert_eq!(
+        prefixes_of(&pool, NAMES_ADDR).await,
+        vec![
+            ("rig1".to_string(), 0x0f00_0001),
+            ("worker".to_string(), 0x0f00_0002)
+        ]
+    );
+
+    let _ = sqlx::query("DELETE FROM pplns_custom_extranonce WHERE address = $1")
+        .bind(NAMES_ADDR)
         .execute(&pool)
         .await;
 }

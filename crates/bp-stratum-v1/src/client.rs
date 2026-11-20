@@ -157,8 +157,7 @@ pub(crate) struct Authorization {
     pub raw_username: String,
     /// The address in the form every store keys it by.
     pub address: AddressId,
-    /// Cleaned by [`bp_common::clean_worker_name`]; `"worker"` when that
-    /// leaves nothing.
+    /// Resolved by [`bp_common::worker_name`].
     pub worker: String,
 }
 

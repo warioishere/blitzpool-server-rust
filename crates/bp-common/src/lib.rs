@@ -194,8 +194,8 @@ pub fn normalize_btc_address(address: &str) -> String {
 
 /// Split a stratum `address.worker` identity at its FIRST dot; the worker
 /// keeps any further dots. The worker is `None` when there is no dot and
-/// `Some("")` for a trailing dot. Which default an absent or empty worker
-/// gets is the caller's business, and so is validating the address part.
+/// `Some("")` for a trailing dot. A session's worker name comes from
+/// [`worker_name`]; validating the address part is the caller's business.
 pub fn split_user_identity(identity: &str) -> (&str, Option<&str>) {
     match identity.split_once('.') {
         Some((address, worker)) => (address, Some(worker)),
@@ -218,6 +218,23 @@ pub fn clean_worker_name(raw: &str) -> String {
         .filter(|&c| !c.is_control() && !is_invisible_format(c))
         .take(MAX_WORKER_NAME_CHARS)
         .collect()
+}
+
+/// The worker name of a miner that names none, on SV1 and SV2 alike.
+pub const DEFAULT_WORKER_NAME: &str = "worker";
+
+/// A session's worker name: `raw` through [`clean_worker_name`], or
+/// [`DEFAULT_WORKER_NAME`] when it is absent or nothing is left. SV1, SV2 and
+/// the custom-extranonce API all resolve a worker name here, so one name keys
+/// the same session row and the same override on every path. Never empty: a
+/// `""` client row would go stale under the share path's non-empty name.
+pub fn worker_name(raw: Option<&str>) -> String {
+    let cleaned = raw.map(clean_worker_name).unwrap_or_default();
+    if cleaned.is_empty() {
+        DEFAULT_WORKER_NAME.to_string()
+    } else {
+        cleaned
+    }
 }
 
 /// Formatting characters that render as nothing or reorder the text around
@@ -567,6 +584,23 @@ mod tests {
     fn empty_input_returns_empty() {
         assert_eq!(normalize_btc_address(""), "");
         assert_eq!(normalize_btc_address("   "), "");
+    }
+
+    // ── worker_name ──────────────────────────────────────────────────
+
+    /// A name is kept as sent, dots and spaces included, after cleaning; an
+    /// absent name, an empty one and one with nothing left after cleaning
+    /// all become the default.
+    #[test]
+    fn worker_name_keeps_the_name_or_falls_back_to_worker() {
+        assert_eq!(worker_name(Some("Rig1")), "Rig1");
+        assert_eq!(worker_name(Some("rig.1")), "rig.1");
+        assert_eq!(worker_name(Some(" spaced ")), " spaced ");
+        assert_eq!(worker_name(Some("rig\n1\u{202E}")), "rig1");
+        assert_eq!(worker_name(None), DEFAULT_WORKER_NAME);
+        assert_eq!(worker_name(Some("")), DEFAULT_WORKER_NAME);
+        assert_eq!(worker_name(Some("\r\n")), DEFAULT_WORKER_NAME);
+        assert_eq!(DEFAULT_WORKER_NAME, "worker");
     }
 
     // ── split_user_identity ──────────────────────────────────────────

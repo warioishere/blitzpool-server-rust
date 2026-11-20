@@ -151,6 +151,12 @@ still rejected.
 Limits: at least 1 and at most **256** workers per request; no repeated
 worker and no repeated prefix within one request.
 
+**Worker names are matched the way the pool names your miner's worker.**
+Control and invisible formatting characters are removed, names are cut to 64
+characters, and an empty name means `worker`, the name a miner gets when it
+connects as `<address>` without a `.worker` part. Two entries that end up with
+the same name count as a repeated worker.
+
 ---
 
 ## Seeing what is set

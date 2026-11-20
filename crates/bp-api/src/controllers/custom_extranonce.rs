@@ -201,7 +201,8 @@ async fn set(
     let mut seen_workers: HashSet<String> = HashSet::with_capacity(body.workers.len());
     let mut seen_prefixes: HashSet<u32> = HashSet::with_capacity(body.workers.len());
     for entry in &body.workers {
-        let worker = normalize_worker(&entry.worker);
+        // The name the core resolves for the same miner, so the override matches.
+        let worker = bp_common::worker_name(Some(&entry.worker));
         let prefix = parse_prefix(&entry.extranonce)?;
         if !seen_prefixes.insert(prefix) {
             // Unlike a swap, one prefix twice in a request can never be satisfied.
@@ -289,17 +290,6 @@ async fn verify_token(pool: &PgPool, address: &AddressId, presented: &str) -> Re
         return Err(en_error("invalid-token", StatusCode::UNAUTHORIZED));
     }
     Ok(())
-}
-
-/// Mirrors the core's worker resolution: verbatim, empty becomes `"default"`.
-/// No trim or lowercase, since the core looks the override up by the miner's
-/// worker bytes as-is.
-fn normalize_worker(raw: &str) -> String {
-    if raw.is_empty() {
-        "default".to_string()
-    } else {
-        raw.to_string()
-    }
 }
 
 fn parse_prefix(raw: &str) -> Result<u32, ApiError> {
@@ -450,14 +440,6 @@ mod tests {
                 "{raw} must be rejected as malformed"
             );
         }
-    }
-
-    #[test]
-    fn normalize_worker_mirrors_the_core() {
-        assert_eq!(normalize_worker(""), "default");
-        assert_eq!(normalize_worker("Rig1"), "Rig1");
-        assert_eq!(normalize_worker("rig.1"), "rig.1");
-        assert_eq!(normalize_worker(" spaced "), " spaced ");
     }
 
     /// The challenge message verifies with a genuine signature, and only its own.
