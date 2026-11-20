@@ -16,9 +16,9 @@ run separately so a back-office fix redeploys without dropping miners (see
 
 | Profile  | Stratum host ports (on `core`) | API (on `api`) | bitcoin host RPC port |
 |----------|--------------------------------|----------------|------------------------|
-| mainnet  | 3333 / 3339 / 3340 / 3349 / 3335 / 3337 | 3334 | 127.0.0.1:8332 |
-| testnet4 | 3333 / 3339 / 3340 / 3349 / 3335 / 3337 | 3334 | 127.0.0.1:48332 |
-| regtest  | 3333 / 3339 / 3340 / 3349 / 3335 / 3337 | 3334 | 127.0.0.1:28443 |
+| mainnet  | 3333 / 3339 / 3340 / 3349 / 3335 | 3334 | 127.0.0.1:8332 |
+| testnet4 | 3333 / 3339 / 3340 / 3349 / 3335 | 3334 | 127.0.0.1:48332 |
+| regtest  | 3333 / 3339 / 3340 / 3349 / 3335 | 3334 | 127.0.0.1:28443 |
 
 Only one profile can be active at a time — bitcoin's IPC socket is on
 a single shared named volume (`blitzpool-ipc`) and all profiles share

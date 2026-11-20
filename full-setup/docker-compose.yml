@@ -185,7 +185,6 @@ services:
     ports:
       - "127.0.0.1:8332:8332/tcp"
       - "0.0.0.0:8333:8333/tcp"
-      - "127.0.0.1:28332:28332/tcp"
     volumes:
       - "./data/bitcoin-mainnet:/app/data"
       - "./docker/bitcoin/mainnet/bitcoin.conf:/app/data/bitcoin.conf:ro"
@@ -216,7 +215,6 @@ services:
     ports:
       - "127.0.0.1:48332:48332/tcp"
       - "0.0.0.0:48333:48333/tcp"
-      - "127.0.0.1:38332:28332/tcp"
     volumes:
       - "./data/bitcoin-testnet4:/app/data"
       - "./docker/bitcoin/testnet4/bitcoin.conf:/app/data/bitcoin.conf:ro"
@@ -268,7 +266,6 @@ services:
       - "0.0.0.0:3340:3340/tcp"   # pplns
       - "0.0.0.0:3349:3349/tcp"   # pplns high-diff
       - "0.0.0.0:3335:3335/tcp"   # jdp ([sv2].jdp_port)
-      - "0.0.0.0:3337:3337/tcp"   # jdp
     volumes:
       - "../.local/${BLITZPOOL_CONFIG:-blitzpool.toml}:/app/blitzpool.toml:ro"
       - "./data/blitzpool-logs:/app/logs"
