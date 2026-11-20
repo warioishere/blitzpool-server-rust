@@ -62,18 +62,18 @@ Verify the roles each process took:
 ```bash
 docker logs blitzpool-core   2>&1 | grep "bound: process live"   # roles=[Front]  stratum_ports=Some([...])
 docker logs blitzpool-api    2>&1 | grep "bound: process live"   # roles=[Api]    api=Some(0.0.0.0:3334)
-docker logs blitzpool-payout 2>&1 | grep -E "consumer: live|bound: process live"   # roles=[Payout, Stats]  block-found-consumer action=ledger live
-docker logs blitzpool-notify 2>&1 | grep -E "consumer: live|bound: process live"   # roles=[Notify]  block-found-consumer action=notify + device-status-consumer live
+docker logs blitzpool-payout 2>&1 | grep -E "stream-consumer: live|bound: process live"   # roles=[Payout, Stats]  label=block-found:ledger among others
+docker logs blitzpool-notify 2>&1 | grep -E "stream-consumer: live|bound: process live"   # roles=[Notify]  label=block-found:notify, label=device-status
 ```
 
 ## Deploying a fix (build-then-swap, minimal downtime)
 
-> The examples use `$COMPOSE` for the compose file. The repo + prod both use
-> `docker-compose.yml` (needs no `-f`), so `$COMPOSE` stays empty; set it only
+> The examples use `$COMPOSE` for the compose file. This directory's
+> `docker-compose.yml` needs no `-f`, so `$COMPOSE` stays empty; set it only
 > if you point at a non-default file. Set it once per shell:
 >
 > ```bash
-> COMPOSE=""                          # docker-compose.yml (repo + prod default)
+> COMPOSE=""                          # docker-compose.yml (the default)
 > # COMPOSE="-f other-file.yml"       # only if you use a non-default compose file
 > ```
 

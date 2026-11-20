@@ -93,9 +93,10 @@ Expect:
 
 * the miner **stays connected** (core untouched) and keeps submitting;
 * while payout is down, shares + any block-found buffer in the Redis streams;
-* on restart, `blitzpool-payout` replays its pending entries (`replayed
-  pending backlog`), logs `stream-consumer: live` per consumer, and the
-  windows / balances catch up — nothing lost.
+* on restart, `blitzpool-payout` logs `stream-consumer: live` per consumer
+  and reads what buffered while it was down, so the windows / balances
+  catch up — nothing lost. Entries it had received but not acked before it
+  stopped come first, logged as `replayed pending backlog`.
 
 ## Teardown
 

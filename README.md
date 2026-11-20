@@ -20,7 +20,7 @@ License: **GNU AGPL v3 (AGPL-3.0-or-later)**.
 |---|---|---|---|
 | Payouts go directly on-chain | ✅ same block as the find | ❌ batch cron, hours to days | ❌ threshold-based |
 | Pool holds miner sats | ❌ never | ✅ between find & payout | ✅ until threshold |
-| Minimum payout | *none* in Solo — it's just a coinbase output; PPLNS carries amounts below `min_payout_sats` over as credit | typically 0.001 BTC+ | same |
+| Minimum payout | *none* in Solo — it's just a coinbase output; PPLNS carries amounts below `min_payout_sats` over as credit; Team Mining and Blockparty pay a share below it to the fee output | typically 0.001 BTC+ | same |
 | Stratum V1 | ✅ | ✅ | ✅ |
 | Stratum V2 (Noise + TDP + JDP + extended channels) | ✅ actively developed | rare | almost never |
 | Non-custodial Team Mining (friends mine together, split on-chain) | ✅ | — | — |
@@ -94,7 +94,7 @@ The pool runs as role-gated processes that communicate over **Redis streams**:
 - `stats` — share-stats aggregation
 - `notify` — Telegram / ntfy / push / email fan-out
 
-Roles are selected with `--roles` / `BLITZPOOL_ROLES` (independent of payout mode). Block-found and accepted/rejected shares flow Core→Satellite over Redis streams, delivered at least once and applied once (shares dedup on their id, bookings are idempotent); routing-cache invalidation is broadcast cross-process. See [`full-setup/DEPLOYMENT.md`](full-setup/DEPLOYMENT.md).
+Roles are selected with `--roles` / `BLITZPOOL_ROLES` (independent of payout mode). Block-found and accepted/rejected shares flow Core→Satellite over Redis streams, delivered at least once: the payout windows dedup shares on their id and bookings are idempotent, while share statistics tolerate the rare double count; routing-cache invalidation is broadcast cross-process. See [`full-setup/DEPLOYMENT.md`](full-setup/DEPLOYMENT.md).
 
 ### 5. Confirmation-gated, orphan-safe payouts
 

@@ -31,9 +31,9 @@
 #   docker compose build blitzpool-payout
 #   docker compose up -d --no-deps blitzpool-payout
 #
-# The shared postgres holds one DB per network so switching does NOT
-# wipe the other network's state. DB name = `blitzpool` (PG_DATABASE in
-# `.env` overrides it).
+# Every network shares one postgres and one valkey. To keep their state
+# apart, give each network's toml its own `[database] database` (create it
+# first) and `[redis] db`.
 
 # Bitcoin Core release the node images build, taken from `.env` when set
 # there (see .env.example); unset, the Dockerfile's defaults apply.

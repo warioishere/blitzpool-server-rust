@@ -142,8 +142,14 @@ authority keys, FCM service-account JSON, web-push VAPID keys.
 
 ## Database name
 
-Default `PG_DATABASE=blitzpool`. To attach to a database with another name,
-set `PG_DATABASE` in `.env` (see `.env.example`).
+The pool connects to `[database] database` from its toml (`blitzpool` in the
+example). `PG_DATABASE` in `.env` (default `blitzpool`) only names the
+database postgres creates when it starts on an empty data dir, and the one
+its healthcheck probes: keep the two equal.
+
+Every network shares the one postgres and valkey. To keep their state
+apart, give each network's toml its own `[database] database` (create it
+first) and `[redis] db`.
 
 ## Image sizes (approximate)
 

@@ -97,8 +97,8 @@ pub(crate) struct BootOptions {
     /// built. For staging where bitcoind is unreachable but PG, Redis and
     /// HTTP should come up.
     pub(crate) skip_bitcoin_rpc_liveness: bool,
-    /// Skip TDP spawn entirely: no Stratum or JDP listener binds and
-    /// `/info/block-template` returns 503. Never in production.
+    /// Skip TDP spawn entirely: no Stratum or JDP listener binds. Never in
+    /// production.
     pub(crate) skip_tdp: bool,
 }
 

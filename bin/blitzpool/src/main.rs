@@ -1517,7 +1517,8 @@ fn print_config_error_help(err: &ConfigError) {
             eprintln!(
                 "hint: pass --config <PATH> to point at a different file. \
                  The repo ships a template at `blitzpool.example.toml` — \
-                 copy that to `.local/blitzpool.toml` and edit it."
+                 copy that to `.local/blitzpool.toml`, edit it and pass \
+                 `--config .local/blitzpool.toml`."
             );
         }
         ConfigError::Parse { .. } => {
