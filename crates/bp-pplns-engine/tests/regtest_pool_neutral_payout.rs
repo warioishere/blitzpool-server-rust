@@ -16,9 +16,7 @@ use bp_coinbase_snapshot::ActualCoinbase;
 use bp_common::{AddressId, Sats};
 use bp_mining_job::PayoutEntry;
 use bp_pplns::{
-    output_weight_for_address, WeightDistribution, WeightEntry, BUDGET_SAFETY_MARGIN_WU,
-    COINBASE_BASE_WEIGHT, COINBASE_OUTPUT_WEIGHT, COINBASE_WITNESS_COMMITMENT_WEIGHT,
-    DEFAULT_MIN_PAYOUT_SATS,
+    output_weight_for_address, WeightDistribution, WeightEntry, DEFAULT_MIN_PAYOUT_SATS,
 };
 use bp_pplns_engine::config::PplnsEngineConfig;
 use bp_pplns_engine::engine::PplnsEngine;
@@ -93,10 +91,7 @@ async fn withheld_miner_is_funded_by_the_other_miners_not_by_the_pool() {
             "the fixture assumes all three miners cost the same output weight"
         );
     }
-    let fixed_overhead = COINBASE_BASE_WEIGHT
-        + COINBASE_WITNESS_COMMITMENT_WEIGHT
-        + COINBASE_OUTPUT_WEIGHT
-        + BUDGET_SAFETY_MARGIN_WU;
+    let fixed_overhead = bp_pplns::budget_for_outputs(0);
     let budget_two_outputs = fixed_overhead + 2 * output_weight;
     let budget_three_outputs = fixed_overhead + 3 * output_weight;
 

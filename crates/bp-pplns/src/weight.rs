@@ -38,12 +38,18 @@ pub const BUDGET_SAFETY_MARGIN_WU: u32 = 200;
 pub(crate) const CUT_RESERVED_WEIGHT: u32 =
     COINBASE_BASE_WEIGHT + COINBASE_WITNESS_COMMITMENT_WEIGHT + COINBASE_OUTPUT_WEIGHT;
 
-/// Smallest budget that publishes one miner output: what the blockspace cut
-/// reserves plus one worst-case ([`COINBASE_OUTPUT_WEIGHT`]) output. Below it
-/// the cut publishes nothing and the §4 residual (`pay_P = T − Σpay`) hands
-/// the pool the whole block, hence a hard config floor.
-pub const MIN_COINBASE_WEIGHT_BUDGET: u32 =
-    CUT_RESERVED_WEIGHT + BUDGET_SAFETY_MARGIN_WU + COINBASE_OUTPUT_WEIGHT;
+/// Budget (WU) for `outputs` miner outputs at the worst-case type
+/// ([`COINBASE_OUTPUT_WEIGHT`]) on top of what the blockspace cut reserves and
+/// the safety margin. The inverse of [`max_coinbase_outputs`].
+pub const fn budget_for_outputs(outputs: u32) -> u32 {
+    (CUT_RESERVED_WEIGHT + BUDGET_SAFETY_MARGIN_WU)
+        .saturating_add(outputs.saturating_mul(COINBASE_OUTPUT_WEIGHT))
+}
+
+/// Smallest budget that publishes one miner output. Below it the cut
+/// publishes nothing and the §4 residual (`pay_P = T − Σpay`) hands the pool
+/// the whole block, hence a hard config floor.
+pub const MIN_COINBASE_WEIGHT_BUDGET: u32 = budget_for_outputs(1);
 
 /// Hard cap on the Group-Solo finder bonus in ppm of the miner cut (50 %),
 /// a typo guard rather than policy. Must stay below 1 000 000: the bonus
@@ -84,7 +90,7 @@ pub fn output_weight_for_address(address: &str) -> u32 {
 /// the blockspace cut does: one slot too many would let `GroupService` admit
 /// a member the coinbase cannot pay, whose share then goes to the pool.
 pub fn max_coinbase_outputs(budget: u32) -> u64 {
-    let fixed = CUT_RESERVED_WEIGHT + BUDGET_SAFETY_MARGIN_WU;
+    let fixed = budget_for_outputs(0);
     if budget <= fixed {
         return 1;
     }
@@ -254,6 +260,21 @@ mod tests {
     fn max_outputs_degenerate_budget_returns_at_least_one() {
         assert_eq!(max_coinbase_outputs(0), 1);
         assert_eq!(max_coinbase_outputs(COINBASE_BASE_WEIGHT), 1);
+    }
+
+    /// Budget and output count are exact inverses, so a party or team sized by
+    /// one is exactly what the other admits.
+    #[test]
+    fn budget_for_outputs_inverts_max_coinbase_outputs() {
+        for n in 1..=2_000u32 {
+            let budget = budget_for_outputs(n);
+            assert_eq!(max_coinbase_outputs(budget), u64::from(n), "n = {n}");
+            // One WU short holds one output less; below the minimum budget,
+            // which boot refuses, the count is not defined.
+            if n > 1 {
+                assert_eq!(max_coinbase_outputs(budget - 1), u64::from(n - 1));
+            }
+        }
     }
 
     #[test]

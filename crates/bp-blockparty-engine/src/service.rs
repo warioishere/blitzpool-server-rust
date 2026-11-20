@@ -226,18 +226,7 @@ impl BlockpartyService {
         validate_percent_bp(admin_percent_bp)?;
         let admin_addr = normalize_address(admin_address)?;
 
-        // The admin address needs a confirmed email or a signature ownership
-        // proof. The email comes from the binding, never from the client; a
-        // signature-only admin stores "".
-        let admin_email = self.hooks.verified_email_for(&admin_addr).await;
-        if admin_email.is_none()
-            && !bp_db::is_address_ownership_verified(&self.payouts.pool, &admin_addr).await?
-        {
-            return Err(BlockpartyServiceError::EmailNotVerified);
-        }
-        let admin_email = admin_email
-            .map(|e| e.to_ascii_lowercase())
-            .unwrap_or_default();
+        let admin_email = self.verified_email(&admin_addr).await?;
 
         if self.pplns_cache.get(&admin_addr).await.is_some() {
             return Err(BlockpartyServiceError::AddressInPplnsGroup);
@@ -332,14 +321,7 @@ impl BlockpartyService {
             return Err(BlockpartyServiceError::AddressInPplnsGroup);
         }
 
-        // Confirmed email or signature ownership proof required.
-        let email = self.hooks.verified_email_for(&address).await;
-        if email.is_none()
-            && !bp_db::is_address_ownership_verified(&self.payouts.pool, &address).await?
-        {
-            return Err(BlockpartyServiceError::EmailNotVerified);
-        }
-        let email = email.map(|e| e.to_ascii_lowercase()).unwrap_or_default();
+        let email = self.verified_email(&address).await?;
 
         let now = now_ms();
         let inserted = match bp_db::insert_blockparty_member(
@@ -470,13 +452,7 @@ impl BlockpartyService {
             return Err(BlockpartyServiceError::AddressInPplnsGroup);
         }
 
-        let email = self.hooks.verified_email_for(&address).await;
-        if email.is_none()
-            && !bp_db::is_address_ownership_verified(&self.payouts.pool, &address).await?
-        {
-            return Err(BlockpartyServiceError::EmailNotVerified);
-        }
-        let email = email.map(|e| e.to_ascii_lowercase()).unwrap_or_default();
+        let email = self.verified_email(&address).await?;
 
         match bp_db::insert_blockparty_member(
             &self.payouts.pool,
@@ -754,6 +730,19 @@ impl BlockpartyService {
         self.leave_draft(&group, now_ms()).await?;
         self.recompute_status(group_id).await?;
         Ok(BlockpartyStatus::Confirming)
+    }
+
+    /// The email a member row stores for `address`, which must prove itself by
+    /// a confirmed email or a signature ownership proof. The email comes from
+    /// the binding, never from the client; a signature-only address stores "".
+    async fn verified_email(&self, address: &AddressId) -> Result<String, BlockpartyServiceError> {
+        if let Some(email) = self.hooks.verified_email_for(address).await {
+            return Ok(email.to_ascii_lowercase());
+        }
+        if bp_db::is_address_ownership_verified(&self.payouts.pool, address).await? {
+            return Ok(String::new());
+        }
+        Err(BlockpartyServiceError::EmailNotVerified)
     }
 
     /// Draft to confirming, in the DB and the routing cache. Every caller

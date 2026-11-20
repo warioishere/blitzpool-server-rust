@@ -54,11 +54,12 @@ impl EngineError {
     pub fn is_terminal(&self) -> bool {
         match self {
             EngineError::Config(_) | EngineError::GroupNotFound(_) => true,
+            // `LedgerError` decides, so this engine and PPLNS cannot disagree.
+            EngineError::Ledger(e) => e.is_terminal(),
             // Infrastructure: these clear on their own.
             EngineError::Redis(_)
             | EngineError::Round(_)
             | EngineError::Db(_)
-            | EngineError::Ledger(_)
             | EngineError::Reset(_)
             | EngineError::Distribution(_) => false,
         }

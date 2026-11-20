@@ -9,10 +9,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use bp_blockparty_engine::CoinbaseReservation;
-use bp_pplns::{
-    BUDGET_SAFETY_MARGIN_WU, COINBASE_BASE_WEIGHT, COINBASE_OUTPUT_WEIGHT,
-    COINBASE_WITNESS_COMMITMENT_WEIGHT,
-};
 use bp_template_distribution::TdpHandle;
 use tracing::{info, warn};
 
@@ -44,16 +40,12 @@ impl TdpCoinbaseReservation {
     }
 }
 
-/// Total coinbase weight budget (WU) needed for `member_count` member outputs
-/// plus one pool-fee output, using the worst-case P2TR output weight. Same WU
-/// units as `[blockparty].coinbase_weight_budget` and the PPLNS budget, so it
-/// feeds [`coinbase_constraints_for_budget`] directly.
+/// Total coinbase weight budget (WU) for `member_count` member outputs; the
+/// pool-fee output is part of what [`bp_pplns::budget_for_outputs`] reserves.
+/// Same WU units as `[blockparty].coinbase_weight_budget`, so it feeds
+/// [`coinbase_constraints_for_budget`] directly.
 fn budget_for_members(member_count: usize) -> u32 {
-    let outputs = (member_count as u32).saturating_add(1); // members + pool fee
-    COINBASE_BASE_WEIGHT
-        .saturating_add(COINBASE_WITNESS_COMMITMENT_WEIGHT)
-        .saturating_add(outputs.saturating_mul(COINBASE_OUTPUT_WEIGHT))
-        .saturating_add(BUDGET_SAFETY_MARGIN_WU)
+    bp_pplns::budget_for_outputs(u32::try_from(member_count).unwrap_or(u32::MAX))
 }
 
 /// Pure high-water decision: the target budget (WU) given the currently-applied
@@ -105,17 +97,15 @@ impl CoinbaseReservation for TdpCoinbaseReservation {
 mod tests {
     use super::*;
 
+    /// A party sized by this budget is exactly what the coinbase cut admits.
     #[test]
-    fn budget_grows_with_member_count() {
-        let one = budget_for_members(1);
-        let fifty = budget_for_members(50);
-        assert!(fifty > one);
-        // 50 members + 1 fee = 51 outputs × 172 WU + base + commitment + margin.
-        let expected = COINBASE_BASE_WEIGHT
-            + COINBASE_WITNESS_COMMITMENT_WEIGHT
-            + 51 * COINBASE_OUTPUT_WEIGHT
-            + BUDGET_SAFETY_MARGIN_WU;
-        assert_eq!(fifty, expected);
+    fn budget_holds_exactly_the_party() {
+        for members in [1usize, 5, 50, 285] {
+            assert_eq!(
+                bp_pplns::max_coinbase_outputs(budget_for_members(members)),
+                members as u64
+            );
+        }
     }
 
     #[test]
