@@ -36,6 +36,14 @@ pub fn effective_min_difficulty(min_difficulty: f64) -> f64 {
     }
 }
 
+/// Vardiff grace: a share is validated and credited at the LOWER of its job's
+/// send-time difficulty and the session's current one, so a share in flight
+/// across a retarget in EITHER direction is not lost. SV1 and SV2 both take
+/// it from here.
+pub fn graced_difficulty(job_frozen: f64, session: f64) -> f64 {
+    job_frozen.min(session)
+}
+
 /// Display-hashrate slot length (10 minutes).
 pub const VARDIFF_SLOT_DURATION_MS: u64 = 600_000;
 
@@ -571,6 +579,17 @@ fn slot_hashrate(work: f64, span_ms: u64) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    /// Vardiff grace takes the lower difficulty in both retarget directions.
+    #[test]
+    fn graced_difficulty_takes_the_lower() {
+        // Raise → the frozen low.
+        assert_eq!(super::graced_difficulty(1024.0, 1536.0), 1024.0);
+        // Lower → the new low.
+        assert_eq!(super::graced_difficulty(1536.0, 512.0), 512.0);
+        // Stable → unchanged.
+        assert_eq!(super::graced_difficulty(1024.0, 1024.0), 1024.0);
+    }
+
     use super::*;
 
     // ── helpers ──────────────────────────────────────────────────────────

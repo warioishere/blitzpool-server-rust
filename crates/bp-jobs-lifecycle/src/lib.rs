@@ -128,6 +128,22 @@ pub enum SeenShareRefusal {
     Full,
 }
 
+/// The reason both servers log for the refused share. Either way it goes out
+/// as `duplicate-share`: a full set is not the miner's fault, but no other
+/// code fits and the share must not be credited.
+impl std::fmt::Display for SeenShareRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Duplicate => f.write_str("duplicate-share"),
+            Self::Full => write!(
+                f,
+                "this tip's duplicate guard is full ({MAX_SEEN_SHARES_PER_TIP} accepted shares), \
+                 so no further share on it can be checked; refused as duplicate-share"
+            ),
+        }
+    }
+}
+
 /// Header hashes of accepted shares, so one proof of work is credited once.
 ///
 /// Keyed by the header hash, not by the submit fields: two job ids with the
@@ -217,6 +233,17 @@ impl SeenShares {
 
 #[cfg(test)]
 mod tests {
+    /// The reasons the servers log, word for word.
+    #[test]
+    fn seen_share_refusal_reasons() {
+        assert_eq!(SeenShareRefusal::Duplicate.to_string(), "duplicate-share");
+        assert_eq!(
+            SeenShareRefusal::Full.to_string(),
+            "this tip's duplicate guard is full (100000 accepted shares), so no further share \
+             on it can be checked; refused as duplicate-share"
+        );
+    }
+
     use super::*;
 
     fn cfg() -> LifecycleConfig {

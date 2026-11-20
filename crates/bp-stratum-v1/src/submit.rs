@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use bitcoin::hex::DisplayHex;
-use bp_jobs_lifecycle::{SeenShareRefusal, SeenShares, MAX_SEEN_SHARES_PER_TIP};
+use bp_jobs_lifecycle::SeenShares;
 use bp_mining_job::{
     build_block_header, meets_network_target, merkle_root_from_coinbase, ntime_in_window,
     MAX_FUTURE_BLOCK_TIME,
@@ -243,30 +243,16 @@ pub(crate) fn validate_submit(
     let hash = scored.submission_hash;
 
     if let Err(refusal) = dedup.seen.check(&lookup.template.prev_hash, &hash) {
-        match refusal {
-            SeenShareRefusal::Duplicate => {
-                tracing::warn!(
-                    worker = %submit.worker,
-                    job_id = %submit.job_id,
-                    "❌ Share rejected: duplicate-share"
-                );
-            }
-            // Not the miner's fault, but no other code fits and the share
-            // must not be credited.
-            SeenShareRefusal::Full => {
-                tracing::warn!(
-                    worker = %submit.worker,
-                    job_id = %submit.job_id,
-                    "❌ Share rejected: this tip's duplicate guard is full ({} accepted shares), \
-                     so no further share on it can be checked; refused as duplicate-share",
-                    MAX_SEEN_SHARES_PER_TIP
-                );
-            }
-        }
+        tracing::warn!(
+            worker = %submit.worker,
+            job_id = %submit.job_id,
+            "❌ Share rejected: {refusal}"
+        );
         return ShareValidation::Rejected(RejectReason::DuplicateShare.into());
     }
 
-    let effective_diff = lookup.difficulty.min(session.session_difficulty);
+    let effective_diff =
+        bp_vardiff::graced_difficulty(lookup.difficulty, session.session_difficulty);
     let effective_target = dedup.target_memo.target_for(Difficulty(effective_diff));
 
     // DEBUG level, so it also needs `RUST_LOG=...,bp_stratum_v1=debug`.

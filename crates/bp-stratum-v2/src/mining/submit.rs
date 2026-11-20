@@ -18,6 +18,7 @@ use smallvec::SmallVec;
 pub type ExtranonceBytes = SmallVec<[u8; 16]>;
 
 use super::jobs::{classify_extended_job, ExtendedJob};
+use bitcoin::hex::DisplayHex;
 use bp_jobs_lifecycle::{LifecycleConfig, SeenShareRefusal, SeenShares};
 
 // ── Wire codes (SV2 mining-protocol error strings) ───────────────────
@@ -480,20 +481,7 @@ pub fn validate_submit_extended(
             // Full byte dump (coinbase, merkle root, header) so the hashed
             // bytes can be compared with what the miner built from the
             // NewExtendedMiningJob frame without instrumenting the miner.
-            let to_hex = |b: &[u8]| -> String {
-                let mut s = String::with_capacity(b.len() * 2);
-                for x in b {
-                    s.push_str(&format!("{x:02x}"));
-                }
-                s
-            };
-            let hash_prefix = to_hex(&pow.submission_hash[..8]);
-            let coinbase_hex = to_hex(&coinbase_parts.concat());
-            let merkle_root_hex = to_hex(&merkle_root);
-            let header_hex = to_hex(header);
-            let prefix_hex = to_hex(&ext_job.coinbase_prefix);
-            let suffix_hex = to_hex(&ext_job.coinbase_suffix);
-            let ext_hex = to_hex(submission.extranonce.as_slice());
+            let coinbase = coinbase_parts.concat();
             tracing::warn!(
                 channel_id = submission.channel_id,
                 job_id = submission.job_id,
@@ -501,16 +489,16 @@ pub fn validate_submit_extended(
                 ntime = submission.ntime,
                 version = format_args!("0x{:08x}", submission.version),
                 ext_job_version = format_args!("0x{:08x}", ext_job.version),
-                extranonce = %ext_hex,
-                hash_prefix_be = %hash_prefix,
+                extranonce = %submission.extranonce.as_slice().as_hex(),
+                hash_prefix_be = %pow.submission_hash[..8].as_hex(),
                 ext_job_prefix_len = ext_job.coinbase_prefix.len(),
                 ext_job_suffix_len = ext_job.coinbase_suffix.len(),
                 ext_job_merkle_path_len = ext_job.merkle_path.len(),
-                ext_job_prefix_hex = %prefix_hex,
-                ext_job_suffix_hex = %suffix_hex,
-                coinbase_hex = %coinbase_hex,
-                merkle_root_hex = %merkle_root_hex,
-                header_hex = %header_hex,
+                ext_job_prefix_hex = %ext_job.coinbase_prefix.as_hex(),
+                ext_job_suffix_hex = %ext_job.coinbase_suffix.as_hex(),
+                coinbase_hex = %coinbase.as_hex(),
+                merkle_root_hex = %merkle_root.as_hex(),
+                header_hex = %header.as_hex(),
                 "❌ Extended share rejected: difficulty-too-low ({:.6} < {:.2})",
                 pow.submission_difficulty.as_f64(),
                 job_difficulty.as_f64()
@@ -571,24 +559,10 @@ fn reject_version(channel_id: u32, job_id: u32, version: u32, job_version: u32) 
     ShareValidation::Rejected(RejectReason::NonRollableVersionBit.into())
 }
 
-/// A share [`SeenShares`] refused goes out as `duplicate-share` either way:
-/// a full set is not the miner's fault, but no other code fits and the share
-/// must not be credited.
+/// A share [`SeenShares`] refused, logged with the [`SeenShareRefusal`]'s
+/// reason; it goes out as `duplicate-share` either way.
 fn refuse_seen_share(refusal: SeenShareRefusal, channel_id: u32, job_id: u32) -> ShareValidation {
-    match refusal {
-        SeenShareRefusal::Duplicate => {
-            tracing::warn!(channel_id, job_id, "❌ Share rejected: duplicate-share");
-        }
-        SeenShareRefusal::Full => {
-            tracing::warn!(
-                channel_id,
-                job_id,
-                "❌ Share rejected: this tip's duplicate guard is full ({} accepted shares), \
-                 so no further share on it can be checked; refused as duplicate-share",
-                bp_jobs_lifecycle::MAX_SEEN_SHARES_PER_TIP
-            );
-        }
-    }
+    tracing::warn!(channel_id, job_id, "❌ Share rejected: {refusal}");
     ShareValidation::Rejected(RejectReason::DuplicateShare.into())
 }
 

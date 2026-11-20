@@ -986,11 +986,12 @@ fn resolve_open_context<C: Clock>(
 
 // ── Handler: SubmitSharesStandard ───────────────────────────────────
 
-/// Vardiff grace: validate against the LOWER of the job's send-time difficulty
-/// and the channel's current one, so shares in flight across a retarget in
-/// EITHER direction are not lost. Crediting uses the same lower difficulty.
+/// [`bp_vardiff::graced_difficulty`] on SV2's difficulty type.
 fn graced_validation_difficulty(job_frozen: Difficulty, session: Difficulty) -> Difficulty {
-    Difficulty(job_frozen.as_f64().min(session.as_f64()))
+    Difficulty(bp_vardiff::graced_difficulty(
+        job_frozen.as_f64(),
+        session.as_f64(),
+    ))
 }
 
 /// Feed the channel's vardiff with a validated share. An accepted share counts
@@ -2886,26 +2887,6 @@ pub(crate) mod tests {
                 "{d} (from {probe}) is not a power of two"
             );
         }
-    }
-
-    /// Vardiff grace takes the lower difficulty in both retarget directions.
-    #[test]
-    fn graced_validation_difficulty_takes_the_lower() {
-        // Raise → the frozen low.
-        assert_eq!(
-            graced_validation_difficulty(Difficulty(1024.0), Difficulty(1536.0)).as_f64(),
-            1024.0
-        );
-        // Lower → the new low.
-        assert_eq!(
-            graced_validation_difficulty(Difficulty(1536.0), Difficulty(512.0)).as_f64(),
-            512.0
-        );
-        // Stable → unchanged.
-        assert_eq!(
-            graced_validation_difficulty(Difficulty(1024.0), Difficulty(1024.0)).as_f64(),
-            1024.0
-        );
     }
 
     // ── SubmitSharesStandard ───────────────────────────────────────
