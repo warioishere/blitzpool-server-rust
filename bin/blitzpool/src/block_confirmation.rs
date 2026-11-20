@@ -467,14 +467,13 @@ mod declared_block_booking_regtest {
         PplnsEngineConfig {
             dust_sweep_enabled: false,
             touch_flush_interval_secs: 3_600,
-            fee_address: Some(AddressId::new(fee_addr.to_string()).expect("fee addr")),
             fee_percent: 1.5,
             min_payout_sats: Sats(DEFAULT_MIN_PAYOUT_SATS as i64),
             // Regtest halves every 150 blocks. At the mainnet default the
             // engine expects 50 BTC past height 150 where regtest pays 25, and
             // its "coinbase pays less than the subsidy" guard refuses to book.
             subsidy_halving_interval: bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL,
-            ..PplnsEngineConfig::default()
+            ..PplnsEngineConfig::new(AddressId::new(fee_addr.to_string()).expect("fee addr"))
         }
     }
 
@@ -572,10 +571,11 @@ mod declared_block_booking_regtest {
             // for a PPLNS block: it is the dispatch target for the other mode.
             let group_solo = bp_group_solo_engine::engine::GroupSoloEngine::spawn(
                 bp_group_solo_engine::config::GroupSoloEngineConfig {
-                    fee_address: Some(AddressId::new(fee_addr.clone()).expect("fee addr")),
                     // Regtest halves every 150 blocks — see `engine_config`.
                     subsidy_halving_interval: bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL,
-                    ..Default::default()
+                    ..bp_group_solo_engine::config::GroupSoloEngineConfig::new(
+                        AddressId::new(fee_addr.clone()).expect("fee addr"),
+                    )
                 }
                 .try_new()
                 .expect("group-solo config"),
@@ -1316,10 +1316,11 @@ mod declared_block_booking_regtest {
             .expect("PplnsEngine::spawn");
             let group_solo = bp_group_solo_engine::engine::GroupSoloEngine::spawn(
                 bp_group_solo_engine::config::GroupSoloEngineConfig {
-                    fee_address: Some(AddressId::new(fee_addr.clone()).expect("fee addr")),
                     // Regtest halves every 150 blocks — see `engine_config`.
                     subsidy_halving_interval: bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL,
-                    ..Default::default()
+                    ..bp_group_solo_engine::config::GroupSoloEngineConfig::new(
+                        AddressId::new(fee_addr.clone()).expect("fee addr"),
+                    )
                 }
                 .try_new()
                 .expect("group-solo config"),
@@ -1821,10 +1822,9 @@ mod group_solo_settlement {
         };
         let fee = bp_test_support::deterministic_p2wpkh_regtest([0xC3; 32]);
         let engine = bp_group_solo_engine::engine::GroupSoloEngine::spawn_core(
-            bp_group_solo_engine::config::GroupSoloEngineConfig {
-                fee_address: Some(AddressId::new(fee).expect("fee addr")),
-                ..Default::default()
-            }
+            bp_group_solo_engine::config::GroupSoloEngineConfig::new(
+                AddressId::new(fee).expect("fee addr"),
+            )
             .try_new()
             .expect("group-solo config"),
             redis,

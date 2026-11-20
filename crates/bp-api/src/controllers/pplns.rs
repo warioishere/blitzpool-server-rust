@@ -252,7 +252,7 @@ async fn mode(
 struct FeesResponse {
     #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     fee_percent: f64,
-    fee_address: Option<String>,
+    fee_address: String,
     coinbase_weight_budget: u32,
     /// Group-Solo fee from `[group_solo]`; `null` while Group-Solo is off.
     #[serde(serialize_with = "crate::time_range::ser_opt_f64_jsnum")]
@@ -306,12 +306,10 @@ async fn fees(State(state): State<SharedState>) -> Result<JsonBytes, ApiError> {
                 .unwrap_or(u32::MAX);
                 Ok(FeesResponse {
                     fee_percent: cfg.fee_percent,
-                    fee_address: cfg.fee_address.as_ref().map(|a| a.as_str().to_string()),
+                    fee_address: cfg.fee_address.as_str().to_string(),
                     coinbase_weight_budget,
                     group_fee_percent: group_solo.map(|g| g.fee_percent),
-                    group_fee_address: group_solo
-                        .and_then(|g| g.fee_address.as_ref())
-                        .map(|a| a.as_str().to_string()),
+                    group_fee_address: group_solo.map(|g| g.fee_address.as_str().to_string()),
                     blockparty_fee_percent: s
                         .blockparty
                         .as_ref()
@@ -646,7 +644,7 @@ mod tests {
     fn fees_response_reports_the_autoscale_ceiling() {
         let fees = |max_weight_budget: Option<u32>, max_miner_outputs_ceiling| FeesResponse {
             fee_percent: 1.0,
-            fee_address: None,
+            fee_address: "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy".to_string(),
             coinbase_weight_budget: 35_000,
             group_fee_percent: None,
             group_fee_address: None,

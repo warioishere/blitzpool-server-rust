@@ -1382,17 +1382,17 @@ fn print_engine_error_help(err: &EngineError) {
     match err {
         EngineError::Pplns(_) | EngineError::PplnsConfig(_) => {
             eprintln!(
-                "hint: check `[pplns]` fields — `fee_address` must be a \
-                 valid bitcoin address for the configured `network`, \
-                 `fee_percent` ∈ [0.0, 100.0], `min_payout_sats` ≥ 546."
+                "hint: check `[pplns]` fields — `fee_percent` ∈ [0.0, 100.0], \
+                 `min_payout_sats` ≥ 546, `coinbase_weight_budget` above the \
+                 minimum in the error."
             );
         }
         EngineError::GroupSolo(_) | EngineError::GroupSoloConfig(_) => {
             eprintln!(
-                "hint: check `[group_solo]`: `fee_address` must be a valid \
-                 address for the configured `network`, `fee_percent` in \
-                 [0.0, 100.0], `min_payout_sats` ≥ 546. Remove `[group_solo]` \
-                 to run without Group-Solo."
+                "hint: check `[group_solo]`: `fee_percent` in [0.0, 100.0], \
+                 `min_payout_sats` ≥ 546, `coinbase_weight_budget` above the \
+                 minimum in the error. Remove `[group_solo]` to run without \
+                 Group-Solo."
             );
         }
         EngineError::ModeDisabledWithLiveGroups { section, .. } => {

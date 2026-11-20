@@ -353,9 +353,8 @@ mod tests {
         let first = bp_test_support::deterministic_p2wpkh_regtest([0xD2; 32]);
         let second = bp_test_support::deterministic_p2wpkh_regtest([0xD3; 32]);
         let config = || PplnsEngineConfig {
-            fee_address: Some(AddressId::new(fee.clone()).unwrap()),
             dust_sweep_enabled: false,
-            ..PplnsEngineConfig::default()
+            ..PplnsEngineConfig::new(AddressId::new(fee.clone()).unwrap())
         };
         let spawn = |redis| {
             bp_pplns_engine::engine::PplnsEngine::spawn_core(

@@ -94,10 +94,7 @@ async fn spawn_or_skip(redis_db: u8, finder_bonus_ppm: Option<i32>) -> Option<Ha
     seed_group(&pool, group_id, finder_bonus_ppm).await;
 
     // The reset loop leaves the seeded group alone: it has no preset.
-    let config = GroupSoloEngineConfig {
-        fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
-        ..GroupSoloEngineConfig::default()
-    };
+    let config = GroupSoloEngineConfig::new(AddressId::new(FEE_ADDR).unwrap());
     let engine = match GroupSoloEngine::spawn(config, conn, pool.clone()).await {
         Ok(e) => e,
         Err(e) => {
@@ -1089,10 +1086,7 @@ async fn spawn_core_builds_distributions() {
     cleanup_group(&pool, group_id).await;
     seed_group_with_daily_reset(&pool, group_id).await;
 
-    let config = || GroupSoloEngineConfig {
-        fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
-        ..GroupSoloEngineConfig::default()
-    };
+    let config = || GroupSoloEngineConfig::new(AddressId::new(FEE_ADDR).unwrap());
 
     let core = GroupSoloEngine::spawn_core(config(), core_conn, pool.clone())
         .await

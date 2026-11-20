@@ -49,10 +49,9 @@ async fn spawn_engine(conn: ConnectionManager, pool: PgPool) -> PplnsEngine {
         touch_flush_interval_secs: 3600,
         dust_sweep_enabled: false,
         // Required by construction (structural under §4); unused here.
-        fee_address: Some(
+        ..PplnsEngineConfig::new(
             bp_common::AddressId::new("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy").expect("valid"),
-        ),
-        ..PplnsEngineConfig::default()
+        )
     };
     PplnsEngine::spawn(config, conn, pool, net_diff)
         .await

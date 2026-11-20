@@ -95,10 +95,9 @@ async fn spawn_or_skip(redis_db: u8, finder_bonus_ppm: Option<i32>) -> Option<Ha
     seed_group(&pool, group_id, finder_bonus_ppm).await;
 
     let round = GroupRoundStore::new(conn);
-    let dist_cfg = DistributionConfig::from_engine_config(&GroupSoloEngineConfig {
-        fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
-        ..GroupSoloEngineConfig::default()
-    });
+    let dist_cfg = DistributionConfig::from_engine_config(&GroupSoloEngineConfig::new(
+        AddressId::new(FEE_ADDR).unwrap(),
+    ));
     let builder = DistributionBuilder::new(pool.clone(), round.clone(), dist_cfg);
 
     Some(Harness {
@@ -219,7 +218,9 @@ async fn build_for_nonexistent_group_returns_group_not_found() {
     let _ = redis::cmd("FLUSHDB").query_async::<()>(&mut conn).await;
 
     let round = GroupRoundStore::new(conn);
-    let cfg = DistributionConfig::from_engine_config(&GroupSoloEngineConfig::default());
+    let cfg = DistributionConfig::from_engine_config(&GroupSoloEngineConfig::new(
+        AddressId::new(FEE_ADDR).unwrap(),
+    ));
     let builder = DistributionBuilder::new(pool, round, cfg);
 
     let nonexistent = Uuid::new_v4();

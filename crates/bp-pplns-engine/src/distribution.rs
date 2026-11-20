@@ -48,9 +48,6 @@ pub enum DistributionError {
     /// the cache shares one `Arc<DistributionError>` across all waiters.
     #[error("distribution inputs: {0}")]
     Inputs(String),
-    /// The weight model has no distribution without a recipient for `pay_P`.
-    #[error("no fee address configured — the weight model requires the pool-output recipient")]
-    NoFeeAddress,
     #[error("weight build: {0}")]
     WeightBuild(#[from] WeightBuildError),
 }
@@ -68,7 +65,7 @@ pub struct DistributionInputs {
 /// `coinbase_weight_budget` is a [`LiveBudget`] so the autoscaler can move it.
 #[derive(Clone, Debug)]
 pub struct DistributionConfig {
-    pub fee_address: Option<AddressId>,
+    pub fee_address: AddressId,
     pub fee_percent: f64,
     pub min_payout_sats: Sats,
     pub coinbase_weight_budget: LiveBudget,
@@ -245,10 +242,7 @@ async fn build_from_inputs(
     reference_revenue_sats: u64,
     bootstrap_claimant: Option<&AddressId>,
 ) -> Result<BuiltDistribution, DistributionError> {
-    let fee_address = config
-        .fee_address
-        .as_ref()
-        .ok_or(DistributionError::NoFeeAddress)?;
+    let fee_address = &config.fee_address;
     let mut conn = window.connection_for_snapshot();
     let built = build_and_snapshot(
         BuildRequest {
@@ -351,16 +345,17 @@ mod tests {
     #[test]
     fn distribution_config_from_engine_config_carries_fields() {
         let engine_cfg = crate::config::PplnsEngineConfig {
-            fee_address: Some(AddressId::new("bc1qfee0000000000000000000000000").unwrap()),
             fee_percent: 2.5,
             coinbase_weight_budget: 60_000,
             snapshot_ttl_secs: 1800,
-            ..crate::config::PplnsEngineConfig::default()
+            ..crate::config::PplnsEngineConfig::new(
+                AddressId::new("bc1qfee0000000000000000000000000").unwrap(),
+            )
         };
 
         let dist_cfg = DistributionConfig::from_engine_config(&engine_cfg);
         assert_eq!(
-            dist_cfg.fee_address.as_ref().unwrap().as_str(),
+            dist_cfg.fee_address.as_str(),
             "bc1qfee0000000000000000000000000"
         );
         assert!((dist_cfg.fee_percent - 2.5).abs() < 1e-9);

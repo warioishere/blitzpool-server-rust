@@ -332,8 +332,7 @@ mod tests {
         const ASKER: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
         let config = PplnsEngineConfig {
             dust_sweep_enabled: false,
-            fee_address: Some(AddressId::new("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy").unwrap()),
-            ..PplnsEngineConfig::default()
+            ..PplnsEngineConfig::new(AddressId::new("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy").unwrap())
         };
         let engine = PplnsEngine::spawn(config, redis, pool, NetworkDifficulty::new(1_000_000.0))
             .await

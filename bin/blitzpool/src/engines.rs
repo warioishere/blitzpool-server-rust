@@ -222,14 +222,7 @@ fn to_pplns_engine_config(
     cfg: &TomlPplnsConfig,
     network: bp_config::Network,
 ) -> Result<PplnsEngineConfig, EngineError> {
-    // Blank falls through to the validator's `MissingFeeAddress`.
-    let fee_address = if cfg.fee_address.trim().is_empty() {
-        None
-    } else {
-        Some(mode_fee_address("pplns", &cfg.fee_address, network)?)
-    };
     let base = PplnsEngineConfig {
-        fee_address,
         fee_percent: cfg.fee_percent,
         min_payout_sats: Sats(cfg.min_payout_sats),
         coinbase_weight_budget: cfg.coinbase_weight_budget,
@@ -238,7 +231,7 @@ fn to_pplns_engine_config(
         abandoned_balance_days: cfg.abandoned_balance_days,
         bucket_shares: cfg.bucket_shares,
         subsidy_halving_interval: subsidy_halving_interval(network),
-        ..PplnsEngineConfig::default()
+        ..PplnsEngineConfig::new(mode_fee_address("pplns", &cfg.fee_address, network)?)
     };
     let validated = base.try_new()?;
     Ok(validated)
@@ -299,7 +292,7 @@ fn to_group_solo_engine_config(
     network: bp_config::Network,
 ) -> Result<GroupSoloEngineConfig, EngineError> {
     let base = GroupSoloEngineConfig {
-        fee_address: Some(mode_fee_address("group_solo", &cfg.fee_address, network)?),
+        fee_address: mode_fee_address("group_solo", &cfg.fee_address, network)?,
         fee_percent: cfg.fee_percent,
         // Must equal the budget boot reserves on the Group-Solo TDP stream, or
         // the coinbase outgrows Core's reservation and the block is rejected.
@@ -348,7 +341,6 @@ async fn blockparty_payouts(
     let fee_address = mode_fee_address("blockparty", &bp_cfg.fee_address, cfg.network)?;
     // The same checks the PPLNS and Group-Solo engines run on their sections.
     bp_pplns::validate_fee_payout_budget(
-        Some(fee_address.as_str()),
         bp_cfg.fee_percent,
         bp_cfg.min_payout_sats,
         bp_cfg.coinbase_weight_budget,
@@ -687,11 +679,14 @@ mod tests {
     #[test]
     fn both_engine_configs_default_to_the_mainnet_schedule() {
         assert_eq!(
-            PplnsEngineConfig::default().subsidy_halving_interval,
+            PplnsEngineConfig::new(AddressId::new(MAINNET_ADDR).unwrap()).subsidy_halving_interval,
             bp_share::SUBSIDY_HALVING_INTERVAL
         );
         assert_eq!(
-            bp_group_solo_engine::config::GroupSoloEngineConfig::default().subsidy_halving_interval,
+            bp_group_solo_engine::config::GroupSoloEngineConfig::new(
+                AddressId::new(MAINNET_ADDR).unwrap()
+            )
+            .subsidy_halving_interval,
             bp_share::SUBSIDY_HALVING_INTERVAL
         );
     }
@@ -761,8 +756,8 @@ mod tests {
 
         let built = to_group_solo_engine_config(gs, cfg.network).expect("build");
         assert_eq!(
-            built.fee_address.as_ref().map(|a| a.as_str()),
-            Some("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4")
+            built.fee_address.as_str(),
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
         );
         assert_eq!(built.fee_percent, 1.0);
         assert_eq!(built.coinbase_weight_budget, 12_000);
@@ -819,6 +814,20 @@ mod tests {
             to_pplns_engine_config(bad.pplns.as_ref().unwrap(), bad.network).map(|_| ()),
             "pplns",
         );
+        // Blank is no address either.
+        let blank = parse_cfg(&format!("{NO_PPLNS_CFG}\n{}", pplns_section("")));
+        match to_pplns_engine_config(blank.pplns.as_ref().unwrap(), blank.network) {
+            Err(EngineError::InvalidFeeAddress {
+                section: "pplns",
+                value,
+            }) => {
+                assert_eq!(value, "")
+            }
+            other => panic!(
+                "blank: expected InvalidFeeAddress, got {:?}",
+                other.map(|_| ())
+            ),
+        }
 
         let ok = parse_cfg(NO_PPLNS_CFG);
         to_group_solo_engine_config(ok.group_solo.as_ref().unwrap(), ok.network)

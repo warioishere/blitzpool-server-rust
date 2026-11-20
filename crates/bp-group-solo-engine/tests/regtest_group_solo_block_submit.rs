@@ -306,9 +306,8 @@ async fn cleanup_member_rows(pool: &PgPool, addrs: &[&str]) {
 
 fn test_engine_config(fee_addr: &str) -> GroupSoloEngineConfig {
     GroupSoloEngineConfig {
-        fee_address: Some(AddressId::new(fee_addr.to_string()).expect("fee addr valid")),
         fee_percent: 1.5,
         min_payout_sats: Sats(DEFAULT_MIN_PAYOUT_SATS as i64),
-        ..GroupSoloEngineConfig::default()
+        ..GroupSoloEngineConfig::new(AddressId::new(fee_addr.to_string()).expect("fee addr valid"))
     }
 }

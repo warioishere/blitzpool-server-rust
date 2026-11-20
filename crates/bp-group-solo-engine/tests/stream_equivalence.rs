@@ -46,10 +46,9 @@ async fn spawn_engine(conn: ConnectionManager, pool: PgPool) -> GroupSoloEngine 
     let config = GroupSoloEngineConfig {
         // Structural under §4: the engine refuses to construct without a
         // usable pool-output recipient.
-        fee_address: Some(
+        ..GroupSoloEngineConfig::new(
             bp_common::AddressId::new("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy").expect("valid"),
-        ),
-        ..GroupSoloEngineConfig::default()
+        )
     };
     GroupSoloEngine::spawn(config, conn, pool)
         .await

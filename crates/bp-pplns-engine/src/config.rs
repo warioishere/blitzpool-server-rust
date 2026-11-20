@@ -9,14 +9,13 @@ use bp_pplns::{
     DEFAULT_MIN_PAYOUT_SATS,
 };
 
-/// PPLNS-engine construction knobs. [`Default`] only fills a `..` spread: it
-/// leaves `fee_address` unset, which `try_new` refuses.
+/// PPLNS-engine construction knobs; [`Self::new`] fills every knob but the
+/// fee address with its default.
 #[derive(Debug, Clone)]
 pub struct PplnsEngineConfig {
-    /// Receives the pool fee and the ext 0x0003 residual `pay_P`. Required:
-    /// without a pool output every job would pay the whole block to one miner.
-    /// `Option` only for the `/api/pplns/fees` shape; `try_new` guarantees `Some`.
-    pub fee_address: Option<AddressId>,
+    /// Receives the pool fee and the ext 0x0003 residual `pay_P`; without a
+    /// pool output every job would pay the whole block to one miner.
+    pub fee_address: AddressId,
 
     /// Percent, `[0.0, 100.0]`.
     pub fee_percent: f64,
@@ -63,10 +62,11 @@ pub struct PplnsEngineConfig {
     pub subsidy_halving_interval: u32,
 }
 
-impl Default for PplnsEngineConfig {
-    fn default() -> Self {
+impl PplnsEngineConfig {
+    /// The defaults around a fee address, which has none.
+    pub fn new(fee_address: AddressId) -> Self {
         Self {
-            fee_address: None,
+            fee_address,
             fee_percent: 0.0,
             min_payout_sats: Sats(DEFAULT_MIN_PAYOUT_SATS as i64),
             coinbase_weight_budget: DEFAULT_COINBASE_WEIGHT_BUDGET,
@@ -80,14 +80,11 @@ impl Default for PplnsEngineConfig {
             subsidy_halving_interval: bp_share::SUBSIDY_HALVING_INTERVAL,
         }
     }
-}
 
-impl PplnsEngineConfig {
     /// Return the config or its first violation, in struct field order.
     pub fn try_new(self) -> Result<Self, ConfigError> {
         // Fee, min-payout and budget checks are shared with Group-Solo.
         validate_fee_payout_budget(
-            self.fee_address.as_ref().map(|a| a.as_str()),
             self.fee_percent,
             self.min_payout_sats.0,
             self.coinbase_weight_budget,
@@ -148,21 +145,9 @@ mod tests {
     use super::*;
     const TEST_FEE_ADDRESS: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
 
-    /// [`PplnsEngineConfig::default`] plus a usable pool-output recipient.
+    /// [`PplnsEngineConfig::new`] around a usable pool-output recipient.
     fn valid() -> PplnsEngineConfig {
-        PplnsEngineConfig {
-            fee_address: Some(AddressId::new(TEST_FEE_ADDRESS).expect("valid")),
-            ..PplnsEngineConfig::default()
-        }
-    }
-
-    /// Without a fee address every block would pay 100 % to one miner.
-    #[test]
-    fn the_default_config_is_refused_because_it_has_no_fee_address() {
-        assert_eq!(
-            PplnsEngineConfig::default().try_new().unwrap_err(),
-            ConfigError::FeePayoutBudget(FeePayoutBudgetError::MissingFeeAddress)
-        );
+        PplnsEngineConfig::new(AddressId::new(TEST_FEE_ADDRESS).expect("valid"))
     }
 
     #[test]
@@ -312,7 +297,7 @@ mod tests {
     #[test]
     fn a_non_zero_fee_validates() {
         PplnsEngineConfig {
-            fee_address: Some(AddressId::new(TEST_FEE_ADDRESS).unwrap()),
+            fee_address: AddressId::new(TEST_FEE_ADDRESS).unwrap(),
             fee_percent: 1.5,
             ..valid()
         }

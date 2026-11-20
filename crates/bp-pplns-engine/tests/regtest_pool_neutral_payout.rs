@@ -472,11 +472,10 @@ fn test_engine_config(fee_addr: &str, coinbase_weight_budget: u32) -> PplnsEngin
         // the balances under assertion.
         dust_sweep_enabled: false,
         touch_flush_interval_secs: 3_600,
-        fee_address: Some(AddressId::new(fee_addr.to_string()).expect("fee addr valid")),
         fee_percent: 1.5,
         min_payout_sats: Sats(DEFAULT_MIN_PAYOUT_SATS as i64),
         coinbase_weight_budget,
-        ..PplnsEngineConfig::default()
+        ..PplnsEngineConfig::new(AddressId::new(fee_addr.to_string()).expect("fee addr valid"))
     }
 }
 

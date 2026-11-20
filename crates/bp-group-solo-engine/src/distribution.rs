@@ -41,10 +41,6 @@ pub enum DistributionError {
     Db(#[from] DbError),
     #[error("group {group_id} not found in pplns_group")]
     GroupNotFound { group_id: Uuid },
-    /// The weight model has no distribution without a pool-output
-    /// recipient — `pay_P` is structural (SV2 ext 0x0003 §4).
-    #[error("no fee address configured — the weight model requires the pool-output recipient")]
-    NoFeeAddress,
     #[error("weight build: {0}")]
     WeightBuild(#[from] WeightBuildError),
 }
@@ -56,7 +52,7 @@ type CacheKey = (Uuid, u64, String);
 /// (finder bonus) live in the DB row, NOT here.
 #[derive(Clone, Debug)]
 pub struct DistributionConfig {
-    pub fee_address: Option<AddressId>,
+    pub fee_address: AddressId,
     pub fee_percent: f64,
     pub min_payout_sats: Sats,
     pub coinbase_weight_budget: u32,
@@ -187,10 +183,7 @@ async fn compute_distribution(
     );
 
     // 3. Group-Solo carries no balances, so the balance map is empty.
-    let fee_address = config
-        .fee_address
-        .as_ref()
-        .ok_or(DistributionError::NoFeeAddress)?;
+    let fee_address = &config.fee_address;
     let distribution = build_with_bootstrap(BuildRequest {
         address_shares,
         balances: HashMap::new(),
@@ -226,14 +219,15 @@ mod tests {
     #[test]
     fn distribution_config_from_engine_config_carries_fields() {
         let engine_cfg = crate::config::GroupSoloEngineConfig {
-            fee_address: Some(AddressId::new("bc1qfee0000000000000000000000000").unwrap()),
             fee_percent: 1.5,
             coinbase_weight_budget: 60_000,
-            ..crate::config::GroupSoloEngineConfig::default()
+            ..crate::config::GroupSoloEngineConfig::new(
+                AddressId::new("bc1qfee0000000000000000000000000").unwrap(),
+            )
         };
         let dist_cfg = DistributionConfig::from_engine_config(&engine_cfg);
         assert_eq!(
-            dist_cfg.fee_address.as_ref().unwrap().as_str(),
+            dist_cfg.fee_address.as_str(),
             "bc1qfee0000000000000000000000000"
         );
         assert!((dist_cfg.fee_percent - 1.5).abs() < 1e-9);

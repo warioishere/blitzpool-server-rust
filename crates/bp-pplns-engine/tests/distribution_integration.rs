@@ -101,10 +101,9 @@ async fn connect_or_skip(redis_db: u8, address_prefix: &str) -> Option<Harness> 
         net_diff,
         INACTIVITY_OFF,
     );
-    let cfg = DistributionConfig::from_engine_config(&PplnsEngineConfig {
-        fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
-        ..PplnsEngineConfig::default()
-    });
+    let cfg = DistributionConfig::from_engine_config(&PplnsEngineConfig::new(
+        AddressId::new(FEE_ADDR).unwrap(),
+    ));
     let builder = DistributionBuilder::new(pool.clone(), window, cfg);
 
     Some(Harness {
@@ -681,10 +680,9 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
             NetworkDifficulty::new(1_000_000.0),
             INACTIVITY_OFF,
         ),
-        DistributionConfig::from_engine_config(&PplnsEngineConfig {
-            fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
-            ..PplnsEngineConfig::default()
-        }),
+        DistributionConfig::from_engine_config(&PplnsEngineConfig::new(
+            AddressId::new(FEE_ADDR).unwrap(),
+        )),
     );
 
     let result = ro_builder
@@ -775,10 +773,9 @@ async fn an_unreadable_ledger_degrades_to_a_score_only_distribution() {
     let degraded_builder = DistributionBuilder::new(
         unreachable_pool(),
         build_window(&h).await,
-        DistributionConfig::from_engine_config(&PplnsEngineConfig {
-            fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
-            ..PplnsEngineConfig::default()
-        }),
+        DistributionConfig::from_engine_config(&PplnsEngineConfig::new(
+            AddressId::new(FEE_ADDR).unwrap(),
+        )),
     );
     let degraded = degraded_builder.build(REWARD).await.expect(
         "an unreadable ledger must NOT fail the build — every PPLNS miner \

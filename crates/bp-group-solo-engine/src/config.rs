@@ -9,13 +9,13 @@ use bp_pplns::{
     DEFAULT_MIN_PAYOUT_SATS,
 };
 
-/// Engine-wide construction knobs.
+/// Engine-wide construction knobs; [`Self::new`] fills every knob but the
+/// fee address with its default.
 #[derive(Debug, Clone)]
 pub struct GroupSoloEngineConfig {
     /// Coinbase output that receives the pool fee and the §4 residual
-    /// `pay_P`. Required: [`Self::try_new`] refuses without it, because a
-    /// Group-Solo block cannot be paid correctly without a pool output.
-    pub fee_address: Option<AddressId>,
+    /// `pay_P`; a Group-Solo block cannot be paid correctly without it.
+    pub fee_address: AddressId,
 
     /// Pool fee % as f64 (`[0.0, 100.0]`).
     pub fee_percent: f64,
@@ -37,24 +37,22 @@ pub struct GroupSoloEngineConfig {
     pub subsidy_halving_interval: u32,
 }
 
-impl Default for GroupSoloEngineConfig {
-    fn default() -> Self {
+impl GroupSoloEngineConfig {
+    /// The defaults around a fee address, which has none.
+    pub fn new(fee_address: AddressId) -> Self {
         Self {
-            fee_address: None,
+            fee_address,
             fee_percent: 0.0,
             min_payout_sats: Sats(DEFAULT_MIN_PAYOUT_SATS as i64),
             coinbase_weight_budget: DEFAULT_COINBASE_WEIGHT_BUDGET,
             subsidy_halving_interval: bp_share::SUBSIDY_HALVING_INTERVAL,
         }
     }
-}
 
-impl GroupSoloEngineConfig {
     /// Validate field-level invariants.
     pub fn try_new(self) -> Result<Self, ConfigError> {
         // Shared with the PPLNS engine so both refuse the same configs.
         validate_fee_payout_budget(
-            self.fee_address.as_ref().map(|a| a.as_str()),
             self.fee_percent,
             self.min_payout_sats.0,
             self.coinbase_weight_budget,
@@ -78,22 +76,9 @@ mod tests {
     use super::*;
     const TEST_FEE_ADDRESS: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
 
-    /// [`GroupSoloEngineConfig::default`] plus a usable pool-output recipient,
-    /// which the default deliberately lacks.
+    /// [`GroupSoloEngineConfig::new`] around a usable pool-output recipient.
     fn valid() -> GroupSoloEngineConfig {
-        GroupSoloEngineConfig {
-            fee_address: Some(AddressId::new(TEST_FEE_ADDRESS).expect("valid")),
-            ..GroupSoloEngineConfig::default()
-        }
-    }
-
-    /// A config without a fee address is refused.
-    #[test]
-    fn the_default_config_is_refused_because_it_has_no_fee_address() {
-        assert_eq!(
-            GroupSoloEngineConfig::default().try_new().unwrap_err(),
-            ConfigError::FeePayoutBudget(FeePayoutBudgetError::MissingFeeAddress)
-        );
+        GroupSoloEngineConfig::new(AddressId::new(TEST_FEE_ADDRESS).expect("valid"))
     }
 
     #[test]
@@ -175,7 +160,7 @@ mod tests {
     #[test]
     fn a_non_zero_fee_validates() {
         GroupSoloEngineConfig {
-            fee_address: Some(AddressId::new(TEST_FEE_ADDRESS).unwrap()),
+            fee_address: AddressId::new(TEST_FEE_ADDRESS).unwrap(),
             fee_percent: 1.5,
             ..valid()
         }

@@ -102,8 +102,7 @@ fn test_config() -> PplnsEngineConfig {
     PplnsEngineConfig {
         touch_flush_interval_secs: 1,
         dust_sweep_enabled: false,
-        fee_address: Some(AddressId::new(TEST_FEE_ADDRESS).expect("valid fee address")),
-        ..PplnsEngineConfig::default()
+        ..PplnsEngineConfig::new(AddressId::new(TEST_FEE_ADDRESS).expect("valid fee address"))
     }
 }
 

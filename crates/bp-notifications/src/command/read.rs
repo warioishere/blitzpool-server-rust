@@ -1783,10 +1783,9 @@ mod tests {
         }
         let engine = Arc::new(
             GroupSoloEngine::spawn_core(
-                bp_group_solo_engine::config::GroupSoloEngineConfig {
-                    fee_address: Some(AddressId::new(FEE_ADDRESS).unwrap()),
-                    ..Default::default()
-                },
+                bp_group_solo_engine::config::GroupSoloEngineConfig::new(
+                    AddressId::new(FEE_ADDRESS).unwrap(),
+                ),
                 redis.clone(),
                 pool.clone(),
             )
