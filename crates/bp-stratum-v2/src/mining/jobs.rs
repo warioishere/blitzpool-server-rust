@@ -34,7 +34,7 @@ pub struct ExtendedJob {
     /// The channel's prefix as of send-time, which the miner appends itself.
     /// Pinned per job because SV2 Mining/SetExtranoncePrefix takes effect only
     /// from the next job; the channel's new prefix would reject in-flight shares.
-    pub extranonce_prefix: Vec<u8>,
+    pub extranonce_prefix: [u8; 4],
     /// Difficulty at send-time: SV2 Mining/SubmitShares.Error validates a
     /// share against the target its job was issued at, not the current one.
     pub difficulty: Difficulty,
@@ -48,6 +48,52 @@ pub struct ExtendedJob {
     pub jdp_claims_the_block: bool,
     pub created_at: u64,
     pub retired_at: Option<u64>,
+}
+
+/// A pool-built extended job before a channel makes it its own: what every
+/// channel's [`ExtendedJob`] for it shares, and what a group's
+/// `NewExtendedMiningJob` announces. [`Self::into_member`] adds the channel's
+/// extranonce prefix and difficulty.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolJob {
+    pub coinbase_prefix: Vec<u8>,
+    pub coinbase_suffix: Vec<u8>,
+    pub payouts_fingerprint: [u8; 32],
+    pub merkle_path: Vec<[u8; 32]>,
+    pub version: u32,
+    pub prev_hash: [u8; 32],
+    pub n_bits: u32,
+    pub min_ntime: u32,
+    pub coinbase_tx_value_remaining: u64,
+    pub template_id: u64,
+}
+
+impl PoolJob {
+    /// The job as one channel holds it, sent at `now_ms`.
+    pub fn into_member(
+        self,
+        extranonce_prefix: [u8; 4],
+        difficulty: Difficulty,
+        now_ms: u64,
+    ) -> ExtendedJob {
+        ExtendedJob {
+            coinbase_prefix: self.coinbase_prefix,
+            coinbase_suffix: self.coinbase_suffix,
+            payouts_fingerprint: self.payouts_fingerprint,
+            merkle_path: self.merkle_path,
+            version: self.version,
+            prev_hash: self.prev_hash,
+            n_bits: self.n_bits,
+            min_ntime: self.min_ntime,
+            extranonce_prefix,
+            difficulty,
+            coinbase_tx_value_remaining: self.coinbase_tx_value_remaining,
+            template_id: Some(self.template_id),
+            jdp_claims_the_block: false,
+            created_at: now_ms,
+            retired_at: None,
+        }
+    }
 }
 
 pub fn classify_extended_job(
@@ -271,7 +317,7 @@ mod tests {
             coinbase_prefix: vec![0; 8],
             coinbase_suffix: vec![0; 8],
             merkle_path: vec![[0u8; 32]],
-            extranonce_prefix: Vec::new(),
+            extranonce_prefix: [0; 4],
             version: 0x2000_0000,
             prev_hash: [0xAB; 32],
             n_bits: 0x1d00_ffff,

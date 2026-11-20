@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::jobs::ExtendedJob;
+use super::jobs::PoolJob;
 
 /// One group, defined by its shared full extranonce size. A broadcast carries
 /// one `job_id`, stored on every member so per-channel validation works.
@@ -22,8 +22,8 @@ pub struct GroupChannel {
     /// the existing members a fresh job and a spurious new block.
     current_job_id: Option<u32>,
     /// Kept on the group because an emptied-then-refilled group has no member
-    /// to copy it from. Its `difficulty` is a placeholder.
-    current_job: Option<ExtendedJob>,
+    /// to copy it from.
+    current_job: Option<PoolJob>,
 }
 
 impl GroupChannel {
@@ -41,11 +41,11 @@ impl GroupChannel {
 
     /// Record the current broadcast's coinbase template; seeds a member that
     /// opens later.
-    pub fn set_current_job(&mut self, job: ExtendedJob) {
+    pub fn set_current_job(&mut self, job: PoolJob) {
         self.current_job = Some(job);
     }
 
-    pub fn current_job(&self) -> Option<&ExtendedJob> {
+    pub fn current_job(&self) -> Option<&PoolJob> {
         self.current_job.as_ref()
     }
 }
@@ -269,23 +269,18 @@ mod tests {
         assert_eq!(reg.get(7).unwrap().channel_ids.len(), 1);
     }
 
-    fn dummy_job() -> ExtendedJob {
-        ExtendedJob {
+    fn dummy_job() -> PoolJob {
+        PoolJob {
             payouts_fingerprint: [0u8; 32],
             coinbase_prefix: vec![0xAA],
             coinbase_suffix: vec![0xBB],
             merkle_path: vec![],
-            extranonce_prefix: Vec::new(),
             version: 0x2000_0000,
             prev_hash: [0u8; 32],
             n_bits: 0x1d00_ffff,
             min_ntime: 0,
-            difficulty: bp_share::Difficulty(1024.0),
             coinbase_tx_value_remaining: 5_000_000_000,
-            template_id: Some(1),
-            jdp_claims_the_block: false,
-            created_at: 0,
-            retired_at: None,
+            template_id: 1,
         }
     }
 

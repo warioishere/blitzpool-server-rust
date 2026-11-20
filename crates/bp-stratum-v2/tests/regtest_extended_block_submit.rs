@@ -101,7 +101,7 @@ async fn run_block_submit_case(miner_extranonce_size: u8, rolled_version_bits: u
 
     // ── Build the per-channel MiningJob the pool would issue ────────
     // Its scriptSig slot is `extranonce_prefix.len + miner_extranonce_size`.
-    let extranonce_prefix: Vec<u8> = vec![0xC0, 0xDE, 0xBA, 0xBE];
+    let extranonce_prefix: [u8; 4] = [0xC0, 0xDE, 0xBA, 0xBE];
     let channel_id: u32 = 1;
     let job_id: u32 = 1;
     // Trivial job target, so the share gate passes and the test is about
@@ -145,7 +145,7 @@ async fn run_block_submit_case(miner_extranonce_size: u8, rolled_version_bits: u
         merkle_path: template.merkle_path.clone(),
         // Same prefix as the channel below: the validator splices the JOB's
         // copy into the coinbase.
-        extranonce_prefix: extranonce_prefix.clone(),
+        extranonce_prefix,
         version: template.version,
         prev_hash: prev_hash.prev_hash,
         n_bits: prev_hash.n_bits,
@@ -162,7 +162,7 @@ async fn run_block_submit_case(miner_extranonce_size: u8, rolled_version_bits: u
         channel_id,
         "00000001".to_string(),
         "worker".to_string(),
-        extranonce_prefix.clone(),
+        extranonce_prefix,
         miner_extranonce_size,
         job_difficulty,
         [0xFFu8; 32],

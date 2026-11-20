@@ -583,7 +583,7 @@ mod tests {
             1,
             "00000001".to_string(),
             "worker".to_string(),
-            vec![0u8; 4],
+            [0u8; 4],
             Difficulty(1024.0),
             max_target(),
             LifecycleConfig::DEFAULT,
@@ -595,7 +595,7 @@ mod tests {
             2,
             "00000001".to_string(),
             "worker".to_string(),
-            vec![0u8; 4],
+            [0u8; 4],
             8,
             Difficulty(1024.0),
             max_target(),
@@ -615,7 +615,7 @@ mod tests {
             min_ntime: 0x6500_0000,
             // Must match `ext_channel()`'s prefix: the validator rebuilds the
             // coinbase from the job's prefix.
-            extranonce_prefix: vec![0u8; 4],
+            extranonce_prefix: [0u8; 4],
             difficulty: Difficulty(1.0 / 4_294_967_296.0),
             coinbase_tx_value_remaining: 5_000_000_000,
             template_id: None,

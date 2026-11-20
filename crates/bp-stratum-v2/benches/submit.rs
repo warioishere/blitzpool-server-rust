@@ -56,7 +56,7 @@ fn ext_channel() -> ChannelState {
         2,
         "00000001".to_string(),
         "worker".to_string(),
-        vec![0u8; 4],
+        [0u8; 4],
         8,
         Difficulty(1024.0),
         [0xFF; 32],
@@ -72,7 +72,7 @@ fn ext_job(merkle_depth: usize) -> ExtendedJob {
         merkle_path: vec![[0x33; 32]; merkle_depth],
         // Same 4-byte prefix `ext_channel()` opens with — the validator
         // splices the job's copy into the coinbase.
-        extranonce_prefix: vec![0u8; 4],
+        extranonce_prefix: [0u8; 4],
         version: 0x2000_0000,
         prev_hash: [0x11; 32],
         n_bits: 0x1d00_ffff,

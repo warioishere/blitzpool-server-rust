@@ -867,11 +867,11 @@ fn swap_channel_prefix(
     prefix: &[u8; 4],
 ) -> Option<OutboundFrame> {
     if channel.kind != crate::mining::channel::ChannelKind::Extended
-        || channel.extranonce_prefix.as_slice() == prefix.as_slice()
+        || channel.extranonce_prefix == *prefix
     {
         return None;
     }
-    channel.extranonce_prefix = prefix.to_vec();
+    channel.extranonce_prefix = *prefix;
     Some(OutboundFrame::SetExtranoncePrefix {
         channel_id,
         extranonce_prefix: prefix.to_vec(),
@@ -935,10 +935,10 @@ fn maybe_apply_custom_extranonce<C: bp_vardiff::Clock>(
     let channel = state.channels.get_mut(&channel_id)?;
     // No `SetExtranoncePrefix` at open: a miner that does not implement it
     // reads its prefix only from the OpenSuccess.
-    if channel.extranonce_prefix.as_slice() == prefix {
+    if channel.extranonce_prefix == prefix {
         return None;
     }
-    channel.extranonce_prefix = prefix.to_vec();
+    channel.extranonce_prefix = prefix;
     Some(prefix)
 }
 
@@ -987,7 +987,7 @@ fn open_with_prefix<C: bp_vardiff::Clock + Clone>(
     state: &mut MiningSessionState<C>,
     extranonce: &ConnectionExtranonce,
     request_id: u32,
-    open: impl FnOnce(&mut MiningSessionState<C>, Vec<u8>) -> HandlerOutcome,
+    open: impl FnOnce(&mut MiningSessionState<C>, [u8; 4]) -> HandlerOutcome,
 ) -> HandlerOutcome {
     let channel_id = state.next_channel_id;
     let prefix = match extranonce.allocate(channel_id) {
@@ -1000,7 +1000,7 @@ fn open_with_prefix<C: bp_vardiff::Clock + Clone>(
             });
         }
     };
-    let outcome = open(state, prefix.to_vec());
+    let outcome = open(state, prefix);
     if !state.channels.contains_key(&channel_id) {
         extranonce.release(channel_id);
     }
@@ -1258,11 +1258,6 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                     .get(&channel_id)
                     .map(|c| c.extranonce_size)
                     .unwrap_or(0);
-                let extranonce_prefix_len = state
-                    .channels
-                    .get(&channel_id)
-                    .map(|c| c.extranonce_prefix.len())
-                    .unwrap_or(0);
                 let session_diff = state
                     .channels
                     .get(&channel_id)
@@ -1274,7 +1269,6 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                     address = %address.as_str(),
                     worker = %worker,
                     kind = ?kind,
-                    extranonce_prefix_len,
                     extranonce_size,
                     session_diff,
                     "sv2 channel opened"
@@ -1490,7 +1484,7 @@ mod tests {
 
     fn solo_session_with_extended_channel(
         channel_id: u32,
-        prefix: Vec<u8>,
+        prefix: [u8; 4],
     ) -> MiningSessionState<Arc<TestClock>> {
         let mut s = fresh_session_with_address();
         s.stream = StreamKind::Solo;
@@ -1516,7 +1510,7 @@ mod tests {
     #[test]
     fn custom_extranonce_swaps_prefix_on_solo_extended() {
         const CUSTOM: [u8; 4] = [0xC0, 0xDE, 0xBA, 0xBE];
-        let mut s = solo_session_with_extended_channel(7, vec![0x00, 0x00, 0x00, 0x05]);
+        let mut s = solo_session_with_extended_channel(7, [0x00, 0x00, 0x00, 0x05]);
         let hooks = hooks_with_override(ADDR, "wrk", CUSTOM);
 
         assert_eq!(
@@ -1525,34 +1519,31 @@ mod tests {
             "the applied prefix is handed back for the OpenSuccess"
         );
         // Channel now carries the custom prefix, so its next job pins it.
-        assert_eq!(
-            s.channels.get(&7).unwrap().extranonce_prefix,
-            CUSTOM.to_vec()
-        );
+        assert_eq!(s.channels.get(&7).unwrap().extranonce_prefix, CUSTOM);
     }
 
     /// On a non-Solo stream the override is ignored and the prefix untouched.
     #[test]
     fn custom_extranonce_skips_non_solo_stream() {
-        let mut s = solo_session_with_extended_channel(7, vec![0x00, 0x00, 0x00, 0x05]);
+        let mut s = solo_session_with_extended_channel(7, [0x00, 0x00, 0x00, 0x05]);
         s.stream = StreamKind::Pplns;
         let hooks = hooks_with_override(ADDR, "wrk", [0xC0, 0xDE, 0xBA, 0xBE]);
         assert!(maybe_apply_custom_extranonce(&mut s, &hooks, 7).is_none());
         assert_eq!(
             s.channels.get(&7).unwrap().extranonce_prefix,
-            vec![0x00, 0x00, 0x00, 0x05]
+            [0x00, 0x00, 0x00, 0x05]
         );
     }
 
     /// No override for this worker leaves the prefix untouched.
     #[test]
     fn custom_extranonce_skips_when_no_override() {
-        let mut s = solo_session_with_extended_channel(7, vec![0x00, 0x00, 0x00, 0x05]);
+        let mut s = solo_session_with_extended_channel(7, [0x00, 0x00, 0x00, 0x05]);
         let hooks = hooks_with_override(ADDR, "different-worker", [0xC0, 0xDE, 0xBA, 0xBE]);
         assert!(maybe_apply_custom_extranonce(&mut s, &hooks, 7).is_none());
         assert_eq!(
             s.channels.get(&7).unwrap().extranonce_prefix,
-            vec![0x00, 0x00, 0x00, 0x05]
+            [0x00, 0x00, 0x00, 0x05]
         );
     }
 
@@ -1560,7 +1551,7 @@ mod tests {
     #[test]
     fn custom_extranonce_idempotent_when_already_applied() {
         const CUSTOM: [u8; 4] = [0xC0, 0xDE, 0xBA, 0xBE];
-        let mut s = solo_session_with_extended_channel(7, CUSTOM.to_vec());
+        let mut s = solo_session_with_extended_channel(7, CUSTOM);
         let hooks = hooks_with_override(ADDR, "wrk", CUSTOM);
         assert!(maybe_apply_custom_extranonce(&mut s, &hooks, 7).is_none());
     }
@@ -1576,7 +1567,7 @@ mod tests {
                 7,
                 "00000001".to_string(),
                 "wrk".to_string(),
-                vec![0x00, 0x00, 0x00, 0x05],
+                [0x00, 0x00, 0x00, 0x05],
                 Difficulty(1024.0),
                 [0xFF; 32],
                 bp_jobs_lifecycle::LifecycleConfig::DEFAULT,
@@ -1596,7 +1587,7 @@ mod tests {
     /// change lands live at the next template.
     #[test]
     fn channel_open_arms_broadcast_flag() {
-        let mut s = solo_session_with_extended_channel(7, vec![0x00, 0x00, 0x00, 0x05]);
+        let mut s = solo_session_with_extended_channel(7, [0x00, 0x00, 0x00, 0x05]);
         assert!(!s.uses_custom_extranonce);
         let hooks = hooks_with_override(ADDR, "wrk", [0xC0, 0xDE, 0xBA, 0xBE]);
         let _ = maybe_apply_custom_extranonce(&mut s, &hooks, 7);
@@ -1609,7 +1600,7 @@ mod tests {
     /// A connection without an override is never armed.
     #[test]
     fn channel_open_without_override_does_not_arm_flag() {
-        let mut s = solo_session_with_extended_channel(7, vec![0x00, 0x00, 0x00, 0x05]);
+        let mut s = solo_session_with_extended_channel(7, [0x00, 0x00, 0x00, 0x05]);
         let hooks = hooks_with_override(ADDR, "different-worker", [0xC0, 0xDE, 0xBA, 0xBE]);
         let _ = maybe_apply_custom_extranonce(&mut s, &hooks, 7);
         assert!(
@@ -1621,12 +1612,12 @@ mod tests {
     /// An unarmed connection gets no frames even if an override exists.
     #[test]
     fn broadcast_frames_empty_when_not_armed() {
-        let mut s = solo_session_with_extended_channel(7, vec![0x00, 0x00, 0x00, 0x05]);
+        let mut s = solo_session_with_extended_channel(7, [0x00, 0x00, 0x00, 0x05]);
         let hooks = hooks_with_override(ADDR, "wrk", [0xC0, 0xDE, 0xBA, 0xBE]);
         assert!(custom_extranonce_broadcast_frames(&mut s, &hooks).is_empty());
         assert_eq!(
             s.channels.get(&7).unwrap().extranonce_prefix,
-            vec![0x00, 0x00, 0x00, 0x05]
+            [0x00, 0x00, 0x00, 0x05]
         );
     }
 
@@ -1634,7 +1625,7 @@ mod tests {
     #[test]
     fn broadcast_frames_switch_when_override_changed() {
         const NEW: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
-        let mut s = solo_session_with_extended_channel(7, vec![0xC0, 0xDE, 0xBA, 0xBE]);
+        let mut s = solo_session_with_extended_channel(7, [0xC0, 0xDE, 0xBA, 0xBE]);
         s.uses_custom_extranonce = true;
         let hooks = hooks_with_override(ADDR, "wrk", NEW);
         let frames = custom_extranonce_broadcast_frames(&mut s, &hooks);
@@ -1649,14 +1640,14 @@ mod tests {
             }
             other => panic!("expected SetExtranoncePrefix, got {other:?}"),
         }
-        assert_eq!(s.channels.get(&7).unwrap().extranonce_prefix, NEW.to_vec());
+        assert_eq!(s.channels.get(&7).unwrap().extranonce_prefix, NEW);
     }
 
     /// Armed but the override is unchanged → no redundant switch.
     #[test]
     fn broadcast_frames_empty_when_override_unchanged() {
         const CUSTOM: [u8; 4] = [0xC0, 0xDE, 0xBA, 0xBE];
-        let mut s = solo_session_with_extended_channel(7, CUSTOM.to_vec());
+        let mut s = solo_session_with_extended_channel(7, CUSTOM);
         s.uses_custom_extranonce = true;
         let hooks = hooks_with_override(ADDR, "wrk", CUSTOM);
         assert!(custom_extranonce_broadcast_frames(&mut s, &hooks).is_empty());
@@ -1665,20 +1656,20 @@ mod tests {
     /// Armed but the override was removed → the last value is kept.
     #[test]
     fn broadcast_frames_keep_last_value_when_override_removed() {
-        let mut s = solo_session_with_extended_channel(7, vec![0xC0, 0xDE, 0xBA, 0xBE]);
+        let mut s = solo_session_with_extended_channel(7, [0xC0, 0xDE, 0xBA, 0xBE]);
         s.uses_custom_extranonce = true;
         let hooks = hooks_with_override(ADDR, "different-worker", [0x11, 0x22, 0x33, 0x44]);
         assert!(custom_extranonce_broadcast_frames(&mut s, &hooks).is_empty());
         assert_eq!(
             s.channels.get(&7).unwrap().extranonce_prefix,
-            vec![0xC0, 0xDE, 0xBA, 0xBE]
+            [0xC0, 0xDE, 0xBA, 0xBE]
         );
     }
 
     fn add_extended_channel(
         s: &mut MiningSessionState<Arc<TestClock>>,
         channel_id: u32,
-        prefix: Vec<u8>,
+        prefix: [u8; 4],
     ) {
         s.channels.insert(
             channel_id,
@@ -1699,9 +1690,9 @@ mod tests {
     #[test]
     fn custom_extranonce_applies_only_to_primary_channel_at_open() {
         const CUSTOM: [u8; 4] = [0xC0, 0xDE, 0xBA, 0xBE];
-        let alloc2 = vec![0x00, 0x00, 0x00, 0x09];
-        let mut s = solo_session_with_extended_channel(7, vec![0x00, 0x00, 0x00, 0x05]);
-        add_extended_channel(&mut s, 8, alloc2.clone());
+        let alloc2 = [0x00, 0x00, 0x00, 0x09];
+        let mut s = solo_session_with_extended_channel(7, [0x00, 0x00, 0x00, 0x05]);
+        add_extended_channel(&mut s, 8, alloc2);
         let hooks = hooks_with_override(ADDR, "wrk", CUSTOM);
 
         // Primary (7) applies.
@@ -1709,10 +1700,7 @@ mod tests {
             maybe_apply_custom_extranonce(&mut s, &hooks, 7),
             Some(CUSTOM)
         );
-        assert_eq!(
-            s.channels.get(&7).unwrap().extranonce_prefix,
-            CUSTOM.to_vec()
-        );
+        assert_eq!(s.channels.get(&7).unwrap().extranonce_prefix, CUSTOM);
 
         // Non-primary (8) is skipped and keeps its distinct allocated prefix.
         assert!(maybe_apply_custom_extranonce(&mut s, &hooks, 8).is_none());
@@ -1728,10 +1716,10 @@ mod tests {
     #[test]
     fn broadcast_frames_switch_only_the_primary_channel() {
         const NEW: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
-        let alloc2 = vec![0x00, 0x00, 0x00, 0x09];
-        let mut s = solo_session_with_extended_channel(7, vec![0xC0, 0xDE, 0xBA, 0xBE]);
+        let alloc2 = [0x00, 0x00, 0x00, 0x09];
+        let mut s = solo_session_with_extended_channel(7, [0xC0, 0xDE, 0xBA, 0xBE]);
         s.uses_custom_extranonce = true;
-        add_extended_channel(&mut s, 8, alloc2.clone());
+        add_extended_channel(&mut s, 8, alloc2);
         let hooks = hooks_with_override(ADDR, "wrk", NEW);
 
         let frames = custom_extranonce_broadcast_frames(&mut s, &hooks);
@@ -1740,7 +1728,7 @@ mod tests {
             &frames[0],
             OutboundFrame::SetExtranoncePrefix { channel_id: 7, .. }
         ));
-        assert_eq!(s.channels.get(&7).unwrap().extranonce_prefix, NEW.to_vec());
+        assert_eq!(s.channels.get(&7).unwrap().extranonce_prefix, NEW);
         assert_eq!(
             s.channels.get(&8).unwrap().extranonce_prefix,
             alloc2,
@@ -1876,7 +1864,7 @@ mod tests {
             channel_id,
             session_id.to_string(),
             worker.to_string(),
-            vec![0u8; 4],
+            [0u8; 4],
             Difficulty(1024.0),
             [0xffu8; 32],
             bp_jobs_lifecycle::LifecycleConfig::DEFAULT,
@@ -1989,7 +1977,7 @@ mod tests {
                 1,
                 "00000001".to_string(),
                 "wrk".to_string(),
-                vec![0; 4],
+                [0; 4],
                 Difficulty(1024.0),
                 [0xFF; 32],
                 bp_jobs_lifecycle::LifecycleConfig::DEFAULT,
@@ -2017,7 +2005,7 @@ mod tests {
             1,
             "00000001".to_string(),
             "worker".to_string(),
-            vec![0; 4],
+            [0; 4],
             Difficulty(1024.0),
             [0xFF; 32],
             bp_jobs_lifecycle::LifecycleConfig::DEFAULT,
@@ -2093,7 +2081,7 @@ mod tests {
         );
         assert!(!owes, "no channel holds a job to go stale");
 
-        let mut s = solo_session_with_extended_channel(1, vec![0; 4]);
+        let mut s = solo_session_with_extended_channel(1, [0; 4]);
         apply_unresolved_broadcast(&mut s, &broadcast(TemplateChange::Refresh), 1, &mut owes);
         assert!(!owes, "a refresh keeps the tip");
         apply_unresolved_broadcast(&mut s, &broadcast(TemplateChange::NewBlock), 2, &mut owes);
@@ -2728,13 +2716,8 @@ mod tests {
             let _ =
                 dispatch_inbound_frame(&mut s, open, &alloc, &bridge, &crate::hooks::NoOpHooks, 0);
             let cid = s.primary_channel.expect("channel opened");
-            prefixes.push(s.channels[&cid].extranonce_prefix.clone());
+            prefixes.push(s.channels[&cid].extranonce_prefix);
         }
-        assert_eq!(
-            prefixes[0].len(),
-            4,
-            "precondition: a real prefix was allocated"
-        );
         assert_ne!(
             prefixes[0], prefixes[1],
             "two live connections must never share an extranonce prefix"

@@ -35,13 +35,13 @@ pub struct ChannelState {
     /// Worker name from this channel's `user_identity`.
     pub worker: String,
 
-    /// Pool-assigned extranonce prefix. 4 bytes typical for Standard
-    /// (the entire prefix); 4–8 bytes for Extended (variable, allocated
-    /// by [`crate::extranonce::ConnectionExtranonce`]).
-    pub extranonce_prefix: Vec<u8>,
-    /// Miner-controlled bytes after the prefix. `0` for Standard;
-    /// clamped to `12 - prefix.len` for Extended, because some BitAxe /
-    /// NerdQAxe firmware ignores larger sizes and corrupts the coinbase varint.
+    /// Pool-assigned extranonce prefix, from the
+    /// [`crate::extranonce::ConnectionExtranonce`] allocator or the address
+    /// owner's custom override; the whole extranonce of a Standard channel.
+    pub extranonce_prefix: [u8; 4],
+    /// Miner-controlled bytes after the prefix. `0` for Standard; for
+    /// Extended exactly the requested `min_extranonce_size`, at most
+    /// [`crate::mining::client::MAX_EXTENDED_ROLLABLE`].
     pub extranonce_size: u8,
 
     pub session_difficulty: Difficulty,
@@ -83,7 +83,7 @@ impl ChannelState {
         channel_id: u32,
         session_id: String,
         worker: String,
-        extranonce_prefix: Vec<u8>,
+        extranonce_prefix: [u8; 4],
         session_difficulty: Difficulty,
         declared_max_target: [u8; 32],
         job_lifecycle: LifecycleConfig,
@@ -111,7 +111,7 @@ impl ChannelState {
         channel_id: u32,
         session_id: String,
         worker: String,
-        extranonce_prefix: Vec<u8>,
+        extranonce_prefix: [u8; 4],
         extranonce_size: u8,
         session_difficulty: Difficulty,
         declared_max_target: [u8; 32],
@@ -166,7 +166,7 @@ mod tests {
             1,
             "00000001".to_string(),
             "worker".to_string(),
-            vec![0; 4],
+            [0; 4],
             Difficulty(1024.0),
             max_target(),
             LifecycleConfig::DEFAULT,
@@ -186,7 +186,7 @@ mod tests {
             2,
             "00000001".to_string(),
             "worker".to_string(),
-            vec![0; 4],
+            [0; 4],
             8,
             Difficulty(1024.0),
             max_target(),
@@ -210,7 +210,7 @@ mod tests {
             1,
             "00000001".to_string(),
             "worker".to_string(),
-            vec![0; 4],
+            [0; 4],
             Difficulty(1.0),
             tgt,
             LifecycleConfig::DEFAULT,
@@ -220,16 +220,14 @@ mod tests {
 
     // ── full_extranonce_size invariant ─────────────────────────────
 
-    /// `full_extranonce_size = prefix.len + extranonce_size`. The SV2 cap is
-    /// **32** (`extranonce_prefix` is `B0_32`, enforced at channel open);
-    /// 12 is only this pool's layout.
+    /// `full_extranonce_size = prefix.len + extranonce_size`.
     #[test]
     fn full_extranonce_size_is_sum_of_prefix_and_rollable() {
         let ch = ChannelState::new_standard(
             1,
             "00000001".to_string(),
             "worker".to_string(),
-            vec![0; 4],
+            [0; 4],
             Difficulty(1.0),
             max_target(),
             LifecycleConfig::DEFAULT,
@@ -239,8 +237,8 @@ mod tests {
             2,
             "00000001".to_string(),
             "worker".to_string(),
-            vec![0; 6],
-            6,
+            [0; 4],
+            8,
             Difficulty(1.0),
             max_target(),
             LifecycleConfig::DEFAULT,

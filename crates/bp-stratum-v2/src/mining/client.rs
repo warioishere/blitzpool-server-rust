@@ -30,7 +30,8 @@ use crate::extensions::{
 use super::channel::{ChannelKind, ChannelState};
 use super::groups::GroupChannelRegistry;
 use super::jobs::{
-    cleanup_retired_extended_jobs, retire_extended_jobs, ExtendedJob, StandardTemplateSnapshot,
+    cleanup_retired_extended_jobs, retire_extended_jobs, ExtendedJob, PoolJob,
+    StandardTemplateSnapshot,
 };
 #[cfg(test)]
 use super::submit::ExtranonceBytes;
@@ -85,6 +86,7 @@ pub const FLAG_SUCCESS_REQUIRES_EXTENDED_CHANNELS: u32 = 1 << 1;
 /// 32-byte cap. A larger `min_extranonce_size` is rejected with
 /// [`ERR_MIN_EXTRANONCE_SIZE_TOO_LARGE`] rather than silently under-granted.
 pub const MAX_EXTENDED_ROLLABLE: usize = 16;
+const _: () = assert!(4 + MAX_EXTENDED_ROLLABLE <= 32);
 
 // ── Wire error codes (SV2 spec setup/open-channel error strings) ────
 
@@ -735,7 +737,7 @@ pub fn handle_request_extensions<C: Clock>(
 pub fn handle_open_standard_mining_channel<C: Clock + Clone>(
     state: &mut MiningSessionState<C>,
     input: &OpenStandardMiningChannelInput,
-    extranonce_prefix: Vec<u8>,
+    extranonce_prefix: [u8; 4],
 ) -> HandlerOutcome {
     let ctx = match resolve_open_context(
         state,
@@ -758,7 +760,7 @@ pub fn handle_open_standard_mining_channel<C: Clock + Clone>(
         channel_id,
         channel_session_id.clone(),
         ctx.worker.clone(),
-        extranonce_prefix.clone(),
+        extranonce_prefix,
         ctx.assigned_difficulty,
         input.max_target,
         state.job_lifecycle,
@@ -772,7 +774,7 @@ pub fn handle_open_standard_mining_channel<C: Clock + Clone>(
             request_id: input.request_id,
             channel_id,
             target: difficulty_to_target(ctx.assigned_difficulty).to_le_bytes(),
-            extranonce_prefix,
+            extranonce_prefix: extranonce_prefix.to_vec(),
             group_channel_id: 0,
         }],
         events: vec![SessionEvent::ChannelOpened {
@@ -815,13 +817,11 @@ fn assign_channel_to_group<C: Clock>(
 pub fn handle_open_extended_mining_channel<C: Clock + Clone>(
     state: &mut MiningSessionState<C>,
     input: &OpenExtendedMiningChannelInput,
-    extranonce_prefix: Vec<u8>,
+    extranonce_prefix: [u8; 4],
 ) -> HandlerOutcome {
     let prefix_len = extranonce_prefix.len();
-    // Prefix + rollable must never exceed the SV2 32-byte cap.
-    let rollable_cap = MAX_EXTENDED_ROLLABLE.min(32usize.saturating_sub(prefix_len));
     let requested = input.min_extranonce_size as usize;
-    if requested > rollable_cap {
+    if requested > MAX_EXTENDED_ROLLABLE {
         return HandlerOutcome::with_frame(OutboundFrame::OpenMiningChannelError {
             request_id: input.request_id,
             error_code: ERR_MIN_EXTRANONCE_SIZE_TOO_LARGE.to_string(),
@@ -852,7 +852,7 @@ pub fn handle_open_extended_mining_channel<C: Clock + Clone>(
         channel_id,
         channel_session_id.clone(),
         ctx.worker.clone(),
-        extranonce_prefix.clone(),
+        extranonce_prefix,
         rollable_size,
         ctx.assigned_difficulty,
         input.max_target,
@@ -869,7 +869,7 @@ pub fn handle_open_extended_mining_channel<C: Clock + Clone>(
             channel_id,
             target: difficulty_to_target(ctx.assigned_difficulty).to_le_bytes(),
             extranonce_size: rollable_size as u16,
-            extranonce_prefix,
+            extranonce_prefix: extranonce_prefix.to_vec(),
             group_channel_id,
         }],
         events: vec![SessionEvent::ChannelOpened {
@@ -1433,10 +1433,6 @@ impl MiningJobInputs {
     }
 }
 
-/// `(group job template, coinbase_tx_prefix, coinbase_tx_suffix, merkle_path)`
-/// from the group-template builder in `apply_template_broadcast`.
-type GroupTemplateParts = (ExtendedJob, Vec<u8>, Vec<u8>, Vec<[u8; 32]>);
-
 /// A new block: retire the channel's jobs, age out the expired ones, move
 /// the duplicate guard to the new tip (the old tip's hashes stay while its
 /// jobs can still be credited) and record the block context later extended
@@ -1460,15 +1456,12 @@ fn retire_for_new_block(
         .on_tip(&template.prev_hash, now_ms, &lifecycle);
 }
 
-/// The pool-built extended job for `template`, as stored for share validation.
-fn extended_job(
+/// The pool-built job for `template`, before any channel makes it its own.
+fn pool_job(
     template: &bp_template_distribution::ActiveTemplate,
     mining_job: &MiningJob,
-    extranonce_prefix: Vec<u8>,
-    difficulty: Difficulty,
-    now_ms: u64,
-) -> ExtendedJob {
-    ExtendedJob {
+) -> PoolJob {
+    PoolJob {
         coinbase_prefix: mining_job.coinbase_prefix().to_vec(),
         coinbase_suffix: mining_job.coinbase_suffix().to_vec(),
         payouts_fingerprint: *mining_job.payouts_fingerprint(),
@@ -1477,13 +1470,8 @@ fn extended_job(
         prev_hash: template.prev_hash,
         n_bits: template.n_bits,
         min_ntime: template.header_timestamp,
-        extranonce_prefix,
-        difficulty,
         coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
-        template_id: Some(template.template_id),
-        jdp_claims_the_block: false,
-        created_at: now_ms,
-        retired_at: None,
+        template_id: template.template_id,
     }
 }
 
@@ -1493,18 +1481,15 @@ fn extended_job(
 fn standard_member_root_and_coinbase(
     coinbase_prefix: &[u8],
     coinbase_suffix: &[u8],
-    extranonce_prefix: &[u8],
+    extranonce_prefix: &[u8; 4],
     merkle_path: &[[u8; 32]],
 ) -> ([u8; 32], Vec<u8>) {
-    let mut enonce1 = [0u8; 4];
-    let copy_len = extranonce_prefix.len().min(4);
-    enonce1[..copy_len].copy_from_slice(&extranonce_prefix[..copy_len]);
     let enonce2 = [0u8; 8];
 
     let mut coinbase_stratum =
         Vec::with_capacity(coinbase_prefix.len() + EXTRANONCE_SLOT_LEN + coinbase_suffix.len());
     coinbase_stratum.extend_from_slice(coinbase_prefix);
-    coinbase_stratum.extend_from_slice(&enonce1);
+    coinbase_stratum.extend_from_slice(extranonce_prefix);
     coinbase_stratum.extend_from_slice(&enonce2);
     coinbase_stratum.extend_from_slice(coinbase_suffix);
 
@@ -1669,10 +1654,8 @@ pub fn apply_template_broadcast<C: Clock>(
                 let tx_suffix = mining_job.coinbase_suffix().to_vec();
                 let merkle_path = template.merkle_path.clone();
 
-                let ext_job = extended_job(
-                    template,
-                    &mining_job,
-                    channel.extranonce_prefix.clone(),
+                let ext_job = pool_job(template, &mining_job).into_member(
+                    channel.extranonce_prefix,
                     channel.session_difficulty,
                     now_ms,
                 );
@@ -1707,10 +1690,10 @@ pub fn apply_template_broadcast<C: Clock>(
     // On open, the new member gets a job to its OWN id (a group-addressed frame
     // would disturb the others); on a template broadcast, ONE group-addressed job.
 
-    // The group's shared job; `difficulty` and `extranonce_prefix` are
-    // placeholders overridden per member.
+    // The group's shared job; each member holds it with its own prefix and
+    // difficulty.
     let session_id = state.session_id;
-    let build_group_template = |gid: u32, full_size: usize| -> Option<GroupTemplateParts> {
+    let build_group_job = |gid: u32, full_size: usize| -> Option<PoolJob> {
         let mining_job = mining_job_inputs
             .build(full_size)
             .inspect_err(|err| {
@@ -1723,22 +1706,16 @@ pub fn apply_template_broadcast<C: Clock>(
                 );
             })
             .ok()?;
-        let tmpl = extended_job(template, &mining_job, Vec::new(), Difficulty(0.0), now_ms);
-        let (tx_prefix, tx_suffix, merkle_path) = (
-            tmpl.coinbase_prefix.clone(),
-            tmpl.coinbase_suffix.clone(),
-            tmpl.merkle_path.clone(),
-        );
-        Some((tmpl, tx_prefix, tx_suffix, merkle_path))
+        Some(pool_job(template, &mining_job))
     };
 
     for gid in groups_to_process {
         // Snapshot, so the groups borrow ends before channels are mutated.
-        let (full_size, members, current_job_id, current_job_template): (
+        let (full_size, members, current_job_id, current_group_job): (
             usize,
             Vec<u32>,
             Option<u32>,
-            Option<ExtendedJob>,
+            Option<PoolJob>,
         ) = match state.groups.get(gid) {
             Some(g) => (
                 g.full_extranonce_size,
@@ -1756,22 +1733,21 @@ pub fn apply_template_broadcast<C: Clock>(
         if let Some(new_id) = only_channel {
             if members.contains(&new_id) {
                 // Reuse the group's current job, or establish the first one.
-                let resolved: Option<(u32, ExtendedJob)> =
-                    match (current_job_id, current_job_template) {
-                        (Some(jid), Some(tmpl)) => Some((jid, tmpl)),
-                        _ => match (
-                            build_group_template(gid, full_size),
-                            state.groups.alloc_job_id(gid),
-                        ) {
-                            (Some((tmpl, _, _, _)), Some(jid)) => {
-                                if let Some(g) = state.groups.get_mut(gid) {
-                                    g.set_current_job(tmpl.clone());
-                                }
-                                Some((jid, tmpl))
+                let resolved: Option<(u32, PoolJob)> = match (current_job_id, current_group_job) {
+                    (Some(jid), Some(tmpl)) => Some((jid, tmpl)),
+                    _ => match (
+                        build_group_job(gid, full_size),
+                        state.groups.alloc_job_id(gid),
+                    ) {
+                        (Some(tmpl), Some(jid)) => {
+                            if let Some(g) = state.groups.get_mut(gid) {
+                                g.set_current_job(tmpl.clone());
                             }
-                            _ => None,
-                        },
-                    };
+                            Some((jid, tmpl))
+                        }
+                        _ => None,
+                    },
+                };
                 // Grouped members are always Extended; guarded defensively.
                 let new_is_extended = matches!(
                     state.channels.get(&new_id).map(|c| c.kind),
@@ -1779,10 +1755,11 @@ pub fn apply_template_broadcast<C: Clock>(
                 );
                 if let (Some((jid, tmpl)), true) = (resolved, new_is_extended) {
                     if let Some(ch) = state.channels.get_mut(&new_id) {
-                        let mut job = tmpl.clone();
-                        job.difficulty = ch.session_difficulty;
-                        job.extranonce_prefix = ch.extranonce_prefix.clone();
-                        job.created_at = now_ms;
+                        let job = tmpl.clone().into_member(
+                            ch.extranonce_prefix,
+                            ch.session_difficulty,
+                            now_ms,
+                        );
                         let (pv, nt, nb, ver) =
                             (job.prev_hash, job.min_ntime, job.n_bits, job.version);
                         let mp = job.merkle_path.clone();
@@ -1814,9 +1791,7 @@ pub fn apply_template_broadcast<C: Clock>(
         }
 
         // ── TEMPLATE broadcast (only_channel == None): ONE group job. ──
-        let Some((group_template, tx_prefix, tx_suffix, merkle_path)) =
-            build_group_template(gid, full_size)
-        else {
+        let Some(group_job) = build_group_job(gid, full_size) else {
             continue;
         };
         let group_job_id = match state.groups.alloc_job_id(gid) {
@@ -1834,16 +1809,15 @@ pub fn apply_template_broadcast<C: Clock>(
             // Store the shared job under the group job_id on every member, so
             // per-member `SubmitSharesExtended` validation finds it.
             if channel.kind == ChannelKind::Extended {
-                let mut ext_job = group_template.clone();
-                ext_job.difficulty = channel.session_difficulty;
-                ext_job.extranonce_prefix = channel.extranonce_prefix.clone();
-                channel.extended_jobs.insert(group_job_id, ext_job);
+                channel.extended_jobs.insert(
+                    group_job_id,
+                    group_job.clone().into_member(
+                        channel.extranonce_prefix,
+                        channel.session_difficulty,
+                        now_ms,
+                    ),
+                );
             }
-        }
-
-        // Kept for members that open later.
-        if let Some(g) = state.groups.get_mut(gid) {
-            g.set_current_job(group_template);
         }
 
         // Same future-job / SetNewPrevHash ordering as the per-channel path.
@@ -1852,15 +1826,19 @@ pub fn apply_template_broadcast<C: Clock>(
             job_id: group_job_id,
             version: template.version,
             version_rolling_allowed: VERSION_ROLLING_ALLOWED,
-            merkle_path,
-            coinbase_tx_prefix: tx_prefix,
-            coinbase_tx_suffix: tx_suffix,
+            merkle_path: group_job.merkle_path.clone(),
+            coinbase_tx_prefix: group_job.coinbase_prefix.clone(),
+            coinbase_tx_suffix: group_job.coinbase_suffix.clone(),
             min_ntime: if is_new_block {
                 None
             } else {
                 Some(template.header_timestamp)
             },
         });
+        // Kept for members that open later.
+        if let Some(g) = state.groups.get_mut(gid) {
+            g.set_current_job(group_job);
+        }
         if is_new_block {
             outcome.push_frame(OutboundFrame::SetNewPrevHash {
                 channel_id: gid,
@@ -2265,7 +2243,7 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             prev_hash: input.prev_hash,
             n_bits: input.n_bits,
             min_ntime: input.min_ntime,
-            extranonce_prefix: channel.extranonce_prefix.clone(),
+            extranonce_prefix: channel.extranonce_prefix,
             difficulty: channel.session_difficulty,
             // No pool template: the JDC builds and propagates the block itself.
             coinbase_tx_value_remaining: 0,
@@ -2563,7 +2541,7 @@ pub(crate) mod tests {
         let out = handle_open_standard_mining_channel(
             &mut s,
             &open_std(7, &format!("{}.worker1", REGTEST_ADDR)),
-            vec![0x01, 0x02, 0x03, 0x04],
+            [0x01, 0x02, 0x03, 0x04],
         );
         assert!(matches!(
             out.outbound[0],
@@ -2589,12 +2567,12 @@ pub(crate) mod tests {
         handle_open_standard_mining_channel(
             &mut s,
             &open_std(1, &format!("{REGTEST_ADDR}.rig1")),
-            vec![0x01, 0x02, 0x03, 0x04],
+            [0x01, 0x02, 0x03, 0x04],
         );
         handle_open_standard_mining_channel(
             &mut s,
             &open_std(2, &format!("{REGTEST_ADDR}.rig2")),
-            vec![0x01, 0x02, 0x03, 0x05],
+            [0x01, 0x02, 0x03, 0x05],
         );
         assert_eq!(s.channels.len(), 2, "precondition: both channels opened");
         assert_eq!(s.channels[&1].worker, "rig1");
@@ -2614,7 +2592,7 @@ pub(crate) mod tests {
             handle_open_standard_mining_channel(
                 &mut s,
                 &open_std(7, &identity),
-                vec![0x01, 0x02, 0x03, 0x04],
+                [0x01, 0x02, 0x03, 0x04],
             );
             assert_eq!(s.channels[&1].worker, "worker", "{identity}");
         }
@@ -2630,7 +2608,7 @@ pub(crate) mod tests {
             handle_open_standard_mining_channel(
                 &mut s,
                 &open_std(7, &format!("{REGTEST_ADDR}.{worker}")),
-                vec![0x01, 0x02, 0x03, 0x04],
+                [0x01, 0x02, 0x03, 0x04],
             );
             assert_eq!(s.channels[&1].worker, expected, "{worker:?}");
         }
@@ -2644,7 +2622,7 @@ pub(crate) mod tests {
         handle_setup_connection(&mut s, &good_setup());
         let mut tiny = open_std(7, &format!("{REGTEST_ADDR}.w"));
         tiny.nominal_hash_rate = 1_000.0; // → ~2.3e-6 derived
-        let _ = handle_open_standard_mining_channel(&mut s, &tiny, vec![0x01, 0x02, 0x03, 0x04]);
+        let _ = handle_open_standard_mining_channel(&mut s, &tiny, [0x01, 0x02, 0x03, 0x04]);
         assert_eq!(
             s.channels[&1].session_difficulty.as_f64(),
             port_cfg().min_difficulty.as_f64(),
@@ -2656,7 +2634,7 @@ pub(crate) mod tests {
         handle_setup_connection(&mut s0, &good_setup());
         let mut zero = open_std(8, &format!("{REGTEST_ADDR}.w"));
         zero.nominal_hash_rate = 0.0;
-        let _ = handle_open_standard_mining_channel(&mut s0, &zero, vec![0x01, 0x02, 0x03, 0x04]);
+        let _ = handle_open_standard_mining_channel(&mut s0, &zero, [0x01, 0x02, 0x03, 0x04]);
         assert_eq!(s0.channels[&1].session_difficulty.as_f64(), 1024.0);
 
         // An honest high nominal (~5 PH/s) starts ABOVE the configured start.
@@ -2664,7 +2642,7 @@ pub(crate) mod tests {
         handle_setup_connection(&mut sh, &good_setup());
         let mut big = open_std(9, &format!("{REGTEST_ADDR}.w"));
         big.nominal_hash_rate = 5.0e15;
-        let _ = handle_open_standard_mining_channel(&mut sh, &big, vec![0x01, 0x02, 0x03, 0x04]);
+        let _ = handle_open_standard_mining_channel(&mut sh, &big, [0x01, 0x02, 0x03, 0x04]);
         assert!(
             sh.channels[&1].session_difficulty.as_f64() > 1024.0,
             "an honest high nominal must start above the configured start"
@@ -2676,7 +2654,7 @@ pub(crate) mod tests {
         handle_setup_connection(&mut sl, &good_setup());
         let mut small = open_std(10, &format!("{REGTEST_ADDR}.w"));
         small.nominal_hash_rate = 1.0e11;
-        let _ = handle_open_standard_mining_channel(&mut sl, &small, vec![0x01, 0x02, 0x03, 0x04]);
+        let _ = handle_open_standard_mining_channel(&mut sl, &small, [0x01, 0x02, 0x03, 0x04]);
         let got = sl.channels[&1].session_difficulty.as_f64();
         assert!(
             (233.0..1024.0).contains(&got),
@@ -2691,7 +2669,7 @@ pub(crate) mod tests {
         let out = handle_open_standard_mining_channel(
             &mut s,
             &open_std(1, "not-a-bitcoin-address.worker"),
-            vec![0x01, 0x02, 0x03, 0x04],
+            [0x01, 0x02, 0x03, 0x04],
         );
         match &out.outbound[0] {
             OutboundFrame::OpenMiningChannelError { error_code, .. } => {
@@ -2726,12 +2704,12 @@ pub(crate) mod tests {
         let _ = handle_open_standard_mining_channel(
             &mut s,
             &open_std(1, &format!("{addr_a}.workerA")),
-            vec![0; 4],
+            [0; 4],
         );
         let out = handle_open_standard_mining_channel(
             &mut s,
             &open_std(2, &format!("{addr_b}.workerB")),
-            vec![0; 4],
+            [0; 4],
         );
         match &out.outbound[0] {
             OutboundFrame::OpenMiningChannelError { error_code, .. } => {
@@ -2747,7 +2725,7 @@ pub(crate) mod tests {
         handle_setup_connection(&mut s, &good_setup());
         let mut input = open_std(1, &format!("{}.w", REGTEST_ADDR));
         input.nominal_hash_rate = 0.0001; // tiny → ratio below min_difficulty
-        let _ = handle_open_standard_mining_channel(&mut s, &input, vec![0; 4]);
+        let _ = handle_open_standard_mining_channel(&mut s, &input, [0; 4]);
         let ch = s.channels.values().next().unwrap();
         assert!(ch.session_difficulty.as_f64() >= s.min_difficulty.as_f64());
     }
@@ -2761,7 +2739,7 @@ pub(crate) mod tests {
         handle_setup_connection(&mut s, &good_setup());
         let mut input = open_ext(1, &format!("{}.w", REGTEST_ADDR));
         input.min_extranonce_size = 10;
-        let out = handle_open_extended_mining_channel(&mut s, &input, vec![0; 4]);
+        let out = handle_open_extended_mining_channel(&mut s, &input, [0; 4]);
         match &out.outbound[0] {
             OutboundFrame::OpenExtendedMiningChannelSuccess {
                 extranonce_size, ..
@@ -2780,7 +2758,7 @@ pub(crate) mod tests {
         handle_setup_connection(&mut s, &good_setup());
         let mut input = open_ext(1, &format!("{}.w", REGTEST_ADDR));
         input.min_extranonce_size = MAX_EXTENDED_ROLLABLE as u16; // 16
-        let out = handle_open_extended_mining_channel(&mut s, &input, vec![0; 4]);
+        let out = handle_open_extended_mining_channel(&mut s, &input, [0; 4]);
         match &out.outbound[0] {
             OutboundFrame::OpenExtendedMiningChannelSuccess {
                 extranonce_size, ..
@@ -2796,7 +2774,7 @@ pub(crate) mod tests {
         handle_setup_connection(&mut s, &good_setup());
         let mut input = open_ext(1, &format!("{}.w", REGTEST_ADDR));
         input.min_extranonce_size = (MAX_EXTENDED_ROLLABLE + 1) as u16; // 17 > cap
-        let out = handle_open_extended_mining_channel(&mut s, &input, vec![0; 4]);
+        let out = handle_open_extended_mining_channel(&mut s, &input, [0; 4]);
         match &out.outbound[0] {
             OutboundFrame::OpenMiningChannelError { error_code, .. } => {
                 assert_eq!(error_code, ERR_MIN_EXTRANONCE_SIZE_TOO_LARGE);
@@ -2825,7 +2803,7 @@ pub(crate) mod tests {
 
         let mut input = open_ext(1, &format!("{}.w", REGTEST_ADDR));
         input.nominal_hash_rate = nominal;
-        let _ = handle_open_extended_mining_channel(&mut s, &input, vec![0; 4]);
+        let _ = handle_open_extended_mining_channel(&mut s, &input, [0; 4]);
 
         let assigned = s
             .channels
@@ -2930,7 +2908,7 @@ pub(crate) mod tests {
         let _ = handle_open_standard_mining_channel(
             &mut s,
             &open_std(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
+            [0; 4],
         );
         let channel_id = s.primary_channel.unwrap();
         let sub = SubmitSharesStandardInput {
@@ -2958,7 +2936,7 @@ pub(crate) mod tests {
         let _ = handle_open_standard_mining_channel(
             &mut s,
             &open_std(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
+            [0; 4],
         );
         let channel_id = s.primary_channel.unwrap();
         // Pre-populate the standard_jobs map with an easy job.
@@ -2996,7 +2974,7 @@ pub(crate) mod tests {
         let _ = handle_open_standard_mining_channel(
             &mut s,
             &open_std(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
+            [0; 4],
         );
         let channel_id = s.primary_channel.unwrap();
         let easy = Difficulty(1.0 / 4_294_967_296.0);
@@ -3035,7 +3013,7 @@ pub(crate) mod tests {
         let _ = handle_open_standard_mining_channel(
             &mut s,
             &open_std(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
+            [0; 4],
         );
         let channel_id = s.primary_channel.unwrap();
         let easy = Difficulty(1.0 / 4_294_967_296.0);
@@ -3077,7 +3055,7 @@ pub(crate) mod tests {
         let _ = handle_open_standard_mining_channel(
             &mut s,
             &open_std(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
+            [0; 4],
         );
         let channel_id = s.primary_channel.unwrap();
         let easy = Difficulty(1.0 / 4_294_967_296.0);
@@ -3113,7 +3091,7 @@ pub(crate) mod tests {
         let _ = handle_open_standard_mining_channel(
             &mut s,
             &open_std(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
+            [0; 4],
         );
         let channel_id = s.primary_channel.unwrap();
         let easy = Difficulty(1.0 / 4_294_967_296.0);
@@ -3153,7 +3131,7 @@ pub(crate) mod tests {
         let _ = handle_open_standard_mining_channel(
             &mut s,
             &open_std(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
+            [0; 4],
         );
         let channel_id = s.primary_channel.unwrap();
         // Simulate a vardiff move: session target is high (1024) while the
@@ -3197,7 +3175,7 @@ pub(crate) mod tests {
         let _ = handle_open_extended_mining_channel(
             &mut s,
             &open_ext(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
+            [0; 4],
         );
         let channel_id = s.primary_channel.unwrap();
         let sub = SubmitSharesExtendedInput {
@@ -3226,7 +3204,7 @@ pub(crate) mod tests {
         let _ = handle_open_extended_mining_channel(
             &mut s,
             &open_ext(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
+            [0; 4],
         );
         let channel_id = s.primary_channel.unwrap();
         let easy = Difficulty(1.0 / 4_294_967_296.0);
@@ -3237,7 +3215,7 @@ pub(crate) mod tests {
             merkle_path: vec![[0u8; 32]],
             // Matches the prefix the channel above was opened with — the
             // validator reconstructs the coinbase from the job's copy.
-            extranonce_prefix: vec![0; 4],
+            extranonce_prefix: [0; 4],
             version: 0x2000_0000,
             prev_hash: [0xCC; 32],
             n_bits: 0x1d00_ffff,
@@ -3285,14 +3263,14 @@ pub(crate) mod tests {
             let _ = handle_open_extended_mining_channel(
                 &mut s,
                 &open_ext(1, &format!("{}.w", REGTEST_ADDR)),
-                OLD_PREFIX.to_vec(),
+                OLD_PREFIX,
             );
             let channel_id = s.primary_channel.unwrap();
             let job = ExtendedJob {
                 coinbase_prefix: vec![0xAA; 8],
                 coinbase_suffix: vec![0xBB; 8],
                 merkle_path: vec![[0u8; 32]],
-                extranonce_prefix: OLD_PREFIX.to_vec(),
+                extranonce_prefix: OLD_PREFIX,
                 version: 0x2000_0000,
                 prev_hash: [0xCC; 32],
                 n_bits: 0x1d00_ffff,
@@ -3308,7 +3286,7 @@ pub(crate) mod tests {
             {
                 let ch = s.channels.get_mut(&channel_id).unwrap();
                 ch.extended_jobs.insert(7, job);
-                ch.extranonce_prefix = channel_prefix.to_vec();
+                ch.extranonce_prefix = channel_prefix;
             }
             let sub = SubmitSharesExtendedInput {
                 channel_id,
@@ -3400,7 +3378,7 @@ pub(crate) mod tests {
         let _ = handle_open_standard_mining_channel(
             &mut s,
             &open_std(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
+            [0; 4],
         );
         let channel_id = s.primary_channel.unwrap();
         let out = handle_update_channel(
@@ -3437,7 +3415,7 @@ pub(crate) mod tests {
         let _ = handle_open_standard_mining_channel(
             &mut s,
             &open_std(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
+            [0; 4],
         );
         let channel_id = s.primary_channel.unwrap();
         // A tiny reported hashrate drives the raw difficulty under the floor,
@@ -3472,12 +3450,12 @@ pub(crate) mod tests {
         let _ = handle_open_standard_mining_channel(
             &mut s,
             &open_std(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
+            [0; 4],
         );
         let _ = handle_open_standard_mining_channel(
             &mut s,
             &open_std(2, &format!("{}.w", REGTEST_ADDR)),
-            vec![0x01; 4],
+            [0x01; 4],
         );
         let first = s.primary_channel.unwrap();
         let out = handle_close_channel(
@@ -3515,12 +3493,12 @@ pub(crate) mod tests {
         let out1 = handle_open_extended_mining_channel(
             &mut s,
             &open_ext(1, &format!("{REGTEST_ADDR}.a")),
-            vec![0xAA, 0xBB, 0xCC, 0xDD],
+            [0xAA, 0xBB, 0xCC, 0xDD],
         );
         let _ = handle_open_extended_mining_channel(
             &mut s,
             &open_ext(2, &format!("{REGTEST_ADDR}.b")),
-            vec![0x11, 0x22, 0x33, 0x44],
+            [0x11, 0x22, 0x33, 0x44],
         );
         let gid = open_group_id(&out1);
         let members: HashSet<u32> = s.channels.keys().copied().collect();
@@ -3559,12 +3537,12 @@ pub(crate) mod tests {
         let _ = handle_open_extended_mining_channel(
             &mut s,
             &open_ext(1, &format!("{REGTEST_ADDR}.a")),
-            vec![0xAA, 0xBB, 0xCC, 0xDD],
+            [0xAA, 0xBB, 0xCC, 0xDD],
         );
         let _ = handle_open_extended_mining_channel(
             &mut s,
             &open_ext(2, &format!("{REGTEST_ADDR}.b")),
-            vec![0x11, 0x22, 0x33, 0x44],
+            [0x11, 0x22, 0x33, 0x44],
         );
         let ch1 = s.primary_channel.unwrap();
         let gid = s.groups.group_for_channel(ch1).unwrap();
@@ -3616,7 +3594,7 @@ pub(crate) mod tests {
         let _ = handle_open_standard_mining_channel(
             &mut s,
             &open_std(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
+            [0; 4],
         );
         let channel_id = s.primary_channel.unwrap();
         let initial = s.channels[&channel_id].session_difficulty.as_f64();
@@ -3673,12 +3651,12 @@ pub(crate) mod tests {
         let _ = handle_open_standard_mining_channel(
             &mut s,
             &open_std(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
+            [0; 4],
         );
         let _ = handle_open_standard_mining_channel(
             &mut s,
             &open_std(2, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
+            [0; 4],
         );
         let fast = 1u32;
         let idle = 2u32;
@@ -3883,7 +3861,7 @@ pub(crate) mod tests {
         let _ = handle_open_standard_mining_channel(
             &mut s,
             &open_std(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0x01, 0x02, 0x03, 0x04],
+            [0x01, 0x02, 0x03, 0x04],
         );
         s
     }
@@ -3895,7 +3873,7 @@ pub(crate) mod tests {
         let _ = handle_open_standard_mining_channel(
             &mut s,
             &open_std(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
+            [0; 4],
         );
         let cid = s.primary_channel.unwrap();
         // 30 shares at the channel's own 1024, 10 s apart → equilibrium
@@ -3979,13 +3957,13 @@ pub(crate) mod tests {
             let mut opened = vec![handle_open_standard_mining_channel(
                 &mut s,
                 &open_std(1, &user),
-                vec![0; 4],
+                [0; 4],
             )];
             for request_id in 2..=3 {
                 opened.push(handle_open_extended_mining_channel(
                     &mut s,
                     &open_ext(request_id, &user),
-                    vec![0; 4],
+                    [0; 4],
                 ));
             }
             ids.extend(opened.into_iter().flat_map(|out| out.events).filter_map(
@@ -4022,7 +4000,7 @@ pub(crate) mod tests {
         let _ = handle_open_standard_mining_channel(
             &mut s,
             &open_std(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
+            [0; 4],
         );
         let standard = s.primary_channel.unwrap();
         let extended_submit = SubmitSharesExtendedInput {
@@ -4046,7 +4024,7 @@ pub(crate) mod tests {
         let _ = handle_open_extended_mining_channel(
             &mut s,
             &open_ext(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
+            [0; 4],
         );
         let extended = s.primary_channel.unwrap();
         let standard_submit = SubmitSharesStandardInput {
@@ -4096,7 +4074,7 @@ pub(crate) mod tests {
         let _ = handle_open_extended_mining_channel(
             &mut s,
             &open_ext(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
+            [0; 4],
         );
         let cid = s.primary_channel.unwrap();
         let sub = SubmitSharesExtendedInput {
@@ -4131,7 +4109,7 @@ pub(crate) mod tests {
         let _ = handle_open_extended_mining_channel(
             &mut s,
             &open_ext(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
+            [0; 4],
         );
         send_first_job(&mut s);
         let cid = s.primary_channel.unwrap();
@@ -4140,7 +4118,7 @@ pub(crate) mod tests {
             coinbase_prefix: vec![0xAA; 8],
             coinbase_suffix: vec![0xBB; 8],
             merkle_path: vec![[0u8; 32]],
-            extranonce_prefix: vec![0; 4],
+            extranonce_prefix: [0; 4],
             version: 0x2000_0000,
             prev_hash: [0xCC; 32],
             n_bits: 0x1d00_ffff,
@@ -4200,7 +4178,7 @@ pub(crate) mod tests {
         let _ = handle_open_standard_mining_channel(
             &mut s,
             &open_std(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
+            [0; 4],
         );
         send_first_job(&mut s);
         s
@@ -4227,7 +4205,7 @@ pub(crate) mod tests {
         let _ = handle_open_standard_mining_channel(
             &mut s,
             &open_std(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
+            [0; 4],
         );
         let cid = s.primary_channel.unwrap();
         clock.advance_ms(600_000);
@@ -4466,7 +4444,7 @@ pub(crate) mod tests {
             let _ = handle_open_standard_mining_channel(
                 &mut s,
                 &open_std(1, &format!("{}.w", REGTEST_ADDR)),
-                vec![0; 4],
+                [0; 4],
             );
             send_first_job(&mut s);
             let cid = s.primary_channel.unwrap();
@@ -4570,7 +4548,7 @@ pub(crate) mod tests {
         let _ = handle_open_extended_mining_channel(
             &mut s,
             &open_ext(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0xAA, 0xBB, 0xCC, 0xDD],
+            [0xAA, 0xBB, 0xCC, 0xDD],
         );
         let mut template = active_template(1, [0xAB; 32]);
         template.coinbase_prefix = vec![0x02, 0xC8, 0x00];
@@ -4771,7 +4749,7 @@ pub(crate) mod tests {
         let _ = handle_open_extended_mining_channel(
             &mut s,
             &open_ext(1, &format!("{REGTEST_ADDR}.w")),
-            vec![0xAA, 0xBB, 0xCC, 0xDD],
+            [0xAA, 0xBB, 0xCC, 0xDD],
         );
         let cid = s.primary_channel.expect("channel opened");
         let gid = s
@@ -4815,7 +4793,7 @@ pub(crate) mod tests {
         handle_setup_connection(&mut s, &good_setup());
         let mut open = open_ext(1, &format!("{}.w", REGTEST_ADDR));
         open.min_extranonce_size = 6;
-        let _ = handle_open_extended_mining_channel(&mut s, &open, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+        let _ = handle_open_extended_mining_channel(&mut s, &open, [0xAA, 0xBB, 0xCC, 0xDD]);
         let cid = s.primary_channel.expect("channel opened");
         assert_eq!(
             s.channels.get(&cid).unwrap().extranonce_size,
@@ -4927,7 +4905,7 @@ pub(crate) mod tests {
         let _ = handle_open_extended_mining_channel(
             &mut s,
             &open_ext(1, &format!("{REGTEST_ADDR}.w")),
-            vec![0xAA, 0xBB, 0xCC, 0xDD],
+            [0xAA, 0xBB, 0xCC, 0xDD],
         );
 
         let mj = synthetic_mining_job_inputs();
@@ -5031,12 +5009,12 @@ pub(crate) mod tests {
         let out1 = handle_open_extended_mining_channel(
             &mut s,
             &open_ext(1, &format!("{REGTEST_ADDR}.a")),
-            vec![0xAA, 0xBB, 0xCC, 0xDD],
+            [0xAA, 0xBB, 0xCC, 0xDD],
         );
         let out2 = handle_open_extended_mining_channel(
             &mut s,
             &open_ext(2, &format!("{REGTEST_ADDR}.b")),
-            vec![0x11, 0x22, 0x33, 0x44],
+            [0x11, 0x22, 0x33, 0x44],
         );
         let g1 = open_group_id(&out1);
         let g2 = open_group_id(&out2);
@@ -5061,7 +5039,7 @@ pub(crate) mod tests {
         let out = handle_open_extended_mining_channel(
             &mut s,
             &open_ext(1, &format!("{REGTEST_ADDR}.w")),
-            vec![0xAA, 0xBB, 0xCC, 0xDD],
+            [0xAA, 0xBB, 0xCC, 0xDD],
         );
         assert_eq!(open_group_id(&out), 0, "RSJ connection must never group");
         assert!(s.groups.is_empty());
@@ -5074,12 +5052,12 @@ pub(crate) mod tests {
         let _ = handle_open_extended_mining_channel(
             &mut s,
             &open_ext(1, &format!("{REGTEST_ADDR}.a")),
-            vec![0xAA, 0xBB, 0xCC, 0xDD],
+            [0xAA, 0xBB, 0xCC, 0xDD],
         );
         let _ = handle_open_extended_mining_channel(
             &mut s,
             &open_ext(2, &format!("{REGTEST_ADDR}.b")),
-            vec![0x11, 0x22, 0x33, 0x44],
+            [0x11, 0x22, 0x33, 0x44],
         );
         let members: Vec<u32> = s.channels.keys().copied().collect();
         assert_eq!(members.len(), 2);
@@ -5138,12 +5116,12 @@ pub(crate) mod tests {
         let _ = handle_open_extended_mining_channel(
             &mut s,
             &open_ext(1, &format!("{REGTEST_ADDR}.a")),
-            vec![0xAA, 0xBB, 0xCC, 0xDD],
+            [0xAA, 0xBB, 0xCC, 0xDD],
         );
         let _ = handle_open_extended_mining_channel(
             &mut s,
             &open_ext(2, &format!("{REGTEST_ADDR}.b")),
-            vec![0x11, 0x22, 0x33, 0x44],
+            [0x11, 0x22, 0x33, 0x44],
         );
         let member = s.primary_channel.unwrap();
 
@@ -5209,7 +5187,7 @@ pub(crate) mod tests {
         let _ = handle_open_extended_mining_channel(
             &mut s,
             &open_ext(1, &format!("{REGTEST_ADDR}.a")),
-            vec![0xAA, 0xBB, 0xCC, 0xDD],
+            [0xAA, 0xBB, 0xCC, 0xDD],
         );
         let ch1 = s.primary_channel.unwrap();
         let mj = synthetic_mining_job_inputs();
@@ -5234,7 +5212,7 @@ pub(crate) mod tests {
         let _ = handle_open_extended_mining_channel(
             &mut s,
             &open_ext(2, &format!("{REGTEST_ADDR}.b")),
-            vec![0x11, 0x22, 0x33, 0x44],
+            [0x11, 0x22, 0x33, 0x44],
         );
         let ch2 = s.channels.keys().copied().find(|&c| c != ch1).unwrap();
         let gid = s.groups.group_for_channel(ch2).unwrap();
@@ -5333,11 +5311,10 @@ pub(crate) mod tests {
     fn standard_member_helper_matches_mining_job_splice() {
         let mj = synthetic_mining_job_inputs();
         let job = mj.build(EXTRANONCE_SLOT_LEN).unwrap();
-        let prefix = vec![0xAB, 0xCD, 0xEF, 0x01];
+        let prefix = [0xAB, 0xCD, 0xEF, 0x01];
         let merkle_path = vec![[0x33u8; 32], [0x44u8; 32]];
 
-        let mut enonce1 = [0u8; 4];
-        enonce1.copy_from_slice(&prefix);
+        let enonce1 = prefix;
         let enonce2 = [0u8; 8];
         let txid = job.coinbase_txid_with_extranonce(&enonce1, &enonce2);
         let expected_root = merkle_root_from_coinbase(&txid, &merkle_path);
@@ -5424,7 +5401,7 @@ pub(crate) mod tests {
                     coinbase_prefix: vec![],
                     coinbase_suffix: vec![],
                     merkle_path: vec![],
-                    extranonce_prefix: vec![],
+                    extranonce_prefix: [0; 4],
                     version: 0,
                     prev_hash: [0; 32],
                     n_bits: 0,
@@ -5485,7 +5462,7 @@ pub(crate) mod tests {
             let _ = handle_open_extended_mining_channel(
                 &mut s,
                 &open_ext(1, &format!("{}.w", REGTEST_ADDR)),
-                vec![0xAA, 0xBB, 0xCC, 0xDD],
+                [0xAA, 0xBB, 0xCC, 0xDD],
             );
             let cid = s.primary_channel.unwrap();
             let ch = s.channels.get_mut(&cid).unwrap();
@@ -5497,7 +5474,7 @@ pub(crate) mod tests {
                         coinbase_prefix: vec![],
                         coinbase_suffix: vec![],
                         merkle_path: vec![],
-                        extranonce_prefix: vec![],
+                        extranonce_prefix: [0; 4],
                         version: 0,
                         prev_hash: [0; 32],
                         n_bits: 0,
@@ -5571,12 +5548,12 @@ pub(crate) mod tests {
         let _ = handle_open_standard_mining_channel(
             &mut s,
             &open_std(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0x11, 0x22, 0x33, 0x44],
+            [0x11, 0x22, 0x33, 0x44],
         );
         let _ = handle_open_standard_mining_channel(
             &mut s,
             &open_std(2, &format!("{}.w", REGTEST_ADDR)),
-            vec![0x55, 0x66, 0x77, 0x88],
+            [0x55, 0x66, 0x77, 0x88],
         );
         assert_eq!(s.channels.len(), 2);
         let mj = synthetic_mining_job_inputs();
