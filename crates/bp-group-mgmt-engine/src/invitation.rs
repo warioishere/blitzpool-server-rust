@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use bp_db::PplnsGroupMemberRow;
-use bp_group_mgmt::{token::InvitationToken, OPEN_INVITE_TYPE};
+use bp_group_mgmt::token::InvitationToken;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -172,7 +172,7 @@ impl InvitationService {
     }
 
     /// Public landing-page lookup. Returns `None` for unknown /
-    /// wrong-type / past-TTL / dissolved-group tokens — every reason
+    /// non-pending / past-TTL / dissolved-group tokens — every reason
     /// the link could be invalid collapses to one response shape so
     /// the page can't probe for "exists but inactive" rows.
     pub async fn get_open_invite_public(
@@ -183,7 +183,7 @@ impl InvitationService {
         let Some(invitation) = invitation else {
             return Ok(None);
         };
-        if invitation.invite_type != OPEN_INVITE_TYPE || invitation.status != "pending" {
+        if invitation.status != "pending" {
             return Ok(None);
         }
         let now = now_ms();
@@ -215,9 +215,6 @@ impl InvitationService {
     ) -> Result<PplnsGroupMemberRow, InvitationServiceError> {
         let invitation = bp_db::find_group_invitation(&self.pool, token).await?;
         let mut invitation = invitation.ok_or(InvitationServiceError::NotFound)?;
-        if invitation.invite_type != OPEN_INVITE_TYPE {
-            return Err(InvitationServiceError::NotFound);
-        }
         if invitation.status != "pending" {
             // `revoked` or `expired` both surface as `expired`.
             return Err(InvitationServiceError::Expired);

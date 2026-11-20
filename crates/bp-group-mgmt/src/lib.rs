@@ -7,7 +7,6 @@
 
 pub mod constants;
 pub mod group;
-pub mod invitation;
 pub mod join_request;
 pub mod token;
 
@@ -20,6 +19,5 @@ pub use group::{
     validate_round_reset, GroupName, GroupNameError, MemberRole, RoundResetConfig, RoundResetError,
     RoundResetPreset,
 };
-pub use invitation::OPEN_INVITE_TYPE;
 pub use join_request::JoinRequestStatus;
 pub use token::{AdminToken, InvitationToken, TokenError, TokenHash};

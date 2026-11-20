@@ -622,7 +622,15 @@ async fn invitation_status_update_by_token() {
         .await
         .expect("ins");
     assert_eq!(inv.status, "pending");
-    assert_eq!(inv.invite_type, "open");
+    // A binary one release older accepts only `'open'`; the column default
+    // is `'directed'`.
+    let invite_type: String =
+        sqlx::query_scalar(r#"SELECT "inviteType" FROM pplns_group_invitation WHERE token = $1"#)
+            .bind(&token)
+            .fetch_one(&pool)
+            .await
+            .expect("inviteType");
+    assert_eq!(invite_type, "open");
     assert!(!inv.approval_required);
 
     assert_eq!(invitation_status(&pool, &token).await, "pending");

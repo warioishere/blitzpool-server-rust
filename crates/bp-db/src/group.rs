@@ -375,19 +375,11 @@ pub struct PplnsGroupInvitationRow {
     pub token: String,
     #[sqlx(rename = "groupId")]
     pub group_id: Uuid,
-    /// Set for `directed` invitations; `None` for `open` invitations
-    /// (anyone with the link can accept).
-    pub address: Option<AddressId>,
-    pub email: Option<String>,
     pub status: String,
     #[sqlx(rename = "createdAt")]
     pub created_at: i64,
     #[sqlx(rename = "expiresAt")]
     pub expires_at: i64,
-    #[sqlx(rename = "respondedAt")]
-    pub responded_at: Option<i64>,
-    #[sqlx(rename = "inviteType")]
-    pub invite_type: String,
     #[sqlx(rename = "approvalRequired")]
     pub approval_required: bool,
 }
@@ -401,13 +393,9 @@ pub async fn find_group_invitation(
         r#"SELECT
             token AS "token!",
             "groupId" AS "group_id!",
-            address AS "address?: AddressId",
-            email AS "email?",
             status AS "status!",
             "createdAt" AS "created_at!",
             "expiresAt" AS "expires_at!",
-            "respondedAt" AS "responded_at?",
-            "inviteType" AS "invite_type!",
             "approvalRequired" AS "approval_required!"
            FROM pplns_group_invitation WHERE token = $1 LIMIT 1"#,
         token
@@ -946,8 +934,9 @@ pub async fn list_live_pplns_group_ids(pool: &PgPool) -> Result<Vec<uuid::Uuid>,
 
 // ── Invitations ─────────────────────────────────────────────────────
 
-/// INSERT a fresh open invite (shareable link, no address or email).
-/// Returns the read-back row.
+/// INSERT a fresh open invite (a shareable link). Returns the read-back row.
+/// `"inviteType"` is written as `'open'`: the column defaults to `'directed'`,
+/// and a binary one release older accepts only `'open'` invitations.
 pub async fn insert_pplns_group_invitation<'e, E>(
     executor: E,
     token: &str,
@@ -962,19 +951,15 @@ where
     sqlx::query_as!(
         PplnsGroupInvitationRow,
         r#"INSERT INTO pplns_group_invitation
-             (token, "groupId", address, email, status, "createdAt",
-              "expiresAt", "inviteType", "approvalRequired")
-           VALUES ($1, $2, NULL, NULL, 'pending', $3, $4, 'open', $5)
+             (token, "groupId", status, "createdAt", "expiresAt", "inviteType",
+              "approvalRequired")
+           VALUES ($1, $2, 'pending', $3, $4, 'open', $5)
            RETURNING
             token AS "token!",
             "groupId" AS "group_id!",
-            address AS "address?: AddressId",
-            email AS "email?",
             status AS "status!",
             "createdAt" AS "created_at!",
             "expiresAt" AS "expires_at!",
-            "respondedAt" AS "responded_at?",
-            "inviteType" AS "invite_type!",
             "approvalRequired" AS "approval_required!""#,
         token,
         group_id,
@@ -1013,9 +998,9 @@ where
     Ok(result.rows_affected())
 }
 
-/// Find the active (`pending`, type=`open`) open-invite for a group,
-/// newest first. Past-`expiresAt` rows are NOT filtered here so the
-/// caller can decide whether to treat them as gone or auto-expire.
+/// Find the active (`pending`) open-invite for a group, newest first.
+/// Past-`expiresAt` rows are NOT filtered here so the caller can decide
+/// whether to treat them as gone or auto-expire.
 pub async fn find_pplns_group_active_open_invite_for_group(
     pool: &PgPool,
     group_id: Uuid,
@@ -1025,18 +1010,13 @@ pub async fn find_pplns_group_active_open_invite_for_group(
         r#"SELECT
             token AS "token!",
             "groupId" AS "group_id!",
-            address AS "address?: AddressId",
-            email AS "email?",
             status AS "status!",
             "createdAt" AS "created_at!",
             "expiresAt" AS "expires_at!",
-            "respondedAt" AS "responded_at?",
-            "inviteType" AS "invite_type!",
             "approvalRequired" AS "approval_required!"
            FROM pplns_group_invitation
            WHERE "groupId" = $1
              AND status = 'pending'
-             AND "inviteType" = 'open'
            ORDER BY "createdAt" DESC
            LIMIT 1"#,
         group_id,
@@ -1060,7 +1040,7 @@ where
     let result = sqlx::query!(
         r#"UPDATE pplns_group_invitation
            SET status = 'revoked', "respondedAt" = $1
-           WHERE "groupId" = $2 AND status = 'pending' AND "inviteType" = 'open'"#,
+           WHERE "groupId" = $2 AND status = 'pending'"#,
         now_ms,
         group_id,
     )

@@ -1,0 +1,88 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            token AS \"token!\",\n            \"groupId\" AS \"group_id!\",\n            status AS \"status!\",\n            \"createdAt\" AS \"created_at!\",\n            \"expiresAt\" AS \"expires_at!\",\n            \"approvalRequired\" AS \"approval_required!\"\n           FROM pplns_group_invitation\n           WHERE \"groupId\" = $1\n             AND status = 'pending'\n           ORDER BY \"createdAt\" DESC\n           LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "token!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_group_invitation",
+            "name": "token"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "group_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "pplns_group_invitation",
+            "name": "groupId"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "status!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_group_invitation",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "created_at!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pplns_group_invitation",
+            "name": "createdAt"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "expires_at!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pplns_group_invitation",
+            "name": "expiresAt"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "approval_required!",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "pplns_group_invitation",
+            "name": "approvalRequired"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "1039609bdea2aa8c25e91b698b771713a00ed25cb60cf894904e88a779f0c3ca"
+}

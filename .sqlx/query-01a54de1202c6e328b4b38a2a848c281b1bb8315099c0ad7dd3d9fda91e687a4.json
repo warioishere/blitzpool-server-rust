@@ -1,0 +1,92 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO pplns_group_invitation\n             (token, \"groupId\", status, \"createdAt\", \"expiresAt\", \"inviteType\",\n              \"approvalRequired\")\n           VALUES ($1, $2, 'pending', $3, $4, 'open', $5)\n           RETURNING\n            token AS \"token!\",\n            \"groupId\" AS \"group_id!\",\n            status AS \"status!\",\n            \"createdAt\" AS \"created_at!\",\n            \"expiresAt\" AS \"expires_at!\",\n            \"approvalRequired\" AS \"approval_required!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "token!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_group_invitation",
+            "name": "token"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "group_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "pplns_group_invitation",
+            "name": "groupId"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "status!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "pplns_group_invitation",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "created_at!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pplns_group_invitation",
+            "name": "createdAt"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "expires_at!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pplns_group_invitation",
+            "name": "expiresAt"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "approval_required!",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "pplns_group_invitation",
+            "name": "approvalRequired"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Uuid",
+        "Int8",
+        "Int8",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "01a54de1202c6e328b4b38a2a848c281b1bb8315099c0ad7dd3d9fda91e687a4"
+}
