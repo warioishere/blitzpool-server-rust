@@ -1021,7 +1021,7 @@ fn open_channel_refusal(outbound: &[OutboundFrame]) -> Option<&str> {
 }
 
 /// The session's user agent, with an empty vendor recorded as the
-/// `jd-client/sv2` placeholder the downstream report later refines.
+/// `jd-client/sv2` placeholder.
 fn session_user_agent(user_agent: Option<&str>) -> &str {
     user_agent.unwrap_or("jd-client/sv2")
 }

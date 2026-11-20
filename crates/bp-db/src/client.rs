@@ -637,32 +637,6 @@ pub async fn revive_sessions(
     Ok(result.rows_affected())
 }
 
-/// Replace the JDP placeholder `userAgent` (`jd-client/sv2`, `/sv2`) of an
-/// address's sessions once the miner reports its downstream devices.
-pub async fn update_sv2_user_agent_by_address<'e, E>(
-    executor: E,
-    address: &str,
-    new_user_agent: &str,
-) -> Result<u64, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    // No updated-at trigger exists, so every UPDATE must set it.
-    let result = sqlx::query(
-        r#"UPDATE client_entity
-           SET "userAgent" = $2,
-               "updatedAt" = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
-           WHERE address = $1
-             AND "userAgent" IN ('jd-client/sv2', '/sv2')"#,
-    )
-    .bind(address)
-    .bind(new_user_agent)
-    .execute(executor)
-    .await
-    .map_err(DbError::from)?;
-    Ok(result.rows_affected())
-}
-
 /// Hard-delete rows soft-deleted before `cutoff_ms`, so the backlog stays
 /// bounded.
 pub async fn delete_old_clients<'e, E>(executor: E, cutoff_ms: i64) -> Result<u64, DbError>

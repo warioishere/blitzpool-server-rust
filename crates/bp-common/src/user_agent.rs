@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Miner user-agent normalisation, shared by SV1 (`mining.subscribe`), SV2
-//! (SetupConnection `vendor`) and the API downstream report so the same
-//! firmware is recorded under the same name whichever way it connects.
+//! Miner user-agent normalisation, shared by SV1 (`mining.subscribe`) and SV2
+//! (SetupConnection `vendor`) so the same firmware is recorded under the same
+//! name whichever way it connects.
 
 /// First space-/`/`-/`V`-bounded token, with known firmware tags collapsed
 /// (case-sensitive).

@@ -11,8 +11,8 @@
 use bp_common::AddressId;
 use bp_db::{
     delete_client_for_session, find_addresses_for_ntfy_listener, find_recently_deleted_sessions,
-    find_stale_active_sessions, revive_sessions, soft_delete_sessions,
-    update_sv2_user_agent_by_address, upsert_client, upsert_ntfy_subscription, ClientUpsert,
+    find_stale_active_sessions, revive_sessions, soft_delete_sessions, upsert_client,
+    upsert_ntfy_subscription, ClientUpsert,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 
@@ -658,63 +658,4 @@ async fn recently_deleted_sessions_are_listed_and_revivable() {
 
     drop_session(&pool, "sessR001").await;
     drop_session(&pool, "sessR002").await;
-}
-
-// ── update_sv2_user_agent_by_address ────────────────────────────────
-
-#[tokio::test]
-async fn update_sv2_user_agent_by_address_bumps_updated_at() {
-    // Without the bump, refining a userAgent would leave a stale "last seen".
-    let Some(pool) = connect_or_skip().await else {
-        return;
-    };
-    let mut tx = pool.begin().await.expect("begin tx");
-
-    // Seed a client row with userAgent = "jd-client/sv2" (one of the SV2
-    // placeholders this fn rewrites) and a frozen-old updatedAt.
-    let stale_updated_at = 1_700_000_000_000_i64;
-    sqlx::query(
-        r#"INSERT INTO client_entity
-             (address, "clientName", "sessionId", "userAgent",
-              "startTime", "createdAt", "updatedAt")
-           VALUES ($1, 'wkr', 'sessSV2A', 'jd-client/sv2',
-                   $2, $2, $2)"#,
-    )
-    .bind("test_sv2_ua_addr")
-    .bind(stale_updated_at)
-    .execute(&mut *tx)
-    .await
-    .expect("seed");
-
-    // Use the same clock the UPDATE writes from (PG's NOW()) to side-step
-    // any drift between the Rust process clock and the PG container clock.
-    let now_before: i64 =
-        sqlx::query_scalar(r#"SELECT (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint"#)
-            .fetch_one(&mut *tx)
-            .await
-            .expect("read pg now");
-    let n = update_sv2_user_agent_by_address(&mut *tx, "test_sv2_ua_addr", "bitaxe/3.0")
-        .await
-        .expect("update");
-    assert_eq!(n, 1, "exactly one row should be rewritten");
-
-    let (ua, updated_at): (String, i64) = sqlx::query_as(
-        r#"SELECT "userAgent", "updatedAt" FROM client_entity WHERE "sessionId" = $1"#,
-    )
-    .bind("sessSV2A")
-    .fetch_one(&mut *tx)
-    .await
-    .expect("read back");
-
-    assert_eq!(ua, "bitaxe/3.0", "userAgent rewritten to the refined value");
-    assert!(
-        updated_at >= now_before,
-        "updatedAt must be bumped to >= NOW() reference ({updated_at} vs {now_before})"
-    );
-    assert!(
-        updated_at > stale_updated_at,
-        "updatedAt must move past the stale seed value"
-    );
-
-    tx.rollback().await.expect("rollback");
 }

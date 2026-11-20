@@ -9,7 +9,6 @@ pub(crate) mod address_ownership;
 pub(crate) mod blockparty;
 pub(crate) mod client;
 pub(crate) mod custom_extranonce;
-pub(crate) mod downstream_report;
 pub(crate) mod email;
 pub(crate) mod groups;
 pub(crate) mod info;

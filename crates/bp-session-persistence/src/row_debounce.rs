@@ -22,8 +22,8 @@ use crate::touch_buffer::TouchKey;
 pub(crate) const MAX_BIRTH_ATTEMPTS: u32 = 3;
 
 /// One not-yet-born session, captured at authorize so the row carries the
-/// authorize-time `userAgent` (incl. the SV2 `jd-client/sv2` placeholder the
-/// downstream-report refinement matches on) and `startTime`.
+/// authorize-time `userAgent` (incl. the SV2 `jd-client/sv2` placeholder) and
+/// `startTime`.
 pub(crate) struct PendingRow {
     pub user_agent: Option<String>,
     pub start_time_ms: i64,

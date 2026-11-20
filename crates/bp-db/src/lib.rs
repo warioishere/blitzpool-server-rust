@@ -70,9 +70,9 @@ pub use client::{
     find_clients_by_address, find_last_share_slot_for_addresses,
     find_max_difficulty_since_for_addresses, find_pool_worker_counts_since,
     find_recently_deleted_sessions, find_stale_active_sessions, find_worker_shares_for_address,
-    raise_client_best_difficulties, revive_sessions, soft_delete_sessions,
-    update_sv2_user_agent_by_address, upsert_client, ClientRow, ClientStatisticsRow, ClientUpsert,
-    DeletedSessionRow, DeviceFirstSeenRow, PoolWorkerCounts, WorkerSharesRow,
+    raise_client_best_difficulties, revive_sessions, soft_delete_sessions, upsert_client,
+    ClientRow, ClientStatisticsRow, ClientUpsert, DeletedSessionRow, DeviceFirstSeenRow,
+    PoolWorkerCounts, WorkerSharesRow,
 };
 pub use custom_extranonce::{
     all_custom_extranonces, delete_extranonce_challenge, find_custom_extranonces_for_address,
