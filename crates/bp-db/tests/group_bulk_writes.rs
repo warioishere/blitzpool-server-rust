@@ -35,9 +35,9 @@ async fn connect_or_skip() -> Option<PgPool> {
     }
 }
 
-/// Each test seeds a `pplns_group` row inside its TX so the FK on
-/// `pplns_group_balance` is satisfied. The TX rolls back at end so
-/// the seeded group disappears too.
+/// Each test seeds a `pplns_group` row inside its TX so the group-keyed
+/// rows it writes satisfy their FK. The TX rolls back at end so the
+/// seeded group disappears too.
 async fn seed_group_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     group_id: Uuid,

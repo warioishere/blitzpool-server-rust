@@ -160,10 +160,6 @@ async fn cleanup_group(pool: &PgPool, group_id: Uuid) {
         .bind(group_id)
         .execute(pool)
         .await;
-    let _ = sqlx::query(r#"DELETE FROM pplns_group_balance WHERE "groupId" = $1"#)
-        .bind(group_id)
-        .execute(pool)
-        .await;
     let _ = sqlx::query(r#"DELETE FROM pplns_group WHERE id = $1"#)
         .bind(group_id)
         .execute(pool)
@@ -441,7 +437,6 @@ async fn a_richer_block_leaves_nobody_owing() {
             who.as_str()
         );
     }
-    assert_eq!(count_group_balance_rows(&h.pool, h.group_id).await, 0);
 
     drop_harness(h).await;
 }
@@ -464,15 +459,6 @@ async fn read_block_history(
     .expect("read history")
     .into_iter()
     .collect()
-}
-
-/// `pplns_group_balance` rows of this group; zero is the "no ledger" invariant.
-async fn count_group_balance_rows(pool: &PgPool, group_id: Uuid) -> i64 {
-    sqlx::query_scalar::<_, i64>(r#"SELECT count(*) FROM pplns_group_balance WHERE "groupId" = $1"#)
-        .bind(group_id)
-        .fetch_one(pool)
-        .await
-        .expect("count balances")
 }
 
 // ── Test 3b — the block books the job's coinbase, never a rebuild ──
@@ -1625,7 +1611,6 @@ async fn a_group_block_far_off_the_reference_is_still_booked() {
             who.as_str()
         );
     }
-    assert_eq!(count_group_balance_rows(&h.pool, h.group_id).await, 0);
 
     drop_harness(h).await;
 }

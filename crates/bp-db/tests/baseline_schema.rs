@@ -154,6 +154,16 @@ async fn an_empty_database_boots_to_the_full_schema() {
     ] {
         assert!(tables.iter().any(|x| x == t), "{t} missing: {tables:?}");
     }
+    // The baseline creates these, 0031 drops them again.
+    for t in [
+        "blockparty_invitation",
+        "external_shares_entity",
+        "migrations",
+        "pplns_group_balance",
+        "rpc_block_entity",
+    ] {
+        assert!(!tables.iter().any(|x| x == t), "{t} still there: {tables:?}");
+    }
     // A column only a later migration adds (0009), and 0016's partial index:
     // the full migration set must land on top of the baseline.
     let fp = schema_fingerprint(pool.pool()).await;

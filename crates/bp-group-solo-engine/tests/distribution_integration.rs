@@ -130,10 +130,6 @@ async fn cleanup_group(pool: &PgPool, group_id: Uuid) {
         .bind(group_id)
         .execute(pool)
         .await;
-    let _ = sqlx::query(r#"DELETE FROM pplns_group_balance WHERE "groupId" = $1"#)
-        .bind(group_id)
-        .execute(pool)
-        .await;
     let _ = sqlx::query(r#"DELETE FROM pplns_group WHERE id = $1"#)
         .bind(group_id)
         .execute(pool)
