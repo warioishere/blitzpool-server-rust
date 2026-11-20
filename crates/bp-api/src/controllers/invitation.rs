@@ -55,6 +55,9 @@ async fn accept_open(
         .accept_open_invite(&token, &body.address)
         .await
         .map_err(invitation_to_api_error)?;
+    // A new member, as an approved join request makes one.
+    super::groups::invalidate_group_cache(&state, member.group_id).await;
+    super::groups::invalidate_address_group_cache(&state, &member.address).await;
     Ok(Json(MemberCreatedResponse {
         address: member.address.as_str().to_string(),
         role: member.role.as_str().to_owned(),

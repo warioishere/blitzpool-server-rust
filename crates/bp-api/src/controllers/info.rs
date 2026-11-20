@@ -350,6 +350,9 @@ struct ClientBlockTemplateResponse {
     preview_finder: Option<String>,
 }
 
+/// Prefix of the `/api/client/:address/block-template` cache keys.
+pub(crate) const CLIENT_BLOCK_TEMPLATE_PREFIX: &str = "CLIENT_BLOCK_TEMPLATE_";
+
 async fn client_block_template(
     State(state): State<SharedState>,
     Path(address): Path<String>,
@@ -357,7 +360,7 @@ async fn client_block_template(
     use bp_common::AddressId;
 
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
-    let key = format!("CLIENT_BLOCK_TEMPLATE_{}", addr.as_str());
+    let key = format!("{CLIENT_BLOCK_TEMPLATE_PREFIX}{}", addr.as_str());
     let s = state.clone();
     let bytes = state
         .cache

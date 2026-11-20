@@ -227,6 +227,11 @@ async fn set(
     let saved = bp_db::upsert_custom_extranonces_batch(&state.pool, &address, &entries, now)
         .await
         .map_err(map_prefix_conflict)?;
+    // `/api/client/:address` serves the extranonce per worker.
+    state
+        .cache
+        .invalidate(&super::client::client_info_cache_key(&address))
+        .await;
 
     let updated_at = saved.first().map(|r| r.updated_at).unwrap_or(now);
     Ok(Json(SetResponse {

@@ -24,10 +24,14 @@ pub(crate) fn mode_cache_key(address: &AddressId) -> String {
     format!("{MODE_CACHE_PREFIX}{}", address.as_str())
 }
 
-/// Drop every cached `/api/pplns/mode` answer. All of them, because a
-/// dissolve has deleted the members it moved by the time it reports.
+/// Drop every cached `/api/pplns/mode` answer and block-template preview,
+/// which shows the same mode. All of them, because a dissolve has deleted the
+/// members it moved by the time it reports.
 async fn forget_cached_modes(cache: &ResponseCache) {
     cache.invalidate_prefix(MODE_CACHE_PREFIX).await;
+    cache
+        .invalidate_prefix(crate::controllers::info::CLIENT_BLOCK_TEMPLATE_PREFIX)
+        .await;
 }
 
 /// Hooked into the Team and Blockparty services, which report every change
@@ -129,6 +133,44 @@ async fn blockparty_group(s: &AppState, address: &AddressId) -> Option<MiningMod
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NoNext;
+
+    #[async_trait]
+    impl MembershipChangeNotifier for NoNext {
+        async fn membership_changed(&self, _kind: &str) {}
+    }
+
+    /// A membership change drops the cached modes and the previews that
+    /// show them, and nothing else.
+    #[tokio::test]
+    async fn a_membership_change_drops_cached_modes_and_previews() {
+        use crate::response_cache::TtlKind;
+        let cache = ResponseCache::new(bp_config::ApiCacheConfig::default());
+        let cached =
+            |key: &'static str, v: u64| {
+                let cache = cache.clone();
+                async move {
+                    cache
+                        .get_or_fetch::<_, _, ()>(key.to_string(), TtlKind::SiteInfo, async move {
+                            Ok(v)
+                        })
+                        .await
+                        .unwrap()
+                }
+            };
+        for key in ["PPLNS_MODE_a", "CLIENT_BLOCK_TEMPLATE_a", "CLIENT_INFO_a"] {
+            cached(key, 1).await;
+        }
+        ModeCacheNotifier::new(cache.clone(), Arc::new(NoNext))
+            .membership_changed("group")
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // A dropped entry is fetched again (2); a kept one still answers 1.
+        assert_eq!(&cached("PPLNS_MODE_a", 2).await[..], b"2");
+        assert_eq!(&cached("CLIENT_BLOCK_TEMPLATE_a", 2).await[..], b"2");
+        assert_eq!(&cached("CLIENT_INFO_a", 2).await[..], b"1");
+    }
 
     // An address no fixture ever writes, so the state fallback finds
     // nothing for it and answers Solo.

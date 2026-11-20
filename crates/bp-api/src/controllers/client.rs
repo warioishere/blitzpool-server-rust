@@ -306,7 +306,7 @@ async fn by_address(
     Path(address): Path<String>,
 ) -> Result<JsonBytes, ApiError> {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
-    let key = format!("CLIENT_INFO_{}", addr.as_str());
+    let key = client_info_cache_key(&addr);
     let s = state.clone();
     let bytes = state
         .cache
@@ -619,6 +619,12 @@ struct StatusResponse {
     address: Option<String>,
 }
 
+/// Response-cache key of `/api/client/:address`, which also serves each
+/// worker's custom extranonce.
+pub(crate) fn client_info_cache_key(addr: &AddressId) -> String {
+    format!("CLIENT_INFO_{}", addr.as_str())
+}
+
 /// Drop every cached entry whose key references `addr`. Called by
 /// the three mutating endpoints so the next read sees fresh data.
 async fn invalidate_address_cache(state: &SharedState, addr: &AddressId) {
@@ -633,7 +639,7 @@ async fn invalidate_address_cache(state: &SharedState, addr: &AddressId) {
         "CLIENT_DIFF_SCORES_",
         "CLIENT_WORKER_GROUP_",
         "CLIENT_WORKER_SESSION_",
-        "CLIENT_BLOCK_TEMPLATE_",
+        super::info::CLIENT_BLOCK_TEMPLATE_PREFIX,
     ] {
         let full = format!("{prefix}{}", addr.as_str());
         state.cache.invalidate_prefix(&full).await;

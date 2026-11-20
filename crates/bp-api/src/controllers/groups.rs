@@ -110,7 +110,7 @@ pub(crate) fn routes() -> Router<SharedState> {
 // ─── cache invalidation helpers ──────────────────────────────────
 
 /// Called by every mutating endpoint so the next read is fresh, not TTL-old.
-async fn invalidate_group_cache(state: &SharedState, id: Uuid) {
+pub(crate) async fn invalidate_group_cache(state: &SharedState, id: Uuid) {
     let id_str = id.to_string();
     state.cache.invalidate_prefix("GROUP_PUBLIC_LIST").await;
     for prefix in [
@@ -135,7 +135,7 @@ async fn invalidate_group_cache(state: &SharedState, id: Uuid) {
 }
 
 /// For membership changes, so the join-request lookup re-resolves immediately.
-async fn invalidate_address_group_cache(state: &SharedState, address: &AddressId) {
+pub(crate) async fn invalidate_address_group_cache(state: &SharedState, address: &AddressId) {
     let jr = format!("GROUP_JOIN_REQUESTS_BY_ADDR_{}", address.as_str());
     state.cache.invalidate(&jr).await;
 }
