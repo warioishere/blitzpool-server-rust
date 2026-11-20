@@ -1132,6 +1132,7 @@ dependencies = [
  "bp-db",
  "bp-share-hook",
  "bp-stats",
+ "bp-test-support",
  "sqlx",
  "tokio",
  "tracing",

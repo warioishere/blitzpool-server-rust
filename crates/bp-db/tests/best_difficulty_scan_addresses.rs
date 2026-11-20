@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! Which addresses the best-difficulty cron scans:
@@ -13,9 +12,8 @@ use bp_db::{
     find_best_difficulty_scan_addresses, update_telegram_sub_best_diff_flag,
     upsert_ntfy_subscription, upsert_push_subscription, upsert_telegram_subscription,
 };
-use sqlx::{postgres::PgPoolOptions, AssertSqlSafe, PgPool};
+use sqlx::{AssertSqlSafe, PgPool};
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 const TEST_CHAT_ID: i64 = 990_000_779;
 
 const TELEGRAM_ONLY: &str = "bdscan_telegram_only";
@@ -30,29 +28,6 @@ const ALL: [&str; 5] = [
     NTFY_REMOVED,
     PUSH_ONLY,
 ];
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping integration test");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    }
-}
 
 async fn hard_cleanup(pool: &PgPool) {
     for table in [
@@ -79,7 +54,7 @@ fn addr(s: &str) -> AddressId {
 /// is not.
 #[tokio::test]
 async fn best_diff_scan_covers_every_transport() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     hard_cleanup(&pool).await;

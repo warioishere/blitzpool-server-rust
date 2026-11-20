@@ -264,7 +264,6 @@ mod tests {
     use super::*;
     use redis::AsyncCommands;
 
-    const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
     const RETENTION_MS: i64 = 48 * 3600 * 1000;
 
     /// Job state (per-job snapshots, the published-output count, the rebuild
@@ -284,15 +283,6 @@ mod tests {
         assert!(!is_job_state("groupsolo:g1:by-address"));
     }
 
-    async fn pg_or_skip() -> Option<PgPool> {
-        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| PG_URL.to_string());
-        let db = tokio::time::timeout(Duration::from_secs(2), bp_db::Db::connect(&url))
-            .await
-            .ok()?
-            .ok()?;
-        Some(db.pool().clone())
-    }
-
     /// Backup, wipe, restore returns every key byte-for-byte; skips and `--scope` hold.
     #[tokio::test]
     async fn backup_then_restore_roundtrip_restores_exact_state() {
@@ -306,7 +296,7 @@ mod tests {
             eprintln!("redis unreachable — skipping redis-state-backup roundtrip");
             return;
         };
-        let Some(pool) = pg_or_skip().await else {
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
             eprintln!("pg unreachable — skipping redis-state-backup roundtrip");
             return;
         };

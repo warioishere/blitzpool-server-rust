@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
-
 //! The public leaderboard must read `allTimeBestDifficulty`, not the column
 //! `/bestdiff_reset` zeroes, or a reset would drop the miner off it for good.
 //! Needs `bp-test-pg` (15433) and skips without it, so watch the passed-count.
@@ -11,36 +9,11 @@ use bp_db::{
     bulk_upsert_address_settings, find_high_scores, reset_address_settings_best_difficulty,
     AddressSettingsUpsert,
 };
-use sqlx::{postgres::PgPoolOptions, PgPool};
-
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
+use sqlx::PgPool;
 
 /// Above every real row, so the seeded entry is deterministically inside
 /// the query's `LIMIT 10` no matter what else the shared test DB holds.
 const ABOVE_EVERYTHING: f64 = 9.9e17;
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping integration test");
-            None
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            None
-        }
-    }
-}
 
 async fn cleanup(pool: &PgPool, address: &str) {
     let _ = sqlx::query(r#"DELETE FROM address_settings_entity WHERE address = $1"#)
@@ -53,7 +26,7 @@ async fn cleanup(pool: &PgPool, address: &str) {
 /// leaderboard.
 #[tokio::test]
 async fn a_reset_does_not_remove_the_miner_from_the_public_leaderboard() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let address = "test_hs_reset_keeps_entry";

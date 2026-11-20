@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
-
 //! A Team's and a Blockparty's coinbase tag: set and cleared only with the
 //! admin token, refused outside 25 printable ASCII characters, and the two
 //! admin endpoints answer the same input the same way.
@@ -14,33 +12,7 @@ use bp_api::{build_router, AppState};
 use bp_blockparty_engine::{BlockpartyPayoutConfig, BlockpartyPayouts, BlockpartyService};
 use bp_group_mgmt_engine::{AddressCache, GroupService, NoopHooks};
 use serde_json::{json, Value};
-use sqlx::{postgres::PgPoolOptions, PgPool};
 use tower::ServiceExt;
-
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(4)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping");
-            None
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            None
-        }
-    }
-}
 
 /// Each call from its own client IP, so the per-IP limit stays out of the
 /// way; [`patch_from`] pins one.
@@ -128,7 +100,7 @@ where
 
 #[tokio::test]
 async fn a_team_admin_sets_and_clears_the_coinbase_tag() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-team-coinbase-tag";
@@ -197,7 +169,7 @@ async fn a_team_admin_sets_and_clears_the_coinbase_tag() {
 
 #[tokio::test]
 async fn a_blockparty_admin_sets_and_clears_the_coinbase_tag() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-party-coinbase-tag";

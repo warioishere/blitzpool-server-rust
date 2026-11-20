@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! Integration tests for `bp-group-solo-engine::reset::GroupResetRunner`
@@ -12,68 +11,17 @@ use std::sync::Arc;
 use bp_cron_utils::TestClock;
 use bp_group_solo_engine::reset::{GroupResetRunner, ResetError, RESET_DEBOUNCE_MS};
 use bp_group_solo_engine::round::GroupRoundStore;
-use redis::{aio::ConnectionManager, Client};
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use redis::aio::ConnectionManager;
+use sqlx::PgPool;
 use uuid::Uuid;
 
-const REDIS_URL: &str = "redis://127.0.0.1:16379";
-const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
-
 async fn connect_or_skip(redis_db: u8) -> Option<(PgPool, ConnectionManager)> {
-    let pg_url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
-    let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
-    // Fold this binary's local number into its own DB range (see
-    // `bp_test_support::redis_db`) so binaries do not FLUSHDB each other.
-    let redis_db =
-        bp_test_support::redis_db_in_range(bp_test_support::redis_db::GS_RESET, redis_db).await;
-    let redis_url = format!("{redis_base}/{redis_db}");
-
-    let pool = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(4)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&pg_url),
+    let pool = bp_test_support::connect_pg_or_skip().await?;
+    let conn = bp_test_support::connect_redis_in_range_or_skip(
+        bp_test_support::redis_db::GS_RESET,
+        redis_db,
     )
-    .await
-    {
-        Ok(Ok(p)) => p,
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed: {e} — skipping");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    };
-    let client = match Client::open(redis_url.clone()) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Redis client failed: {e} — skipping");
-            return None;
-        }
-    };
-    let mut conn = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        bp_test_support::connection_manager(client),
-    )
-    .await
-    {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
-            eprintln!("Redis connect failed: {e} — skipping");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("redis connect timed out (>2s) — skipping integration test");
-            return None;
-        }
-    };
-    if let Err(e) = redis::cmd("FLUSHDB").query_async::<()>(&mut conn).await {
-        eprintln!("FLUSHDB failed: {e} — skipping");
-        return None;
-    }
+    .await?;
     Some((pool, conn))
 }
 

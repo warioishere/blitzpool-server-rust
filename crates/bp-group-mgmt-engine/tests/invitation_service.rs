@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! Integration tests for `bp_group_mgmt_engine::InvitationService`
@@ -11,36 +10,11 @@ use std::sync::Arc;
 use bp_group_mgmt_engine::{
     GroupService, InvitationService, InvitationServiceError, NoopHooks, OpenInviteTtl,
 };
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::PgPool;
 use uuid::Uuid;
-
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 /// Coinbase ceiling high enough to stay out of the way here.
 const TEST_COINBASE_CAP: u64 = 10_000;
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(4)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    }
-}
 
 async fn cleanup_group(pool: &PgPool, group_id: Uuid) {
     let _ = sqlx::query("DELETE FROM pplns_group_invitation WHERE \"groupId\" = $1")
@@ -71,7 +45,7 @@ async fn build_services(pool: PgPool) -> (Arc<GroupService>, InvitationService) 
 
 #[tokio::test]
 async fn open_invite_create_revoke_and_replace_atomic() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -131,7 +105,7 @@ async fn open_invite_create_revoke_and_replace_atomic() {
 
 #[tokio::test]
 async fn accept_open_invite_creates_member() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -170,7 +144,7 @@ async fn accept_open_invite_creates_member() {
 
 #[tokio::test]
 async fn accept_open_invite_creates_member_via_signature() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -204,7 +178,7 @@ async fn accept_open_invite_creates_member_via_signature() {
 
 #[tokio::test]
 async fn accept_open_invite_blocks_approval_required() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -237,7 +211,7 @@ async fn accept_open_invite_blocks_approval_required() {
 
 #[tokio::test]
 async fn get_open_invite_public_omits_admin_data() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };

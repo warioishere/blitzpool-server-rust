@@ -581,41 +581,14 @@ fn parse_stream_id(id: &str) -> Option<(u64, u64)> {
 mod tests {
     //! Integration tests against Redis (`BP_REDIS_URL`); each test uses its
     //! own logical DB and skips if Redis is unreachable.
-    #![allow(clippy::print_stderr)]
 
     use super::*;
     use bp_share_hook::MiningModeResult;
     use redis::Client;
 
-    const DEFAULT_URL: &str = "redis://127.0.0.1:16379";
-
     async fn connect_or_skip(db: u8) -> Option<ConnectionManager> {
-        // This binary's own DB range, so other test binaries do not flush it.
-        let db =
-            bp_test_support::redis_db_in_range(bp_test_support::redis_db::SHARE_STREAM, db).await;
-        let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-        let url = format!("{base}/{db}");
-        let client = Client::open(url).ok()?;
-        let mut conn = match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            ConnectionManager::new_with_config(client, crate::connection_manager_config()),
-        )
-        .await
-        {
-            Ok(Ok(c)) => c,
-            _ => {
-                eprintln!("redis unreachable — skipping bp-share-stream integration test");
-                return None;
-            }
-        };
-        if redis::cmd("FLUSHDB")
-            .query_async::<()>(&mut conn)
+        bp_test_support::connect_redis_in_range_or_skip(bp_test_support::redis_db::SHARE_STREAM, db)
             .await
-            .is_err()
-        {
-            return None;
-        }
-        Some(conn)
     }
 
     /// An idle `XREADGROUP … BLOCK 1000` returns empty on a connection built
@@ -628,7 +601,7 @@ mod tests {
         };
         let db =
             bp_test_support::redis_db_in_range(bp_test_support::redis_db::SHARE_STREAM, 16).await;
-        let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
+        let base = bp_test_support::redis_url();
         let client = Client::open(format!("{base}/{db}")).expect("client");
 
         let ours = ConnectionManager::new_with_config(client.clone(), connection_manager_config())
@@ -656,21 +629,11 @@ mod tests {
     /// `XREADGROUP … BLOCK` would otherwise head-of-line-block an `XADD` on
     /// the shared multiplexed connection.
     async fn connect_peer(db: u8) -> Option<ConnectionManager> {
-        // Must fold like `connect_or_skip`, or producer and consumer never meet.
-        let db =
-            bp_test_support::redis_db_in_range(bp_test_support::redis_db::SHARE_STREAM, db).await;
-        let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-        let url = format!("{base}/{db}");
-        let client = Client::open(url).ok()?;
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            ConnectionManager::new_with_config(client, crate::connection_manager_config()),
+        bp_test_support::connect_redis_in_range_no_flush(
+            bp_test_support::redis_db::SHARE_STREAM,
+            db,
         )
         .await
-        {
-            Ok(Ok(c)) => Some(c),
-            _ => None,
-        }
     }
 
     const GROUP: uuid::Uuid = uuid::Uuid::from_u128(0x550e8400_e29b_41d4_a716_446655440000);

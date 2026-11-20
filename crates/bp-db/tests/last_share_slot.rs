@@ -5,40 +5,14 @@
 
 use bp_common::AddressId;
 use bp_db::find_last_share_slot_for_addresses;
-use sqlx::{postgres::PgPoolOptions, PgPool};
-
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 // Printing why an integration test skipped is what stderr is for here.
-#[allow(clippy::print_stderr)]
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping integration test");
-            None
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            None
-        }
-    }
-}
 
 /// A later slot without shares, and one at or past the cutoff, do not count;
 /// an address with only share-less rows, or no rows, is absent.
 #[tokio::test]
 async fn last_share_slot_skips_empty_slots_and_the_cutoff() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");

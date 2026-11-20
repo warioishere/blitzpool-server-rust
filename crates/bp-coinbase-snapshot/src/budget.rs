@@ -57,26 +57,18 @@ pub fn is_wrongtype(e: &RedisError) -> bool {
 mod tests {
     use super::*;
 
-    /// Local dev Redis, or `None` (test skips) when unreachable.
+    /// Unflushed: the tests only touch their own `test:coinbase_budget:*` keys.
     async fn conn() -> Option<ConnectionManager> {
-        let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:16379".into());
-        let client = redis::Client::open(url).ok()?;
-        // `ConnectionManager::new` hangs on an unreachable host instead of
-        // erroring.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            bp_test_support::connection_manager(client),
+        bp_test_support::connect_redis_in_range_no_flush(
+            bp_test_support::redis_db::BLITZPOOL_BIN,
+            0,
         )
         .await
-        .ok()?
-        .ok()
     }
 
     #[tokio::test]
-    #[allow(clippy::print_stderr)]
     async fn round_trips_and_overwrites() {
         let Some(mut c) = conn().await else {
-            eprintln!("skipping: no local Redis");
             return;
         };
         let key = "test:coinbase_budget:roundtrip";
@@ -105,10 +97,8 @@ mod tests {
     /// A hash under the budget key answers `GET` with WRONGTYPE; the read
     /// treats it as missing. The raw `GET` shows the error is really there.
     #[tokio::test]
-    #[allow(clippy::print_stderr)]
     async fn a_wrong_typed_key_reads_as_missing() {
         let Some(mut c) = conn().await else {
-            eprintln!("skipping: no local Redis");
             return;
         };
         let key = "test:coinbase_budget:wrongtype";
@@ -124,10 +114,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::print_stderr)]
     async fn no_ttl_set_on_value() {
         let Some(mut c) = conn().await else {
-            eprintln!("skipping: no local Redis");
             return;
         };
         let key = "test:coinbase_budget:nottl";

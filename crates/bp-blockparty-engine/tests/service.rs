@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! `BlockpartyService` against the test Postgres: lifecycle transitions and
@@ -16,33 +15,8 @@ use bp_blockparty_engine::{
 };
 use bp_common::{AddressId, Sats};
 use bp_group_mgmt_engine::{AddressCache as PplnsAddressCache, OpenInviteTtl};
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::PgPool;
 use uuid::Uuid;
-
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(4)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    }
-}
 
 fn addr(s: &str) -> AddressId {
     AddressId::new(s).expect("test address")
@@ -130,7 +104,7 @@ async fn confirm(svc: &BlockpartyService, group_id: Uuid, member: &str, member_t
 
 #[tokio::test]
 async fn create_group_seeds_draft_and_routing_cache() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-create-1";
@@ -159,7 +133,7 @@ async fn create_group_seeds_draft_and_routing_cache() {
 
 #[tokio::test]
 async fn a_joined_member_flips_the_party_to_confirming_and_is_cached() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-add-2";
@@ -193,7 +167,7 @@ async fn a_joined_member_flips_the_party_to_confirming_and_is_cached() {
 
 #[tokio::test]
 async fn join_via_link_adds_unconfirmed_member_and_mints_token() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-joinlink-1";
@@ -262,7 +236,7 @@ async fn join_via_link_adds_unconfirmed_member_and_mints_token() {
 async fn join_via_link_admits_signature_verified_email_less_base58_address() {
     // A signature proof admits an email-less address; the mixed-case Base58
     // address pins that the gate does not lowercase it.
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-sigjoin-1";
@@ -320,7 +294,7 @@ async fn join_via_link_admits_signature_verified_email_less_base58_address() {
 
 #[tokio::test]
 async fn join_via_link_rejects_unverified_address() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-unverjoin-1";
@@ -368,7 +342,7 @@ async fn join_via_link_rejects_unverified_address() {
 /// A signature-verified, email-less admin can create; its row stores "".
 #[tokio::test]
 async fn create_group_admits_signature_verified_email_less_admin() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-sigcreate-1";
@@ -396,7 +370,7 @@ async fn create_group_admits_signature_verified_email_less_admin() {
 /// An admin with neither email nor signature proof cannot create a party.
 #[tokio::test]
 async fn create_group_rejects_unverified_admin() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-unvercreate-1";
@@ -430,7 +404,7 @@ async fn create_group_rejects_unverified_admin() {
 /// `confirmationRequestedAt` is unset at creation and stamped only by the admin.
 #[tokio::test]
 async fn request_member_confirmation_stamps_flag_and_is_admin_gated() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-reqconfirm-1";
@@ -464,7 +438,7 @@ async fn request_member_confirmation_stamps_flag_and_is_admin_gated() {
 
 #[tokio::test]
 async fn the_last_confirmation_promotes_to_ready_and_unblocks_routing() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-confirm-3";
@@ -507,7 +481,7 @@ async fn the_last_confirmation_promotes_to_ready_and_unblocks_routing() {
 
 #[tokio::test]
 async fn on_share_accepted_promotes_ready_to_active_only() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-share-4";
@@ -552,7 +526,7 @@ async fn on_share_accepted_promotes_ready_to_active_only() {
 
 #[tokio::test]
 async fn dissolve_blocked_during_active_cooldown() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-dissolve-5";
@@ -604,7 +578,7 @@ async fn dissolve_blocked_during_active_cooldown() {
 
 #[tokio::test]
 async fn dissolve_frees_every_address_for_the_next_party() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-dissolve-free";
@@ -673,7 +647,7 @@ async fn dissolve_frees_every_address_for_the_next_party() {
 
 #[tokio::test]
 async fn on_block_found_is_idempotent_on_duplicate_hash() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-blockfound-6";
@@ -743,7 +717,7 @@ async fn on_block_found_is_idempotent_on_duplicate_hash() {
 
 #[tokio::test]
 async fn name_collision_rejects_second_create() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-nameclash-7";
@@ -770,7 +744,7 @@ async fn name_collision_rejects_second_create() {
 
 #[tokio::test]
 async fn ready_transition_sizes_coinbase_reservation_to_roster() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-reservation-9";
@@ -827,7 +801,7 @@ async fn ready_transition_sizes_coinbase_reservation_to_roster() {
 /// must be frozen from Ready on. The same edit succeeds while confirming (negative control).
 #[tokio::test]
 async fn a_ready_party_refuses_every_roster_edit() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-ready-frozen";
@@ -888,7 +862,7 @@ async fn a_ready_party_refuses_every_roster_edit() {
 
 #[tokio::test]
 async fn update_splits_confirms_admin_and_resets_non_admin() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-splits-10";
@@ -969,7 +943,7 @@ async fn update_splits_confirms_admin_and_resets_non_admin() {
 /// splits and the member confirms them, it turns Ready.
 #[tokio::test]
 async fn a_party_turns_ready_only_with_complete_splits() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-splitsum-11";
@@ -1031,7 +1005,7 @@ async fn a_party_turns_ready_only_with_complete_splits() {
 /// because the member holds no split yet.
 #[tokio::test]
 async fn a_joined_member_without_a_split_keeps_the_party_confirming() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-splitmin-12";
@@ -1076,7 +1050,7 @@ async fn a_joined_member_without_a_split_keeps_the_party_confirming() {
 
 #[tokio::test]
 async fn update_rental_hint_sets_cleans_and_clears() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-rental-hint-1";

@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! Integration tests for the group-management write primitives, against the
@@ -23,33 +22,7 @@ use bp_db::{
     RoundResetConfigPatch,
 };
 use bp_group_mgmt::group::PayoutMode;
-use sqlx::{postgres::PgPoolOptions, PgPool};
 use uuid::Uuid;
-
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    }
-}
 
 fn addr(s: &str) -> AddressId {
     AddressId::new(s).expect("test address shape")
@@ -61,7 +34,7 @@ fn addr(s: &str) -> AddressId {
 /// the read instead of passing as PROP.
 #[tokio::test]
 async fn an_unknown_payout_mode_fails_the_read() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -106,7 +79,7 @@ async fn an_unknown_payout_mode_fails_the_read() {
 
 #[tokio::test]
 async fn insert_group_returns_row_with_defaults() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -157,7 +130,7 @@ async fn insert_group_returns_row_with_defaults() {
 
 #[tokio::test]
 async fn find_group_by_name_filters_dissolved() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -199,7 +172,7 @@ async fn find_group_by_name_filters_dissolved() {
 
 #[tokio::test]
 async fn list_active_groups_omits_dissolved() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -250,7 +223,7 @@ async fn list_active_groups_omits_dissolved() {
 
 #[tokio::test]
 async fn count_members_for_group() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -308,7 +281,7 @@ async fn count_members_for_group() {
 
 #[tokio::test]
 async fn transfer_creator_swaps_admin_token_and_creator_address() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -384,7 +357,7 @@ async fn transfer_creator_swaps_admin_token_and_creator_address() {
 
 #[tokio::test]
 async fn round_reset_config_patch_applies_per_field() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -485,7 +458,7 @@ async fn round_reset_config_patch_applies_per_field() {
 
 #[tokio::test]
 async fn dissolve_is_idempotent() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -532,7 +505,7 @@ async fn dissolve_is_idempotent() {
 
 #[tokio::test]
 async fn insert_member_and_delete_roundtrip() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -598,7 +571,7 @@ async fn invitation_status(pool: &sqlx::PgPool, token: &str) -> String {
 
 #[tokio::test]
 async fn invitation_status_update_by_token() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -655,7 +628,7 @@ async fn invitation_status_update_by_token() {
 
 #[tokio::test]
 async fn open_invite_revoke_replaces_atomically() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -709,7 +682,7 @@ async fn open_invite_revoke_replaces_atomically() {
 
 #[tokio::test]
 async fn expire_invitations_only_flips_past_due() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -760,7 +733,7 @@ async fn expire_invitations_only_flips_past_due() {
 
 #[tokio::test]
 async fn join_request_lifecycle() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -849,7 +822,7 @@ async fn join_request_lifecycle() {
 
 #[tokio::test]
 async fn expire_join_requests_flips_old_pending() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };

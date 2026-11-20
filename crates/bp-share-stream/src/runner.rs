@@ -225,18 +225,15 @@ impl StreamConsumerHandle {
 mod tests {
     //! Consume-loop tests against Redis (`BP_REDIS_URL`); each test uses its
     //! own logical DB and skips if Redis is unreachable.
-    #![allow(clippy::print_stderr)]
 
     use std::sync::Arc;
 
     use redis::aio::ConnectionManager;
-    use redis::Client;
+
     use tokio::sync::Mutex as AsyncMutex;
 
     use super::*;
     use crate::StreamProducer;
-
-    const DEFAULT_URL: &str = "redis://127.0.0.1:16379";
 
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     struct Evt {
@@ -256,31 +253,8 @@ mod tests {
     }
 
     async fn connect_or_skip(db: u8) -> Option<ConnectionManager> {
-        // This binary's own DB range, so other test binaries do not flush it.
-        let db =
-            bp_test_support::redis_db_in_range(bp_test_support::redis_db::SHARE_STREAM, db).await;
-        let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-        let client = Client::open(format!("{base}/{db}")).ok()?;
-        let mut conn = match tokio::time::timeout(
-            Duration::from_secs(2),
-            ConnectionManager::new_with_config(client, crate::connection_manager_config()),
-        )
-        .await
-        {
-            Ok(Ok(c)) => c,
-            _ => {
-                eprintln!("redis unreachable — skipping runner integration test");
-                return None;
-            }
-        };
-        if redis::cmd("FLUSHDB")
-            .query_async::<()>(&mut conn)
+        bp_test_support::connect_redis_in_range_or_skip(bp_test_support::redis_db::SHARE_STREAM, db)
             .await
-            .is_err()
-        {
-            return None;
-        }
-        Some(conn)
     }
 
     async fn wait_until_len(seen: &Arc<AsyncMutex<Vec<u32>>>, target: usize) -> bool {

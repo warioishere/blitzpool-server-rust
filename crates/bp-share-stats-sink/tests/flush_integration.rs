@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! `flush_once` against PG, one take → upsert → restore-on-failure tick at a time.
@@ -20,29 +19,6 @@ use tokio::sync::Mutex;
 const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 static FLUSH_TEST_LOCK: Mutex<()> = Mutex::const_new(());
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(4)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping integration test");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    }
-}
 
 fn fixture_slot() -> TimeSlot {
     // Year 3000-ish — far past any real fixture data.
@@ -83,7 +59,7 @@ fn addr(s: &str) -> AddressId {
 #[tokio::test]
 async fn flush_once_writes_all_six_tables_to_pg() {
     let _guard = FLUSH_TEST_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let slot = fixture_slot();
@@ -215,7 +191,7 @@ async fn flush_once_writes_all_six_tables_to_pg() {
 #[tokio::test]
 async fn flush_once_folds_best_difficulty_via_greatest() {
     let _guard = FLUSH_TEST_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let prefix = "test_flush_bd_";
@@ -279,7 +255,7 @@ async fn flush_once_folds_best_difficulty_via_greatest() {
 #[tokio::test]
 async fn replay_idempotency_double_flush_doubles_counts() {
     let _guard = FLUSH_TEST_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let slot = TimeSlot::from_millis(32_503_680_001_234);
@@ -316,7 +292,7 @@ async fn replay_idempotency_double_flush_doubles_counts() {
 #[tokio::test]
 async fn client_slots_reach_pg_once_ended_and_the_drain_writes_the_rest() {
     let _guard = FLUSH_TEST_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let ended = TimeSlot::from_millis(32_503_680_600_000);
@@ -380,7 +356,7 @@ async fn client_slots_reach_pg_once_ended_and_the_drain_writes_the_rest() {
 #[tokio::test]
 async fn a_failed_flush_hands_everything_back_for_the_next_one() {
     let _guard = FLUSH_TEST_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let slot = TimeSlot::from_millis(32_503_680_700_000);
@@ -460,7 +436,7 @@ async fn a_failed_flush_hands_everything_back_for_the_next_one() {
 #[tokio::test]
 async fn a_nul_byte_in_a_worker_name_does_not_block_the_flush() {
     let _guard = FLUSH_TEST_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let slot = TimeSlot::from_millis(32_503_680_800_000);

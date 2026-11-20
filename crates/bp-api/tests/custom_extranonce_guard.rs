@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
-
 //! Custom-extranonce endpoints against a real PG. The core applies overrides
 //! only on the Solo stream, so the API must reject non-Solo addresses instead
 //! of persisting an override the core would silently drop.
@@ -11,10 +9,8 @@ use std::sync::Arc;
 use axum::body::to_bytes;
 use axum::http::{Request, StatusCode};
 use bp_api::{build_router, AppState};
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::PgPool;
 use tower::ServiceExt;
-
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 // Two distinct valid mainnet bech32 addresses (BIP-173 test vectors).
 const GROUPED_ADDR: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
@@ -30,29 +26,6 @@ const DUP_ADDR: &str = "bc1qha7546x08qwudehuc724np522c2n65m4sseeae";
 const HEADER_ADDR: &str = "bc1qyr9dx2zjg7rdla2dwc20za975w2gxtr4q39arj";
 const CLIENT_VIEW_ADDR: &str = "bc1qcpmga8eqxzwz4nmnew6v6xkapggs3sqzpu4fp0";
 const NAMES_ADDR: &str = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh";
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping");
-            None
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            None
-        }
-    }
-}
 
 fn minimal_state(pool: PgPool) -> Arc<AppState> {
     Arc::new(AppState::new(pool, "0.0.0"))
@@ -141,7 +114,7 @@ async fn post_challenge(router: axum::Router, address: &str) -> (StatusCode, ser
 
 #[tokio::test]
 async fn challenge_rejects_group_member_and_allows_solo() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     cleanup(&pool).await;
@@ -192,7 +165,7 @@ async fn challenge_rejects_group_member_and_allows_solo() {
 /// override on the strength of the address alone.
 #[tokio::test]
 async fn set_rejects_without_valid_token() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     // Make sure no stale token/override for SOLO_ADDR lingers from a prior run.
@@ -272,7 +245,7 @@ async fn prefixes_of(pool: &PgPool, addr: &str) -> Vec<(String, i64)> {
 /// would collide on the intermediate state although the END state is valid.
 #[tokio::test]
 async fn set_batch_can_swap_two_workers_prefixes() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let _ = sqlx::query("DELETE FROM pplns_custom_extranonce WHERE address = $1")
@@ -328,7 +301,7 @@ async fn set_batch_can_swap_two_workers_prefixes() {
 /// matches the miner's channel.
 #[tokio::test]
 async fn set_stores_worker_names_as_the_core_resolves_them() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let _ = sqlx::query("DELETE FROM pplns_custom_extranonce WHERE address = $1")
@@ -367,7 +340,7 @@ async fn set_stores_worker_names_as_the_core_resolves_them() {
 /// clean rejection.
 #[tokio::test]
 async fn set_batch_is_all_or_nothing() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let _ = sqlx::query("DELETE FROM pplns_custom_extranonce WHERE address = $1")
@@ -400,7 +373,7 @@ async fn set_batch_is_all_or_nothing() {
 /// problem instead of surfacing as a database constraint.
 #[tokio::test]
 async fn set_batch_rejects_duplicate_prefix_within_the_request() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     seed_token(&pool, DUP_ADDR, "tok-dup").await;
@@ -423,7 +396,7 @@ async fn set_batch_rejects_duplicate_prefix_within_the_request() {
 /// honoured.
 #[tokio::test]
 async fn set_requires_the_bearer_header() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     seed_token(&pool, HEADER_ADDR, "tok-header").await;
@@ -446,7 +419,7 @@ async fn set_requires_the_bearer_header() {
 /// a worker without one (so a field filled unconditionally fails).
 #[tokio::test]
 async fn client_address_reports_the_custom_extranonce_per_worker() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let cleanup_rows = |pool: PgPool| async move {

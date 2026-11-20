@@ -528,25 +528,6 @@ mod tests {
 mod regtest {
     use super::*;
     use bp_regtest_harness::RegtestNode;
-    use sqlx::postgres::PgPoolOptions;
-
-    const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
-
-    async fn pg_or_skip() -> Option<PgPool> {
-        let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
-        match tokio::time::timeout(
-            Duration::from_secs(2),
-            PgPoolOptions::new().max_connections(2).connect(&url),
-        )
-        .await
-        {
-            Ok(Ok(p)) => Some(p),
-            _ => {
-                eprintln!("pg unreachable — skipping block-reconcile regtest");
-                None
-            }
-        }
-    }
 
     /// Remove any rows another suite (or an aborted run) left at this height.
     /// The test database is shared and regtest heights are small, so the test
@@ -590,7 +571,7 @@ mod regtest {
     /// booked has one and would otherwise look accounted for.
     #[tokio::test]
     async fn both_ways_a_pool_block_goes_unaccounted_for_are_reported() {
-        let Some(pg) = pg_or_skip().await else {
+        let Some(pg) = bp_test_support::connect_pg_or_skip().await else {
             return;
         };
         let node = match RegtestNode::start().await {

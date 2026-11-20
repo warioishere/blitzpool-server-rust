@@ -9,12 +9,9 @@
 use bp_common::AddressId;
 use bp_group_solo_engine::config::GroupSoloEngineConfig;
 use bp_group_solo_engine::engine::{FoundGroupBlock, GroupSoloEngine};
-use redis::{aio::ConnectionManager, Client};
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use redis::aio::ConnectionManager;
+use sqlx::PgPool;
 use uuid::Uuid;
-
-const REDIS_URL: &str = "redis://127.0.0.1:16379";
-const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 /// Pool-output recipient; the weight model needs one.
 const FEE_ADDR: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
@@ -39,54 +36,12 @@ struct Harness {
 }
 
 async fn spawn_or_skip(redis_db: u8, finder_bonus_ppm: Option<i32>) -> Option<Harness> {
-    let pg_url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
-    let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
-    let redis_db =
-        bp_test_support::redis_db_in_range(bp_test_support::redis_db::GS_ENGINE, redis_db).await;
-    let redis_url = format!("{redis_base}/{redis_db}");
-
-    let pool = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(4)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&pg_url),
+    let pool = bp_test_support::connect_pg_or_skip().await?;
+    let conn = bp_test_support::connect_redis_in_range_no_flush(
+        bp_test_support::redis_db::GS_ENGINE,
+        redis_db,
     )
-    .await
-    {
-        Ok(Ok(p)) => p,
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed: {e} — skipping");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    };
-    let client = match Client::open(redis_url.clone()) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Redis client failed: {e} — skipping");
-            return None;
-        }
-    };
-    let conn = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        bp_test_support::connection_manager(client),
-    )
-    .await
-    {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
-            eprintln!("Redis connect failed: {e} — skipping");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("redis connect timed out (>2s) — skipping integration test");
-            return None;
-        }
-    };
+    .await?;
     // No FLUSHDB: tests share DB indexes and are isolated by `group_id`, so a
     // flush would wipe state a sibling is still asserting on.
 
@@ -1073,7 +1028,7 @@ async fn reader_best_difficulty_after_shares() {
 // The Core (no background tasks) builds a group's distribution.
 #[tokio::test]
 async fn spawn_core_builds_distributions() {
-    let pool = match connect_pg_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -1120,52 +1075,10 @@ async fn spawn_core_builds_distributions() {
     cleanup_group(&pool, group_id).await;
 }
 
-async fn connect_pg_or_skip() -> Option<PgPool> {
-    let pg_url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(4)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&pg_url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        _ => {
-            eprintln!("PG connect failed/timed out — skipping");
-            None
-        }
-    }
-}
-
 /// Connect a flushed Redis logical DB, or `None` to skip.
 async fn connect_redis_or_skip(redis_db: u8) -> Option<ConnectionManager> {
-    let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
-    let redis_db =
-        bp_test_support::redis_db_in_range(bp_test_support::redis_db::GS_ENGINE, redis_db).await;
-    let client = Client::open(format!("{redis_base}/{redis_db}")).ok()?;
-    let mut conn = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        bp_test_support::connection_manager(client),
-    )
-    .await
-    {
-        Ok(Ok(c)) => c,
-        _ => {
-            eprintln!("redis connect failed/timed out — skipping");
-            return None;
-        }
-    };
-    if redis::cmd("FLUSHDB")
-        .query_async::<()>(&mut conn)
+    bp_test_support::connect_redis_in_range_or_skip(bp_test_support::redis_db::GS_ENGINE, redis_db)
         .await
-        .is_err()
-    {
-        eprintln!("FLUSHDB failed — skipping");
-        return None;
-    }
-    Some(conn)
 }
 
 async fn seed_group_with_daily_reset(pool: &PgPool, group_id: Uuid) {
@@ -1722,14 +1635,10 @@ async fn a_block_of_a_dissolved_group_writes_no_round_state() {
         )
         .await
         .expect("the history still books");
-    let redis_url = format!(
-        "{}/{}",
-        std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string()),
-        bp_test_support::redis_db_in_range(bp_test_support::redis_db::GS_ENGINE, 27).await
-    );
-    let mut conn = bp_test_support::connection_manager(Client::open(redis_url).unwrap())
-        .await
-        .unwrap();
+    let mut conn =
+        bp_test_support::connect_redis_in_range_no_flush(bp_test_support::redis_db::GS_ENGINE, 27)
+            .await
+            .expect("redis reachable: the harness connected");
     let settled: bool = redis::AsyncCommands::exists(
         &mut conn,
         bp_group_solo_engine::round::key_settled_blocks(&h.group_id.to_string()),

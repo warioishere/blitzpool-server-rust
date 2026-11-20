@@ -5,9 +5,7 @@
 //! handed to another channel of the same Solo coinbase, wasting its work. The
 //! core loads rows unchecked, so the rule must hold in the schema itself.
 
-use sqlx::{postgres::PgPoolOptions, PgPool};
-
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
+use sqlx::PgPool;
 
 /// First prefix above SV1's partition — `0x02000000`.
 const FIRST_UNRESERVED: i64 = 33_554_432;
@@ -15,29 +13,6 @@ const FIRST_UNRESERVED: i64 = 33_554_432;
 const TEST_ADDRESS: &str = "bcrt1qreservedrangetest";
 
 // Printing why an integration test skipped is what stderr is for here.
-#[allow(clippy::print_stderr)]
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping integration test");
-            None
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            None
-        }
-    }
-}
 
 async fn insert_prefix(pool: &PgPool, worker: &str, prefix: i64) -> Result<(), sqlx::Error> {
     sqlx::query("INSERT INTO pplns_custom_extranonce (address, worker, prefix) VALUES ($1, $2, $3)")
@@ -57,9 +32,8 @@ async fn cleanup(pool: &PgPool) {
 }
 
 #[tokio::test]
-#[allow(clippy::print_stderr)]
 async fn the_database_refuses_an_allocator_owned_prefix_and_accepts_the_rest() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     cleanup(&pool).await;

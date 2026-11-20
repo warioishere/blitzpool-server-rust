@@ -132,4 +132,8 @@ jobs:
       # tests share the one Postgres/Redis, so run serially. Regtests self-skip
       # (no bitcoin-node here).
       - name: cargo test
+        env:
+          # Both services run here, so an unreachable one fails the run
+          # instead of skipping its tests.
+          BP_REQUIRE_TEST_SERVICES: "1"
         run: cargo test --workspace --locked -- --test-threads=1

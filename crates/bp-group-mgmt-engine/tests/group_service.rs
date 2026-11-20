@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! Integration tests for `bp_group_mgmt_engine::GroupService` against the
@@ -16,36 +15,11 @@ use bp_group_mgmt::group::{PayoutMode, RoundResetPreset};
 use bp_group_mgmt_engine::{
     GroupService, GroupServiceError, GroupServiceHooks, UpdateRoundResetSettings,
 };
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::PgPool;
 use uuid::Uuid;
-
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 /// Coinbase ceiling high enough to stay out of tests not about it.
 const TEST_COINBASE_CAP: u64 = 10_000;
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(4)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    }
-}
 
 /// Captures + scripts hook invocations for tests.
 #[derive(Default, Debug)]
@@ -107,7 +81,7 @@ async fn cleanup_group(pool: &PgPool, group_id: Uuid) {
 
 #[tokio::test]
 async fn create_group_happy_path_returns_token_and_seeds_creator() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -132,7 +106,7 @@ async fn create_group_happy_path_returns_token_and_seeds_creator() {
 
 #[tokio::test]
 async fn create_group_defaults_to_prop_mode() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -155,7 +129,7 @@ async fn create_group_defaults_to_prop_mode() {
 
 #[tokio::test]
 async fn create_group_with_window_mode_persists_window() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -188,7 +162,7 @@ async fn create_group_with_window_mode_persists_window() {
 /// accepted creations cannot pass on a proof that was there all along.
 #[tokio::test]
 async fn create_group_requires_a_verified_creator() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -244,7 +218,7 @@ async fn create_group_requires_a_verified_creator() {
 
 #[tokio::test]
 async fn create_group_rejects_invalid_name() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -270,7 +244,7 @@ async fn create_group_rejects_invalid_name() {
 
 #[tokio::test]
 async fn create_group_rejects_duplicate_name() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -295,7 +269,7 @@ async fn create_group_rejects_duplicate_name() {
 
 #[tokio::test]
 async fn create_group_rejects_address_already_in_group() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -330,7 +304,7 @@ async fn routes(svc: &GroupService, address: &str) -> Option<Uuid> {
 
 #[tokio::test]
 async fn a_group_routes_its_members_from_creation_on() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -362,7 +336,7 @@ async fn a_group_routes_its_members_from_creation_on() {
 
 #[tokio::test]
 async fn add_member_rejects_address_in_other_group() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -402,7 +376,7 @@ async fn add_member_rejects_address_in_other_group() {
 
 #[tokio::test]
 async fn require_admin_token_rejects_invalid() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -442,7 +416,7 @@ async fn require_admin_token_rejects_invalid() {
 
 #[tokio::test]
 async fn remove_member_creator_rejected() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -469,7 +443,7 @@ async fn remove_member_creator_rejected() {
 
 #[tokio::test]
 async fn remove_member_inactivity_guard_then_kick_succeeds() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -521,7 +495,7 @@ async fn remove_member_inactivity_guard_then_kick_succeeds() {
 
 #[tokio::test]
 async fn the_creator_still_routes_after_the_last_member_is_removed() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -555,7 +529,7 @@ async fn the_creator_still_routes_after_the_last_member_is_removed() {
 
 #[tokio::test]
 async fn transfer_creator_rotates_role_and_token() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -618,7 +592,7 @@ async fn transfer_creator_rotates_role_and_token() {
 
 #[tokio::test]
 async fn transfer_creator_rejects_non_member() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -648,7 +622,7 @@ async fn transfer_creator_rejects_non_member() {
 
 #[tokio::test]
 async fn update_round_reset_config_persists_the_settings() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -702,7 +676,7 @@ impl bp_group_mgmt_engine::MembershipChangeNotifier for CountingNotifier {
 /// front builds the team's coinbase from these settings.
 #[tokio::test]
 async fn a_settings_change_without_a_tag_reaches_the_front() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -744,7 +718,7 @@ async fn a_settings_change_without_a_tag_reaches_the_front() {
 
 #[tokio::test]
 async fn update_round_reset_rejects_invalid_timezone() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -779,7 +753,7 @@ async fn update_round_reset_rejects_invalid_timezone() {
 
 #[tokio::test]
 async fn update_round_reset_rejects_a_bonus_past_the_ppm_cap() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -815,7 +789,7 @@ async fn update_round_reset_rejects_a_bonus_past_the_ppm_cap() {
 
 #[tokio::test]
 async fn dissolve_group_removes_members_and_marks_row() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -852,7 +826,7 @@ async fn dissolve_group_removes_members_and_marks_row() {
 
 #[tokio::test]
 async fn address_cache_reflects_membership_changes() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -898,7 +872,7 @@ async fn address_cache_reflects_membership_changes() {
 /// A corrupt member address is skipped without failing the cache rebuild.
 #[tokio::test]
 async fn address_cache_rebuild_skips_invalid_address_member() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -961,7 +935,7 @@ async fn address_cache_rebuild_skips_invalid_address_member() {
 /// `maxMembers = NULL` still stops at the coinbase ceiling.
 #[tokio::test]
 async fn null_max_members_still_stops_at_the_coinbase_ceiling() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -995,7 +969,7 @@ async fn null_max_members_still_stops_at_the_coinbase_ceiling() {
 /// A tighter operator `maxMembers` binds below the coinbase ceiling.
 #[tokio::test]
 async fn operator_max_members_still_binds_below_the_ceiling() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -1034,7 +1008,7 @@ async fn operator_max_members_still_binds_below_the_ceiling() {
 /// `maxMembers` one past the coinbase ceiling is refused, exactly at it accepted.
 #[tokio::test]
 async fn max_members_above_the_coinbase_ceiling_is_refused() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };

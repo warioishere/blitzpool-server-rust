@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
-
 //! With the address-token check on, the routes that act for one address
 //! answer 401 `{"error": "login required"}` unless the request carries that
 //! address's token from the UI sidecar, and reach their own checks with it.
@@ -19,8 +17,6 @@ use serde_json::{json, Value};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use tower::ServiceExt;
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
-
 const SECRET: &str = "test-secret-for-bp-api";
 const ADDRESS: &str = "bc1qtokenvectoraddress";
 const TOKEN: &str = "eyJhIjoiYmMxcXRva2VudmVjdG9yYWRkcmVzcyIsImUiOjQxMDI0NDQ4MDAwMDAsImkiOjQxMDE4NDAwMDAwMDB9.zau-gB8Tz65HFZ6IbRjbckZ11OAoahcjFUsbWd9729I";
@@ -31,29 +27,6 @@ const ACCOUNT_TOKEN: &str =
     "eyJhY2N0IjoiMDJhYmMiLCJlIjo0MTAyNDQ0ODAwMDAwfQ.9RvDIeR-pfWTnaK1-gQv_gQdL-5Ou7qotLbNk-KDzBM";
 const OTHER: &str = "bc1qsomeoneelseaddress";
 const SOME_ID: &str = "00000000-0000-0000-0000-000000000001";
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(4)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e}, skipping");
-            None
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out, skipping");
-            None
-        }
-    }
-}
 
 /// A pool that is never connected: a request refused before its handler
 /// touches the database answers without one.
@@ -246,7 +219,7 @@ async fn with_the_check_off_a_request_without_a_token_goes_through() {
 /// service is wired and email is off, so each answers that, not 401.
 #[tokio::test]
 async fn the_matching_token_reaches_the_handlers_own_checks() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let app = app(pool, required());
@@ -267,7 +240,7 @@ async fn the_matching_token_reaches_the_handlers_own_checks() {
 /// as well.
 #[tokio::test]
 async fn the_matching_token_passes_the_push_writes() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     for (auth, token) in [(required(), Some(TOKEN)), (AddressAuth::Off(None), None)] {
@@ -281,7 +254,7 @@ async fn the_matching_token_passes_the_push_writes() {
 
 #[tokio::test]
 async fn the_matching_token_runs_the_client_writes() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let app = app(pool, required());
@@ -299,7 +272,7 @@ async fn the_matching_token_runs_the_client_writes() {
 
 #[tokio::test]
 async fn a_base58_route_takes_the_lowercased_token() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let app = app(pool, required());

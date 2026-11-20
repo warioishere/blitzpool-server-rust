@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Workspace denies print_stderr; the skip-when-no-PG path is
-// test-tooling output, not production logging.
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! Integration tests for the PPLNS bulk-write primitives, against the local
@@ -13,36 +10,10 @@ use bp_db::{
     bulk_insert_pplns_payout_history, bulk_upsert_pplns_balances,
     bulk_upsert_pplns_last_accepted_share_at, BalanceUpsert, PayoutHistoryInsert, TouchUpdate,
 };
-use sqlx::{postgres::PgPoolOptions, PgPool};
-
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping integration test");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    }
-}
 
 #[tokio::test]
 async fn bulk_upsert_balances_inserts_then_updates_absolute() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -118,7 +89,7 @@ async fn bulk_upsert_balances_inserts_then_updates_absolute() {
 
 #[tokio::test]
 async fn bulk_upsert_balances_empty_is_noop() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -134,7 +105,7 @@ async fn bulk_upsert_balances_empty_is_noop() {
 /// share stamped); on an existing row an older stamp never lowers a newer one.
 #[tokio::test]
 async fn a_touch_creates_a_missing_row_and_never_lowers_its_stamp() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -210,7 +181,7 @@ async fn a_touch_creates_a_missing_row_and_never_lowers_its_stamp() {
 
 #[tokio::test]
 async fn bulk_insert_payout_history_idempotent_on_unique_collision() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -274,7 +245,7 @@ async fn bulk_insert_payout_history_idempotent_on_unique_collision() {
 async fn bulk_insert_payout_history_handles_negative_block_height_for_sweep() {
     // Dust-sweep audit rows use `blockHeight = -unix_seconds` so they never
     // collide with real blocks.
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -299,7 +270,7 @@ async fn bulk_insert_payout_history_handles_negative_block_height_for_sweep() {
 #[tokio::test]
 async fn apply_distribution_tx_atomicity_rollback_undoes_both_writes() {
     // A balance upsert and a history insert in one TX roll back together.
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };

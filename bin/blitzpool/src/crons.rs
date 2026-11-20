@@ -990,8 +990,7 @@ mod sweep_tests {
             return;
         };
         // A manager built through a proxy that dies right after connect.
-        let base =
-            std::env::var("BP_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:16379".to_string());
+        let base = bp_test_support::redis_url();
         let upstream = base
             .trim_start_matches("redis://")
             .split('/')

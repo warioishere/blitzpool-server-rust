@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
-
 //! `/api/pplns/mode/:address` is cached, and a Team or Blockparty change
 //! that moves an address drops that cache, so the next read shows the new
 //! mode rather than the cached one.
@@ -15,33 +13,7 @@ use bp_api::{build_router, AppState, ModeCacheNotifier};
 use bp_blockparty_engine::{BlockpartyPayoutConfig, BlockpartyPayouts, BlockpartyService};
 use bp_group_mgmt_engine::{AddressCache, GroupService, MembershipChangeNotifier, NoopHooks};
 use serde_json::Value;
-use sqlx::{postgres::PgPoolOptions, PgPool};
 use tower::ServiceExt;
-
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(4)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e}, skipping");
-            None
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out, skipping");
-            None
-        }
-    }
-}
 
 /// Stands in for the stream publisher the api chains after the mode cache.
 struct NoopNotifier;
@@ -72,7 +44,7 @@ async fn mode(app: &axum::Router, address: &str) -> String {
 
 #[tokio::test]
 async fn dissolving_a_team_drops_its_members_cached_mode() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-team-mode-cache";
@@ -124,7 +96,7 @@ async fn dissolving_a_team_drops_its_members_cached_mode() {
 
 #[tokio::test]
 async fn dissolving_a_blockparty_drops_its_admins_cached_mode() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let name = "bp-test-party-mode-cache";

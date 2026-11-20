@@ -12,11 +12,8 @@ use bp_pplns_engine::config::PplnsEngineConfig;
 use bp_pplns_engine::engine::PplnsEngine;
 use bp_pplns_engine::window::snapshot::{resolve_snapshot_for_block_found, StoredWeightSnapshot};
 use bp_pplns_engine::window::NetworkDifficulty;
-use redis::{aio::ConnectionManager, Client};
-use sqlx::{postgres::PgPoolOptions, PgPool};
-
-const REDIS_URL: &str = "redis://127.0.0.1:16379";
-const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
+use redis::aio::ConnectionManager;
+use sqlx::PgPool;
 
 /// Serializes tests that leave open balances on valid addresses:
 /// `build_distribution` reads every open balance in the table, so they would
@@ -37,61 +34,13 @@ struct EngineHarness {
 /// Connect PG + a flushed Redis logical DB, or `None` to skip when the
 /// services are unavailable.
 async fn connect_or_skip(redis_db: u8, prefix: &str) -> Option<(ConnectionManager, PgPool)> {
-    let pg_url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
-    let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
-    // This binary's own DB range, so binaries do not flush each other's.
-    let redis_db =
-        bp_test_support::redis_db_in_range(bp_test_support::redis_db::PPLNS_ENGINE, redis_db).await;
-    let redis_url = format!("{redis_base}/{redis_db}");
-
-    let pool = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(4)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&pg_url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => p,
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed: {e} — skipping");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    };
+    let pool = bp_test_support::connect_pg_or_skip().await?;
     cleanup(&pool, prefix).await;
-
-    let client = match Client::open(redis_url.clone()) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Redis client failed: {e} — skipping");
-            return None;
-        }
-    };
-    let mut conn = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        bp_test_support::connection_manager(client),
+    let conn = bp_test_support::connect_redis_in_range_or_skip(
+        bp_test_support::redis_db::PPLNS_ENGINE,
+        redis_db,
     )
-    .await
-    {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
-            eprintln!("Redis connect failed: {e} — skipping");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("redis connect timed out (>2s) — skipping integration test");
-            return None;
-        }
-    };
-    if let Err(e) = redis::cmd("FLUSHDB").query_async::<()>(&mut conn).await {
-        eprintln!("FLUSHDB failed: {e} — skipping");
-        return None;
-    }
+    .await?;
     Some((conn, pool))
 }
 

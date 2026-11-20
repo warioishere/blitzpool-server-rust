@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
-
 //! A Blockparty join link comes back as the shareable URL on the configured
 //! pool UI, from creating it and from reading the active one, the same way a
 //! Group-Solo open-invite link does.
@@ -13,35 +11,11 @@ use bp_api::{build_router, AppState};
 use bp_blockparty_engine::{BlockpartyPayoutConfig, BlockpartyPayouts, BlockpartyService};
 use bp_common::Sats;
 use bp_group_mgmt_engine::AddressCache as PplnsAddressCache;
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::PgPool;
 use tower::ServiceExt;
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 const NAME: &str = "join-link-url-test";
 const ADMIN: &str = "bc1qjoinlinkurltestadmin";
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(4)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping");
-            None
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            None
-        }
-    }
-}
 
 async fn cleanup(pool: &PgPool) {
     let _ = sqlx::query("DELETE FROM blockparty_group WHERE name = $1")
@@ -75,7 +49,7 @@ async fn call(app: &axum::Router, method: &str, uri: &str, token: &str) -> serde
 
 #[tokio::test]
 async fn the_join_link_is_the_url_on_the_pool_ui() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     cleanup(&pool).await;

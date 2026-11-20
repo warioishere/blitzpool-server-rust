@@ -96,18 +96,16 @@ pub(crate) fn spawn(
 mod tests {
     use bp_test_support::{connect_redis_in_range_or_skip, redis_db};
     use std::sync::Arc;
-    use std::time::Duration;
 
     use bp_notifications::command::ChatLanguages;
     use bp_notifications::dispatcher::NotificationDispatcher;
     use bp_share_stream::{Consumed, StreamConsumer, StreamProducer, BLOCK_FOUND_STREAM_KEY};
-    use sqlx::postgres::PgPoolOptions;
+
     use sqlx::PgPool;
 
     use super::*;
     use crate::block_sink::{BlockFoundApplier, BlockFoundEvent, Booking, FoundMode};
 
-    const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
     const ADDR: &str = "bcrt1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l";
 
     fn solo_event() -> BlockFoundEvent {
@@ -141,16 +139,6 @@ mod tests {
         ledger.notify_block_found(&solo_event()).await;
     }
 
-    async fn connect_pg_or_skip() -> Option<PgPool> {
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            PgPoolOptions::new().max_connections(2).connect(PG_URL),
-        )
-        .await
-        .ok()?
-        .ok()
-    }
-
     fn no_adapter_dispatcher(pool: PgPool) -> Arc<NotificationDispatcher> {
         let chat = ChatLanguages::new(pool.clone());
         Arc::new(NotificationDispatcher::new(
@@ -179,7 +167,7 @@ mod tests {
             eprintln!("redis unreachable — skipping block-found dual-group test");
             return;
         };
-        let Some(pg) = connect_pg_or_skip().await else {
+        let Some(pg) = bp_test_support::connect_pg_or_skip().await else {
             eprintln!("pg unreachable — skipping block-found dual-group test");
             return;
         };

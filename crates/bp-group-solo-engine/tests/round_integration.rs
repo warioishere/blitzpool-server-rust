@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! Integration tests for `bp-group-solo-engine::round` against Redis; each
@@ -12,53 +11,11 @@ use bp_group_solo_engine::round::{
     key_settled_blocks, key_shares_since_block, key_window_buckets, key_window_by_address,
     GroupRoundStore, WindowLane, WINDOW_BUCKET_MS,
 };
-use redis::{aio::ConnectionManager, AsyncCommands, Client};
-
-const DEFAULT_URL: &str = "redis://127.0.0.1:16379";
+use redis::{aio::ConnectionManager, AsyncCommands};
 
 async fn connect_or_skip(test_db: u8) -> Option<ConnectionManager> {
-    let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    // Fold this binary's local number into its own DB range (see
-    // `bp_test_support::redis_db`) so binaries do not FLUSHDB each other.
-    let test_db =
-        bp_test_support::redis_db_in_range(bp_test_support::redis_db::GS_ROUND, test_db).await;
-    let url = format!("{base}/{test_db}");
-    let client = match Client::open(url.clone()) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("redis client open failed for {url}: {e} — skipping");
-            return None;
-        }
-    };
-    let mut conn = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        bp_test_support::connection_manager(client),
-    )
-    .await
-    {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
-            eprintln!("redis connect failed for {url}: {e} — skipping");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("redis connect timed out (>2s) — skipping integration test");
-            return None;
-        }
-    };
-    if redis::cmd("PING")
-        .query_async::<String>(&mut conn)
+    bp_test_support::connect_redis_in_range_or_skip(bp_test_support::redis_db::GS_ROUND, test_db)
         .await
-        .is_err()
-    {
-        eprintln!("redis PING failed — skipping");
-        return None;
-    }
-    if let Err(e) = redis::cmd("FLUSHDB").query_async::<()>(&mut conn).await {
-        eprintln!("FLUSHDB failed: {e} — skipping");
-        return None;
-    }
-    Some(conn)
 }
 
 // ── Test 1 — record_share writes the aggregate keys atomically ─────

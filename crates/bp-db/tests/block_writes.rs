@@ -1,38 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
-
 //! Integration tests for found-block persistence and for
 //! `payout_recorded_at_height`.
 
 use bp_common::MiningMode;
 use bp_db::{find_found_blocks, found_block_at_height, insert_found_block, FoundBlockInsert};
-use sqlx::{postgres::PgPoolOptions, PgPool};
-
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping integration test");
-            None
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            None
-        }
-    }
-}
+use sqlx::PgPool;
 
 async fn cleanup(pool: &PgPool, miner_address: &str) {
     sqlx::query(r#"DELETE FROM blocks_entity WHERE "minerAddress" = $1"#)
@@ -44,7 +17,7 @@ async fn cleanup(pool: &PgPool, miner_address: &str) {
 
 #[tokio::test]
 async fn insert_persists_all_columns() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     const ADDR: &str = "bc1qblockwritetest0001";
@@ -91,7 +64,7 @@ async fn insert_persists_all_columns() {
 
 #[tokio::test]
 async fn insert_multiple_rows_same_height() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     const ADDR: &str = "bc1qblockwritetest0002";
@@ -161,7 +134,7 @@ async fn drop_history(pool: &PgPool, heights: &[i32]) {
 /// still reports it.
 #[tokio::test]
 async fn zero_sat_rows_alone_do_not_count_as_a_recorded_payout() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     drop_history(&pool, &[H_ZERO_ROWS_ONLY, H_REAL_PAYOUT]).await;

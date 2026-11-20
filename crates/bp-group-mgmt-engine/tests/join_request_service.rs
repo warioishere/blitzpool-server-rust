@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! Integration tests for `bp_group_mgmt_engine::JoinRequestService`.
@@ -14,36 +13,11 @@ use bp_group_mgmt_engine::{
     JoinDecisionOutcome, JoinRequestLimits, JoinRequestService, JoinRequestServiceConfig,
     JoinRequestServiceError, NoopHooks, UpdateRoundResetSettings,
 };
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::PgPool;
 use uuid::Uuid;
-
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 /// Coinbase ceiling high enough to stay out of the way here.
 const TEST_COINBASE_CAP: u64 = 10_000;
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(4)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    }
-}
 
 async fn cleanup_group(pool: &PgPool, group_id: Uuid) {
     let _ = sqlx::query("DELETE FROM pplns_group_join_request WHERE \"groupId\" = $1")
@@ -129,7 +103,7 @@ async fn create_public_group(
 
 #[tokio::test]
 async fn create_join_request_happy_path() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -160,7 +134,7 @@ async fn create_join_request_happy_path() {
 /// nobody.
 #[tokio::test]
 async fn a_stored_join_request_notifies_the_current_admin() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -227,7 +201,7 @@ async fn a_stored_join_request_notifies_the_current_admin() {
 
 #[tokio::test]
 async fn create_join_request_rejects_private_group_as_not_found() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -252,7 +226,7 @@ async fn create_join_request_rejects_private_group_as_not_found() {
 
 #[tokio::test]
 async fn create_join_request_rejects_unverified_email() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -270,7 +244,7 @@ async fn create_join_request_rejects_unverified_email() {
 
 #[tokio::test]
 async fn create_join_request_dup_pending_surfaces_clean_error() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -295,7 +269,7 @@ async fn create_join_request_dup_pending_surfaces_clean_error() {
 
 #[tokio::test]
 async fn approve_request_adds_member_and_sends_email() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -328,7 +302,7 @@ async fn approve_request_adds_member_and_sends_email() {
 
 #[tokio::test]
 async fn reject_request_marks_row_and_sends_email() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -357,7 +331,7 @@ async fn reject_request_marks_row_and_sends_email() {
 
 #[tokio::test]
 async fn list_for_group_filters_by_decided() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -391,7 +365,7 @@ async fn list_for_group_filters_by_decided() {
 
 #[tokio::test]
 async fn expire_join_requests_once_flips_stale_pending() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };

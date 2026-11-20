@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! Who follows a Team's best.
@@ -12,10 +11,9 @@ use bp_db::{
     update_ntfy_sub_team_best_flag, update_pplns_group_dissolved,
     update_telegram_sub_team_best_flag, upsert_ntfy_subscription, upsert_telegram_subscription,
 };
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::PgPool;
 use uuid::Uuid;
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 const NAME_PREFIX: &str = "bp-test-teambest-";
 /// Chats: both members of the Team, one member with the switch off, an
 /// address in no Team, a member of the Team that is dissolved.
@@ -27,29 +25,6 @@ const MEMBER_A: &str = "bc1q_teambest_member_a";
 const MEMBER_B: &str = "bc1q_teambest_member_b";
 const OUTSIDER: &str = "bc1q_teambest_outsider";
 const DISSOLVED_MEMBER: &str = "bc1q_teambest_dissolved";
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping integration test");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    }
-}
 
 async fn cleanup(pool: &PgPool) {
     let addresses = vec![MEMBER_A, MEMBER_B, OUTSIDER, DISSOLVED_MEMBER];
@@ -132,7 +107,7 @@ async fn ntfy_recipients(pool: &PgPool, groups: &[Uuid]) -> Vec<(Uuid, String)> 
 
 #[tokio::test]
 async fn a_teams_round_best_goes_to_each_following_chat_and_topic_once() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     cleanup(&pool).await;

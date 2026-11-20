@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! Ledger tests against Postgres (`BP_PG_URL`); they skip when it is
@@ -12,7 +11,7 @@ use bp_pplns_engine::ledger::{
     apply_distribution, pending_row, touch_buffer::flush_once, touch_buffer::TouchBuffer,
     ApplyDistributionResult, AuditRow, BalanceWrite, PayoutRowType,
 };
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::PgPool;
 
 /// `apply_distribution` takes the caller's transaction because the balance
 /// read it settles against must be locked in the same one.
@@ -31,31 +30,6 @@ async fn apply_in_tx(
     out
 }
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping integration test");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    }
-}
-
 async fn cleanup(pool: &PgPool, address_prefix: &str, block_heights: &[i32]) {
     let like_pattern = format!("{address_prefix}%");
     let _ = sqlx::query("DELETE FROM pplns_payout_history WHERE \"blockHeight\" = ANY($1)")
@@ -72,7 +46,7 @@ async fn cleanup(pool: &PgPool, address_prefix: &str, block_heights: &[i32]) {
 
 #[tokio::test]
 async fn apply_distribution_writes_history_and_balance() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -142,7 +116,7 @@ async fn apply_distribution_writes_history_and_balance() {
 
 #[tokio::test]
 async fn apply_distribution_replay_idempotent() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -202,7 +176,7 @@ async fn apply_distribution_replay_idempotent() {
 
 #[tokio::test]
 async fn apply_distribution_mixed_row_types() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -285,7 +259,7 @@ async fn apply_distribution_mixed_row_types() {
 
 #[tokio::test]
 async fn coinbase_audit_row_roundtrips_via_apply_distribution() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -335,7 +309,7 @@ async fn coinbase_audit_row_roundtrips_via_apply_distribution() {
 
 #[tokio::test]
 async fn touch_buffer_flush_once_stamps_every_marked_address() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -383,7 +357,7 @@ async fn touch_buffer_flush_once_stamps_every_marked_address() {
 
 #[tokio::test]
 async fn touch_buffer_flush_once_empty_returns_zero() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -398,7 +372,7 @@ async fn touch_buffer_flush_once_empty_returns_zero() {
 
 #[tokio::test]
 async fn the_settlement_read_locks_the_rows_it_will_write() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let address = "test_ledger_locked_addr";

@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! Integration tests for the bulk-write primitives in `stats_writes.rs`;
@@ -14,32 +13,7 @@ use bp_db::{
     AddressSettingsUpsert, ClientStatsUpsert, PoolModeHashrateUpsert, PoolRejectedStatsUpsert,
     PoolShareStatsUpsert, WorkerSharesUpsert,
 };
-use sqlx::{postgres::PgPoolOptions, PgPool, Row};
-
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping integration test");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    }
-}
+use sqlx::Row;
 
 /// A slot end far from real or fixture data (year 3000), offset per test so
 /// parallel tests do not collide.
@@ -51,7 +25,7 @@ fn unique_slot(seed: i64) -> i64 {
 
 #[tokio::test]
 async fn pool_share_stats_insert_then_increment() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -98,7 +72,7 @@ async fn pool_share_stats_insert_then_increment() {
 
 #[tokio::test]
 async fn pool_share_stats_empty_is_noop() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -113,7 +87,7 @@ async fn pool_share_stats_empty_is_noop() {
 
 #[tokio::test]
 async fn pool_mode_hashrate_composite_key_increment() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -174,7 +148,7 @@ async fn pool_mode_hashrate_composite_key_increment() {
 
 #[tokio::test]
 async fn pool_rejected_stats_composite_key_increment() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -225,7 +199,7 @@ async fn pool_rejected_stats_composite_key_increment() {
 
 #[tokio::test]
 async fn client_stats_insert_then_increment_every_field() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -321,7 +295,7 @@ async fn client_stats_insert_then_increment_every_field() {
 /// same slot.
 #[tokio::test]
 async fn max_difficulty_for_addresses_is_the_members_maximum_per_slot() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -373,7 +347,7 @@ async fn max_difficulty_for_addresses_is_the_members_maximum_per_slot() {
 
 #[tokio::test]
 async fn client_stats_distinct_keys_stay_independent() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -441,7 +415,7 @@ fn bd(address: &str, best: f64, ua: Option<&str>) -> AddressSettingsUpsert {
 
 #[tokio::test]
 async fn address_settings_shares_increment_and_create_missing_rows() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -509,7 +483,7 @@ async fn address_settings_shares_increment_and_create_missing_rows() {
 /// `"updatedAt"` moves only when the best grows.
 #[tokio::test]
 async fn address_settings_upsert_folds_shares_and_best_in_one_write() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -611,7 +585,7 @@ async fn read_all_time(
 /// both directions are asserted so a no-op reset cannot pass.
 #[tokio::test]
 async fn a_reset_zeroes_the_personal_best_and_leaves_the_public_record() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -695,7 +669,7 @@ async fn read_row(
 
 #[tokio::test]
 async fn best_difficulty_upsert_inserts_then_climbs_via_greatest() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -735,7 +709,7 @@ async fn best_difficulty_upsert_inserts_then_climbs_via_greatest() {
 /// lower than the old high.
 #[tokio::test]
 async fn best_difficulty_recovers_after_a_reset() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -774,7 +748,7 @@ async fn best_difficulty_recovers_after_a_reset() {
 
 #[tokio::test]
 async fn best_difficulty_upsert_empty_slice_is_noop() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -789,7 +763,7 @@ async fn best_difficulty_upsert_empty_slice_is_noop() {
 
 #[tokio::test]
 async fn worker_shares_composite_pk_upsert_increments() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -827,7 +801,7 @@ async fn worker_shares_composite_pk_upsert_increments() {
 /// The retention delete removes rows strictly older than the cutoff.
 #[tokio::test]
 async fn pool_rejected_retention_keeps_the_cutoff_slot() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");

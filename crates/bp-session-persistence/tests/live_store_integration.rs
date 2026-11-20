@@ -23,29 +23,6 @@ use sqlx::{postgres::PgPoolOptions, PgPool};
 
 const DEFAULT_PG_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
-async fn pg_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_PG_URL.to_string());
-    match tokio::time::timeout(
-        Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(4)
-            .acquire_timeout(Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping integration test");
-            None
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            None
-        }
-    }
-}
-
 async fn cleanup(pool: &PgPool, prefix: &str) {
     for sql in [
         r#"DELETE FROM client_entity WHERE address LIKE $1"#,
@@ -118,7 +95,7 @@ async fn ttl(conn: &mut ConnectionManager, key: &str) -> i64 {
 /// with a TTL (none = immortal under `volatile-lru`).
 #[tokio::test]
 async fn touch_flush_dual_writes_hash_and_ttl() {
-    let Some(pool) = pg_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let Some(mut redis) = connect_redis_in_range_or_skip(redis_db::SESSION_PERSISTENCE, 0).await
@@ -176,7 +153,7 @@ async fn touch_flush_dual_writes_hash_and_ttl() {
 /// `updated_at_ms` is the front's accept time, not this process's consume time.
 #[tokio::test]
 async fn a_late_consumed_share_keeps_its_acceptance_time() {
-    let Some(pool) = pg_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let Some(mut redis) = connect_redis_in_range_or_skip(redis_db::SESSION_PERSISTENCE, 9).await
@@ -216,7 +193,7 @@ async fn a_late_consumed_share_keeps_its_acceptance_time() {
 /// share then sets the best afresh.
 #[tokio::test]
 async fn a_reset_zeroes_one_addresss_session_bests() {
-    let Some(pool) = pg_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let Some(redis) = connect_redis_in_range_or_skip(redis_db::SESSION_PERSISTENCE, 7).await else {
@@ -281,7 +258,7 @@ async fn a_reset_zeroes_one_addresss_session_bests() {
 /// A lower later flush never lowers the row's best.
 #[tokio::test]
 async fn best_difficulty_is_monotone_across_flushes() {
-    let Some(pool) = pg_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let Some(mut redis) = connect_redis_in_range_or_skip(redis_db::SESSION_PERSISTENCE, 1).await
@@ -330,7 +307,7 @@ async fn best_difficulty_is_monotone_across_flushes() {
 /// A paused miner's live key expires; its session keeps the best.
 #[tokio::test]
 async fn a_session_keeps_its_best_when_its_live_key_expires() {
-    let Some(pool) = pg_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let Some(mut redis) = connect_redis_in_range_or_skip(redis_db::SESSION_PERSISTENCE, 10).await
@@ -384,7 +361,7 @@ async fn a_session_keeps_its_best_when_its_live_key_expires() {
 /// The touch writes vardiff's rate, and vardiff's 0 keeps the stored one.
 #[tokio::test]
 async fn touch_writes_vardiffs_rate_and_a_zero_keeps_it() {
-    let Some(pool) = pg_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let Some(mut redis) = connect_redis_in_range_or_skip(redis_db::SESSION_PERSISTENCE, 2).await
@@ -440,13 +417,12 @@ async fn touch_writes_vardiffs_rate_and_a_zero_keeps_it() {
 /// A killed TCP proxy fakes the outage, since a `ConnectionManager` needs one connect.
 #[tokio::test]
 async fn redis_down_does_not_hang_the_flush() {
-    let Some(pool) = pg_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     // Resolve the real test-Redis address (for the proxy's upstream) and
     // this test's folded DB index.
-    let base_url =
-        std::env::var("BP_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:16379".to_string());
+    let base_url = bp_test_support::redis_url();
     let upstream = base_url
         .trim_start_matches("redis://")
         .split('/')
@@ -536,7 +512,7 @@ async fn redis_down_does_not_hang_the_flush() {
 /// `bp_client_live`'s scans find and sum what the engine wrote (per address and pool-wide).
 #[tokio::test]
 async fn live_reader_agrees_with_the_writer() {
-    let Some(pool) = pg_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let Some(mut redis) = connect_redis_in_range_or_skip(redis_db::SESSION_PERSISTENCE, 5).await
@@ -623,7 +599,7 @@ async fn live_reader_agrees_with_the_writer() {
 /// `live_fields_for_sessions` returns what was written, `None` in place when unflushed.
 #[tokio::test]
 async fn composed_reader_returns_the_writers_fields_in_position() {
-    let Some(pool) = pg_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let Some(redis) = connect_redis_in_range_or_skip(redis_db::SESSION_PERSISTENCE, 6).await else {
@@ -709,7 +685,7 @@ async fn a_failed_best_write_still_refreshes_the_live_hash() {
 /// rejects, does not hold back the other sessions' bests.
 #[tokio::test]
 async fn a_nul_byte_in_one_worker_name_does_not_block_the_other_bests() {
-    let Some(pool) = pg_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let Some(redis) = connect_redis_in_range_or_skip(redis_db::SESSION_PERSISTENCE, 11).await

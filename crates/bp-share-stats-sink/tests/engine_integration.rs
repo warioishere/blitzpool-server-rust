@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! End-to-end `ShareStatsEngine` tests: data pushed through the shared
@@ -12,35 +11,10 @@ use bp_common::AddressId;
 use bp_share_stats_sink::config::StatsSinkConfig;
 use bp_share_stats_sink::engine::ShareStatsEngine;
 use bp_stats::{ClientStatisticsKey, ClientStatisticsRecord, RejectedReason, TimeSlot};
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::PgPool;
 use tokio::sync::Mutex;
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
-
 static ENGINE_TEST_LOCK: Mutex<()> = Mutex::const_new(());
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(4)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping integration test");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    }
-}
 
 fn addr(s: &str) -> AddressId {
     AddressId::new(s.to_string()).unwrap()
@@ -91,7 +65,7 @@ async fn poll_accepted(pool: &PgPool, slot_ms: i64, timeout: Duration) -> Option
 #[tokio::test]
 async fn engine_spawn_tick_flushes_to_pg_then_shutdown_drains() {
     let _guard = ENGINE_TEST_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let slot = TimeSlot::from_millis(32_503_680_010_001);
@@ -157,7 +131,7 @@ async fn engine_spawn_tick_flushes_to_pg_then_shutdown_drains() {
 async fn engine_handle_shutdown_is_idempotent_against_dropped_handle() {
     // Dropping the handle without an explicit shutdown must not panic.
     let _guard = ENGINE_TEST_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     {

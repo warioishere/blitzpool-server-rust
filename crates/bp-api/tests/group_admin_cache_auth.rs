@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
-
 //! A Group-Solo admin read must check the token before its response cache.
 //! The cache key only says "admin", and a check inside the cached
 //! computation runs on a miss only, so a warmed entry must still refuse a
@@ -15,34 +13,9 @@ use bp_group_mgmt_engine::{
     GroupService, InvitationService, JoinRequestLimits, JoinRequestService,
     JoinRequestServiceConfig, NoopEmailHooks, NoopHooks, OpenInviteTtl,
 };
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
-
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(4)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping");
-            None
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            None
-        }
-    }
-}
 
 async fn cleanup(pool: &PgPool, group_id: Uuid) {
     for table in [
@@ -79,7 +52,7 @@ async fn get(app: &axum::Router, uri: &str, token: &str) -> StatusCode {
 /// Warm the admin entry of `path` (under `/api/pplns/groups/:id/`) with the
 /// real token, then ask again with a wrong one.
 async fn wrong_token_after_warm_admin(name: &str, path: &str) -> Option<(StatusCode, StatusCode)> {
-    let pool = connect_or_skip().await?;
+    let pool = bp_test_support::connect_pg_or_skip().await?;
     // A run that failed half-way leaves its group behind; the FKs cascade.
     let _ = sqlx::query("DELETE FROM pplns_group WHERE name = $1")
         .bind(name)

@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! Integration tests for `DistributionBuilder` against docker Redis + PG; each
@@ -14,12 +13,8 @@ use bp_group_solo_engine::distribution::{
     DistributionBuilder, DistributionConfig, DistributionError,
 };
 use bp_group_solo_engine::round::GroupRoundStore;
-use redis::Client;
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::PgPool;
 use uuid::Uuid;
-
-const REDIS_URL: &str = "redis://127.0.0.1:16379";
-const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 /// Pool-output recipient, distinct from every miner address used here.
 const FEE_ADDR: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
@@ -36,60 +31,12 @@ struct Harness {
 }
 
 async fn spawn_or_skip(redis_db: u8, finder_bonus_ppm: Option<i32>) -> Option<Harness> {
-    let pg_url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
-    let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
-    // Own DB range per binary, so binaries do not FLUSHDB each other.
-    let redis_db =
-        bp_test_support::redis_db_in_range(bp_test_support::redis_db::GS_DISTRIBUTION, redis_db)
-            .await;
-    let redis_url = format!("{redis_base}/{redis_db}");
-
-    let pool = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(4)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&pg_url),
+    let pool = bp_test_support::connect_pg_or_skip().await?;
+    let conn = bp_test_support::connect_redis_in_range_or_skip(
+        bp_test_support::redis_db::GS_DISTRIBUTION,
+        redis_db,
     )
-    .await
-    {
-        Ok(Ok(p)) => p,
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed: {e} — skipping");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    };
-    let client = match Client::open(redis_url.clone()) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Redis client failed: {e} — skipping");
-            return None;
-        }
-    };
-    let mut conn = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        bp_test_support::connection_manager(client),
-    )
-    .await
-    {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
-            eprintln!("Redis connect failed: {e} — skipping");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("redis connect timed out (>2s) — skipping integration test");
-            return None;
-        }
-    };
-    if let Err(e) = redis::cmd("FLUSHDB").query_async::<()>(&mut conn).await {
-        eprintln!("FLUSHDB failed: {e} — skipping");
-        return None;
-    }
+    .await?;
 
     let group_id = Uuid::new_v4();
     seed_group(&pool, group_id, finder_bonus_ppm).await;
@@ -191,31 +138,17 @@ async fn build_with_shares_returns_payouts_and_writes_snapshot() {
 
 #[tokio::test]
 async fn build_for_nonexistent_group_returns_group_not_found() {
-    let pg_url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
-    let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
-    let pool = match PgPoolOptions::new()
-        .max_connections(2)
-        .acquire_timeout(std::time::Duration::from_secs(2))
-        .connect(&pg_url)
-        .await
-    {
-        Ok(p) => p,
-        Err(_) => return,
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+        return;
     };
-    let client = match Client::open(format!("{redis_base}/1")) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let mut conn = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        bp_test_support::connection_manager(client),
+    let Some(conn) = bp_test_support::connect_redis_in_range_or_skip(
+        bp_test_support::redis_db::GS_DISTRIBUTION,
+        1,
     )
     .await
-    {
-        Ok(Ok(c)) => c,
-        _ => return,
+    else {
+        return;
     };
-    let _ = redis::cmd("FLUSHDB").query_async::<()>(&mut conn).await;
 
     let round = GroupRoundStore::new(conn);
     let cfg = DistributionConfig::from_engine_config(&GroupSoloEngineConfig::new(

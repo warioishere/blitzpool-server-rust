@@ -23,9 +23,6 @@ const FEE_ADDR: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
 use redis::{aio::ConnectionManager, Client};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
-const REDIS_URL: &str = "redis://127.0.0.1:16379";
-const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
-
 struct Harness {
     pool: PgPool,
     builder: DistributionBuilder,
@@ -33,60 +30,12 @@ struct Harness {
 }
 
 async fn connect_or_skip(redis_db: u8, address_prefix: &str) -> Option<Harness> {
-    let pg_url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
-    let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
-    let redis_db =
-        bp_test_support::redis_db_in_range(bp_test_support::redis_db::PPLNS_DISTRIBUTION, redis_db)
-            .await;
-    let redis_url = format!("{redis_base}/{redis_db}");
-
-    let pool = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(4)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&pg_url),
+    let pool = bp_test_support::connect_pg_or_skip().await?;
+    let conn = bp_test_support::connect_redis_in_range_or_skip(
+        bp_test_support::redis_db::PPLNS_DISTRIBUTION,
+        redis_db,
     )
-    .await
-    {
-        Ok(Ok(p)) => p,
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {pg_url}: {e} — skipping");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    };
-
-    let client = match Client::open(redis_url.clone()) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Redis client failed for {redis_url}: {e} — skipping");
-            return None;
-        }
-    };
-    let mut conn = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        bp_test_support::connection_manager(client),
-    )
-    .await
-    {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
-            eprintln!("Redis connect failed for {redis_url}: {e} — skipping");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("redis connect timed out (>2s) — skipping integration test");
-            return None;
-        }
-    };
-    if let Err(e) = redis::cmd("FLUSHDB").query_async::<()>(&mut conn).await {
-        eprintln!("FLUSHDB failed: {e} — skipping");
-        return None;
-    }
+    .await?;
 
     let _ = sqlx::query("DELETE FROM pplns_balance WHERE address LIKE $1")
         .bind(format!("{address_prefix}%"))
@@ -586,15 +535,7 @@ async fn a_share_after_an_empty_window_reaches_the_next_build() {
 // ── Helper: a sibling WindowStore on the harness's Redis DB ─────────
 
 async fn build_window(h: &Harness) -> WindowStore {
-    let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
-    let db = redis_db_for_prefix(&h.address_prefix);
-    let db =
-        bp_test_support::redis_db_in_range(bp_test_support::redis_db::PPLNS_DISTRIBUTION, db).await;
-    let url = format!("{redis_base}/{db}");
-    let client = Client::open(url).expect("client");
-    let conn = bp_test_support::connection_manager(client)
-        .await
-        .expect("conn");
+    let conn = raw_conn(h).await;
     let nd = NetworkDifficulty::new(1_000_000.0);
     WindowStore::new(conn, 4.0, 100, nd, INACTIVITY_OFF)
 }
@@ -639,7 +580,7 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
     seed_share(&window, ADDR_B, 40.0, 1_700_000_000_002).await;
 
     const ACL_USER: &str = "bp_test_readonly_snapshot";
-    let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
+    let redis_base = bp_test_support::redis_url();
     let db = redis_db_for_prefix(&h.address_prefix);
     let db =
         bp_test_support::redis_db_in_range(bp_test_support::redis_db::PPLNS_DISTRIBUTION, db).await;
@@ -874,14 +815,12 @@ async fn an_unreadable_window_fails_the_build_instead_of_degrading() {
     cleanup_addresses(&h.pool, &[ADDR]).await;
 }
 
-/// A raw connection to the harness's Redis DB, for corrupting a key.
+/// A second connection to the harness's Redis DB, unflushed.
 async fn raw_conn(h: &Harness) -> ConnectionManager {
-    let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
-    let db = redis_db_for_prefix(&h.address_prefix);
-    let db =
-        bp_test_support::redis_db_in_range(bp_test_support::redis_db::PPLNS_DISTRIBUTION, db).await;
-    let client = Client::open(format!("{redis_base}/{db}")).expect("client");
-    bp_test_support::connection_manager(client)
-        .await
-        .expect("conn")
+    bp_test_support::connect_redis_in_range_no_flush(
+        bp_test_support::redis_db::PPLNS_DISTRIBUTION,
+        redis_db_for_prefix(&h.address_prefix),
+    )
+    .await
+    .expect("redis reachable: the harness connected")
 }

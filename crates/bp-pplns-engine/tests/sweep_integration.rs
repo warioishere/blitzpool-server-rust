@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! PPLNS dust-sweep against docker-PG. Each test owns an address prefix;
@@ -12,37 +11,12 @@ use bp_common::{AddressId, Sats};
 use bp_pplns_engine::ledger::PayoutRowType;
 use bp_pplns_engine::sweep::{DustSweepRunner, SweepStats, TestClock};
 use chrono::{TimeZone, Utc};
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::PgPool;
 use tokio::sync::Mutex;
 
 // The sweep reads the whole `pplns_balance` table, so the tests in this
 // binary run one at a time, seeding through cleanup.
 static SWEEP_TEST_LOCK: Mutex<()> = Mutex::const_new(());
-
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping integration test");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    }
-}
 
 async fn seed_balance(
     pool: &PgPool,
@@ -127,7 +101,7 @@ fn clock_at(year: i32, month: u32, day: u32) -> Arc<TestClock> {
 #[tokio::test]
 async fn sweep_exact_pair_zeroes_both_balance_rows() {
     let _guard = SWEEP_TEST_LOCK.lock().await;
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -185,7 +159,7 @@ async fn sweep_exact_pair_zeroes_both_balance_rows() {
 #[tokio::test]
 async fn sweep_unequal_amounts_keeps_remainder_side() {
     let _guard = SWEEP_TEST_LOCK.lock().await;
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -232,7 +206,7 @@ async fn sweep_unequal_amounts_keeps_remainder_side() {
 #[tokio::test]
 async fn sweep_multi_pair_preserves_ledger_symmetry() {
     let _guard = SWEEP_TEST_LOCK.lock().await;
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -279,7 +253,7 @@ async fn sweep_multi_pair_preserves_ledger_symmetry() {
 #[tokio::test]
 async fn an_abandoned_credit_pairs_against_an_active_debit() {
     let _guard = SWEEP_TEST_LOCK.lock().await;
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -319,7 +293,7 @@ async fn an_abandoned_credit_pairs_against_an_active_debit() {
 #[tokio::test]
 async fn an_active_credit_is_not_swept_even_with_an_abandoned_debit() {
     let _guard = SWEEP_TEST_LOCK.lock().await;
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -369,7 +343,7 @@ async fn an_active_credit_is_not_swept_even_with_an_abandoned_debit() {
 #[tokio::test]
 async fn sweep_skips_null_last_accepted_share() {
     let _guard = SWEEP_TEST_LOCK.lock().await;
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -412,7 +386,7 @@ async fn sweep_skips_null_last_accepted_share() {
 #[tokio::test]
 async fn sweep_empty_returns_zero_stats() {
     let _guard = SWEEP_TEST_LOCK.lock().await;
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -431,7 +405,7 @@ async fn sweep_empty_returns_zero_stats() {
 #[tokio::test]
 async fn sweep_running_twice_is_safe() {
     let _guard = SWEEP_TEST_LOCK.lock().await;
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -472,7 +446,7 @@ async fn sweep_running_twice_is_safe() {
 async fn sweep_works_with_typed_address_id() {
     // The runner accepts addresses up to the 62-char column limit.
     let _guard = SWEEP_TEST_LOCK.lock().await;
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -508,7 +482,7 @@ async fn sweep_works_with_typed_address_id() {
 #[tokio::test]
 async fn a_balance_that_moved_since_the_run_started_is_not_overwritten() {
     let _guard = SWEEP_TEST_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     wipe_all_test_state(&pool).await;
@@ -600,7 +574,7 @@ async fn balance_of(pool: &PgPool, address: &str) -> Option<i64> {
 #[tokio::test]
 async fn a_cancelled_pair_keeps_each_sides_lifetime_payout() {
     let _guard = SWEEP_TEST_LOCK.lock().await;
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -671,7 +645,7 @@ async fn a_cancelled_pair_keeps_each_sides_lifetime_payout() {
 #[tokio::test]
 async fn an_abandoned_debit_is_settled_before_an_active_one() {
     let _guard = SWEEP_TEST_LOCK.lock().await;
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };

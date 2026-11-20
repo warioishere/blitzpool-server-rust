@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
-
 //! `0000_baseline.sql`: the boot migrations build the schema on an empty
 //! database, and leave a database that already has it untouched. Runs in
 //! throwaway databases so the shared test schema is never touched.
@@ -9,37 +7,13 @@
 use std::path::PathBuf;
 
 use sqlx::migrate::Migrator;
-use sqlx::{postgres::PgPoolOptions, AssertSqlSafe, Executor, PgPool};
-
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
-
-async fn connect(url: &str) -> Option<PgPool> {
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping integration test");
-            None
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            None
-        }
-    }
-}
+use sqlx::{AssertSqlSafe, Executor, PgPool};
 
 /// A fresh empty database; returns the admin pool (to drop it again), the
 /// database's name and its URL.
 async fn throwaway_db(tag: &str) -> Option<(PgPool, String, String)> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    let admin = connect(&url).await?;
+    let url = bp_test_support::pg_url();
+    let admin = bp_test_support::connect_pg_url_or_skip(&url).await?;
     let db = format!("bp_baseline_{tag}_{}", std::process::id());
     admin
         .execute(AssertSqlSafe(format!(
@@ -119,7 +93,9 @@ async fn an_empty_database_boots_to_the_full_schema() {
             std::fs::copy(&path, without_baseline.join(&name)).unwrap();
         }
     }
-    let refused = connect(&db_url).await.expect("throwaway db");
+    let refused = bp_test_support::connect_pg_url_or_skip(&db_url)
+        .await
+        .expect("throwaway db");
     let err = bp_db::with_boot_policy(Migrator::new(without_baseline.as_path()).await.unwrap())
         .run(&refused)
         .await

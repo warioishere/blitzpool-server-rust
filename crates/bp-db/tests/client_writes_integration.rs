@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! Integration tests for the session-persistence write-primitives
@@ -15,32 +14,7 @@ use bp_db::{
     find_addresses_for_ntfy_listener, find_recently_deleted_sessions, find_stale_active_sessions,
     revive_sessions, soft_delete_sessions, upsert_ntfy_subscription, ClientUpsert,
 };
-use sqlx::{postgres::PgPoolOptions, PgPool, Row};
-
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping integration test");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    }
-}
+use sqlx::{PgPool, Row};
 
 fn mk(session: &str) -> ClientUpsert {
     ClientUpsert {
@@ -56,7 +30,7 @@ fn mk(session: &str) -> ClientUpsert {
 
 #[tokio::test]
 async fn bulk_upsert_clients_inserts_fresh_row() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -85,7 +59,7 @@ async fn bulk_upsert_clients_inserts_fresh_row() {
 
 #[tokio::test]
 async fn bulk_upsert_clients_sets_first_seen_on_insert() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -117,7 +91,7 @@ async fn bulk_upsert_clients_sets_first_seen_on_insert() {
 
 #[tokio::test]
 async fn bulk_upsert_clients_preserves_first_seen_on_reregister() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -163,7 +137,7 @@ async fn bulk_upsert_clients_preserves_first_seen_on_reregister() {
 
 #[tokio::test]
 async fn bulk_upsert_clients_on_conflict_resurrects_soft_deleted_row() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -203,7 +177,7 @@ async fn bulk_upsert_clients_on_conflict_resurrects_soft_deleted_row() {
 /// mixed Some/None `userAgent` in one statement.
 #[tokio::test]
 async fn bulk_upsert_clients_inserts_and_updates_in_one_statement() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     const SESSIONS: &[&str] = &["tBUs1", "tBUs2"];
@@ -306,7 +280,7 @@ async fn bulk_upsert_clients_inserts_and_updates_in_one_statement() {
 /// that variant, so this pins the classification against sqlx.
 #[tokio::test]
 async fn bulk_upsert_clients_oversized_name_fails_whole_batch_as_database_error() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     const HEALTHY: &str = "tBUpsn";
@@ -354,7 +328,7 @@ async fn bulk_upsert_clients_oversized_name_fails_whole_batch_as_database_error(
 
 #[tokio::test]
 async fn ntfy_listener_topics_union_clients_and_ntfy_subs() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let client_addr = "ntfy_topics_client_addr";
@@ -413,7 +387,7 @@ async fn ntfy_listener_topics_union_clients_and_ntfy_subs() {
 
 #[tokio::test]
 async fn bulk_upsert_clients_distinct_sessions_stay_independent() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     // Its own address: the sweep tests below commit `mk` rows under
@@ -450,7 +424,7 @@ async fn bulk_upsert_clients_distinct_sessions_stay_independent() {
 /// address keeps its row.
 #[tokio::test]
 async fn delete_clients_for_address_removes_only_that_address() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -490,7 +464,7 @@ async fn delete_clients_for_address_removes_only_that_address() {
 
 #[tokio::test]
 async fn delete_client_for_session_soft_deletes_by_session_id() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -515,7 +489,7 @@ async fn delete_client_for_session_soft_deletes_by_session_id() {
 
 #[tokio::test]
 async fn delete_client_for_session_is_idempotent_against_missing_session() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -528,7 +502,7 @@ async fn delete_client_for_session_is_idempotent_against_missing_session() {
 
 #[tokio::test]
 async fn delete_client_for_session_skips_already_deleted_rows() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -580,7 +554,7 @@ async fn deleted_at_of(pool: &PgPool, session: &str) -> Option<i64> {
 
 #[tokio::test]
 async fn stale_sessions_become_candidates_and_only_named_ones_die() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     drop_session(&pool, "sessK001").await;
@@ -625,7 +599,7 @@ async fn stale_sessions_become_candidates_and_only_named_ones_die() {
 
 #[tokio::test]
 async fn sweep_primitives_skip_already_deleted_rows() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     drop_session(&pool, "sessK003").await;
@@ -657,7 +631,7 @@ async fn sweep_primitives_skip_already_deleted_rows() {
 /// negative control is the fresh row, which must be invisible to both.
 #[tokio::test]
 async fn recently_deleted_sessions_are_listed_and_revivable() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     drop_session(&pool, "sessR001").await;

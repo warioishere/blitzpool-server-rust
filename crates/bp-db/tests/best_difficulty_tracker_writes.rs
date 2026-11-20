@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
-
 //! Integration tests for the best-difficulty tracker bulk upsert and bulk
 //! read. Test rows use a dedicated address prefix and are deleted before and
 //! after each test.
@@ -9,32 +7,7 @@
 use std::collections::HashMap;
 
 use bp_db::{find_best_difficulty_trackers_for_addresses, upsert_best_difficulty_trackers};
-use sqlx::{postgres::PgPoolOptions, PgPool};
-
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping integration test");
-            None
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            None
-        }
-    }
-}
+use sqlx::PgPool;
 
 async fn cleanup(pool: &PgPool, addrs: &[String]) {
     sqlx::query("DELETE FROM best_difficulty_tracker_entity WHERE address = ANY($1)")
@@ -46,7 +19,7 @@ async fn cleanup(pool: &PgPool, addrs: &[String]) {
 
 #[tokio::test]
 async fn upsert_initialises_then_overwrites_in_either_direction() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     const ADDR_A: &str = "bc1qbptrackeroverwritea1";
@@ -103,7 +76,7 @@ async fn upsert_initialises_then_overwrites_in_either_direction() {
 
 #[tokio::test]
 async fn read_omits_addresses_without_a_tracker_row() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     const ADDR_A: &str = "bc1qbptrackeromitsa1";

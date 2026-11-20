@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! Integration tests for the Telegram default-subscription primitives behind
@@ -12,37 +11,13 @@ use bp_db::{
     promote_telegram_default_if_none, set_telegram_default_subscription, set_telegram_hourly_flags,
     upsert_telegram_subscription,
 };
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::PgPool;
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 // Each test uses a distinct chat id so the two tests stay isolated when
 // the harness runs them concurrently against the shared local PG.
 const TEST_CHAT_ID: i64 = 990_000_777;
 const TEST_CHAT_ID_HOURLY: i64 = 990_000_778;
 const TEST_CHAT_ID_TOPIC: i64 = 990_000_790;
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping integration test");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    }
-}
 
 async fn hard_cleanup(pool: &PgPool, chat_id: i64) {
     sqlx::query(r#"DELETE FROM telegram_subscriptions_entity WHERE "telegramChatId" = $1"#)
@@ -68,7 +43,7 @@ async fn is_default_of(pool: &PgPool, chat_id: i64, id: i32) -> bool {
 
 #[tokio::test]
 async fn telegram_default_management_set_and_promote() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let chat_id = TEST_CHAT_ID;
@@ -143,7 +118,7 @@ async fn telegram_default_management_set_and_promote() {
 
 #[tokio::test]
 async fn telegram_hourly_flags_toggle_independently() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let chat_id = TEST_CHAT_ID_HOURLY;
@@ -188,7 +163,7 @@ async fn telegram_hourly_flags_toggle_independently() {
 /// moves it to the topic it is sent from, the main topic included.
 #[tokio::test]
 async fn a_subscription_follows_the_topic_it_is_made_in() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let chat_id = TEST_CHAT_ID_TOPIC;

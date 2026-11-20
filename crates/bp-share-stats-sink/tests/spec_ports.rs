@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! Statistics-coordinator edge cases: a large flush, special characters in
@@ -14,35 +13,10 @@ use bp_share_hook::{RejectedReason, SharedRejectedShare, SharedRejectedShareSink
 use bp_share_stats_sink::flush::{flush_once, Accumulators, FlushScope};
 use bp_share_stats_sink::ShareStatsRejectedSink;
 use bp_stats::{ClientStatisticsKey, ClientStatisticsRecord, TimeSlot};
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::PgPool;
 use tokio::sync::Mutex;
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
-
 static SPEC_PORT_LOCK: Mutex<()> = Mutex::const_new(());
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(4)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping integration test");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    }
-}
 
 fn addr(s: &str) -> AddressId {
     AddressId::new(s.to_string()).unwrap()
@@ -66,7 +40,7 @@ async fn cleanup(pool: &PgPool, prefix: &str) {
 #[tokio::test]
 async fn client_statistics_1500_rows_land_in_one_statement() {
     let _guard = SPEC_PORT_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let prefix = "test_spec_batch_";
@@ -108,7 +82,7 @@ async fn client_statistics_1500_rows_land_in_one_statement() {
 #[tokio::test]
 async fn client_name_with_special_chars_roundtrips_through_unnest() {
     let _guard = SPEC_PORT_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let prefix = "test_spec_special_";
@@ -199,7 +173,7 @@ async fn reject(
 #[tokio::test]
 async fn rejected_diff_per_worker_aggregates_across_sessions() {
     let _guard = SPEC_PORT_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let prefix = "test_spec_fanout_";
@@ -234,7 +208,7 @@ async fn rejected_diff_per_worker_aggregates_across_sessions() {
 #[tokio::test]
 async fn a_zero_difficulty_reject_writes_no_worker_row() {
     let _guard = SPEC_PORT_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let prefix = "test_spec_zero_fanout_";

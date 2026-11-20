@@ -1,39 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! Integration tests for the Group-Solo payout-history write path, against
 //! the local test PG; each test rolls its transaction back.
 
 use bp_db::{bulk_insert_pplns_group_block_history, GroupPayoutHistoryInsert};
-use sqlx::{postgres::PgPoolOptions, PgPool};
 use uuid::Uuid;
-
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    }
-}
 
 /// Each test seeds a `pplns_group` row inside its TX so the group-keyed
 /// rows it writes satisfy their FK. The TX rolls back at end so the
@@ -59,7 +32,7 @@ async fn seed_group_in_tx(
 
 #[tokio::test]
 async fn bulk_insert_group_block_history_idempotent_on_unique() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -119,7 +92,7 @@ async fn bulk_insert_group_block_history_idempotent_on_unique() {
 
 #[tokio::test]
 async fn update_group_last_reset_at_stamps_timestamp() {
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };
@@ -148,7 +121,7 @@ async fn apply_distribution_rollback_undoes_the_history_write() {
     // The contract `bp_group_solo_engine::history::apply_distribution`
     // relies on: a block's payout history commits as one unit or not at
     // all, so a redelivery never finds a half-written block.
-    let pool = match connect_or_skip().await {
+    let pool = match bp_test_support::connect_pg_or_skip().await {
         Some(p) => p,
         None => return,
     };

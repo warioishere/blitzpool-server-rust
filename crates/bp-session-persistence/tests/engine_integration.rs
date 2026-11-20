@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! End-to-end tests for `SessionPersistenceEngine`: the
@@ -11,35 +10,10 @@ use std::time::Duration;
 
 use bp_session_persistence::{SessionPersistenceConfig, SessionPersistenceEngine};
 use bp_share_hook::SharedSessionPersistence;
-use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use sqlx::{PgPool, Row};
 use tokio::sync::Mutex;
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
-
 static ENGINE_LOCK: Mutex<()> = Mutex::const_new(());
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(4)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping integration test");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    }
-}
 
 async fn cleanup(pool: &PgPool, prefix: &str) {
     for sql in [
@@ -57,7 +31,7 @@ async fn cleanup(pool: &PgPool, prefix: &str) {
 #[tokio::test]
 async fn engine_session_persistence_hook_debounces_then_soft_deletes() {
     let _guard = ENGINE_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let prefix = "test_sp_eng_";
@@ -134,7 +108,7 @@ async fn engine_session_persistence_hook_debounces_then_soft_deletes() {
 #[tokio::test]
 async fn a_probe_session_leaves_no_row_while_a_survivor_gets_one() {
     let _guard = ENGINE_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let prefix = "test_sp_probe_";
@@ -180,7 +154,7 @@ async fn a_probe_session_leaves_no_row_while_a_survivor_gets_one() {
 #[tokio::test]
 async fn two_workers_on_one_session_both_get_rows_and_one_teardown_retires_both() {
     let _guard = ENGINE_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let prefix = "test_sp_twoworker_";
@@ -231,7 +205,7 @@ async fn two_workers_on_one_session_both_get_rows_and_one_teardown_retires_both(
 #[tokio::test]
 async fn a_poisoned_birth_row_is_isolated_and_dropped_after_bounded_retries() {
     let _guard = ENGINE_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let prefix = "test_sp_poison_";
@@ -293,7 +267,7 @@ async fn a_poisoned_birth_row_is_isolated_and_dropped_after_bounded_retries() {
 #[tokio::test]
 async fn engine_re_register_under_same_session_id_clears_soft_delete() {
     let _guard = ENGINE_LOCK.lock().await;
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let prefix = "test_sp_reuse_";
@@ -333,7 +307,7 @@ async fn engine_re_register_under_same_session_id_clears_soft_delete() {
 
 #[tokio::test]
 async fn engine_invalid_config_rejected() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let bad = SessionPersistenceConfig {
@@ -347,7 +321,7 @@ async fn engine_invalid_config_rejected() {
 #[tokio::test]
 async fn engine_shutdown_is_a_drop_no_op() {
     // Dropping the handle without `shutdown()` must not panic.
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     {

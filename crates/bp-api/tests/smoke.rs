@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! In-process smoke tests for the API router: it builds on a minimal
@@ -11,33 +10,8 @@ use std::sync::Arc;
 use axum::body::to_bytes;
 use axum::http::{Request, StatusCode};
 use bp_api::{build_router, AppState};
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::PgPool;
 use tower::ServiceExt;
-
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    }
-}
 
 fn minimal_state(pool: PgPool) -> Arc<AppState> {
     Arc::new(AppState::new(pool, "0.0.0"))
@@ -60,7 +34,7 @@ async fn state_with_live_store(pool: PgPool) -> Option<Arc<AppState>> {
 
 #[tokio::test]
 async fn version_endpoint_returns_pool_version() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let router = build_router(minimal_state(pool));
@@ -83,7 +57,7 @@ async fn version_endpoint_returns_pool_version() {
 
 #[tokio::test]
 async fn pplns_status_returns_503_when_engine_unwired() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let router = build_router(minimal_state(pool));
@@ -104,7 +78,7 @@ async fn pplns_status_returns_503_when_engine_unwired() {
 
 #[tokio::test]
 async fn block_template_returns_503_when_tdp_unwired() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let router = build_router(minimal_state(pool));
@@ -122,7 +96,7 @@ async fn block_template_returns_503_when_tdp_unwired() {
 
 #[tokio::test]
 async fn health_returns_ok_with_database_check() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let router = build_router(minimal_state(pool));
@@ -151,7 +125,7 @@ async fn health_returns_ok_with_database_check() {
 
 #[tokio::test]
 async fn groups_returns_503_when_service_unwired() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let router = build_router(minimal_state(pool));
@@ -169,7 +143,7 @@ async fn groups_returns_503_when_service_unwired() {
 
 #[tokio::test]
 async fn client_by_address_invalid_returns_400() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let router = build_router(minimal_state(pool));
@@ -192,7 +166,7 @@ async fn client_by_address_invalid_returns_400() {
 
 #[tokio::test]
 async fn invitation_returns_503_when_service_unwired() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let router = build_router(minimal_state(pool));
@@ -212,7 +186,7 @@ async fn invitation_returns_503_when_service_unwired() {
 async fn info_chart_empty_db_answers_a_zero_per_slot() {
     // `/api/info/chart` answers one point per slot of the window, as every
     // chart does; with no rows each one is zero.
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let router = build_router(minimal_state(pool));
@@ -238,7 +212,7 @@ async fn info_chart_empty_db_answers_a_zero_per_slot() {
 
 #[tokio::test]
 async fn info_chart_invalid_range_returns_400() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let router = build_router(minimal_state(pool));
@@ -258,7 +232,7 @@ async fn info_chart_invalid_range_returns_400() {
 /// the request answers 200, not 400.
 #[tokio::test]
 async fn info_chart_accepts_fourteen_day_range() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let router = build_router(minimal_state(pool));
@@ -276,7 +250,7 @@ async fn info_chart_accepts_fourteen_day_range() {
 
 #[tokio::test]
 async fn info_shares_returns_singleton_totals() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let router = build_router(minimal_state(pool));
@@ -301,7 +275,7 @@ async fn info_shares_returns_singleton_totals() {
 
 #[tokio::test]
 async fn post_group_returns_503_when_service_unwired() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let router = build_router(minimal_state(pool));
@@ -324,7 +298,7 @@ async fn post_group_returns_503_when_service_unwired() {
 
 #[tokio::test]
 async fn delete_group_returns_503_when_service_unwired() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let router = build_router(minimal_state(pool));
@@ -343,7 +317,7 @@ async fn delete_group_returns_503_when_service_unwired() {
 
 #[tokio::test]
 async fn invitation_accept_returns_503_when_service_unwired() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let router = build_router(minimal_state(pool));
@@ -366,7 +340,7 @@ async fn invitation_accept_returns_503_when_service_unwired() {
 
 #[tokio::test]
 async fn pool_endpoint_returns_basic_shape() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     // `/api/pool` reads the live hashrate from the `client:live:*`
@@ -400,7 +374,7 @@ async fn pool_endpoint_returns_basic_shape() {
 /// endpoint must say so (500), never invent a 0 total.
 #[tokio::test]
 async fn pool_endpoint_without_live_store_returns_500() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let router = build_router(minimal_state(pool));
@@ -418,7 +392,7 @@ async fn pool_endpoint_without_live_store_returns_500() {
 
 #[tokio::test]
 async fn push_info_returns_camelcase_doc() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let router = build_router(minimal_state(pool));
@@ -444,7 +418,7 @@ async fn push_info_returns_camelcase_doc() {
 
 #[tokio::test]
 async fn push_register_missing_fields_returns_400() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let router = build_router(minimal_state(pool));
@@ -468,7 +442,7 @@ async fn push_register_missing_fields_returns_400() {
 
 #[tokio::test]
 async fn push_status_for_unknown_address_returns_empty_shape() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let router = build_router(minimal_state(pool));
@@ -491,7 +465,7 @@ async fn push_status_for_unknown_address_returns_empty_shape() {
 
 #[tokio::test]
 async fn client_reset_best_difficulty_succeeds() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let router = build_router(minimal_state(pool));
@@ -531,7 +505,7 @@ async fn purge_probe(pool: &sqlx::PgPool, addr: &str, worker: &str, session: &st
 
 #[tokio::test]
 async fn worker_chart_breaks_rejects_down_by_every_reason() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     // Five distinct counts, so a breakdown field wired to the wrong column
@@ -658,7 +632,7 @@ async fn get_json(pool: PgPool, uri: &str) -> (StatusCode, serde_json::Value) {
 
 #[tokio::test]
 async fn best_difficulty_today_maxes_workers_and_slots_from_since() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     // Own address: no sibling test in this binary touches it.
@@ -736,7 +710,7 @@ async fn best_difficulty_today_maxes_workers_and_slots_from_since() {
 /// hour: the slot ending on the hour belongs to the hour before.
 #[tokio::test]
 async fn diff_scores_folds_slots_into_the_hour_they_start_in() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     // Own address: no sibling test in this binary touches it.
@@ -792,7 +766,7 @@ async fn diff_scores_folds_slots_into_the_hour_they_start_in() {
 
 #[tokio::test]
 async fn best_difficulty_today_without_rows_is_zero() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     // P2WSH address nothing in the suite writes rows for.
@@ -810,7 +784,7 @@ async fn best_difficulty_today_without_rows_is_zero() {
 
 #[tokio::test]
 async fn best_difficulty_today_rejects_missing_or_out_of_window_since() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let addr = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
@@ -847,7 +821,7 @@ async fn best_difficulty_today_rejects_missing_or_out_of_window_since() {
 /// out, a connected worker without a row too.
 #[tokio::test]
 async fn worker_shares_lists_connected_workers_with_a_row_in_name_order() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     // Own address: no sibling test in this binary touches it.
@@ -915,7 +889,7 @@ async fn worker_shares_lists_connected_workers_with_a_row_in_name_order() {
 /// over all its sessions, every other slot 0.
 #[tokio::test]
 async fn client_max_difficulty_takes_the_best_session_per_slot() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     // Own address: no sibling test in this binary touches it.
@@ -982,7 +956,7 @@ async fn client_max_difficulty_takes_the_best_session_per_slot() {
 /// so both count from the same start afterwards; the public record stays.
 #[tokio::test]
 async fn delete_stats_zeroes_the_address_total_with_the_workers() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     // Own address: no sibling test in this binary touches it.
@@ -1052,7 +1026,7 @@ async fn delete_stats_zeroes_the_address_total_with_the_workers() {
 /// time-zone offset, so the scoreboard's month starts inside the window.
 #[tokio::test]
 async fn diff_scores_month_window_covers_a_31_day_month() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let addr = "bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h";
@@ -1074,7 +1048,7 @@ async fn diff_scores_month_window_covers_a_31_day_month() {
 /// the finder's full address; a private or dissolved team's blocks stay out.
 #[tokio::test]
 async fn public_team_blocks_lists_only_public_teams() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let public = uuid::Uuid::new_v4();

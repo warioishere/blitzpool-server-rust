@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
 //! The join-request switch a Team admin sets per channel: on for a new
@@ -14,35 +13,11 @@ use bp_db::{
     upsert_ntfy_subscription, upsert_push_subscription, upsert_telegram_subscription,
     PushPreferenceUpdate,
 };
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::PgPool;
 
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 const TEST_CHAT_ID: i64 = 990_000_779;
 const ADDR: &str = "bc1q_group_admin_flag_test";
 const ENDPOINT: &str = "group-admin-flag-test-endpoint";
-
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping integration test");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            return None;
-        }
-    }
-}
 
 async fn cleanup(pool: &PgPool) {
     sqlx::query(r#"DELETE FROM telegram_subscriptions_entity WHERE "telegramChatId" = $1"#)
@@ -64,7 +39,7 @@ async fn cleanup(pool: &PgPool) {
 
 #[tokio::test]
 async fn the_group_admin_switch_starts_on_and_flips_alone() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     cleanup(&pool).await;

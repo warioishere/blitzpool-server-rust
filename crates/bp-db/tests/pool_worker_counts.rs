@@ -4,40 +4,14 @@
 //! rows at or after `since`) and the row order of the multi-address reader.
 
 use bp_db::{find_pool_worker_counts_since, PoolWorkerCounts};
-use sqlx::{postgres::PgPoolOptions, PgPool};
-
-const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
 // Printing why an integration test skipped is what stderr is for here.
-#[allow(clippy::print_stderr)]
-async fn connect_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(2))
-            .connect(&url),
-    )
-    .await
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect failed for {url}: {e} — skipping integration test");
-            None
-        }
-        Err(_) => {
-            eprintln!("PG connect timed out — skipping");
-            None
-        }
-    }
-}
 
 /// Distinct addresses and workers per slot, from in-window rows only: two
 /// sessions of one worker count once, an earlier row not at all.
 #[tokio::test]
 async fn worker_counts_are_distinct_and_skip_old_rows() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
@@ -97,7 +71,7 @@ async fn worker_counts_are_distinct_and_skip_old_rows() {
 /// each by time, so sums over it add in the order one read per address did.
 #[tokio::test]
 async fn client_statistics_come_address_by_address_in_the_given_order() {
-    let Some(pool) = connect_or_skip().await else {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
         return;
     };
     let since: i64 = 9_100_000_000_000_000;

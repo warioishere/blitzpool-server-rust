@@ -13,53 +13,15 @@ use bp_pplns_engine::window::{
     bucket_key, NetworkDifficulty, WindowStore, KEY_APPLIED, KEY_BUCKETS, KEY_WINDOW_BY_ADDRESS,
     KEY_WINDOW_LAST_SHARE, KEY_WINDOW_TOTAL,
 };
-use redis::{aio::ConnectionManager, AsyncCommands, Client};
-
-const DEFAULT_URL: &str = "redis://127.0.0.1:16379";
+use redis::{aio::ConnectionManager, AsyncCommands};
 
 /// A flushed Redis logical DB, or `None` to skip when unreachable.
 async fn connect_or_skip(test_db: u8) -> Option<ConnectionManager> {
-    let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    // This binary's own DB range, so binaries do not flush each other's.
-    let test_db =
-        bp_test_support::redis_db_in_range(bp_test_support::redis_db::PPLNS_WINDOW, test_db).await;
-    let url = format!("{base}/{test_db}");
-    let client = match Client::open(url.clone()) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("redis client open failed for {url}: {e} — skipping integration test");
-            return None;
-        }
-    };
-    let mut conn = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        bp_test_support::connection_manager(client),
+    bp_test_support::connect_redis_in_range_or_skip(
+        bp_test_support::redis_db::PPLNS_WINDOW,
+        test_db,
     )
     .await
-    {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
-            eprintln!("redis connect failed for {url}: {e} — skipping integration test");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("redis connect timed out at {url} — skipping integration test");
-            return None;
-        }
-    };
-    if redis::cmd("PING")
-        .query_async::<String>(&mut conn)
-        .await
-        .is_err()
-    {
-        eprintln!("redis PING failed for {url} — skipping integration test");
-        return None;
-    }
-    if let Err(e) = redis::cmd("FLUSHDB").query_async::<()>(&mut conn).await {
-        eprintln!("redis FLUSHDB failed: {e} — skipping integration test");
-        return None;
-    }
-    Some(conn)
 }
 
 /// Inactivity period for tests not about it: longer than any timestamp gap here.

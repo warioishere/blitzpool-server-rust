@@ -346,6 +346,9 @@ pub mod redis_db {
     /// Wide enough for the largest binary's number of connects.
     pub const RANGE: u16 = 32;
 
+    /// Index 0 of this range is shared, unflushed, by the `live_mode_marker`
+    /// tests and the `bp-coinbase-snapshot` lib tests (namespaced keys): never
+    /// flush it.
     pub const BLITZPOOL_BIN: u16 = 0;
     /// Index 31 of this range is lent to the `bp-notifications` lib tests
     /// (`/team_status`): don't claim it here.
@@ -382,6 +385,17 @@ pub mod redis_db {
     pub const BLITZPOOL_BIN_2: u16 = 17 * RANGE;
 }
 
+/// The test Postgres: `BP_PG_URL`, else [`PG_DEFAULT_URL`].
+pub fn pg_url() -> String {
+    std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_DEFAULT_URL.to_string())
+}
+
+/// The test Redis server, without a database index: `BP_REDIS_URL`, else
+/// [`REDIS_DEFAULT_URL`].
+pub fn redis_url() -> String {
+    std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_DEFAULT_URL.to_string())
+}
+
 /// A test connection with the pool's own settings
 /// ([`bp_share_stream::connection_manager_config`]), so a blocking stream read
 /// behaves as it does in production.
@@ -396,10 +410,8 @@ async fn redis_database_count() -> u16 {
     static COUNT: tokio::sync::OnceCell<u16> = tokio::sync::OnceCell::const_new();
     *COUNT
         .get_or_init(|| async {
-            let base =
-                std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_DEFAULT_URL.to_string());
             let fallback = 16u16;
-            let Ok(client) = Client::open(format!("{base}/0")) else {
+            let Ok(client) = Client::open(format!("{}/0", redis_url())) else {
                 return fallback;
             };
             let Ok(Ok(mut conn)) =
@@ -427,25 +439,14 @@ async fn redis_database_count() -> u16 {
 /// Flushes the DB. `base` is the binary's constant from [`redis_db`];
 /// `test_db` only has to be unique among that binary's tests.
 pub async fn connect_redis_in_range_or_skip(base: u16, test_db: u8) -> Option<ConnectionManager> {
-    connect_redis_or_skip_raw(redis_db_in_range(base, test_db).await).await
+    connect_redis_index_or_skip(redis_db_in_range(base, test_db).await, true).await
 }
 
 /// Like [`connect_redis_in_range_or_skip`] without the flush, for sibling tests
 /// in one binary that deliberately share an index with namespaced keys. Safe
 /// only while every test on that index skips the flush.
 pub async fn connect_redis_in_range_no_flush(base: u16, test_db: u8) -> Option<ConnectionManager> {
-    let index = redis_db_in_range(base, test_db).await;
-    let url_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_DEFAULT_URL.to_string());
-    let url = format!("{url_base}/{index}");
-    let client = match Client::open(url.clone()) {
-        Ok(c) => c,
-        Err(e) => return skip_or_fail(format!("redis client open {url}: {e}")),
-    };
-    match tokio::time::timeout(Duration::from_secs(2), connection_manager(client)).await {
-        Ok(Ok(c)) => Some(c),
-        Ok(Err(e)) => skip_or_fail(format!("redis connect {url}: {e}")),
-        Err(_) => skip_or_fail(format!("redis connect timed out at {url}")),
-    }
+    connect_redis_index_or_skip(redis_db_in_range(base, test_db).await, false).await
 }
 
 /// For harnesses that build their own connection and only need the index.
@@ -453,15 +454,10 @@ pub async fn redis_db_in_range(base: u16, test_db: u8) -> u16 {
     (base + test_db as u16) % redis_database_count().await
 }
 
-/// Prefer [`connect_redis_in_range_or_skip`]: this flushes a raw index, so two
-/// callers passing the same number wipe each other.
-pub async fn connect_redis_or_skip(test_db: u8) -> Option<ConnectionManager> {
-    connect_redis_or_skip_raw(test_db as u16).await
-}
-
-async fn connect_redis_or_skip_raw(test_db: u16) -> Option<ConnectionManager> {
-    let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_DEFAULT_URL.to_string());
-    let url = format!("{base}/{test_db}");
+/// Connect to database `index` of the test Redis and PING it; `flush` empties
+/// it first.
+async fn connect_redis_index_or_skip(index: u16, flush: bool) -> Option<ConnectionManager> {
+    let url = format!("{}/{index}", redis_url());
     let client = match Client::open(url.clone()) {
         Ok(c) => c,
         Err(e) => return skip_or_fail(format!("redis client open {url}: {e}")),
@@ -475,20 +471,27 @@ async fn connect_redis_or_skip_raw(test_db: u16) -> Option<ConnectionManager> {
     if let Err(e) = redis::cmd("PING").query_async::<String>(&mut conn).await {
         return skip_or_fail(format!("redis PING {url} failed: {e}"));
     }
-    if let Err(e) = redis::cmd("FLUSHDB").query_async::<()>(&mut conn).await {
-        return skip_or_fail(format!("redis FLUSHDB {url} failed: {e}"));
+    if flush {
+        if let Err(e) = redis::cmd("FLUSHDB").query_async::<()>(&mut conn).await {
+            return skip_or_fail(format!("redis FLUSHDB {url} failed: {e}"));
+        }
     }
     Some(conn)
 }
 
 pub async fn connect_pg_or_skip() -> Option<PgPool> {
-    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_DEFAULT_URL.to_string());
+    connect_pg_url_or_skip(&pg_url()).await
+}
+
+/// [`connect_pg_or_skip`] for another database on the test server, such as a
+/// throwaway one a test creates.
+pub async fn connect_pg_url_or_skip(url: &str) -> Option<PgPool> {
     match tokio::time::timeout(
         Duration::from_secs(2),
         PgPoolOptions::new()
-            .max_connections(2)
+            .max_connections(4)
             .acquire_timeout(Duration::from_secs(2))
-            .connect(&url),
+            .connect(url),
     )
     .await
     {
