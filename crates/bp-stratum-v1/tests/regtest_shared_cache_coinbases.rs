@@ -163,7 +163,7 @@ async fn sv1_shared_cache_keeps_per_finder_coinbases_distinct() {
     )
     .expect("spawn TDP");
     let updates_rx = tdp.subscribe();
-    node.generate_to_self(1).await.expect("mine 1 for template");
+    let tip_height = node.generate_to_self(1).await.expect("mine 1 for template");
 
     let hooks = ServerHooks {
         payout_resolver: Arc::new(PayToSelfResolver),
@@ -179,8 +179,13 @@ async fn sv1_shared_cache_keeps_per_finder_coinbases_distinct() {
         SharedExtranonce::new(),
         job_cache.clone(),
     );
+    // The template on the block just mined, not the one before it: a tip
+    // change between two handshakes would give them different coinbases. The
+    // node sets the coinbase locktime to the tip's height.
     wait_until(Duration::from_secs(8), || {
-        server.current_template().is_some()
+        server
+            .current_template()
+            .is_some_and(|t| t.coinbase_tx_locktime == tip_height)
     })
     .await;
 
