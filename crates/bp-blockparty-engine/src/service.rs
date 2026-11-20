@@ -366,16 +366,7 @@ impl BlockpartyService {
         };
 
         if group.status == BlockpartyStatus::Draft.as_str() {
-            bp_db::update_blockparty_group_status(
-                &self.payouts.pool,
-                group_id,
-                BlockpartyStatus::Confirming.as_str(),
-                now,
-            )
-            .await?;
-            self.cache
-                .set_admin_status(&group.admin_address, group_id, BlockpartyStatus::Confirming)
-                .await;
+            self.leave_draft(&group, now).await?;
         }
         self.cache.insert_member(&address, group_id).await;
         self.recompute_status(group_id).await?;
@@ -521,16 +512,7 @@ impl BlockpartyService {
         .await?;
 
         if group.status == BlockpartyStatus::Draft.as_str() {
-            bp_db::update_blockparty_group_status(
-                &self.payouts.pool,
-                group.id,
-                BlockpartyStatus::Confirming.as_str(),
-                now,
-            )
-            .await?;
-            self.cache
-                .set_admin_status(&group.admin_address, group.id, BlockpartyStatus::Confirming)
-                .await;
+            self.leave_draft(&group, now).await?;
         }
         self.cache.insert_member(&address, group.id).await;
         self.recompute_status(group.id).await?;
@@ -769,19 +751,29 @@ impl BlockpartyService {
         if !splits_are_complete(&members) {
             return Err(BlockpartyServiceError::InvalidSplitsSum);
         }
-        let now = now_ms();
+        self.leave_draft(&group, now_ms()).await?;
+        self.recompute_status(group_id).await?;
+        Ok(BlockpartyStatus::Confirming)
+    }
+
+    /// Draft to confirming, in the DB and the routing cache. Every caller
+    /// runs [`Self::recompute_status`] next, which announces the change.
+    async fn leave_draft(
+        &self,
+        group: &BlockpartyGroupRow,
+        now: i64,
+    ) -> Result<(), BlockpartyServiceError> {
         bp_db::update_blockparty_group_status(
             &self.payouts.pool,
-            group_id,
+            group.id,
             BlockpartyStatus::Confirming.as_str(),
             now,
         )
         .await?;
         self.cache
-            .set_admin_status(&group.admin_address, group_id, BlockpartyStatus::Confirming)
+            .set_admin_status(&group.admin_address, group.id, BlockpartyStatus::Confirming)
             .await;
-        self.recompute_status(group_id).await?;
-        Ok(BlockpartyStatus::Confirming)
+        Ok(())
     }
 
     /// [`recompute_status_in_tx`] in a standalone TX, then the cache update
