@@ -721,7 +721,6 @@ mod tests {
     use super::*;
     use crate::frame::RpcId;
     use crate::notify::ActiveSV1Template;
-    use bp_common::MiningMode;
     use bp_mining_job::PayoutEntry;
     use bp_vardiff::TestClock;
 
@@ -733,7 +732,7 @@ mod tests {
 
     fn solo_port(initial_diff: f64) -> PortConfig {
         PortConfig {
-            payout_mode: MiningMode::Solo,
+            payout_mode: crate::config::PortMode::Solo,
             ..PortConfig::new(3333, initial_diff)
         }
     }

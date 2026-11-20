@@ -7,7 +7,6 @@
 
 use std::sync::{Arc, RwLock};
 
-use bp_common::MiningMode;
 use bp_config::AppConfig;
 use bp_jobs_lifecycle::LifecycleConfig;
 use bp_mining_job::PayoutResolver;
@@ -239,7 +238,7 @@ impl<'a> Sv2Servers<'a> {
 
 #[allow(clippy::too_many_arguments)]
 fn build_port_hooks(
-    port_payout_mode: MiningMode,
+    port_payout_mode: bp_stratum_v1::PortMode,
     payout_resolver: Arc<dyn PayoutResolver>,
     block_sink: Arc<dyn Sv2BlockSink>,
     engines: &EngineHandles,

@@ -9,11 +9,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use bp_common::{AddressId, MiningMode};
+use bp_common::AddressId;
 use bp_config::AppConfig;
 use bp_mining_mode::MiningModeResult;
 use bp_share_hook::SharedSessionPersistence;
-use bp_stratum_v1::{PortConfig, ServerConfig, ServerHooks, SharedExtranonce, StratumV1Server};
+use bp_stratum_v1::{
+    PortConfig, PortMode, ServerConfig, ServerHooks, SharedExtranonce, StratumV1Server,
+};
 use bp_template_distribution::TdpHandle;
 use thiserror::Error;
 
@@ -152,7 +154,7 @@ fn build_port_configs(cfg: &AppConfig) -> Vec<PortConfig> {
 
     // Solo (low-diff)
     ports.push(PortConfig {
-        payout_mode: MiningMode::Solo,
+        payout_mode: PortMode::Solo,
         target_shares_per_minute: cfg.stratum.target_shares_per_minute as f64,
         ..PortConfig::new(
             cfg.stratum.solo_port,
@@ -162,7 +164,7 @@ fn build_port_configs(cfg: &AppConfig) -> Vec<PortConfig> {
 
     // Solo high-diff
     ports.push(PortConfig {
-        payout_mode: MiningMode::Solo,
+        payout_mode: PortMode::Solo,
         target_shares_per_minute: cfg.stratum.high_diff_target_shares_per_minute as f64,
         allow_suggested_difficulty: false,
         ..PortConfig::new(
@@ -174,7 +176,7 @@ fn build_port_configs(cfg: &AppConfig) -> Vec<PortConfig> {
     if let Some(pplns) = &cfg.pplns {
         // PPLNS (low-diff)
         ports.push(PortConfig {
-            payout_mode: MiningMode::Pplns,
+            payout_mode: PortMode::Pplns,
             target_shares_per_minute: pplns.target_shares_per_minute as f64,
             minimum_difficulty: pplns.min_difficulty as f64,
             ..PortConfig::new(pplns.port, pplns.start_difficulty as f64)
@@ -182,7 +184,7 @@ fn build_port_configs(cfg: &AppConfig) -> Vec<PortConfig> {
 
         // PPLNS high-diff: shares `[stratum]`'s high-diff start difficulty.
         ports.push(PortConfig {
-            payout_mode: MiningMode::Pplns,
+            payout_mode: PortMode::Pplns,
             target_shares_per_minute: cfg.stratum.high_diff_target_shares_per_minute as f64,
             minimum_difficulty: pplns.min_difficulty as f64,
             allow_suggested_difficulty: false,
@@ -200,7 +202,7 @@ fn build_port_configs(cfg: &AppConfig) -> Vec<PortConfig> {
 
 #[allow(clippy::too_many_arguments)]
 fn build_port_hooks(
-    port_payout_mode: MiningMode,
+    port_payout_mode: PortMode,
     block_sink: Arc<dyn bp_stratum_v1::BlockSubmissionSink>,
     payout_resolver: Arc<dyn bp_mining_job::PayoutResolver>,
     engines: &EngineHandles,
@@ -240,7 +242,7 @@ fn build_port_hooks(
 /// AND protocol: `sessions` is keyed by ids each protocol mints on its own,
 /// and maps them back to the address because deregister carries only the id.
 pub(crate) struct ModeGatePopulatingPersistence {
-    port_payout_mode: MiningMode,
+    port_payout_mode: PortMode,
     mode_gate: Arc<BlitzpoolModeGate>,
     group_lookup: Arc<dyn GroupLookup>,
     /// Blockparty admin-lookup. `None` when the `[blockparty]` feature
@@ -255,7 +257,7 @@ impl ModeGatePopulatingPersistence {
     /// place the SV1 and SV2 port builders get it from, so the two cannot
     /// resolve a connection's mode from different inputs.
     pub(crate) fn for_port(
-        port_payout_mode: MiningMode,
+        port_payout_mode: PortMode,
         engines: &EngineHandles,
         membership: &Membership,
         live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
@@ -274,7 +276,7 @@ impl ModeGatePopulatingPersistence {
     }
 
     pub(crate) fn new(
-        port_payout_mode: MiningMode,
+        port_payout_mode: PortMode,
         mode_gate: Arc<BlitzpoolModeGate>,
         group_lookup: Arc<dyn GroupLookup>,
         blockparty: Option<Arc<dyn BlockpartyAdminLookup>>,
@@ -337,22 +339,18 @@ impl SharedSessionPersistence for ModeGatePopulatingPersistence {
     }
 }
 
-/// Map a port's `payout_mode` to a `MiningModeResult`. Port configs only
-/// carry Solo or Pplns.
-fn mode_from_port(m: MiningMode) -> MiningModeResult {
+/// The mode a session takes from its port.
+fn mode_from_port(m: PortMode) -> MiningModeResult {
     match m {
-        MiningMode::Pplns => MiningModeResult::Pplns,
-        MiningMode::Solo => MiningModeResult::Solo,
-        // Group-Solo and Blockparty are per-address modes; a port naming
-        // either is a misconfiguration, and solo keeps the coinbase
-        // spendable.
-        MiningMode::GroupSolo | MiningMode::Blockparty => MiningModeResult::Solo,
+        PortMode::Pplns => MiningModeResult::Pplns,
+        PortMode::Solo => MiningModeResult::Solo,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bp_common::MiningMode;
     use bp_config::{
         ApiConfig, BitcoinRpcConfig, DatabaseConfig, Network, PplnsConfig, RedisConfig,
         StratumConfig, TdpConfig as TomlTdpConfig,
@@ -453,8 +451,8 @@ mod tests {
         let cfg = min_cfg(None);
         let ports = build_port_configs(&cfg);
         assert_eq!(ports.len(), 2);
-        assert_eq!(ports[0].payout_mode, MiningMode::Solo);
-        assert_eq!(ports[1].payout_mode, MiningMode::Solo);
+        assert_eq!(ports[0].payout_mode, PortMode::Solo);
+        assert_eq!(ports[1].payout_mode, PortMode::Solo);
         assert_eq!(ports[0].port, 3333);
         assert_eq!(ports[1].port, 3339);
         assert_eq!(ports[0].initial_difficulty, 1024.0);
@@ -468,10 +466,10 @@ mod tests {
         let cfg = min_cfg(Some(pplns_block()));
         let ports = build_port_configs(&cfg);
         assert_eq!(ports.len(), 4);
-        assert_eq!(ports[0].payout_mode, MiningMode::Solo);
-        assert_eq!(ports[1].payout_mode, MiningMode::Solo);
-        assert_eq!(ports[2].payout_mode, MiningMode::Pplns);
-        assert_eq!(ports[3].payout_mode, MiningMode::Pplns);
+        assert_eq!(ports[0].payout_mode, PortMode::Solo);
+        assert_eq!(ports[1].payout_mode, PortMode::Solo);
+        assert_eq!(ports[2].payout_mode, PortMode::Pplns);
+        assert_eq!(ports[3].payout_mode, PortMode::Pplns);
         assert_eq!(ports[2].port, 3340);
         assert_eq!(ports[3].port, 3349);
         assert_eq!(ports[2].minimum_difficulty, 1024.0);
@@ -485,14 +483,8 @@ mod tests {
 
     #[test]
     fn mode_from_port_maps_each_variant() {
-        assert_eq!(mode_from_port(MiningMode::Solo).mode(), MiningMode::Solo);
-        assert_eq!(mode_from_port(MiningMode::Pplns).mode(), MiningMode::Pplns);
-        // GroupSolo port -> defensive solo (port configs never carry
-        // GroupSolo; group membership is per-address).
-        assert_eq!(
-            mode_from_port(MiningMode::GroupSolo).mode(),
-            MiningMode::Solo
-        );
+        assert_eq!(mode_from_port(PortMode::Solo).mode(), MiningMode::Solo);
+        assert_eq!(mode_from_port(PortMode::Pplns).mode(), MiningMode::Pplns);
     }
 
     #[test]
@@ -588,7 +580,7 @@ mod tests {
         let inner = RecordingInner::new();
         let lookup: Arc<dyn GroupLookup> = Arc::new(StubLookup::empty());
         let wrapper = ModeGatePopulatingPersistence::new(
-            MiningMode::Pplns,
+            PortMode::Pplns,
             gate.clone(),
             lookup,
             None,
@@ -613,7 +605,7 @@ mod tests {
         let lookup: Arc<dyn GroupLookup> = Arc::new(StubLookup::with("bcrt1qgs", gid));
         // Port is Solo, but the address is in an active group → group_solo wins.
         let wrapper = ModeGatePopulatingPersistence::new(
-            MiningMode::Solo,
+            PortMode::Solo,
             gate.clone(),
             lookup,
             None,
@@ -636,7 +628,7 @@ mod tests {
         // Solo port, not a group member, but IS the admin of a routable
         // party → Blockparty wins over the port's Solo default.
         let wrapper = ModeGatePopulatingPersistence::new(
-            MiningMode::Solo,
+            PortMode::Solo,
             gate.clone(),
             lookup,
             Some(bp),
@@ -662,7 +654,7 @@ mod tests {
         let inner = RecordingInner::new();
         let lookup: Arc<dyn GroupLookup> = Arc::new(StubLookup::empty());
         let wrapper = ModeGatePopulatingPersistence::new(
-            MiningMode::Pplns,
+            PortMode::Pplns,
             gate.clone(),
             lookup,
             None,
@@ -690,7 +682,7 @@ mod tests {
         let inner = RecordingInner::new();
         let lookup: Arc<dyn GroupLookup> = Arc::new(StubLookup::empty());
         let wrapper = ModeGatePopulatingPersistence::new(
-            MiningMode::Pplns,
+            PortMode::Pplns,
             gate.clone(),
             lookup,
             None,

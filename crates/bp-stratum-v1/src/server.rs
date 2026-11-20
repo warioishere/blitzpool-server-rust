@@ -843,7 +843,6 @@ mod tests {
     use crate::hooks::test_support::RecordingHooks;
     use crate::notify::ActiveSV1Template;
     use bitcoin::Network;
-    use bp_common::MiningMode;
     use bp_template_distribution::{NewTemplate, SetNewPrevHash};
     use bp_vardiff::TestClock;
 
@@ -853,7 +852,7 @@ mod tests {
 
     fn port_cfg() -> PortConfig {
         PortConfig {
-            payout_mode: MiningMode::Solo,
+            payout_mode: crate::config::PortMode::Solo,
             ..PortConfig::new(3333, 16384.0)
         }
     }

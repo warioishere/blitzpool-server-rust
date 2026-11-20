@@ -4,7 +4,6 @@
 //! [`PortConfig`] per listener. Defaults are the production values.
 
 use bitcoin::Network;
-use bp_common::MiningMode;
 use bp_jobs_lifecycle::LifecycleConfig;
 use std::time::Duration;
 
@@ -95,6 +94,14 @@ impl ServerConfig {
     }
 }
 
+/// The payout modes a port serves. Team Mining and Blockparty are modes of an
+/// address, not of a port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortMode {
+    Solo,
+    Pplns,
+}
+
 /// Per-listener configuration: one instance per TCP port.
 #[derive(Clone, Debug)]
 pub struct PortConfig {
@@ -106,9 +113,9 @@ pub struct PortConfig {
     pub allow_suggested_difficulty: bool,
     /// Vardiff target shares per minute.
     pub target_shares_per_minute: f64,
-    /// Payout mode for shares on this port. The PPLNS port overrides any
-    /// group membership: choosing the port is the session's opt-out.
-    pub payout_mode: MiningMode,
+    /// The payout mode of a session on this port whose address belongs to no
+    /// group; a Team-Mining or Blockparty membership wins over it.
+    pub payout_mode: PortMode,
     /// Vardiff floor when `> 0`. Keeps sub-dust devices off the ledger on
     /// payout-mode ports. See [`Self::effective_minimum_difficulty`].
     pub minimum_difficulty: f64,
@@ -123,7 +130,7 @@ impl PortConfig {
             initial_difficulty,
             allow_suggested_difficulty: true,
             target_shares_per_minute: DEFAULT_TARGET_SHARES_PER_MINUTE,
-            payout_mode: MiningMode::Solo,
+            payout_mode: PortMode::Solo,
             minimum_difficulty: 0.0,
         }
     }
@@ -237,7 +244,7 @@ mod tests {
         assert_eq!(p.initial_difficulty, 1024.0);
         assert!(p.allow_suggested_difficulty);
         assert_eq!(p.target_shares_per_minute, 6.0);
-        assert_eq!(p.payout_mode, MiningMode::Solo);
+        assert_eq!(p.payout_mode, PortMode::Solo);
         assert_eq!(p.minimum_difficulty, 0.0);
     }
 

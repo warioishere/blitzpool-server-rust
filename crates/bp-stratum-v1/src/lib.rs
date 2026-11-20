@@ -16,7 +16,7 @@ mod server;
 mod shared_adapter;
 mod submit;
 
-pub use config::{PortConfig, ServerConfig, DEFAULT_POOL_IDENTIFIER};
+pub use config::{PortConfig, PortMode, ServerConfig, DEFAULT_POOL_IDENTIFIER};
 pub use error::StratumV1Error;
 pub use frame::parse_request;
 pub use hooks::{BlockSubmissionSink, ServerHooks};
