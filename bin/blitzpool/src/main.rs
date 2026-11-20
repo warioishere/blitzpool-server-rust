@@ -108,9 +108,9 @@ struct Cli {
     check_engines: bool,
 
     /// Like `--check-engines` but extends through production hook
-    /// construction (SMTP / FCM / Web-Push adapter init,
-    /// GroupServiceHooks wiring), so any referenced files (FCM
-    /// service-account JSON, VAPID PEM) must load.
+    /// construction (SMTP adapter init, GroupServiceHooks wiring, and on the
+    /// `notify` role the FCM / Web-Push adapters), so any referenced files
+    /// (FCM service-account JSON, VAPID PEM) must load there.
     #[arg(long)]
     check_hooks: bool,
 
@@ -291,6 +291,17 @@ async fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    // The share statistics run on the payout process's stream consumer, so
+    // one without the other would leave half of that consumer unrun.
+    if cfg.has_role(Role::Stats) != cfg.has_role(Role::Payout) {
+        tracing::error!(
+            "invalid roles: `stats` and `payout` run together in one process — \
+             configure both or neither"
+        );
+        eprintln!("blitzpool: invalid roles — `stats` and `payout` must be configured together");
+        return ExitCode::from(2);
+    }
+
     let boot_opts = boot::BootOptions {
         skip_bitcoin_rpc_liveness: cli.skip_bitcoin_rpc_liveness,
         skip_tdp: cli.skip_tdp,
@@ -343,11 +354,12 @@ async fn main() -> ExitCode {
     }
 
     // Each subsystem is gated on this process's roles: front = Stratum, JDP,
-    // share producer; api = HTTP; accounting (payout|stats) = consumers,
+    // share producer; api = HTTP; accounting (payout+stats) = consumers,
     // ledger, crons; notify = dispatcher, listeners, notification fan-out.
     let is_front = cfg.has_role(Role::Front);
     let is_api = cfg.has_role(Role::Api);
-    let is_accounting = cfg.has_role(Role::Payout) || cfg.has_role(Role::Stats);
+    // `stats` comes with `payout` (refused otherwise above).
+    let is_accounting = cfg.has_role(Role::Payout);
     let is_notify = cfg.has_role(Role::Notify);
     // Front and payout never share a process (refused above), so a front is
     // the producer of the share and block streams.
@@ -454,19 +466,9 @@ async fn main() -> ExitCode {
                 .service
                 .set_blockparty_reader(bp.membership_reader.clone());
         }
-        let coinbase_tags =
-            match crate::coinbase_tags::CoinbaseTagCache::load(handles.db.pool()).await {
-                Ok(cache) => Arc::new(cache),
-                Err(err) => {
-                    tracing::error!(%err, "coinbase tag cache load failed");
-                    eprintln!("blitzpool: {err}");
-                    return ExitCode::from(7);
-                }
-            };
         Some(membership::Membership {
             group,
             blockparty,
-            coinbase_tags,
             session_kicks: tokio::sync::broadcast::channel(membership::SESSION_KICKS_CAPACITY).0,
         })
     } else {
@@ -503,6 +505,21 @@ async fn main() -> ExitCode {
     // bridge would leave the mining side reading a registry nobody writes.
     let jdp_bridge = stratum_v2::build_bridge();
 
+    // The groups' coinbase tags, for the front's coinbases; `cache_sync`
+    // keeps them current.
+    let coinbase_tags = if is_front {
+        match crate::coinbase_tags::CoinbaseTagCache::load(handles.db.pool()).await {
+            Ok(cache) => Some(Arc::new(cache)),
+            Err(err) => {
+                tracing::error!(%err, "coinbase tag cache load failed");
+                eprintln!("blitzpool: {err}");
+                return ExitCode::from(7);
+            }
+        }
+    } else {
+        None
+    };
+
     // One payout resolver for SV1, SV2 and JDP, so every protocol resolves
     // the same coinbase for the same address.
     let payout_resolver = membership.as_ref().filter(|_| is_front).map(|m| {
@@ -512,7 +529,7 @@ async fn main() -> ExitCode {
             engines.group_solo.clone(),
             engines.solo_fee.clone(),
             m.blockparty_service(),
-            Some(m.coinbase_tags.clone()),
+            coinbase_tags.clone(),
         ))
     });
 
@@ -720,7 +737,10 @@ async fn main() -> ExitCode {
             engines.pplns.as_ref(),
             engines.group_solo.as_ref(),
             stats,
-            &engines.session_persistence,
+            engines
+                .session_persistence
+                .as_ref()
+                .expect("payout mode spawns session persistence"),
             handles.redis.clone(),
         );
         // Dedicated connections: a blocking XREAD would head-of-line-block a
@@ -857,19 +877,20 @@ async fn main() -> ExitCode {
 
     // Keep the front's routing caches in sync with membership changes made
     // by the api, from `cache:invalidate` plus a periodic rebuild.
-    let cache_sync = match membership.as_ref().filter(|_| is_front) {
-        Some(m) => {
+    let cache_sync = match (membership.as_ref(), coinbase_tags) {
+        (Some(m), Some(coinbase_tags)) => {
             // Dedicated: the blocking XREAD would stall the per-share `XADD`.
             let cache_conn = handles.dedicated_redis(&cfg.redis, "cache-sync").await;
             Some(crate::cache_sync::spawn(
                 cache_conn,
                 m,
+                coinbase_tags,
                 handles.db.pool().clone(),
                 &engines,
                 settle_signal.registry_slot(),
             ))
         }
-        None => None,
+        _ => None,
     };
 
     // A front only produces: both consumer flags exclude it.
@@ -989,7 +1010,7 @@ struct EngineShutdownHandles {
     stats: Option<bp_share_stats_sink::ShareStatsEngineHandle>,
     pplns: Option<bp_pplns_engine::engine::PplnsEngine>,
     group_solo: Option<bp_group_solo_engine::engine::GroupSoloEngine>,
-    session_persistence: bp_session_persistence::SessionPersistenceEngineHandle,
+    session_persistence: Option<bp_session_persistence::SessionPersistenceEngineHandle>,
 }
 
 /// Block until a shutdown signal arrives or the API server task exits on its
@@ -1099,7 +1120,9 @@ async fn wait_for_shutdown(
         stats.shutdown().await;
     }
     listeners.shutdown().await;
-    engine_shutdown.session_persistence.shutdown().await;
+    if let Some(sp) = engine_shutdown.session_persistence.as_ref() {
+        sp.shutdown().await;
+    }
 }
 
 /// One-line-per-subsystem summary of what the config resolved to, before any

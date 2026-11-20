@@ -16,15 +16,12 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::blockparty_service::SharedBlockparty;
-use crate::coinbase_tags::CoinbaseTagCache;
 use crate::group_service::SharedGroupService;
 
 pub(crate) struct Membership {
     pub(crate) group: SharedGroupService,
     /// `None` unless Blockparty is configured.
     pub(crate) blockparty: Option<SharedBlockparty>,
-    /// Kept current by `cache_sync` on the front.
-    pub(crate) coinbase_tags: Arc<CoinbaseTagCache>,
     /// Addresses whose mode changed. `cache_sync` sends, every Stratum
     /// connection listens and closes on its own address.
     pub(crate) session_kicks: broadcast::Sender<String>,

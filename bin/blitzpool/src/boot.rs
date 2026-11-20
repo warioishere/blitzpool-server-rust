@@ -154,7 +154,12 @@ pub(crate) async fn boot(
         }
         (Some(tdp), alt_tdp)
     };
-    let geoip = spawn_geoip().map(Arc::new);
+    // Only the API resolves visitor locations.
+    let geoip = cfg
+        .has_role(Role::Api)
+        .then(spawn_geoip)
+        .flatten()
+        .map(Arc::new);
     let metrics = spawn_metrics(&cfg.metrics);
     info!("foundation handles ready");
     Ok(FoundationHandles {

@@ -13,7 +13,7 @@ use bp_api::email_hooks::{
     VerificationContext as ApiVerificationContext,
 };
 use bp_common::AddressId;
-use bp_config::AppConfig;
+use bp_config::{AppConfig, Role};
 use bp_group_mgmt_engine::{
     EmailHooks, GroupServiceHooks, JoinDecisionEmailContext, JoinDecisionOutcome,
 };
@@ -76,8 +76,12 @@ pub(crate) async fn spawn(
     engines: &EngineHandles,
 ) -> Result<ProductionHooks, HooksError> {
     let smtp = build_smtp_adapter(cfg)?;
-    let fcm = build_fcm_adapter(cfg)?;
-    let web_push = build_web_push_adapter(cfg)?;
+    // Only `notify` pushes; elsewhere a broken push config stops nothing.
+    let (fcm, web_push) = if cfg.has_role(Role::Notify) {
+        (build_fcm_adapter(cfg)?, build_web_push_adapter(cfg)?)
+    } else {
+        (None, None)
+    };
 
     let pool_base_url = cfg.pool_base_url.clone();
     let email_verification: Arc<dyn EmailVerificationHooks> =

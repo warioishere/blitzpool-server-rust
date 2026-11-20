@@ -133,6 +133,8 @@ pub enum Role {
     /// rejected + block-found ledger apply) + the confirmation watcher.
     Payout,
     /// Share statistics + per-session persistence (best-diff / touch / charts).
+    /// Runs on the payout process's stream consumer, so it is configured
+    /// together with [`Role::Payout`].
     Stats,
     /// Notifications: dispatcher, command listeners, push/digest crons and the
     /// block-found + device-status fan-out. Separate so notification changes

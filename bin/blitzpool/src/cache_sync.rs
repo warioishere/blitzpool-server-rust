@@ -79,6 +79,7 @@ impl MembershipChangeNotifier for StreamCacheNotifier {
 pub(crate) fn spawn(
     redis: ConnectionManager,
     membership: &crate::membership::Membership,
+    coinbase_tags: Arc<CoinbaseTagCache>,
     pool: PgPool,
     engines: &EngineHandles,
     // The Front's JDP payout registry, once `jdp::spawn` has attached it.
@@ -96,7 +97,7 @@ pub(crate) fn spawn(
             gate: engines.mode_gate.clone(),
             kicks: membership.session_kicks.clone(),
         },
-        coinbase_tags: membership.coinbase_tags.clone(),
+        coinbase_tags,
         pool,
         pplns: engines.pplns.clone(),
         group_solo: engines.group_solo.clone(),

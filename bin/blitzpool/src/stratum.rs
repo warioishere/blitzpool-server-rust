@@ -120,7 +120,13 @@ pub(crate) async fn spawn(
     // One registry per process, wrapping the shared persistence hook so
     // both protocols feed it.
     let live_sessions = Arc::new(crate::live_sessions::LiveSessionRegistry::new(
-        Arc::new(engines.session_persistence_hook.clone()),
+        Arc::new(
+            engines
+                .session_persistence
+                .as_ref()
+                .expect("front mode spawns session persistence")
+                .session_persistence_hook(),
+        ),
         foundation.redis.clone(),
         &uuid::Uuid::new_v4().to_string(),
     ));

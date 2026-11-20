@@ -192,12 +192,10 @@ docker logs --tail 20 blitzpool-payout 2>&1 | grep -E "engines ready|consumer: l
   `notify` process is up. The payout process logs a loud `WARN` at boot when it
   runs accounting without notify. (A back that carries the `notify` role holds
   the dispatcher itself; the warning is only about splitting it out.)
-* **`payout` and `stats` not yet split from each other**: they run in one
-  process for now (the statistics flush loop must be single-writer). To split
-  them later set `BLITZPOOL_ROLES=payout` and `BLITZPOOL_ROLES=stats` on two
-  containers — but that needs the engine-layer single-writer work first; don't
-  do it yet. (`notify` *is* fully split out — that's this section's whole
-  point.)
+* **`payout` and `stats` run in one process**: the statistics ride on the
+  payout process's stream consumer, so the binary refuses to start with one
+  role and not the other. (`notify` *is* fully split out — that's this
+  section's whole point.)
 
 ## Rollback
 

@@ -24,7 +24,6 @@ use bp_pplns_engine::hooks::PplnsAcceptedShareSink;
 use bp_pplns_engine::window::NetworkDifficulty;
 use bp_session_persistence::{
     SessionPersistenceConfig, SessionPersistenceEngine, SessionPersistenceEngineHandle,
-    SessionPersistenceHook,
 };
 use bp_share_hook::{
     ShareSequencer, SharedAcceptedShare, SharedAcceptedShareSink, SharedRejectedShare,
@@ -45,13 +44,14 @@ use crate::boot::FoundationHandles;
 pub(crate) struct EngineHandles {
     pub(crate) pplns: Option<PplnsEngine>,
     pub(crate) group_solo: Option<GroupSoloEngine>,
-    pub(crate) session_persistence: SessionPersistenceEngineHandle,
+    /// The front feeds its session births, the payout its row touches;
+    /// `None` in every other process.
+    pub(crate) session_persistence: Option<SessionPersistenceEngineHandle>,
     pub(crate) mode_gate: Arc<BlitzpoolModeGate>,
     /// The front's sinks that stamp each share and publish it to the stream.
     /// `None` off the front, where the consumer builds its own sinks.
     pub(crate) accepted_sink: Option<Arc<CompositeAcceptedShareSink>>,
     pub(crate) rejected_sink: Option<Arc<dyn SharedRejectedShareSink>>,
-    pub(crate) session_persistence_hook: SessionPersistenceHook,
     /// The DB-only Blockparty half every role may hold; `None` unless
     /// Blockparty is configured. The cache-carrying service is front/API
     /// only, see [`crate::membership::Membership`].
@@ -119,7 +119,11 @@ pub(crate) async fn spawn(
     let mode_gate = Arc::new(BlitzpoolModeGate::new());
     let pplns = spawn_pplns(cfg, handles, read_only).await?;
     let group_solo = spawn_group_solo(cfg, handles, read_only).await?;
-    let session_persistence = spawn_session_persistence(handles).await?;
+    let session_persistence = if cfg.has_role(Role::Front) || cfg.has_role(Role::Payout) {
+        Some(spawn_session_persistence(handles).await?)
+    } else {
+        None
+    };
     let blockparty_payouts = blockparty_payouts(cfg, handles.db.pool()).await?;
 
     let (accepted_sink, rejected_sink) = if cfg.has_role(Role::Front) {
@@ -131,7 +135,6 @@ pub(crate) async fn spawn(
     } else {
         (None, None)
     };
-    let session_persistence_hook = session_persistence.session_persistence_hook();
 
     info!(
         pplns_enabled = pplns.is_some(),
@@ -147,7 +150,6 @@ pub(crate) async fn spawn(
         mode_gate,
         accepted_sink,
         rejected_sink,
-        session_persistence_hook,
         blockparty_payouts,
         solo_fee,
         subsidy_halving_interval: bp_mining_job::subsidy_halving_interval(
