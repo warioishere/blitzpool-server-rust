@@ -91,7 +91,7 @@ The pool runs as role-gated processes that communicate over **Redis streams**:
 - `front` — Stratum listeners, template streams, job building, block submit
 - `api` — HTTP API
 - `payout` — ledger apply for PPLNS, Team Mining and Blockparty, confirmation gating, dust sweep
-- `stats` — share-stats aggregation
+- `stats` — share-stats aggregation; runs in the `payout` process (the binary refuses one without the other)
 - `notify` — Telegram / ntfy / push / email fan-out
 
 Roles are selected with `--roles` / `BLITZPOOL_ROLES` (independent of payout mode). Block-found and accepted/rejected shares flow Core→Satellite over Redis streams, delivered at least once: the payout windows dedup shares on their id and bookings are idempotent, while share statistics tolerate the rare double count; routing-cache invalidation is broadcast cross-process. See [`full-setup/DEPLOYMENT.md`](full-setup/DEPLOYMENT.md).

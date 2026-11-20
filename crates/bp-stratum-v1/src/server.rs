@@ -86,8 +86,8 @@ pub struct PrefixGuard {
 }
 
 impl PrefixGuard {
-    /// `None` when the partition is exhausted; the caller then keeps the
-    /// session-id-derived extranonce1.
+    /// `None` when the partition is exhausted; the caller then closes the
+    /// connection.
     pub fn prefix(&self) -> Option<[u8; 4]> {
         self.prefix
     }

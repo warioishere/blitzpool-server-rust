@@ -15,7 +15,7 @@ notification change.
 | Container | `BLITZPOOL_ROLES` | Holds | Restart impact |
 |---|---|---|---|
 | `blitzpool-core` | `front` | Stratum listeners + share producer + block submit + JDP | **miners reconnect** — avoid unless fixing the share path / coinbase math |
-| `blitzpool-api` | `api` | read-only HTTP API (charts, admin) | none (read-only; recreate freely) |
+| `blitzpool-api` | `api` | HTTP API (charts, Team and Blockparty admin, address settings) | none (no miner connection; recreate freely) |
 | `blitzpool-payout` | `payout,stats` | PPLNS + Team Mining + Blockparty ledger (block-found ledger apply), confirmation watcher, maintenance crons, statistics | API + miners + notifications unaffected; a few seconds of accounting lag, then catches up |
 | `blitzpool-notify` | `notify` | dispatcher (FCM/Web-Push/Telegram/ntfy), command listeners, notification crons (network-/best-difficulty, hourly stats), notify-only fan-out of block-found + device-status | payout + API + miners unaffected; recreate freely for a notification change |
 
@@ -181,9 +181,6 @@ docker logs --tail 20 blitzpool-payout 2>&1 | grep -E "engines ready|consumer: l
 
 ## Caveats
 
-* **API block-template endpoint**: `/info/block-template` needs TDP, which is
-  front-only, so it returns 503 on the `api` process. Everything else
-  (balances, charts, stats, admin) needs no TDP and works fully.
 * **One shared config**: keep `roles` *out* of `blitzpool.toml` —
   `BLITZPOOL_ROLES` in the compose file is what decides each process's
   topology.

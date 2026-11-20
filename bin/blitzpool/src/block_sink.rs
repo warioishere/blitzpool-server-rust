@@ -1097,8 +1097,8 @@ impl Sv2BlockSubmissionSink for TdpBlockSubmissionSink {
     ) {
         // A `SetCustomMiningJob` job: the JDC propagates its own block, the
         // pool only records it. `jdp_claims_the_block` alone decides who
-        // records: the insert has no `ON CONFLICT`, so a second, unbooked row
-        // would suppress the booked one (SV2 JDP/Coinbase-only Mode never declares).
+        // records, so the block is recorded by one side only
+        // (SV2 JDP/Coinbase-only Mode never declares).
         if accept.witness_coinbase.is_empty() || accept.template_id.is_none() {
             if accept.jdp_claims_the_block {
                 info!(

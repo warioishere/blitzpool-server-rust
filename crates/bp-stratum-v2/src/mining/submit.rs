@@ -101,7 +101,6 @@ pub struct ShareAccept {
     /// the personal-best tracker.
     pub submission_difficulty: Difficulty,
     pub header: [u8; 80],
-    /// `sha256d(header)` in LE byte order.
     /// Hash meets the job's network target. bitcoind stays the authoritative
     /// validator; this only triggers `TdpHandle::submit_solution`.
     pub is_block_candidate: bool,

@@ -239,8 +239,8 @@ fn build_port_hooks(
 
 /// Publishes / refcounts the resolved `MiningModeResult` in the shared
 /// [`BlitzpoolModeGate`] on every register/deregister. One instance per port
-/// AND protocol: `sessions` is keyed by ids each protocol mints on its own,
-/// and maps them back to the address because deregister carries only the id.
+/// AND protocol: `sessions` maps a session id back to its address, because
+/// deregister carries only the id.
 pub(crate) struct ModeGatePopulatingPersistence {
     port_payout_mode: PortMode,
     mode_gate: Arc<BlitzpoolModeGate>,
