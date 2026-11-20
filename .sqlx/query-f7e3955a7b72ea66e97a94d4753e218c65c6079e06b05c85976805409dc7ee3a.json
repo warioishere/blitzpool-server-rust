@@ -1,21 +1,10 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            address AS \"address!: AddressId\",\n            shares AS \"shares!\",\n            \"bestDifficulty\" AS \"best_difficulty!\",\n            \"miscCoinbaseScriptData\" AS \"misc_coinbase_script_data?\",\n            \"bestDifficultyUserAgent\" AS \"best_difficulty_user_agent?\"\n           FROM address_settings_entity WHERE address = $1 LIMIT 1",
+  "query": "SELECT\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            address AS \"address!: AddressId\",\n            shares AS \"shares!\",\n            \"bestDifficulty\" AS \"best_difficulty!\",\n            \"bestDifficultyUserAgent\" AS \"best_difficulty_user_agent?\"\n           FROM address_settings_entity WHERE address = ANY($1)",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "deleted_at?",
-        "type_info": "Int8",
-        "origin": {
-          "Table": {
-            "table": "address_settings_entity",
-            "name": "deletedAt"
-          }
-        }
-      },
-      {
-        "ordinal": 1,
         "name": "created_at!",
         "type_info": "Int8",
         "origin": {
@@ -26,7 +15,7 @@
         }
       },
       {
-        "ordinal": 2,
+        "ordinal": 1,
         "name": "updated_at!",
         "type_info": "Int8",
         "origin": {
@@ -37,7 +26,7 @@
         }
       },
       {
-        "ordinal": 3,
+        "ordinal": 2,
         "name": "address!: AddressId",
         "type_info": "Varchar",
         "origin": {
@@ -48,7 +37,7 @@
         }
       },
       {
-        "ordinal": 4,
+        "ordinal": 3,
         "name": "shares!",
         "type_info": "Float8",
         "origin": {
@@ -59,7 +48,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 4,
         "name": "best_difficulty!",
         "type_info": "Float8",
         "origin": {
@@ -70,18 +59,7 @@
         }
       },
       {
-        "ordinal": 6,
-        "name": "misc_coinbase_script_data?",
-        "type_info": "Varchar",
-        "origin": {
-          "Table": {
-            "table": "address_settings_entity",
-            "name": "miscCoinbaseScriptData"
-          }
-        }
-      },
-      {
-        "ordinal": 7,
+        "ordinal": 5,
         "name": "best_difficulty_user_agent?",
         "type_info": "Varchar",
         "origin": {
@@ -94,19 +72,17 @@
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "TextArray"
       ]
     },
     "nullable": [
-      true,
       false,
       false,
       false,
       false,
       false,
-      true,
       true
     ]
   },
-  "hash": "fc8b184bce4fa94cbe7a7ae8e1297fe8f81f021be7669337d6ac2ce293399f2d"
+  "hash": "f7e3955a7b72ea66e97a94d4753e218c65c6079e06b05c85976805409dc7ee3a"
 }

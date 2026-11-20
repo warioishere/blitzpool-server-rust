@@ -1,21 +1,10 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            \"telegramChatId\" AS \"telegram_chat_id!\",\n            \"bestDiffNotificationsEnabled\" AS \"best_diff_notifications_enabled!\",\n            \"isDefault\" AS \"is_default!\",\n            \"deviceNotificationsEnabled\" AS \"device_notifications_enabled!\",\n            \"hourlyStatsEnabled\" AS \"hourly_stats_enabled!\",\n            \"hourlyWorkersEnabled\" AS \"hourly_workers_enabled!\",\n            \"groupAdminNotificationsEnabled\" AS \"group_admin_notifications_enabled!\",\n            \"blockNotificationsEnabled\" AS \"block_notifications_enabled!\",\n            \"teamBestNotificationsEnabled\" AS \"team_best_notifications_enabled!\",\n            \"messageThreadId\" AS \"message_thread_id?\",\n            \"groupChat\" AS \"group_chat!\"\n           FROM telegram_subscriptions_entity\n           WHERE \"deletedAt\" IS NULL\n             AND (\"hourlyStatsEnabled\" = true OR \"hourlyWorkersEnabled\" = true)",
+  "query": "SELECT\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            \"telegramChatId\" AS \"telegram_chat_id!\",\n            \"bestDiffNotificationsEnabled\" AS \"best_diff_notifications_enabled!\",\n            \"isDefault\" AS \"is_default!\",\n            \"deviceNotificationsEnabled\" AS \"device_notifications_enabled!\",\n            \"hourlyStatsEnabled\" AS \"hourly_stats_enabled!\",\n            \"hourlyWorkersEnabled\" AS \"hourly_workers_enabled!\",\n            \"groupAdminNotificationsEnabled\" AS \"group_admin_notifications_enabled!\",\n            \"blockNotificationsEnabled\" AS \"block_notifications_enabled!\",\n            \"teamBestNotificationsEnabled\" AS \"team_best_notifications_enabled!\",\n            \"messageThreadId\" AS \"message_thread_id?\",\n            \"groupChat\" AS \"group_chat!\"\n           FROM telegram_subscriptions_entity\n           WHERE \"telegramChatId\" = $1 AND \"deletedAt\" IS NULL",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "deleted_at?",
-        "type_info": "Int8",
-        "origin": {
-          "Table": {
-            "table": "telegram_subscriptions_entity",
-            "name": "deletedAt"
-          }
-        }
-      },
-      {
-        "ordinal": 1,
         "name": "created_at!",
         "type_info": "Int8",
         "origin": {
@@ -26,7 +15,7 @@
         }
       },
       {
-        "ordinal": 2,
+        "ordinal": 1,
         "name": "updated_at!",
         "type_info": "Int8",
         "origin": {
@@ -37,7 +26,7 @@
         }
       },
       {
-        "ordinal": 3,
+        "ordinal": 2,
         "name": "id!",
         "type_info": "Int4",
         "origin": {
@@ -48,7 +37,7 @@
         }
       },
       {
-        "ordinal": 4,
+        "ordinal": 3,
         "name": "address!: AddressId",
         "type_info": "Varchar",
         "origin": {
@@ -59,7 +48,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 4,
         "name": "telegram_chat_id!",
         "type_info": "Int8",
         "origin": {
@@ -70,7 +59,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 5,
         "name": "best_diff_notifications_enabled!",
         "type_info": "Bool",
         "origin": {
@@ -81,7 +70,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 6,
         "name": "is_default!",
         "type_info": "Bool",
         "origin": {
@@ -92,7 +81,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 7,
         "name": "device_notifications_enabled!",
         "type_info": "Bool",
         "origin": {
@@ -103,7 +92,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 8,
         "name": "hourly_stats_enabled!",
         "type_info": "Bool",
         "origin": {
@@ -114,7 +103,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 9,
         "name": "hourly_workers_enabled!",
         "type_info": "Bool",
         "origin": {
@@ -125,7 +114,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 10,
         "name": "group_admin_notifications_enabled!",
         "type_info": "Bool",
         "origin": {
@@ -136,7 +125,7 @@
         }
       },
       {
-        "ordinal": 12,
+        "ordinal": 11,
         "name": "block_notifications_enabled!",
         "type_info": "Bool",
         "origin": {
@@ -147,7 +136,7 @@
         }
       },
       {
-        "ordinal": 13,
+        "ordinal": 12,
         "name": "team_best_notifications_enabled!",
         "type_info": "Bool",
         "origin": {
@@ -158,7 +147,7 @@
         }
       },
       {
-        "ordinal": 14,
+        "ordinal": 13,
         "name": "message_thread_id?",
         "type_info": "Int8",
         "origin": {
@@ -169,7 +158,7 @@
         }
       },
       {
-        "ordinal": 15,
+        "ordinal": 14,
         "name": "group_chat!",
         "type_info": "Bool",
         "origin": {
@@ -181,10 +170,11 @@
       }
     ],
     "parameters": {
-      "Left": []
+      "Left": [
+        "Int8"
+      ]
     },
     "nullable": [
-      true,
       false,
       false,
       false,
@@ -202,5 +192,5 @@
       false
     ]
   },
-  "hash": "9af7569cc0dcab77992873bef84121443b646b38986cee56b66c5475774c4227"
+  "hash": "04fbd042bb01e7711716db6a9d3ddbbd61bf1c9719faaf4f937ca7e8a0a22256"
 }

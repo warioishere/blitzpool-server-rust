@@ -254,7 +254,6 @@ mod tests {
             (
                 address.clone(),
                 PushSubscriptionRow {
-                    deleted_at: None,
                     created_at: 0,
                     updated_at: 0,
                     id,

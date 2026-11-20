@@ -11,8 +11,6 @@ use crate::DbError;
 
 #[derive(Clone, Debug, FromRow)]
 pub struct TelegramSubscriptionRow {
-    #[sqlx(rename = "deletedAt")]
-    pub deleted_at: Option<i64>,
     #[sqlx(rename = "createdAt")]
     pub created_at: i64,
     #[sqlx(rename = "updatedAt")]
@@ -58,7 +56,6 @@ pub async fn find_telegram_subscriptions_by_address(
     sqlx::query_as!(
         TelegramSubscriptionRow,
         r#"SELECT
-            "deletedAt" AS "deleted_at?",
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
             id AS "id!",
@@ -91,7 +88,6 @@ pub async fn find_telegram_subscriptions_with_hourly_enabled(
     sqlx::query_as!(
         TelegramSubscriptionRow,
         r#"SELECT
-            "deletedAt" AS "deleted_at?",
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
             id AS "id!",
@@ -126,7 +122,6 @@ pub async fn find_telegram_subscriptions_by_chat(
     sqlx::query_as!(
         TelegramSubscriptionRow,
         r#"SELECT
-            "deletedAt" AS "deleted_at?",
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
             id AS "id!",
@@ -153,8 +148,6 @@ pub async fn find_telegram_subscriptions_by_chat(
 
 #[derive(Clone, Debug, FromRow)]
 pub struct NtfySubscriptionRow {
-    #[sqlx(rename = "deletedAt")]
-    pub deleted_at: Option<i64>,
     #[sqlx(rename = "createdAt")]
     pub created_at: i64,
     #[sqlx(rename = "updatedAt")]
@@ -184,7 +177,6 @@ pub async fn find_ntfy_subscriptions_with_hourly_enabled(
     sqlx::query_as!(
         NtfySubscriptionRow,
         r#"SELECT
-            "deletedAt" AS "deleted_at?",
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
             id AS "id!",
@@ -215,7 +207,6 @@ pub async fn find_ntfy_subscription_by_address(
     sqlx::query_as!(
         NtfySubscriptionRow,
         r#"SELECT
-            "deletedAt" AS "deleted_at?",
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
             id AS "id!",
@@ -239,8 +230,6 @@ pub async fn find_ntfy_subscription_by_address(
 
 #[derive(Clone, Debug, FromRow)]
 pub struct PushSubscriptionRow {
-    #[sqlx(rename = "deletedAt")]
-    pub deleted_at: Option<i64>,
     #[sqlx(rename = "createdAt")]
     pub created_at: i64,
     #[sqlx(rename = "updatedAt")]
@@ -279,7 +268,6 @@ pub async fn find_push_subscriptions_by_address(
     sqlx::query_as!(
         PushSubscriptionRow,
         r#"SELECT
-            "deletedAt" AS "deleted_at?",
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
             id AS "id!",
@@ -374,7 +362,6 @@ pub async fn upsert_push_subscription(
                 "deletedAt" = NULL,
                 "updatedAt" = $5
             RETURNING
-                "deletedAt" AS "deleted_at?",
                 "createdAt" AS "created_at!",
                 "updatedAt" AS "updated_at!",
                 id AS "id!",

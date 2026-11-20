@@ -2266,7 +2266,6 @@ mod tests {
 
     fn sub_row(id: i32, address: &str, is_default: bool) -> TelegramSubscriptionRow {
         TelegramSubscriptionRow {
-            deleted_at: None,
             created_at: 0,
             updated_at: 0,
             id,

@@ -646,9 +646,6 @@ fn settings_to_db_patch(s: UpdateRoundResetSettings) -> RoundResetConfigPatch {
         preset: s.preset.map_set(|p| p.as_str().to_string()),
         interval_days: s.interval_days.map_set(|d| d as i32),
         timezone: s.timezone,
-        // hour_local is hard-coded to 0 on every PATCH —
-        // calendar resets fire at midnight local time, always.
-        hour_local: PatchField::Set(0),
         finder_bonus_ppm: s.finder_bonus_ppm,
         is_public: s.is_public,
         reset_round_on_block: s.reset_round_on_block,

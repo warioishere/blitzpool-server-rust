@@ -2034,7 +2034,6 @@ mod tests {
 
     fn telegram_sub(group_admin: bool) -> TelegramSubscriptionRow {
         TelegramSubscriptionRow {
-            deleted_at: None,
             created_at: 0,
             updated_at: 0,
             id: 1,
@@ -2055,7 +2054,6 @@ mod tests {
 
     fn ntfy_sub(group_admin: bool) -> NtfySubscriptionRow {
         NtfySubscriptionRow {
-            deleted_at: None,
             created_at: 0,
             updated_at: 0,
             id: 2,
@@ -2072,7 +2070,6 @@ mod tests {
 
     fn push_sub(kind: &str, group_admin: bool) -> PushSubscriptionRow {
         PushSubscriptionRow {
-            deleted_at: None,
             created_at: 0,
             updated_at: 0,
             id: 3,

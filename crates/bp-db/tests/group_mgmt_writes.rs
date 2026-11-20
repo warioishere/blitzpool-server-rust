@@ -419,7 +419,6 @@ async fn round_reset_config_patch_applies_per_field() {
         preset: PatchField::Set("daily".into()),
         interval_days: PatchField::Untouched,
         timezone: PatchField::Set("Europe/Berlin".into()),
-        hour_local: PatchField::Set(0),
         finder_bonus_ppm: PatchField::Set(160_000),
         is_public: PatchField::Set(true),
         reset_round_on_block: PatchField::Set(true),
@@ -432,7 +431,6 @@ async fn round_reset_config_patch_applies_per_field() {
         .expect("present");
     assert_eq!(row1.round_reset_preset.as_deref(), Some("daily"));
     assert_eq!(row1.round_reset_timezone.as_deref(), Some("Europe/Berlin"));
-    assert_eq!(row1.round_reset_hour_local, Some(0));
     assert_eq!(row1.finder_bonus_ppm, Some(160_000));
     assert!(row1.is_public);
     assert!(row1.reset_round_on_block);
@@ -444,7 +442,6 @@ async fn round_reset_config_patch_applies_per_field() {
         preset: PatchField::Clear,
         interval_days: PatchField::Clear,
         timezone: PatchField::Untouched,
-        hour_local: PatchField::Untouched,
         finder_bonus_ppm: PatchField::Clear,
         is_public: PatchField::Untouched,
         reset_round_on_block: PatchField::Untouched,
@@ -457,7 +454,7 @@ async fn round_reset_config_patch_applies_per_field() {
         .expect("present");
     assert!(row2.round_reset_preset.is_none());
     assert!(row2.round_reset_interval_days.is_none());
-    assert!(row2.finder_bonus_sats.is_none());
+    assert!(row2.finder_bonus_ppm.is_none());
     // Timezone untouched.
     assert_eq!(row2.round_reset_timezone.as_deref(), Some("Europe/Berlin"));
     assert!(row2.is_public);

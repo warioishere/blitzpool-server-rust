@@ -12,8 +12,6 @@ use crate::DbError;
 
 #[derive(Clone, Debug, FromRow)]
 pub struct AddressSettingsRow {
-    #[sqlx(rename = "deletedAt")]
-    pub deleted_at: Option<i64>,
     #[sqlx(rename = "createdAt")]
     pub created_at: i64,
     #[sqlx(rename = "updatedAt")]
@@ -22,8 +20,6 @@ pub struct AddressSettingsRow {
     pub shares: f64,
     #[sqlx(rename = "bestDifficulty")]
     pub best_difficulty: f64,
-    #[sqlx(rename = "miscCoinbaseScriptData")]
-    pub misc_coinbase_script_data: Option<String>,
     #[sqlx(rename = "bestDifficultyUserAgent")]
     pub best_difficulty_user_agent: Option<String>,
 }
@@ -35,13 +31,11 @@ pub async fn find_address_settings(
     sqlx::query_as!(
         AddressSettingsRow,
         r#"SELECT
-            "deletedAt" AS "deleted_at?",
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
             address AS "address!: AddressId",
             shares AS "shares!",
             "bestDifficulty" AS "best_difficulty!",
-            "miscCoinbaseScriptData" AS "misc_coinbase_script_data?",
             "bestDifficultyUserAgent" AS "best_difficulty_user_agent?"
            FROM address_settings_entity WHERE address = $1 LIMIT 1"#,
         address.as_str()
@@ -60,13 +54,11 @@ pub async fn find_address_settings_for_addresses(
     sqlx::query_as!(
         AddressSettingsRow,
         r#"SELECT
-            "deletedAt" AS "deleted_at?",
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
             address AS "address!: AddressId",
             shares AS "shares!",
             "bestDifficulty" AS "best_difficulty!",
-            "miscCoinbaseScriptData" AS "misc_coinbase_script_data?",
             "bestDifficultyUserAgent" AS "best_difficulty_user_agent?"
            FROM address_settings_entity WHERE address = ANY($1)"#,
         addresses
@@ -78,8 +70,6 @@ pub async fn find_address_settings_for_addresses(
 
 #[derive(Clone, Debug, FromRow)]
 pub struct BestDifficultyTrackerRow {
-    #[sqlx(rename = "deletedAt")]
-    pub deleted_at: Option<i64>,
     #[sqlx(rename = "createdAt")]
     pub created_at: i64,
     #[sqlx(rename = "updatedAt")]
@@ -98,7 +88,6 @@ pub async fn find_best_difficulty_tracker(
     sqlx::query_as!(
         BestDifficultyTrackerRow,
         r#"SELECT
-            "deletedAt" AS "deleted_at?",
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
             address AS "address!: AddressId",
@@ -122,7 +111,6 @@ pub async fn find_best_difficulty_trackers_for_addresses(
     sqlx::query_as!(
         BestDifficultyTrackerRow,
         r#"SELECT
-            "deletedAt" AS "deleted_at?",
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
             address AS "address!: AddressId",

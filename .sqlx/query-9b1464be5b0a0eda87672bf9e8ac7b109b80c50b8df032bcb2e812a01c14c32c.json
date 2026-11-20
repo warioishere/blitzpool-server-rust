@@ -1,21 +1,10 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            language AS \"language!\",\n            \"bestDiffNotificationsEnabled\" AS \"best_diff_notifications_enabled!\",\n            \"deviceNotificationsEnabled\" AS \"device_notifications_enabled!\",\n            \"hourlyStatsEnabled\" AS \"hourly_stats_enabled!\",\n            \"hourlyWorkersEnabled\" AS \"hourly_workers_enabled!\",\n            \"groupAdminNotificationsEnabled\" AS \"group_admin_notifications_enabled!\",\n            \"teamBestNotificationsEnabled\" AS \"team_best_notifications_enabled!\"\n           FROM ntfy_subscriptions_entity\n           WHERE address = $1 AND \"deletedAt\" IS NULL\n           LIMIT 1",
+  "query": "SELECT\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            language AS \"language!\",\n            \"bestDiffNotificationsEnabled\" AS \"best_diff_notifications_enabled!\",\n            \"deviceNotificationsEnabled\" AS \"device_notifications_enabled!\",\n            \"hourlyStatsEnabled\" AS \"hourly_stats_enabled!\",\n            \"hourlyWorkersEnabled\" AS \"hourly_workers_enabled!\",\n            \"groupAdminNotificationsEnabled\" AS \"group_admin_notifications_enabled!\",\n            \"teamBestNotificationsEnabled\" AS \"team_best_notifications_enabled!\"\n           FROM ntfy_subscriptions_entity\n           WHERE \"deletedAt\" IS NULL\n             AND (\"hourlyStatsEnabled\" = true OR \"hourlyWorkersEnabled\" = true)",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "deleted_at?",
-        "type_info": "Int8",
-        "origin": {
-          "Table": {
-            "table": "ntfy_subscriptions_entity",
-            "name": "deletedAt"
-          }
-        }
-      },
-      {
-        "ordinal": 1,
         "name": "created_at!",
         "type_info": "Int8",
         "origin": {
@@ -26,7 +15,7 @@
         }
       },
       {
-        "ordinal": 2,
+        "ordinal": 1,
         "name": "updated_at!",
         "type_info": "Int8",
         "origin": {
@@ -37,7 +26,7 @@
         }
       },
       {
-        "ordinal": 3,
+        "ordinal": 2,
         "name": "id!",
         "type_info": "Int4",
         "origin": {
@@ -48,7 +37,7 @@
         }
       },
       {
-        "ordinal": 4,
+        "ordinal": 3,
         "name": "address!: AddressId",
         "type_info": "Varchar",
         "origin": {
@@ -59,7 +48,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 4,
         "name": "language!",
         "type_info": "Varchar",
         "origin": {
@@ -70,7 +59,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 5,
         "name": "best_diff_notifications_enabled!",
         "type_info": "Bool",
         "origin": {
@@ -81,7 +70,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 6,
         "name": "device_notifications_enabled!",
         "type_info": "Bool",
         "origin": {
@@ -92,7 +81,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 7,
         "name": "hourly_stats_enabled!",
         "type_info": "Bool",
         "origin": {
@@ -103,7 +92,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 8,
         "name": "hourly_workers_enabled!",
         "type_info": "Bool",
         "origin": {
@@ -114,7 +103,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 9,
         "name": "group_admin_notifications_enabled!",
         "type_info": "Bool",
         "origin": {
@@ -125,7 +114,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 10,
         "name": "team_best_notifications_enabled!",
         "type_info": "Bool",
         "origin": {
@@ -137,12 +126,9 @@
       }
     ],
     "parameters": {
-      "Left": [
-        "Text"
-      ]
+      "Left": []
     },
     "nullable": [
-      true,
       false,
       false,
       false,
@@ -156,5 +142,5 @@
       false
     ]
   },
-  "hash": "052cd5b482a06abe2c3c202a457607cd12c2b50d05a1a15a566d5e6ecd8b8745"
+  "hash": "9b1464be5b0a0eda87672bf9e8ac7b109b80c50b8df032bcb2e812a01c14c32c"
 }

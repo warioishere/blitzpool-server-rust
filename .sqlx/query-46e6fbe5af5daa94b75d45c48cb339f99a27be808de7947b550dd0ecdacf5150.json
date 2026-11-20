@@ -1,21 +1,10 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            \"currentDifficulty\" AS \"current_difficulty!\",\n            \"previousDifficulty\" AS \"previous_difficulty?\",\n            \"lastCheckedAt\" AS \"last_checked_at!\",\n            \"lastChangedAt\" AS \"last_changed_at?\"\n           FROM network_difficulty_tracker_entity WHERE id = 1 LIMIT 1",
+  "query": "SELECT\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            \"currentDifficulty\" AS \"current_difficulty!\",\n            \"previousDifficulty\" AS \"previous_difficulty?\",\n            \"lastCheckedAt\" AS \"last_checked_at!\"\n           FROM network_difficulty_tracker_entity WHERE id = 1 LIMIT 1",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "deleted_at?",
-        "type_info": "Int8",
-        "origin": {
-          "Table": {
-            "table": "network_difficulty_tracker_entity",
-            "name": "deletedAt"
-          }
-        }
-      },
-      {
-        "ordinal": 1,
         "name": "created_at!",
         "type_info": "Int8",
         "origin": {
@@ -26,7 +15,7 @@
         }
       },
       {
-        "ordinal": 2,
+        "ordinal": 1,
         "name": "updated_at!",
         "type_info": "Int8",
         "origin": {
@@ -37,7 +26,7 @@
         }
       },
       {
-        "ordinal": 3,
+        "ordinal": 2,
         "name": "id!",
         "type_info": "Int4",
         "origin": {
@@ -48,7 +37,7 @@
         }
       },
       {
-        "ordinal": 4,
+        "ordinal": 3,
         "name": "current_difficulty!",
         "type_info": "Float8",
         "origin": {
@@ -59,7 +48,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 4,
         "name": "previous_difficulty?",
         "type_info": "Float8",
         "origin": {
@@ -70,7 +59,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 5,
         "name": "last_checked_at!",
         "type_info": "Int8",
         "origin": {
@@ -79,32 +68,19 @@
             "name": "lastCheckedAt"
           }
         }
-      },
-      {
-        "ordinal": 7,
-        "name": "last_changed_at?",
-        "type_info": "Int8",
-        "origin": {
-          "Table": {
-            "table": "network_difficulty_tracker_entity",
-            "name": "lastChangedAt"
-          }
-        }
       }
     ],
     "parameters": {
       "Left": []
     },
     "nullable": [
-      true,
       false,
       false,
       false,
       false,
       true,
-      false,
-      true
+      false
     ]
   },
-  "hash": "66270e4803296e4b5d33f45ffc1c2e02bd746d1691773dad74c8d4b7e26c1b27"
+  "hash": "46e6fbe5af5daa94b75d45c48cb339f99a27be808de7947b550dd0ecdacf5150"
 }

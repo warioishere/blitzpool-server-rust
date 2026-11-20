@@ -108,8 +108,6 @@ pub struct PoolModeHashrateRow {
 
 #[derive(Clone, Debug, FromRow)]
 pub struct NetworkDifficultyTrackerRow {
-    #[sqlx(rename = "deletedAt")]
-    pub deleted_at: Option<i64>,
     #[sqlx(rename = "createdAt")]
     pub created_at: i64,
     #[sqlx(rename = "updatedAt")]
@@ -122,8 +120,6 @@ pub struct NetworkDifficultyTrackerRow {
     pub previous_difficulty: Option<f64>,
     #[sqlx(rename = "lastCheckedAt")]
     pub last_checked_at: i64,
-    #[sqlx(rename = "lastChangedAt")]
-    pub last_changed_at: Option<i64>,
 }
 
 /// Returns the singleton `network_difficulty_tracker_entity` row (constrained
@@ -134,14 +130,12 @@ pub async fn find_network_difficulty_tracker(
     sqlx::query_as!(
         NetworkDifficultyTrackerRow,
         r#"SELECT
-            "deletedAt" AS "deleted_at?",
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
             id AS "id!",
             "currentDifficulty" AS "current_difficulty!",
             "previousDifficulty" AS "previous_difficulty?",
-            "lastCheckedAt" AS "last_checked_at!",
-            "lastChangedAt" AS "last_changed_at?"
+            "lastCheckedAt" AS "last_checked_at!"
            FROM network_difficulty_tracker_entity WHERE id = 1 LIMIT 1"#,
     )
     .fetch_optional(pool)
@@ -150,8 +144,7 @@ pub async fn find_network_difficulty_tracker(
 }
 
 /// Upsert the singleton network-difficulty tracker. On a change the old value
-/// rotates into `previousDifficulty`; `lastChangedAt` is stamped only on a
-/// real change so the bot can suppress no-op pings.
+/// rotates into `previousDifficulty`.
 pub async fn upsert_network_difficulty_tracker(
     pool: &PgPool,
     new_current: f64,
@@ -160,8 +153,8 @@ pub async fn upsert_network_difficulty_tracker(
     sqlx::query!(
         r#"INSERT INTO network_difficulty_tracker_entity
            (id, "currentDifficulty", "previousDifficulty",
-            "lastCheckedAt", "lastChangedAt", "createdAt", "updatedAt")
-           VALUES (1, $1, NULL, $2, $2, $2, $2)
+            "lastCheckedAt", "createdAt", "updatedAt")
+           VALUES (1, $1, NULL, $2, $2, $2)
            ON CONFLICT (id) DO UPDATE SET
              "previousDifficulty" = CASE
                  WHEN network_difficulty_tracker_entity."currentDifficulty" <> EXCLUDED."currentDifficulty"
@@ -170,11 +163,6 @@ pub async fn upsert_network_difficulty_tracker(
              END,
              "currentDifficulty" = EXCLUDED."currentDifficulty",
              "lastCheckedAt" = EXCLUDED."lastCheckedAt",
-             "lastChangedAt" = CASE
-                 WHEN network_difficulty_tracker_entity."currentDifficulty" <> EXCLUDED."currentDifficulty"
-                 THEN EXCLUDED."lastCheckedAt"
-                 ELSE network_difficulty_tracker_entity."lastChangedAt"
-             END,
              "updatedAt" = EXCLUDED."updatedAt""#,
         new_current,
         now_ms,

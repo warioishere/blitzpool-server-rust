@@ -32,16 +32,10 @@ pub struct PplnsGroupRow {
     pub dissolved_at: Option<i64>,
     #[sqlx(rename = "roundResetIntervalDays")]
     pub round_reset_interval_days: Option<i32>,
-    #[sqlx(rename = "roundResetHourLocal")]
-    pub round_reset_hour_local: Option<i32>,
     #[sqlx(rename = "roundResetTimezone")]
     pub round_reset_timezone: Option<String>,
     #[sqlx(rename = "lastRoundResetAt")]
     pub last_round_reset_at: Option<i64>,
-    /// Fixed-satoshi finder bonus. Nothing reads it; the finder bonus is
-    /// `finder_bonus_ppm`.
-    #[sqlx(rename = "finderBonusSats")]
-    pub finder_bonus_sats: Option<Sats>,
     /// Finder bonus as a fraction of the miner cut, in parts-per-million.
     /// A proportion rather than an amount, so §4 pays it exactly at every
     /// template revenue — including a job-declaring client's own.
@@ -84,10 +78,8 @@ pub async fn find_group(pool: &PgPool, id: Uuid) -> Result<Option<PplnsGroupRow>
             "updatedAt" AS "updated_at!",
             "dissolvedAt" AS "dissolved_at?",
             "roundResetIntervalDays" AS "round_reset_interval_days?",
-            "roundResetHourLocal" AS "round_reset_hour_local?",
             "roundResetTimezone" AS "round_reset_timezone?",
             "lastRoundResetAt" AS "last_round_reset_at?",
-            "finderBonusSats" AS "finder_bonus_sats?: Sats",
             "finderBonusPpm" AS "finder_bonus_ppm?",
             "roundResetPreset" AS "round_reset_preset?",
             "isPublic" AS "is_public!",
@@ -480,10 +472,8 @@ where
             "updatedAt" AS "updated_at!",
             "dissolvedAt" AS "dissolved_at?",
             "roundResetIntervalDays" AS "round_reset_interval_days?",
-            "roundResetHourLocal" AS "round_reset_hour_local?",
             "roundResetTimezone" AS "round_reset_timezone?",
             "lastRoundResetAt" AS "last_round_reset_at?",
-            "finderBonusSats" AS "finder_bonus_sats?: Sats",
             "finderBonusPpm" AS "finder_bonus_ppm?",
             "roundResetPreset" AS "round_reset_preset?",
             "isPublic" AS "is_public!",
@@ -525,10 +515,8 @@ pub async fn find_pplns_group_by_name_not_dissolved(
             "updatedAt" AS "updated_at!",
             "dissolvedAt" AS "dissolved_at?",
             "roundResetIntervalDays" AS "round_reset_interval_days?",
-            "roundResetHourLocal" AS "round_reset_hour_local?",
             "roundResetTimezone" AS "round_reset_timezone?",
             "lastRoundResetAt" AS "last_round_reset_at?",
-            "finderBonusSats" AS "finder_bonus_sats?: Sats",
             "finderBonusPpm" AS "finder_bonus_ppm?",
             "roundResetPreset" AS "round_reset_preset?",
             "isPublic" AS "is_public!",
@@ -561,10 +549,8 @@ pub async fn list_active_pplns_groups(pool: &PgPool) -> Result<Vec<PplnsGroupRow
             "updatedAt" AS "updated_at!",
             "dissolvedAt" AS "dissolved_at?",
             "roundResetIntervalDays" AS "round_reset_interval_days?",
-            "roundResetHourLocal" AS "round_reset_hour_local?",
             "roundResetTimezone" AS "round_reset_timezone?",
             "lastRoundResetAt" AS "last_round_reset_at?",
-            "finderBonusSats" AS "finder_bonus_sats?: Sats",
             "finderBonusPpm" AS "finder_bonus_ppm?",
             "roundResetPreset" AS "round_reset_preset?",
             "isPublic" AS "is_public!",
@@ -656,14 +642,12 @@ where
 }
 
 /// Partial-update DTO for `update_round_reset_config`: `Untouched` keeps the
-/// column, `Clear` sets NULL or zero, `Set` overwrites. `hour_local` is always
-/// `Set(0)`: calendar resets fire at local midnight.
+/// column, `Clear` sets NULL or zero, `Set` overwrites.
 #[derive(Clone, Debug, Default)]
 pub struct RoundResetConfigPatch {
     pub preset: PatchField<String>,
     pub interval_days: PatchField<i32>,
     pub timezone: PatchField<String>,
-    pub hour_local: PatchField<i32>,
     pub finder_bonus_ppm: PatchField<i32>,
     pub is_public: PatchField<bool>,
     pub reset_round_on_block: PatchField<bool>,
@@ -693,7 +677,6 @@ pub async fn update_pplns_group_round_reset_config(
     let (preset_write, preset_clear, preset_value) = patch_triple_str(&patch.preset);
     let (interval_write, interval_clear, interval_value) = patch_triple_i32(&patch.interval_days);
     let (tz_write, tz_clear, tz_value) = patch_triple_str(&patch.timezone);
-    let (hour_write, hour_clear, hour_value) = patch_triple_i32(&patch.hour_local);
     let (bonus_write, bonus_clear, bonus_value) = patch_triple_i32(&patch.finder_bonus_ppm);
     let (public_write, _public_clear, public_value) = patch_triple_bool(&patch.is_public);
     let (reset_on_block_write, _reset_on_block_clear, reset_on_block_value) =
@@ -708,13 +691,12 @@ pub async fn update_pplns_group_round_reset_config(
              "roundResetPreset"       = CASE WHEN $2  THEN (CASE WHEN $3  THEN NULL::varchar  ELSE $4::varchar  END) ELSE "roundResetPreset"       END,
              "roundResetIntervalDays" = CASE WHEN $5  THEN (CASE WHEN $6  THEN NULL::int      ELSE $7::int      END) ELSE "roundResetIntervalDays" END,
              "roundResetTimezone"     = CASE WHEN $8  THEN (CASE WHEN $9  THEN NULL::varchar  ELSE $10::varchar END) ELSE "roundResetTimezone"     END,
-             "roundResetHourLocal"    = CASE WHEN $11 THEN (CASE WHEN $12 THEN NULL::int      ELSE $13::int     END) ELSE "roundResetHourLocal"    END,
-             "finderBonusPpm"         = CASE WHEN $14 THEN (CASE WHEN $15 THEN NULL::int      ELSE $16::int     END) ELSE "finderBonusPpm"         END,
-             "isPublic"               = CASE WHEN $17 THEN $18 ELSE "isPublic" END,
-             "resetRoundOnBlock"      = CASE WHEN $19 THEN $20 ELSE "resetRoundOnBlock" END,
-             "maxMembers"             = CASE WHEN $21 THEN (CASE WHEN $22 THEN NULL::int ELSE $23::int END) ELSE "maxMembers" END,
-             "coinbaseTag"            = CASE WHEN $25 THEN (CASE WHEN $26 THEN NULL::varchar ELSE $27::varchar END) ELSE "coinbaseTag" END,
-             "updatedAt"              = $24
+             "finderBonusPpm"         = CASE WHEN $11 THEN (CASE WHEN $12 THEN NULL::int      ELSE $13::int     END) ELSE "finderBonusPpm"         END,
+             "isPublic"               = CASE WHEN $14 THEN $15 ELSE "isPublic" END,
+             "resetRoundOnBlock"      = CASE WHEN $16 THEN $17 ELSE "resetRoundOnBlock" END,
+             "maxMembers"             = CASE WHEN $18 THEN (CASE WHEN $19 THEN NULL::int ELSE $20::int END) ELSE "maxMembers" END,
+             "coinbaseTag"            = CASE WHEN $22 THEN (CASE WHEN $23 THEN NULL::varchar ELSE $24::varchar END) ELSE "coinbaseTag" END,
+             "updatedAt"              = $21
            WHERE id = $1
            RETURNING
             id AS "id!",
@@ -726,10 +708,8 @@ pub async fn update_pplns_group_round_reset_config(
             "updatedAt" AS "updated_at!",
             "dissolvedAt" AS "dissolved_at?",
             "roundResetIntervalDays" AS "round_reset_interval_days?",
-            "roundResetHourLocal" AS "round_reset_hour_local?",
             "roundResetTimezone" AS "round_reset_timezone?",
             "lastRoundResetAt" AS "last_round_reset_at?",
-            "finderBonusSats" AS "finder_bonus_sats?: Sats",
             "finderBonusPpm" AS "finder_bonus_ppm?",
             "roundResetPreset" AS "round_reset_preset?",
             "isPublic" AS "is_public!",
@@ -747,9 +727,6 @@ pub async fn update_pplns_group_round_reset_config(
         tz_write,
         tz_clear,
         tz_value,
-        hour_write,
-        hour_clear,
-        hour_value,
         bonus_write,
         bonus_clear,
         bonus_value,

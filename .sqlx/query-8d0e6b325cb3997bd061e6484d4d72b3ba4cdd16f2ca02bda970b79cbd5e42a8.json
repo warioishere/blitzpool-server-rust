@@ -1,21 +1,10 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            endpoint AS \"endpoint!\",\n            platform AS \"platform!\",\n            \"lastNotificationAt\" AS \"last_notification_at?\",\n            \"bestDiffNotificationsEnabled\" AS \"best_diff_notifications_enabled!\",\n            \"deviceNotificationsEnabled\" AS \"device_notifications_enabled!\",\n            \"blockNotificationsEnabled\" AS \"block_notifications_enabled!\",\n            \"subscriptionType\" AS \"subscription_type!\",\n            \"networkDiffNotificationsEnabled\" AS \"network_diff_notifications_enabled!\",\n            \"groupAdminNotificationsEnabled\" AS \"group_admin_notifications_enabled!\"\n           FROM push_subscription_entity\n           WHERE address = $1 AND \"deletedAt\" IS NULL",
+  "query": "INSERT INTO push_subscription_entity (\n                address, endpoint, platform, \"subscriptionType\",\n                \"bestDiffNotificationsEnabled\", \"deviceNotificationsEnabled\",\n                \"blockNotificationsEnabled\", \"networkDiffNotificationsEnabled\",\n                \"createdAt\", \"updatedAt\"\n            )\n            VALUES ($1, $2, $3, $4, TRUE, TRUE, TRUE, TRUE, $5, $5)\n            ON CONFLICT (address, endpoint, \"subscriptionType\") DO UPDATE\n            SET platform = EXCLUDED.platform,\n                \"deletedAt\" = NULL,\n                \"updatedAt\" = $5\n            RETURNING\n                \"createdAt\" AS \"created_at!\",\n                \"updatedAt\" AS \"updated_at!\",\n                id AS \"id!\",\n                address AS \"address!: AddressId\",\n                endpoint AS \"endpoint!\",\n                platform AS \"platform!\",\n                \"lastNotificationAt\" AS \"last_notification_at?\",\n                \"bestDiffNotificationsEnabled\" AS \"best_diff_notifications_enabled!\",\n                \"deviceNotificationsEnabled\" AS \"device_notifications_enabled!\",\n                \"blockNotificationsEnabled\" AS \"block_notifications_enabled!\",\n                \"subscriptionType\" AS \"subscription_type!\",\n                \"networkDiffNotificationsEnabled\" AS \"network_diff_notifications_enabled!\",\n                \"groupAdminNotificationsEnabled\" AS \"group_admin_notifications_enabled!\"",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "deleted_at?",
-        "type_info": "Int8",
-        "origin": {
-          "Table": {
-            "table": "push_subscription_entity",
-            "name": "deletedAt"
-          }
-        }
-      },
-      {
-        "ordinal": 1,
         "name": "created_at!",
         "type_info": "Int8",
         "origin": {
@@ -26,7 +15,7 @@
         }
       },
       {
-        "ordinal": 2,
+        "ordinal": 1,
         "name": "updated_at!",
         "type_info": "Int8",
         "origin": {
@@ -37,7 +26,7 @@
         }
       },
       {
-        "ordinal": 3,
+        "ordinal": 2,
         "name": "id!",
         "type_info": "Int4",
         "origin": {
@@ -48,7 +37,7 @@
         }
       },
       {
-        "ordinal": 4,
+        "ordinal": 3,
         "name": "address!: AddressId",
         "type_info": "Varchar",
         "origin": {
@@ -59,7 +48,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 4,
         "name": "endpoint!",
         "type_info": "Text",
         "origin": {
@@ -70,7 +59,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 5,
         "name": "platform!",
         "type_info": "Varchar",
         "origin": {
@@ -81,7 +70,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 6,
         "name": "last_notification_at?",
         "type_info": "Int8",
         "origin": {
@@ -92,7 +81,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 7,
         "name": "best_diff_notifications_enabled!",
         "type_info": "Bool",
         "origin": {
@@ -103,7 +92,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 8,
         "name": "device_notifications_enabled!",
         "type_info": "Bool",
         "origin": {
@@ -114,7 +103,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 9,
         "name": "block_notifications_enabled!",
         "type_info": "Bool",
         "origin": {
@@ -125,7 +114,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 10,
         "name": "subscription_type!",
         "type_info": "Varchar",
         "origin": {
@@ -136,7 +125,7 @@
         }
       },
       {
-        "ordinal": 12,
+        "ordinal": 11,
         "name": "network_diff_notifications_enabled!",
         "type_info": "Bool",
         "origin": {
@@ -147,7 +136,7 @@
         }
       },
       {
-        "ordinal": 13,
+        "ordinal": 12,
         "name": "group_admin_notifications_enabled!",
         "type_info": "Bool",
         "origin": {
@@ -160,11 +149,14 @@
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Varchar",
+        "Text",
+        "Varchar",
+        "Varchar",
+        "Int8"
       ]
     },
     "nullable": [
-      true,
       false,
       false,
       false,
@@ -180,5 +172,5 @@
       false
     ]
   },
-  "hash": "da846d0368275a84f1b83f85817fc7f71303d82af46444d5722641f39de6f231"
+  "hash": "8d0e6b325cb3997bd061e6484d4d72b3ba4cdd16f2ca02bda970b79cbd5e42a8"
 }

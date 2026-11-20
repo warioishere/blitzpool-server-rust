@@ -47,7 +47,7 @@ pub enum GroupServiceError {
     InvalidPreset,
     #[error("invalid IANA timezone")]
     InvalidTimezone,
-    #[error("invalid finderBonusSats (range / sub-minPayout)")]
+    #[error("invalid finderBonusPpm (out of range)")]
     InvalidBonus,
     #[error(
         "invalid maxMembers (must be null, or an integer between 2 and what the coinbase can pay)"

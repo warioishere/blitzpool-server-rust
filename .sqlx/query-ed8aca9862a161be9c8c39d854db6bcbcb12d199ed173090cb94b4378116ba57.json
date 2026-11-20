@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "UPDATE pplns_group\n           SET\n             \"roundResetPreset\"       = CASE WHEN $2  THEN (CASE WHEN $3  THEN NULL::varchar  ELSE $4::varchar  END) ELSE \"roundResetPreset\"       END,\n             \"roundResetIntervalDays\" = CASE WHEN $5  THEN (CASE WHEN $6  THEN NULL::int      ELSE $7::int      END) ELSE \"roundResetIntervalDays\" END,\n             \"roundResetTimezone\"     = CASE WHEN $8  THEN (CASE WHEN $9  THEN NULL::varchar  ELSE $10::varchar END) ELSE \"roundResetTimezone\"     END,\n             \"roundResetHourLocal\"    = CASE WHEN $11 THEN (CASE WHEN $12 THEN NULL::int      ELSE $13::int     END) ELSE \"roundResetHourLocal\"    END,\n             \"finderBonusPpm\"         = CASE WHEN $14 THEN (CASE WHEN $15 THEN NULL::int      ELSE $16::int     END) ELSE \"finderBonusPpm\"         END,\n             \"isPublic\"               = CASE WHEN $17 THEN $18 ELSE \"isPublic\" END,\n             \"resetRoundOnBlock\"      = CASE WHEN $19 THEN $20 ELSE \"resetRoundOnBlock\" END,\n             \"maxMembers\"             = CASE WHEN $21 THEN (CASE WHEN $22 THEN NULL::int ELSE $23::int END) ELSE \"maxMembers\" END,\n             \"coinbaseTag\"            = CASE WHEN $25 THEN (CASE WHEN $26 THEN NULL::varchar ELSE $27::varchar END) ELSE \"coinbaseTag\" END,\n             \"updatedAt\"              = $24\n           WHERE id = $1\n           RETURNING\n            id AS \"id!\",\n            name AS \"name!\",\n            \"creatorAddress\" AS \"creator_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            active AS \"active!\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"roundResetIntervalDays\" AS \"round_reset_interval_days?\",\n            \"roundResetHourLocal\" AS \"round_reset_hour_local?\",\n            \"roundResetTimezone\" AS \"round_reset_timezone?\",\n            \"lastRoundResetAt\" AS \"last_round_reset_at?\",\n            \"finderBonusSats\" AS \"finder_bonus_sats?: Sats\",\n            \"finderBonusPpm\" AS \"finder_bonus_ppm?\",\n            \"roundResetPreset\" AS \"round_reset_preset?\",\n            \"isPublic\" AS \"is_public!\",\n            \"resetRoundOnBlock\" AS \"reset_round_on_block!\",\n            \"maxMembers\" AS \"max_members?\",\n            \"payoutMode\" AS \"payout_mode!: PayoutMode\",\n            \"coinbaseTag\" AS \"coinbase_tag?\"",
+  "query": "SELECT\n            id AS \"id!\",\n            name AS \"name!\",\n            \"creatorAddress\" AS \"creator_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            active AS \"active!\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"roundResetIntervalDays\" AS \"round_reset_interval_days?\",\n            \"roundResetTimezone\" AS \"round_reset_timezone?\",\n            \"lastRoundResetAt\" AS \"last_round_reset_at?\",\n            \"finderBonusPpm\" AS \"finder_bonus_ppm?\",\n            \"roundResetPreset\" AS \"round_reset_preset?\",\n            \"isPublic\" AS \"is_public!\",\n            \"resetRoundOnBlock\" AS \"reset_round_on_block!\",\n            \"maxMembers\" AS \"max_members?\",\n            \"payoutMode\" AS \"payout_mode!: PayoutMode\",\n            \"coinbaseTag\" AS \"coinbase_tag?\"\n           FROM pplns_group\n           WHERE name = $1 AND \"dissolvedAt\" IS NULL\n           LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -104,17 +104,6 @@
       },
       {
         "ordinal": 9,
-        "name": "round_reset_hour_local?",
-        "type_info": "Int4",
-        "origin": {
-          "Table": {
-            "table": "pplns_group",
-            "name": "roundResetHourLocal"
-          }
-        }
-      },
-      {
-        "ordinal": 10,
         "name": "round_reset_timezone?",
         "type_info": "Varchar",
         "origin": {
@@ -125,7 +114,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 10,
         "name": "last_round_reset_at?",
         "type_info": "Int8",
         "origin": {
@@ -136,18 +125,7 @@
         }
       },
       {
-        "ordinal": 12,
-        "name": "finder_bonus_sats?: Sats",
-        "type_info": "Int8",
-        "origin": {
-          "Table": {
-            "table": "pplns_group",
-            "name": "finderBonusSats"
-          }
-        }
-      },
-      {
-        "ordinal": 13,
+        "ordinal": 11,
         "name": "finder_bonus_ppm?",
         "type_info": "Int4",
         "origin": {
@@ -158,7 +136,7 @@
         }
       },
       {
-        "ordinal": 14,
+        "ordinal": 12,
         "name": "round_reset_preset?",
         "type_info": "Varchar",
         "origin": {
@@ -169,7 +147,7 @@
         }
       },
       {
-        "ordinal": 15,
+        "ordinal": 13,
         "name": "is_public!",
         "type_info": "Bool",
         "origin": {
@@ -180,7 +158,7 @@
         }
       },
       {
-        "ordinal": 16,
+        "ordinal": 14,
         "name": "reset_round_on_block!",
         "type_info": "Bool",
         "origin": {
@@ -191,7 +169,7 @@
         }
       },
       {
-        "ordinal": 17,
+        "ordinal": 15,
         "name": "max_members?",
         "type_info": "Int4",
         "origin": {
@@ -202,7 +180,7 @@
         }
       },
       {
-        "ordinal": 18,
+        "ordinal": 16,
         "name": "payout_mode!: PayoutMode",
         "type_info": "Varchar",
         "origin": {
@@ -213,7 +191,7 @@
         }
       },
       {
-        "ordinal": 19,
+        "ordinal": 17,
         "name": "coinbase_tag?",
         "type_info": "Varchar",
         "origin": {
@@ -226,33 +204,7 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Bool",
-        "Bool",
-        "Varchar",
-        "Bool",
-        "Bool",
-        "Int4",
-        "Bool",
-        "Bool",
-        "Varchar",
-        "Bool",
-        "Bool",
-        "Int4",
-        "Bool",
-        "Bool",
-        "Int4",
-        "Bool",
-        "Bool",
-        "Bool",
-        "Bool",
-        "Bool",
-        "Bool",
-        "Int4",
-        "Int8",
-        "Bool",
-        "Bool",
-        "Varchar"
+        "Text"
       ]
     },
     "nullable": [
@@ -269,8 +221,6 @@
       true,
       true,
       true,
-      true,
-      true,
       false,
       false,
       true,
@@ -278,5 +228,5 @@
       true
     ]
   },
-  "hash": "9301cb880dde5245d924139132304d9ed04d4d8575df4d2cfd3b673a1d854d57"
+  "hash": "ed8aca9862a161be9c8c39d854db6bcbcb12d199ed173090cb94b4378116ba57"
 }
