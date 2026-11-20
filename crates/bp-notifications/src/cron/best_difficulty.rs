@@ -19,6 +19,7 @@ use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
+use super::classify;
 use crate::dispatcher::NotificationDispatcher;
 
 /// Configuration for the best-diff cron. Default tick is 60 s;
@@ -37,41 +38,6 @@ impl Default for BestDifficultyCronConfig {
             tick_interval: Duration::from_secs(60),
             startup_offset: Duration::ZERO,
         }
-    }
-}
-
-/// What a single address-vs-tracker comparison resolves to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TrackerAction {
-    /// Push a notification (only on a strict increase over a known
-    /// baseline).
-    notify: bool,
-    /// Write the row back to `best_difficulty_tracker_entity`.
-    upsert: bool,
-}
-
-/// Compare the current persisted best against the tracked baseline. Only a
-/// strict increase over a known baseline notifies; a missing row is created
-/// silently, and a decrease (a best-difficulty reset) syncs the tracker down
-/// silently because `address_settings` is the source of truth.
-fn classify(current: f64, tracked: Option<f64>) -> TrackerAction {
-    match tracked {
-        None => TrackerAction {
-            notify: false,
-            upsert: true,
-        },
-        Some(prev) if current > prev => TrackerAction {
-            notify: true,
-            upsert: true,
-        },
-        Some(prev) if current < prev => TrackerAction {
-            notify: false,
-            upsert: true,
-        },
-        Some(_) => TrackerAction {
-            notify: false,
-            upsert: false,
-        },
     }
 }
 
@@ -161,37 +127,4 @@ async fn run_once(pool: &PgPool, dispatcher: &NotificationDispatcher) -> Result<
         dispatcher.notify_best_diff(&address, current).await;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn classify_initialises_silently_without_tracker() {
-        let a = classify(100.0, None);
-        assert!(a.upsert);
-        assert!(!a.notify);
-    }
-
-    #[test]
-    fn classify_notifies_on_strict_increase() {
-        let a = classify(150.0, Some(100.0));
-        assert!(a.upsert);
-        assert!(a.notify);
-    }
-
-    #[test]
-    fn classify_syncs_down_silently_on_decrease() {
-        let a = classify(50.0, Some(100.0));
-        assert!(a.upsert);
-        assert!(!a.notify);
-    }
-
-    #[test]
-    fn classify_noops_on_equal_value() {
-        let a = classify(100.0, Some(100.0));
-        assert!(!a.upsert);
-        assert!(!a.notify);
-    }
 }

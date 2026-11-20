@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT \"groupId\" AS \"group_id!\", \"bestDifficulty\" AS \"best_difficulty!\"\n           FROM team_best_tracker",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "group_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "team_best_tracker",
+            "name": "groupId"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "best_difficulty!",
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "team_best_tracker",
+            "name": "bestDifficulty"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "abe20eef993b67fa76e684c7f943a8730f0a9d10afbdf038f34a29731f9bf0ab"
+}

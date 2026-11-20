@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM team_best_tracker WHERE NOT (\"groupId\" = ANY($1))",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "45feb307cabec731073d52b2c385d0ba7516a723867bb33bd959be02687e0f67"
+}

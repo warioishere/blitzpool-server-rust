@@ -1385,3 +1385,55 @@ pub async fn find_team_best_ntfy_recipients(
         })
         .collect())
 }
+
+/// The Team best the team-best cron last announced or recorded, per Team.
+pub async fn find_team_best_trackers(pool: &PgPool) -> Result<Vec<(uuid::Uuid, f64)>, DbError> {
+    let rows = sqlx::query!(
+        r#"SELECT "groupId" AS "group_id!", "bestDifficulty" AS "best_difficulty!"
+           FROM team_best_tracker"#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.group_id, r.best_difficulty))
+        .collect())
+}
+
+pub async fn upsert_team_best_tracker(
+    pool: &PgPool,
+    group_id: uuid::Uuid,
+    best_difficulty: f64,
+    now_ms: i64,
+) -> Result<(), DbError> {
+    sqlx::query!(
+        r#"INSERT INTO team_best_tracker ("groupId", "bestDifficulty", "updatedAt")
+           VALUES ($1, $2, $3)
+           ON CONFLICT ("groupId") DO UPDATE SET
+             "bestDifficulty" = EXCLUDED."bestDifficulty",
+             "updatedAt" = EXCLUDED."updatedAt""#,
+        group_id,
+        best_difficulty,
+        now_ms,
+    )
+    .execute(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(())
+}
+
+/// Drops the rows of every Team not in `followed`. Returns how many went.
+pub async fn delete_team_best_trackers_except(
+    pool: &PgPool,
+    followed: &[uuid::Uuid],
+) -> Result<u64, DbError> {
+    let result = sqlx::query!(
+        r#"DELETE FROM team_best_tracker WHERE NOT ("groupId" = ANY($1))"#,
+        followed,
+    )
+    .execute(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(result.rows_affected())
+}

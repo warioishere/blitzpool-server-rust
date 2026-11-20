@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO team_best_tracker (\"groupId\", \"bestDifficulty\", \"updatedAt\")\n           VALUES ($1, $2, $3)\n           ON CONFLICT (\"groupId\") DO UPDATE SET\n             \"bestDifficulty\" = EXCLUDED.\"bestDifficulty\",\n             \"updatedAt\" = EXCLUDED.\"updatedAt\"",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Float8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9d668830f398632a46b8334dfd0e4572bb72a967e39ac781d522e9c9f430922a"
+}
