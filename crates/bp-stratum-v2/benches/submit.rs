@@ -15,7 +15,8 @@ use bp_share::{calculate_difficulty, Difficulty};
 use bp_stratum_v2::mining::channel::ChannelState;
 use bp_stratum_v2::mining::jobs::ExtendedJob;
 use bp_stratum_v2::mining::submit::{
-    validate_submit_extended, ExtendedChannelView, ExtranonceBytes, SubmitSharesExtendedInput,
+    validate_submit_extended, ExtendedChannelView, ExtranonceBytes, ShareValidation,
+    SubmitSharesExtendedInput,
 };
 use criterion::{BatchSize, Criterion, Throughput};
 
@@ -75,7 +76,8 @@ fn ext_job(merkle_depth: usize) -> ExtendedJob {
         version: 0x2000_0000,
         prev_hash: [0x11; 32],
         n_bits: 0x1d00_ffff,
-        min_ntime: 0,
+        // `ext_submission`'s ntime lies inside this job's window.
+        min_ntime: 0x6500_0000,
         // Trivially easy → target ≈ MAX → any hash meets it → Accepted.
         difficulty: Difficulty(1.0 / 4_294_967_296.0),
         coinbase_tx_value_remaining: 5_000_000_000,
@@ -119,6 +121,12 @@ fn run_validate(channel: &mut ChannelState, sub: &SubmitSharesExtendedInput, job
         1_000,
         false,
         false,
+    );
+    // Every measurement here is of an accepted share; a reject would time and
+    // count a shorter path.
+    assert!(
+        matches!(v, ShareValidation::Accepted(_)),
+        "the bench share must be accepted, got {v:?}"
     );
     black_box(&v);
 }
