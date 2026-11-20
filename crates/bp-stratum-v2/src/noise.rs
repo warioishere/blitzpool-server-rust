@@ -13,9 +13,7 @@ use tokio::net::TcpStream;
 
 // ── Re-exports — let consumers import via `crate::noise::*` ─────────
 
-pub use stratum_apps::network_helpers::noise_stream::{
-    NoiseTcpReadHalf, NoiseTcpStream, NoiseTcpWriteHalf,
-};
+pub use stratum_apps::network_helpers::noise_stream::{NoiseTcpStream, NoiseTcpWriteHalf};
 
 /// Errors from [`accept_pool_noise`]: the upstream
 /// [`stratum_apps::network_helpers::Error`] under a short pool-side alias.
@@ -51,6 +49,7 @@ impl NoiseConfig {
         &self.authority_pub
     }
 
+    #[cfg(test)]
     pub fn authority_prv(&self) -> &Secp256k1SecretKey {
         &self.authority_prv
     }
@@ -103,7 +102,6 @@ mod tests {
     fn accept_pool_noise_surface_type_compiles() {
         fn _assert_signature() {
             // Compile-time only.
-            #[allow(dead_code)]
             async fn _example(stream: TcpStream, cfg: &NoiseConfig) {
                 let _: Result<NoiseTcpStream, NoiseError> = accept_pool_noise(stream, cfg).await;
             }

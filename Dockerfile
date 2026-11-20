@@ -27,7 +27,6 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
         pkg-config \
-        libssl-dev \
         ca-certificates \
         capnproto \
         libcapnp-dev \
@@ -66,7 +65,6 @@ FROM debian:${DEBIAN_VERSION}-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
-        libssl3 \
         tini \
     && rm -rf /var/lib/apt/lists/*
 

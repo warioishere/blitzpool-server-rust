@@ -30,8 +30,6 @@ pub enum BlockpartyServiceError {
     InvalidName,
     #[error("address is invalid or missing")]
     InvalidAddress,
-    #[error("email is invalid or missing")]
-    InvalidEmail,
     #[error("percentBp out of range (must be 100..=10000)")]
     InvalidPercent,
     #[error("splits must sum to exactly 10000 (= 100 % of miner cut)")]
@@ -82,7 +80,6 @@ impl BlockpartyServiceError {
             Self::NotMember => "not-member",
             Self::InvalidName => "invalid-name",
             Self::InvalidAddress => "invalid-address",
-            Self::InvalidEmail => "invalid-email",
             Self::InvalidPercent => "invalid-percent",
             Self::InvalidSplitsSum => "invalid-splits-sum",
             Self::InvalidState => "invalid-state",

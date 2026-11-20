@@ -85,7 +85,7 @@ async fn dissolving_a_team_drops_its_members_cached_mode() {
 
     let mut state = AppState::new(pool.clone(), "0.0.0");
     let svc = Arc::new(
-        GroupService::load(pool.clone(), Arc::new(NoopHooks), 14, 10_000)
+        GroupService::load(pool.clone(), Arc::new(NoopHooks), 10_000)
             .await
             .expect("load group service"),
     );

@@ -60,7 +60,6 @@ pub struct GroupService {
     pool: PgPool,
     hooks: Arc<dyn GroupServiceHooks>,
     address_cache: AddressCache,
-    kick_inactivity_days: u32,
     /// HARD member ceiling: how many payout outputs the Group-Solo coinbase
     /// can carry. Past it the blockspace cut silently drops members from the
     /// coinbase, so refusing the join is what lets Group-Solo run without a
@@ -85,14 +84,12 @@ impl GroupService {
     pub async fn load(
         pool: PgPool,
         hooks: Arc<dyn GroupServiceHooks>,
-        kick_inactivity_days: u32,
         coinbase_max_members: u64,
     ) -> Result<Self, GroupServiceError> {
         let service = Self {
             pool,
             hooks,
             address_cache: AddressCache::new(),
-            kick_inactivity_days,
             coinbase_max_members,
             blockparty_reader: Arc::new(std::sync::OnceLock::new()),
             change_notifier: Arc::new(std::sync::OnceLock::new()),
@@ -312,19 +309,6 @@ impl GroupService {
             admin_token: admin.into_inner(),
         })
     }
-
-    /// Admin path to add a new member: verifies the token then
-    /// delegates to [`Self::add_member_without_admin`].
-    pub async fn add_member(
-        &self,
-        group_id: Uuid,
-        address: &str,
-        token: Option<&str>,
-    ) -> Result<PplnsGroupMemberRow, GroupServiceError> {
-        self.require_admin_token(group_id, token).await?;
-        self.add_member_without_admin(group_id, address).await
-    }
-
     /// Add a member bypassing the admin-token check. Used by the
     /// invitation accept + open-invite accept + join-request approve
     /// flows once they've established authorization through a
@@ -377,7 +361,7 @@ impl GroupService {
     }
 
     /// Admin path to remove a non-creator member. Enforces the
-    /// kick-inactivity window (`kick_inactivity_days`) and runs Redis
+    /// kick-inactivity window (`KICK_INACTIVITY_DAYS`) and runs Redis
     /// cleanup AFTER the member row is deleted so a Redis failure
     /// cannot leave the DB state inconsistent.
     pub async fn remove_member(
@@ -403,9 +387,9 @@ impl GroupService {
         let reference = last_active.unwrap_or(member.joined_at);
         let now = now_ms();
         let days_since = (now - reference).max(0) as f64 / MS_PER_DAY as f64;
-        if days_since < self.kick_inactivity_days as f64 {
+        if days_since < bp_group_mgmt::KICK_INACTIVITY_DAYS as f64 {
             return Err(GroupServiceError::MemberStillActive {
-                required_days: self.kick_inactivity_days,
+                required_days: bp_group_mgmt::KICK_INACTIVITY_DAYS,
                 actual_days: days_since,
             });
         }

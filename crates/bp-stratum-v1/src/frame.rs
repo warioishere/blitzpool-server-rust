@@ -108,11 +108,9 @@ impl<'de> Deserialize<'de> for RpcId {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SubscribeRequest {
     pub id: RpcId,
-    /// `None` when the client sent `params: []` (Braiins-style probe).
-    pub raw_user_agent: Option<String>,
     /// Normalised label for behaviour dispatch and stats, see
-    /// [`bp_common::recorded_user_agent`]; `"unknown"` when `raw_user_agent`
-    /// is absent or normalises to nothing.
+    /// [`bp_common::recorded_user_agent`]; `"unknown"` when the client sent
+    /// none (`params: []`, a Braiins-style probe) or it normalises to nothing.
     pub user_agent: String,
 }
 
@@ -190,7 +188,6 @@ pub struct AuthorizeRequest {
     /// Substring after the first `.`, cleaned by
     /// [`bp_common::worker_name`].
     pub worker: String,
-    pub password: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -232,11 +229,9 @@ pub enum SV1Request<'a> {
     Submit(SubmitRequest<'a>),
     /// `mining.extranonce.subscribe`.
     ExtranonceSubscribe(RpcId),
-    /// Any other `method`, kept for diagnostic logging.
-    Other {
-        id: RpcId,
-        method: String,
-    },
+    /// Any other `method`, or valid JSON that is not a request object;
+    /// ignored.
+    Other,
 }
 
 // ── Parse errors ─────────────────────────────────────────────────────
@@ -388,10 +383,7 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
             // Not JSON at all is connection-fatal; valid JSON that is not a
             // request object is tolerated as `Other`.
             return match serde_json::from_str::<&RawValue>(trimmed) {
-                Ok(_) => Ok(SV1Request::Other {
-                    id: RpcId::Null,
-                    method: String::new(),
-                }),
+                Ok(_) => Ok(SV1Request::Other),
                 Err(_) => Err(FrameParseError::InvalidJson),
             };
         }
@@ -464,11 +456,7 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
             let arr = params.unwrap().as_array().unwrap();
             let raw_ua = arr.first().and_then(|v| v.as_str()).map(String::from);
             let user_agent = bp_common::recorded_user_agent(raw_ua.as_deref());
-            Ok(SV1Request::Subscribe(SubscribeRequest {
-                id,
-                raw_user_agent: raw_ua,
-                user_agent,
-            }))
+            Ok(SV1Request::Subscribe(SubscribeRequest { id, user_agent }))
         }
         "mining.configure" => {
             if !id_present || !params.is_some_and(|p| p.is_array()) {
@@ -505,13 +493,11 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
             let (address, worker) = bp_common::split_user_identity(&raw_username);
             let address = address.to_string();
             let worker = bp_common::worker_name(worker);
-            let password = arr.get(1).and_then(|v| v.as_str()).map(String::from);
             Ok(SV1Request::Authorize(AuthorizeRequest {
                 id,
                 raw_username,
                 address,
                 worker,
-                password,
             }))
         }
         "mining.suggest_difficulty" => {
@@ -540,10 +526,7 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
             }
         }
         "mining.extranonce.subscribe" => Ok(SV1Request::ExtranonceSubscribe(id)),
-        other => Ok(SV1Request::Other {
-            id,
-            method: other.to_string(),
-        }),
+        _ => Ok(SV1Request::Other),
     }
 }
 
@@ -719,7 +702,6 @@ mod tests {
         match req {
             SV1Request::Subscribe(s) => {
                 assert_eq!(s.id, RpcId::from(1));
-                assert_eq!(s.raw_user_agent.as_deref(), Some("cgminer/4.11.1"));
                 assert_eq!(s.user_agent, "cgminer");
             }
             other => panic!("expected Subscribe, got {:?}", other),
@@ -731,7 +713,6 @@ mod tests {
         let req = parse_request(r#"{"id":1,"method":"mining.subscribe","params":[]}"#).expect("ok");
         match req {
             SV1Request::Subscribe(s) => {
-                assert!(s.raw_user_agent.is_none());
                 assert_eq!(s.user_agent, "unknown");
             }
             other => panic!("expected Subscribe, got {:?}", other),
@@ -746,7 +727,6 @@ mod tests {
             let line = format!(r#"{{"id":1,"method":"mining.subscribe","params":["{ua}"]}}"#);
             match parse_request(&line).expect("ok") {
                 SV1Request::Subscribe(s) => {
-                    assert_eq!(s.raw_user_agent.as_deref(), Some(ua));
                     assert_eq!(s.user_agent, "unknown", "raw {ua:?}");
                 }
                 other => panic!("expected Subscribe, got {:?}", other),
@@ -834,7 +814,6 @@ mod tests {
                 assert_eq!(a.raw_username, "bc1qaddress.worker1");
                 assert_eq!(a.address, "bc1qaddress");
                 assert_eq!(a.worker, "worker1");
-                assert_eq!(a.password.as_deref(), Some("x"));
             }
             other => panic!("expected Authorize, got {:?}", other),
         }
@@ -1125,7 +1104,7 @@ mod tests {
         // A top-level array is valid JSON but not a request envelope — the
         // lenient catch-all keeps the connection alive (no InvalidJson).
         let req = parse_request("[1,2,3]").expect("ok");
-        assert!(matches!(req, SV1Request::Other { .. }));
+        assert!(matches!(req, SV1Request::Other));
     }
 
     #[test]
@@ -1158,13 +1137,7 @@ mod tests {
     fn parse_unknown_method_goes_to_other() {
         let req =
             parse_request(r#"{"id":7,"method":"mining.fancy_new_thing","params":[]}"#).expect("ok");
-        match req {
-            SV1Request::Other { id, method } => {
-                assert_eq!(id, RpcId::from(7));
-                assert_eq!(method, "mining.fancy_new_thing");
-            }
-            _ => unreachable!(),
-        }
+        assert!(matches!(req, SV1Request::Other));
     }
 
     #[test]

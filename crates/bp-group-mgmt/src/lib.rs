@@ -12,17 +12,14 @@ pub mod join_request;
 pub mod token;
 
 pub use constants::{
-    DEFAULT_KICK_INACTIVITY_DAYS, JOIN_REQUEST_PENDING_EXPIRY_DAYS, MAX_FINDER_BONUS_PPM,
+    JOIN_REQUEST_PENDING_EXPIRY_DAYS, KICK_INACTIVITY_DAYS, MAX_FINDER_BONUS_PPM,
     MAX_GROUP_NAME_LEN, MAX_JOIN_REQUEST_MESSAGE_LEN, MAX_RESET_INTERVAL_DAYS, MIN_GROUP_NAME_LEN,
     MS_PER_DAY,
 };
 pub use group::{
-    kick_eligibility, validate_round_reset, GroupName, GroupNameError, KickEligibility, MemberRole,
-    RoundResetConfig, RoundResetError, RoundResetPreset,
+    validate_round_reset, GroupName, GroupNameError, MemberRole, RoundResetConfig, RoundResetError,
+    RoundResetPreset,
 };
 pub use invitation::OPEN_INVITE_TYPE;
-pub use join_request::{
-    can_decide, is_stale, stale_cutoff_ms, validate_message, JoinRequestMessageError,
-    JoinRequestStatus, JoinRequestTransitionError,
-};
+pub use join_request::JoinRequestStatus;
 pub use token::{AdminToken, InvitationToken, TokenError, TokenHash};

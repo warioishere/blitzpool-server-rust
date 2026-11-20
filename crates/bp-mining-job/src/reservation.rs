@@ -10,7 +10,7 @@ use bp_template_distribution::TdpCoinbaseConstraints;
 /// Headroom over the byte-equivalent of a coinbase weight budget, so a
 /// mismatch between the pre-trim weight estimate and the serialised size
 /// never yields a coinbase larger than bitcoin-core reserved.
-pub const COINBASE_SIZE_HEADROOM_BYTES: u32 = 256;
+pub(crate) const COINBASE_SIZE_HEADROOM_BYTES: u32 = 256;
 
 /// Serialised size of a P2PKH output: value 8, script length 1, script 25.
 const P2PKH_OUTPUT_BYTES: u32 = 34;

@@ -3300,7 +3300,7 @@ pub(crate) mod tests {
             };
             let out = handle_submit_shares_extended(&mut s, &sub, 0);
             match out.events.first() {
-                Some(SessionEvent::ShareAccepted { accept, .. }) => accept.hash,
+                Some(SessionEvent::ShareAccepted { accept, .. }) => sha256d(&accept.header),
                 other => panic!("expected ShareAccepted, got {other:?}"),
             }
         }

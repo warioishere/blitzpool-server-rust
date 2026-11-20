@@ -59,7 +59,7 @@ async fn cleanup_group(pool: &PgPool, group_id: Uuid) {
 
 async fn build_services(pool: PgPool) -> (Arc<GroupService>, InvitationService) {
     let group = Arc::new(
-        GroupService::load(pool.clone(), Arc::new(NoopHooks), 14, TEST_COINBASE_CAP)
+        GroupService::load(pool.clone(), Arc::new(NoopHooks), TEST_COINBASE_CAP)
             .await
             .expect("load group service"),
     );

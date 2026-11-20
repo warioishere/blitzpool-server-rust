@@ -63,10 +63,12 @@ impl GroupChannelRegistry {
         }
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.groups.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.groups.is_empty()
     }
@@ -159,6 +161,7 @@ impl GroupChannelRegistry {
             .map(GroupChannel::alloc_job_id)
     }
 
+    #[cfg(test)]
     pub fn iter(&self) -> impl Iterator<Item = (u32, &GroupChannel)> {
         self.groups.iter().map(|(&id, g)| (id, g))
     }

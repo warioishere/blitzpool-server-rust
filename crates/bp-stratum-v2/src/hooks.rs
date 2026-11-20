@@ -343,7 +343,6 @@ mod tests {
     use super::test_support::RecordingHooks;
     use super::*;
     use crate::mining::submit::RejectReason;
-    use bp_jobs_lifecycle::JobClassification;
     use bp_share::Difficulty;
 
     fn make_addr() -> AddressId {
@@ -353,11 +352,9 @@ mod tests {
     fn make_accept() -> ShareAccept {
         ShareAccept {
             payouts_fingerprint: [0u8; 32],
-            classification: JobClassification::Active,
             effective_difficulty: Difficulty(1024.0),
             submission_difficulty: Difficulty(2048.0),
             header: [0u8; 80],
-            hash: [0u8; 32],
             is_block_candidate: false,
             template_id: None,
             jdp_claims_the_block: false,

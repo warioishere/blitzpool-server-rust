@@ -85,46 +85,6 @@ impl std::str::FromStr for MemberRole {
 #[cfg(feature = "sqlx")]
 bp_common::impl_pg_text_enum!(MemberRole);
 
-// ─── Kick-eligibility ───────────────────────────────────────────────────────
-
-/// Outcome of [`kick_eligibility`]. Differentiates "can be kicked" from
-/// "still active" so the caller can produce a precise error message.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum KickEligibility {
-    Eligible,
-    StillActive {
-        days_since_last_active: f64,
-        required_days: u32,
-    },
-    /// Caller passed a creator role to a remove path that doesn't support
-    /// it. Surfaced separately because the UI shows a different message.
-    CannotKickCreator,
-}
-
-/// Whether a member may be removed. A creator never can (transfer or
-/// dissolve first); `last_active_ms` is the latest accepted share, or
-/// `joined_at` if the member never mined.
-pub fn kick_eligibility(
-    role: MemberRole,
-    last_active_ms: i64,
-    now_ms: i64,
-    inactivity_threshold_days: u32,
-) -> KickEligibility {
-    if role == MemberRole::Creator {
-        return KickEligibility::CannotKickCreator;
-    }
-    let elapsed_ms = (now_ms - last_active_ms).max(0);
-    let days_since = elapsed_ms as f64 / MS_PER_DAY as f64;
-    if days_since < inactivity_threshold_days as f64 {
-        KickEligibility::StillActive {
-            days_since_last_active: days_since,
-            required_days: inactivity_threshold_days,
-        }
-    } else {
-        KickEligibility::Eligible
-    }
-}
-
 // ─── Round-reset configuration ──────────────────────────────────────────────
 
 /// Round-reset cadence preset. Stored as a varchar in
@@ -321,63 +281,6 @@ mod tests {
     fn name_accepts_unicode() {
         let n = GroupName::new("Pool 🦀 Group").expect("valid");
         assert_eq!(n.as_str(), "Pool 🦀 Group");
-    }
-
-    // ── Kick eligibility ─────────────────────────────────────────────
-
-    #[test]
-    fn creator_never_kickable() {
-        let e = kick_eligibility(MemberRole::Creator, 0, 1_000 * MS_PER_DAY, 14);
-        assert_eq!(e, KickEligibility::CannotKickCreator);
-    }
-
-    #[test]
-    fn long_idle_member_is_eligible() {
-        let last = 0;
-        let now = 100 * MS_PER_DAY;
-        let e = kick_eligibility(MemberRole::Member, last, now, 14);
-        assert_eq!(e, KickEligibility::Eligible);
-    }
-
-    #[test]
-    fn recently_active_member_blocked() {
-        let last = 1_000 * MS_PER_DAY;
-        let now = last + 7 * MS_PER_DAY;
-        let e = kick_eligibility(MemberRole::Member, last, now, 14);
-        match e {
-            KickEligibility::StillActive {
-                days_since_last_active,
-                required_days,
-            } => {
-                assert!((days_since_last_active - 7.0).abs() < 0.001);
-                assert_eq!(required_days, 14);
-            }
-            _ => panic!("expected StillActive"),
-        }
-    }
-
-    #[test]
-    fn negative_elapsed_clamped_to_zero() {
-        // Pathological clock-skew case: last_active in the future.
-        let last = 2_000 * MS_PER_DAY;
-        let now = 1_000 * MS_PER_DAY;
-        let e = kick_eligibility(MemberRole::Member, last, now, 14);
-        match e {
-            KickEligibility::StillActive {
-                days_since_last_active,
-                ..
-            } => assert_eq!(days_since_last_active, 0.0),
-            _ => panic!("expected StillActive"),
-        }
-    }
-
-    #[test]
-    fn exact_threshold_is_eligible() {
-        // `>= threshold` is eligible.
-        let last = 0;
-        let now = 14 * MS_PER_DAY;
-        let e = kick_eligibility(MemberRole::Member, last, now, 14);
-        assert_eq!(e, KickEligibility::Eligible);
     }
 
     // ── Round-reset config ───────────────────────────────────────────

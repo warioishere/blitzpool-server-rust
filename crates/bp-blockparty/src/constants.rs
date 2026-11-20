@@ -13,7 +13,6 @@ pub const TOTAL_PERCENT_BP: i32 = 10_000;
 
 pub const NAME_MIN_LEN: usize = 3;
 pub const NAME_MAX_LEN: usize = 64;
-pub const EMAIL_MAX_LEN: usize = 320;
 
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
 

@@ -51,7 +51,7 @@ async fn blockparty_ready_party_pays_members_and_history_is_idempotent() {
 
     let svc = service(&pg, &addr_fee).await;
 
-    // ── Lifecycle: create → add_member → confirm → READY ────────
+    // ── Lifecycle: create → join → split → confirm → READY ────────
     let create = svc
         .create_group(&name, &addr_admin, 6_000)
         .await
@@ -59,15 +59,28 @@ async fn blockparty_ready_party_pays_members_and_history_is_idempotent() {
     assert_eq!(create.group.status, BlockpartyStatus::Draft);
     let group_id = create.group.id;
 
-    svc.add_member(group_id, &addr_bob, 4_000, Some(&create.admin_token))
+    let link = svc
+        .create_join_link(
+            group_id,
+            bp_group_mgmt_engine::OpenInviteTtl::SevenDays,
+            Some(&create.admin_token),
+        )
         .await
-        .expect("add_member");
+        .expect("create_join_link");
+    let (bob_token, _) = svc
+        .join_via_link(&link, &addr_bob)
+        .await
+        .expect("join_via_link");
+    let bob = AddressId::new(addr_bob.clone()).unwrap();
+    svc.update_splits(group_id, &[(bob.clone(), 4_000)], Some(&create.admin_token))
+        .await
+        .expect("update_splits");
     let g = svc.get_group(group_id).await.unwrap().unwrap();
     assert_eq!(g.status, BlockpartyStatus::Confirming);
 
-    svc.mark_member_confirmed(group_id, &AddressId::new(addr_bob.clone()).unwrap())
+    svc.confirm_as_member(group_id, &bob, Some(&bob_token))
         .await
-        .expect("mark_member_confirmed");
+        .expect("confirm_as_member");
     let g = svc.get_group(group_id).await.unwrap().unwrap();
     assert_eq!(
         g.status,

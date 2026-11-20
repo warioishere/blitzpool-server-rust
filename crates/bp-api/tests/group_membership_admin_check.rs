@@ -74,7 +74,7 @@ async fn group_solo_membership_and_admin_check() {
         .execute(&pool)
         .await;
     let svc = Arc::new(
-        GroupService::load(pool.clone(), Arc::new(NoopHooks), 14, 10_000)
+        GroupService::load(pool.clone(), Arc::new(NoopHooks), 10_000)
             .await
             .expect("load group service"),
     );

@@ -172,9 +172,8 @@ impl StratumV2MiningServer {
         self.inner.templates.current()
     }
 
-    /// Subscribe to template broadcasts. Each subscriber sees its own
-    /// copy. Used by tests + the per-connection task; production
-    /// `accept_connection` does this internally.
+    /// A receiver of the template broadcasts a connection gets.
+    #[cfg(test)]
     pub fn subscribe_templates(&self) -> broadcast::Receiver<TemplateBroadcast> {
         self.inner.templates.subscribe()
     }
@@ -1221,18 +1220,9 @@ async fn resolve_template_mining_job_inputs(
     })
 }
 
-/// Fan each [`SessionEvent`] out to its hook; no socket writes.
-pub(crate) async fn apply_session_events(
-    events: Vec<SessionEvent>,
-    session_id_hex: &str,
-    state: &MiningSessionState<SystemClock>,
-    hooks: &MiningServerHooks,
-) {
-    apply_session_events_generic(events, session_id_hex, state, hooks).await;
-}
-
-/// Generic over the clock so unit tests can drive it with a `TestClock`.
-pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
+/// Fan each [`SessionEvent`] out to its hook; no socket writes. Generic over
+/// the clock so unit tests can drive it with a `TestClock`.
+pub(crate) async fn apply_session_events<C: bp_vardiff::Clock>(
     events: Vec<SessionEvent>,
     session_id_hex: &str,
     state: &MiningSessionState<C>,
@@ -1403,7 +1393,6 @@ mod tests {
     use crate::mining::channel::ChannelState;
     use crate::mining::client::SessionEvent;
     use crate::mining::submit::{RejectReason, ShareAccept, ShareReject};
-    use bp_jobs_lifecycle::JobClassification;
     use bp_share::Difficulty;
     use bp_template_distribution::{NewTemplate, SetNewPrevHash};
     use bp_vardiff::TestClock;
@@ -1844,11 +1833,9 @@ mod tests {
     fn accept() -> ShareAccept {
         ShareAccept {
             payouts_fingerprint: [0u8; 32],
-            classification: JobClassification::Active,
             effective_difficulty: Difficulty(1024.0),
             submission_difficulty: Difficulty(2048.0),
             header: [0u8; 80],
-            hash: [0u8; 32],
             is_block_candidate: false,
             template_id: None,
             jdp_claims_the_block: false,
@@ -1881,7 +1868,7 @@ mod tests {
             channel_id: 1,
             accept: Box::new(accept()),
         }];
-        apply_session_events_generic(events, "sess-1", &state, &hooks).await;
+        apply_session_events(events, "sess-1", &state, &hooks).await;
         let records = recording.accepted.lock().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].address, ADDR);
@@ -1902,7 +1889,7 @@ mod tests {
         state.channels.insert(2, channel(2, "0000000b", "rig2"));
         let mut block = accept();
         block.is_block_candidate = true;
-        apply_session_events_generic(
+        apply_session_events(
             vec![SessionEvent::ShareAccepted {
                 channel_id: 2,
                 accept: Box::new(block),
@@ -1929,7 +1916,7 @@ mod tests {
         let recording = RecordingHooks::new();
         let hooks = recording.clone().into_server_hooks();
         let state = fresh_session_with_address();
-        apply_session_events_generic(
+        apply_session_events(
             vec![SessionEvent::ChannelClosed {
                 channel_id: 2,
                 session_id: "0000000b".to_string(),
@@ -1961,7 +1948,7 @@ mod tests {
             channel_id: 1,
             accept: Box::new(a),
         }];
-        apply_session_events_generic(events, "sess-1", &state, &hooks).await;
+        apply_session_events(events, "sess-1", &state, &hooks).await;
         assert_eq!(recording.accepted.lock().unwrap().len(), 1);
         assert_eq!(recording.blocks_submitted.lock().unwrap().len(), 1);
     }
@@ -1987,7 +1974,7 @@ mod tests {
             channel_id: 1,
             reject: ShareReject::from(RejectReason::StaleShare),
         }];
-        apply_session_events_generic(events, "sess-1", &state, &hooks).await;
+        apply_session_events(events, "sess-1", &state, &hooks).await;
         let records = recording.rejected.lock().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].reason, bp_share_hook::RejectedReason::Stale);
@@ -2018,7 +2005,7 @@ mod tests {
             channel_id: 1,
             reject: ShareReject::from(RejectReason::StaleShare),
         }];
-        apply_session_events_generic(events, "sess-1", &state, &hooks).await;
+        apply_session_events(events, "sess-1", &state, &hooks).await;
         assert_eq!(recording.rejected.lock().unwrap()[0].difficulty, 4096.0);
     }
 
@@ -2034,7 +2021,7 @@ mod tests {
             worker: "worker-7".to_string(),
             kind: crate::mining::channel::ChannelKind::Standard,
         }];
-        apply_session_events_generic(events, "sess-1", &state, &hooks).await;
+        apply_session_events(events, "sess-1", &state, &hooks).await;
         // No register from this layer.
         assert!(recording.registered.lock().unwrap().is_empty());
         // Device-online event fired (address is the session's locked one).
@@ -2054,7 +2041,7 @@ mod tests {
         let recording = RecordingHooks::new();
         let hooks = recording.clone().into_server_hooks();
         let state = fresh_session_with_address();
-        apply_session_events_generic(Vec::new(), "sess-1", &state, &hooks).await;
+        apply_session_events(Vec::new(), "sess-1", &state, &hooks).await;
         assert!(recording.accepted.lock().unwrap().is_empty());
         assert!(recording.rejected.lock().unwrap().is_empty());
         assert!(recording.registered.lock().unwrap().is_empty());

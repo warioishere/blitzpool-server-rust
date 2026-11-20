@@ -33,7 +33,7 @@ pub trait GroupServiceHooks: Send + Sync {
     async fn on_group_dissolved(&self, group_id: Uuid);
 }
 
-/// Lets `create_group` and `add_member` refuse an address already in a
+/// Lets `create_group` and `add_member_without_admin` refuse an address already in a
 /// Blockparty, mirroring the Blockparty side's group-membership check.
 /// Without Blockparty it stays unwired and the check short-circuits.
 #[async_trait]

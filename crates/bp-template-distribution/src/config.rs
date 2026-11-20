@@ -10,21 +10,21 @@ use bitcoin_core_sv2::runtime_api::BitcoinCoreVersion;
 /// Short enough that a bitcoind restart is transparent to miners (the last
 /// template stays live), long enough that a hard-down core doesn't spin the
 /// reconnect loop hot.
-pub const DEFAULT_RECONNECT_BACKOFF_SECS: u64 = 2;
+pub(crate) const DEFAULT_RECONNECT_BACKOFF_SECS: u64 = 2;
 
 /// Mempool fee delta in sats that triggers a fresh `NewTemplate`: one template
 /// per meaningful fee bump, not per noise.
-pub const DEFAULT_FEE_THRESHOLD: u64 = 100_000;
+pub(crate) const DEFAULT_FEE_THRESHOLD: u64 = 100_000;
 
 /// Minimum seconds between two non-tip `NewTemplate`s; chain-tip updates
 /// always go out immediately.
-pub const DEFAULT_MIN_INTERVAL_SECS: u8 = 10;
+pub(crate) const DEFAULT_MIN_INTERVAL_SECS: u8 = 10;
 
 /// Outbound broadcast buffer; a subscriber further behind gets `RecvError::Lagged`.
-pub const DEFAULT_BROADCAST_CAPACITY: usize = 64;
+pub(crate) const DEFAULT_BROADCAST_CAPACITY: usize = 64;
 
 /// Bounded so pool requests feel back-pressure when the worker stalls.
-pub const DEFAULT_SUBMIT_CAPACITY: usize = 32;
+pub(crate) const DEFAULT_SUBMIT_CAPACITY: usize = 32;
 
 /// IPC schema spoken to bitcoin-core when the operator names no release.
 pub const DEFAULT_BITCOIN_CORE_VERSION: BitcoinCoreVersion = BitcoinCoreVersion::V32X;
@@ -107,6 +107,7 @@ impl TdpConfig {
         self
     }
 
+    #[cfg(test)]
     pub fn with_submit_capacity(mut self, capacity: usize) -> Self {
         self.submit_capacity = capacity;
         self

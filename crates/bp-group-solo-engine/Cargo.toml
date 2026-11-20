@@ -30,8 +30,6 @@ bp-inflight-cache = { workspace = true }
 bp-share = { workspace = true }
 bp-cron-utils = { workspace = true }
 uuid = { workspace = true }
-# Snapshot key encoding (payout-list fingerprint → hex).
-hex = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
@@ -51,7 +49,6 @@ thiserror = { workspace = true }
 
 # Snapshot serialization
 serde = { workspace = true }
-serde_json = { workspace = true }
 
 [dev-dependencies]
 bp-test-support = { workspace = true }

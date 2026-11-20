@@ -177,8 +177,6 @@ impl Authorization {
 /// hooks from these without re-deriving state.
 #[derive(Debug)]
 pub(crate) enum SessionEvent {
-    /// Diagnostic only; no hooks fire on it.
-    Subscribed,
     Authorized {
         address: AddressId,
         worker: String,
@@ -257,7 +255,7 @@ pub(crate) fn dispatch<C: Clock>(
         }
         SV1Request::Submit(req) => handle_submit(state, registry, req, now_ms),
         SV1Request::ExtranonceSubscribe(id) => handle_extranonce_subscribe(id),
-        SV1Request::Other { .. } => HandlerOutcome::default(),
+        SV1Request::Other => HandlerOutcome::default(),
     }
 }
 
@@ -291,7 +289,6 @@ pub(crate) fn handle_subscribe<C: Clock>(
         &extranonce1_hex,
         EXTRANONCE2_SIZE,
     ));
-    out.push_event(SessionEvent::Subscribed);
 
     // Init right after subscribe, as ckpool does, not gated on
     // mining.extranonce.subscribe. A re-subscribe skips it.
@@ -858,7 +855,6 @@ mod tests {
         let refined = bp_common::recorded_user_agent(raw_ua);
         SubscribeRequest {
             id: RpcId::from(1),
-            raw_user_agent: raw_ua.map(String::from),
             user_agent: refined,
         }
     }
@@ -869,7 +865,6 @@ mod tests {
             raw_username: format!("{}.w", addr),
             address: addr.to_string(),
             worker: "w".to_string(),
-            password: None,
         }
     }
 

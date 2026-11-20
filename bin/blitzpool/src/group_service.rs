@@ -14,8 +14,6 @@ use tracing::info;
 use crate::boot::FoundationHandles;
 use crate::hooks::ProductionHooks;
 
-pub(crate) const KICK_INACTIVITY_DAYS: u32 = 14;
-
 #[derive(Debug, Error)]
 pub(crate) enum GroupServiceSpawnError {
     #[error("group-service initial cache rebuild failed: {0}")]
@@ -47,7 +45,6 @@ pub(crate) async fn spawn(
         GroupService::load(
             foundation.db.pool().clone(),
             production_hooks.group_service.clone(),
-            KICK_INACTIVITY_DAYS,
             coinbase_max_members,
         )
         .await?,

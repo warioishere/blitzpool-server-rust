@@ -113,6 +113,7 @@ impl<A: ActiveFromTemplate> TemplateAssembler<A> {
     }
 
     /// Number of cached future templates awaiting activation.
+    #[cfg(test)]
     pub fn future_count(&self) -> usize {
         self.future_templates.len()
     }

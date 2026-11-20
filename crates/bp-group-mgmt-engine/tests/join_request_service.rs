@@ -78,7 +78,7 @@ async fn build_services_with_notifier(
     CapturingJoinRequestNotifier,
 ) {
     let group = Arc::new(
-        GroupService::load(pool.clone(), Arc::new(NoopHooks), 14, TEST_COINBASE_CAP)
+        GroupService::load(pool.clone(), Arc::new(NoopHooks), TEST_COINBASE_CAP)
             .await
             .expect("load group service"),
     );
@@ -196,7 +196,7 @@ async fn a_stored_join_request_notifies_the_current_admin() {
     );
 
     group_svc
-        .add_member(group_id, &heir, Some(&admin_token))
+        .add_member_without_admin(group_id, &heir)
         .await
         .expect("heir joins");
     group_svc

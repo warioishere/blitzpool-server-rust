@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use bp_jobs_lifecycle::{age_entries, classify, LifecycleConfig};
 use bp_share::Difficulty;
 
-pub use bp_jobs_lifecycle::JobClassification;
+use bp_jobs_lifecycle::JobClassification;
 
 // ── ExtendedJob ──────────────────────────────────────────────────────
 
@@ -269,6 +269,7 @@ impl StandardJobMaps {
     }
 
     /// Also returns retired entries; pair with [`Self::classify`].
+    #[cfg(test)]
     pub fn lookup(&self, job_id: u32) -> Option<(Difficulty, [u8; 32])> {
         self.entries
             .get(&job_id)
@@ -283,11 +284,13 @@ impl StandardJobMaps {
         self.entries.get(&job_id).map(|e| e.difficulty)
     }
 
+    #[cfg(test)]
     pub fn forget(&mut self, job_id: u32) {
         self.entries.remove(&job_id);
     }
 
     /// Retired and active entries alike.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }

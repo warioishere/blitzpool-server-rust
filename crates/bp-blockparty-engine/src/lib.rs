@@ -13,6 +13,4 @@ mod util;
 pub use cache::{AdminCacheEntry, BlockpartyCache};
 pub use error::BlockpartyServiceError;
 pub use payouts::{BlockpartyPayoutConfig, BlockpartyPayouts};
-pub use service::{
-    BlockpartyCreateResult, BlockpartyService, CoinbaseReservation, MarkMemberConfirmedResult,
-};
+pub use service::{BlockpartyCreateResult, BlockpartyService, CoinbaseReservation};

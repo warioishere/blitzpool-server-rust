@@ -137,7 +137,7 @@ async fn a_team_admin_sets_and_clears_the_coinbase_tag() {
         .execute(&pool)
         .await;
     let svc = Arc::new(
-        GroupService::load(pool.clone(), Arc::new(NoopHooks), 14, 10_000)
+        GroupService::load(pool.clone(), Arc::new(NoopHooks), 10_000)
             .await
             .expect("load group service"),
     );

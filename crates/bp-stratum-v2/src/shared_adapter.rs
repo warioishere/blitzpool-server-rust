@@ -76,16 +76,13 @@ pub(crate) fn shared_rejected<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bp_jobs_lifecycle::JobClassification;
 
     fn synthetic_accept(eff: f64, sub: f64, candidate: bool) -> ShareAccept {
         ShareAccept {
             payouts_fingerprint: [0u8; 32],
-            classification: JobClassification::Active,
             effective_difficulty: Difficulty(eff),
             submission_difficulty: Difficulty(sub),
             header: [0u8; 80],
-            hash: [0u8; 32],
             is_block_candidate: candidate,
             template_id: None,
             jdp_claims_the_block: false,

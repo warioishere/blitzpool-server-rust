@@ -201,8 +201,6 @@ struct RpcRequest<'a> {
 struct RawRpcResponse {
     result: Option<serde_json::Value>,
     error: Option<RpcErrorDetail>,
-    #[allow(dead_code)]
-    id: serde_json::Value,
 }
 
 #[cfg(test)]

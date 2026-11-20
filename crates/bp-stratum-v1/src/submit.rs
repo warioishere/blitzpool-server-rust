@@ -73,15 +73,12 @@ impl RejectReason {
 /// and submit the solution.
 #[derive(Clone, Debug)]
 pub struct ShareAccept {
-    /// `Active` or `StaleCreditable`; both are credited.
-    pub classification: JobClassification,
     /// Difficulty the share is credited at: the lower of the job's send-time
     /// difficulty and the session's current one, as `validate_submit` judges it.
     pub effective_difficulty: f64,
     /// Difficulty the hash actually reached; drives best-diff.
     pub submission_difficulty: f64,
     pub header: [u8; 80],
-    pub hash: [u8; 32],
     /// Hash meets the template's network target. bitcoind stays the authoritative
     /// validator; this only triggers the submit path.
     pub is_block_candidate: bool,
@@ -305,11 +302,9 @@ pub(crate) fn validate_submit(
         );
     }
     ShareValidation::Accepted(Box::new(ShareAccept {
-        classification: lookup.classification,
         effective_difficulty: effective_diff,
         submission_difficulty,
         header,
-        hash,
         is_block_candidate,
         mining_job: lookup.mining_job,
         template: lookup.template,
@@ -716,9 +711,7 @@ mod tests {
 
         let control = validate_submit(&s, &session, &mut SessionShareCache::new(), &reg, 11_000);
         match control {
-            ShareValidation::Accepted(a) => {
-                assert_eq!(a.classification, JobClassification::StaleCreditable)
-            }
+            ShareValidation::Accepted(_) => {}
             ShareValidation::Rejected(r) => panic!("control must be creditable, got {r:?}"),
         }
     }
@@ -767,9 +760,7 @@ mod tests {
         reg.cleanup(true, 10_000);
         let v = validate_submit(&submit(&jid, "1"), &session, &mut cache, &reg, 11_000);
         match v {
-            ShareValidation::Accepted(a) => {
-                assert_eq!(a.classification, JobClassification::StaleCreditable);
-            }
+            ShareValidation::Accepted(_) => {}
             _ => panic!("expected Accepted/StaleCreditable"),
         }
     }
@@ -828,9 +819,7 @@ mod tests {
         match v {
             ShareValidation::Accepted(a) => {
                 assert_eq!(a.effective_difficulty, 0.0);
-                assert_eq!(a.classification, JobClassification::Active);
                 assert!(a.submission_difficulty >= 0.0);
-                assert_eq!(a.hash.len(), 32);
                 assert_eq!(a.header.len(), 80);
             }
             _ => panic!("expected Accepted"),

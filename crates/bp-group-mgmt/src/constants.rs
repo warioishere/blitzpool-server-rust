@@ -2,9 +2,8 @@
 
 //! Kick and expiry thresholds for groups and join requests.
 
-/// An admin can only remove a member idle for this many days. Must stay in
-/// step with `blitzpool`'s hardcoded `group_service::KICK_INACTIVITY_DAYS`.
-pub const DEFAULT_KICK_INACTIVITY_DAYS: u32 = 14;
+/// An admin can only remove a member idle for this many days.
+pub const KICK_INACTIVITY_DAYS: u32 = 14;
 
 /// Hard upper bound on the round-reset custom interval, in days.
 pub const MAX_RESET_INTERVAL_DAYS: u32 = 365;

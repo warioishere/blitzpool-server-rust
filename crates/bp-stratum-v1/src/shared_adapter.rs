@@ -75,7 +75,6 @@ mod tests {
 
     fn synthetic_accept(eff: f64, sub: f64, candidate: bool) -> ShareAccept {
         use crate::ActiveSV1Template;
-        use bp_jobs_lifecycle::JobClassification;
         use bp_mining_job::{CoinbaseTemplate, PayoutEntry};
 
         // Minimal MiningJob via the real builder.
@@ -99,11 +98,9 @@ mod tests {
         .expect("build job");
 
         ShareAccept {
-            classification: JobClassification::Active,
             effective_difficulty: eff,
             submission_difficulty: sub,
             header: [0u8; 80],
-            hash: [0u8; 32],
             is_block_candidate: candidate,
             mining_job: Arc::new(job),
             template: Arc::new(ActiveSV1Template::from_template(

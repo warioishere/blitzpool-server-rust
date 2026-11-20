@@ -17,6 +17,7 @@ use bp_blockparty_engine::{
 use bp_common::{AddressId, Sats};
 use bp_group_mgmt_engine::{AddressCache as PplnsAddressCache, OpenInviteTtl};
 use sqlx::{postgres::PgPoolOptions, PgPool};
+use uuid::Uuid;
 
 const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
 
@@ -78,6 +79,13 @@ async fn svc(pool: &PgPool) -> BlockpartyService {
 
 /// Best-effort cleanup; addresses and names are unique per test.
 async fn cleanup(pool: &PgPool, name: &str, admin_addr: &str) {
+    let _ = sqlx::query(
+        r#"DELETE FROM blockparty_join_link
+           WHERE "groupId" IN (SELECT id FROM blockparty_group WHERE name = $1)"#,
+    )
+    .bind(name)
+    .execute(pool)
+    .await;
     let _ = sqlx::query(r#"DELETE FROM blockparty_group WHERE name = $1"#)
         .bind(name)
         .execute(pool)
@@ -86,6 +94,36 @@ async fn cleanup(pool: &PgPool, name: &str, admin_addr: &str) {
         .bind(admin_addr)
         .execute(pool)
         .await;
+}
+
+/// The way into a party in production: `member` joins through the party's
+/// link and the admin gives it `percent_bp`. Returns the member's token; the
+/// member is not confirmed yet.
+async fn join_with_split(
+    svc: &BlockpartyService,
+    group_id: Uuid,
+    admin_token: &str,
+    member: &str,
+    percent_bp: i32,
+) -> String {
+    let link = svc
+        .create_join_link(group_id, OpenInviteTtl::SevenDays, Some(admin_token))
+        .await
+        .expect("create_join_link");
+    let (member_token, _) = svc
+        .join_via_link(&link, member)
+        .await
+        .expect("join_via_link");
+    svc.update_splits(group_id, &[(addr(member), percent_bp)], Some(admin_token))
+        .await
+        .expect("update_splits");
+    member_token
+}
+
+async fn confirm(svc: &BlockpartyService, group_id: Uuid, member: &str, member_token: &str) {
+    svc.confirm_as_member(group_id, &addr(member), Some(member_token))
+        .await
+        .expect("confirm_as_member");
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────
@@ -120,7 +158,7 @@ async fn create_group_seeds_draft_and_routing_cache() {
 }
 
 #[tokio::test]
-async fn add_member_flips_to_confirming_and_inserts_member_cache() {
+async fn a_joined_member_flips_the_party_to_confirming_and_is_cached() {
     let Some(pool) = connect_or_skip().await else {
         return;
     };
@@ -137,9 +175,7 @@ async fn add_member_flips_to_confirming_and_inserts_member_cache() {
     bp_test_support::seed_verified_email(&pool, bob, "test@example.test").await;
     let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
-    svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
-        .await
-        .expect("add_member");
+    join_with_split(&svc, create.group.id, &create.admin_token, bob, 5_000).await;
 
     // DB row: CONFIRMING.
     let g = svc.get_group(create.group.id).await.unwrap().unwrap();
@@ -427,7 +463,7 @@ async fn request_member_confirmation_stamps_flag_and_is_admin_gated() {
 }
 
 #[tokio::test]
-async fn mark_member_confirmed_promotes_to_ready_and_unblocks_routing() {
+async fn the_last_confirmation_promotes_to_ready_and_unblocks_routing() {
     let Some(pool) = connect_or_skip().await else {
         return;
     };
@@ -444,20 +480,14 @@ async fn mark_member_confirmed_promotes_to_ready_and_unblocks_routing() {
     bp_test_support::seed_verified_email(&pool, bob, "test@example.test").await;
     let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
-    svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
-        .await
-        .expect("add_member");
+    let bob_token = join_with_split(&svc, create.group.id, &create.admin_token, bob, 5_000).await;
 
     // Pre-confirm: the admin gets no work.
     let admin_addr = addr(admin);
     assert!(svc.unready_group_id_for_admin(&admin_addr).await.is_some());
 
     // The admin is confirmed at creation, so bob's confirm makes it ready.
-    let r = svc
-        .mark_member_confirmed(create.group.id, &addr(bob))
-        .await
-        .expect("mark_confirmed");
-    assert!(r.member_token.is_some(), "first confirm mints token");
+    confirm(&svc, create.group.id, bob, &bob_token).await;
 
     let g = svc.get_group(create.group.id).await.unwrap().unwrap();
     assert_eq!(g.status, BlockpartyStatus::Ready);
@@ -503,12 +533,8 @@ async fn on_share_accepted_promotes_ready_to_active_only() {
     assert_eq!(g.status, BlockpartyStatus::Draft, "no promotion from draft");
 
     // Add + confirm bob → READY.
-    svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
-        .await
-        .expect("add");
-    svc.mark_member_confirmed(create.group.id, &addr(bob))
-        .await
-        .expect("confirm");
+    let bob_token = join_with_split(&svc, create.group.id, &create.admin_token, bob, 5_000).await;
+    confirm(&svc, create.group.id, bob, &bob_token).await;
 
     // First share → READY → ACTIVE.
     svc.on_share_accepted(&admin_addr).await.expect("share");
@@ -542,12 +568,8 @@ async fn dissolve_blocked_during_active_cooldown() {
     bp_test_support::seed_verified_email(&pool, bob, "test@example.test").await;
     let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
-    svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
-        .await
-        .expect("add");
-    svc.mark_member_confirmed(create.group.id, &addr(bob))
-        .await
-        .expect("confirm");
+    let bob_token = join_with_split(&svc, create.group.id, &create.admin_token, bob, 5_000).await;
+    confirm(&svc, create.group.id, bob, &bob_token).await;
     svc.on_share_accepted(&addr(admin)).await.expect("share");
     // ACTIVE, last_share_at = now. Dissolve must be rejected.
     let err = svc
@@ -604,9 +626,7 @@ async fn dissolve_frees_every_address_for_the_next_party() {
     bp_test_support::seed_verified_email(&pool, other_admin, "test@example.test").await;
     let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
-    svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
-        .await
-        .expect("add");
+    join_with_split(&svc, create.group.id, &create.admin_token, bob, 5_000).await;
     // Precondition: bob really is a member before the dissolve.
     assert_eq!(svc.member_group_id(&addr(bob)).await, Some(create.group.id));
 
@@ -632,9 +652,7 @@ async fn dissolve_frees_every_address_for_the_next_party() {
         .create_group(next, other_admin, 5_000)
         .await
         .expect("create next");
-    svc.add_member(other.group.id, bob, 5_000, Some(&other.admin_token))
-        .await
-        .expect("former member joins the next party");
+    join_with_split(&svc, other.group.id, &other.admin_token, bob, 5_000).await;
     let refounded = svc
         .create_group(again, admin, 10_000)
         .await
@@ -778,9 +796,7 @@ async fn ready_transition_sizes_coinbase_reservation_to_roster() {
     })));
 
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
-    svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
-        .await
-        .expect("add_member");
+    let bob_token = join_with_split(&svc, create.group.id, &create.admin_token, bob, 5_000).await;
 
     // Still confirming: the hook fires only at ready.
     assert!(
@@ -789,9 +805,7 @@ async fn ready_transition_sizes_coinbase_reservation_to_roster() {
     );
 
     // Ready with admin + bob: the hook gets exactly 2 members.
-    svc.mark_member_confirmed(create.group.id, &addr(bob))
-        .await
-        .expect("mark_confirmed");
+    confirm(&svc, create.group.id, bob, &bob_token).await;
     let g = svc.get_group(create.group.id).await.unwrap().unwrap();
     assert_eq!(g.status, BlockpartyStatus::Ready);
 
@@ -835,16 +849,14 @@ async fn a_ready_party_refuses_every_roster_edit() {
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
     let gid = create.group.id;
     let token = Some(create.admin_token.as_str());
-    svc.add_member(gid, bob, 5_000, token)
-        .await
-        .expect("add_member");
-    svc.update_splits(gid, &[(addr(bob), 5_000)], token)
+    let bob_token = join_with_split(&svc, gid, &create.admin_token, bob, 5_000).await;
+    // Minted while the party is editable, used once it is not.
+    let link = svc
+        .create_join_link(gid, OpenInviteTtl::SevenDays, token)
         .await
         .expect("precondition: confirming is editable");
 
-    svc.mark_member_confirmed(gid, &addr(bob))
-        .await
-        .expect("mark_confirmed");
+    confirm(&svc, gid, bob, &bob_token).await;
     let g = svc.get_group(gid).await.unwrap().unwrap();
     assert_eq!(
         g.status,
@@ -857,10 +869,10 @@ async fn a_ready_party_refuses_every_roster_edit() {
         matches!(splits, Err(BlockpartyServiceError::NotEditable)),
         "{splits:?}"
     );
-    let add = svc.add_member(gid, carol, 1_000, token).await;
+    let join = svc.join_via_link(&link, carol).await;
     assert!(
-        matches!(add, Err(BlockpartyServiceError::NotEditable)),
-        "{add:?}"
+        matches!(join, Err(BlockpartyServiceError::NotEditable)),
+        "{join:?}"
     );
     let remove = svc.remove_member(gid, bob, token).await;
     assert!(
@@ -899,14 +911,9 @@ async fn update_splits_confirms_admin_and_resets_non_admin() {
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
     let gid = create.group.id;
     let token = Some(create.admin_token.as_str());
-    for (m, pct) in [(bob, 3_000), (carol, 2_000)] {
-        svc.add_member(gid, m, pct, token)
-            .await
-            .expect("add_member");
-    }
-    svc.mark_member_confirmed(gid, &addr(bob))
-        .await
-        .expect("mark_confirmed");
+    let bob_token = join_with_split(&svc, gid, &create.admin_token, bob, 3_000).await;
+    let carol_token = join_with_split(&svc, gid, &create.admin_token, carol, 2_000).await;
+    confirm(&svc, gid, bob, &bob_token).await;
     let bob_before = bp_db::list_blockparty_members_for_group(&pool, gid)
         .await
         .expect("list members")
@@ -944,10 +951,8 @@ async fn update_splits_confirms_admin_and_resets_non_admin() {
     assert_eq!(g.status, BlockpartyStatus::Confirming);
 
     // Everyone re-confirms → READY.
-    for m in [bob, carol] {
-        svc.mark_member_confirmed(gid, &addr(m))
-            .await
-            .expect("re-confirm");
+    for (m, t) in [(bob, &bob_token), (carol, &carol_token)] {
+        confirm(&svc, gid, m, t).await;
     }
     let g = svc.get_group(gid).await.unwrap().unwrap();
     assert_eq!(

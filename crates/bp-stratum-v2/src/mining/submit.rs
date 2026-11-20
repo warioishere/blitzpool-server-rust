@@ -93,8 +93,6 @@ impl RejectReason {
 /// share-stats fan-out and, for a block candidate, `SubmitSolution`.
 #[derive(Clone, Debug)]
 pub struct ShareAccept {
-    /// `Active` or `StaleCreditable`. Both credit the share.
-    pub classification: JobClassification,
     /// Difficulty the share is credited at: the job's difficulty pinned at
     /// send-time (SV2 Mining/SubmitShares.Error), which may be below the
     /// session's current difficulty after a vardiff increase.
@@ -104,7 +102,6 @@ pub struct ShareAccept {
     pub submission_difficulty: Difficulty,
     pub header: [u8; 80],
     /// `sha256d(header)` in LE byte order.
-    pub hash: [u8; 32],
     /// Hash meets the job's network target. bitcoind stays the authoritative
     /// validator; this only triggers `TdpHandle::submit_solution`.
     pub is_block_candidate: bool,
@@ -354,11 +351,9 @@ pub fn validate_submit_standard(
         Vec::new()
     };
     ShareValidation::Accepted(Box::new(ShareAccept {
-        classification: job_ctx.classification,
         effective_difficulty: job_difficulty,
         submission_difficulty: judged.pow.submission_difficulty,
         header: judged.header,
-        hash: judged.pow.submission_hash,
         is_block_candidate: judged.is_block_candidate,
         template_id: Some(job_ctx.template_id),
         jdp_claims_the_block: false,
@@ -518,11 +513,9 @@ pub fn validate_submit_extended(
     );
 
     ShareValidation::Accepted(Box::new(ShareAccept {
-        classification,
         effective_difficulty: job_difficulty,
         submission_difficulty: judged.pow.submission_difficulty,
         header: judged.header,
-        hash: judged.pow.submission_hash,
         is_block_candidate: judged.is_block_candidate,
         template_id: ext_job.template_id,
         jdp_claims_the_block: ext_job.jdp_claims_the_block,
@@ -751,7 +744,6 @@ mod tests {
         );
         match out {
             ShareValidation::Accepted(accept) => {
-                assert_eq!(accept.classification, JobClassification::Active);
                 assert_eq!(accept.effective_difficulty, easy_diff());
                 assert!(!accept.is_block_candidate, "1e15 net-diff is unreachable");
             }
@@ -890,9 +882,7 @@ mod tests {
             &std_ctx(JobClassification::StaleCreditable),
         );
         match out {
-            ShareValidation::Accepted(accept) => {
-                assert_eq!(accept.classification, JobClassification::StaleCreditable);
-            }
+            ShareValidation::Accepted(_) => {}
             _ => panic!("StaleCreditable must accept"),
         }
     }
@@ -1046,7 +1036,6 @@ mod tests {
         );
         match out {
             ShareValidation::Accepted(a) => {
-                assert_eq!(a.classification, JobClassification::Active);
                 assert!(!a.is_block_candidate);
                 assert_eq!(
                     a.coinbase_tx_value_remaining,
@@ -1277,9 +1266,7 @@ mod tests {
             false,
         );
         match control {
-            ShareValidation::Accepted(a) => {
-                assert_eq!(a.classification, JobClassification::StaleCreditable)
-            }
+            ShareValidation::Accepted(_) => {}
             ShareValidation::Rejected(r) => panic!("control must be creditable, got {r:?}"),
         }
     }

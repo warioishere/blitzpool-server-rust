@@ -18,17 +18,13 @@ mod worker;
 
 pub use assembler::{ActiveFromTemplate, ActiveTemplate, TemplateAssembler, TemplateChange};
 pub use bitcoin_core_sv2::runtime_api::BitcoinCoreVersion;
-pub use config::{
-    TdpCoinbaseConstraints, TdpConfig, DEFAULT_BITCOIN_CORE_VERSION, DEFAULT_BROADCAST_CAPACITY,
-    DEFAULT_FEE_THRESHOLD, DEFAULT_MIN_INTERVAL_SECS, DEFAULT_RECONNECT_BACKOFF_SECS,
-    DEFAULT_SUBMIT_CAPACITY,
-};
+pub use config::{TdpCoinbaseConstraints, TdpConfig, DEFAULT_BITCOIN_CORE_VERSION};
 pub use error::TdpError;
 pub use fanout::{StreamHandle, TemplateBroadcast, TemplateStreams};
 pub use handle::TdpHandle;
 pub use message::{
-    apply_to_snapshot, NewTemplate, RequestTransactionDataError, RequestTransactionDataSuccess,
-    SetNewPrevHash, TdpRequest, TemplateSnapshot, TemplateUpdate,
+    NewTemplate, RequestTransactionDataError, RequestTransactionDataSuccess, SetNewPrevHash,
+    TdpRequest, TemplateSnapshot, TemplateUpdate,
 };
 pub use pacing::{RefreshPacer, REFRESH_SPREAD};
 pub use tx_cache::TemplateTxCache;

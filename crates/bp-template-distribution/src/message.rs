@@ -43,8 +43,8 @@ pub struct SetNewPrevHash {
     pub target: [u8; 32],
 }
 
-/// Latest-known TDP state for read-only consumers, built by
-/// [`apply_to_snapshot`] and read via [`crate::TdpHandle::current_snapshot`].
+/// Latest-known TDP state for read-only consumers, built from the handle's
+/// updates and read via [`crate::TdpHandle::current_snapshot`].
 /// `None` fields mean "not ready yet". The two halves can be one update apart;
 /// a caller needing a coherent pair must compare their `template_id`s.
 #[derive(Debug, Default, Clone)]
@@ -52,16 +52,14 @@ pub struct TemplateSnapshot {
     pub new_template: Option<NewTemplate>,
     pub set_new_prev_hash: Option<SetNewPrevHash>,
     /// Epoch-ms of the last absorbed update, for `/api/health`'s staleness
-    /// check. Stamped only by the live tap in [`crate::TdpHandle::spawn`], not
-    /// by [`apply_to_snapshot`]: staleness belongs to the running connection,
-    /// not to a replayed stream.
+    /// check, stamped by the live tap in [`crate::TdpHandle::spawn`].
     pub last_update_at: Option<i64>,
 }
 
 /// Apply one [`TemplateUpdate`] to a [`TemplateSnapshot`] in place. The
 /// `RequestTransactionData*` responses are per-call, not pool state, so they
-/// are ignored. Public so a TDP stream can be replayed without the handle.
-pub fn apply_to_snapshot(snapshot: &mut TemplateSnapshot, update: &TemplateUpdate) {
+/// are ignored.
+pub(crate) fn apply_to_snapshot(snapshot: &mut TemplateSnapshot, update: &TemplateUpdate) {
     match update {
         TemplateUpdate::NewTemplate(t) => snapshot.new_template = Some(t.clone()),
         TemplateUpdate::SetNewPrevHash(p) => snapshot.set_new_prev_hash = Some(p.clone()),

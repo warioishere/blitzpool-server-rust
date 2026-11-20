@@ -44,13 +44,6 @@ pub struct BlockpartyCreateResult {
     pub pool_fee_percent: f64,
 }
 
-#[derive(Debug)]
-pub struct MarkMemberConfirmedResult {
-    /// `Some` only when this confirmation minted a fresh token; a re-confirm
-    /// with the existing token returns `None`.
-    pub member_token: Option<String>,
-}
-
 // ─── Service struct ────────────────────────────────────────────────
 
 /// Exists only with a warm routing cache: [`Self::load`] is the sole
@@ -288,68 +281,6 @@ impl BlockpartyService {
             admin_token: admin_token.into_inner(),
             pool_fee_percent: self.payouts.config.fee_percent,
         })
-    }
-
-    /// Admin-gated. The member's email comes from its verified binding;
-    /// the first add moves the party from draft to confirming.
-    pub async fn add_member(
-        &self,
-        group_id: Uuid,
-        member_address: &str,
-        percent_bp: i32,
-        token: Option<&str>,
-    ) -> Result<BlockpartyMemberRow, BlockpartyServiceError> {
-        let group = self.require_admin_token(group_id, token).await?;
-        assert_editable(&group)?;
-        validate_percent_bp(percent_bp)?;
-
-        let address = normalize_address(member_address)?;
-        if address == group.admin_address {
-            return Err(BlockpartyServiceError::AdminCannotRejoin);
-        }
-        if bp_db::find_blockparty_member_by_address(&self.payouts.pool, &address)
-            .await?
-            .is_some()
-        {
-            return Err(BlockpartyServiceError::AddressInBlockparty);
-        }
-        if self.pplns_cache.get(&address).await.is_some() {
-            return Err(BlockpartyServiceError::AddressInPplnsGroup);
-        }
-
-        let email = self.verified_email(&address).await?;
-
-        let now = now_ms();
-        let inserted = match bp_db::insert_blockparty_member(
-            &self.payouts.pool,
-            group_id,
-            &address,
-            &email,
-            percent_bp,
-            "member",
-            None, // confirmed_at = null; member must accept invitation
-            now,
-        )
-        .await
-        {
-            Ok(row) => row,
-            Err(bp_db::DbError::Sqlx(sqlx::Error::Database(db_err)))
-                if db_err.code().as_deref() == Some("23505") =>
-            {
-                // A concurrent add slipped past the lookup above;
-                // UNIQUE(address) caught it.
-                return Err(BlockpartyServiceError::AddressInBlockparty);
-            }
-            Err(e) => return Err(e.into()),
-        };
-
-        if group.status == BlockpartyStatus::Draft {
-            self.leave_draft(&group, now).await?;
-        }
-        self.cache.insert_member(&address, group_id).await;
-        self.recompute_status(group_id).await?;
-
-        Ok(inserted)
     }
 
     /// Create or replace the group's single join link; returns its token.
@@ -606,57 +537,6 @@ impl BlockpartyService {
         Ok(())
     }
 
-    /// Idempotent. Mints the member token on the first call and returns its
-    /// plaintext only then.
-    pub async fn mark_member_confirmed(
-        &self,
-        group_id: Uuid,
-        address: &AddressId,
-    ) -> Result<MarkMemberConfirmedResult, BlockpartyServiceError> {
-        let member = bp_db::find_blockparty_member_in_group(&self.payouts.pool, group_id, address)
-            .await?
-            .ok_or(BlockpartyServiceError::NotMember)?;
-
-        let now = now_ms();
-        let (member_token, hash_for_db) = if member.member_token_hash.is_none() {
-            let t = InvitationToken::generate()?;
-            let h = t.hash();
-            (Some(t.into_inner()), Some(h))
-        } else {
-            (None, None)
-        };
-
-        let confirmed_at = Some(member.confirmed_at.unwrap_or(now));
-        let hash_str = hash_for_db
-            .as_ref()
-            .map(|h| h.as_str())
-            .or(member.member_token_hash.as_deref());
-
-        // One TX with the status recompute: a crash between them would leave
-        // a fully-confirmed party stuck in confirming, never routable.
-        let mut tx = self
-            .payouts
-            .pool
-            .begin()
-            .await
-            .map_err(bp_db::DbError::from)?;
-        bp_db::update_blockparty_member_confirmed(
-            &mut *tx,
-            group_id,
-            address,
-            confirmed_at,
-            hash_str,
-            now,
-        )
-        .await?;
-        let outcome = recompute_status_in_tx(&mut tx, group_id, now).await?;
-        tx.commit().await.map_err(bp_db::DbError::from)?;
-        if let Some(o) = outcome {
-            self.apply_status_side_effects(group_id, &o).await;
-        }
-        Ok(MarkMemberConfirmedResult { member_token })
-    }
-
     /// Re-confirmation after a splits edit reset it, authenticated by the
     /// existing member token; mints no new token.
     pub async fn confirm_as_member(
@@ -672,7 +552,8 @@ impl BlockpartyService {
             return Ok(()); // idempotent
         }
         let now = now_ms();
-        // Atomic confirm + status recompute — see mark_member_confirmed.
+        // One TX with the status recompute: a crash between them would leave a
+        // fully-confirmed party stuck in confirming, never routable.
         let mut tx = self
             .payouts
             .pool

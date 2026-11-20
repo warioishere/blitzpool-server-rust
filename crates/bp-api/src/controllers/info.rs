@@ -2,8 +2,6 @@
 
 //! `/api/info/*` + `/api/pool` + `/api/network` + `/api/health`.
 
-use std::sync::Arc;
-
 use axum::{
     extract::{Path, State},
     response::Json,
@@ -1159,10 +1157,6 @@ async fn shares(State(state): State<SharedState>) -> Result<JsonBytes, ApiError>
         .await?;
     Ok(JsonBytes(bytes))
 }
-
-// Exists only to keep the `Arc` import used.
-#[allow(dead_code)]
-fn _force_arc_use(_: Arc<()>) {}
 
 // ─── /api/info ────────────────────────────────────────────────────
 

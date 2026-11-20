@@ -688,7 +688,6 @@ pub(crate) async fn process_event<C: bp_vardiff::Clock>(
     hooks: &ServerHooks,
 ) -> bool {
     match event {
-        SessionEvent::Subscribed => true,
         SessionEvent::DifficultyChanged => {
             // The only signal on either protocol that a difficulty moved.
             bp_metrics::record_stratum_difficulty_adjustment();
@@ -1005,7 +1004,6 @@ mod tests {
     // ── process_event hook fan-out ────────────────────────────────────
 
     fn dummy_share_accept(is_block_candidate: bool) -> Box<ShareAccept> {
-        use crate::jobs::JobClassification;
         use bp_mining_job::{
             build_mining_job_from_tdp, PayoutEntry, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
         };
@@ -1053,11 +1051,9 @@ mod tests {
         )
         .unwrap();
         Box::new(ShareAccept {
-            classification: JobClassification::Active,
             effective_difficulty: 1024.0,
             submission_difficulty: 2048.0,
             header: [0u8; 80],
-            hash: [0u8; 32],
             is_block_candidate,
             mining_job: Arc::new(mining_job),
             template: Arc::new(active),

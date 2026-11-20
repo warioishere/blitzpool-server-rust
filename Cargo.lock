@@ -712,7 +712,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -890,10 +889,8 @@ dependencies = [
  "bp-test-support",
  "chrono",
  "chrono-tz",
- "hex",
  "redis",
  "serde",
- "serde_json",
  "sqlx",
  "thiserror 2.0.21",
  "tokio",
@@ -1028,8 +1025,6 @@ dependencies = [
  "bp-share",
  "bp-template-distribution",
  "bp-test-support",
- "proptest",
- "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",

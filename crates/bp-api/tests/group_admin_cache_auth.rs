@@ -86,7 +86,7 @@ async fn wrong_token_after_warm_admin(name: &str, path: &str) -> Option<(StatusC
         .execute(&pool)
         .await;
     let group_svc = Arc::new(
-        GroupService::load(pool.clone(), Arc::new(NoopHooks), 14, 10_000)
+        GroupService::load(pool.clone(), Arc::new(NoopHooks), 10_000)
             .await
             .expect("load group service"),
     );

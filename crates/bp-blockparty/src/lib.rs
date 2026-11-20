@@ -9,8 +9,8 @@ mod distribution;
 mod status;
 
 pub use constants::{
-    DISSOLVE_COOLDOWN_MS, EMAIL_MAX_LEN, MAX_PERCENT_BP, MIN_PERCENT_BP, NAME_MAX_LEN,
-    NAME_MIN_LEN, TOTAL_PERCENT_BP,
+    DISSOLVE_COOLDOWN_MS, MAX_PERCENT_BP, MIN_PERCENT_BP, NAME_MAX_LEN, NAME_MIN_LEN,
+    TOTAL_PERCENT_BP,
 };
 pub use distribution::{
     build_blockparty_distribution, splits_paid, BlockpartyDistributionInput,
