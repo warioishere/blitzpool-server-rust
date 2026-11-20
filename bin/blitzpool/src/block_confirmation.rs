@@ -70,9 +70,7 @@ pub(crate) fn spawn(
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.tick().await; // consume the immediate first tick
 
-        // Last reported unbookable depth, so a standing non-zero count is
-        // logged on change instead of every pass.
-        let mut last_unbookable: Option<u64> = None;
+        let mut reported = Reported::default();
 
         info!(
             confirmation_depth,
@@ -94,12 +92,12 @@ pub(crate) fn spawn(
                 biased;
                 _ = cancel.cancelled() => break,
                 _ = tick.tick() => {
-                    reconcile(&bitcoin_rpc, &redis, &settlers, confirmation_depth, &settle, &mut last_unbookable).await;
+                    reconcile(&bitcoin_rpc, &redis, &settlers, confirmation_depth, &settle, &mut reported).await;
                 }
                 ev = next_tip_signal(&mut rx) => match ev {
                     // A new chain tip — re-check every parked block's depth.
                     Ok(TemplateUpdate::SetNewPrevHash(_)) => {
-                        reconcile(&bitcoin_rpc, &redis, &settlers, confirmation_depth, &settle, &mut last_unbookable).await;
+                        reconcile(&bitcoin_rpc, &redis, &settlers, confirmation_depth, &settle, &mut reported).await;
                     }
                     // NewTemplate / tx-data responses aren't new-block ticks.
                     Ok(_) => {}
@@ -194,8 +192,19 @@ async fn collect_confirmed(
     confirmed
 }
 
+/// What the watcher already logged: a standing condition logged every pass
+/// gets ignored.
+#[derive(Default)]
+struct Reported {
+    /// The unbookable store's depth, logged when it changes.
+    unbookable: Option<u64>,
+    /// Confirmed blocks whose mode has no engine in this process, each logged
+    /// once.
+    no_engine: std::collections::HashSet<String>,
+}
+
 /// Publish how deep the two parking stores are, and log when the unbookable
-/// one CHANGES: a standing non-zero count logged every pass gets ignored.
+/// one changes.
 async fn report_parked_depths(conn: &mut ConnectionManager, last_unbookable: &mut Option<u64>) {
     let pending = count_pending_at(conn, PENDING_KEY).await;
     let unbookable = count_pending_at(conn, UNBOOKABLE_KEY).await;
@@ -232,7 +241,7 @@ async fn reconcile(
     confirmation_depth: u32,
     // See `spawn`: a gated apply IS a settlement event.
     settle: &crate::settlement::SettlementSignal,
-    last_unbookable: &mut Option<u64>,
+    reported: &mut Reported,
 ) {
     let depth = i64::from(confirmation_depth);
     let mut conn = redis.clone();
@@ -253,8 +262,21 @@ async fn reconcile(
                 );
                 let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
             }
-            // No engine for this block's mode here; another process may own it.
-            Err(SettleFailure::NoEngine) => continue,
+            // The watcher runs on the accounting process, the one holding the
+            // engines: without this mode's engine nothing settles the block,
+            // so it stays parked until the engine is configured.
+            Err(SettleFailure::NoEngine) => {
+                if reported.no_engine.insert(pb.block_hash.clone()) {
+                    error!(
+                        block_hash = %pb.block_hash,
+                        height = pb.block_height,
+                        mode = pb.settlement.label(),
+                        "block-confirmation: confirmed block parked for a mode this process \
+                         has no engine for — nothing settles it until that engine is \
+                         configured; its coinbase already paid miners on-chain"
+                    );
+                }
+            }
             Err(err) if err.is_terminal() => {
                 // Park, don't destroy: the frozen blob is the only record
                 // of what this block paid every miner.
@@ -283,7 +305,7 @@ async fn reconcile(
 
     // After the pass, not before: a block parked into the unbookable store
     // by the loop above must show up in the same tick that put it there.
-    report_parked_depths(&mut conn, last_unbookable).await;
+    report_parked_depths(&mut conn, &mut reported.unbookable).await;
 }
 
 /// The engines a process can settle with; `None` where this process does not
@@ -409,7 +431,7 @@ impl SettleFailure {
     /// Will a retry fail the same way? A deleted group stays deleted, inputs
     /// not resolved at found-time are gone and a coinbase does not change,
     /// so those are terminal like the engines' own verdicts. A missing engine
-    /// is not: another process may own the block.
+    /// is not: configuring it books the block.
     pub(crate) fn is_terminal(&self) -> bool {
         match self {
             SettleFailure::NoEngine => false,
@@ -838,7 +860,7 @@ mod declared_block_booking_regtest {
         }
 
         async fn reconcile_once(&self) {
-            let mut last_unbookable = None;
+            let mut reported = super::Reported::default();
             super::reconcile(
                 &self.node.bitcoin_rpc().expect("regtest BitcoinRpc"),
                 &self.redis,
@@ -852,7 +874,7 @@ mod declared_block_booking_regtest {
                 },
                 DEPTH,
                 &crate::settlement::SettlementSignal::local_only(),
-                &mut last_unbookable,
+                &mut reported,
             )
             .await;
         }
@@ -1537,7 +1559,7 @@ mod declared_block_booking_regtest {
         }
 
         async fn reconcile_once(&self) {
-            let mut last_unbookable = None;
+            let mut reported = super::Reported::default();
             super::reconcile(
                 &self.node.bitcoin_rpc().expect("regtest BitcoinRpc"),
                 &self.redis,
@@ -1551,7 +1573,7 @@ mod declared_block_booking_regtest {
                 },
                 DEPTH,
                 &crate::settlement::SettlementSignal::local_only(),
-                &mut last_unbookable,
+                &mut reported,
             )
             .await;
         }

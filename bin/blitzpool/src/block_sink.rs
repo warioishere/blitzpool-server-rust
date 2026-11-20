@@ -831,51 +831,39 @@ impl BlockFoundApplier {
                 Booking::Book {
                     reward_sats: reward,
                 },
-            ) => match self.pplns.as_ref() {
-                Some(_) => {
-                    self.gate_or_apply(
-                        address_str,
-                        height,
-                        reward,
-                        block_hash,
-                        event.actual_coinbase.as_ref(),
-                        event.payouts_fingerprint,
-                        PendingSettlement::Pplns {
-                            weight_snapshot: weight_snapshot.clone(),
-                        },
-                    )
-                    .await
-                }
-                None => warn!(
-                    address = address_str,
-                    height, "block-found: PPLNS mode but engine not configured"
-                ),
-            },
+            ) => {
+                self.gate_or_apply(
+                    address_str,
+                    height,
+                    reward,
+                    block_hash,
+                    event.actual_coinbase.as_ref(),
+                    event.payouts_fingerprint,
+                    PendingSettlement::Pplns {
+                        weight_snapshot: weight_snapshot.clone(),
+                    },
+                )
+                .await
+            }
             (
                 FoundMode::Blockparty(group_id),
                 Booking::Book {
                     reward_sats: reward,
                 },
-            ) => match self.blockparty.as_ref() {
-                Some(_payouts) => {
-                    self.gate_or_apply(
-                        address_str,
-                        height,
-                        reward,
-                        block_hash,
-                        event.actual_coinbase.as_ref(),
-                        event.payouts_fingerprint,
-                        PendingSettlement::Blockparty {
-                            group_id: *group_id,
-                        },
-                    )
-                    .await;
-                }
-                None => warn!(
-                    address = address_str,
-                    height, "block-found: Blockparty mode but payouts not configured — skipping history-row write"
-                ),
-            },
+            ) => {
+                self.gate_or_apply(
+                    address_str,
+                    height,
+                    reward,
+                    block_hash,
+                    event.actual_coinbase.as_ref(),
+                    event.payouts_fingerprint,
+                    PendingSettlement::Blockparty {
+                        group_id: *group_id,
+                    },
+                )
+                .await
+            }
             (
                 FoundMode::GroupSolo(group_id),
                 Booking::Book {
@@ -883,44 +871,49 @@ impl BlockFoundApplier {
                 },
             ) => {
                 let group_id = *group_id;
-                match self.group_solo.as_ref() {
-                    Some(engine) => {
-                        if self.is_parked(block_hash).await {
-                            // A redelivered event: the parked state is the
-                            // one taken at the find.
-                            info!(%group_id, height, block_hash,
-                                "block-found: group-solo block already parked — left as it stands");
-                        } else {
-                            // Taken now, so booking leaves the shares mined
-                            // while the block waits for its confirmations.
-                            let round_at_find = match retry_at_find("group-solo round", || engine.cut_round_at_find(group_id, block_hash)).await {
-                                Ok(round_at_find) => Some(round_at_find),
-                                Err(err) => {
-                                    error!(%err, %group_id, address = address_str, height,
-                                        "block-found: group-solo round state unreadable at the \
-                                         find after retries; parking the block without it");
-                                    None
-                                }
-                            };
-                            self.gate_or_apply(
-                                address_str,
-                                height,
-                                reward,
-                                block_hash,
-                                event.actual_coinbase.as_ref(),
-                                event.payouts_fingerprint,
-                                PendingSettlement::GroupSolo {
-                                    group_id,
-                                    round_at_find,
-                                },
-                            )
-                            .await;
+                if self.is_parked(block_hash).await {
+                    // A redelivered event: the parked state is the one taken
+                    // at the find.
+                    info!(%group_id, height, block_hash,
+                        "block-found: group-solo block already parked — left as it stands");
+                } else {
+                    // Taken now, so booking leaves the shares mined while the
+                    // block waits for its confirmations. Without it the block
+                    // still parks, so the frozen coinbase is kept.
+                    let round_at_find = match self.group_solo.as_ref() {
+                        Some(engine) => match retry_at_find("group-solo round", || {
+                            engine.cut_round_at_find(group_id, block_hash)
+                        })
+                        .await
+                        {
+                            Ok(round_at_find) => Some(round_at_find),
+                            Err(err) => {
+                                error!(%err, %group_id, address = address_str, height,
+                                    "block-found: group-solo round state unreadable at the \
+                                     find after retries; parking the block without it");
+                                None
+                            }
+                        },
+                        None => {
+                            error!(%group_id, address = address_str, height,
+                                "block-found: no Group-Solo engine to take the round at the \
+                                 find; the block goes on without it");
+                            None
                         }
-                    }
-                    None => warn!(
-                        address = address_str,
-                        height, "block-found: Group-Solo mode but engine not configured"
-                    ),
+                    };
+                    self.gate_or_apply(
+                        address_str,
+                        height,
+                        reward,
+                        block_hash,
+                        event.actual_coinbase.as_ref(),
+                        event.payouts_fingerprint,
+                        PendingSettlement::GroupSolo {
+                            group_id,
+                            round_at_find,
+                        },
+                    )
+                    .await;
                 }
             }
         }
@@ -1588,6 +1581,75 @@ mod tests {
         v["group_id"] = serde_json::Value::Null;
         let err = serde_json::from_value::<BlockFoundEvent>(v).unwrap_err();
         assert!(err.to_string().contains("without its group_id"), "{err}");
+    }
+
+    /// A block whose mode has no engine in this process is parked, not
+    /// dropped: the frozen coinbase is the only record of what it paid, and
+    /// the watcher books it once the engine is configured.
+    #[tokio::test]
+    async fn a_block_without_its_engine_is_parked() {
+        let Some(mut conn) = bp_test_support::connect_redis_in_range_or_skip(
+            bp_test_support::redis_db::BLITZPOOL_BIN_2,
+            6,
+        )
+        .await
+        else {
+            return;
+        };
+        let applier = BlockFoundApplier::new(
+            None,
+            None,
+            None,
+            None,
+            Some(conn.clone()),
+            None,
+            bp_share::SUBSIDY_HALVING_INTERVAL,
+        );
+        let group_id = uuid::Uuid::new_v4();
+        for (hash, mode) in [
+            (
+                "no-engine-pplns",
+                FoundMode::Pplns {
+                    weight_snapshot: None,
+                },
+            ),
+            ("no-engine-gs", FoundMode::GroupSolo(group_id)),
+            ("no-engine-bp", FoundMode::Blockparty(group_id)),
+        ] {
+            let event = BlockFoundEvent {
+                mode,
+                block_hash: hash.to_string(),
+                booking: Booking::Book {
+                    reward_sats: 312_500_000,
+                },
+                payouts_fingerprint: Some([7u8; 32]),
+                actual_coinbase: Some(ActualCoinbase {
+                    paid_by_address: Default::default(),
+                    output_zero: None,
+                    total_value_sats: 312_500_000,
+                }),
+                ..record_only_event()
+            };
+            applier.apply_block_found(&event).await;
+            let parked = crate::pending_blocks::pending_block_hashes(&mut conn)
+                .await
+                .expect("pending hashes");
+            assert!(parked.contains(hash), "{hash} must be parked");
+        }
+        // Group-Solo has no engine to take the round with: it parks without.
+        let gs = crate::pending_blocks::load_pending_blocks(&mut conn)
+            .await
+            .expect("pending blocks")
+            .into_iter()
+            .find(|pb| pb.block_hash == "no-engine-gs")
+            .expect("parked");
+        assert!(matches!(
+            gs.settlement,
+            PendingSettlement::GroupSolo {
+                round_at_find: None,
+                ..
+            }
+        ));
     }
 
     /// One rule for every mode that books against a pool-built distribution:
