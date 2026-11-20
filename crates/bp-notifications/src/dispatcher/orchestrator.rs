@@ -433,17 +433,23 @@ impl NotificationDispatcher {
     /// wording differs from the other two: the owner of three rigs must not
     /// read "offline" when two are still working.
     pub async fn notify_device_partial(&self, partial: &DevicePartial) {
+        let owned = partial.clone();
         self.notify_device(
             &partial.address,
-            |adapter, pool, langs, subs| {
-                Box::pin(send_telegram_device_partial(
-                    adapter,
-                    pool,
-                    langs,
-                    partial.clone(),
-                    subs,
-                ))
-            },
+            partial.timestamp,
+            ("telegram-device-partial", "ntfy-device-partial"),
+            Arc::new(move |lang, time_formatted, address_suffix| {
+                DevicePartialText::build(&DevicePartialArgs {
+                    language: lang,
+                    time_formatted,
+                    worker_name: owned.worker_name.as_deref(),
+                    remaining: owned.remaining,
+                    before: owned.before,
+                    address_suffix,
+                })
+                .pick(lang)
+                .to_string()
+            }),
             || device_partial_fcm_payload(partial),
             || device_partial_unified_payload(partial),
         )
@@ -454,61 +460,73 @@ impl NotificationDispatcher {
     /// Same transports and same per-subscriber filtering as the single
     /// form — only the rendered text differs.
     pub async fn notify_device_aggregate(&self, agg: &DeviceAggregate) {
+        let owned = agg.clone();
         self.notify_device(
             &agg.address,
-            |adapter, pool, langs, subs| {
-                Box::pin(send_telegram_device_aggregate(
-                    adapter,
-                    pool,
-                    langs,
-                    agg.clone(),
-                    subs,
-                ))
-            },
+            agg.timestamp,
+            ("telegram-device-agg", "ntfy-device-agg"),
+            Arc::new(move |lang, time_formatted, address_suffix| {
+                DeviceAggregateText::build(&DeviceAggregateArgs {
+                    language: lang,
+                    time_formatted,
+                    went_offline: &owned.went_offline,
+                    came_back: &owned.came_back,
+                    first_seen: &owned.first_seen,
+                    reduced: &owned.reduced,
+                    address_suffix,
+                })
+                .pick(lang)
+                .to_string()
+            }),
             || device_aggregate_fcm_payload(agg),
             || device_aggregate_unified_payload(agg),
         )
         .await;
     }
 
-    /// Worker on `address` connected or disconnected. Routes to
-    /// Telegram + FCM + UnifiedPush (ntfy intentionally skipped — the
-    /// topic model doesn't carry per-user device subscriptions cleanly).
+    /// Worker on `address` connected or disconnected.
     pub async fn notify_device_status(&self, event: &DeviceStatusEvent) {
+        let owned = event.clone();
         self.notify_device(
             &event.address,
-            |adapter, pool, langs, subs| {
-                Box::pin(send_telegram_device_status(
-                    adapter,
-                    pool,
-                    langs,
-                    event.clone(),
-                    subs,
-                ))
-            },
+            event.timestamp,
+            ("telegram-device", "ntfy-device"),
+            Arc::new(move |lang, time_formatted, address_suffix| {
+                DeviceStatusText::build(&DeviceStatusArgs {
+                    language: lang,
+                    time_formatted,
+                    user_agent: owned.user_agent.as_deref(),
+                    worker_name: owned.worker_name.as_deref(),
+                    is_online: owned.is_online,
+                    is_returning: owned.is_returning,
+                    address_suffix,
+                })
+                .pick(lang)
+                .to_string()
+            }),
             || device_status_fcm_payload(event),
             || device_status_unified_payload(event),
         )
         .await;
     }
 
-    /// Route one device notice to every device-enabled subscription. The two
-    /// push transports do NOT share a payload: FCM turns `tag` into
-    /// `data.status` and merges `extras`, while UnifiedPush flattens to
-    /// `title|body|tag`. Payloads are built only for a transport with subscribers.
+    /// Route one device notice to every device-enabled subscription. Telegram
+    /// and ntfy show the same `render`ed text, each in its own language and
+    /// the pool's timezone; `labels` names them in the send log. The two push
+    /// transports do NOT share a payload: FCM turns `tag` into `data.status`
+    /// and merges `extras`, while UnifiedPush flattens to `title|body|tag`.
+    /// Payloads are built only for a transport with subscribers.
     async fn notify_device(
         &self,
         address: &AddressId,
-        telegram: impl FnOnce(
-            Arc<TelegramAdapter>,
-            PgPool,
-            ChatLanguages,
-            Vec<TelegramSubscriptionRow>,
-        ) -> TaskFuture,
+        timestamp: DateTime<Utc>,
+        labels: (&'static str, &'static str),
+        render: DeviceRender,
         fcm_payload: impl FnOnce() -> PushPayload,
         unified_payload: impl FnOnce() -> PushPayload,
     ) {
-        let (telegram_subs, _ntfy_sub, push_subs) = self.load_subs(address).await;
+        let (telegram_subs, ntfy_sub, push_subs) = self.load_subs(address).await;
+        let (telegram_label, ntfy_label) = labels;
 
         let mut tasks = Vec::new();
         let telegram_dev: Vec<_> = telegram_subs
@@ -517,12 +535,32 @@ impl NotificationDispatcher {
             .collect();
         if !telegram_dev.is_empty() {
             if let Some(adapter) = &self.telegram {
-                tasks.push(telegram(
+                tasks.push(Box::pin(send_telegram_device(
                     Arc::clone(adapter),
                     self.pool.clone(),
                     self.chat_languages.clone(),
+                    address.clone(),
+                    timestamp,
                     telegram_dev,
-                ));
+                    telegram_label,
+                    Arc::clone(&render),
+                )) as TaskFuture);
+            }
+        }
+        if let (Some(sub), Some(adapter)) = (ntfy_sub, &self.ntfy) {
+            if sub.device_notifications_enabled {
+                let adapter = Arc::clone(adapter);
+                let render = Arc::clone(&render);
+                tasks.push(Box::pin(async move {
+                    // One topic per address, so no address suffix.
+                    let lang = Language::parse(&sub.language);
+                    let time_str = format_device_time(DEVICE_TIMEZONE, timestamp, lang);
+                    let text = render(lang, &time_str, None);
+                    log_adapter_send(
+                        ntfy_label,
+                        adapter.publish(sub.address.as_str(), &text).await,
+                    );
+                }) as TaskFuture);
             }
         }
         let push_of = |kind: &str| -> Vec<PushSubscriptionRow> {
@@ -612,6 +650,11 @@ struct PushHandles {
 }
 
 type TaskFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// A device notice rendered for one recipient from its language, the time in
+/// the pool's timezone and, for a chat following more than one address, the
+/// address suffix.
+type DeviceRender = Arc<dyn Fn(Language, &str, Option<&str>) -> String + Send + Sync>;
 
 /// Which transports this dispatcher can send on.
 #[derive(Debug, Clone, Copy)]
@@ -883,39 +926,6 @@ async fn send_telegram_best_diff(
     join_all(tasks).await;
 }
 
-async fn send_telegram_device_status(
-    adapter: Arc<TelegramAdapter>,
-    pool: PgPool,
-    chat_languages: ChatLanguages,
-    event: DeviceStatusEvent,
-    subs: Vec<TelegramSubscriptionRow>,
-) {
-    let (address, timestamp) = (event.address.clone(), event.timestamp);
-    send_telegram_device(
-        adapter,
-        pool,
-        chat_languages,
-        &address,
-        timestamp,
-        subs,
-        "telegram-device",
-        |lang, time_formatted, address_suffix| {
-            DeviceStatusText::build(&DeviceStatusArgs {
-                language: lang,
-                time_formatted,
-                user_agent: event.user_agent.as_deref(),
-                worker_name: event.worker_name.as_deref(),
-                is_online: event.is_online,
-                is_returning: event.is_returning,
-                address_suffix,
-            })
-            .pick(lang)
-            .to_string()
-        },
-    )
-    .await;
-}
-
 /// One Telegram device notice per chat, in the chat's language and the pool's
 /// timezone. The address is named only when the chat follows more than one.
 #[allow(clippy::too_many_arguments)]
@@ -923,11 +933,11 @@ async fn send_telegram_device(
     adapter: Arc<TelegramAdapter>,
     pool: PgPool,
     chat_languages: ChatLanguages,
-    address: &AddressId,
+    address: AddressId,
     timestamp: DateTime<Utc>,
     subs: Vec<TelegramSubscriptionRow>,
     label: &'static str,
-    render: impl Fn(Language, &str, Option<&str>) -> String,
+    render: DeviceRender,
 ) {
     let fmt_addr = short_address(address.as_str());
     let (adapter, pool, chat_languages, fmt_addr, render) =
@@ -952,37 +962,6 @@ async fn send_telegram_device(
         .await;
     });
     join_all(tasks).await;
-}
-
-async fn send_telegram_device_partial(
-    adapter: Arc<TelegramAdapter>,
-    pool: PgPool,
-    chat_languages: ChatLanguages,
-    partial: DevicePartial,
-    subs: Vec<TelegramSubscriptionRow>,
-) {
-    send_telegram_device(
-        adapter,
-        pool,
-        chat_languages,
-        &partial.address,
-        partial.timestamp,
-        subs,
-        "telegram-device-partial",
-        |lang, time_formatted, address_suffix| {
-            DevicePartialText::build(&DevicePartialArgs {
-                language: lang,
-                time_formatted,
-                worker_name: partial.worker_name.as_deref(),
-                remaining: partial.remaining,
-                before: partial.before,
-                address_suffix,
-            })
-            .pick(lang)
-            .to_string()
-        },
-    )
-    .await;
 }
 
 /// Push payload for a partial loss. `status` is deliberately neither
@@ -1047,38 +1026,6 @@ fn device_partial_unified_payload(partial: &DevicePartial) -> PushPayload {
         tag: String::new(),
         extras: Vec::new(),
     }
-}
-
-async fn send_telegram_device_aggregate(
-    adapter: Arc<TelegramAdapter>,
-    pool: PgPool,
-    chat_languages: ChatLanguages,
-    agg: DeviceAggregate,
-    subs: Vec<TelegramSubscriptionRow>,
-) {
-    send_telegram_device(
-        adapter,
-        pool,
-        chat_languages,
-        &agg.address,
-        agg.timestamp,
-        subs,
-        "telegram-device-agg",
-        |lang, time_formatted, address_suffix| {
-            DeviceAggregateText::build(&DeviceAggregateArgs {
-                language: lang,
-                time_formatted,
-                went_offline: &agg.went_offline,
-                came_back: &agg.came_back,
-                first_seen: &agg.first_seen,
-                reduced: &agg.reduced,
-                address_suffix,
-            })
-            .pick(lang)
-            .to_string()
-        },
-    )
-    .await;
 }
 
 /// Push payload for an aggregate. Carries the same key set as the single
@@ -1605,6 +1552,97 @@ mod tests {
         ));
         assert!(text.contains("Team-Block 900001 gefunden"), "{text}");
         assert!(!text.contains("sats"), "{text}");
+    }
+
+    /// A device notice reaches an ntfy topic whose subscription has device
+    /// notices on, with the worker in its text; a topic with them off gets
+    /// nothing (the control). A local listener stands in for the ntfy server
+    /// and records each publish.
+    #[tokio::test]
+    async fn a_device_notice_reaches_an_ntfy_topic_with_device_notices_on() {
+        use tokio::io::AsyncWriteExt;
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_url = format!("http://{}", listener.local_addr().unwrap());
+        let posts: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::default();
+        let recorded = Arc::clone(&posts);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let recorded = Arc::clone(&recorded);
+                tokio::spawn(async move {
+                    let (path, body) = crate::test_http::read_request(&mut sock).await;
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push((path, String::from_utf8_lossy(&body).to_string()));
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        let adapter = Arc::new(
+            NtfyAdapter::new(crate::adapter::NtfyConfig {
+                server_url,
+                access_token: None,
+                topic_prefix: "bp-test-".to_string(),
+            })
+            .unwrap(),
+        );
+        let dispatcher = NotificationDispatcher::new(
+            pool.clone(),
+            None,
+            Some(adapter),
+            None,
+            None,
+            ChatLanguages::new(pool.clone()),
+        );
+        let (on, off) = (
+            addr("bc1qntfydevicenoticeson"),
+            addr("bc1qntfydevicenoticesoff"),
+        );
+        let cleanup = || async {
+            sqlx::query("DELETE FROM ntfy_subscriptions_entity WHERE address = ANY($1)")
+                .bind(vec![on.as_str(), off.as_str()])
+                .execute(&pool)
+                .await
+                .unwrap();
+        };
+        cleanup().await;
+        for (address, device) in [(&on, true), (&off, false)] {
+            bp_db::upsert_ntfy_subscription(&pool, address)
+                .await
+                .unwrap();
+            bp_db::update_ntfy_sub_device_flag(&pool, address, device)
+                .await
+                .unwrap();
+        }
+
+        for address in [&on, &off] {
+            dispatcher
+                .notify_device_status(&DeviceStatusEvent {
+                    address: address.clone(),
+                    worker_name: Some("rig7".to_string()),
+                    user_agent: Some("cgminer".to_string()),
+                    is_online: false,
+                    is_returning: false,
+                    timestamp: Utc::now(),
+                })
+                .await;
+        }
+        let posts = posts.lock().unwrap().clone();
+        cleanup().await;
+        assert_eq!(
+            posts.len(),
+            1,
+            "only the topic with device notices on: {posts:?}"
+        );
+        assert_eq!(posts[0].0, format!("/bp-test-{}", on.as_str()));
+        assert!(posts[0].1.contains("rig7"), "{:?}", posts[0].1);
     }
 
     /// The members are read from the finder's Team or Blockparty; a Solo

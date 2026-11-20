@@ -11,3 +11,5 @@ pub mod dispatcher;
 pub mod format;
 pub mod listener;
 pub mod template;
+#[cfg(test)]
+mod test_http;

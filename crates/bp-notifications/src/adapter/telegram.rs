@@ -414,7 +414,7 @@ fn migrated_to(body: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
     /// A Bot API stand-in on localhost: answers each request with the next
@@ -431,27 +431,7 @@ mod tests {
             let mut bodies = Vec::new();
             for (status, reply) in replies {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut raw = Vec::new();
-                let mut buf = [0u8; 4096];
-                let body = loop {
-                    let n = socket.read(&mut buf).await.unwrap();
-                    assert!(n > 0, "connection closed before the request was read");
-                    raw.extend_from_slice(&buf[..n]);
-                    let text = String::from_utf8_lossy(&raw).to_string();
-                    if let Some(end) = text.find("\r\n\r\n") {
-                        let len: usize = text
-                            .lines()
-                            .find_map(|l| {
-                                l.to_ascii_lowercase()
-                                    .strip_prefix("content-length:")
-                                    .map(|v| v.trim().parse().unwrap())
-                            })
-                            .unwrap_or(0);
-                        if raw.len() >= end + 4 + len {
-                            break raw[end + 4..end + 4 + len].to_vec();
-                        }
-                    }
-                };
+                let (_path, body) = crate::test_http::read_request(&mut socket).await;
                 bodies.push(serde_json::from_slice(&body).unwrap());
                 let response = format!(
                     "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n\

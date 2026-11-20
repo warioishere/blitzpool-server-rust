@@ -1245,9 +1245,8 @@ pub async fn find_best_difficulty_scan_addresses(pool: &PgPool) -> Result<Vec<Ad
 }
 
 /// Every address that has at least one **device-status** subscriber, on
-/// Telegram or push (ntfy deliberately carries no device status). The
-/// device-status gate tracks only these, so nobody-would-receive-it
-/// messages cost no subscription lookups.
+/// Telegram, ntfy or push. The device-status gate tracks only these, so
+/// nobody-would-receive-it messages cost no subscription lookups.
 pub async fn find_device_notification_addresses(pool: &PgPool) -> Result<Vec<AddressId>, DbError> {
     let rows = sqlx::query!(
         r#"SELECT address AS "address!: AddressId"
@@ -1256,6 +1255,10 @@ pub async fn find_device_notification_addresses(pool: &PgPool) -> Result<Vec<Add
            UNION
            SELECT address AS "address!: AddressId"
            FROM push_subscription_entity
+           WHERE "deviceNotificationsEnabled" AND "deletedAt" IS NULL
+           UNION
+           SELECT address AS "address!: AddressId"
+           FROM ntfy_subscriptions_entity
            WHERE "deviceNotificationsEnabled" AND "deletedAt" IS NULL"#,
     )
     .fetch_all(pool)
