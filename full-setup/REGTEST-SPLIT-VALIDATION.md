@@ -7,14 +7,15 @@ the ledger — including across a `payout` restart. Proves the *deployment*
 (the validity logic is already proven by `regtest_split_e2e.rs` + the
 in-process regtest tests).
 
-Uses the server-local `docker-compose-regtest-pg-split.yml` (core / api /
-payout, `blitzpool-regtest.toml`). Commands assume the test server's
-regtest node container `blitzpool-bitcoin-regtest` (bitcoin-cli at
-`/app/bin/bitcoin-cli`, rpc `bitcoin:bitcoin`).
+Uses this directory's `docker-compose.yml` with the `regtest` profile and a
+regtest config at `../.local/blitzpool-regtest.toml`. The regtest node runs as
+`blitzpool-bitcoin-regtest` (bitcoin-cli at `/app/bin/bitcoin-cli`, rpc
+`bitcoin:bitcoin` from `docker/bitcoin/regtest/bitcoin.conf`).
 
 ```bash
 cd full-setup
-COMPOSE="-f docker-compose-regtest-pg-split.yml"
+export BLITZPOOL_CONFIG=blitzpool-regtest.toml
+COMPOSE="--profile regtest"
 BCLI="docker exec blitzpool-bitcoin-regtest /app/bin/bitcoin-cli -regtest -rpcuser=bitcoin -rpcpassword=bitcoin"
 ```
 
@@ -24,8 +25,8 @@ BCLI="docker exec blitzpool-bitcoin-regtest /app/bin/bitcoin-cli -regtest -rpcus
 docker compose $COMPOSE up -d --build
 docker compose $COMPOSE ps                       # postgres, redis, bitcoin-regtest, core, api, payout, notify up
 docker logs blitzpool-core   2>&1 | grep "bound: process live"   # roles=[Front]  stratum_ports=Some([...])
-docker logs blitzpool-payout 2>&1 | grep -E "consumer: live"     # money/stats-session/block-found(ledger)/rejected live
-docker logs blitzpool-notify 2>&1 | grep -E "consumer: live"     # block-found(notify) + device-status live
+docker logs blitzpool-payout 2>&1 | grep -E "stream-consumer: live"   # one line per consumer
+docker logs blitzpool-notify 2>&1 | grep -E "stream-consumer: live"
 ```
 
 ## 2. Initialise the chain (IBD-exit + coinbase maturity)
@@ -44,8 +45,8 @@ docker logs --tail 20 blitzpool-core 2>&1 | grep -i "template"   # core is now s
 
 Connect your regtest stratum miner to the **core** (not the api/payout):
 
-* PPLNS: `stratum+tcp://<server-ip>:3340`
-* Solo:  `stratum+tcp://<server-ip>:3333`
+* PPLNS: `stratum+tcp://<host>:3340`
+* Solo:  `stratum+tcp://<host>:3333`
 
 Username = a regtest payout address (`bcrt1q…`), optionally `.worker`.
 Regtest network difficulty is trivial, so accepted shares meet the network
@@ -65,12 +66,17 @@ would mean the coinbase was rejected — that's the thing this run rules out.
 
 ## 5. Confirm the satellite applied the ledger
 
+A found block is parked until it has `confirmation_depth` confirmations
+(default 3), then booked:
+
 ```bash
 docker logs --tail 80 blitzpool-payout 2>&1 \
-  | grep -iE "block-found-consumer: applied|on_block_found|ledger applied"
+  | grep -F "awaiting confirmations before apply"
+$BCLI generatetoaddress 3 $ADDR                       # bury it to the default depth
+docker logs --tail 80 blitzpool-payout 2>&1 \
+  | grep -F "confirmed → payout history applied"
 # PPLNS balances written for the block:
-$BCLI getblockcount   # note the height H, then:
-docker exec blitzpool-postgres psql -U postgres -d public_pool \
+docker exec blitzpool-postgres psql -U postgres -d blitzpool \
   -c 'SELECT address, "balanceSats" FROM pplns_balance ORDER BY "updatedAt" DESC LIMIT 5;'
 ```
 
@@ -87,9 +93,9 @@ Expect:
 
 * the miner **stays connected** (core untouched) and keeps submitting;
 * while payout is down, shares + any block-found buffer in the Redis streams;
-* on restart, `blitzpool-payout` logs `consumer: live`, drains the pending
-  backlog (`drained pending backlog` / `applied + acked`), and the windows /
-  balances catch up — nothing lost.
+* on restart, `blitzpool-payout` replays its pending entries (`replayed
+  pending backlog`), logs `stream-consumer: live` per consumer, and the
+  windows / balances catch up — nothing lost.
 
 ## Teardown
 

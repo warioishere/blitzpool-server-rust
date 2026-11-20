@@ -71,7 +71,7 @@ use crate::boot::{BootError, FoundationHandles};
 use crate::crons::CronHandles;
 use crate::engines::{EngineError, EngineHandles};
 use crate::group_service::GroupServiceSpawnError;
-use crate::hooks::{HooksError, ProductionHooks};
+use crate::hooks::HooksError;
 use crate::jdp::{JdpHandles, JdpSpawnError};
 use crate::listeners::{ListenerHandles, ListenerSpawnError};
 use crate::stratum::{StratumHandles, StratumSpawnError};
@@ -133,7 +133,8 @@ struct Cli {
     skip_bitcoin_rpc_liveness: bool,
 
     /// Skip the TDP worker spawn entirely, to verify the api / engines
-    /// layer without bitcoind. PPLNS network difficulty falls back to 1.0.
+    /// layer without the bitcoin-core IPC socket. No Stratum or JDP listener
+    /// binds.
     #[arg(long)]
     skip_tdp: bool,
 
@@ -303,7 +304,7 @@ async fn main() -> ExitCode {
             return ExitCode::from(3);
         }
     };
-    log_handles_summary(&handles);
+    log_handles_summary(&handles, cli.skip_bitcoin_rpc_liveness);
 
     if cli.check_boot {
         tracing::info!("--check-boot given; exiting after successful boot");
@@ -335,7 +336,6 @@ async fn main() -> ExitCode {
             return ExitCode::from(5);
         }
     };
-    log_hooks_summary(&production_hooks);
 
     if cli.check_hooks {
         tracing::info!("--check-hooks given; exiting after successful hook spawn");
@@ -1306,28 +1306,14 @@ fn print_api_error_help(err: &ApiServerError) {
     }
 }
 
-/// One-line-per-hook summary after [`hooks::spawn`] returns.
-fn log_hooks_summary(_h: &ProductionHooks) {
-    // The concrete impls are behind `Arc<dyn _>`; `hooks::spawn` logs their
-    // readiness, this line only marks the phase boundary.
-    tracing::info!(
-        email_verification_ready = true,
-        join_decision_email_ready = true,
-        push_ready = true,
-        group_service_ready = true,
-        "production hooks summary"
-    );
-}
-
 /// Operator-friendly hint for [`GroupServiceSpawnError`] variants.
 fn print_group_service_error_help(err: &GroupServiceSpawnError) {
     match err {
         GroupServiceSpawnError::Rebuild(_) => {
             eprintln!(
-                "hint: the initial address-cache rebuild hit PG — check \
-                 that the `pplns_group` + `pplns_group_member` tables are \
-                 present in the configured database. If you migrated from \
-                 a prior schema make sure both tables made it across."
+                "hint: the initial team address-cache rebuild could not read \
+                 `pplns_group` / `pplns_group_member` from Postgres; check the \
+                 `[database]` connection."
             );
         }
     }
@@ -1424,8 +1410,8 @@ fn print_engine_error_help(err: &EngineError) {
         }
         EngineError::SessionPersistence(_) => {
             eprintln!(
-                "hint: session-persistence config rejected — the flush/sample \
-                 intervals must be > 0."
+                "hint: the session-persistence engine failed to start; on a \
+                 database error, check the `[database]` connection."
             );
         }
         EngineError::InvalidAddress(_, _) => {
@@ -1447,13 +1433,14 @@ fn print_engine_error_help(err: &EngineError) {
 
 /// One-line-per-handle summary after [`boot::boot`] returns: the live-handle
 /// counterpart of [`log_startup_summary`].
-fn log_handles_summary(h: &FoundationHandles) {
-    // db/redis/bitcoin_rpc are live here, since boot::boot returns Err if any
-    // fails. `tdp` is optional (front-only, and absent under --skip-tdp).
+fn log_handles_summary(h: &FoundationHandles, skip_bitcoin_rpc_liveness: bool) {
+    // db/redis are live here, since boot::boot returns Err if either fails;
+    // bitcoin_rpc is live unless its liveness ping was skipped. `tdp` is
+    // optional (front-only, and absent under --skip-tdp).
     tracing::info!(
         db_ready = true,
         redis_ready = true,
-        bitcoin_rpc_ready = true,
+        bitcoin_rpc_ready = !skip_bitcoin_rpc_liveness,
         tdp_ready = h.tdp.is_some(),
         geoip = h.geoip.is_some(),
         metrics = h.metrics.is_some(),
@@ -1502,9 +1489,9 @@ fn print_boot_error_help(err: &BootError) {
         BootError::Tdp(_) => {
             eprintln!(
                 "hint: `[tdp] socket_path` must point at the bitcoin-core IPC \
-                 socket. Per memory `project-tdp-direct-architecture` the Rust \
-                 port uses TDP-direkt — bitcoind must be built with the IPC \
-                 bridge + the socket file present + readable by this process."
+                 socket. The pool takes its templates straight from bitcoin-core \
+                 over IPC, so the node must run with IPC enabled and the socket \
+                 file must exist and be readable by this process."
             );
         }
     }
@@ -1513,13 +1500,12 @@ fn print_boot_error_help(err: &BootError) {
 /// Operator-friendly hint when the config can't be loaded.
 fn print_config_error_help(err: &ConfigError) {
     match err {
-        ConfigError::Io { path, .. } => {
+        ConfigError::Io { .. } => {
             eprintln!(
                 "hint: pass --config <PATH> to point at a different file. \
                  The repo ships a template at `blitzpool.example.toml` — \
                  copy that to `.local/blitzpool.toml` and edit it."
             );
-            let _ = path;
         }
         ConfigError::Parse { .. } => {
             eprintln!(

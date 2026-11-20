@@ -1,73 +1,73 @@
-# DB-Schema + sqlx Offline-Cache Workflow
+# DB schema + sqlx offline-cache workflow
 
 ## Schema
 
-Das ganze Schema liegt in **`crates/bp-db/migrations/*.sql`**.
-`Db::run_migrations()` wendet die Migrationen beim Boot an — Advisory-Lock-
-serialisiert, also fahren alle Prozesse im Core/Satellite-Split sie gefahrlos.
-Der Deploy braucht keinen separaten Schema- oder Migrations-Schritt.
+The whole schema lives in **`crates/bp-db/migrations/*.sql`**.
+`Db::run_migrations()` applies the migrations at boot, serialised by an
+advisory lock, so every process of the core/satellite split runs them safely.
+A deploy needs no separate schema or migration step.
 
-- `0000_baseline.sql` legt auf einer **leeren** DB die Basis-Tabellen an (Stand
-  nach `0016`). Auf einer DB, die schon eine davon hat (prod, Testserver, alte
-  TS-Pool-DB), tut sie nichts und wird nur als angewandt eingetragen.
-- `0001`… ändern das Schema danach wie gehabt.
+- `0000_baseline.sql` creates the base tables on an **empty** database (the
+  schema as of `0016`). On a database that already has one of them, it does
+  nothing and is only recorded as applied.
+- `0001`… change the schema from there.
 
-**Neue Migration hinzufügen:**
-1. `crates/bp-db/migrations/NNNN_beschreibung.sql` anlegen (idempotent,
-   `IF NOT EXISTS`). Sie muss ein Binary eine Version älter weiter laufen
-   lassen (`bp_db::with_boot_policy`).
-2. Lokales Postgres migrieren + sqlx-Cache regenerieren (siehe unten).
+**Adding a migration:**
+1. Create `crates/bp-db/migrations/NNNN_description.sql` (idempotent,
+   `IF NOT EXISTS`). A binary one release older must keep running against it
+   (`bp_db::with_boot_policy`).
+2. Migrate the local Postgres and regenerate the sqlx cache (see below).
 
-Eine einmal irgendwo angewandte Migration wird **nie** editiert — sqlx prüft
-ihre Checksumme. Das gilt auch für `0000_baseline.sql`.
+A migration that has been applied anywhere is **never** edited: sqlx checks
+its checksum. That holds for `0000_baseline.sql` too.
 
-## sqlx-Offline-Cache (`.sqlx/` im Repo-Root)
+## sqlx offline cache (`.sqlx/` at the repo root)
 
-`bp-db` nutzt **`sqlx::query!` / `sqlx::query_as!` Makros** für compile-time
-SQL-Validierung. Diese brauchen entweder eine Live-PG-Verbindung beim Build
-ODER einen vorab generierten Cache (`.sqlx/` im Repo-Root, committet).
+`bp-db` uses the **`sqlx::query!` / `sqlx::query_as!` macros** for
+compile-time SQL validation. They need either a live Postgres at build time
+OR a pre-generated cache (`.sqlx/` at the repo root, committed).
 
-**CI / Production builds:** Nutzen den committeten Cache via `SQLX_OFFLINE=true`
-(in `.github/workflows/ci.yml` gesetzt). Kein DB-Zugriff beim Build nötig.
+**CI / production builds** use the committed cache via `SQLX_OFFLINE=true`
+(set in `.github/workflows/ci.yml`). No database access at build time.
 
-**Dev-Loop wenn du eine Query änderst/hinzufügst:**
+**Dev loop when you change or add a query:**
 
-1. Lokales Postgres starten (matched die prod-Version 18.1):
+1. Start a local Postgres (the major version the compose files run):
    ```bash
-   docker run -d --name blitzpool-rust-pg --rm \
+   docker run -d --name bp-test-pg \
        -p 15433:5432 \
-       -e POSTGRES_DB=public_pool \
+       -e POSTGRES_DB=blitzpool \
        -e POSTGRES_USER=postgres \
        -e POSTGRES_PASSWORD=postgres \
        postgres:18
-   # warten bis ready: docker exec blitzpool-rust-pg pg_isready -U postgres
+   # wait until ready: docker exec bp-test-pg pg_isready -U postgres
    ```
 
-2. Schema bauen (einmal nach Container-Start oder nach einer neuen Migration):
+2. Build the schema (once after the container starts, and after a new
+   migration):
    ```bash
-   DATABASE_URL='postgres://postgres:postgres@localhost:15433/public_pool' \
+   DATABASE_URL='postgres://postgres:postgres@localhost:15433/blitzpool' \
        cargo sqlx migrate run --source crates/bp-db/migrations
    ```
 
-3. Cache regenerieren:
+3. Regenerate the cache:
    ```bash
-   DATABASE_URL='postgres://postgres:postgres@localhost:15433/public_pool' \
+   DATABASE_URL='postgres://postgres:postgres@localhost:15433/blitzpool' \
        cargo sqlx prepare --workspace
    ```
 
-4. Die geänderten `.sqlx/query-*.json` Files committen.
+4. Commit the changed `.sqlx/query-*.json` files.
 
-5. Verifikation dass Offline-Mode noch durchläuft:
+5. Check that offline mode still builds:
    ```bash
    unset DATABASE_URL
    SQLX_OFFLINE=true cargo check --workspace
    ```
 
-**Regel:** Nie `cargo sqlx prepare` gegen den test-server oder prod ausführen —
-nur gegen lokalen Docker-Container.
+**Rule:** run `cargo sqlx prepare` only against a local container, never
+against a shared or production database.
 
-## Was hier liegt
+## What lives here
 
-Nur diese README. `.gitignore` ist eine Allow-list: lokale Daten-Dumps in
-diesem Ordner bleiben uncommittet — sie enthalten Miner-Adressen, Emails,
-Tokens.
+Only this README. `.gitignore` is an allow-list: local data dumps in this
+folder stay uncommitted, since they hold miner addresses, emails and tokens.

@@ -91,10 +91,10 @@ downtime:
 (postgres / redis / bitcoin) alone" — so the swap never disturbs the core or
 the infra.
 
-> **Always name the service in the `up`.** All three services share
+> **Always name the service in the `up`.** All four pool services share
 > `image: blitzpool:latest`, so `build` updates that shared tag. A bare
-> `docker compose $COMPOSE up -d` would then also recreate `core` + `api` onto
-> the new image — i.e. disconnect the miners. Naming the service (with
+> `docker compose $COMPOSE up -d` would then also recreate the other three onto
+> the new image, `core` included — i.e. disconnect the miners. Naming the service (with
 > `--no-deps`) keeps the swap surgical.
 
 **Accounting / payout / stats fix** (most common — PPLNS ledger, Team Mining,

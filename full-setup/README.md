@@ -52,7 +52,7 @@ the same host port numbers.
   named volume `blitzpool-ipc`). High-throughput template stream —
   per-template hot path. Only the `core` process mounts it.
 - **JSON-RPC** over the internal docker network (`http://bitcoin:8332`
-  etc.). Used for one-shot calls: `getblockchaininfo` (PPLNS window
+  etc.). Used for one-shot calls: `getmininginfo` (PPLNS window
   size needs current network difficulty), chain-tip stale-detection
   reads.
 
@@ -133,7 +133,7 @@ data/
 ├── bitcoin-testnet4/         # testnet4 chain
 ├── bitcoin-regtest/          # regtest chain
 ├── postgres/                 # shared PG cluster
-├── redis/                    # AOF + RDB
+├── redis/                    # AOF (no RDB snapshots)
 └── blitzpool-logs/           # pool tracing-JSON (all processes, all profiles)
 ```
 
@@ -142,9 +142,8 @@ authority keys, FCM service-account JSON, web-push VAPID keys.
 
 ## Database name
 
-Default `PG_DATABASE=public_pool` matches the TS-pool legacy schema
-name. When attaching to an existing prod DB the env override
-mechanism is in `.env.example` — copy to `.env` and uncomment.
+Default `PG_DATABASE=blitzpool`. To attach to a database with another name,
+set `PG_DATABASE` in `.env` (see `.env.example`).
 
 ## Image sizes (approximate)
 
@@ -156,7 +155,8 @@ mechanism is in `.env.example` — copy to `.env` and uncomment.
 | blitzpool | debian:bookworm-slim + binary  | ~30 MB     |
 
 The four pool processes all run the one `blitzpool:latest` image. Build
-images (rust:1.93-slim, debian build stages) are discarded after the final
+images (the Rust image `RUST_VERSION` in the Dockerfile names, debian build
+stages) are discarded after the final
 image is assembled.
 
 ## Schema sync
@@ -164,5 +164,5 @@ image is assembled.
 The whole schema lives in `crates/bp-db/migrations/` and is applied at boot
 by `Db::run_migrations()` under an advisory lock, so the deploy needs no
 separate migration step. On an empty data volume `0000_baseline.sql` creates
-the base tables first; on a database that already has them (one carried over
-from the TS pool, or prod) it changes nothing.
+the base tables first; on a database that already has them it changes
+nothing.

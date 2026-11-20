@@ -20,7 +20,7 @@ License: **GNU AGPL v3 (AGPL-3.0-or-later)**.
 |---|---|---|---|
 | Payouts go directly on-chain | ✅ same block as the find | ❌ batch cron, hours to days | ❌ threshold-based |
 | Pool holds miner sats | ❌ never | ✅ between find & payout | ✅ until threshold |
-| Minimum payout | *none* — it's just a coinbase output | typically 0.001 BTC+ | same |
+| Minimum payout | *none* in Solo — it's just a coinbase output; PPLNS carries amounts below `min_payout_sats` over as credit | typically 0.001 BTC+ | same |
 | Stratum V1 | ✅ | ✅ | ✅ |
 | Stratum V2 (Noise + TDP + JDP + extended channels) | ✅ actively developed | rare | almost never |
 | Non-custodial Team Mining (friends mine together, split on-chain) | ✅ | — | — |
@@ -35,7 +35,7 @@ Every block mined on Blitzpool has the miner address(es) as the **direct** coinb
 All four write their payout straight into the coinbase. They differ only in *how the reward is split*.
 
 ### 🎯 Solo
-You versus Bitcoin. Your share wins → the entire coinbase goes to your address. No fee, no custody.
+You versus Bitcoin. Your share wins → the coinbase goes to your address, minus the optional Solo fee (`[solo]`). No custody.
 
 ### 🔗 PPLNS (Pay Per Last N Shares)
 Sliding-window pooled mining with a **multi-output coinbase** and a **signed credit/debit ledger**. Every miner in the window gets their proportional cut as their own coinbase output.
@@ -94,7 +94,7 @@ The pool runs as role-gated processes that communicate over **Redis streams**:
 - `stats` — share-stats aggregation
 - `notify` — Telegram / ntfy / push / email fan-out
 
-Roles are selected with `--roles` / `BLITZPOOL_ROLES` (independent of payout mode). Block-found and accepted/rejected shares flow Core→Satellite over Redis streams with exactly-once semantics; routing-cache invalidation is broadcast cross-process. See [`full-setup/DEPLOYMENT.md`](full-setup/DEPLOYMENT.md).
+Roles are selected with `--roles` / `BLITZPOOL_ROLES` (independent of payout mode). Block-found and accepted/rejected shares flow Core→Satellite over Redis streams, delivered at least once and applied once (shares dedup on their id, bookings are idempotent); routing-cache invalidation is broadcast cross-process. See [`full-setup/DEPLOYMENT.md`](full-setup/DEPLOYMENT.md).
 
 ### 5. Confirmation-gated, orphan-safe payouts
 
@@ -142,7 +142,7 @@ Configuration is **TOML-first** (parsed by `bp-config`), grouped into sections �
 | Section / key | Purpose |
 |---|---|
 | `[tdp].socket_path` | bitcoin-core IPC socket for the template streams |
-| `[pplns].coinbase_weight_budget` | PPLNS budget **floor** (default 50 000 WU); autoscaler grows from here |
+| `[pplns].coinbase_weight_budget` | PPLNS budget **floor** (required; 50 000 WU in the example config); autoscaler grows from here |
 | `[pplns.coinbase_autoscale]` | `max_weight_budget` (ceiling), `up/down_threshold`, `step_factor`, debounce, cooldown |
 | `[pplns]` / `[group_solo]` (Team Mining) / `[blockparty]` | Presence switches the mode on; absent means off. Solo is always on |
 | `[solo]` / `[pplns]` / `[group_solo]` / `[blockparty]` `.fee_address` + `.fee_percent` | Each mode's own pool fee (optional on Solo) |

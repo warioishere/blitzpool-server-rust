@@ -32,9 +32,8 @@
 #   docker compose up -d --no-deps blitzpool-payout
 #
 # The shared postgres holds one DB per network so switching does NOT
-# wipe the other network's state. DB name = `blitzpool`. The cutover
-# (cutover-to-rust.sh) renames the migrated TS DB `public_pool` →
-# `blitzpool`, so no PG_DATABASE override is needed post-cutover.
+# wipe the other network's state. DB name = `blitzpool` (PG_DATABASE in
+# `.env` overrides it).
 
 # Bitcoin Core release the node images build, taken from `.env` when set
 # there (see .env.example); unset, the Dockerfile's defaults apply.
@@ -93,9 +92,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    # Tuning copied from the TS-pool production compose. Reasonable
-    # defaults for a single-host pool; tune `shared_buffers` / `work_mem`
-    # downward on a smaller box.
+    # Reasonable defaults for a single-host pool; tune `shared_buffers` /
+    # `work_mem` downward on a smaller box.
     command: >
       postgres
       -c max_connections=120
@@ -125,9 +123,7 @@ services:
       # Mount at /var/lib/postgresql (not /var/lib/postgresql/18/docker)
       # so the postgres:18-alpine image's default PGDATA layout
       # (/var/lib/postgresql/18/docker/) lives entirely inside the
-      # mount. This matches the structure the TS pool ships its
-      # production PG data in (data/.../pg/18/docker/), enabling a
-      # 1:1 cp -a copy without flattening.
+      # mount.
       - "./data/postgres:/var/lib/postgresql"
 
   redis:
@@ -143,10 +139,10 @@ services:
     networks:
       - blitzpool
     healthcheck:
-      # docker 29.5 regression: CMD-form healthchecks fail with "cwd
-      # outside container mount namespace root" when the docker
-      # client's CWD doesn't exist in the container. Wrap in shell
-      # with explicit `cd /` to sidestep it.
+      # Some Docker versions fail CMD-form healthchecks with "cwd outside
+      # container mount namespace root" when the docker client's CWD does
+      # not exist in the container; the shell with an explicit `cd /`
+      # avoids that.
       test: ["CMD-SHELL", "cd / && valkey-cli ${REDIS_PASSWORD:+-a \"$$REDIS_PASSWORD\"} ping"]
       interval: 10s
       timeout: 5s
@@ -271,7 +267,7 @@ services:
       - "0.0.0.0:3339:3339/tcp"   # solo high-diff
       - "0.0.0.0:3340:3340/tcp"   # pplns
       - "0.0.0.0:3349:3349/tcp"   # pplns high-diff
-      - "0.0.0.0:3335:3335/tcp"   # sv2
+      - "0.0.0.0:3335:3335/tcp"   # jdp ([sv2].jdp_port)
       - "0.0.0.0:3337:3337/tcp"   # jdp
     volumes:
       - "../.local/${BLITZPOOL_CONFIG:-blitzpool.toml}:/app/blitzpool.toml:ro"

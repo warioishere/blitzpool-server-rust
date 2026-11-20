@@ -97,9 +97,8 @@ pub(crate) struct BootOptions {
     /// built. For staging where bitcoind is unreachable but PG, Redis and
     /// HTTP should come up.
     pub(crate) skip_bitcoin_rpc_liveness: bool,
-    /// Skip TDP spawn entirely: the PPLNS network-difficulty bootstrap
-    /// defaults to 1.0 and `/info/block-template` returns 503. Never in
-    /// production.
+    /// Skip TDP spawn entirely: no Stratum or JDP listener binds and
+    /// `/info/block-template` returns 503. Never in production.
     pub(crate) skip_tdp: bool,
 }
 
@@ -118,9 +117,7 @@ pub(crate) async fn boot(
     // socket.
     let (tdp, alt_tdp) = if opts.skip_tdp || !cfg.has_role(Role::Front) {
         if opts.skip_tdp {
-            warn!(
-                "tdp: spawn skipped via --skip-tdp; pplns net-diff bootstrap will fall back to 1.0"
-            );
+            warn!("tdp: spawn skipped via --skip-tdp; no Stratum or JDP listener binds");
         } else {
             info!(roles = ?cfg.effective_roles(), "tdp: spawn skipped (process has no front role)");
         }
@@ -462,14 +459,14 @@ mod tests {
             port: 5432,
             user: "postgres".into(),
             password: "secret".into(),
-            database: "public_pool".into(),
+            database: "blitzpool".into(),
             ssl: false,
             pool_size: 10,
             acquire_timeout_ms: 60_000,
             idle_timeout_ms: 10_000,
         };
         let url = build_pg_url(&cfg);
-        assert_eq!(url, "postgres://postgres:secret@127.0.0.1:5432/public_pool");
+        assert_eq!(url, "postgres://postgres:secret@127.0.0.1:5432/blitzpool");
     }
 
     #[test]
