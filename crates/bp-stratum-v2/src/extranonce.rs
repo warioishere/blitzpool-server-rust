@@ -7,8 +7,8 @@
 pub use bp_common::extranonce::{ExtranonceError, SharedExtranonceAllocator, SV2_WORKER_ID};
 
 /// One connection's view of the SV2 allocator. The connection number comes
-/// from the allocator's counter, not the random `session_id`, which can
-/// collide; it is 32 bits so the channel id fits beside it in the key. Not
+/// from the allocator's own counter, so its keys do not depend on how session
+/// ids are minted; it is 32 bits so the channel id fits beside it in the key. Not
 /// `Clone`: a copy would share the connection number.
 #[derive(Debug)]
 pub struct ConnectionExtranonce {

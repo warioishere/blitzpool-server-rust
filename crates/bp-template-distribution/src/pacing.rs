@@ -25,11 +25,17 @@ pub struct RefreshPacer<A> {
 }
 
 impl<A> RefreshPacer<A> {
-    /// `seed` picks this connection's delay inside `spread`. It must be spread
-    /// evenly itself; both servers pass their random session id.
+    /// `seed` picks this connection's delay inside `spread`; both servers pass
+    /// their session id. It is mixed first, so consecutive ids, which
+    /// connections opened one after another get, still spread over the whole
+    /// window.
     pub fn new(seed: u64, spread: Duration) -> Self {
         let spread_ms = u64::try_from(spread.as_millis()).unwrap_or(u64::MAX);
-        let delay_ms = if spread_ms == 0 { 0 } else { seed % spread_ms };
+        let delay_ms = if spread_ms == 0 {
+            0
+        } else {
+            mix(seed) % spread_ms
+        };
         Self {
             delay: Duration::from_millis(delay_ms),
             held: None,
@@ -86,6 +92,15 @@ impl<A> RefreshPacer<A> {
     }
 }
 
+/// SplitMix64's finalizer: every input bit moves every output bit, so
+/// neighbouring seeds land far apart.
+fn mix(seed: u64) -> u64 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,9 +130,10 @@ mod tests {
     }
 
     fn pacer_with_delay(delay_ms: u64) -> RefreshPacer<u32> {
-        let pacer = RefreshPacer::new(delay_ms, REFRESH_SPREAD);
-        assert_eq!(pacer.delay, Duration::from_millis(delay_ms));
-        pacer
+        RefreshPacer {
+            delay: Duration::from_millis(delay_ms),
+            held: None,
+        }
     }
 
     /// Nothing comes out of `next` within `wait`.
@@ -248,13 +264,33 @@ mod tests {
         assert_eq!(start.elapsed(), Duration::ZERO);
     }
 
-    /// 1000 connections with random u32 seeds, as both servers hand them out:
+    /// 100 connections opened one after another get consecutive session ids;
+    /// their delays still cover the whole window instead of 100 adjacent
+    /// milliseconds.
+    #[test]
+    fn consecutive_seeds_spread_over_the_window() {
+        for start in [0u64, 0x6500_0000, u64::from(u32::MAX) - 50] {
+            let mut slices = [0usize; 10];
+            for seed in start..start + 100 {
+                let delay = RefreshPacer::<u32>::new(seed, REFRESH_SPREAD).delay;
+                slices[(delay.as_millis() / 100) as usize] += 1;
+            }
+            for (i, n) in slices.iter().enumerate() {
+                assert!(
+                    (2..=25).contains(n),
+                    "start {start:#x}: slice {i} holds {n} of 100"
+                );
+            }
+        }
+    }
+
+    /// 1000 connections with random u32 seeds:
     /// every delay stays inside the window and no 100 ms slice gets far more
     /// than its share.
     #[test]
     fn delays_spread_evenly_over_the_window() {
         let mut slices = [0usize; 10];
-        // A fixed xorshift sequence stands in for the session ids.
+        // A fixed xorshift sequence stands in for arbitrary seeds.
         let mut x: u32 = 0x9e37_79b9;
         for _ in 0..1000 {
             x ^= x << 13;

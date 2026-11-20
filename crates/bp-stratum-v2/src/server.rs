@@ -205,7 +205,7 @@ impl StratumV2MiningServer {
         let cancel = self.inner.cancel.clone();
         let extranonce = ConnectionExtranonce::new(self.inner.extranonce.clone());
         let job_cache = self.inner.job_cache.clone();
-        let session_id = self.alloc_session_id();
+        let session_id = bp_common::next_session_id();
 
         tokio::spawn(async move {
             let result = run_mining_connection(
@@ -239,15 +239,6 @@ impl StratumV2MiningServer {
             .templates
             .drain(self.inner.server_config.shutdown_drain_timeout)
             .await;
-    }
-
-    /// Generate a session id from 4 OS-CSPRNG bytes interpreted as a
-    /// big-endian u32. Formatted as `{:08x}` on the wire so logs +
-    /// `client_entity.sessionId` carry the same 8-char hex string.
-    fn alloc_session_id(&self) -> u32 {
-        let mut bytes = [0u8; 4];
-        getrandom::fill(&mut bytes).unwrap_or_default();
-        u32::from_be_bytes(bytes)
     }
 }
 
@@ -1829,35 +1820,6 @@ mod tests {
         );
         let clone = server.clone();
         assert!(clone.current_template().is_none());
-        server.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn allocated_session_ids_are_distinct_per_handle() {
-        let (_tdp_tx, tdp_rx) = broadcast::channel::<TemplateUpdate>(8);
-        let bridge = Arc::new(RwLock::new(JdpDeclaredJobRegistry::new()));
-        let server = StratumV2MiningServer::spawn(
-            server_cfg(),
-            noise_cfg(),
-            tdp_rx,
-            bp_template_distribution::TemplateSnapshot::default(),
-            Vec::new(),
-            MiningServerHooks::no_op(),
-            bridge,
-            fresh_allocator(),
-            Arc::new(MiningJobCache::new()),
-        );
-        let a = server.alloc_session_id();
-        let b = server.alloc_session_id();
-        let c = server.alloc_session_id();
-        assert_ne!(a, b);
-        assert_ne!(b, c);
-        assert_ne!(a, c);
-        for id in [a, b, c] {
-            let hex = format!("{id:08x}");
-            assert_eq!(hex.len(), 8);
-            assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
-        }
         server.shutdown().await;
     }
 

@@ -107,8 +107,8 @@ impl ExtranonceAllocator {
 }
 
 /// One protocol's allocator, shared by all of its ports, plus the counter
-/// its keys come from: a counter is unique by construction, a random session
-/// id only with high probability.
+/// its keys come from, which is unique by construction and independent of
+/// how session ids are minted.
 #[derive(Clone, Debug)]
 pub struct SharedExtranonceAllocator {
     allocator: Arc<Mutex<ExtranonceAllocator>>,

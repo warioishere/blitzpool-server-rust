@@ -29,7 +29,8 @@ pub struct ChannelState {
 
     /// The channel's own session: each channel is one device with its own
     /// worker name, client row and hashrate, as in the SV2 reference pool.
-    /// The connection shares only the address.
+    /// The connection shares only the address. Drawn from
+    /// [`bp_common::next_session_id`] at open, like an SV1 session's id.
     pub session_id: String,
     /// Worker name from this channel's `user_identity`.
     pub worker: String,

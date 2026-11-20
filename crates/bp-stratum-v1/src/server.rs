@@ -25,8 +25,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::client::{
-    apply_new_template, apply_vardiff_check, dispatch, random_session_id_hex, HandlerOutcome,
-    SessionEvent, SessionState,
+    apply_new_template, apply_vardiff_check, dispatch, HandlerOutcome, SessionEvent, SessionState,
 };
 use crate::config::{PortConfig, ServerConfig};
 use crate::frame::{write_error, ERR_UNAUTHORIZED_WORKER};
@@ -257,14 +256,15 @@ async fn run_connection(
         LinesCodec::new_with_max_length(MAX_STRATUM_LINE_BYTES),
     );
 
+    let session_id = bp_common::next_session_id();
     let mut state = SessionState::<SystemClock>::new(
         SystemClock,
         &server_config,
         &port_config,
-        random_session_id_hex(),
+        bp_common::session_id_hex(session_id),
     );
-    // Extranonce1 is allocated separately from the random session id, which
-    // stays the identity for UI, DB and device notifications.
+    // Extranonce1 is allocated separately from the session id, which stays
+    // the identity for UI, DB and device notifications.
     // Nothing is registered yet, so returning here skips no teardown. A
     // prefix another session holds would let both mine identical coinbases.
     let extranonce_guard = extranonce.allocate();
@@ -284,10 +284,7 @@ async fn run_connection(
     let mut owes_new_block = false;
     // A fee refresh reaches this connection within `REFRESH_SPREAD`, at its
     // own offset, so the pool does not send it to every miner at once.
-    let mut refresh_pacer = RefreshPacer::new(
-        u64::from_str_radix(&state.session_id_hex, 16).unwrap_or_default(),
-        REFRESH_SPREAD,
-    );
+    let mut refresh_pacer = RefreshPacer::new(u64::from(session_id), REFRESH_SPREAD);
 
     let mut vardiff_tick = tokio::time::interval(std::time::Duration::from_millis(
         server_config.difficulty_check_interval_ms,

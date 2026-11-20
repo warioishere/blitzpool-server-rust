@@ -146,15 +146,6 @@ fn parse_session_id(hex_id: &str) -> [u8; 4] {
     out
 }
 
-/// 8-hex-char session id from the OS CSPRNG. Falls back to `"00000000"` if
-/// the RNG fails: a fixed id is better than dropping the connection.
-pub(crate) fn random_session_id_hex() -> String {
-    let mut bytes = [0u8; 4];
-    getrandom::fill(&mut bytes).unwrap_or_default();
-    let n = u32::from_be_bytes(bytes);
-    format!("{:08x}", n)
-}
-
 // ── Session-level outcomes ───────────────────────────────────────────
 
 /// A session's accepted `mining.authorize`.
@@ -1898,16 +1889,5 @@ mod tests {
             "control: the session that was sent the job is credited, got {}",
             std::str::from_utf8(&out.outbound_frames[0]).unwrap()
         );
-    }
-
-    // ── Random session id ─────────────────────────────────────────────
-
-    #[test]
-    fn random_session_id_is_eight_lowercase_hex_chars() {
-        let id = random_session_id_hex();
-        assert_eq!(id.len(), 8);
-        assert!(id
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 }

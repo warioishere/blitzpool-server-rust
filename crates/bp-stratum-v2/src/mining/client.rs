@@ -592,13 +592,6 @@ impl<C: Clock + Clone> MiningSessionState<C> {
         self.last_difficulty_check_ms = self.clock.now_ms();
     }
 
-    /// The session id of `channel_id`: the connection's id offset by the
-    /// channel id, so every channel of the connection has its own and the
-    /// hex form keeps the 8 characters `client_entity.sessionId` holds.
-    pub fn channel_session_id(&self, channel_id: u32) -> String {
-        format!("{:08x}", self.session_id.wrapping_add(channel_id))
-    }
-
     /// Register an opened channel with its vardiff engine; the first one
     /// becomes the primary channel.
     fn add_channel(&mut self, channel_id: u32, channel: ChannelState, difficulty: Difficulty) {
@@ -770,9 +763,12 @@ pub fn handle_open_standard_mining_channel<C: Clock + Clone>(
     let channel_id = state.next_channel_id;
     state.next_channel_id = state.next_channel_id.saturating_add(1);
 
+    // Every channel is a session of its own in the live-session registry and
+    // `client_entity`, so it draws its id from the sequence SV1 sessions use.
+    let channel_session_id = bp_common::session_id_hex(bp_common::next_session_id());
     let channel = ChannelState::new_standard(
         channel_id,
-        state.channel_session_id(channel_id),
+        channel_session_id.clone(),
         ctx.worker.clone(),
         extranonce_prefix.clone(),
         ctx.assigned_difficulty,
@@ -793,7 +789,7 @@ pub fn handle_open_standard_mining_channel<C: Clock + Clone>(
         }],
         events: vec![SessionEvent::ChannelOpened {
             channel_id,
-            session_id: state.channel_session_id(channel_id),
+            session_id: channel_session_id,
             address: ctx.address,
             worker: ctx.worker,
             kind: ChannelKind::Standard,
@@ -862,9 +858,11 @@ pub fn handle_open_extended_mining_channel<C: Clock + Clone>(
     let channel_id = state.next_channel_id;
     state.next_channel_id = state.next_channel_id.saturating_add(1);
 
+    // See the Standard open: one id sequence for every registered session.
+    let channel_session_id = bp_common::session_id_hex(bp_common::next_session_id());
     let channel = ChannelState::new_extended(
         channel_id,
-        state.channel_session_id(channel_id),
+        channel_session_id.clone(),
         ctx.worker.clone(),
         extranonce_prefix.clone(),
         rollable_size,
@@ -888,7 +886,7 @@ pub fn handle_open_extended_mining_channel<C: Clock + Clone>(
         }],
         events: vec![SessionEvent::ChannelOpened {
             channel_id,
-            session_id: state.channel_session_id(channel_id),
+            session_id: channel_session_id,
             address: ctx.address,
             worker: ctx.worker,
             kind: ChannelKind::Extended,
@@ -1740,7 +1738,7 @@ pub fn apply_template_broadcast<C: Clock>(
             .inspect_err(|err| {
                 tracing::warn!(
                     ?err,
-                    session_id,
+                    session_id = format_args!("{session_id:08x}"),
                     gid,
                     full_size,
                     "skipping group: mining-job build failed"
@@ -3960,6 +3958,44 @@ pub(crate) mod tests {
                 .any(|f| matches!(f, OutboundFrame::SetTarget { .. })),
             "stale rejects at the usual cadence must hold the channel"
         );
+    }
+
+    /// Every channel registers an id of its own from the sequence SV1 sessions
+    /// draw from, so no channel shares one with another connection's channel
+    /// or with an SV1 session opened in between.
+    #[test]
+    fn registered_session_ids_never_repeat_across_connections() {
+        let clock = Arc::new(TestClock::new(0));
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let mut s =
+                MiningSessionState::new(clock.clone(), bp_common::next_session_id(), port_cfg());
+            handle_setup_connection(&mut s, &good_setup());
+            let user = format!("{}.w", REGTEST_ADDR);
+            let mut opened = vec![handle_open_standard_mining_channel(
+                &mut s,
+                &open_std(1, &user),
+                vec![0; 4],
+            )];
+            for request_id in 2..=3 {
+                opened.push(handle_open_extended_mining_channel(
+                    &mut s,
+                    &open_ext(request_id, &user),
+                    vec![0; 4],
+                ));
+            }
+            ids.extend(opened.into_iter().flat_map(|out| out.events).filter_map(
+                |event| match event {
+                    SessionEvent::ChannelOpened { session_id, .. } => Some(session_id),
+                    _ => None,
+                },
+            ));
+            // An SV1 session opened between two SV2 connections.
+            ids.push(bp_common::session_id_hex(bp_common::next_session_id()));
+        }
+        assert_eq!(ids.len(), 3 * (3 + 1), "precondition: every channel opened");
+        let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(distinct.len(), ids.len(), "{ids:?}");
     }
 
     /// A submit for the other channel kind is refused as `invalid-job-id`
