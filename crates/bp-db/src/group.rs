@@ -355,25 +355,6 @@ where
     Ok(result.rows_affected())
 }
 
-/// DELETE all `pplns_group_block_history` rows for one group. Called
-/// when a group is dissolved to remove all ledger history.
-pub async fn delete_pplns_group_block_history_for_group<'e, E>(
-    executor: E,
-    group_id: Uuid,
-) -> Result<u64, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    let result = sqlx::query!(
-        r#"DELETE FROM pplns_group_block_history WHERE "groupId" = $1"#,
-        group_id,
-    )
-    .execute(executor)
-    .await
-    .map_err(DbError::from)?;
-    Ok(result.rows_affected())
-}
-
 /// Stamp `lastRoundResetAt` on a `pplns_group` row. Called after each
 /// scheduled round reset; the 60s guard reads this column to prevent
 /// double-fire.

@@ -327,7 +327,7 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let production_hooks = match hooks::spawn(&cfg, &handles, &engines).await {
+    let production_hooks = match hooks::spawn(&cfg, &engines).await {
         Ok(h) => h,
         Err(err) => {
             tracing::error!(%err, "hooks spawn failed");

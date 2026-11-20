@@ -14,8 +14,6 @@ use bp_api::email_hooks::{
 };
 use bp_common::AddressId;
 use bp_config::AppConfig;
-use bp_db::delete_pplns_group_block_history_for_group;
-use bp_db::Db;
 use bp_group_mgmt_engine::{
     EmailHooks, GroupServiceHooks, JoinDecisionEmailContext, JoinDecisionOutcome,
 };
@@ -35,7 +33,6 @@ use thiserror::Error;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::boot::FoundationHandles;
 use crate::engines::EngineHandles;
 
 /// Every production hook impl, handed to the bp-api `AppState` and the
@@ -72,11 +69,10 @@ pub(crate) enum HooksError {
     WebPush(AdapterError),
 }
 
-/// Build every production hook from `cfg` and the live handles. Bad
-/// adapter config is a boot-time error, not a runtime failure.
+/// Build every production hook from `cfg` and the engines. Bad adapter
+/// config is a boot-time error, not a runtime failure.
 pub(crate) async fn spawn(
     cfg: &AppConfig,
-    foundation: &FoundationHandles,
     engines: &EngineHandles,
 ) -> Result<ProductionHooks, HooksError> {
     let smtp = build_smtp_adapter(cfg)?;
@@ -88,7 +84,6 @@ pub(crate) async fn spawn(
         Arc::new(SmtpEmailVerificationHooks::new(smtp.clone()));
     let join_decision_email = Arc::new(SmtpJoinDecisionEmailHooks::new(smtp.clone()));
     let group_service = Arc::new(ProductionGroupServiceHooks {
-        db: foundation.db.clone(),
         group_solo: engines.group_solo.clone(),
     });
 
@@ -283,7 +278,6 @@ impl EmailHooks for SmtpJoinDecisionEmailHooks {
 // ─── bp-group-mgmt-engine::GroupServiceHooks impl ────────────────
 
 pub(crate) struct ProductionGroupServiceHooks {
-    db: Db,
     /// `None` without `[group_solo]`: then no group holds round state.
     group_solo: Option<GroupSoloEngine>,
 }
@@ -354,6 +348,8 @@ impl GroupServiceHooks for ProductionGroupServiceHooks {
         // whoever is left. That is the redistribution.
     }
 
+    /// Wipes the round state only: the team's block history stays, as a
+    /// dissolved Blockparty's does, since it records what blocks paid.
     async fn on_group_dissolved(&self, group_id: Uuid) {
         let group_id_str = group_id.to_string();
 
@@ -371,17 +367,6 @@ impl GroupServiceHooks for ProductionGroupServiceHooks {
                     );
                 }
             }
-        }
-        // PG: delete all block history rows for this group.
-        match delete_pplns_group_block_history_for_group(self.db.pool(), group_id).await {
-            Ok(n) => {
-                info!(%group_id, rows = n, "group-hooks: on_group_dissolved history rows deleted")
-            }
-            Err(err) => warn!(
-                %err,
-                %group_id,
-                "group-hooks: on_group_dissolved delete history failed (best-effort)"
-            ),
         }
     }
 }

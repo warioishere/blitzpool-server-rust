@@ -88,11 +88,10 @@ pub use email::{
 };
 pub use group::{
     bulk_insert_pplns_group_block_history, count_pplns_group_join_requests_pending_for_address,
-    count_pplns_group_members_for_group, delete_pplns_group_block_history_for_group,
-    delete_pplns_group_member, delete_pplns_group_members_for_group,
-    expire_pending_pplns_group_invitations, expire_pending_pplns_group_join_requests,
-    find_all_pplns_group_member_addresses, find_group, find_group_block_history_of_recent_blocks,
-    find_group_invitation, find_group_member_by_address,
+    count_pplns_group_members_for_group, delete_pplns_group_member,
+    delete_pplns_group_members_for_group, expire_pending_pplns_group_invitations,
+    expire_pending_pplns_group_join_requests, find_all_pplns_group_member_addresses, find_group,
+    find_group_block_history_of_recent_blocks, find_group_invitation, find_group_member_by_address,
     find_pplns_group_active_open_invite_for_group, find_pplns_group_by_name_not_dissolved,
     find_pplns_group_creator_member, find_pplns_group_join_request_most_recent_rejected,
     find_pplns_group_join_request_pending_in_group, find_pplns_group_member_in_group,
