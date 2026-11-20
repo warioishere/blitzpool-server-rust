@@ -5,14 +5,16 @@
 //! `roundResetIntervalDays`). One loop serves every group and reads the
 //! groups from Postgres on each tick. The reset wipes the round's shares and
 //! rejects and stamps `lastRoundResetAt`; the dedup set and each member's
-//! last accepted share stay.
+//! last accepted share stay. The Team's admin can ask for the same reset at
+//! once ([`GroupResetRunner::reset_now`]), with a cooldown between two.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use bp_cron_utils::Clock;
 use bp_db::{
-    find_group, list_active_pplns_groups, update_pplns_group_last_reset_at, DbError, PplnsGroupRow,
+    find_group, list_active_pplns_groups, stamp_pplns_group_manual_reset,
+    update_pplns_group_last_reset_at, DbError, PplnsGroupRow,
 };
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
 use chrono_tz::Tz;
@@ -35,6 +37,10 @@ pub const RESET_DEBOUNCE_MS: i64 = 60_000;
 /// so without it an N-day schedule could miss its Nth daily fire.
 pub const DST_TOLERANCE_MS: i64 = 12 * 60 * 60 * 1000;
 
+/// How long a Team waits between two manual resets, so its admin cannot
+/// keep wiping the members' round.
+pub const MANUAL_RESET_COOLDOWN_MS: i64 = 24 * 60 * 60 * 1000;
+
 /// How often the reset loop reads the groups: while it runs and Postgres
 /// answers, a reset fires within this interval of its 00:00.
 pub const RESET_POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -53,6 +59,10 @@ pub enum ResetError {
     InvalidTimezone(String),
     #[error("invalid round-reset preset: {0:?}")]
     InvalidPreset(String),
+    #[error("a Window group has no round to reset")]
+    WindowGroup,
+    #[error("the last manual reset is too recent; the next is allowed at {retry_at_ms}")]
+    ManualResetCooldown { retry_at_ms: i64 },
 }
 
 // ── Preset + schedule config ───────────────────────────────────────
@@ -293,6 +303,30 @@ impl<C: Clock> GroupResetRunner<C> {
 
         info!(%group_id, "group-solo scheduled round-reset applied");
         Ok(true)
+    }
+
+    /// Reset `group`'s round now, on its admin's request: the same wipe as a
+    /// scheduled reset, whatever the schedule says. The stamp restarts the
+    /// schedule's count, so a `custom` interval runs from this reset. Refused
+    /// for a Window group, whose round is its window, and within
+    /// [`MANUAL_RESET_COOLDOWN_MS`] of the last manual reset. Returns the
+    /// stamped time.
+    pub async fn reset_now(&self, group: &PplnsGroupRow) -> Result<i64, ResetError> {
+        match group.payout_mode {
+            PayoutMode::Prop => {}
+            PayoutMode::Window => return Err(ResetError::WindowGroup),
+        }
+        let now_ms = self.clock.now().timestamp_millis();
+        if let Some(last) = group.last_manual_round_reset_at {
+            let retry_at_ms = last + MANUAL_RESET_COOLDOWN_MS;
+            if now_ms < retry_at_ms {
+                return Err(ResetError::ManualResetCooldown { retry_at_ms });
+            }
+        }
+        self.round.reset_for_calendar(&group.id.to_string()).await?;
+        stamp_pplns_group_manual_reset(&self.pool, group.id, now_ms).await?;
+        info!(group_id = %group.id, "group-solo manual round-reset applied");
+        Ok(now_ms)
     }
 
     /// Reset every group whose scheduled 00:00 fell in `(since, now]`. Each
@@ -623,6 +657,7 @@ mod tests {
             round_reset_interval_days: None,
             round_reset_timezone: Some("UTC".to_string()),
             last_round_reset_at: None,
+            last_manual_round_reset_at: None,
             finder_bonus_ppm: None,
             round_reset_preset: preset.map(str::to_string),
             is_public: false,

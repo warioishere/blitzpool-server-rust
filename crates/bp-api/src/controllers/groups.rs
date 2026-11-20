@@ -43,6 +43,10 @@ pub(crate) fn routes() -> Router<SharedState> {
                 .delete(revoke_open_invite),
         )
         .route(
+            "/api/pplns/groups/{id}/round/reset",
+            post(reset_round_now).layer(rate_limit::per_minute_layer(5)),
+        )
+        .route(
             "/api/pplns/groups/{id}/members/{address}",
             delete(remove_member),
         )
@@ -463,6 +467,52 @@ async fn revoke_open_invite(
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct RoundResetResponse {
+    last_round_reset_at: String,
+}
+
+/// The admin resets the Team's round now, outside its schedule.
+async fn reset_round_now(
+    State(state): State<SharedState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<RoundResetResponse>, ApiError> {
+    let svc = require_group_service(&state)?;
+    let group = svc.require_admin_token(id, admin_token(&headers)).await?;
+    let engine = state
+        .group_solo
+        .as_deref()
+        .ok_or(ApiError::Unavailable("group-solo engine not wired"))?;
+    let reset_at_ms = engine
+        .reset_round_now(&group)
+        .await
+        .map_err(round_reset_to_api_error)?;
+    invalidate_group_cache(&state, id).await;
+    Ok(Json(RoundResetResponse {
+        last_round_reset_at: crate::time_range::format_iso_ms(reset_at_ms),
+    }))
+}
+
+/// The two refusals of a manual round reset get their own code; anything
+/// else is the engine failing.
+pub(crate) fn round_reset_to_api_error(e: bp_group_solo_engine::reset::ResetError) -> ApiError {
+    use axum::http::StatusCode;
+    use bp_group_solo_engine::reset::ResetError as R;
+    match e {
+        R::WindowGroup => ApiError::GroupService {
+            code: "window-group-has-no-round",
+            status: StatusCode::CONFLICT,
+        },
+        R::ManualResetCooldown { .. } => ApiError::GroupService {
+            code: "round-reset-cooldown",
+            status: StatusCode::TOO_MANY_REQUESTS,
+        },
+        other => ApiError::GroupSoloEngine(other.into()),
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct RemovedResponse {
     removed: bool,
 }
@@ -640,6 +690,8 @@ struct GroupSummary {
     round_reset_timezone: Option<String>,
     finder_bonus_ppm: i32,
     last_round_reset_at: Option<String>,
+    /// When the admin last reset the round by hand; null if never.
+    last_manual_round_reset_at: Option<String>,
     /// See [`next_reset_at`]; `None` without a usable schedule.
     next_reset_at: Option<String>,
     is_public: bool,
@@ -666,6 +718,9 @@ impl From<bp_db::PplnsGroupRow> for GroupSummary {
             round_reset_timezone: r.round_reset_timezone,
             finder_bonus_ppm: r.finder_bonus_ppm.unwrap_or(0),
             last_round_reset_at: r.last_round_reset_at.map(crate::time_range::format_iso_ms),
+            last_manual_round_reset_at: r
+                .last_manual_round_reset_at
+                .map(crate::time_range::format_iso_ms),
             next_reset_at,
             is_public: r.is_public,
             reset_round_on_block: r.reset_round_on_block,
@@ -1987,6 +2042,7 @@ mod tests {
             round_reset_interval_days: None,
             round_reset_timezone: Some("Europe/Zurich".to_string()),
             last_round_reset_at: None,
+            last_manual_round_reset_at: None,
             finder_bonus_ppm: None,
             round_reset_preset: Some("weekly".to_string()),
             is_public: false,
@@ -2282,6 +2338,7 @@ mod tests {
             round_reset_timezone: None,
             finder_bonus_ppm: 0,
             last_round_reset_at: None,
+            last_manual_round_reset_at: None,
             next_reset_at: None,
             is_public: false,
             reset_round_on_block: false,
@@ -2317,6 +2374,7 @@ mod tests {
             round_reset_timezone: None,
             finder_bonus_ppm: 0,
             last_round_reset_at: None,
+            last_manual_round_reset_at: None,
             next_reset_at: None,
             is_public: true,
             reset_round_on_block: false,
@@ -2417,6 +2475,7 @@ mod tests {
                 round_reset_timezone: None,
                 finder_bonus_ppm: 0,
                 last_round_reset_at: None,
+                last_manual_round_reset_at: None,
                 next_reset_at: None,
                 is_public: true,
                 reset_round_on_block: false,

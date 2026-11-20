@@ -158,6 +158,7 @@ Schema is applied via **sqlx migrations run at boot** (advisory-locked + idempot
 The HTTP API (served by the `api` role) mirrors the TS pool's surface — pool-wide (`/api/info/*`, `/api/network`), per-address (`/api/client/:address/*`, `/api/pplns/mode/:address`), PPLNS (`/api/pplns/*`), Team Mining (`/api/pplns/groups/*`), Blockparty (`/api/blockparty/*`), and email-binding endpoints. Rust-build additions include:
 
 - `GET /api/pplns/groups/coinbase-capacity` — worst-case member ceiling for the Team Mining coinbase budget (UI shows used / free slots per team).
+- `POST /api/pplns/groups/{id}/round/reset` (`x-admin-token`) — the Team admin resets the round now, outside its schedule; an every-N-days schedule then counts from this reset. At most once per 24 h per Team (`429 round-reset-cooldown`), not for a Window Team (`409 window-group-has-no-round`); the Team detail shows `lastManualRoundResetAt`.
 - `/api/address/ownership/*` — prove control of a mining address by signing a challenge.
 - `/api/address/extranonce/*` — lets a Solo miner pin its own extranonce prefix per worker, see [`CUSTOM-EXTRANONCE-API.md`](CUSTOM-EXTRANONCE-API.md).
 

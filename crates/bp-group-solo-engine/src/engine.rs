@@ -560,15 +560,10 @@ fn history_rows_from_coinbase(
 }
 
 impl GroupSoloEngine {
-    /// Manually trigger a scheduled reset for `group_id`. Returns
-    /// `Ok(true)` if the reset fired, `Ok(false)` if it was
-    /// debounce-skipped or custom-elapsed-gated.
-    pub async fn manual_reset(&self, group_id: Uuid) -> Result<bool, EngineError> {
-        self.inner
-            .reset_runner
-            .reset_scheduled(group_id)
-            .await
-            .map_err(EngineError::from)
+    /// Reset `group`'s round now, on its admin's request; see
+    /// [`GroupResetRunner::reset_now`](crate::reset::GroupResetRunner::reset_now).
+    pub async fn reset_round_now(&self, group: &bp_db::PplnsGroupRow) -> Result<i64, ResetError> {
+        self.inner.reset_runner.reset_now(group).await
     }
 
     /// Stop the round-reset loop. It is not joined, so a shutdown time-out is

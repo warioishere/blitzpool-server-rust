@@ -836,24 +836,109 @@ async fn concurrent_applies_of_one_block_book_it_once() {
     drop_harness(h).await;
 }
 
-// ── Test 6 — manual_reset wipes the round ──────────────────────────
+// ── Test 6 — the admin's manual reset ──────────────────────────────
 
+/// The admin's reset wipes the round although the `custom` schedule's
+/// interval has not elapsed, and stamps both times. A second one inside the
+/// cooldown is refused and leaves the round alone.
 #[tokio::test]
-async fn manual_reset_wipes_group_state() {
+async fn a_manual_reset_wipes_the_round_and_then_waits_out_its_cooldown() {
+    use bp_group_solo_engine::reset::{ResetError, MANUAL_RESET_COOLDOWN_MS};
     let h = match spawn_or_skip(5, None).await {
         Some(h) => h,
         None => return,
     };
+    // Reset a moment ago on a 3-day schedule: nothing scheduled is due.
+    sqlx::query(
+        r#"UPDATE pplns_group
+           SET "roundResetPreset" = 'custom', "roundResetIntervalDays" = 3,
+               "roundResetTimezone" = 'UTC',
+               "lastRoundResetAt" = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
+           WHERE id = $1"#,
+    )
+    .bind(h.group_id)
+    .execute(&h.pool)
+    .await
+    .expect("schedule");
     h.engine
         .record_share(None, h.group_id, "test_eng_reset_a", 50.0, 50.0, 1)
         .await
         .unwrap();
+    assert_eq!(
+        round_total(&h).await,
+        50.0,
+        "precondition: the round holds the share"
+    );
 
-    let fired = h.engine.manual_reset(h.group_id).await.expect("ok");
-    assert!(fired);
+    let group = bp_db::find_group(&h.pool, h.group_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let reset_at = h
+        .engine
+        .reset_round_now(&group)
+        .await
+        .expect("manual reset");
+    assert_eq!(round_total(&h).await, 0.0);
+    let group = bp_db::find_group(&h.pool, h.group_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(group.last_round_reset_at, Some(reset_at));
+    assert_eq!(group.last_manual_round_reset_at, Some(reset_at));
 
-    let stats = h.engine.reader().round_stats(h.group_id).await.expect("ok");
-    assert_eq!(stats.total_shares, 0.0);
+    h.engine
+        .record_share(None, h.group_id, "test_eng_reset_a", 7.0, 7.0, 2)
+        .await
+        .unwrap();
+    let refused = h.engine.reset_round_now(&group).await.unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            ResetError::ManualResetCooldown { retry_at_ms }
+                if retry_at_ms == reset_at + MANUAL_RESET_COOLDOWN_MS
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(round_total(&h).await, 7.0, "a refused reset wipes nothing");
+
+    drop_harness(h).await;
+}
+
+/// The shares the group's round holds.
+async fn round_total(h: &Harness) -> f64 {
+    h.engine
+        .reader()
+        .round_stats(h.group_id)
+        .await
+        .expect("stats")
+        .total_shares
+}
+
+/// A Window group has no round; its window is not the admin's to wipe.
+#[tokio::test]
+async fn a_window_group_refuses_a_manual_reset() {
+    use bp_group_solo_engine::reset::ResetError;
+    let h = match spawn_or_skip(5, None).await {
+        Some(h) => h,
+        None => return,
+    };
+    sqlx::query(r#"UPDATE pplns_group SET "payoutMode" = 'window' WHERE id = $1"#)
+        .bind(h.group_id)
+        .execute(&h.pool)
+        .await
+        .expect("window mode");
+    let group = bp_db::find_group(&h.pool, h.group_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let refused = h.engine.reset_round_now(&group).await.unwrap_err();
+    assert!(matches!(refused, ResetError::WindowGroup), "{refused:?}");
+    let group = bp_db::find_group(&h.pool, h.group_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(group.last_manual_round_reset_at, None);
 
     drop_harness(h).await;
 }

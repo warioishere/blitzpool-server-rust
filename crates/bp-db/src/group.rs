@@ -35,6 +35,9 @@ pub struct PplnsGroupRow {
     pub round_reset_timezone: Option<String>,
     #[sqlx(rename = "lastRoundResetAt")]
     pub last_round_reset_at: Option<i64>,
+    /// When the admin last reset the round by hand; `None` if never.
+    #[sqlx(rename = "lastManualRoundResetAt")]
+    pub last_manual_round_reset_at: Option<i64>,
     /// Finder bonus as a fraction of the miner cut, in parts-per-million.
     /// A proportion rather than an amount, so §4 pays it exactly at every
     /// template revenue — including a job-declaring client's own.
@@ -78,6 +81,7 @@ pub async fn find_group(pool: &PgPool, id: Uuid) -> Result<Option<PplnsGroupRow>
             "roundResetIntervalDays" AS "round_reset_interval_days?",
             "roundResetTimezone" AS "round_reset_timezone?",
             "lastRoundResetAt" AS "last_round_reset_at?",
+            "lastManualRoundResetAt" AS "last_manual_round_reset_at?",
             "finderBonusPpm" AS "finder_bonus_ppm?",
             "roundResetPreset" AS "round_reset_preset?",
             "isPublic" AS "is_public!",
@@ -370,6 +374,29 @@ where
     Ok(result.rows_affected())
 }
 
+/// Stamp a manual round reset: `lastRoundResetAt`, which the schedule counts
+/// from, and `lastManualRoundResetAt`, which the cooldown counts from.
+pub async fn stamp_pplns_group_manual_reset<'e, E>(
+    executor: E,
+    group_id: Uuid,
+    reset_at_ms: i64,
+) -> Result<u64, DbError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let result = sqlx::query!(
+        r#"UPDATE pplns_group
+           SET "lastRoundResetAt" = $1, "lastManualRoundResetAt" = $1
+           WHERE id = $2"#,
+        reset_at_ms,
+        group_id,
+    )
+    .execute(executor)
+    .await
+    .map_err(DbError::from)?;
+    Ok(result.rows_affected())
+}
+
 #[derive(Clone, Debug, FromRow)]
 pub struct PplnsGroupInvitationRow {
     pub token: String,
@@ -459,6 +486,7 @@ where
             "roundResetIntervalDays" AS "round_reset_interval_days?",
             "roundResetTimezone" AS "round_reset_timezone?",
             "lastRoundResetAt" AS "last_round_reset_at?",
+            "lastManualRoundResetAt" AS "last_manual_round_reset_at?",
             "finderBonusPpm" AS "finder_bonus_ppm?",
             "roundResetPreset" AS "round_reset_preset?",
             "isPublic" AS "is_public!",
@@ -500,6 +528,7 @@ pub async fn find_pplns_group_by_name_not_dissolved(
             "roundResetIntervalDays" AS "round_reset_interval_days?",
             "roundResetTimezone" AS "round_reset_timezone?",
             "lastRoundResetAt" AS "last_round_reset_at?",
+            "lastManualRoundResetAt" AS "last_manual_round_reset_at?",
             "finderBonusPpm" AS "finder_bonus_ppm?",
             "roundResetPreset" AS "round_reset_preset?",
             "isPublic" AS "is_public!",
@@ -533,6 +562,7 @@ pub async fn list_active_pplns_groups(pool: &PgPool) -> Result<Vec<PplnsGroupRow
             "roundResetIntervalDays" AS "round_reset_interval_days?",
             "roundResetTimezone" AS "round_reset_timezone?",
             "lastRoundResetAt" AS "last_round_reset_at?",
+            "lastManualRoundResetAt" AS "last_manual_round_reset_at?",
             "finderBonusPpm" AS "finder_bonus_ppm?",
             "roundResetPreset" AS "round_reset_preset?",
             "isPublic" AS "is_public!",
@@ -666,6 +696,7 @@ pub async fn update_pplns_group_round_reset_config(
             "roundResetIntervalDays" AS "round_reset_interval_days?",
             "roundResetTimezone" AS "round_reset_timezone?",
             "lastRoundResetAt" AS "last_round_reset_at?",
+            "lastManualRoundResetAt" AS "last_manual_round_reset_at?",
             "finderBonusPpm" AS "finder_bonus_ppm?",
             "roundResetPreset" AS "round_reset_preset?",
             "isPublic" AS "is_public!",

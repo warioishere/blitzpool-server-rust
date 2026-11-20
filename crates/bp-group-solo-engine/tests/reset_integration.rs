@@ -9,7 +9,9 @@
 use std::sync::Arc;
 
 use bp_cron_utils::TestClock;
-use bp_group_solo_engine::reset::{GroupResetRunner, ResetError, RESET_DEBOUNCE_MS};
+use bp_group_solo_engine::reset::{
+    GroupResetRunner, ResetError, MANUAL_RESET_COOLDOWN_MS, RESET_DEBOUNCE_MS,
+};
 use bp_group_solo_engine::round::GroupRoundStore;
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
@@ -224,6 +226,44 @@ async fn reset_custom_preset_fires_when_interval_elapsed() {
     let runner = GroupResetRunner::new(pool.clone(), round, clock);
     let fired = runner.reset_scheduled(group_id).await.expect("ok");
     assert!(fired);
+
+    cleanup_group(&pool, group_id).await;
+}
+
+// ── Manual reset: the cooldown ends exactly after its 24 h ─────────
+
+/// A manual reset is refused one millisecond before the cooldown ends and
+/// allowed at its end.
+#[tokio::test]
+async fn a_manual_reset_is_allowed_again_when_its_cooldown_ends() {
+    let (pool, conn) = match connect_or_skip(8).await {
+        Some(x) => x,
+        None => return,
+    };
+    const LAST_MANUAL: i64 = 1_700_000_000_000;
+    let group_id = Uuid::new_v4();
+    seed_group(&pool, group_id, Some(LAST_MANUAL)).await;
+    sqlx::query(r#"UPDATE pplns_group SET "lastManualRoundResetAt" = $1 WHERE id = $2"#)
+        .bind(LAST_MANUAL)
+        .bind(group_id)
+        .execute(&pool)
+        .await
+        .expect("stamp");
+    let group = bp_db::find_group(&pool, group_id).await.unwrap().unwrap();
+    let round = GroupRoundStore::new(conn);
+    let cooldown_end = LAST_MANUAL + MANUAL_RESET_COOLDOWN_MS;
+
+    let early = GroupResetRunner::new(pool.clone(), round.clone(), clock_at_ms(cooldown_end - 1));
+    let refused = early.reset_now(&group).await.unwrap_err();
+    assert!(
+        matches!(refused, ResetError::ManualResetCooldown { retry_at_ms } if retry_at_ms == cooldown_end),
+        "{refused:?}"
+    );
+
+    let due = GroupResetRunner::new(pool.clone(), round, clock_at_ms(cooldown_end));
+    assert_eq!(due.reset_now(&group).await.expect("reset"), cooldown_end);
+    let group = bp_db::find_group(&pool, group_id).await.unwrap().unwrap();
+    assert_eq!(group.last_manual_round_reset_at, Some(cooldown_end));
 
     cleanup_group(&pool, group_id).await;
 }
