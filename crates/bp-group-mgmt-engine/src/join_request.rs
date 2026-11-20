@@ -105,14 +105,11 @@ impl JoinRequestService {
             normalize_address(address).map_err(|_| JoinRequestServiceError::InvalidAddress)?;
         // Verified by email OR a signature ownership proof; a signature-only
         // joiner has no email and is not mailed on the decision.
-        let email = bp_db::find_address_email(&self.pool, &normalized)
-            .await?
-            .filter(|b| b.verified_at.is_some())
-            .map(|b| b.email);
-        if email.is_none() && !bp_db::is_address_ownership_verified(&self.pool, &normalized).await?
-        {
-            return Err(JoinRequestServiceError::EmailNotVerified);
-        }
+        let email = match bp_db::find_address_verification(&self.pool, &normalized).await? {
+            Some(bp_db::AddressVerification::Email(email)) => Some(email),
+            Some(bp_db::AddressVerification::Signature) => None,
+            None => return Err(JoinRequestServiceError::EmailNotVerified),
+        };
 
         if let Some(existing) = bp_db::find_group_member_by_address(&self.pool, &normalized).await?
         {

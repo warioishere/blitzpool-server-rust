@@ -149,7 +149,6 @@ async fn dissolving_a_blockparty_drops_its_admins_cached_mode() {
                     min_payout_sats: bp_common::Sats(5_000),
                 },
             ),
-            Arc::new(bp_blockparty_engine::NoopHooks::default()),
             AddressCache::new(),
         )
         .await
@@ -159,6 +158,7 @@ async fn dissolving_a_blockparty_drops_its_admins_cached_mode() {
         state.cache.clone(),
         Arc::new(NoopNotifier),
     )));
+    bp_test_support::seed_verified_email(&pool, admin, "admin@example.test").await;
     let created = svc
         .create_group(name, admin, 10_000)
         .await

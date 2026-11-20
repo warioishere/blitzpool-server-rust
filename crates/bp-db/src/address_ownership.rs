@@ -196,19 +196,35 @@ pub async fn addresses_with_ownership_proof(
     Ok(rows.into_iter().collect())
 }
 
-/// True when the address is verified by EITHER a confirmed email binding
-/// (`pplns_address_email.verifiedAt`) OR a signature ownership proof
-/// (`pplns_address_ownership`). This is the unified onboarding gate — a joining
-/// address must satisfy one of the two.
-pub async fn is_address_verified(pool: &PgPool, address: &AddressId) -> Result<bool, DbError> {
-    sqlx::query_scalar!(
-        r#"SELECT (
-             EXISTS(SELECT 1 FROM pplns_address_email WHERE address = $1 AND "verifiedAt" IS NOT NULL)
-             OR EXISTS(SELECT 1 FROM pplns_address_ownership WHERE address = $1)
-           ) AS "verified!""#,
+/// How an address proved it is the miner's, the onboarding gate of every
+/// Team and Blockparty path: a confirmed email binding or a signature
+/// ownership proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AddressVerification {
+    /// A confirmed email; preferred when both exist, as rows keep the email.
+    Email(String),
+    /// A signature ownership proof and no confirmed email.
+    Signature,
+}
+
+/// The address's [`AddressVerification`], `None` when it has neither.
+pub async fn find_address_verification(
+    pool: &PgPool,
+    address: &AddressId,
+) -> Result<Option<AddressVerification>, DbError> {
+    let row = sqlx::query!(
+        r#"SELECT
+             (SELECT email FROM pplns_address_email
+               WHERE address = $1 AND "verifiedAt" IS NOT NULL) AS "email?",
+             EXISTS(SELECT 1 FROM pplns_address_ownership WHERE address = $1) AS "signature!""#,
         address.as_str()
     )
     .fetch_one(pool)
     .await
-    .map_err(DbError::from)
+    .map_err(DbError::from)?;
+    Ok(match (row.email, row.signature) {
+        (Some(email), _) => Some(AddressVerification::Email(email)),
+        (None, true) => Some(AddressVerification::Signature),
+        (None, false) => None,
+    })
 }

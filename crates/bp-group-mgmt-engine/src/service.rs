@@ -275,7 +275,10 @@ impl GroupService {
         // The creator's address routes into the group the moment it exists,
         // so creating one is held to the same proof a joining member gives:
         // a confirmed email or a signature.
-        if !bp_db::is_address_verified(&self.pool, &normalized_address).await? {
+        if bp_db::find_address_verification(&self.pool, &normalized_address)
+            .await?
+            .is_none()
+        {
             return Err(GroupServiceError::EmailNotVerified);
         }
 

@@ -48,7 +48,7 @@ pub enum BlockpartyServiceError {
     AddressInBlockparty,
     #[error("address is already a member of a PPLNS group — leave that group first")]
     AddressInPplnsGroup,
-    #[error("address has no verified email binding")]
+    #[error("address has neither a confirmed email nor a signature ownership proof")]
     EmailNotVerified,
 
     // ── Lifecycle invariants ───────────────────────────────────────

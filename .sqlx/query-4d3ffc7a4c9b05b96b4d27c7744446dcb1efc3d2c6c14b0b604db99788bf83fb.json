@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n             (SELECT email FROM pplns_address_email\n               WHERE address = $1 AND \"verifiedAt\" IS NOT NULL) AS \"email?\",\n             EXISTS(SELECT 1 FROM pplns_address_ownership WHERE address = $1) AS \"signature!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "email?",
+        "type_info": "Varchar",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "signature!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "4d3ffc7a4c9b05b96b4d27c7744446dcb1efc3d2c6c14b0b604db99788bf83fb"
+}

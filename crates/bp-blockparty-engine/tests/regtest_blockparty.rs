@@ -12,10 +12,7 @@ use bp_blockparty::BlockpartyStatus;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
-use bp_blockparty_engine::{
-    BlockpartyHooks, BlockpartyPayoutConfig, BlockpartyPayouts, BlockpartyService,
-};
+use bp_blockparty_engine::{BlockpartyPayoutConfig, BlockpartyPayouts, BlockpartyService};
 use bp_common::{AddressId, Sats};
 use bp_group_mgmt_engine::AddressCache as PplnsAddressCache;
 use bp_mining_job::PayoutEntry;
@@ -26,16 +23,6 @@ use bp_test_support::{
     mine_and_submit_payouts, wait_for_paired_template,
 };
 use sqlx::PgPool;
-
-/// Every address has a verified email; the email gate is not under test.
-struct AllVerified;
-
-#[async_trait]
-impl BlockpartyHooks for AllVerified {
-    async fn verified_email_for(&self, address: &AddressId) -> Option<String> {
-        Some(format!("{}@regtest.example", address.as_str()))
-    }
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn blockparty_ready_party_pays_members_and_history_is_idempotent() {
@@ -58,6 +45,9 @@ async fn blockparty_ready_party_pays_members_and_history_is_idempotent() {
     let addr_fee = deterministic_p2wpkh_regtest([0xfe; 32]);
     let name = format!("bp-regtest-lifecycle-{}", uuid::Uuid::new_v4());
     cleanup_blockparty_rows(&pg, &[&addr_admin, &addr_bob]).await;
+    for a in [&addr_admin, &addr_bob] {
+        bp_test_support::seed_verified_email(&pg, a, "regtest@example.test").await;
+    }
 
     let svc = service(&pg, &addr_fee).await;
 
@@ -216,7 +206,6 @@ async fn service(pg: &PgPool, fee_address: &str) -> Arc<BlockpartyService> {
                     min_payout_sats: Sats(5_000),
                 },
             ),
-            Arc::new(AllVerified),
             PplnsAddressCache::new(),
         )
         .await

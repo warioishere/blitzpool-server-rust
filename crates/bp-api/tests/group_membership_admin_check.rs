@@ -154,12 +154,12 @@ async fn blockparty_admin_check() {
                     min_payout_sats: bp_common::Sats(5_000),
                 },
             ),
-            Arc::new(bp_blockparty_engine::NoopHooks::default()),
             AddressCache::new(),
         )
         .await
         .expect("load blockparty service"),
     );
+    bp_test_support::seed_verified_email(&pool, admin, "admin@example.test").await;
     let created = svc
         .create_group(name, admin, 10_000)
         .await

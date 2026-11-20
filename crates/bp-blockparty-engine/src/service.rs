@@ -19,7 +19,6 @@ use uuid::Uuid;
 
 use crate::cache::BlockpartyCache;
 use crate::error::BlockpartyServiceError;
-use crate::hooks::BlockpartyHooks;
 use crate::payouts::BlockpartyPayouts;
 use crate::util::normalize_address;
 use bp_common::now_ms;
@@ -59,7 +58,6 @@ pub struct MarkMemberConfirmedResult {
 /// [`BlockpartyPayouts`] instead and cannot reach a cold one.
 pub struct BlockpartyService {
     payouts: BlockpartyPayouts,
-    hooks: Arc<dyn BlockpartyHooks>,
     cache: BlockpartyCache,
     /// Read-only; for the mode-collision check against PPLNS groups.
     pplns_cache: PplnsAddressCache,
@@ -75,12 +73,10 @@ impl BlockpartyService {
     /// Builds the service and fills its routing cache from PG.
     pub async fn load(
         payouts: BlockpartyPayouts,
-        hooks: Arc<dyn BlockpartyHooks>,
         pplns_cache: PplnsAddressCache,
     ) -> Result<Self, BlockpartyServiceError> {
         let service = Self {
             payouts,
-            hooks,
             cache: BlockpartyCache::new(),
             pplns_cache,
             reservation: None,
@@ -733,13 +729,11 @@ impl BlockpartyService {
     /// a confirmed email or a signature ownership proof. The email comes from
     /// the binding, never from the client; a signature-only address stores "".
     async fn verified_email(&self, address: &AddressId) -> Result<String, BlockpartyServiceError> {
-        if let Some(email) = self.hooks.verified_email_for(address).await {
-            return Ok(email.to_ascii_lowercase());
+        match bp_db::find_address_verification(&self.payouts.pool, address).await? {
+            Some(bp_db::AddressVerification::Email(email)) => Ok(email.to_ascii_lowercase()),
+            Some(bp_db::AddressVerification::Signature) => Ok(String::new()),
+            None => Err(BlockpartyServiceError::EmailNotVerified),
         }
-        if bp_db::is_address_ownership_verified(&self.payouts.pool, address).await? {
-            return Ok(String::new());
-        }
-        Err(BlockpartyServiceError::EmailNotVerified)
     }
 
     /// Draft to confirming, in the DB and the routing cache. Every caller

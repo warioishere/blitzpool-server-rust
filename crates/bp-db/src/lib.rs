@@ -38,9 +38,9 @@ pub use address::{
 };
 pub use address_ownership::{
     addresses_with_ownership_proof, delete_ownership_challenge, find_address_ownership,
-    find_ownership_challenge, is_address_ownership_verified, is_address_verified,
+    find_address_verification, find_ownership_challenge, is_address_ownership_verified,
     upsert_address_ownership_verified, upsert_ownership_challenge, AddressOwnershipRow,
-    OwnershipChallengeRow,
+    AddressVerification, OwnershipChallengeRow,
 };
 pub use address_token::{find_token_revoked_before, raise_token_revoked_before};
 pub use block::{

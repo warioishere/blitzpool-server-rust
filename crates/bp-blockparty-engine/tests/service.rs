@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bp_blockparty_engine::{
-    BlockpartyHooks, BlockpartyPayoutConfig, BlockpartyPayouts, BlockpartyService,
-    BlockpartyServiceError, CoinbaseReservation,
+    BlockpartyPayoutConfig, BlockpartyPayouts, BlockpartyService, BlockpartyServiceError,
+    CoinbaseReservation,
 };
 use bp_common::{AddressId, Sats};
 use bp_group_mgmt_engine::{AddressCache as PplnsAddressCache, OpenInviteTtl};
@@ -43,16 +43,6 @@ async fn connect_or_skip() -> Option<PgPool> {
     }
 }
 
-// Every address binds to the same canned email.
-struct AllVerified;
-
-#[async_trait]
-impl BlockpartyHooks for AllVerified {
-    async fn verified_email_for(&self, _address: &AddressId) -> Option<String> {
-        Some("test@example.test".to_owned())
-    }
-}
-
 fn addr(s: &str) -> AddressId {
     AddressId::new(s).expect("test address")
 }
@@ -80,27 +70,6 @@ fn config() -> BlockpartyPayoutConfig {
 async fn svc(pool: &PgPool) -> BlockpartyService {
     BlockpartyService::load(
         BlockpartyPayouts::new(pool.clone(), config()),
-        Arc::new(AllVerified),
-        PplnsAddressCache::new(),
-    )
-    .await
-    .expect("load blockparty service")
-}
-
-// No address has a verified email, forcing the signature-ownership branch.
-struct NoEmail;
-
-#[async_trait]
-impl BlockpartyHooks for NoEmail {
-    async fn verified_email_for(&self, _address: &AddressId) -> Option<String> {
-        None
-    }
-}
-
-async fn svc_no_email(pool: &PgPool) -> BlockpartyService {
-    BlockpartyService::load(
-        BlockpartyPayouts::new(pool.clone(), config()),
-        Arc::new(NoEmail),
         PplnsAddressCache::new(),
     )
     .await
@@ -130,6 +99,7 @@ async fn create_group_seeds_draft_and_routing_cache() {
     let admin = "bc1qadmincreate1";
     cleanup(&pool, name, admin).await;
 
+    bp_test_support::seed_verified_email(&pool, admin, "test@example.test").await;
     let svc = svc(&pool).await;
     let res = svc
         .create_group(name, admin, 10_000)
@@ -163,6 +133,8 @@ async fn add_member_flips_to_confirming_and_inserts_member_cache() {
         .execute(&pool)
         .await;
 
+    bp_test_support::seed_verified_email(&pool, admin, "test@example.test").await;
+    bp_test_support::seed_verified_email(&pool, bob, "test@example.test").await;
     let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
     svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
@@ -197,6 +169,8 @@ async fn join_via_link_adds_unconfirmed_member_and_mints_token() {
         .execute(&pool)
         .await;
 
+    bp_test_support::seed_verified_email(&pool, admin, "test@example.test").await;
+    bp_test_support::seed_verified_email(&pool, carol, "test@example.test").await;
     let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
 
@@ -269,7 +243,7 @@ async fn join_via_link_admits_signature_verified_email_less_base58_address() {
     bp_test_support::delete_signature_ownership(&pool, admin).await;
     bp_test_support::seed_signature_ownership(&pool, admin).await;
 
-    let svc = svc_no_email(&pool).await;
+    let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
     let link = svc
         .create_join_link(
@@ -286,9 +260,13 @@ async fn join_via_link_admits_signature_verified_email_less_base58_address() {
     assert_eq!(group_id, create.group.id);
     assert!(!member_token.is_empty());
     let members = svc.list_members(create.group.id).await.unwrap();
-    assert!(
-        members.iter().any(|m| m.address.as_str() == carol),
-        "member row keyed by the verbatim (case-preserved) Base58 address"
+    let carol_row = members
+        .iter()
+        .find(|m| m.address.as_str() == carol)
+        .expect("member row keyed by the verbatim (case-preserved) Base58 address");
+    assert_eq!(
+        carol_row.email, "",
+        "admitted by the signature, not an email"
     );
 
     cleanup(&pool, name, admin).await;
@@ -322,7 +300,7 @@ async fn join_via_link_rejects_unverified_address() {
     bp_test_support::delete_signature_ownership(&pool, admin).await;
     bp_test_support::seed_signature_ownership(&pool, admin).await;
 
-    let svc = svc_no_email(&pool).await;
+    let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
     let link = svc
         .create_join_link(
@@ -363,7 +341,7 @@ async fn create_group_admits_signature_verified_email_less_admin() {
     bp_test_support::delete_signature_ownership(&pool, admin).await;
     bp_test_support::seed_signature_ownership(&pool, admin).await;
 
-    let svc = svc_no_email(&pool).await;
+    let svc = svc(&pool).await;
     let create = svc
         .create_group(name, admin, 10_000)
         .await
@@ -390,7 +368,7 @@ async fn create_group_rejects_unverified_admin() {
     cleanup(&pool, name, admin).await;
     bp_test_support::delete_signature_ownership(&pool, admin).await;
 
-    let svc = svc_no_email(&pool).await;
+    let svc = svc(&pool).await;
     let err = svc
         .create_group(name, admin, 10_000)
         .await
@@ -423,6 +401,7 @@ async fn request_member_confirmation_stamps_flag_and_is_admin_gated() {
     let admin = "bc1qadminreqconfirm1";
     cleanup(&pool, name, admin).await;
 
+    bp_test_support::seed_verified_email(&pool, admin, "test@example.test").await;
     let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 10_000).await.expect("create");
 
@@ -461,6 +440,8 @@ async fn mark_member_confirmed_promotes_to_ready_and_unblocks_routing() {
         .execute(&pool)
         .await;
 
+    bp_test_support::seed_verified_email(&pool, admin, "test@example.test").await;
+    bp_test_support::seed_verified_email(&pool, bob, "test@example.test").await;
     let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
     svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
@@ -508,6 +489,8 @@ async fn on_share_accepted_promotes_ready_to_active_only() {
         .execute(&pool)
         .await;
 
+    bp_test_support::seed_verified_email(&pool, admin, "test@example.test").await;
+    bp_test_support::seed_verified_email(&pool, bob, "test@example.test").await;
     let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
     let admin_addr = addr(admin);
@@ -555,6 +538,8 @@ async fn dissolve_blocked_during_active_cooldown() {
         .execute(&pool)
         .await;
 
+    bp_test_support::seed_verified_email(&pool, admin, "test@example.test").await;
+    bp_test_support::seed_verified_email(&pool, bob, "test@example.test").await;
     let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
     svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
@@ -614,6 +599,9 @@ async fn dissolve_frees_every_address_for_the_next_party() {
         .execute(&pool)
         .await;
 
+    bp_test_support::seed_verified_email(&pool, admin, "test@example.test").await;
+    bp_test_support::seed_verified_email(&pool, bob, "test@example.test").await;
+    bp_test_support::seed_verified_email(&pool, other_admin, "test@example.test").await;
     let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
     svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
@@ -674,6 +662,7 @@ async fn on_block_found_is_idempotent_on_duplicate_hash() {
     let admin = "bc1qadminbf6xx";
     cleanup(&pool, name, admin).await;
 
+    bp_test_support::seed_verified_email(&pool, admin, "test@example.test").await;
     let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 10_000).await.expect("create");
     // What the coinbase paid: the admin, and the pool fee to an address that
@@ -745,6 +734,8 @@ async fn name_collision_rejects_second_create() {
     cleanup(&pool, name, admin_a).await;
     cleanup(&pool, name, admin_b).await;
 
+    bp_test_support::seed_verified_email(&pool, admin_a, "test@example.test").await;
+    bp_test_support::seed_verified_email(&pool, admin_b, "test@example.test").await;
     let svc = svc(&pool).await;
     svc.create_group(name, admin_a, 10_000)
         .await
@@ -773,10 +764,11 @@ async fn ready_transition_sizes_coinbase_reservation_to_roster() {
         .execute(&pool)
         .await;
 
+    bp_test_support::seed_verified_email(&pool, admin, "test@example.test").await;
+    bp_test_support::seed_verified_email(&pool, bob, "test@example.test").await;
     let calls = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
     let svc = BlockpartyService::load(
         BlockpartyPayouts::new(pool.clone(), config()),
-        Arc::new(AllVerified),
         PplnsAddressCache::new(),
     )
     .await
@@ -836,6 +828,9 @@ async fn a_ready_party_refuses_every_roster_edit() {
             .await;
     }
 
+    bp_test_support::seed_verified_email(&pool, admin, "test@example.test").await;
+    bp_test_support::seed_verified_email(&pool, bob, "test@example.test").await;
+    bp_test_support::seed_verified_email(&pool, carol, "test@example.test").await;
     let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
     let gid = create.group.id;
@@ -897,6 +892,9 @@ async fn update_splits_confirms_admin_and_resets_non_admin() {
             .await;
     }
 
+    bp_test_support::seed_verified_email(&pool, admin, "test@example.test").await;
+    bp_test_support::seed_verified_email(&pool, bob, "test@example.test").await;
+    bp_test_support::seed_verified_email(&pool, carol, "test@example.test").await;
     let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
     let gid = create.group.id;
@@ -978,6 +976,8 @@ async fn a_party_turns_ready_only_with_complete_splits() {
         .execute(&pool)
         .await;
 
+    bp_test_support::seed_verified_email(&pool, admin, "test@example.test").await;
+    bp_test_support::seed_verified_email(&pool, carol, "test@example.test").await;
     let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 5_000).await.expect("create");
     let gid = create.group.id;
@@ -1038,6 +1038,8 @@ async fn a_joined_member_without_a_split_keeps_the_party_confirming() {
         .execute(&pool)
         .await;
 
+    bp_test_support::seed_verified_email(&pool, admin, "test@example.test").await;
+    bp_test_support::seed_verified_email(&pool, dave, "test@example.test").await;
     let svc = svc(&pool).await;
     let create = svc.create_group(name, admin, 10_000).await.expect("create");
     let gid = create.group.id;
@@ -1076,6 +1078,7 @@ async fn update_rental_hint_sets_cleans_and_clears() {
     let admin = "bc1qadminrentalhint1";
     cleanup(&pool, name, admin).await;
 
+    bp_test_support::seed_verified_email(&pool, admin, "test@example.test").await;
     let svc = svc(&pool).await;
     let create = svc
         .create_group(name, admin, 10_000)

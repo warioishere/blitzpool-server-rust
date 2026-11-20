@@ -218,12 +218,12 @@ async fn a_blockparty_admin_sets_and_clears_the_coinbase_tag() {
                     min_payout_sats: bp_common::Sats(5_000),
                 },
             ),
-            Arc::new(bp_blockparty_engine::NoopHooks::default()),
             AddressCache::new(),
         )
         .await
         .expect("load blockparty service"),
     );
+    bp_test_support::seed_verified_email(&pool, "bc1qpartycoinbasetag", "admin@example.test").await;
     let created = svc
         .create_group(name, "bc1qpartycoinbasetag", 10_000)
         .await

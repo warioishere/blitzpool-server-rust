@@ -8,40 +8,15 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bp_blockparty_engine::{
-    BlockpartyHooks, BlockpartyPayouts, BlockpartyService, CoinbaseReservation,
-};
+use bp_blockparty_engine::{BlockpartyPayouts, BlockpartyService, CoinbaseReservation};
 use bp_common::{AddressId, MiningMode, StreamKind};
 use bp_config::AppConfig;
-use bp_db::{find_address_email, Db};
 use bp_share_hook::{SharedAcceptedShare, SharedAcceptedShareSink};
 use thiserror::Error;
 use tracing::{info, warn};
 
 use crate::boot::FoundationHandles;
 use crate::group_service::SharedGroupService;
-
-/// Production [`BlockpartyHooks`] impl. Looks up verified email
-/// bindings against the same `pplns_address_email` table the
-/// Group-Solo invitation flow uses — the binding is the cross-mode
-/// trust anchor.
-pub(crate) struct ProductionBlockpartyHooks {
-    db: Db,
-}
-
-#[async_trait]
-impl BlockpartyHooks for ProductionBlockpartyHooks {
-    async fn verified_email_for(&self, address: &AddressId) -> Option<String> {
-        match find_address_email(self.db.pool(), address).await {
-            Ok(Some(row)) if row.verified_at.is_some() => Some(row.email),
-            Ok(_) => None,
-            Err(err) => {
-                warn!(%err, address = %address.as_str(), "blockparty: email-binding lookup failed");
-                None
-            }
-        }
-    }
-}
 
 #[derive(Debug, Error)]
 pub(crate) enum BlockpartySpawnError {
@@ -64,10 +39,6 @@ pub(crate) async fn spawn(
     payouts: &BlockpartyPayouts,
     group_service: &SharedGroupService,
 ) -> Result<SharedBlockparty, BlockpartySpawnError> {
-    let hooks = Arc::new(ProductionBlockpartyHooks {
-        db: foundation.db.clone(),
-    });
-
     // PplnsGroup membership cache is the cross-mode collision check
     // source of truth — share the same handle the GroupService owns.
     let pplns_cache = group_service.service.address_cache();
@@ -88,7 +59,7 @@ pub(crate) async fn spawn(
 
     info!("blockparty: loading routing cache");
     let concrete = Arc::new(
-        BlockpartyService::load(payouts.clone(), hooks, pplns_cache)
+        BlockpartyService::load(payouts.clone(), pplns_cache)
             .await?
             .with_coinbase_reservation(reservation),
     );

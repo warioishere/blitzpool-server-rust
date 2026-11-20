@@ -10,9 +10,7 @@ use std::sync::Arc;
 
 use axum::http::{Request, StatusCode};
 use bp_api::{build_router, AppState};
-use bp_blockparty_engine::{
-    BlockpartyPayoutConfig, BlockpartyPayouts, BlockpartyService, NoopHooks,
-};
+use bp_blockparty_engine::{BlockpartyPayoutConfig, BlockpartyPayouts, BlockpartyService};
 use bp_common::Sats;
 use bp_group_mgmt_engine::AddressCache as PplnsAddressCache;
 use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -94,12 +92,12 @@ async fn the_join_link_is_the_url_on_the_pool_ui() {
                     min_payout_sats: Sats(5_000),
                 },
             ),
-            Arc::new(NoopHooks::default()),
             PplnsAddressCache::new(),
         )
         .await
         .expect("load blockparty service"),
     );
+    bp_test_support::seed_verified_email(&pool, ADMIN, "admin@example.test").await;
     let created = svc
         .create_group(NAME, ADMIN, 9_800)
         .await

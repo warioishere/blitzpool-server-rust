@@ -814,6 +814,7 @@ dependencies = [
  "bp-blockparty",
  "bp-common",
  "bp-group-mgmt",
+ "bp-test-support",
  "chrono",
  "sqlx",
  "thiserror 2.0.21",

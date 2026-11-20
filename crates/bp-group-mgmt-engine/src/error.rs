@@ -26,7 +26,7 @@ pub enum GroupServiceError {
     AddressInGroup,
     #[error("address is already a member of a Blockparty — leave that party first")]
     AddressInBlockparty,
-    #[error("address has no verified email binding or signature proof")]
+    #[error("address has neither a confirmed email nor a signature ownership proof")]
     EmailNotVerified,
     #[error("address is already a member of this group")]
     AlreadyMember,
@@ -105,7 +105,7 @@ pub enum InvitationServiceError {
     Expired,
     #[error("group has been dissolved")]
     GroupDissolved,
-    #[error("address has no verified email binding")]
+    #[error("address has neither a confirmed email nor a signature ownership proof")]
     EmailNotVerified,
     #[error("address is invalid or missing")]
     InvalidAddress,
@@ -151,7 +151,7 @@ pub enum JoinRequestServiceError {
     NotFound,
     #[error("address is invalid or missing")]
     InvalidAddress,
-    #[error("address has no verified email binding")]
+    #[error("address has neither a confirmed email nor a signature ownership proof")]
     EmailNotVerified,
     #[error("address is already a member of this group")]
     AlreadyMember,

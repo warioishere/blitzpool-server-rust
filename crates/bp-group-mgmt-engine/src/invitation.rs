@@ -239,7 +239,10 @@ impl InvitationService {
         }
         let normalized =
             normalize_address(address).map_err(|_| InvitationServiceError::InvalidAddress)?;
-        if !bp_db::is_address_verified(&self.pool, &normalized).await? {
+        if bp_db::find_address_verification(&self.pool, &normalized)
+            .await?
+            .is_none()
+        {
             return Err(InvitationServiceError::EmailNotVerified);
         }
 
