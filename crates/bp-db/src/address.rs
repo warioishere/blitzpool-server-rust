@@ -231,8 +231,7 @@ pub async fn reset_address_settings_best_difficulty(
     .execute(pool)
     .await
     .map_err(DbError::from)?;
-    let mut tx = pool.begin().await.map_err(DbError::from)?;
-    crate::client::take_client_entity_bulk_write_lock(&mut tx).await?;
+    let mut tx = crate::client::begin_client_entity_write(pool).await?;
     sqlx::query!(
         r#"UPDATE client_entity SET "bestDifficulty" = 0
            WHERE address = $1 AND "bestDifficulty" > 0"#,

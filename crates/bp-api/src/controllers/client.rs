@@ -694,14 +694,7 @@ async fn delete_all(
 ) -> Result<Json<StatusResponse>, ApiError> {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     purge_address_stats(&state.pool, &addr).await?;
-    // Hard-delete the client rows.
-    sqlx::query!(
-        r#"DELETE FROM client_entity WHERE address = $1"#,
-        addr.as_str()
-    )
-    .execute(&state.pool)
-    .await
-    .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
+    bp_db::delete_clients_for_address(&state.pool, &addr).await?;
     // The address-settings row is EMPTIED, not deleted: dropping it would
     // take `allTimeBestDifficulty` with it, the one value no path may lower.
     // What stays is the leaderboard record, which carries no address.

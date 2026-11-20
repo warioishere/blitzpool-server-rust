@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM client_entity\n           WHERE \"deletedAt\" IS NOT NULL AND \"deletedAt\" < $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8903c1f8c25c82356260203a84ef149837836c3fc84872a188deb3a090ac4347"
+}

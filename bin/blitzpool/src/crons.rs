@@ -681,7 +681,7 @@ mod sweep_tests {
     }
 
     async fn seed_aged(pool: &sqlx::PgPool, address: &str, session: &str) {
-        bp_db::upsert_client(pool, &upsert(session, address))
+        bp_db::bulk_upsert_clients(pool, std::slice::from_ref(&upsert(session, address)))
             .await
             .expect("seed");
         sqlx::query(r#"UPDATE client_entity SET "updatedAt" = 1000 WHERE "sessionId" = $1"#)

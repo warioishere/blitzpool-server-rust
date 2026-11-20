@@ -346,13 +346,14 @@ pub struct ClientUpsert {
     pub start_time_ms: i64,
 }
 
-/// The statement behind [`upsert_client`] and [`bulk_upsert_clients`]. A
-/// re-register clears `deletedAt`, reviving a soft-deleted session; `firstSeen`
-/// is left alone. `rows` must be unique per key triple, since
-/// `ON CONFLICT DO UPDATE` rejects hitting one row twice.
-async fn upsert_clients_stmt<'e, E>(executor: E, rows: &[ClientUpsert]) -> Result<u64, DbError>
+/// Insert / upsert N client rows in one statement — the row-birth flush
+/// of the session-persistence debounce. A re-register clears `deletedAt`,
+/// reviving a soft-deleted session; `firstSeen` is left alone. `rows` must be
+/// unique per key triple, since `ON CONFLICT DO UPDATE` rejects hitting one
+/// row twice.
+pub async fn bulk_upsert_clients<'a, A>(conn: A, rows: &[ClientUpsert]) -> Result<u64, DbError>
 where
-    E: sqlx::PgExecutor<'e>,
+    A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
 {
     let mut addresses = Vec::with_capacity(rows.len());
     let mut client_names = Vec::with_capacity(rows.len());
@@ -366,6 +367,7 @@ where
         user_agents.push(row.user_agent.clone());
         start_times.push(row.start_time_ms);
     }
+    let mut tx = begin_client_entity_write(conn).await?;
     let result = sqlx::query!(
         r#"INSERT INTO client_entity
              (address, "clientName", "sessionId", "userAgent", "startTime", "firstSeen",
@@ -393,60 +395,53 @@ where
         &user_agents as &[Option<String>],
         &start_times,
     )
-    .execute(executor)
+    .execute(&mut *tx)
     .await
     .map_err(DbError::from)?;
+    tx.commit().await.map_err(DbError::from)?;
     Ok(result.rows_affected())
 }
 
-/// Single-row upsert without the bulk-write lock, so a test can run it in
-/// its rollback transaction; production writes use [`bulk_upsert_clients`].
-pub async fn upsert_client<'e, E>(executor: E, row: &ClientUpsert) -> Result<u64, DbError>
+/// Advisory lock serialising the `client_entity` writers. They run in three
+/// processes (core, payout, api) and most touch several rows per statement,
+/// so two of them can deadlock on shared rows. Sorting the inputs does not
+/// help: the planner decides lock order.
+const CLIENT_ENTITY_WRITE_LOCK: i64 = 0x636c_6e74_6277; // "clntbw"
+
+/// Open a transaction on `conn` that holds [`CLIENT_ENTITY_WRITE_LOCK`].
+/// Every `client_entity` writer starts here. Given a connection that is
+/// already in a transaction (a test's rollback), it opens a savepoint; the
+/// lock then lasts until the outer transaction ends, or until the savepoint
+/// rolls back on an error.
+pub(crate) async fn begin_client_entity_write<'a, A>(
+    conn: A,
+) -> Result<sqlx::Transaction<'a, sqlx::Postgres>, DbError>
 where
-    E: sqlx::PgExecutor<'e>,
+    A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
 {
-    upsert_clients_stmt(executor, std::slice::from_ref(row)).await
-}
-
-/// Advisory lock serialising the multi-row `client_entity` writers, which run
-/// in two processes and would otherwise deadlock on shared rows. Sorting the
-/// inputs does not help: the planner decides lock order.
-/// Any multi-row writer of `client_entity` MUST take this lock.
-const CLIENT_ENTITY_BULK_WRITE_LOCK: i64 = 0x636c_6e74_6277; // "clntbw"
-
-/// Take [`CLIENT_ENTITY_BULK_WRITE_LOCK`] for the rest of `tx`.
-pub(crate) async fn take_client_entity_bulk_write_lock(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-) -> Result<(), DbError> {
-    crate::pool::take_xact_lock(tx, CLIENT_ENTITY_BULK_WRITE_LOCK).await
-}
-
-/// Insert / upsert N client rows in one statement — the row-birth flush
-/// of the session-persistence debounce.
-pub async fn bulk_upsert_clients(pool: &PgPool, rows: &[ClientUpsert]) -> Result<u64, DbError> {
-    let mut tx = pool.begin().await.map_err(DbError::from)?;
-    take_client_entity_bulk_write_lock(&mut tx).await?;
-    let n = upsert_clients_stmt(&mut *tx, rows).await?;
-    tx.commit().await.map_err(DbError::from)?;
-    Ok(n)
+    let mut tx = conn.begin().await.map_err(DbError::from)?;
+    crate::pool::take_xact_lock(&mut tx, CLIENT_ENTITY_WRITE_LOCK).await?;
+    Ok(tx)
 }
 
 /// Raise each session's `bestDifficulty` to its flushed best where that beats
 /// the stored value (parallel key arrays). Rows already at or above it are not
 /// written, so writes follow new records, not shares. A session whose row is
 /// not born yet matches nothing.
-pub async fn raise_client_best_difficulties(
-    pool: &PgPool,
+pub async fn raise_client_best_difficulties<'a, A>(
+    conn: A,
     addresses: &[String],
     client_names: &[String],
     session_ids: &[String],
     bests: &[f64],
-) -> Result<u64, DbError> {
+) -> Result<u64, DbError>
+where
+    A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
+{
     if addresses.is_empty() {
         return Ok(0);
     }
-    let mut tx = pool.begin().await.map_err(DbError::from)?;
-    take_client_entity_bulk_write_lock(&mut tx).await?;
+    let mut tx = begin_client_entity_write(conn).await?;
     let result = sqlx::query!(
         r#"UPDATE client_entity AS c
            SET "bestDifficulty" = u.best
@@ -470,10 +465,11 @@ pub async fn raise_client_best_difficulties(
 
 /// Soft-delete every active row with this `sessionId`. The PK does not make
 /// `sessionId` unique on its own, so more than one row may be touched.
-pub async fn delete_client_for_session<'e, E>(executor: E, session_id: &str) -> Result<u64, DbError>
+pub async fn delete_client_for_session<'a, A>(conn: A, session_id: &str) -> Result<u64, DbError>
 where
-    E: sqlx::PgExecutor<'e>,
+    A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
 {
+    let mut tx = begin_client_entity_write(conn).await?;
     let result = sqlx::query!(
         r#"UPDATE client_entity
            SET "deletedAt" = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint,
@@ -481,9 +477,10 @@ where
            WHERE "sessionId" = $1 AND "deletedAt" IS NULL"#,
         session_id
     )
-    .execute(executor)
+    .execute(&mut *tx)
     .await
     .map_err(DbError::from)?;
+    tx.commit().await.map_err(DbError::from)?;
     Ok(result.rows_affected())
 }
 
@@ -519,14 +516,16 @@ where
 /// Soft-delete the given sessions (parallel key arrays), skipping any
 /// that were re-registered or soft-deleted in the meantime. The verdict
 /// half of the dead-session sweep — see [`find_stale_active_sessions`].
-pub async fn soft_delete_sessions(
-    pool: &PgPool,
+pub async fn soft_delete_sessions<'a, A>(
+    conn: A,
     addresses: &[String],
     client_names: &[String],
     session_ids: &[String],
-) -> Result<u64, DbError> {
-    let mut tx = pool.begin().await.map_err(DbError::from)?;
-    take_client_entity_bulk_write_lock(&mut tx).await?;
+) -> Result<u64, DbError>
+where
+    A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
+{
+    let mut tx = begin_client_entity_write(conn).await?;
     let result = sqlx::query!(
         r#"UPDATE client_entity AS t
            SET "deletedAt" = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint,
@@ -604,14 +603,16 @@ pub async fn find_recently_deleted_sessions(
 /// dead-session sweep. The caller decides who qualifies; the rule is
 /// "its live hash has been written SINCE the soft-delete", which only a
 /// session that kept mining can satisfy.
-pub async fn revive_sessions(
-    pool: &PgPool,
+pub async fn revive_sessions<'a, A>(
+    conn: A,
     addresses: &[String],
     client_names: &[String],
     session_ids: &[String],
-) -> Result<u64, DbError> {
-    let mut tx = pool.begin().await.map_err(DbError::from)?;
-    take_client_entity_bulk_write_lock(&mut tx).await?;
+) -> Result<u64, DbError>
+where
+    A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
+{
+    let mut tx = begin_client_entity_write(conn).await?;
     let result = sqlx::query!(
         r#"UPDATE client_entity AS t
            SET "deletedAt" = NULL,
@@ -639,18 +640,38 @@ pub async fn revive_sessions(
 
 /// Hard-delete rows soft-deleted before `cutoff_ms`, so the backlog stays
 /// bounded.
-pub async fn delete_old_clients<'e, E>(executor: E, cutoff_ms: i64) -> Result<u64, DbError>
+pub async fn delete_old_clients<'a, A>(conn: A, cutoff_ms: i64) -> Result<u64, DbError>
 where
-    E: sqlx::PgExecutor<'e>,
+    A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
 {
-    let result = sqlx::query(
+    let mut tx = begin_client_entity_write(conn).await?;
+    let result = sqlx::query!(
         r#"DELETE FROM client_entity
            WHERE "deletedAt" IS NOT NULL AND "deletedAt" < $1"#,
+        cutoff_ms
     )
-    .bind(cutoff_ms)
-    .execute(executor)
+    .execute(&mut *tx)
     .await
     .map_err(DbError::from)?;
+    tx.commit().await.map_err(DbError::from)?;
+    Ok(result.rows_affected())
+}
+
+/// Hard-delete every row of `address`, soft-deleted or not — the client
+/// half of the API's delete-all.
+pub async fn delete_clients_for_address<'a, A>(conn: A, address: &AddressId) -> Result<u64, DbError>
+where
+    A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
+{
+    let mut tx = begin_client_entity_write(conn).await?;
+    let result = sqlx::query!(
+        r#"DELETE FROM client_entity WHERE address = $1"#,
+        address.as_str()
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(DbError::from)?;
+    tx.commit().await.map_err(DbError::from)?;
     Ok(result.rows_affected())
 }
 
@@ -708,7 +729,7 @@ pub struct DeviceFirstSeenRow {
     pub address: String,
     pub client_name: String,
     /// Earliest `COALESCE("firstSeen", "startTime")` over all rows of the pair,
-    /// soft-deleted included. Not `startTime` alone: [`upsert_client`]
+    /// soft-deleted included. Not `startTime` alone: [`bulk_upsert_clients`]
     /// refreshes that on every re-register, while `firstSeen` stays put.
     pub first_seen_ms: i64,
 }

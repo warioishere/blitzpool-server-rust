@@ -4,15 +4,16 @@
 #![allow(clippy::needless_return)]
 
 //! Integration tests for the session-persistence write-primitives
-//! (`upsert_client`, `delete_client_for_session`, …). Single-row tests
-//! wrap writes in TX-rollback for isolation; the bulk writers own their
-//! transaction (bulk-write lock), so their tests clean up by sessionId.
+//! (`bulk_upsert_clients`, `delete_client_for_session`, …). Each writer
+//! opens its own locked transaction, a savepoint when handed a test's
+//! rollback transaction; tests that write through the pool clean up by
+//! sessionId.
 
 use bp_common::AddressId;
 use bp_db::{
-    delete_client_for_session, find_addresses_for_ntfy_listener, find_recently_deleted_sessions,
-    find_stale_active_sessions, revive_sessions, soft_delete_sessions, upsert_client,
-    upsert_ntfy_subscription, ClientUpsert,
+    bulk_upsert_clients, delete_client_for_session, delete_clients_for_address,
+    find_addresses_for_ntfy_listener, find_recently_deleted_sessions, find_stale_active_sessions,
+    revive_sessions, soft_delete_sessions, upsert_ntfy_subscription, ClientUpsert,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 
@@ -51,15 +52,15 @@ fn mk(session: &str) -> ClientUpsert {
     }
 }
 
-// ── upsert_client ───────────────────────────────────────────────────
+// ── bulk_upsert_clients ──────────────────────────────────────────────
 
 #[tokio::test]
-async fn upsert_client_inserts_fresh_row() {
+async fn bulk_upsert_clients_inserts_fresh_row() {
     let Some(pool) = connect_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
-    let n = upsert_client(&mut *tx, &mk("sessA001"))
+    let n = bulk_upsert_clients(&mut *tx, std::slice::from_ref(&mk("sessA001")))
         .await
         .expect("insert");
     assert_eq!(n, 1);
@@ -83,12 +84,12 @@ async fn upsert_client_inserts_fresh_row() {
 }
 
 #[tokio::test]
-async fn upsert_client_sets_first_seen_on_insert() {
+async fn bulk_upsert_clients_sets_first_seen_on_insert() {
     let Some(pool) = connect_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
-    upsert_client(&mut *tx, &mk("sessFS01"))
+    bulk_upsert_clients(&mut *tx, std::slice::from_ref(&mk("sessFS01")))
         .await
         .expect("insert");
 
@@ -115,13 +116,13 @@ async fn upsert_client_sets_first_seen_on_insert() {
 }
 
 #[tokio::test]
-async fn upsert_client_preserves_first_seen_on_reregister() {
+async fn bulk_upsert_clients_preserves_first_seen_on_reregister() {
     let Some(pool) = connect_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
     // First register at T1 — sets firstSeen = T1.
-    upsert_client(&mut *tx, &mk("sessFS02"))
+    bulk_upsert_clients(&mut *tx, std::slice::from_ref(&mk("sessFS02")))
         .await
         .expect("insert");
 
@@ -130,7 +131,7 @@ async fn upsert_client_preserves_first_seen_on_reregister() {
         start_time_ms: 1_700_000_099_000, // T2 = T1 + 99s
         ..mk("sessFS02")
     };
-    upsert_client(&mut *tx, &reregister)
+    bulk_upsert_clients(&mut *tx, std::slice::from_ref(&reregister))
         .await
         .expect("re-register");
 
@@ -161,20 +162,24 @@ async fn upsert_client_preserves_first_seen_on_reregister() {
 }
 
 #[tokio::test]
-async fn upsert_client_on_conflict_resurrects_soft_deleted_row() {
+async fn bulk_upsert_clients_on_conflict_resurrects_soft_deleted_row() {
     let Some(pool) = connect_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
     // First register, then deregister, then re-register with same composite PK.
-    upsert_client(&mut *tx, &mk("sessC002")).await.unwrap();
+    bulk_upsert_clients(&mut *tx, std::slice::from_ref(&mk("sessC002")))
+        .await
+        .unwrap();
     delete_client_for_session(&mut *tx, "sessC002")
         .await
         .unwrap();
     // Re-register: ON CONFLICT path must clear deletedAt + refresh fields.
     let mut updated = mk("sessC002");
     updated.user_agent = Some("bitaxe/3.0".to_string());
-    upsert_client(&mut *tx, &updated).await.unwrap();
+    bulk_upsert_clients(&mut *tx, std::slice::from_ref(&updated))
+        .await
+        .unwrap();
 
     let row = sqlx::query(
         r#"SELECT "userAgent", "deletedAt" FROM client_entity
@@ -193,8 +198,6 @@ async fn upsert_client_on_conflict_resurrects_soft_deleted_row() {
 
     tx.rollback().await.expect("rollback");
 }
-
-// ── bulk_upsert_clients ─────────────────────────────────────────────
 
 /// Pins the array plumbing of the bulk upsert: mixed insert + conflict and
 /// mixed Some/None `userAgent` in one statement.
@@ -369,15 +372,15 @@ async fn ntfy_listener_topics_union_clients_and_ntfy_subs() {
     }
 
     // An active mining client + an ntfy subscription on two distinct addrs.
-    upsert_client(
+    bulk_upsert_clients(
         &pool,
-        &ClientUpsert {
+        &[ClientUpsert {
             address: client_addr.to_string(),
             client_name: "wkr".to_string(),
             session_id: "ntfytpc1".to_string(),
             user_agent: None,
             start_time_ms: 1_700_000_000_000,
-        },
+        }],
     )
     .await
     .expect("upsert client");
@@ -409,7 +412,7 @@ async fn ntfy_listener_topics_union_clients_and_ntfy_subs() {
 }
 
 #[tokio::test]
-async fn upsert_client_distinct_sessions_stay_independent() {
+async fn bulk_upsert_clients_distinct_sessions_stay_independent() {
     let Some(pool) = connect_or_skip().await else {
         return;
     };
@@ -422,8 +425,12 @@ async fn upsert_client_distinct_sessions_stay_independent() {
         ..mk(session)
     };
     let mut tx = pool.begin().await.expect("begin tx");
-    upsert_client(&mut *tx, &at("sessD003")).await.unwrap();
-    upsert_client(&mut *tx, &at("sessD004")).await.unwrap();
+    bulk_upsert_clients(&mut *tx, std::slice::from_ref(&at("sessD003")))
+        .await
+        .unwrap();
+    bulk_upsert_clients(&mut *tx, std::slice::from_ref(&at("sessD004")))
+        .await
+        .unwrap();
     let n: i64 = sqlx::query_scalar(
         r#"SELECT COUNT(*) FROM client_entity
            WHERE address = $1 AND "clientName" = $2"#,
@@ -437,6 +444,48 @@ async fn upsert_client_distinct_sessions_stay_independent() {
     tx.rollback().await.expect("rollback");
 }
 
+// ── delete_clients_for_address ──────────────────────────────────────
+
+/// Every row of the address goes, soft-deleted ones included; another
+/// address keeps its row.
+#[tokio::test]
+async fn delete_clients_for_address_removes_only_that_address() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let mut tx = pool.begin().await.expect("begin tx");
+    let gone = AddressId::new("test_delall_gone".to_string()).unwrap();
+    let kept = AddressId::new("test_delall_kept".to_string()).unwrap();
+    let row = |address: &AddressId, session: &str| ClientUpsert {
+        address: address.as_str().to_string(),
+        ..mk(session)
+    };
+    bulk_upsert_clients(
+        &mut *tx,
+        &[
+            row(&gone, "sessDA01"),
+            row(&gone, "sessDA02"),
+            row(&kept, "sessDA03"),
+        ],
+    )
+    .await
+    .unwrap();
+    delete_client_for_session(&mut *tx, "sessDA02")
+        .await
+        .unwrap();
+
+    let n = delete_clients_for_address(&mut *tx, &gone).await.unwrap();
+    assert_eq!(n, 2, "the active and the soft-deleted row");
+    let left: Vec<String> =
+        sqlx::query_scalar(r#"SELECT address FROM client_entity WHERE "sessionId" = ANY($1)"#)
+            .bind(["sessDA01", "sessDA02", "sessDA03"])
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(left, vec![kept.as_str().to_string()]);
+    tx.rollback().await.expect("rollback");
+}
+
 // ── delete_client_for_session ───────────────────────────────────────
 
 #[tokio::test]
@@ -445,7 +494,9 @@ async fn delete_client_for_session_soft_deletes_by_session_id() {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
-    upsert_client(&mut *tx, &mk("sessE005")).await.unwrap();
+    bulk_upsert_clients(&mut *tx, std::slice::from_ref(&mk("sessE005")))
+        .await
+        .unwrap();
 
     let affected = delete_client_for_session(&mut *tx, "sessE005")
         .await
@@ -481,7 +532,9 @@ async fn delete_client_for_session_skips_already_deleted_rows() {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
-    upsert_client(&mut *tx, &mk("sessF006")).await.unwrap();
+    bulk_upsert_clients(&mut *tx, std::slice::from_ref(&mk("sessF006")))
+        .await
+        .unwrap();
     delete_client_for_session(&mut *tx, "sessF006")
         .await
         .unwrap();
@@ -497,11 +550,11 @@ async fn delete_client_for_session_skips_already_deleted_rows() {
 // Age selects CANDIDATES only (the sweep consults Redis before the verdict);
 // the soft-delete hits exactly the given triples.
 
-/// Seed a row straight on the pool (the sweep writers own their own
-/// transaction for the bulk-write lock, so a rollback-tx test cannot
-/// drive them) and age its `updatedAt` into candidate territory.
+/// Seed a row on the pool and age its `updatedAt` into candidate territory.
 async fn seed_aged_session(pool: &PgPool, session: &str, updated_at: i64) {
-    upsert_client(pool, &mk(session)).await.expect("seed");
+    bulk_upsert_clients(pool, std::slice::from_ref(&mk(session)))
+        .await
+        .expect("seed");
     sqlx::query(r#"UPDATE client_entity SET "updatedAt" = $2 WHERE "sessionId" = $1"#)
         .bind(session)
         .bind(updated_at)

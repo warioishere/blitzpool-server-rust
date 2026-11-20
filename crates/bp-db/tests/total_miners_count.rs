@@ -6,7 +6,7 @@
 //! client rows. The `/api/pool` response must count all clients, not
 //! only active sessions, so the query carries no deletedAt filter.
 
-use bp_db::{upsert_client, ClientUpsert};
+use bp_db::{bulk_upsert_clients, ClientUpsert};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
 const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
@@ -56,18 +56,18 @@ async fn total_miners_counts_soft_deleted_rows() {
 
     // Insert both as active first.
     for sid in [SID_ACTIVE, SID_DELETED] {
-        upsert_client(
+        bulk_upsert_clients(
             &pool,
-            &ClientUpsert {
+            &[ClientUpsert {
                 address: ADDR.to_string(),
                 client_name: format!("worker-{sid}"),
                 session_id: sid.to_string(),
                 user_agent: Some("test-miner/1.0".to_string()),
                 start_time_ms: 1_700_000_000_000,
-            },
+            }],
         )
         .await
-        .expect("upsert_client");
+        .expect("bulk_upsert_clients");
     }
 
     // Soft-delete the second session.
