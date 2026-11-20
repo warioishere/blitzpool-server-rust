@@ -43,9 +43,9 @@ impl<A> Clone for TemplateBroadcast<A> {
 impl<A> TemplateBroadcast<A> {
     /// The broadcast a connection's next job goes out under: a block change
     /// while `owes_new_block` is set, which this clears. A connection owes one
-    /// when it skipped broadcasts, got no job for a block change, or (SV2) got
-    /// no first job at channel open; its next job must then announce the tip,
-    /// or the miner keeps hashing the old one.
+    /// when it skipped a block change ([`take_template`]), got no job
+    /// for one, or (SV2) got no first job at channel open; its next job must
+    /// then announce the tip, or the miner keeps hashing the old one.
     pub fn for_next_job(self, owes_new_block: &mut bool) -> Self {
         if std::mem::take(owes_new_block) {
             Self {
@@ -56,6 +56,32 @@ impl<A> TemplateBroadcast<A> {
             self
         }
     }
+}
+
+/// The chain tip a template builds on.
+pub trait TemplateTip {
+    fn prev_hash(&self) -> &[u8; 32];
+}
+
+impl TemplateTip for crate::ActiveTemplate {
+    fn prev_hash(&self) -> &[u8; 32] {
+        &self.prev_hash
+    }
+}
+
+/// Make `next` the connection's template. Returns whether broadcasts skipped
+/// before it (`skipped_broadcasts`, cleared here) hid a block change: its tip
+/// differs from the template the connection held, or it held none. Skipped
+/// refreshes on the same tip hide nothing, and announcing a block change for
+/// them would retire jobs that are still valid.
+pub fn take_template<A: TemplateTip>(
+    current: &mut Option<Arc<A>>,
+    next: &Arc<A>,
+    skipped_broadcasts: &mut bool,
+) -> bool {
+    let tip_moved = current.as_deref().map(TemplateTip::prev_hash) != Some(next.prev_hash());
+    *current = Some(Arc::clone(next));
+    std::mem::take(skipped_broadcasts) && tip_moved
 }
 
 /// One connection's claim on a stream: its own broadcast receiver plus the
@@ -361,6 +387,44 @@ mod tests {
 
         cancel.cancel();
         streams.drain(WAIT).await;
+    }
+
+    struct Tip([u8; 32]);
+
+    impl TemplateTip for Tip {
+        fn prev_hash(&self) -> &[u8; 32] {
+            &self.0
+        }
+    }
+
+    /// `take_template` from a connection holding `held`, having skipped
+    /// broadcasts or not: whether it reports a hidden block change. Also
+    /// checks the connection holds `next` afterwards and the flag is cleared.
+    fn hidden_block_change(held: Option<u8>, next: u8, skipped: bool) -> bool {
+        let mut current = held.map(|tip| Arc::new(Tip([tip; 32])));
+        let next = Arc::new(Tip([next; 32]));
+        let mut skipped_broadcasts = skipped;
+        let hidden = take_template(&mut current, &next, &mut skipped_broadcasts);
+        assert!(Arc::ptr_eq(current.as_ref().unwrap(), &next));
+        assert!(!skipped_broadcasts);
+        hidden
+    }
+
+    /// Skipped broadcasts hid a block change only when the tip moved: a
+    /// skipped refresh on the held tip owes nothing.
+    #[test]
+    fn skipped_broadcasts_hide_a_block_change_only_when_the_tip_moved() {
+        assert!(!hidden_block_change(Some(1), 1, true));
+        assert!(hidden_block_change(Some(1), 2, true));
+        assert!(hidden_block_change(None, 2, true));
+    }
+
+    /// Without skipped broadcasts nothing is hidden: a new tip then arrives
+    /// as its own block change.
+    #[test]
+    fn nothing_is_hidden_without_skipped_broadcasts() {
+        assert!(!hidden_block_change(Some(1), 2, false));
+        assert!(!hidden_block_change(None, 2, false));
     }
 
     /// An owed block change turns the next job's broadcast into one, once;

@@ -34,7 +34,7 @@ use crate::jobs::JobRegistry;
 use crate::notify::ActiveSV1Template;
 use bp_mining_job::{MiningJobCache, ResolvedPayouts};
 use bp_template_distribution::{
-    RefreshPacer, StreamHandle, TemplateChange, TemplateStreams, REFRESH_SPREAD,
+    take_template, RefreshPacer, StreamHandle, TemplateChange, TemplateStreams, REFRESH_SPREAD,
 };
 use bp_vardiff::{Clock, SystemClock};
 
@@ -282,6 +282,8 @@ async fn run_connection(
     // Set while the next notify must clean the miner's jobs; see
     // `TemplateBroadcast::for_next_job`.
     let mut owes_new_block = false;
+    // Set from a lagged receive until the next broadcast arrives.
+    let mut skipped_broadcasts = false;
     // A fee refresh reaches this connection within `REFRESH_SPREAD`, at its
     // own offset, so the pool does not send it to every miner at once.
     let mut refresh_pacer = RefreshPacer::new(u64::from(session_id), REFRESH_SPREAD);
@@ -510,15 +512,20 @@ async fn run_connection(
             broadcast = refresh_pacer.next(&mut template_rx) => {
                 let payload = match broadcast {
                     Ok(p) => p,
-                    // A skipped broadcast may have been the block change: the
-                    // next notify cleans the jobs.
+                    // A skipped broadcast may have been the block change;
+                    // the next one tells by its tip.
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        owes_new_block |= state.authorization.is_some();
+                        skipped_broadcasts = true;
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
-                current_template = Some(payload.template.clone());
+                let hidden_block_change = take_template(
+                    &mut current_template,
+                    &payload.template,
+                    &mut skipped_broadcasts,
+                );
+                owes_new_block |= hidden_block_change && state.authorization.is_some();
                 let payload = payload.for_next_job(&mut owes_new_block);
                 let clean_jobs = matches!(payload.change, TemplateChange::NewBlock);
                 let payouts = resolve_payouts_for_state(&state, &hooks, &payload.template).await;

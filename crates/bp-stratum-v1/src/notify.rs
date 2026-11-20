@@ -32,6 +32,12 @@ pub struct ActiveSV1Template {
     pub header_timestamp_hex: String,
 }
 
+impl bp_template_distribution::TemplateTip for ActiveSV1Template {
+    fn prev_hash(&self) -> &[u8; 32] {
+        &self.template.prev_hash
+    }
+}
+
 impl Deref for ActiveSV1Template {
     type Target = ActiveTemplate;
 

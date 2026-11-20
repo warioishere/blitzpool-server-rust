@@ -20,7 +20,7 @@ pub use assembler::{ActiveFromTemplate, ActiveTemplate, TemplateAssembler, Templ
 pub use bitcoin_core_sv2::runtime_api::BitcoinCoreVersion;
 pub use config::{TdpCoinbaseConstraints, TdpConfig, DEFAULT_BITCOIN_CORE_VERSION};
 pub use error::TdpError;
-pub use fanout::{StreamHandle, TemplateBroadcast, TemplateStreams};
+pub use fanout::{take_template, StreamHandle, TemplateBroadcast, TemplateStreams, TemplateTip};
 pub use handle::TdpHandle;
 pub use message::{
     NewTemplate, RequestTransactionDataError, RequestTransactionDataSuccess, SetNewPrevHash,

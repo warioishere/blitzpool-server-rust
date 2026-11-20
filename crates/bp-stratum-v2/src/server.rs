@@ -40,7 +40,8 @@ use crate::mining::client::{
     PortConfig, SessionEvent, ERR_CHANNEL_CAPACITY_EXHAUSTED,
 };
 use bp_template_distribution::{
-    ActiveTemplate, RefreshPacer, StreamHandle, TemplateChange, TemplateStreams, REFRESH_SPREAD,
+    take_template, ActiveTemplate, RefreshPacer, StreamHandle, TemplateChange, TemplateStreams,
+    REFRESH_SPREAD,
 };
 
 use crate::mining::client::TemplateBroadcast;
@@ -286,9 +287,12 @@ async fn run_mining_connection(
     // own offset, so the pool does not send it to every miner at once.
     let mut refresh_pacer = RefreshPacer::new(u64::from(session_id), REFRESH_SPREAD);
     // Set while the open channels hold no job on the current tip (payouts did
-    // not resolve at a block change or at open): the next job that builds
-    // must announce the tip, whatever the template change that carries it.
+    // not resolve at a block change or at open, or skipped broadcasts hid a
+    // block change): the next job that builds must announce the tip, whatever
+    // the template change that carries it.
     let mut owes_new_block = false;
+    // Set from a lagged receive until the next broadcast arrives.
+    let mut skipped_broadcasts = false;
 
     let mut vardiff_tick = tokio::time::interval(Duration::from_millis(state.vardiff_interval_ms));
     vardiff_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -697,15 +701,20 @@ async fn run_mining_connection(
             broadcast_recv = refresh_pacer.next(&mut template_rx) => {
                 let payload = match broadcast_recv {
                     Ok(p) => p,
-                    // A skipped broadcast may have been the block change: the
-                    // next job announces the tip and retires the old one.
+                    // A skipped broadcast may have been the block change;
+                    // the next one tells by its tip.
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        owes_new_block |= !state.channels.is_empty();
+                        skipped_broadcasts = true;
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
-                state.current_template = Some(payload.template.clone());
+                let hidden_block_change = take_template(
+                    &mut state.current_template,
+                    &payload.template,
+                    &mut skipped_broadcasts,
+                );
+                owes_new_block |= hidden_block_change && !state.channels.is_empty();
                 // A work-selection connection (SV2 Mining/SetupConnection
                 // `REQUIRES_WORK_SELECTION`) mines only its own custom jobs:
                 // it needs no payouts and gets no pool job. Any other builds a
