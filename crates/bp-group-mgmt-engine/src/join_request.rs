@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use bp_db::PplnsGroupJoinRequestRow;
-use bp_group_mgmt::group::PayoutMode;
+use bp_group_mgmt::join_request::JoinRequestStatus;
 use bp_group_mgmt::token::TokenHash;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -250,7 +250,7 @@ impl JoinRequestService {
                 bp_db::update_pplns_group_join_request_decision(
                     &self.pool,
                     request.id,
-                    "rejected",
+                    JoinRequestStatus::Rejected,
                     now,
                     admin_hash.as_str(),
                 )
@@ -266,7 +266,7 @@ impl JoinRequestService {
         bp_db::update_pplns_group_join_request_decision(
             &self.pool,
             request.id,
-            "approved",
+            JoinRequestStatus::Approved,
             now,
             admin_hash.as_str(),
         )
@@ -280,9 +280,7 @@ impl JoinRequestService {
                     to_email: request.email,
                     address: address.as_str().to_string(),
                     group_name: group.name,
-                    outcome: JoinDecisionOutcome::Approved(PayoutMode::parse_or_default(
-                        &group.payout_mode,
-                    )),
+                    outcome: JoinDecisionOutcome::Approved(group.payout_mode),
                     group_url: url,
                 })
                 .await;
@@ -311,7 +309,7 @@ impl JoinRequestService {
         bp_db::update_pplns_group_join_request_decision(
             &self.pool,
             request.id,
-            "rejected",
+            JoinRequestStatus::Rejected,
             now,
             admin_hash.as_str(),
         )

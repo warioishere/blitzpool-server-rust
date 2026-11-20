@@ -5,6 +5,8 @@
 //! pool-wide.
 
 use bp_common::{AddressId, Sats};
+use bp_group_mgmt::group::{MemberRole, PayoutMode};
+use bp_group_mgmt::join_request::JoinRequestStatus;
 use sqlx::{postgres::PgPool, FromRow};
 use uuid::Uuid;
 
@@ -59,11 +61,10 @@ pub struct PplnsGroupRow {
     /// (GroupService::add_member_without_admin) across every join path.
     #[sqlx(rename = "maxMembers")]
     pub max_members: Option<i32>,
-    /// Payout mode — `"prop"` (classic per-round PROP, default) or `"window"`
-    /// (continuously-sliding time window). Chosen at creation and immutable.
-    /// Parsed via `bp_group_mgmt::group::PayoutMode::parse_or_default`.
+    /// Payout mode: per-round PROP or a continuously sliding time window.
+    /// Chosen at creation and immutable; a text no mode has fails the read.
     #[sqlx(rename = "payoutMode")]
-    pub payout_mode: String,
+    pub payout_mode: PayoutMode,
     /// The admin's own coinbase tag, written after the pool identifier
     /// (`bp_common::CoinbaseTag`); NULL for none.
     #[sqlx(rename = "coinbaseTag")]
@@ -92,7 +93,7 @@ pub async fn find_group(pool: &PgPool, id: Uuid) -> Result<Option<PplnsGroupRow>
             "isPublic" AS "is_public!",
             "resetRoundOnBlock" AS "reset_round_on_block!",
             "maxMembers" AS "max_members?",
-            "payoutMode" AS "payout_mode!",
+            "payoutMode" AS "payout_mode!: PayoutMode",
             "coinbaseTag" AS "coinbase_tag?"
            FROM pplns_group WHERE id = $1 LIMIT 1"#,
         id
@@ -108,7 +109,7 @@ pub struct PplnsGroupMemberRow {
     #[sqlx(rename = "groupId")]
     pub group_id: Uuid,
     pub address: AddressId,
-    pub role: String,
+    pub role: MemberRole,
     #[sqlx(rename = "joinedAt")]
     pub joined_at: i64,
 }
@@ -126,7 +127,7 @@ pub async fn find_group_member_by_address(
             id AS "id!",
             "groupId" AS "group_id!",
             address AS "address!: AddressId",
-            role AS "role!",
+            role AS "role!: MemberRole",
             "joinedAt" AS "joined_at!"
            FROM pplns_group_member WHERE address = $1 LIMIT 1"#,
         address.as_str(),
@@ -149,7 +150,7 @@ pub async fn find_pplns_group_members_for_group(
             id AS "id!",
             "groupId" AS "group_id!",
             address AS "address!: AddressId",
-            role AS "role!",
+            role AS "role!: MemberRole",
             "joinedAt" AS "joined_at!"
            FROM pplns_group_member
            WHERE "groupId" = $1
@@ -434,7 +435,7 @@ pub struct PplnsGroupJoinRequestRow {
     pub address: AddressId,
     pub email: String,
     pub message: Option<String>,
-    pub status: String,
+    pub status: JoinRequestStatus,
     #[sqlx(rename = "createdAt")]
     pub created_at: i64,
     #[sqlx(rename = "decidedAt")]
@@ -457,7 +458,7 @@ pub async fn insert_pplns_group<'e, E>(
     admin_token_hash: &str,
     active: bool,
     is_public: bool,
-    payout_mode: &str,
+    payout_mode: PayoutMode,
     now_ms: i64,
 ) -> Result<PplnsGroupRow, DbError>
 where
@@ -488,7 +489,7 @@ where
             "isPublic" AS "is_public!",
             "resetRoundOnBlock" AS "reset_round_on_block!",
             "maxMembers" AS "max_members?",
-            "payoutMode" AS "payout_mode!",
+            "payoutMode" AS "payout_mode!: PayoutMode",
             "coinbaseTag" AS "coinbase_tag?""#,
         id,
         name,
@@ -497,7 +498,7 @@ where
         active,
         now_ms,
         is_public,
-        payout_mode,
+        payout_mode.as_str(),
     )
     .fetch_one(executor)
     .await
@@ -533,7 +534,7 @@ pub async fn find_pplns_group_by_name_not_dissolved(
             "isPublic" AS "is_public!",
             "resetRoundOnBlock" AS "reset_round_on_block!",
             "maxMembers" AS "max_members?",
-            "payoutMode" AS "payout_mode!",
+            "payoutMode" AS "payout_mode!: PayoutMode",
             "coinbaseTag" AS "coinbase_tag?"
            FROM pplns_group
            WHERE name = $1 AND "dissolvedAt" IS NULL
@@ -569,7 +570,7 @@ pub async fn list_active_pplns_groups(pool: &PgPool) -> Result<Vec<PplnsGroupRow
             "isPublic" AS "is_public!",
             "resetRoundOnBlock" AS "reset_round_on_block!",
             "maxMembers" AS "max_members?",
-            "payoutMode" AS "payout_mode!",
+            "payoutMode" AS "payout_mode!: PayoutMode",
             "coinbaseTag" AS "coinbase_tag?"
            FROM pplns_group
            WHERE "dissolvedAt" IS NULL
@@ -734,7 +735,7 @@ pub async fn update_pplns_group_round_reset_config(
             "isPublic" AS "is_public!",
             "resetRoundOnBlock" AS "reset_round_on_block!",
             "maxMembers" AS "max_members?",
-            "payoutMode" AS "payout_mode!",
+            "payoutMode" AS "payout_mode!: PayoutMode",
             "coinbaseTag" AS "coinbase_tag?""#,
         group_id,
         preset_write,
@@ -824,7 +825,7 @@ pub async fn insert_pplns_group_member<'e, E>(
     executor: E,
     group_id: Uuid,
     address: &AddressId,
-    role: &str,
+    role: MemberRole,
     now_ms: i64,
 ) -> Result<PplnsGroupMemberRow, DbError>
 where
@@ -839,11 +840,11 @@ where
             id AS "id!",
             "groupId" AS "group_id!",
             address AS "address!: AddressId",
-            role AS "role!",
+            role AS "role!: MemberRole",
             "joinedAt" AS "joined_at!""#,
         group_id,
         address.as_str(),
-        role,
+        role.as_str(),
         now_ms,
     )
     .fetch_one(executor)
@@ -897,7 +898,7 @@ pub async fn update_pplns_group_member_role<'e, E>(
     executor: E,
     group_id: Uuid,
     address: &AddressId,
-    new_role: &str,
+    new_role: MemberRole,
 ) -> Result<u64, DbError>
 where
     E: sqlx::PgExecutor<'e>,
@@ -906,7 +907,7 @@ where
         r#"UPDATE pplns_group_member
            SET role = $1
            WHERE "groupId" = $2 AND address = $3"#,
-        new_role,
+        new_role.as_str(),
         group_id,
         address.as_str(),
     )
@@ -930,7 +931,7 @@ pub async fn find_pplns_group_member_in_group(
             id AS "id!",
             "groupId" AS "group_id!",
             address AS "address!: AddressId",
-            role AS "role!",
+            role AS "role!: MemberRole",
             "joinedAt" AS "joined_at!"
            FROM pplns_group_member
            WHERE "groupId" = $1 AND address = $2
@@ -955,7 +956,7 @@ pub async fn find_pplns_group_creator_member(
             id AS "id!",
             "groupId" AS "group_id!",
             address AS "address!: AddressId",
-            role AS "role!",
+            role AS "role!: MemberRole",
             "joinedAt" AS "joined_at!"
            FROM pplns_group_member
            WHERE "groupId" = $1 AND role = 'creator'
@@ -1174,7 +1175,7 @@ where
             address AS "address!: AddressId",
             email AS "email!",
             message AS "message?",
-            status AS "status!",
+            status AS "status!: JoinRequestStatus",
             "createdAt" AS "created_at!",
             "decidedAt" AS "decided_at?",
             "decidedByAdminTokenHash" AS "decided_by_admin_token_hash?""#,
@@ -1205,7 +1206,7 @@ pub async fn find_pplns_group_join_request_pending_in_group(
             address AS "address!: AddressId",
             email AS "email!",
             message AS "message?",
-            status AS "status!",
+            status AS "status!: JoinRequestStatus",
             "createdAt" AS "created_at!",
             "decidedAt" AS "decided_at?",
             "decidedByAdminTokenHash" AS "decided_by_admin_token_hash?"
@@ -1235,7 +1236,7 @@ pub async fn find_pplns_group_join_request_most_recent_rejected(
             address AS "address!: AddressId",
             email AS "email!",
             message AS "message?",
-            status AS "status!",
+            status AS "status!: JoinRequestStatus",
             "createdAt" AS "created_at!",
             "decidedAt" AS "decided_at?",
             "decidedByAdminTokenHash" AS "decided_by_admin_token_hash?"
@@ -1286,7 +1287,7 @@ pub async fn list_pplns_group_join_requests_for_group(
                 address AS "address!: AddressId",
                 email AS "email!",
                 message AS "message?",
-                status AS "status!",
+                status AS "status!: JoinRequestStatus",
                 "createdAt" AS "created_at!",
                 "decidedAt" AS "decided_at?",
                 "decidedByAdminTokenHash" AS "decided_by_admin_token_hash?"
@@ -1307,7 +1308,7 @@ pub async fn list_pplns_group_join_requests_for_group(
                 address AS "address!: AddressId",
                 email AS "email!",
                 message AS "message?",
-                status AS "status!",
+                status AS "status!: JoinRequestStatus",
                 "createdAt" AS "created_at!",
                 "decidedAt" AS "decided_at?",
                 "decidedByAdminTokenHash" AS "decided_by_admin_token_hash?"
@@ -1337,7 +1338,7 @@ pub async fn list_pplns_group_join_requests_pending_for_address(
             address AS "address!: AddressId",
             email AS "email!",
             message AS "message?",
-            status AS "status!",
+            status AS "status!: JoinRequestStatus",
             "createdAt" AS "created_at!",
             "decidedAt" AS "decided_at?",
             "decidedByAdminTokenHash" AS "decided_by_admin_token_hash?"
@@ -1357,7 +1358,7 @@ pub async fn list_pplns_group_join_requests_pending_for_address(
 pub async fn update_pplns_group_join_request_decision<'e, E>(
     executor: E,
     request_id: Uuid,
-    new_status: &str,
+    new_status: JoinRequestStatus,
     decided_at_ms: i64,
     decided_by_admin_token_hash: &str,
 ) -> Result<u64, DbError>
@@ -1370,7 +1371,7 @@ where
                "decidedAt" = $2,
                "decidedByAdminTokenHash" = $3
            WHERE id = $4"#,
-        new_status,
+        new_status.as_str(),
         decided_at_ms,
         decided_by_admin_token_hash,
         request_id,

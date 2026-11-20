@@ -57,7 +57,7 @@ async fn accept_open(
         .map_err(invitation_to_api_error)?;
     Ok(Json(MemberCreatedResponse {
         address: member.address.as_str().to_string(),
-        role: member.role,
+        role: member.role.as_str().to_owned(),
         joined_at: crate::time_range::format_iso_ms(member.joined_at),
         group_id: member.group_id,
     }))

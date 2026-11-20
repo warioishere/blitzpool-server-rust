@@ -5,6 +5,8 @@
 //! second process can finish a slot the first one started. Sending the same
 //! delta twice counts it twice.
 
+use bp_common::MiningMode;
+
 use crate::pool::DbError;
 
 // ── 1. Slot-bucketed stats ──────────────────────────────────────────
@@ -64,7 +66,7 @@ where
 /// accepted-share diff sum for `(mode, slot)`.
 #[derive(Clone, Debug)]
 pub struct PoolModeHashrateUpsert {
-    pub mode: String,
+    pub mode: MiningMode,
     pub time_ms: i64,
     pub diff: f32,
 }
@@ -81,7 +83,7 @@ where
     if rows.is_empty() {
         return Ok(0);
     }
-    let modes: Vec<String> = rows.iter().map(|r| r.mode.clone()).collect();
+    let modes: Vec<String> = rows.iter().map(|r| r.mode.as_str().to_owned()).collect();
     let times: Vec<i64> = rows.iter().map(|r| r.time_ms).collect();
     let diffs: Vec<f32> = rows.iter().map(|r| r.diff).collect();
 

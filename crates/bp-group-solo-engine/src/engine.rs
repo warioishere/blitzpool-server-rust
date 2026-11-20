@@ -112,7 +112,7 @@ fn should_trim_on_bucket(watermark: Option<i64>, bucket_id: i64) -> bool {
 /// the reset-cadence config as a sliding-window length (see
 /// [`bp_group_mgmt::group::window_duration_ms`]); it is 0 for PROP groups.
 pub(crate) fn group_mode_from_row(g: &PplnsGroupRow) -> (PayoutMode, i64) {
-    let mode = PayoutMode::parse_or_default(&g.payout_mode);
+    let mode = g.payout_mode;
     let window_ms = match mode {
         PayoutMode::Prop => 0,
         PayoutMode::Window => {

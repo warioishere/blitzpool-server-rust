@@ -121,12 +121,12 @@ async fn pool_mode_hashrate_composite_key_increment() {
 
     let rows = vec![
         PoolModeHashrateUpsert {
-            mode: "pplns".to_string(),
+            mode: bp_common::MiningMode::Pplns,
             time_ms: slot,
             diff: 10.0,
         },
         PoolModeHashrateUpsert {
-            mode: "solo".to_string(),
+            mode: bp_common::MiningMode::Solo,
             time_ms: slot,
             diff: 5.0,
         },
@@ -139,7 +139,7 @@ async fn pool_mode_hashrate_composite_key_increment() {
     bulk_upsert_pool_mode_hashrate(
         &mut *tx,
         &[PoolModeHashrateUpsert {
-            mode: "pplns".to_string(),
+            mode: bp_common::MiningMode::Pplns,
             time_ms: slot,
             diff: 7.5,
         }],

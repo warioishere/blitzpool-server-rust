@@ -56,7 +56,7 @@ impl GroupPublicView {
             id: r.id,
             name: r.name.clone(),
             admin_address: r.admin_address.as_str().to_owned(),
-            status: r.status.clone(),
+            status: r.status.as_str().to_owned(),
             last_share_at: r.last_share_at,
             created_at: r.created_at,
             dissolved_at: r.dissolved_at,
@@ -346,7 +346,7 @@ async fn by_address(
     Ok(Json(ByAddressResponse::Match {
         group_id: group.id,
         group_name: group.name,
-        status: group.status,
+        status: group.status.as_str().to_owned(),
         role,
     }))
 }
@@ -777,7 +777,7 @@ async fn transition_confirming(
     // yields an omitted status rather than a 404.
     let group = svc.get_group(id).await?;
     Ok(Json(TransitionResponse {
-        status: group.map(|g| g.status),
+        status: group.map(|g| g.status.as_str().to_owned()),
     }))
 }
 
@@ -810,7 +810,7 @@ mod tests {
             name: "Blockparty XX".to_owned(),
             admin_address: AddressId::new("bc1qywnf55acqpxr0lekg2gmy2s46pzxqze99j0u9y").unwrap(),
             admin_token_hash: "internal".to_owned(),
-            status: "active".to_owned(),
+            status: bp_blockparty::BlockpartyStatus::Active,
             last_share_at: Some(1_779_523_779_828),
             rental_provider_hint: None,
             created_at: 1_779_464_858_619,

@@ -12,7 +12,8 @@ workspace = true
 
 [dependencies]
 bp-common = { workspace = true, features = ["sqlx"] }
-bp-blockparty = { workspace = true }
+bp-blockparty = { workspace = true, features = ["sqlx"] }
+bp-group-mgmt = { workspace = true, features = ["sqlx"] }
 sqlx = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }

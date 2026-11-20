@@ -3,7 +3,7 @@
 //! must call `set_admin_status`; a stale status refuses a confirmed party's
 //! admin, or skips its coinbase.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bp_blockparty::BlockpartyStatus;
@@ -102,36 +102,24 @@ impl BlockpartyCache {
         let groups = bp_db::list_blockparty_groups_non_dissolved(pool).await?;
         let members = bp_db::list_all_blockparty_members(pool).await?;
 
-        let mut status_by_id: HashMap<Uuid, BlockpartyStatus> =
-            HashMap::with_capacity(groups.len());
-        let mut admin_by_id: HashMap<Uuid, AddressId> = HashMap::with_capacity(groups.len());
-        for g in &groups {
-            if let Ok(s) = g.status.parse::<BlockpartyStatus>() {
-                status_by_id.insert(g.id, s);
-                admin_by_id.insert(g.id, g.admin_address.clone());
-            }
-        }
-
-        let mut next_admin: HashMap<AddressId, AdminCacheEntry> =
-            HashMap::with_capacity(groups.len());
-        for g in &groups {
-            if let Some(&status) = status_by_id.get(&g.id) {
-                next_admin.insert(
+        let next_admin: HashMap<AddressId, AdminCacheEntry> = groups
+            .iter()
+            .map(|g| {
+                (
                     g.admin_address.clone(),
                     AdminCacheEntry {
                         group_id: g.id,
-                        status,
+                        status: g.status,
                     },
-                );
-            }
-        }
-
-        let mut next_member: HashMap<AddressId, Uuid> = HashMap::with_capacity(members.len());
-        for m in members {
-            if status_by_id.contains_key(&m.group_id) {
-                next_member.insert(m.address, m.group_id);
-            }
-        }
+                )
+            })
+            .collect();
+        let live: HashSet<Uuid> = groups.iter().map(|g| g.id).collect();
+        let next_member: HashMap<AddressId, Uuid> = members
+            .into_iter()
+            .filter(|m| live.contains(&m.group_id))
+            .map(|m| (m.address, m.group_id))
+            .collect();
 
         let mut guard = self.inner.write().await;
         guard.admin = next_admin;

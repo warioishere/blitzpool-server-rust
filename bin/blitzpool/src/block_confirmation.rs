@@ -1937,7 +1937,7 @@ mod blockparty_settlement {
             &format!("bp-settle-{group_id}"),
             &admin_id,
             "hash",
-            "active",
+            bp_blockparty::BlockpartyStatus::Active,
             1,
         )
         .await
@@ -2049,7 +2049,7 @@ mod blockparty_settlement {
             &format!("bp-subsidy-{group_id}"),
             &admin_id,
             "hash",
-            "active",
+            bp_blockparty::BlockpartyStatus::Active,
             1,
         )
         .await

@@ -867,7 +867,7 @@ pub(super) async fn build_group_status(
 /// reset. A Window Team's round is its window, and a calendar reset or a
 /// round kept across blocks makes the two differ.
 fn round_is_since_block(group: &bp_db::PplnsGroupRow) -> bool {
-    match bp_group_mgmt::group::PayoutMode::parse_or_default(&group.payout_mode) {
+    match group.payout_mode {
         bp_group_mgmt::group::PayoutMode::Window => false,
         bp_group_mgmt::group::PayoutMode::Prop => {
             group.reset_round_on_block
@@ -904,10 +904,7 @@ pub(super) async fn build_blockparty_status(
             return db_error_text(lang);
         }
     };
-    let status = match group.status.parse::<BlockpartyStatus>() {
-        Ok(status) => blockparty_status_name(lang, status),
-        Err(_) => group.status.clone(),
-    };
+    let status = blockparty_status_name(lang, group.status);
     let addresses: Vec<AddressId> = members.iter().map(|m| m.address.clone()).collect();
     let hashrate = hashrate_for_addresses(redis, &addresses)
         .await
@@ -1017,8 +1014,8 @@ async fn live_blockparty_of(
             return Err(db_error_text(lang));
         }
     };
-    match group.status.parse::<BlockpartyStatus>() {
-        Ok(BlockpartyStatus::Dissolved) => Err(not_in_party_text(lang, address, viewer)),
+    match group.status {
+        BlockpartyStatus::Dissolved => Err(not_in_party_text(lang, address, viewer)),
         _ => Ok(LiveBlockparty {
             member,
             group,
@@ -1576,7 +1573,7 @@ mod tests {
             &format!("bp-test-readview-{party}"),
             &miner,
             "hash",
-            "active",
+            bp_blockparty::BlockpartyStatus::Active,
             now,
         )
         .await
@@ -1739,7 +1736,7 @@ mod tests {
                 "hash",
                 true,
                 false,
-                "prop",
+                bp_group_mgmt::group::PayoutMode::Prop,
                 now,
             )
             .await
@@ -1750,9 +1747,15 @@ mod tests {
                 .execute(&pool)
                 .await
                 .unwrap();
-            bp_db::insert_pplns_group_member(&pool, team, address, "creator", now)
-                .await
-                .unwrap();
+            bp_db::insert_pplns_group_member(
+                &pool,
+                team,
+                address,
+                bp_group_mgmt::group::MemberRole::Creator,
+                now,
+            )
+            .await
+            .unwrap();
             // A member's all-time best above the Team's best.
             sqlx::query(
                 "INSERT INTO address_settings_entity (address, \"bestDifficulty\") VALUES ($1, 9e12)",

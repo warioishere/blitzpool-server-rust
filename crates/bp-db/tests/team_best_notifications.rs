@@ -91,13 +91,17 @@ async fn team(pool: &PgPool, members: &[&str]) -> Uuid {
         "hash",
         true,
         false,
-        "prop",
+        bp_group_mgmt::group::PayoutMode::Prop,
         now,
     )
     .await
     .expect("group");
     for (i, m) in members.iter().enumerate() {
-        let role = if i == 0 { "creator" } else { "member" };
+        let role = if i == 0 {
+            bp_group_mgmt::group::MemberRole::Creator
+        } else {
+            bp_group_mgmt::group::MemberRole::Member
+        };
         insert_pplns_group_member(pool, id, &addr(m), role, now)
             .await
             .expect("member");

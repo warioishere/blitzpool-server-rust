@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            id AS \"id!\",\n            name AS \"name!\",\n            \"creatorAddress\" AS \"creator_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            active AS \"active!\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"roundResetIntervalDays\" AS \"round_reset_interval_days?\",\n            \"roundResetHourLocal\" AS \"round_reset_hour_local?\",\n            \"roundResetTimezone\" AS \"round_reset_timezone?\",\n            \"lastRoundResetAt\" AS \"last_round_reset_at?\",\n            \"finderBonusSats\" AS \"finder_bonus_sats?: Sats\",\n            \"finderBonusPpm\" AS \"finder_bonus_ppm?\",\n            \"roundResetPreset\" AS \"round_reset_preset?\",\n            \"isPublic\" AS \"is_public!\",\n            \"resetRoundOnBlock\" AS \"reset_round_on_block!\",\n            \"maxMembers\" AS \"max_members?\",\n            \"payoutMode\" AS \"payout_mode!\",\n            \"coinbaseTag\" AS \"coinbase_tag?\"\n           FROM pplns_group WHERE id = $1 LIMIT 1",
+  "query": "INSERT INTO pplns_group\n             (id, name, \"creatorAddress\", \"adminTokenHash\", active,\n              \"createdAt\", \"updatedAt\", \"isPublic\", \"payoutMode\")\n           VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8)\n           RETURNING\n            id AS \"id!\",\n            name AS \"name!\",\n            \"creatorAddress\" AS \"creator_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            active AS \"active!\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"roundResetIntervalDays\" AS \"round_reset_interval_days?\",\n            \"roundResetHourLocal\" AS \"round_reset_hour_local?\",\n            \"roundResetTimezone\" AS \"round_reset_timezone?\",\n            \"lastRoundResetAt\" AS \"last_round_reset_at?\",\n            \"finderBonusSats\" AS \"finder_bonus_sats?: Sats\",\n            \"finderBonusPpm\" AS \"finder_bonus_ppm?\",\n            \"roundResetPreset\" AS \"round_reset_preset?\",\n            \"isPublic\" AS \"is_public!\",\n            \"resetRoundOnBlock\" AS \"reset_round_on_block!\",\n            \"maxMembers\" AS \"max_members?\",\n            \"payoutMode\" AS \"payout_mode!: PayoutMode\",\n            \"coinbaseTag\" AS \"coinbase_tag?\"",
   "describe": {
     "columns": [
       {
@@ -203,7 +203,7 @@
       },
       {
         "ordinal": 18,
-        "name": "payout_mode!",
+        "name": "payout_mode!: PayoutMode",
         "type_info": "Varchar",
         "origin": {
           "Table": {
@@ -226,7 +226,14 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Bool",
+        "Int8",
+        "Bool",
+        "Varchar"
       ]
     },
     "nullable": [
@@ -252,5 +259,5 @@
       true
     ]
   },
-  "hash": "396686327a1eeb19ca25c891a653d2cdad86d58660b42edb256c957b8000afbc"
+  "hash": "cfb30d1aa48611334c02e9e6453aa7f75a2b1cd75f5b332dec9040fab810867a"
 }

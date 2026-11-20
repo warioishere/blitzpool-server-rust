@@ -1394,8 +1394,8 @@ impl CommandHandler {
         let party = find_blockparty_group(&self.pool, member.group_id)
             .await
             .ok()??;
-        match party.status.parse::<bp_blockparty::BlockpartyStatus>() {
-            Ok(bp_blockparty::BlockpartyStatus::Dissolved) => None,
+        match party.status {
+            bp_blockparty::BlockpartyStatus::Dissolved => None,
             _ => Some(format!("Blockparty {}", party.name)),
         }
     }
@@ -2445,12 +2445,15 @@ mod tests {
             "hash",
             true,
             false,
-            "prop",
+            bp_group_mgmt::group::PayoutMode::Prop,
             now,
         )
         .await
         .unwrap();
-        for (address, role) in [(&admin, "creator"), (&member, "member")] {
+        for (address, role) in [
+            (&admin, bp_group_mgmt::group::MemberRole::Creator),
+            (&member, bp_group_mgmt::group::MemberRole::Member),
+        ] {
             bp_db::insert_pplns_group_member(&pool, group_id, address, role, now)
                 .await
                 .unwrap();
@@ -2704,7 +2707,7 @@ mod tests {
             &format!("bp-test-mininghint-{party}"),
             &admin,
             "hash",
-            "active",
+            bp_blockparty::BlockpartyStatus::Active,
             now,
         )
         .await
@@ -2821,21 +2824,27 @@ mod tests {
             "hash",
             true,
             false,
-            "prop",
+            bp_group_mgmt::group::PayoutMode::Prop,
             now,
         )
         .await
         .unwrap();
-        bp_db::insert_pplns_group_member(&pool, team, &team_addr, "creator", now)
-            .await
-            .unwrap();
+        bp_db::insert_pplns_group_member(
+            &pool,
+            team,
+            &team_addr,
+            bp_group_mgmt::group::MemberRole::Creator,
+            now,
+        )
+        .await
+        .unwrap();
         bp_db::insert_blockparty_group(
             &pool,
             party,
             &format!("bp-test-follows-{party}"),
             &party_addr,
             "hash",
-            "active",
+            bp_blockparty::BlockpartyStatus::Active,
             now,
         )
         .await

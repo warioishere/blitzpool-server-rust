@@ -22,6 +22,7 @@ use bp_db::{
     update_pplns_group_join_request_decision, update_pplns_group_member_role,
     update_pplns_group_round_reset_config, PatchField, RoundResetConfigPatch,
 };
+use bp_group_mgmt::group::PayoutMode;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use uuid::Uuid;
 
@@ -56,6 +57,54 @@ fn addr(s: &str) -> AddressId {
 
 // ─── Groups ────────────────────────────────────────────────────────────────
 
+/// A stored payout mode reads back as its enum, and a text no mode has fails
+/// the read instead of passing as PROP.
+#[tokio::test]
+async fn an_unknown_payout_mode_fails_the_read() {
+    let pool = match connect_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    let id = Uuid::new_v4();
+    insert_pplns_group(
+        &pool,
+        id,
+        &format!("mode-decode-{id}"),
+        &addr("mode_decode_c"),
+        "h",
+        false,
+        false,
+        PayoutMode::Window,
+        1,
+    )
+    .await
+    .expect("insert");
+    let read = find_group(&pool, id).await.expect("read").expect("row");
+    assert_eq!(read.payout_mode, PayoutMode::Window);
+
+    // Dissolved as well, so no parallel test listing the live groups meets
+    // the row; `find_group` reads dissolved rows too.
+    sqlx::query(
+        r#"UPDATE pplns_group SET "payoutMode" = 'bogus', "dissolvedAt" = 1 WHERE id = $1"#,
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .expect("corrupt the mode");
+    let refused = find_group(&pool, id).await;
+
+    sqlx::query("DELETE FROM pplns_group WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("cleanup");
+    let err = refused.expect_err("an unknown mode must not read as a mode");
+    assert!(
+        err.to_string().contains("unknown payout mode"),
+        "the decode of the mode must be what fails: {err}"
+    );
+}
+
 #[tokio::test]
 async fn insert_group_returns_row_with_defaults() {
     let pool = match connect_or_skip().await {
@@ -72,7 +121,7 @@ async fn insert_group_returns_row_with_defaults() {
         "hash-a",
         false,
         false,
-        "prop",
+        PayoutMode::Prop,
         1_700_000_000_000,
     )
     .await
@@ -118,7 +167,7 @@ async fn find_group_by_name_filters_dissolved() {
         "h",
         false,
         false,
-        "prop",
+        PayoutMode::Prop,
         1,
     )
     .await
@@ -163,7 +212,7 @@ async fn list_active_groups_omits_dissolved() {
         "h1",
         false,
         false,
-        "prop",
+        PayoutMode::Prop,
         1,
     )
     .await
@@ -176,7 +225,7 @@ async fn list_active_groups_omits_dissolved() {
         "h2",
         false,
         false,
-        "prop",
+        PayoutMode::Prop,
         1,
     )
     .await
@@ -214,21 +263,33 @@ async fn active_toggle_and_count_members() {
         "h",
         false,
         false,
-        "prop",
+        PayoutMode::Prop,
         1,
     )
     .await
     .expect("g");
-    insert_pplns_group_member(&pool, gid, &addr("m1"), "creator", 2)
-        .await
-        .expect("m1");
+    insert_pplns_group_member(
+        &pool,
+        gid,
+        &addr("m1"),
+        bp_group_mgmt::group::MemberRole::Creator,
+        2,
+    )
+    .await
+    .expect("m1");
     let count = count_pplns_group_members_for_group(&pool, gid)
         .await
         .expect("count");
     assert_eq!(count, 1);
-    insert_pplns_group_member(&pool, gid, &addr("m2"), "member", 3)
-        .await
-        .expect("m2");
+    insert_pplns_group_member(
+        &pool,
+        gid,
+        &addr("m2"),
+        bp_group_mgmt::group::MemberRole::Member,
+        3,
+    )
+    .await
+    .expect("m2");
     let count2 = count_pplns_group_members_for_group(&pool, gid)
         .await
         .expect("count2");
@@ -270,27 +331,49 @@ async fn transfer_creator_swaps_admin_token_and_creator_address() {
         "old_hash",
         false,
         false,
-        "prop",
+        PayoutMode::Prop,
         1,
     )
     .await
     .expect("g");
-    insert_pplns_group_member(&pool, gid, &addr("old_creator"), "creator", 2)
-        .await
-        .expect("m1");
-    insert_pplns_group_member(&pool, gid, &addr("new_creator"), "member", 3)
-        .await
-        .expect("m2");
+    insert_pplns_group_member(
+        &pool,
+        gid,
+        &addr("old_creator"),
+        bp_group_mgmt::group::MemberRole::Creator,
+        2,
+    )
+    .await
+    .expect("m1");
+    insert_pplns_group_member(
+        &pool,
+        gid,
+        &addr("new_creator"),
+        bp_group_mgmt::group::MemberRole::Member,
+        3,
+    )
+    .await
+    .expect("m2");
 
     update_pplns_group_creator_and_admin_token(&pool, gid, &addr("new_creator"), "new_hash", 100)
         .await
         .expect("creator");
-    update_pplns_group_member_role(&pool, gid, &addr("old_creator"), "member")
-        .await
-        .expect("demote");
-    update_pplns_group_member_role(&pool, gid, &addr("new_creator"), "creator")
-        .await
-        .expect("promote");
+    update_pplns_group_member_role(
+        &pool,
+        gid,
+        &addr("old_creator"),
+        bp_group_mgmt::group::MemberRole::Member,
+    )
+    .await
+    .expect("demote");
+    update_pplns_group_member_role(
+        &pool,
+        gid,
+        &addr("new_creator"),
+        bp_group_mgmt::group::MemberRole::Creator,
+    )
+    .await
+    .expect("promote");
 
     let g = find_group(&pool, gid).await.expect("g").expect("present");
     assert_eq!(g.creator_address.as_str(), "new_creator");
@@ -325,7 +408,7 @@ async fn round_reset_config_patch_applies_per_field() {
         "h",
         false,
         false,
-        "prop",
+        PayoutMode::Prop,
         1,
     )
     .await
@@ -430,7 +513,7 @@ async fn dissolve_is_idempotent() {
         "h",
         true,
         false,
-        "prop",
+        PayoutMode::Prop,
         1,
     )
     .await
@@ -472,17 +555,23 @@ async fn insert_member_and_delete_roundtrip() {
         "h",
         false,
         false,
-        "prop",
+        PayoutMode::Prop,
         1,
     )
     .await
     .expect("g");
 
-    let m = insert_pplns_group_member(&pool, gid, &addr("m_x"), "member", 5)
-        .await
-        .expect("m");
+    let m = insert_pplns_group_member(
+        &pool,
+        gid,
+        &addr("m_x"),
+        bp_group_mgmt::group::MemberRole::Member,
+        5,
+    )
+    .await
+    .expect("m");
     assert_eq!(m.address.as_str(), "m_x");
-    assert_eq!(m.role, "member");
+    assert_eq!(m.role, bp_group_mgmt::group::MemberRole::Member);
     assert_eq!(m.joined_at, 5);
 
     let again = find_pplns_group_member_in_group(&pool, gid, &addr("m_x"))
@@ -525,9 +614,19 @@ async fn invitation_status_update_by_token() {
     };
     let gid = Uuid::new_v4();
     let n = format!("inv-{}", gid);
-    insert_pplns_group(&pool, gid, &n, &addr("inv_c"), "h", false, false, "prop", 1)
-        .await
-        .expect("g");
+    insert_pplns_group(
+        &pool,
+        gid,
+        &n,
+        &addr("inv_c"),
+        "h",
+        false,
+        false,
+        PayoutMode::Prop,
+        1,
+    )
+    .await
+    .expect("g");
 
     let token = format!("tok-d-{}", gid);
     let inv = insert_pplns_group_invitation(&pool, &token, gid, false, 100, 100 + 7 * 86_400_000)
@@ -573,7 +672,7 @@ async fn open_invite_revoke_replaces_atomically() {
         "h",
         false,
         false,
-        "prop",
+        PayoutMode::Prop,
         1,
     )
     .await
@@ -620,9 +719,19 @@ async fn expire_invitations_only_flips_past_due() {
     };
     let gid = Uuid::new_v4();
     let n = format!("exp-i-{}", gid);
-    insert_pplns_group(&pool, gid, &n, &addr("ei_c"), "h", false, false, "prop", 1)
-        .await
-        .expect("g");
+    insert_pplns_group(
+        &pool,
+        gid,
+        &n,
+        &addr("ei_c"),
+        "h",
+        false,
+        false,
+        PayoutMode::Prop,
+        1,
+    )
+    .await
+    .expect("g");
 
     let past = format!("past-{}", gid);
     let fresh = format!("fresh-{}", gid);
@@ -662,15 +771,28 @@ async fn join_request_lifecycle() {
     };
     let gid = Uuid::new_v4();
     let n = format!("jr-{}", gid);
-    insert_pplns_group(&pool, gid, &n, &addr("jr_c"), "h", false, true, "prop", 1)
-        .await
-        .expect("g");
+    insert_pplns_group(
+        &pool,
+        gid,
+        &n,
+        &addr("jr_c"),
+        "h",
+        false,
+        true,
+        PayoutMode::Prop,
+        1,
+    )
+    .await
+    .expect("g");
 
     let req_addr = addr(&format!("jr_addr_{}", gid));
     let req = insert_pplns_group_join_request(&pool, gid, &req_addr, "join@x", Some("hi"), 100)
         .await
         .expect("ins");
-    assert_eq!(req.status, "pending");
+    assert_eq!(
+        req.status,
+        bp_group_mgmt::join_request::JoinRequestStatus::Pending
+    );
     assert_eq!(req.message.as_deref(), Some("hi"));
 
     let count = count_pplns_group_join_requests_pending_for_address(&pool, &req_addr)
@@ -688,9 +810,15 @@ async fn join_request_lifecycle() {
         .expect("by_g_p");
     assert_eq!(by_group_pending.len(), 1);
 
-    update_pplns_group_join_request_decision(&pool, req.id, "rejected", 200, "admin_hash")
-        .await
-        .expect("dec");
+    update_pplns_group_join_request_decision(
+        &pool,
+        req.id,
+        bp_group_mgmt::join_request::JoinRequestStatus::Rejected,
+        200,
+        "admin_hash",
+    )
+    .await
+    .expect("dec");
 
     let pending = find_pplns_group_join_request_pending_in_group(&pool, req.id, gid)
         .await
@@ -701,7 +829,10 @@ async fn join_request_lifecycle() {
         .await
         .expect("by_g_a");
     assert_eq!(by_group_all.len(), 1);
-    assert_eq!(by_group_all[0].status, "rejected");
+    assert_eq!(
+        by_group_all[0].status,
+        bp_group_mgmt::join_request::JoinRequestStatus::Rejected
+    );
 
     let recent = find_pplns_group_join_request_most_recent_rejected(&pool, gid, &req_addr)
         .await
@@ -730,9 +861,19 @@ async fn expire_join_requests_flips_old_pending() {
     };
     let gid = Uuid::new_v4();
     let n = format!("ejr-{}", gid);
-    insert_pplns_group(&pool, gid, &n, &addr("ejr_c"), "h", false, true, "prop", 1)
-        .await
-        .expect("g");
+    insert_pplns_group(
+        &pool,
+        gid,
+        &n,
+        &addr("ejr_c"),
+        "h",
+        false,
+        true,
+        PayoutMode::Prop,
+        1,
+    )
+    .await
+    .expect("g");
     let old =
         insert_pplns_group_join_request(&pool, gid, &addr(&format!("old_{}", gid)), "o@x", None, 1)
             .await
@@ -788,7 +929,7 @@ async fn update_active_ignores_dissolved_group() {
         "h",
         false,
         false,
-        "prop",
+        PayoutMode::Prop,
         1,
     )
     .await

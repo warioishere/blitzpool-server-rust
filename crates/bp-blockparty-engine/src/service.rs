@@ -182,7 +182,7 @@ impl BlockpartyService {
         let group = bp_db::find_blockparty_group(&self.payouts.pool, group_id)
             .await?
             .ok_or(BlockpartyServiceError::NotFound)?;
-        if group.status == BlockpartyStatus::Dissolved.as_str() {
+        if group.status == BlockpartyStatus::Dissolved {
             return Err(BlockpartyServiceError::NotFound);
         }
         let stored = TokenHash::from_hex(group.admin_token_hash.clone());
@@ -261,7 +261,7 @@ impl BlockpartyService {
             name,
             &admin_addr,
             admin_hash.as_str(),
-            BlockpartyStatus::Draft.as_str(),
+            BlockpartyStatus::Draft,
             now,
         )
         .await?;
@@ -347,7 +347,7 @@ impl BlockpartyService {
             Err(e) => return Err(e.into()),
         };
 
-        if group.status == BlockpartyStatus::Draft.as_str() {
+        if group.status == BlockpartyStatus::Draft {
             self.leave_draft(&group, now).await?;
         }
         self.cache.insert_member(&address, group_id).await;
@@ -487,7 +487,7 @@ impl BlockpartyService {
         )
         .await?;
 
-        if group.status == BlockpartyStatus::Draft.as_str() {
+        if group.status == BlockpartyStatus::Draft {
             self.leave_draft(&group, now).await?;
         }
         self.cache.insert_member(&address, group.id).await;
@@ -708,10 +708,7 @@ impl BlockpartyService {
         token: Option<&str>,
     ) -> Result<BlockpartyStatus, BlockpartyServiceError> {
         let group = self.require_admin_token(group_id, token).await?;
-        let status = group
-            .status
-            .parse::<BlockpartyStatus>()
-            .map_err(|_| BlockpartyServiceError::InvalidState)?;
+        let status = group.status;
         match status {
             BlockpartyStatus::Confirming | BlockpartyStatus::Ready => return Ok(status),
             BlockpartyStatus::Active | BlockpartyStatus::Dissolved => {
@@ -755,7 +752,7 @@ impl BlockpartyService {
         bp_db::update_blockparty_group_status(
             &self.payouts.pool,
             group.id,
-            BlockpartyStatus::Confirming.as_str(),
+            BlockpartyStatus::Confirming,
             now,
         )
         .await?;
@@ -806,15 +803,9 @@ impl BlockpartyService {
         group_id: Uuid,
         token: Option<&str>,
     ) -> Result<(), BlockpartyServiceError> {
+        // `require_admin_token` refuses a dissolved party as not found.
         let group = self.require_admin_token(group_id, token).await?;
-        let status = group
-            .status
-            .parse::<BlockpartyStatus>()
-            .map_err(|_| BlockpartyServiceError::InvalidState)?;
-        if matches!(status, BlockpartyStatus::Dissolved) {
-            return Ok(()); // idempotent
-        }
-        if matches!(status, BlockpartyStatus::Active) {
+        if matches!(group.status, BlockpartyStatus::Active) {
             if let Some(last) = group.last_share_at {
                 let now = now_ms();
                 if now - last < DISSOLVE_COOLDOWN_MS {
@@ -907,13 +898,10 @@ impl BlockpartyService {
         else {
             return Ok(());
         };
-        if group.status == BlockpartyStatus::Dissolved.as_str() {
+        if group.status == BlockpartyStatus::Dissolved {
             return Ok(());
         }
-        let current = group
-            .status
-            .parse::<BlockpartyStatus>()
-            .map_err(|_| BlockpartyServiceError::InvalidState)?;
+        let current = group.status;
         let promote = matches!(current, BlockpartyStatus::Ready);
         let next = if promote {
             BlockpartyStatus::Active
@@ -925,7 +913,7 @@ impl BlockpartyService {
             &self.payouts.pool,
             entry.group_id,
             now,
-            next.as_str(),
+            next,
             now,
         )
         .await?;
@@ -961,10 +949,7 @@ async fn recompute_status_in_tx(
     let Some(group) = bp_db::find_blockparty_group(&mut *conn, group_id).await? else {
         return Ok(None);
     };
-    let current = group
-        .status
-        .parse::<BlockpartyStatus>()
-        .map_err(|_| BlockpartyServiceError::InvalidState)?;
+    let current = group.status;
     if current != BlockpartyStatus::Confirming {
         return Ok(None);
     }
@@ -980,8 +965,7 @@ async fn recompute_status_in_tx(
     };
 
     if current != target {
-        bp_db::update_blockparty_group_status(&mut *conn, group_id, target.as_str(), now_ms)
-            .await?;
+        bp_db::update_blockparty_group_status(&mut *conn, group_id, target, now_ms).await?;
     }
 
     Ok(Some(RecomputeOutcome {
@@ -1020,10 +1004,7 @@ fn validate_percent_bp(bp: i32) -> Result<(), BlockpartyServiceError> {
 }
 
 fn assert_editable(group: &BlockpartyGroupRow) -> Result<(), BlockpartyServiceError> {
-    let status = group
-        .status
-        .parse::<BlockpartyStatus>()
-        .map_err(|_| BlockpartyServiceError::InvalidState)?;
+    let status = group.status;
     if !status.is_editable() {
         return Err(BlockpartyServiceError::NotEditable);
     }

@@ -297,7 +297,7 @@ impl GroupService {
             /* active = */
             is_active(1),
             /* is_public = */ false,
-            mode.as_str(),
+            mode,
             now,
         )
         .await?;
@@ -305,7 +305,7 @@ impl GroupService {
             &mut *tx,
             id,
             &normalized_address,
-            MemberRole::Creator.as_str(),
+            MemberRole::Creator,
             now,
         )
         .await?;
@@ -374,7 +374,7 @@ impl GroupService {
             &mut *tx,
             group_id,
             &normalized,
-            MemberRole::Member.as_str(),
+            MemberRole::Member,
             now,
         )
         .await?;
@@ -402,7 +402,7 @@ impl GroupService {
         let member = bp_db::find_pplns_group_member_in_group(&self.pool, group_id, &normalized)
             .await?
             .ok_or(GroupServiceError::NotMember)?;
-        if member.role == MemberRole::Creator.as_str() {
+        if member.role == MemberRole::Creator {
             return Err(GroupServiceError::CreatorCannotBeRemoved);
         }
 
@@ -462,7 +462,7 @@ impl GroupService {
             bp_db::find_pplns_group_member_in_group(&self.pool, group_id, &normalized)
                 .await?
                 .ok_or(GroupServiceError::NotMember)?;
-        if new_creator.role == MemberRole::Creator.as_str() {
+        if new_creator.role == MemberRole::Creator {
             return Err(GroupServiceError::AlreadyCreator);
         }
         let old_creator = bp_db::find_pplns_group_creator_member(&self.pool, group_id).await?;
@@ -477,17 +477,12 @@ impl GroupService {
                 &mut *tx,
                 group_id,
                 &old.address,
-                MemberRole::Member.as_str(),
+                MemberRole::Member,
             )
             .await?;
         }
-        bp_db::update_pplns_group_member_role(
-            &mut *tx,
-            group_id,
-            &normalized,
-            MemberRole::Creator.as_str(),
-        )
-        .await?;
+        bp_db::update_pplns_group_member_role(&mut *tx, group_id, &normalized, MemberRole::Creator)
+            .await?;
         bp_db::update_pplns_group_creator_and_admin_token(
             &mut *tx,
             group_id,

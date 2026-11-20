@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            id AS \"id!\",\n            \"groupId\" AS \"group_id!\",\n            address AS \"address!: AddressId\",\n            role AS \"role!\",\n            \"joinedAt\" AS \"joined_at!\"\n           FROM pplns_group_member\n           WHERE \"groupId\" = $1 AND role = 'creator'\n           LIMIT 1",
+  "query": "SELECT\n            id AS \"id!\",\n            \"groupId\" AS \"group_id!\",\n            address AS \"address!: AddressId\",\n            role AS \"role!: MemberRole\",\n            \"joinedAt\" AS \"joined_at!\"\n           FROM pplns_group_member\n           WHERE \"groupId\" = $1 AND role = 'creator'\n           LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -38,7 +38,7 @@
       },
       {
         "ordinal": 3,
-        "name": "role!",
+        "name": "role!: MemberRole",
         "type_info": "Varchar",
         "origin": {
           "Table": {
@@ -72,5 +72,5 @@
       false
     ]
   },
-  "hash": "f80d5788cab14ac577906d0637fd4eec5839686c1faeb93edfcea4d41c945c06"
+  "hash": "e8d3d8aa56ccd2971a3b43427b36aae2550c68a98b3c7517f660df55432d4f2f"
 }

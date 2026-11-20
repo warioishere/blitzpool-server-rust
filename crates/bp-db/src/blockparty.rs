@@ -4,6 +4,7 @@
 //! address is UNIQUE pool-wide; a dissolve deletes the group's member rows so
 //! the address is free again. Block history is UNIQUE (groupId, blockHash).
 
+use bp_blockparty::BlockpartyStatus;
 use bp_common::{AddressId, Sats};
 use sqlx::{postgres::PgPool, types::Json, FromRow};
 use uuid::Uuid;
@@ -20,7 +21,7 @@ pub struct BlockpartyGroupRow {
     pub admin_address: AddressId,
     #[sqlx(rename = "adminTokenHash")]
     pub admin_token_hash: String,
-    pub status: String,
+    pub status: BlockpartyStatus,
     #[sqlx(rename = "lastShareAt")]
     pub last_share_at: Option<i64>,
     #[sqlx(rename = "rentalProviderHint")]
@@ -56,7 +57,7 @@ where
             name AS "name!",
             "adminAddress" AS "admin_address!: AddressId",
             "adminTokenHash" AS "admin_token_hash!",
-            status AS "status!",
+            status AS "status!: BlockpartyStatus",
             "lastShareAt" AS "last_share_at?",
             "rentalProviderHint" AS "rental_provider_hint?",
             "createdAt" AS "created_at!",
@@ -83,7 +84,7 @@ pub async fn find_blockparty_group_by_name(
             name AS "name!",
             "adminAddress" AS "admin_address!: AddressId",
             "adminTokenHash" AS "admin_token_hash!",
-            status AS "status!",
+            status AS "status!: BlockpartyStatus",
             "lastShareAt" AS "last_share_at?",
             "rentalProviderHint" AS "rental_provider_hint?",
             "createdAt" AS "created_at!",
@@ -112,7 +113,7 @@ pub async fn find_blockparty_group_by_admin_address(
             name AS "name!",
             "adminAddress" AS "admin_address!: AddressId",
             "adminTokenHash" AS "admin_token_hash!",
-            status AS "status!",
+            status AS "status!: BlockpartyStatus",
             "lastShareAt" AS "last_share_at?",
             "rentalProviderHint" AS "rental_provider_hint?",
             "createdAt" AS "created_at!",
@@ -140,7 +141,7 @@ pub async fn list_blockparty_groups_non_dissolved(
             name AS "name!",
             "adminAddress" AS "admin_address!: AddressId",
             "adminTokenHash" AS "admin_token_hash!",
-            status AS "status!",
+            status AS "status!: BlockpartyStatus",
             "lastShareAt" AS "last_share_at?",
             "rentalProviderHint" AS "rental_provider_hint?",
             "createdAt" AS "created_at!",
@@ -162,7 +163,7 @@ pub async fn insert_blockparty_group(
     name: &str,
     admin_address: &AddressId,
     admin_token_hash: &str,
-    status: &str,
+    status: BlockpartyStatus,
     created_at: i64,
 ) -> Result<BlockpartyGroupRow, DbError> {
     sqlx::query_as!(
@@ -175,7 +176,7 @@ pub async fn insert_blockparty_group(
             name AS "name!",
             "adminAddress" AS "admin_address!: AddressId",
             "adminTokenHash" AS "admin_token_hash!",
-            status AS "status!",
+            status AS "status!: BlockpartyStatus",
             "lastShareAt" AS "last_share_at?",
             "rentalProviderHint" AS "rental_provider_hint?",
             "createdAt" AS "created_at!",
@@ -187,7 +188,7 @@ pub async fn insert_blockparty_group(
         name,
         admin_address.as_str(),
         admin_token_hash,
-        status,
+        status.as_str(),
         created_at,
     )
     .fetch_one(pool)
@@ -198,7 +199,7 @@ pub async fn insert_blockparty_group(
 pub async fn update_blockparty_group_status<'e, E>(
     executor: E,
     id: Uuid,
-    status: &str,
+    status: BlockpartyStatus,
     updated_at: i64,
 ) -> Result<(), DbError>
 where
@@ -209,7 +210,7 @@ where
            SET status = $2, "updatedAt" = $3
            WHERE id = $1"#,
         id,
-        status,
+        status.as_str(),
         updated_at,
     )
     .execute(executor)
@@ -222,7 +223,7 @@ pub async fn update_blockparty_group_last_share_and_status(
     pool: &PgPool,
     id: Uuid,
     last_share_at: i64,
-    status: &str,
+    status: BlockpartyStatus,
     updated_at: i64,
 ) -> Result<(), DbError> {
     sqlx::query!(
@@ -231,7 +232,7 @@ pub async fn update_blockparty_group_last_share_and_status(
            WHERE id = $1"#,
         id,
         last_share_at,
-        status,
+        status.as_str(),
         updated_at,
     )
     .execute(pool)

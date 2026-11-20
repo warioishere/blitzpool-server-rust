@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            id AS \"id!\",\n            name AS \"name!\",\n            \"adminAddress\" AS \"admin_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            status AS \"status!\",\n            \"lastShareAt\" AS \"last_share_at?\",\n            \"rentalProviderHint\" AS \"rental_provider_hint?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"confirmationRequestedAt\" AS \"confirmation_requested_at?\",\n            \"coinbaseTag\" AS \"coinbase_tag?\"\n           FROM blockparty_group WHERE name = $1 LIMIT 1",
+  "query": "SELECT\n            id AS \"id!\",\n            name AS \"name!\",\n            \"adminAddress\" AS \"admin_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            status AS \"status!: BlockpartyStatus\",\n            \"lastShareAt\" AS \"last_share_at?\",\n            \"rentalProviderHint\" AS \"rental_provider_hint?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"confirmationRequestedAt\" AS \"confirmation_requested_at?\",\n            \"coinbaseTag\" AS \"coinbase_tag?\"\n           FROM blockparty_group WHERE status <> 'dissolved' ORDER BY \"createdAt\" ASC",
   "describe": {
     "columns": [
       {
@@ -49,7 +49,7 @@
       },
       {
         "ordinal": 4,
-        "name": "status!",
+        "name": "status!: BlockpartyStatus",
         "type_info": "Varchar",
         "origin": {
           "Table": {
@@ -137,9 +137,7 @@
       }
     ],
     "parameters": {
-      "Left": [
-        "Text"
-      ]
+      "Left": []
     },
     "nullable": [
       false,
@@ -156,5 +154,5 @@
       true
     ]
   },
-  "hash": "f3278a3c8b3f46e7e906109d12132c6509cb55ec08f84841c61641aafa61bd37"
+  "hash": "7c9ca9b1c217a20bdca7d7c2f267f918461fcc9c7dca8fcff56a413e5b1e78ef"
 }

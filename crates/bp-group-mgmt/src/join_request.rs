@@ -25,17 +25,28 @@ impl JoinRequestStatus {
             Self::Expired => "expired",
         }
     }
+}
 
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "pending" => Self::Pending,
-            "approved" => Self::Approved,
-            "rejected" => Self::Rejected,
-            "expired" => Self::Expired,
-            _ => return None,
-        })
+/// A `status` text that names no [`JoinRequestStatus`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown join-request status {0:?}")]
+pub struct UnknownJoinRequestStatus(pub String);
+
+impl std::str::FromStr for JoinRequestStatus {
+    type Err = UnknownJoinRequestStatus;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "approved" => Ok(Self::Approved),
+            "rejected" => Ok(Self::Rejected),
+            "expired" => Ok(Self::Expired),
+            other => Err(UnknownJoinRequestStatus(other.to_owned())),
+        }
     }
 }
+
+#[cfg(feature = "sqlx")]
+bp_common::impl_pg_text_enum!(JoinRequestStatus);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum JoinRequestTransitionError {
@@ -106,7 +117,7 @@ mod tests {
             JoinRequestStatus::Rejected,
             JoinRequestStatus::Expired,
         ] {
-            assert_eq!(JoinRequestStatus::parse(s.as_str()), Some(s));
+            assert_eq!(s.as_str().parse::<JoinRequestStatus>(), Ok(s));
         }
     }
 

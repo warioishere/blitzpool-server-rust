@@ -66,6 +66,25 @@ impl MemberRole {
     }
 }
 
+/// A `role` text that names no [`MemberRole`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown member role {0:?}")]
+pub struct UnknownMemberRole(pub String);
+
+impl std::str::FromStr for MemberRole {
+    type Err = UnknownMemberRole;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "creator" => Ok(Self::Creator),
+            "member" => Ok(Self::Member),
+            other => Err(UnknownMemberRole(other.to_owned())),
+        }
+    }
+}
+
+#[cfg(feature = "sqlx")]
+bp_common::impl_pg_text_enum!(MemberRole);
+
 /// A group is **active** iff its member count meets [`MIN_MEMBERS_ACTIVE`].
 /// The stratum layer refuses Group-Solo connections for addresses in
 /// inactive groups, so this predicate gates real money flow.
@@ -156,9 +175,8 @@ impl RoundResetPreset {
 /// migration between modes). `Prop` pays PROP per round, wiped on block or
 /// calendar/manual reset; `Window` pays the last N days of shares, with N
 /// taken from the reset-cadence config.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayoutMode {
-    #[default]
     Prop,
     Window,
 }
@@ -170,19 +188,26 @@ impl PayoutMode {
             Self::Window => "window",
         }
     }
+}
 
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "prop" => Self::Prop,
-            "window" => Self::Window,
-            _ => return None,
-        })
-    }
+/// A `payoutMode` text that names no [`PayoutMode`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown payout mode {0:?}")]
+pub struct UnknownPayoutMode(pub String);
 
-    pub fn parse_or_default(s: &str) -> Self {
-        Self::parse(s).unwrap_or_default()
+impl std::str::FromStr for PayoutMode {
+    type Err = UnknownPayoutMode;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "prop" => Ok(Self::Prop),
+            "window" => Ok(Self::Window),
+            other => Err(UnknownPayoutMode(other.to_owned())),
+        }
     }
 }
+
+#[cfg(feature = "sqlx")]
+bp_common::impl_pg_text_enum!(PayoutMode);
 
 /// Default sliding-window length in days when a `Window`-mode group has no
 /// reset-cadence config to reinterpret.
@@ -508,23 +533,19 @@ mod tests {
     // ── Payout mode ──────────────────────────────────────────────────
 
     #[test]
-    fn payout_mode_default_is_prop() {
-        assert_eq!(PayoutMode::default(), PayoutMode::Prop);
-    }
-
-    #[test]
     fn payout_mode_roundtrips_through_str() {
         for m in [PayoutMode::Prop, PayoutMode::Window] {
-            assert_eq!(PayoutMode::parse(m.as_str()), Some(m));
+            assert_eq!(m.as_str().parse::<PayoutMode>(), Ok(m));
         }
     }
 
+    /// An unknown text is an error, never a guessed mode.
     #[test]
-    fn payout_mode_parse_rejects_unknown() {
-        assert_eq!(PayoutMode::parse("bogus"), None);
-        // Lenient variant falls back to Prop instead of erroring.
-        assert_eq!(PayoutMode::parse_or_default("bogus"), PayoutMode::Prop);
-        assert_eq!(PayoutMode::parse_or_default("window"), PayoutMode::Window);
+    fn payout_mode_rejects_unknown_text() {
+        assert_eq!(
+            "bogus".parse::<PayoutMode>(),
+            Err(UnknownPayoutMode("bogus".to_owned()))
+        );
     }
 
     // ── Window length reinterpretation ───────────────────────────────

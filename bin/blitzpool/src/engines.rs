@@ -899,9 +899,17 @@ mod tests {
         let id = Uuid::new_v4();
         let admin = AddressId::new(format!("bc1qboot{}", &id.simple().to_string()[..20]))
             .expect("admin id");
-        bp_db::insert_blockparty_group(&pool, id, &format!("boot-{id}"), &admin, "h", "draft", 0)
-            .await
-            .expect("seed a live party");
+        bp_db::insert_blockparty_group(
+            &pool,
+            id,
+            &format!("boot-{id}"),
+            &admin,
+            "h",
+            bp_blockparty::BlockpartyStatus::Draft,
+            0,
+        )
+        .await
+        .expect("seed a live party");
 
         let refused = blockparty_payouts(&cfg, &pool).await;
         let _ = sqlx::query("DELETE FROM blockparty_group WHERE id = $1")

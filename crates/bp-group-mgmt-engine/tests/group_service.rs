@@ -125,7 +125,7 @@ async fn create_group_happy_path_returns_token_and_seeds_creator() {
     assert!(result.group.active);
     let members = svc.list_members(result.group.id).await.expect("members");
     assert_eq!(members.len(), 1);
-    assert_eq!(members[0].role, "creator");
+    assert_eq!(members[0].role, bp_group_mgmt::group::MemberRole::Creator);
     assert_eq!(members[0].address.as_str(), creator.to_lowercase());
 
     cleanup_group(&pool, result.group.id).await;
@@ -145,7 +145,11 @@ async fn create_group_defaults_to_prop_mode() {
     let creator = format!("bc1qpropdef{}", Uuid::new_v4().simple());
     bp_test_support::seed_signature_ownership(&pool, &creator).await;
     let result = svc.create_group(&name, &creator).await.expect("create");
-    assert_eq!(result.group.payout_mode, "prop", "default is PROP");
+    assert_eq!(
+        result.group.payout_mode,
+        PayoutMode::Prop,
+        "default is PROP"
+    );
 
     cleanup_group(&pool, result.group.id).await;
 }
@@ -167,7 +171,7 @@ async fn create_group_with_window_mode_persists_window() {
         .create_group_with_mode(&name, &creator, PayoutMode::Window)
         .await
         .expect("create");
-    assert_eq!(result.group.payout_mode, "window");
+    assert_eq!(result.group.payout_mode, PayoutMode::Window);
 
     // The mode has no edit path, so creation is the only place it is set.
     let row = svc
@@ -175,7 +179,7 @@ async fn create_group_with_window_mode_persists_window() {
         .await
         .expect("get")
         .expect("present");
-    assert_eq!(row.payout_mode, "window");
+    assert_eq!(row.payout_mode, PayoutMode::Window);
 
     cleanup_group(&pool, result.group.id).await;
 }
@@ -518,7 +522,7 @@ async fn remove_member_inactivity_guard_then_kick_succeeds() {
         .expect("kick");
     let members = svc_old.list_members(g.group.id).await.expect("list");
     assert_eq!(members.len(), 1);
-    assert_eq!(members[0].role, "creator");
+    assert_eq!(members[0].role, bp_group_mgmt::group::MemberRole::Creator);
     // Hook callback fired
     let snap = hooks_old.snapshot();
     assert_eq!(snap.member_removed.len(), 1);

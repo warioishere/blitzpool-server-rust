@@ -126,6 +126,9 @@ bp-test-support = { workspace = true }
 bp-regtest-harness = { workspace = true }
 # Engine-config tests parse an `AppConfig` from TOML the way boot does.
 toml = { workspace = true }
+# Group and party rows in tests carry the typed payout mode and status.
+bp-group-mgmt = { workspace = true }
+bp-blockparty = { workspace = true }
 
 # Process-wide allocator (Linux only). Wired into `main.rs` via
 # `#[global_allocator]`. See workspace Cargo.toml for rationale.

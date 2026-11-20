@@ -12,4 +12,9 @@ workspace = true
 
 [dependencies]
 bp-common = { workspace = true }
+# Optional so only the DB layer pulls sqlx in; see `bp_common::impl_pg_text_enum`.
+sqlx = { workspace = true, optional = true }
 serde = { workspace = true }
+
+[features]
+sqlx = ["dep:sqlx", "bp-common/sqlx"]

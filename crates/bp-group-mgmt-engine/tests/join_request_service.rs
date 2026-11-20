@@ -144,7 +144,10 @@ async fn create_join_request_happy_path() {
         .await
         .expect("req");
     assert_eq!(row.address.as_str(), requester.to_lowercase());
-    assert_eq!(row.status, "pending");
+    assert_eq!(
+        row.status,
+        bp_group_mgmt::join_request::JoinRequestStatus::Pending
+    );
     assert_eq!(row.email, "req@example.com");
     assert_eq!(row.message.as_deref(), Some("hi please"));
 

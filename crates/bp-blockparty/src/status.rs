@@ -79,6 +79,9 @@ impl FromStr for BlockpartyStatus {
     }
 }
 
+#[cfg(feature = "sqlx")]
+bp_common::impl_pg_text_enum!(BlockpartyStatus);
+
 #[cfg(test)]
 mod tests {
     use super::*;

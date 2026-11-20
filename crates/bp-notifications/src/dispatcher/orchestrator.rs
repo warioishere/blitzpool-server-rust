@@ -1689,12 +1689,15 @@ mod tests {
             "hash",
             true,
             false,
-            "prop",
+            bp_group_mgmt::group::PayoutMode::Prop,
             now,
         )
         .await
         .unwrap();
-        for (a, role) in [(&team_finder, "creator"), (&team_dummy, "member")] {
+        for (a, role) in [
+            (&team_finder, bp_group_mgmt::group::MemberRole::Creator),
+            (&team_dummy, bp_group_mgmt::group::MemberRole::Member),
+        ] {
             bp_db::insert_pplns_group_member(&pool, team, a, role, now)
                 .await
                 .unwrap();
@@ -1706,7 +1709,7 @@ mod tests {
             &format!("bp-test-blockmembers-{party}"),
             &party_finder,
             "hash",
-            "active",
+            bp_blockparty::BlockpartyStatus::Active,
             now,
         )
         .await

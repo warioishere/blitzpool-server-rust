@@ -189,8 +189,9 @@ async fn create(
     // Immutable, so validated up front.
     let mode = match body.mode.as_deref() {
         None => bp_group_mgmt::group::PayoutMode::Prop,
-        Some(s) => bp_group_mgmt::group::PayoutMode::parse(s)
-            .ok_or(ApiError::BadRequest("mode must be 'prop' or 'window'"))?,
+        Some(s) => s
+            .parse::<bp_group_mgmt::group::PayoutMode>()
+            .map_err(|_| ApiError::BadRequest("mode must be 'prop' or 'window'"))?,
     };
     let res = svc
         .create_group_with_mode(&body.name, &body.creator_address, mode)
@@ -207,7 +208,7 @@ async fn create(
             admin_token: res.admin_token,
             members: vec![InitialMember {
                 address: creator_address,
-                role: "creator",
+                role: bp_group_mgmt::group::MemberRole::Creator.as_str(),
             }],
         }),
     ))
@@ -576,7 +577,7 @@ async fn create_join_request(
         Json(CreateJoinRequestResponse {
             id: row.id,
             group_id: row.group_id,
-            status: row.status,
+            status: row.status.as_str().to_owned(),
             created_at: crate::time_range::format_iso_ms(row.created_at),
         }),
     ))
@@ -678,7 +679,7 @@ impl From<bp_db::PplnsGroupRow> for GroupSummary {
             is_public: r.is_public,
             reset_round_on_block: r.reset_round_on_block,
             max_members: r.max_members.map(|v| v as i64),
-            mode: r.payout_mode,
+            mode: r.payout_mode.as_str().to_owned(),
             coinbase_tag: r.coinbase_tag,
         }
     }
@@ -1101,7 +1102,7 @@ async fn by_id(
                         .unwrap_or_else(|| bp_common::short_address(addr_str)),
                     address: is_admin.then(|| addr_str.to_string()),
                     is_self: viewer.as_deref() == Some(addr_str),
-                    role: m.role,
+                    role: m.role.as_str().to_owned(),
                     joined_at: crate::time_range::format_iso_ms(m.joined_at),
                     hashrate,
                     best_difficulty,
@@ -1193,7 +1194,7 @@ async fn membership(
     Ok(Json(MembershipResponse::Member {
         group_id: group.id,
         group_name: group.name,
-        role: member.role,
+        role: member.role.as_str().to_owned(),
     }))
 }
 
@@ -1729,7 +1730,7 @@ async fn list_join_requests(
                         address: r.address.as_str().to_string(),
                         email: crate::utils::mask_email(&r.email),
                         message: r.message,
-                        status: r.status,
+                        status: r.status.as_str().to_owned(),
                         created_at: crate::time_range::format_iso_ms(r.created_at),
                         decided_at: crate::time_range::format_iso_ms_opt(r.decided_at),
                     })
@@ -1773,7 +1774,7 @@ async fn join_requests_by_address(
                     .map(|e| AddressJoinRequestEntry {
                         group_id: e.group_id,
                         group_name: e.group_name,
-                        status: "pending",
+                        status: bp_group_mgmt::join_request::JoinRequestStatus::Pending.as_str(),
                         created_at: crate::time_range::format_iso_ms(e.created_at),
                     })
                     .collect())
@@ -2017,7 +2018,7 @@ mod tests {
             is_public: false,
             reset_round_on_block: false,
             max_members: None,
-            payout_mode: mode.to_string(),
+            payout_mode: mode.parse().unwrap(),
             coinbase_tag: None,
         };
         assert!(next_reset_at(&row("prop", None)).is_some());
@@ -2319,7 +2320,7 @@ mod tests {
             admin_token: "tok".into(),
             members: vec![InitialMember {
                 address: "bc1q".into(),
-                role: "creator",
+                role: bp_group_mgmt::group::MemberRole::Creator.as_str(),
             }],
         };
         let v: Value = serde_json::to_value(&r).unwrap();

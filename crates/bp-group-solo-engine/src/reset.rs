@@ -104,7 +104,7 @@ pub fn scheduled_reset(group: &PplnsGroupRow) -> Result<Option<ResetSchedule>, R
     if group.dissolved_at.is_some() {
         return Ok(None);
     }
-    match PayoutMode::parse_or_default(&group.payout_mode) {
+    match group.payout_mode {
         PayoutMode::Window => Ok(None),
         PayoutMode::Prop => ResetSchedule::from_row_fields(
             group.round_reset_preset.as_deref(),
@@ -631,7 +631,7 @@ mod tests {
             is_public: false,
             reset_round_on_block: false,
             max_members: None,
-            payout_mode: payout_mode.to_string(),
+            payout_mode: payout_mode.parse().unwrap(),
             coinbase_tag: None,
         }
     }

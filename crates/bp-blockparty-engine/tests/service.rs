@@ -6,6 +6,7 @@
 //! `BlockpartyService` against the test Postgres: lifecycle transitions and
 //! the routing cache staying in lockstep with the DB.
 
+use bp_blockparty::BlockpartyStatus;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -135,7 +136,7 @@ async fn create_group_seeds_draft_and_routing_cache() {
         .await
         .expect("create_group");
 
-    assert_eq!(res.group.status, "draft");
+    assert_eq!(res.group.status, BlockpartyStatus::Draft);
     assert_eq!(res.admin_member.role, "admin");
     assert!(res.admin_member.confirmed_at.is_some());
     assert!(res.admin_token.starts_with("GRP-"));
@@ -170,7 +171,7 @@ async fn add_member_flips_to_confirming_and_inserts_member_cache() {
 
     // DB row: CONFIRMING.
     let g = svc.get_group(create.group.id).await.unwrap().unwrap();
-    assert_eq!(g.status, "confirming");
+    assert_eq!(g.status, BlockpartyStatus::Confirming);
 
     // Admin cache: unready=Some, routable=None.
     let admin_addr = addr(admin);
@@ -228,7 +229,7 @@ async fn join_via_link_adds_unconfirmed_member_and_mints_token() {
         Some(create.group.id)
     );
     let g = svc.get_group(create.group.id).await.unwrap().unwrap();
-    assert_eq!(g.status, "confirming");
+    assert_eq!(g.status, BlockpartyStatus::Confirming);
 
     // Unknown link → error (not found).
     assert!(svc
@@ -367,7 +368,7 @@ async fn create_group_admits_signature_verified_email_less_admin() {
         .create_group(name, admin, 10_000)
         .await
         .expect("signature-verified admin should create");
-    assert_eq!(create.group.status, "draft");
+    assert_eq!(create.group.status, BlockpartyStatus::Draft);
     assert_eq!(create.admin_member.role, "admin");
     assert_eq!(
         create.admin_member.email, "",
@@ -478,7 +479,7 @@ async fn mark_member_confirmed_promotes_to_ready_and_unblocks_routing() {
     assert!(r.member_token.is_some(), "first confirm mints token");
 
     let g = svc.get_group(create.group.id).await.unwrap().unwrap();
-    assert_eq!(g.status, "ready");
+    assert_eq!(g.status, BlockpartyStatus::Ready);
 
     assert!(
         svc.unready_group_id_for_admin(&admin_addr).await.is_none(),
@@ -516,7 +517,7 @@ async fn on_share_accepted_promotes_ready_to_active_only() {
         .await
         .expect("share-noop");
     let g = svc.get_group(create.group.id).await.unwrap().unwrap();
-    assert_eq!(g.status, "draft", "no promotion from draft");
+    assert_eq!(g.status, BlockpartyStatus::Draft, "no promotion from draft");
 
     // Add + confirm bob → READY.
     svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
@@ -529,7 +530,7 @@ async fn on_share_accepted_promotes_ready_to_active_only() {
     // First share → READY → ACTIVE.
     svc.on_share_accepted(&admin_addr).await.expect("share");
     let g = svc.get_group(create.group.id).await.unwrap().unwrap();
-    assert_eq!(g.status, "active");
+    assert_eq!(g.status, BlockpartyStatus::Active);
     assert!(g.last_share_at.is_some());
     // ACTIVE remains routable.
     assert_eq!(
@@ -583,7 +584,7 @@ async fn dissolve_blocked_during_active_cooldown() {
         .await
         .expect("dissolve");
     let g = svc.get_group(create.group.id).await.unwrap().unwrap();
-    assert_eq!(g.status, "dissolved");
+    assert_eq!(g.status, BlockpartyStatus::Dissolved);
     // Cache: dissolved drops both maps.
     assert!(svc
         .routable_group_id_for_admin(&addr(admin))
@@ -632,7 +633,7 @@ async fn dissolve_frees_every_address_for_the_next_party() {
             .unwrap()
             .unwrap()
             .status,
-        "dissolved"
+        BlockpartyStatus::Dissolved
     );
     assert!(svc.list_members(create.group.id).await.unwrap().is_empty());
     assert!(svc.member_group_id(&addr(bob)).await.is_none());
@@ -800,7 +801,7 @@ async fn ready_transition_sizes_coinbase_reservation_to_roster() {
         .await
         .expect("mark_confirmed");
     let g = svc.get_group(create.group.id).await.unwrap().unwrap();
-    assert_eq!(g.status, "ready");
+    assert_eq!(g.status, BlockpartyStatus::Ready);
 
     let recorded = calls.lock().unwrap().clone();
     assert!(
@@ -851,7 +852,8 @@ async fn a_ready_party_refuses_every_roster_edit() {
         .expect("mark_confirmed");
     let g = svc.get_group(gid).await.unwrap().unwrap();
     assert_eq!(
-        g.status, "ready",
+        g.status,
+        BlockpartyStatus::Ready,
         "precondition: the party must be routable"
     );
 
@@ -871,7 +873,7 @@ async fn a_ready_party_refuses_every_roster_edit() {
         "{remove:?}"
     );
     let g = svc.get_group(gid).await.unwrap().unwrap();
-    assert_eq!(g.status, "ready");
+    assert_eq!(g.status, BlockpartyStatus::Ready);
     assert_eq!(svc.list_members(gid).await.unwrap().len(), 2);
 
     cleanup(&pool, name, admin).await;
@@ -941,7 +943,7 @@ async fn update_splits_confirms_admin_and_resets_non_admin() {
         "non-admin must lose confirmedAt after splits edit"
     );
     let g = svc.get_group(gid).await.unwrap().unwrap();
-    assert_eq!(g.status, "confirming");
+    assert_eq!(g.status, BlockpartyStatus::Confirming);
 
     // Everyone re-confirms → READY.
     for m in [bob, carol] {
@@ -951,7 +953,8 @@ async fn update_splits_confirms_admin_and_resets_non_admin() {
     }
     let g = svc.get_group(gid).await.unwrap().unwrap();
     assert_eq!(
-        g.status, "ready",
+        g.status,
+        BlockpartyStatus::Ready,
         "group enters READY once all members confirm the new splits"
     );
 
@@ -989,7 +992,8 @@ async fn a_party_turns_ready_only_with_complete_splits() {
         .expect("confirm");
     let g = svc.get_group(gid).await.unwrap().unwrap();
     assert_eq!(
-        g.status, "confirming",
+        g.status,
+        BlockpartyStatus::Confirming,
         "5000 + 0 bp is not the full cut, even with everyone confirmed"
     );
 
@@ -1000,7 +1004,11 @@ async fn a_party_turns_ready_only_with_complete_splits() {
         .await
         .expect("re-confirm");
     let g = svc.get_group(gid).await.unwrap().unwrap();
-    assert_eq!(g.status, "ready", "5000 + 5000 bp, everyone confirmed");
+    assert_eq!(
+        g.status,
+        BlockpartyStatus::Ready,
+        "5000 + 5000 bp, everyone confirmed"
+    );
 
     cleanup(&pool, name, admin).await;
     let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
@@ -1043,7 +1051,8 @@ async fn a_joined_member_without_a_split_keeps_the_party_confirming() {
         .expect("confirm");
     let g = svc.get_group(gid).await.unwrap().unwrap();
     assert_eq!(
-        g.status, "confirming",
+        g.status,
+        BlockpartyStatus::Confirming,
         "10000 + 0 bp sums right, but the member has no split"
     );
 

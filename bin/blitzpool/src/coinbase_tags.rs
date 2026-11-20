@@ -92,7 +92,7 @@ mod tests {
                 "h",
                 true,
                 false,
-                "prop",
+                bp_group_mgmt::group::PayoutMode::Prop,
                 1,
             )
             .await
@@ -104,7 +104,7 @@ mod tests {
             &format!("tag-test-{party}"),
             &address("party"),
             "h",
-            "ACTIVE",
+            bp_blockparty::BlockpartyStatus::Active,
             1,
         )
         .await

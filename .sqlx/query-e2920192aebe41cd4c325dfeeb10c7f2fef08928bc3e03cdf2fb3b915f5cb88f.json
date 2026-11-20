@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            id AS \"id!\",\n            name AS \"name!\",\n            \"adminAddress\" AS \"admin_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            status AS \"status!\",\n            \"lastShareAt\" AS \"last_share_at?\",\n            \"rentalProviderHint\" AS \"rental_provider_hint?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"confirmationRequestedAt\" AS \"confirmation_requested_at?\",\n            \"coinbaseTag\" AS \"coinbase_tag?\"\n           FROM blockparty_group WHERE id = $1 LIMIT 1",
+  "query": "SELECT\n            id AS \"id!\",\n            name AS \"name!\",\n            \"adminAddress\" AS \"admin_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            status AS \"status!: BlockpartyStatus\",\n            \"lastShareAt\" AS \"last_share_at?\",\n            \"rentalProviderHint\" AS \"rental_provider_hint?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"confirmationRequestedAt\" AS \"confirmation_requested_at?\",\n            \"coinbaseTag\" AS \"coinbase_tag?\"\n           FROM blockparty_group WHERE name = $1 LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -49,7 +49,7 @@
       },
       {
         "ordinal": 4,
-        "name": "status!",
+        "name": "status!: BlockpartyStatus",
         "type_info": "Varchar",
         "origin": {
           "Table": {
@@ -138,7 +138,7 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Text"
       ]
     },
     "nullable": [
@@ -156,5 +156,5 @@
       true
     ]
   },
-  "hash": "e7a75ced92dc35160c912d4047a71ec86455ac69bd25aa9826d8bc3ee6bc5c28"
+  "hash": "e2920192aebe41cd4c325dfeeb10c7f2fef08928bc3e03cdf2fb3b915f5cb88f"
 }

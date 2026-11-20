@@ -95,7 +95,7 @@ async fn flush_pool_mode_hashrate(pool: &PgPool, accs: &Accumulators) {
     for (slot, modes) in &snapshot {
         for (mode, diff) in modes {
             rows.push(PoolModeHashrateUpsert {
-                mode: mode.as_str().to_string(),
+                mode: *mode,
                 time_ms: slot.as_millis(),
                 diff: *diff as f32,
             });

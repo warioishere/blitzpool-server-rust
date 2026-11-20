@@ -8,6 +8,7 @@
 //! right cannot pass. Skipped when `bitcoin-node` or Postgres
 //! is absent.
 
+use bp_blockparty::BlockpartyStatus;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,20 +66,24 @@ async fn blockparty_ready_party_pays_members_and_history_is_idempotent() {
         .create_group(&name, &addr_admin, 6_000)
         .await
         .expect("create_group");
-    assert_eq!(create.group.status, "draft");
+    assert_eq!(create.group.status, BlockpartyStatus::Draft);
     let group_id = create.group.id;
 
     svc.add_member(group_id, &addr_bob, 4_000, Some(&create.admin_token))
         .await
         .expect("add_member");
     let g = svc.get_group(group_id).await.unwrap().unwrap();
-    assert_eq!(g.status, "confirming");
+    assert_eq!(g.status, BlockpartyStatus::Confirming);
 
     svc.mark_member_confirmed(group_id, &AddressId::new(addr_bob.clone()).unwrap())
         .await
         .expect("mark_member_confirmed");
     let g = svc.get_group(group_id).await.unwrap().unwrap();
-    assert_eq!(g.status, "ready", "READY after all members confirmed");
+    assert_eq!(
+        g.status,
+        BlockpartyStatus::Ready,
+        "READY after all members confirmed"
+    );
 
     // Routing-cache invariant: READY enables routing and lets the admin mine.
     let admin_addr_id = AddressId::new(addr_admin.clone()).unwrap();
