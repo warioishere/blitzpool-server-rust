@@ -37,7 +37,7 @@ impl SharedAcceptedShareSink for ShareStatsAcceptedSink {
             return;
         }
         let slot = TimeSlot::current();
-        let mode = share.mode;
+        let mode = share.mode.mode();
         self.accumulators
             .pool_shares
             .add_accepted(slot, diff, share.submission_difficulty);
@@ -162,7 +162,6 @@ impl SharedRejectedShareSink for ShareStatsRejectedSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bp_common::MiningMode;
 
     /// Slot maxima take the solved difficulty, sums the credited one.
     #[tokio::test]
@@ -180,8 +179,7 @@ mod tests {
             hash_rate: 0.0,
             ts_ms: 0,
             share_id: "",
-            mode: MiningMode::Solo,
-            group_id: None,
+            mode: bp_share_hook::MiningModeResult::Solo,
         })
         .await;
 

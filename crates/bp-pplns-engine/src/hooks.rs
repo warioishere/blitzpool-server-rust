@@ -5,8 +5,8 @@
 //! in `bin/blitzpool`, not here.
 
 use async_trait::async_trait;
-use bp_common::{warn_throttled, LogThrottle, MiningMode};
-use bp_share_hook::{SharedAcceptedShare, SharedAcceptedShareSink};
+use bp_common::{warn_throttled, LogThrottle};
+use bp_share_hook::{MiningModeResult, SharedAcceptedShare, SharedAcceptedShareSink};
 
 /// A Redis outage fails every accepted share; one warning per window plus a
 /// suppressed count alerts without burying the log.
@@ -33,9 +33,9 @@ impl SharedAcceptedShareSink for PplnsAcceptedShareSink {
     async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
         // Mode is resolved once by the producer and stamped on the share,
         // so the consumer needs no gate.
-        if share.mode != MiningMode::Pplns {
+        let MiningModeResult::Pplns = share.mode else {
             return;
-        }
+        };
         // The share's Core-accept time, not now(): a Satellite replaying a
         // backlog would otherwise put shares in the wrong window slot.
         let ts_ms = share.ts_ms as u64;

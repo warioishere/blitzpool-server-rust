@@ -16,13 +16,18 @@ async-trait = { workspace = true }
 # accepted share by the producer, so sinks read the share's resolved mode
 # instead of re-querying a mode-gate per share.
 bp-common = { workspace = true }
+# MiningModeResult: the stamped mode with its group, so a sink matches on
+# the mode instead of testing whether a group id is present.
+bp-mining-mode = { workspace = true }
 # Owned share records derive Serialize/Deserialize so they can be the wire
 # unit on the Core→Satellite share stream (bp-share-stream).
 serde = { workspace = true }
+uuid = { workspace = true }
 # Canonical RejectedReason enum shared with the bp-stats accumulators. SV1
 # and SV2 adapters map their protocol-specific reject reasons into it before
 # invoking SharedRejectedShareSink.
 bp-stats = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

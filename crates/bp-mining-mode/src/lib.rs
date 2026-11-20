@@ -8,7 +8,7 @@ mod debouncer;
 mod result;
 
 pub use debouncer::{MarkDebouncer, DEFAULT_REFRESH_INTERVAL};
-pub use result::MiningModeResult;
+pub use result::{GroupMissing, MiningModeResult};
 
 /// Redis key of an address's live mode marker: the mode its last accepted
 /// share was mined in, kept for a few minutes.

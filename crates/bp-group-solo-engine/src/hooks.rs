@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Group-Solo share sinks for SV1 and SV2. They read the producer-stamped
-//! `mode` / `group_id` off the share instead of holding a mode gate, so they
-//! run unchanged on the Satellite off the stream.
+//! mode off the share instead of holding a mode gate, so they run unchanged
+//! on the Satellite off the stream.
 
 use async_trait::async_trait;
-use bp_common::{warn_throttled, LogThrottle, MiningMode};
+use bp_common::{warn_throttled, LogThrottle};
 use bp_share_hook::{
-    SharedAcceptedShare, SharedAcceptedShareSink, SharedRejectedShare, SharedRejectedShareSink,
+    MiningModeResult, SharedAcceptedShare, SharedAcceptedShareSink, SharedRejectedShare,
+    SharedRejectedShareSink,
 };
 use tracing::warn;
-use uuid::Uuid;
 
 use crate::engine::GroupSoloEngine;
 
@@ -37,11 +37,7 @@ impl GroupSoloAcceptedShareSink {
 #[async_trait]
 impl SharedAcceptedShareSink for GroupSoloAcceptedShareSink {
     async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
-        // Blockparty shares also carry a group_id, so test the mode.
-        if share.mode != MiningMode::GroupSolo {
-            return;
-        }
-        let Some(group_id) = share.group_id.and_then(|g| Uuid::parse_str(g).ok()) else {
+        let MiningModeResult::GroupSolo(group_id) = share.mode else {
             return;
         };
         // Accept time, not now(): backlogged shares keep their original time.
@@ -71,8 +67,8 @@ impl SharedAcceptedShareSink for GroupSoloAcceptedShareSink {
     }
 }
 
-/// Counts a reject against the Group-Solo round when the share carries a
-/// `group_id`; pre-auth and non-group rejects are dropped.
+/// Counts a reject against the Group-Solo round of the share's
+/// `group_solo_group`; pre-auth and non-Group-Solo rejects carry none.
 pub struct GroupSoloRejectedShareSink {
     engine: GroupSoloEngine,
 }
@@ -89,20 +85,8 @@ impl SharedRejectedShareSink for GroupSoloRejectedShareSink {
         let Some(addr) = share.address else {
             return;
         };
-        let Some(group_id_str) = share.group_id else {
+        let Some(group_id) = share.group_solo_group else {
             return;
-        };
-        let group_id = match Uuid::parse_str(group_id_str) {
-            Ok(u) => u,
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    address = addr,
-                    group_id = group_id_str,
-                    "GroupSoloRejectedShareSink: stamped group_id is not a valid UUID — skipping"
-                );
-                return;
-            }
         };
         if let Err(e) = self
             .engine

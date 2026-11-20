@@ -60,8 +60,10 @@ where
 /// The Core→Satellite block-found event: the front submits and records the
 /// block, the payout Satellite applies the ledger from this. Producer and
 /// consumer run the same version: a release that changes this format deploys
-/// with the block-found stream fully acked.
+/// with the block-found stream fully acked. On the stream the mode travels as
+/// `mode` + `group_id` + `weight_snapshot` ([`BlockFoundWire`]).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(into = "BlockFoundWire", try_from = "BlockFoundWire")]
 pub(crate) struct BlockFoundEvent {
     /// Miner-authorized payout address.
     pub address: String,
@@ -75,16 +77,10 @@ pub(crate) struct BlockFoundEvent {
     /// 80-byte header hex (LE), stored in `blocks_entity.blockData`.
     pub block_data: String,
     /// Resolved on the Core, the only side holding the mode gate.
-    pub mode: MiningMode,
-    /// Group for `GroupSolo` / `Blockparty`, else `None`.
-    pub group_id: Option<uuid::Uuid>,
+    pub mode: FoundMode,
     /// Derived on the Core right after submit: the chain may have advanced by
     /// the time a Satellite consumes the event.
     pub height: i32,
-    /// PPLNS settlement inputs of the winning job's distribution, resolved at
-    /// the block-found instant: the Redis keys they come from are overwritten
-    /// or expire before the apply side runs.
-    pub weight_snapshot: Option<bp_pplns_engine::window::snapshot::StoredWeightSnapshot>,
     /// Identity of the payout list the winning job's coinbase pays, so what is
     /// booked is what the coinbase paid. `None` when the pool did not build the
     /// coinbase.
@@ -93,6 +89,101 @@ pub(crate) struct BlockFoundEvent {
     /// settlement books `claim − paid` from it. `None` (undecodable, or
     /// [`Booking::RecordOnly`]) makes every mode book nothing.
     pub actual_coinbase: Option<ActualCoinbase>,
+}
+
+/// The mode a block was found in, with what its settlement needs.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum FoundMode {
+    Solo,
+    /// PPLNS settlement inputs of the winning job's distribution, resolved at
+    /// the block-found instant: the Redis keys they come from are overwritten
+    /// or expire before the apply side runs. `None` when the pool did not
+    /// build the coinbase or the snapshot was unreadable.
+    Pplns {
+        weight_snapshot: Option<bp_pplns_engine::window::snapshot::StoredWeightSnapshot>,
+    },
+    GroupSolo(uuid::Uuid),
+    Blockparty(uuid::Uuid),
+}
+
+impl FoundMode {
+    pub(crate) fn mode(&self) -> MiningMode {
+        match self {
+            Self::Solo => MiningMode::Solo,
+            Self::Pplns { .. } => MiningMode::Pplns,
+            Self::GroupSolo(_) => MiningMode::GroupSolo,
+            Self::Blockparty(_) => MiningMode::Blockparty,
+        }
+    }
+}
+
+/// The stream form of [`BlockFoundEvent`].
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BlockFoundWire {
+    address: String,
+    worker: String,
+    session_id: String,
+    booking: Booking,
+    block_hash: String,
+    block_data: String,
+    mode: MiningMode,
+    group_id: Option<uuid::Uuid>,
+    height: i32,
+    weight_snapshot: Option<bp_pplns_engine::window::snapshot::StoredWeightSnapshot>,
+    payouts_fingerprint: Option<[u8; 32]>,
+    actual_coinbase: Option<ActualCoinbase>,
+}
+
+impl From<BlockFoundEvent> for BlockFoundWire {
+    fn from(e: BlockFoundEvent) -> Self {
+        let mode = e.mode.mode();
+        let (group_id, weight_snapshot) = match e.mode {
+            FoundMode::Solo => (None, None),
+            FoundMode::Pplns { weight_snapshot } => (None, weight_snapshot),
+            FoundMode::GroupSolo(g) | FoundMode::Blockparty(g) => (Some(g), None),
+        };
+        Self {
+            mode,
+            group_id,
+            weight_snapshot,
+            address: e.address,
+            worker: e.worker,
+            session_id: e.session_id,
+            booking: e.booking,
+            block_hash: e.block_hash,
+            block_data: e.block_data,
+            height: e.height,
+            payouts_fingerprint: e.payouts_fingerprint,
+            actual_coinbase: e.actual_coinbase,
+        }
+    }
+}
+
+impl TryFrom<BlockFoundWire> for BlockFoundEvent {
+    type Error = bp_mining_mode::GroupMissing;
+
+    fn try_from(w: BlockFoundWire) -> Result<Self, Self::Error> {
+        let mode = match MiningModeResult::from_parts(w.mode, w.group_id)? {
+            MiningModeResult::Solo => FoundMode::Solo,
+            MiningModeResult::Pplns => FoundMode::Pplns {
+                weight_snapshot: w.weight_snapshot,
+            },
+            MiningModeResult::GroupSolo(g) => FoundMode::GroupSolo(g),
+            MiningModeResult::Blockparty(g) => FoundMode::Blockparty(g),
+        };
+        Ok(Self {
+            address: w.address,
+            worker: w.worker,
+            session_id: w.session_id,
+            booking: w.booking,
+            block_hash: w.block_hash,
+            block_data: w.block_data,
+            mode,
+            height: w.height,
+            payouts_fingerprint: w.payouts_fingerprint,
+            actual_coinbase: w.actual_coinbase,
+        })
+    }
 }
 
 /// Whether a found block goes into its mode's ledger, or is only recorded
@@ -406,9 +497,16 @@ impl TdpBlockSubmissionSink {
             warn!(%err, address = %address, height, "block-found: blocks_entity insert failed");
         }
 
-        let weight_snapshot = self
-            .resolve_weight_snapshot(resolved, &address, payouts_fingerprint, height)
-            .await;
+        let mode = match resolved {
+            MiningModeResult::Solo => FoundMode::Solo,
+            MiningModeResult::Pplns => FoundMode::Pplns {
+                weight_snapshot: self
+                    .pplns_weight_snapshot(&address, payouts_fingerprint, height)
+                    .await,
+            },
+            MiningModeResult::GroupSolo(g) => FoundMode::GroupSolo(g),
+            MiningModeResult::Blockparty(g) => FoundMode::Blockparty(g),
+        };
 
         let event = BlockFoundEvent {
             address,
@@ -418,10 +516,8 @@ impl TdpBlockSubmissionSink {
             booking,
             block_hash,
             block_data,
-            mode: resolved.mode(),
-            group_id: resolved.group_id(),
+            mode,
             height,
-            weight_snapshot,
             actual_coinbase,
         };
 
@@ -462,60 +558,50 @@ impl TdpBlockSubmissionSink {
         }
     }
 
-    /// Resolve PPLNS's settlement inputs at the block-found instant: the
+    /// PPLNS's settlement inputs, resolved at the block-found instant: the
     /// snapshot key is alive now, not at apply time, and is their only store.
-    /// Every mode is decided by the exhaustive `match`. A coinbase the pool
-    /// did not build has no snapshot; the apply side refuses to book it.
-    async fn resolve_weight_snapshot(
+    /// A coinbase the pool did not build has no snapshot; the apply side
+    /// refuses to book it.
+    async fn pplns_weight_snapshot(
         &self,
-        mode: MiningModeResult,
         address: &str,
         payouts_fingerprint: Option<[u8; 32]>,
         height: i32,
     ) -> Option<bp_pplns_engine::window::snapshot::StoredWeightSnapshot> {
-        match mode {
-            // Solo writes no ledger, Blockparty and Group-Solo book from the
-            // coinbase alone. None of them has a snapshot to carry.
-            MiningModeResult::Solo
-            | MiningModeResult::Blockparty(_)
-            | MiningModeResult::GroupSolo(_) => None,
-            MiningModeResult::Pplns => {
-                let engine = self.applier.pplns.as_ref().or_else(|| {
-                    warn!(
-                        address,
-                        height, "block-found: PPLNS mode but the engine is not configured"
-                    );
-                    None
-                })?;
-                let fingerprint = pool_built(payouts_fingerprint)?;
-                match retry_at_find("pplns snapshot", || {
-                    engine.weight_snapshot_for_block_found(&fingerprint)
-                })
-                .await
-                {
-                    Ok(Some(snap)) => Some(snap),
-                    Ok(None) => {
-                        error!(
-                            address,
-                            height,
-                            fingerprint = %hex::encode(fingerprint),
-                            "block-found: no PPLNS snapshot under the winning job's \
-                             fingerprint — the block will park as unbookable once confirmed"
-                        );
-                        None
-                    }
-                    Err(err) => {
-                        error!(
-                            %err,
-                            address,
-                            height,
-                            fingerprint = %hex::encode(fingerprint),
-                            "block-found: PPLNS snapshot read failed — the block will park as \
-                             unbookable once confirmed"
-                        );
-                        None
-                    }
-                }
+        let engine = self.applier.pplns.as_ref().or_else(|| {
+            warn!(
+                address,
+                height, "block-found: PPLNS mode but the engine is not configured"
+            );
+            None
+        })?;
+        let fingerprint = pool_built(payouts_fingerprint)?;
+        match retry_at_find("pplns snapshot", || {
+            engine.weight_snapshot_for_block_found(&fingerprint)
+        })
+        .await
+        {
+            Ok(Some(snap)) => Some(snap),
+            Ok(None) => {
+                error!(
+                    address,
+                    height,
+                    fingerprint = %hex::encode(fingerprint),
+                    "block-found: no PPLNS snapshot under the winning job's \
+                     fingerprint — the block will park as unbookable once confirmed"
+                );
+                None
+            }
+            Err(err) => {
+                error!(
+                    %err,
+                    address,
+                    height,
+                    fingerprint = %hex::encode(fingerprint),
+                    "block-found: PPLNS snapshot read failed — the block will park as \
+                     unbookable once confirmed"
+                );
+                None
             }
         }
     }
@@ -724,8 +810,8 @@ impl BlockFoundApplier {
             return;
         }
 
-        match (event.mode, event.booking) {
-            (MiningMode::Solo, _) => {
+        match (&event.mode, event.booking) {
+            (FoundMode::Solo, _) => {
                 info!(
                     address = address_str,
                     height,
@@ -736,12 +822,12 @@ impl BlockFoundApplier {
                 warn!(
                     address = address_str,
                     height,
-                    mode = ?event.mode,
+                    mode = event.mode.mode().as_str(),
                     "block-found: recorded without booking — engine ledger-write skipped"
                 );
             }
             (
-                MiningMode::Pplns,
+                FoundMode::Pplns { weight_snapshot },
                 Booking::Book {
                     reward_sats: reward,
                 },
@@ -755,7 +841,7 @@ impl BlockFoundApplier {
                         event.actual_coinbase.as_ref(),
                         event.payouts_fingerprint,
                         PendingSettlement::Pplns {
-                            weight_snapshot: event.weight_snapshot.clone(),
+                            weight_snapshot: weight_snapshot.clone(),
                         },
                     )
                     .await
@@ -766,12 +852,12 @@ impl BlockFoundApplier {
                 ),
             },
             (
-                MiningMode::Blockparty,
+                FoundMode::Blockparty(group_id),
                 Booking::Book {
                     reward_sats: reward,
                 },
-            ) => match (event.group_id, self.blockparty.as_ref()) {
-                (Some(group_id), Some(_payouts)) => {
+            ) => match self.blockparty.as_ref() {
+                Some(_payouts) => {
                     self.gate_or_apply(
                         address_str,
                         height,
@@ -779,27 +865,26 @@ impl BlockFoundApplier {
                         block_hash,
                         event.actual_coinbase.as_ref(),
                         event.payouts_fingerprint,
-                        PendingSettlement::Blockparty { group_id },
+                        PendingSettlement::Blockparty {
+                            group_id: *group_id,
+                        },
                     )
                     .await;
                 }
-                (None, _) => warn!(
-                    address = address_str,
-                    height, "block-found: Blockparty mode published WITHOUT a group_id — skipping"
-                ),
-                (Some(_), None) => warn!(
+                None => warn!(
                     address = address_str,
                     height, "block-found: Blockparty mode but payouts not configured — skipping history-row write"
                 ),
             },
             (
-                MiningMode::GroupSolo,
+                FoundMode::GroupSolo(group_id),
                 Booking::Book {
                     reward_sats: reward,
                 },
             ) => {
-                match (event.group_id, self.group_solo.as_ref()) {
-                    (Some(group_id), Some(engine)) => {
+                let group_id = *group_id;
+                match self.group_solo.as_ref() {
+                    Some(engine) => {
                         if self.is_parked(block_hash).await {
                             // A redelivered event: the parked state is the
                             // one taken at the find.
@@ -832,11 +917,7 @@ impl BlockFoundApplier {
                             .await;
                         }
                     }
-                    (None, _) => warn!(
-                        address = address_str,
-                        height, "block-found: Group-Solo mode but mode-gate returned no group_id"
-                    ),
-                    (Some(_), None) => warn!(
+                    None => warn!(
                         address = address_str,
                         height, "block-found: Group-Solo mode but engine not configured"
                     ),
@@ -1097,7 +1178,7 @@ fn block_found_notice(event: &BlockFoundEvent, finder: AddressId) -> BlockFoundN
         .as_ref()
         .map(|actual| {
             actual
-                .paid_to_payees(event.mode)
+                .paid_to_payees(event.mode.mode())
                 .into_iter()
                 .filter_map(|(a, sats)| Some((AddressId::new(a).ok()?, sats)))
                 .collect()
@@ -1105,7 +1186,7 @@ fn block_found_notice(event: &BlockFoundEvent, finder: AddressId) -> BlockFoundN
         .unwrap_or_default();
     BlockFoundNotice {
         height: event.height as u64,
-        mode: event.mode,
+        mode: event.mode.mode(),
         finder,
         paid,
     }
@@ -1368,10 +1449,10 @@ mod tests {
             booking: Booking::RecordOnly,
             block_hash: "00000000deadbeef".to_string(),
             block_data: "ab".repeat(80),
-            mode: MiningMode::Pplns,
-            group_id: None,
+            mode: FoundMode::Pplns {
+                weight_snapshot: None,
+            },
             height: 870_123,
-            weight_snapshot: None,
             payouts_fingerprint: None,
             actual_coinbase: None,
         }
@@ -1389,12 +1470,14 @@ mod tests {
             output_zero: Some((MINER.to_string(), 312_500_000)),
             total_value_sats: 312_500_000,
         });
-        event.mode = MiningMode::Solo;
+        event.mode = FoundMode::Solo;
         assert_eq!(
             block_found_notice(&event, finder.clone()).paid,
             vec![(finder.clone(), 312_500_000)]
         );
-        event.mode = MiningMode::Pplns;
+        event.mode = FoundMode::Pplns {
+            weight_snapshot: None,
+        };
         assert!(block_found_notice(&event, finder).paid.is_empty());
     }
 
@@ -1415,7 +1498,6 @@ mod tests {
         };
         let event = BlockFoundEvent {
             actual_coinbase: None,
-            weight_snapshot: Some(weight_snapshot.clone()),
             payouts_fingerprint: None,
             address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
             worker: "rig1".to_string(),
@@ -1425,13 +1507,14 @@ mod tests {
             },
             block_hash: "00000000deadbeef".to_string(),
             block_data: "ab".repeat(80),
-            mode: MiningMode::Pplns,
-            group_id: None,
+            mode: FoundMode::Pplns {
+                weight_snapshot: Some(weight_snapshot.clone()),
+            },
             height: 870_123,
         };
         let json = serde_json::to_string(&event).expect("serialize");
         let back: BlockFoundEvent = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.mode, MiningMode::Pplns);
+        assert_eq!(back.mode, event.mode);
         assert_eq!(back.height, 870_123);
         assert_eq!(
             back.booking,
@@ -1441,7 +1524,70 @@ mod tests {
         );
         assert_eq!(back.address, event.address);
         assert_eq!(back.block_data, event.block_data);
-        assert_eq!(back.weight_snapshot, Some(weight_snapshot));
+    }
+
+    /// The stream carries the mode as `mode` + `group_id` + `weight_snapshot`,
+    /// the form an older reader decodes, and a group mode without its group
+    /// does not decode.
+    #[test]
+    fn the_event_wire_form_is_mode_plus_group_id_plus_snapshot() {
+        let g = uuid::Uuid::from_u128(0x550e8400_e29b_41d4_a716_446655440000);
+        let snapshot = bp_pplns_engine::window::snapshot::StoredWeightSnapshot {
+            entries: vec![],
+            score_total: 1,
+            fee_ppm: 15_000,
+            fee_address: "bc1qfee".to_string(),
+            reference_revenue_sats: 312_500_000,
+        };
+        let pplns = BlockFoundEvent {
+            mode: FoundMode::Pplns {
+                weight_snapshot: Some(snapshot.clone()),
+            },
+            ..record_only_event()
+        };
+        let v = serde_json::to_value(&pplns).unwrap();
+        assert_eq!(v["mode"], "pplns");
+        assert_eq!(v["group_id"], serde_json::Value::Null);
+        assert_eq!(
+            v["weight_snapshot"],
+            serde_json::to_value(&snapshot).unwrap()
+        );
+        let back: BlockFoundEvent = serde_json::from_value(v).unwrap();
+        assert_eq!(back.mode, pplns.mode);
+
+        for (mode, wire_mode, group_id) in [
+            (FoundMode::Solo, "solo", serde_json::Value::Null),
+            (
+                FoundMode::GroupSolo(g),
+                "group-solo",
+                serde_json::json!(g.to_string()),
+            ),
+            (
+                FoundMode::Blockparty(g),
+                "blockparty",
+                serde_json::json!(g.to_string()),
+            ),
+        ] {
+            let event = BlockFoundEvent {
+                mode: mode.clone(),
+                ..record_only_event()
+            };
+            let v = serde_json::to_value(&event).unwrap();
+            assert_eq!(v["mode"], wire_mode);
+            assert_eq!(v["group_id"], group_id);
+            assert_eq!(v["weight_snapshot"], serde_json::Value::Null);
+            let back: BlockFoundEvent = serde_json::from_value(v).unwrap();
+            assert_eq!(back.mode, mode);
+        }
+
+        let mut v = serde_json::to_value(BlockFoundEvent {
+            mode: FoundMode::GroupSolo(g),
+            ..record_only_event()
+        })
+        .unwrap();
+        v["group_id"] = serde_json::Value::Null;
+        let err = serde_json::from_value::<BlockFoundEvent>(v).unwrap_err();
+        assert!(err.to_string().contains("without its group_id"), "{err}");
     }
 
     /// One rule for every mode that books against a pool-built distribution:

@@ -38,7 +38,7 @@ impl LiveModeMarkerSink {
 impl SharedAcceptedShareSink for LiveModeMarkerSink {
     async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
         // Producer-stamped mode — no gate lookup on the consumer.
-        let mode = share.mode;
+        let mode = share.mode.mode();
         let mode_str = mode.as_str();
 
         let Ok(address) = AddressId::new(share.address.to_string()) else {
@@ -68,7 +68,7 @@ impl SharedAcceptedShareSink for LiveModeMarkerSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bp_share_hook::{MiningMode, SharedAcceptedShare};
+    use bp_share_hook::{MiningModeResult, SharedAcceptedShare};
 
     const REDIS_DEFAULT_URL: &str = "redis://127.0.0.1:16379";
 
@@ -86,7 +86,7 @@ mod tests {
         address: &'a str,
         worker: &'a str,
         session_id: &'a str,
-        mode: MiningMode,
+        mode: MiningModeResult,
     ) -> SharedAcceptedShare<'a> {
         SharedAcceptedShare {
             address,
@@ -100,7 +100,6 @@ mod tests {
             ts_ms: 0,
             share_id: "",
             mode,
-            group_id: None,
         }
     }
 
@@ -120,8 +119,13 @@ mod tests {
             .await
             .unwrap_or(());
 
-        sink.record_accepted(share(address, "wkr", "sessL01", MiningMode::Pplns))
-            .await;
+        sink.record_accepted(share(
+            address,
+            "wkr",
+            "sessL01",
+            bp_share_hook::MiningModeResult::Pplns,
+        ))
+        .await;
 
         let raw: Option<String> = redis
             .get(bp_mining_mode::live_mode_marker_key(address))
@@ -163,8 +167,13 @@ mod tests {
             .unwrap_or(());
 
         // First share — writes "pplns".
-        sink.record_accepted(share(address, "wkr", "sessL02", MiningMode::Pplns))
-            .await;
+        sink.record_accepted(share(
+            address,
+            "wkr",
+            "sessL02",
+            bp_share_hook::MiningModeResult::Pplns,
+        ))
+        .await;
         let v1: Option<String> = redis
             .get(bp_mining_mode::live_mode_marker_key(address))
             .await
@@ -172,8 +181,13 @@ mod tests {
         assert_eq!(v1.as_deref(), Some("pplns"));
 
         // Same mode immediately — debounced, value stays "pplns".
-        sink.record_accepted(share(address, "wkr", "sessL02", MiningMode::Pplns))
-            .await;
+        sink.record_accepted(share(
+            address,
+            "wkr",
+            "sessL02",
+            bp_share_hook::MiningModeResult::Pplns,
+        ))
+        .await;
         let v2: Option<String> = redis
             .get(bp_mining_mode::live_mode_marker_key(address))
             .await
@@ -181,8 +195,13 @@ mod tests {
         assert_eq!(v2.as_deref(), Some("pplns"));
 
         // Mode change — must always write.
-        sink.record_accepted(share(address, "wkr", "sessL02", MiningMode::Solo))
-            .await;
+        sink.record_accepted(share(
+            address,
+            "wkr",
+            "sessL02",
+            bp_share_hook::MiningModeResult::Solo,
+        ))
+        .await;
         let v3: Option<String> = redis
             .get(bp_mining_mode::live_mode_marker_key(address))
             .await

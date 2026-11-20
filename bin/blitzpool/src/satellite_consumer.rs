@@ -75,7 +75,6 @@ fn spawn_group(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use bp_common::MiningMode;
     use bp_share_hook::{SharedAcceptedShare, SharedAcceptedShareOwned};
     use bp_share_stream::StreamProducer;
     use bp_test_support::{connect_redis_in_range_or_skip, redis_db};
@@ -106,8 +105,7 @@ mod tests {
             hash_rate: 1.0,
             ts_ms: 1_700_000_000_000,
             share_id: share_id.into(),
-            mode: MiningMode::Pplns,
-            group_id: None,
+            mode: bp_share_hook::MiningModeResult::Pplns,
         }
     }
 

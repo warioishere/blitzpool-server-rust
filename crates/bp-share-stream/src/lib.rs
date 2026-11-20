@@ -54,8 +54,8 @@ pub const ACCEPTED_STREAM_KEY: &str = "shares:accepted";
 /// apply is PG-idempotent.
 pub const BLOCK_FOUND_STREAM_KEY: &str = "blocks:found";
 
-/// Rejected-share stream (Core → Satellite). The Core stamps `group_id`, so
-/// the consumer needs no mode gate.
+/// Rejected-share stream (Core → Satellite). The Core stamps the Group-Solo
+/// group, so the consumer needs no mode gate.
 pub const REJECTED_STREAM_KEY: &str = "shares:rejected";
 
 /// Miner online/offline events (Front → Satellite). Notify-only, so a
@@ -189,7 +189,7 @@ impl<T: Serialize + Send + Sync + 'static> BufferedPublisher<T> {
 
 /// Publishes accepted shares onto the stream. Being a sink, it sits behind
 /// the Core's in-process composite, so shares arrive already stamped with
-/// `share_id`, `mode` and `group_id`.
+/// `share_id` and `mode`.
 pub struct ProducingSink {
     inner: BufferedPublisher<SharedAcceptedShareOwned>,
 }
@@ -210,7 +210,7 @@ impl SharedAcceptedShareSink for ProducingSink {
 }
 
 /// [`ProducingSink`] for rejected shares; the Core's rejected composite
-/// stamps `group_id` first.
+/// stamps the Group-Solo group first.
 pub struct ProducingRejectedSink {
     inner: BufferedPublisher<SharedRejectedShareOwned>,
 }
@@ -584,7 +584,7 @@ mod tests {
     #![allow(clippy::print_stderr)]
 
     use super::*;
-    use bp_share_hook::MiningMode;
+    use bp_share_hook::MiningModeResult;
     use redis::Client;
 
     const DEFAULT_URL: &str = "redis://127.0.0.1:16379";
@@ -673,11 +673,9 @@ mod tests {
         }
     }
 
-    fn sample(
-        share_id: &str,
-        mode: MiningMode,
-        group_id: Option<&str>,
-    ) -> SharedAcceptedShareOwned {
+    const GROUP: uuid::Uuid = uuid::Uuid::from_u128(0x550e8400_e29b_41d4_a716_446655440000);
+
+    fn sample(share_id: &str, mode: MiningModeResult) -> SharedAcceptedShareOwned {
         SharedAcceptedShareOwned {
             address: "bc1qfoo".into(),
             worker: "rig1".into(),
@@ -690,7 +688,6 @@ mod tests {
             ts_ms: 1_700_000_000_000,
             share_id: share_id.into(),
             mode,
-            group_id: group_id.map(str::to_string),
         }
     }
 
@@ -752,11 +749,11 @@ mod tests {
         consumer.ensure_group().await.expect("ensure_group");
 
         producer
-            .publish(&sample("ep1:0", MiningMode::Pplns, None))
+            .publish(&sample("ep1:0", MiningModeResult::Pplns))
             .await
             .expect("publish");
         producer
-            .publish(&sample("ep1:1", MiningMode::GroupSolo, Some("g")))
+            .publish(&sample("ep1:1", MiningModeResult::GroupSolo(GROUP)))
             .await
             .expect("publish");
 
@@ -796,12 +793,12 @@ mod tests {
         consumer.ensure_group().await.expect("ensure_group");
 
         producer
-            .publish(&sample("ep1:0", MiningMode::Pplns, None))
+            .publish(&sample("ep1:0", MiningModeResult::Pplns))
             .await
             .expect("publish good1");
         xadd_poison(&conn, key).await;
         producer
-            .publish(&sample("ep1:1", MiningMode::GroupSolo, Some("g")))
+            .publish(&sample("ep1:1", MiningModeResult::GroupSolo(GROUP)))
             .await
             .expect("publish good2");
 
@@ -966,7 +963,7 @@ mod tests {
         // Poison FIRST (lowest id → front of the PEL), good share behind it.
         xadd_poison(&conn, key).await;
         producer
-            .publish(&sample("ep1:0", MiningMode::Pplns, None))
+            .publish(&sample("ep1:0", MiningModeResult::Pplns))
             .await
             .expect("publish good");
 
@@ -1033,8 +1030,8 @@ mod tests {
         consumer.ensure_group().await.expect("ensure_group");
 
         let sink = ProducingSink::new(StreamProducer::new(producer_conn, key));
-        let s1 = sample("ep1:0", MiningMode::Pplns, None);
-        let s2 = sample("ep1:1", MiningMode::GroupSolo, Some("group-xyz"));
+        let s1 = sample("ep1:0", MiningModeResult::Pplns);
+        let s2 = sample("ep1:1", MiningModeResult::GroupSolo(GROUP));
         // Drive the sink with stamped views, exactly as the composite would.
         sink.record_accepted(s1.as_view()).await;
         sink.record_accepted(s2.as_view()).await;
@@ -1049,7 +1046,10 @@ mod tests {
         assert_eq!(got.len(), 2);
         // Reconstructed records are identical, in produce order.
         assert_eq!(got[0].value, s1, "the produced record round-trips intact");
-        assert_eq!(got[1].value, s2, "mode + group_id round-trip intact");
+        assert_eq!(
+            got[1].value, s2,
+            "the mode with its group round-trips intact"
+        );
     }
 
     /// A burst larger than one drain batch arrives complete and in order.
@@ -1069,7 +1069,7 @@ mod tests {
         let n = PUBLISH_BATCH * 3 + 7;
         // No yield, so the drain finds more than one batch queued.
         for i in 0..n {
-            sink.record_accepted(sample(&format!("ep1:{i}"), MiningMode::Pplns, None).as_view())
+            sink.record_accepted(sample(&format!("ep1:{i}"), MiningModeResult::Pplns).as_view())
                 .await;
         }
 
@@ -1104,7 +1104,7 @@ mod tests {
         let sink = ProducingSink::new(StreamProducer::new(conn.clone(), key));
         let n = PUBLISH_BATCH + 7;
         for i in 0..n {
-            sink.record_accepted(sample(&format!("ep1:{i}"), MiningMode::Pplns, None).as_view())
+            sink.record_accepted(sample(&format!("ep1:{i}"), MiningModeResult::Pplns).as_view())
                 .await;
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1154,7 +1154,7 @@ mod tests {
             session_id: "sess1".into(),
             reason: bp_share_hook::RejectedReason::LowDifficulty,
             difficulty: 512.0,
-            group_id: Some("550e8400-e29b-41d4-a716-446655440000".into()),
+            group_solo_group: Some(GROUP),
         };
         sink.record_rejected(owned.as_view()).await;
 
@@ -1162,7 +1162,7 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(
             got[0].value, owned,
-            "the rejected record (incl. group_id) round-trips intact"
+            "the rejected record (incl. its group) round-trips intact"
         );
     }
 

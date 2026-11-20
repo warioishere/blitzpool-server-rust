@@ -191,7 +191,7 @@ async fn reject(
             session_id: session,
             reason,
             difficulty: diff,
-            group_id: None,
+            group_solo_group: None,
         })
         .await;
 }

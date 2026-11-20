@@ -30,10 +30,9 @@ pub(crate) fn shared_accepted<'a>(
         ts_ms: bp_common::now_ms(),
         // Producer-assigned downstream at the single fan-out point; the
         // protocol side has no global share sequence and no mode-gate, so it
-        // leaves share_id/mode/group_id blank.
+        // leaves share_id and mode blank.
         share_id: "",
-        mode: bp_common::MiningMode::Solo,
-        group_id: None,
+        mode: bp_share_hook::MiningModeResult::Solo,
     }
 }
 
@@ -68,9 +67,9 @@ pub(crate) fn shared_rejected<'a>(
         session_id: session_id_hex,
         reason: map_sv2_reject(reason)?,
         difficulty: difficulty.as_f64(),
-        // The producer (Core composite) stamps the group id from the mode
+        // The producer (Core composite) stamps the group from the mode
         // gate; the protocol side has none.
-        group_id: None,
+        group_solo_group: None,
     })
 }
 

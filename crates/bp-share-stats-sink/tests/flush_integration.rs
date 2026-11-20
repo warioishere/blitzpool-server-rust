@@ -486,8 +486,7 @@ async fn a_nul_byte_in_a_worker_name_does_not_block_the_flush() {
             hash_rate: 0.0,
             ts_ms: 0,
             share_id: "",
-            mode: bp_common::MiningMode::Solo,
-            group_id: None,
+            mode: bp_share_hook::MiningModeResult::Solo,
         })
         .await;
     }

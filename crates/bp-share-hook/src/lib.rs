@@ -8,7 +8,9 @@
 use async_trait::async_trait;
 
 pub use bp_common::MiningMode;
+pub use bp_mining_mode::MiningModeResult;
 pub use bp_stats::RejectedReason;
+use uuid::Uuid;
 
 /// Protocol-agnostic view of an accepted share, borrowed from the native
 /// `ShareAccept` without copies.
@@ -52,11 +54,10 @@ pub struct SharedAcceptedShare<'a> {
     /// producer stamps it.
     pub share_id: &'a str,
 
-    /// Payout mode stamped by the producer from the authoritative mode gate,
-    /// so consumer sinks need no gate. `Solo` until stamped.
-    pub mode: MiningMode,
-    /// Group id for `GroupSolo` / `Blockparty`, else `None`.
-    pub group_id: Option<&'a str>,
+    /// Payout mode, with its group, stamped by the producer from the
+    /// authoritative mode gate, so consumer sinks need no gate. `Solo` until
+    /// stamped.
+    pub mode: MiningModeResult,
 }
 
 /// Assigns `{epoch}:{seq}` share ids on the Core. `epoch` is fresh per boot
@@ -92,8 +93,10 @@ pub trait SharedAcceptedShareSink: Send + Sync {
 
 /// Owned record of an accepted share for crossing the stream to the
 /// Satellite, which borrows a view back ([`Self::as_view`]) to drive the
-/// exact same [`SharedAcceptedShareSink`] code.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+/// exact same [`SharedAcceptedShareSink`] code. On the stream the mode travels
+/// as `mode` + `group_id`.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(try_from = "AcceptedShareWire<String>")]
 pub struct SharedAcceptedShareOwned {
     pub address: String,
     pub worker: String,
@@ -105,8 +108,65 @@ pub struct SharedAcceptedShareOwned {
     pub hash_rate: f64,
     pub ts_ms: i64,
     pub share_id: String,
-    pub mode: MiningMode,
-    pub group_id: Option<String>,
+    pub mode: MiningModeResult,
+}
+
+/// The stream form of [`SharedAcceptedShareOwned`]: the mode split into
+/// `mode` + `group_id`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AcceptedShareWire<S> {
+    address: S,
+    worker: S,
+    session_id: S,
+    effective_difficulty: f64,
+    submission_difficulty: f64,
+    user_agent: Option<S>,
+    is_block_candidate: bool,
+    hash_rate: f64,
+    ts_ms: i64,
+    share_id: S,
+    mode: MiningMode,
+    group_id: Option<Uuid>,
+}
+
+impl serde::Serialize for SharedAcceptedShareOwned {
+    fn serialize<Ser: serde::Serializer>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error> {
+        AcceptedShareWire::<&str> {
+            address: &self.address,
+            worker: &self.worker,
+            session_id: &self.session_id,
+            effective_difficulty: self.effective_difficulty,
+            submission_difficulty: self.submission_difficulty,
+            user_agent: self.user_agent.as_deref(),
+            is_block_candidate: self.is_block_candidate,
+            hash_rate: self.hash_rate,
+            ts_ms: self.ts_ms,
+            share_id: &self.share_id,
+            mode: self.mode.mode(),
+            group_id: self.mode.group_id(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl TryFrom<AcceptedShareWire<String>> for SharedAcceptedShareOwned {
+    type Error = bp_mining_mode::GroupMissing;
+
+    fn try_from(w: AcceptedShareWire<String>) -> Result<Self, Self::Error> {
+        Ok(Self {
+            mode: MiningModeResult::from_parts(w.mode, w.group_id)?,
+            address: w.address,
+            worker: w.worker,
+            session_id: w.session_id,
+            effective_difficulty: w.effective_difficulty,
+            submission_difficulty: w.submission_difficulty,
+            user_agent: w.user_agent,
+            is_block_candidate: w.is_block_candidate,
+            hash_rate: w.hash_rate,
+            ts_ms: w.ts_ms,
+            share_id: w.share_id,
+        })
+    }
 }
 
 impl SharedAcceptedShareOwned {
@@ -124,7 +184,6 @@ impl SharedAcceptedShareOwned {
             ts_ms: self.ts_ms,
             share_id: &self.share_id,
             mode: self.mode,
-            group_id: self.group_id.as_deref(),
         }
     }
 }
@@ -145,7 +204,6 @@ impl SharedAcceptedShare<'_> {
             ts_ms: self.ts_ms,
             share_id: self.share_id.to_string(),
             mode: self.mode,
-            group_id: self.group_id.map(str::to_string),
         }
     }
 }
@@ -160,9 +218,10 @@ pub struct SharedRejectedShare<'a> {
     pub session_id: &'a str,
     pub reason: RejectedReason,
     pub difficulty: f64,
-    /// Group id for a Group-Solo address, stamped by the producer (the only
-    /// side with the mode gate); the protocol side leaves it `None`.
-    pub group_id: Option<&'a str>,
+    /// The Group-Solo group whose round counts this reject, stamped by the
+    /// producer (the only side with the mode gate); `None` for every other
+    /// mode and before authorize. The protocol side leaves it `None`.
+    pub group_solo_group: Option<Uuid>,
 }
 
 /// Hook for rejected shares. Engines that care about per-mode reject
@@ -181,7 +240,8 @@ pub struct SharedRejectedShareOwned {
     pub session_id: String,
     pub reason: RejectedReason,
     pub difficulty: f64,
-    pub group_id: Option<String>,
+    #[serde(rename = "group_id")]
+    pub group_solo_group: Option<Uuid>,
 }
 
 impl SharedRejectedShareOwned {
@@ -193,7 +253,7 @@ impl SharedRejectedShareOwned {
             session_id: &self.session_id,
             reason: self.reason,
             difficulty: self.difficulty,
-            group_id: self.group_id.as_deref(),
+            group_solo_group: self.group_solo_group,
         }
     }
 }
@@ -207,7 +267,7 @@ impl SharedRejectedShare<'_> {
             session_id: self.session_id.to_string(),
             reason: self.reason,
             difficulty: self.difficulty,
-            group_id: self.group_id.map(str::to_string),
+            group_solo_group: self.group_solo_group,
         }
     }
 }
@@ -356,8 +416,7 @@ mod tests {
             hash_rate: 0.0,
             ts_ms: 0,
             share_id: "",
-            mode: MiningMode::Solo,
-            group_id: None,
+            mode: MiningModeResult::Solo,
         })
         .await;
         let rec = sink.recorded.lock().unwrap();
@@ -384,12 +443,13 @@ mod tests {
             hash_rate: 0.0,
             ts_ms: 0,
             share_id: "",
-            mode: MiningMode::Solo,
-            group_id: None,
+            mode: MiningModeResult::Solo,
         })
         .await;
         assert!(sink.recorded.lock().unwrap()[0].5);
     }
+
+    const GROUP: Uuid = Uuid::from_u128(0x550e8400_e29b_41d4_a716_446655440000);
 
     fn sample_accepted_view<'a>(addr: &'a str, ua: &'a Option<String>) -> SharedAcceptedShare<'a> {
         SharedAcceptedShare {
@@ -403,8 +463,7 @@ mod tests {
             hash_rate: 1234.5,
             ts_ms: 1_700_000_000_123,
             share_id: "ep7:42",
-            mode: MiningMode::GroupSolo,
-            group_id: Some("group-xyz"),
+            mode: MiningModeResult::GroupSolo(GROUP),
         }
     }
 
@@ -426,8 +485,7 @@ mod tests {
         assert_eq!(owned.hash_rate, 1234.5);
         assert_eq!(owned.ts_ms, 1_700_000_000_123);
         assert_eq!(owned.share_id, "ep7:42");
-        assert_eq!(owned.mode, MiningMode::GroupSolo);
-        assert_eq!(owned.group_id.as_deref(), Some("group-xyz"));
+        assert_eq!(owned.mode, MiningModeResult::GroupSolo(GROUP));
 
         // Re-materializing through the borrowed view is lossless.
         let back = owned.as_view().to_owned_record();
@@ -468,7 +526,7 @@ mod tests {
             session_id: "sess-rej",
             reason: RejectedReason::LowDifficulty,
             difficulty: 512.0,
-            group_id: Some("550e8400-e29b-41d4-a716-446655440000"),
+            group_solo_group: Some(GROUP),
         };
         let owned = view.to_owned_record();
         assert_eq!(owned.address.as_deref(), Some("bc1qcarol"));
@@ -476,10 +534,7 @@ mod tests {
         assert_eq!(owned.session_id, "sess-rej");
         assert_eq!(owned.reason, RejectedReason::LowDifficulty);
         assert_eq!(owned.difficulty, 512.0);
-        assert_eq!(
-            owned.group_id.as_deref(),
-            Some("550e8400-e29b-41d4-a716-446655440000")
-        );
+        assert_eq!(owned.group_solo_group, Some(GROUP));
 
         // Pre-authorize reject: address/worker/group absent, must survive.
         let preauth = SharedRejectedShare {
@@ -488,13 +543,56 @@ mod tests {
             session_id: "sess-early",
             reason: RejectedReason::JobNotFound,
             difficulty: 0.0,
-            group_id: None,
+            group_solo_group: None,
         };
         let owned_preauth = preauth.to_owned_record();
         assert!(owned_preauth.address.is_none());
         assert!(owned_preauth.worker.is_none());
-        assert!(owned_preauth.group_id.is_none());
+        assert!(owned_preauth.group_solo_group.is_none());
         // View borrowed back matches the original Option shape.
         assert!(owned_preauth.as_view().address.is_none());
+    }
+
+    /// An accepted share as the stream carried it before the mode became one
+    /// field; entries in flight across a deploy must still decode.
+    const WIRE_ACCEPTED: &str = r#"{"address":"bc1qalice","worker":"rig1","session_id":"sess0001","effective_difficulty":1024.0,"submission_difficulty":2048.0,"user_agent":null,"is_block_candidate":false,"hash_rate":1.5,"ts_ms":1700000000123,"share_id":"ep7:42","mode":"group-solo","group_id":"550e8400-e29b-41d4-a716-446655440000"}"#;
+
+    #[test]
+    fn the_accepted_wire_form_is_mode_plus_group_id() {
+        let owned: SharedAcceptedShareOwned = serde_json::from_str(WIRE_ACCEPTED).unwrap();
+        assert_eq!(owned.mode, MiningModeResult::GroupSolo(GROUP));
+        // Written back, it is the same object: an older reader decodes it.
+        let back: serde_json::Value = serde_json::to_value(&owned).unwrap();
+        let wire: serde_json::Value = serde_json::from_str(WIRE_ACCEPTED).unwrap();
+        assert_eq!(back, wire);
+
+        let solo = WIRE_ACCEPTED
+            .replace("\"group-solo\"", "\"solo\"")
+            .replace("\"550e8400-e29b-41d4-a716-446655440000\"", "null");
+        let owned: SharedAcceptedShareOwned = serde_json::from_str(&solo).unwrap();
+        assert_eq!(owned.mode, MiningModeResult::Solo);
+    }
+
+    #[test]
+    fn an_accepted_group_mode_without_its_group_does_not_decode() {
+        let bad = WIRE_ACCEPTED.replace("\"550e8400-e29b-41d4-a716-446655440000\"", "null");
+        let err = serde_json::from_str::<SharedAcceptedShareOwned>(&bad).unwrap_err();
+        assert!(err.to_string().contains("without its group_id"), "{err}");
+    }
+
+    #[test]
+    fn the_rejected_wire_key_stays_group_id() {
+        let owned = SharedRejectedShareOwned {
+            address: Some("bc1qcarol".into()),
+            worker: Some("rig9".into()),
+            session_id: "s".into(),
+            reason: RejectedReason::LowDifficulty,
+            difficulty: 1.0,
+            group_solo_group: Some(GROUP),
+        };
+        let v = serde_json::to_value(&owned).unwrap();
+        assert_eq!(v["group_id"], "550e8400-e29b-41d4-a716-446655440000");
+        let back: SharedRejectedShareOwned = serde_json::from_value(v).unwrap();
+        assert_eq!(back, owned);
     }
 }

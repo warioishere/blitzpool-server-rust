@@ -86,8 +86,7 @@ fn share<'a>(
         hash_rate: 0.0,
         ts_ms: bp_common::now_ms(),
         share_id: "",
-        mode: bp_share_hook::MiningMode::Solo,
-        group_id: None,
+        mode: bp_share_hook::MiningModeResult::Solo,
     }
 }
 

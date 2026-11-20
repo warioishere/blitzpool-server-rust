@@ -1063,6 +1063,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1118,9 +1119,12 @@ version = "2.4.5"
 dependencies = [
  "async-trait",
  "bp-common",
+ "bp-mining-mode",
  "bp-stats",
  "serde",
+ "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1152,6 +1156,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

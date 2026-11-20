@@ -11,7 +11,7 @@ use std::sync::Arc;
 use bp_group_solo_engine::config::GroupSoloEngineConfig;
 use bp_group_solo_engine::engine::GroupSoloEngine;
 use bp_group_solo_engine::hooks::GroupSoloAcceptedShareSink;
-use bp_share_hook::{MiningMode, SharedAcceptedShareOwned, SharedAcceptedShareSink};
+use bp_share_hook::{MiningModeResult, SharedAcceptedShareOwned, SharedAcceptedShareSink};
 use bp_share_stream::{AcceptedShareFanOut, StreamConsumer, StreamProducer};
 use bp_test_support::{connect_pg_or_skip, connect_redis_in_range_or_skip};
 use redis::aio::ConnectionManager;
@@ -23,7 +23,6 @@ const N: usize = 60;
 /// Deterministic Group-Solo share sequence for one `group_id` — 5 miners,
 /// varying difficulty, stable `share_id`s.
 fn share_seq(group_id: Uuid) -> Vec<SharedAcceptedShareOwned> {
-    let gid = group_id.to_string();
     (0..N)
         .map(|i| SharedAcceptedShareOwned {
             address: format!("bc1qminer{}", i % 5),
@@ -36,8 +35,7 @@ fn share_seq(group_id: Uuid) -> Vec<SharedAcceptedShareOwned> {
             hash_rate: 0.0,
             ts_ms: 1_700_000_000_000 + i as i64,
             share_id: format!("t:{i}"),
-            mode: MiningMode::GroupSolo,
-            group_id: Some(gid.clone()),
+            mode: MiningModeResult::GroupSolo(group_id),
         })
         .collect()
 }

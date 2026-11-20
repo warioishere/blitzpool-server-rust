@@ -98,7 +98,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use bp_common::MiningMode;
     use bp_notifications::command::ChatLanguages;
     use bp_notifications::dispatcher::NotificationDispatcher;
     use bp_share_stream::{Consumed, StreamConsumer, StreamProducer, BLOCK_FOUND_STREAM_KEY};
@@ -106,7 +105,7 @@ mod tests {
     use sqlx::PgPool;
 
     use super::*;
-    use crate::block_sink::{BlockFoundApplier, BlockFoundEvent, Booking};
+    use crate::block_sink::{BlockFoundApplier, BlockFoundEvent, Booking, FoundMode};
 
     const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/blitzpool";
     const ADDR: &str = "bcrt1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l";
@@ -114,7 +113,6 @@ mod tests {
     fn solo_event() -> BlockFoundEvent {
         BlockFoundEvent {
             actual_coinbase: None,
-            weight_snapshot: None,
             payouts_fingerprint: None,
             address: ADDR.to_string(),
             worker: "rig1".to_string(),
@@ -122,8 +120,7 @@ mod tests {
             booking: Booking::RecordOnly,
             block_hash: "00".repeat(32),
             block_data: "00".repeat(80),
-            mode: MiningMode::Solo,
-            group_id: None,
+            mode: FoundMode::Solo,
             height: 101,
         }
     }

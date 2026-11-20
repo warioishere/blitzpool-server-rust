@@ -54,6 +54,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+uuid = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 # Integration tests against docker-Redis need direct redis-rs access
 # (for FLUSHDB / direct zset inspection).

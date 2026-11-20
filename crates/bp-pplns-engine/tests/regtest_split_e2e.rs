@@ -17,7 +17,7 @@ use bp_pplns_engine::engine::PplnsEngine;
 use bp_pplns_engine::hooks::PplnsAcceptedShareSink;
 use bp_pplns_engine::window::NetworkDifficulty;
 use bp_regtest_harness::{RegtestConfig, RegtestNode};
-use bp_share_hook::{MiningMode, SharedAcceptedShareOwned, SharedAcceptedShareSink};
+use bp_share_hook::{SharedAcceptedShareOwned, SharedAcceptedShareSink};
 use bp_share_stream::{AcceptedShareFanOut, StreamConsumer, StreamProducer};
 use bp_template_distribution::{TdpConfig, TdpHandle};
 use sqlx::PgPool;
@@ -42,8 +42,7 @@ fn mk_share(share_id: &str, address: &str, diff: f64) -> SharedAcceptedShareOwne
         hash_rate: 0.0,
         ts_ms: 1_700_000_000_000,
         share_id: share_id.to_string(),
-        mode: MiningMode::Pplns,
-        group_id: None,
+        mode: bp_share_hook::MiningModeResult::Pplns,
     }
 }
 

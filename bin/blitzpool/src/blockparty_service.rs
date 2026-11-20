@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bp_blockparty_engine::{BlockpartyPayouts, BlockpartyService, CoinbaseReservation};
-use bp_common::{AddressId, MiningMode, StreamKind};
+use bp_common::{AddressId, StreamKind};
 use bp_config::AppConfig;
-use bp_share_hook::{SharedAcceptedShare, SharedAcceptedShareSink};
+use bp_share_hook::{MiningModeResult, SharedAcceptedShare, SharedAcceptedShareSink};
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -92,9 +92,9 @@ impl BlockpartyAcceptedShareSink {
 #[async_trait]
 impl SharedAcceptedShareSink for BlockpartyAcceptedShareSink {
     async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
-        if share.mode != MiningMode::Blockparty {
+        let MiningModeResult::Blockparty(_) = share.mode else {
             return;
-        }
+        };
         let Ok(addr) = AddressId::new(share.address.to_string()) else {
             return;
         };

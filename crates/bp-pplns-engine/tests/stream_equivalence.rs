@@ -13,7 +13,7 @@ use bp_pplns_engine::config::PplnsEngineConfig;
 use bp_pplns_engine::engine::PplnsEngine;
 use bp_pplns_engine::hooks::PplnsAcceptedShareSink;
 use bp_pplns_engine::window::NetworkDifficulty;
-use bp_share_hook::{MiningMode, SharedAcceptedShareOwned, SharedAcceptedShareSink};
+use bp_share_hook::{MiningModeResult, SharedAcceptedShareOwned, SharedAcceptedShareSink};
 use bp_share_stream::{AcceptedShareFanOut, StreamConsumer, StreamProducer};
 use bp_test_support::{connect_pg_or_skip, connect_redis_in_range_or_skip};
 use redis::aio::ConnectionManager;
@@ -35,8 +35,7 @@ fn share_seq() -> Vec<SharedAcceptedShareOwned> {
             hash_rate: 0.0,
             ts_ms: 1_700_000_000_000 + i as i64,
             share_id: format!("t:{i}"),
-            mode: MiningMode::Pplns,
-            group_id: None,
+            mode: bp_share_hook::MiningModeResult::Pplns,
         })
         .collect()
 }
@@ -205,7 +204,7 @@ async fn duplicate_entries_in_the_stream_do_not_break_equivalence() {
 
 fn mk_share(
     share_id: &str,
-    mode: MiningMode,
+    mode: MiningModeResult,
     address: &str,
     diff: f64,
     ts_ms: i64,
@@ -222,7 +221,6 @@ fn mk_share(
         ts_ms,
         share_id: share_id.to_string(),
         mode,
-        group_id: None,
     }
 }
 
@@ -241,10 +239,10 @@ async fn mixed_epoch_share_ids_apply_once_without_seq_collision() {
 
     let addr = "bc1qmixedepoch";
     let shares = vec![
-        mk_share("1:0", MiningMode::Pplns, addr, 1.0, 1_700_000_000_000),
-        mk_share("1:1", MiningMode::Pplns, addr, 1.0, 1_700_000_000_001),
-        mk_share("2:0", MiningMode::Pplns, addr, 1.0, 1_700_000_000_002),
-        mk_share("2:1", MiningMode::Pplns, addr, 1.0, 1_700_000_000_003),
+        mk_share("1:0", MiningModeResult::Pplns, addr, 1.0, 1_700_000_000_000),
+        mk_share("1:1", MiningModeResult::Pplns, addr, 1.0, 1_700_000_000_001),
+        mk_share("2:0", MiningModeResult::Pplns, addr, 1.0, 1_700_000_000_002),
+        mk_share("2:1", MiningModeResult::Pplns, addr, 1.0, 1_700_000_000_003),
     ];
     // Redelivery of one id from each epoch — must dedup, not double-count.
     let dups = vec![shares[0].clone(), shares[2].clone()];
@@ -280,11 +278,17 @@ async fn only_pplns_mode_shares_land_in_the_pplns_window() {
 
     let addr = "bc1qmodeonshare";
     let shares = vec![
-        mk_share("m:0", MiningMode::Pplns, addr, 1.0, 1_700_000_000_000),
-        mk_share("m:1", MiningMode::Solo, addr, 5.0, 1_700_000_000_001),
-        mk_share("m:2", MiningMode::Pplns, addr, 1.0, 1_700_000_000_002),
-        mk_share("m:3", MiningMode::GroupSolo, addr, 9.0, 1_700_000_000_003),
-        mk_share("m:4", MiningMode::Pplns, addr, 1.0, 1_700_000_000_004),
+        mk_share("m:0", MiningModeResult::Pplns, addr, 1.0, 1_700_000_000_000),
+        mk_share("m:1", MiningModeResult::Solo, addr, 5.0, 1_700_000_000_001),
+        mk_share("m:2", MiningModeResult::Pplns, addr, 1.0, 1_700_000_000_002),
+        mk_share(
+            "m:3",
+            MiningModeResult::GroupSolo(uuid::Uuid::from_u128(1)),
+            addr,
+            9.0,
+            1_700_000_000_003,
+        ),
+        mk_share("m:4", MiningModeResult::Pplns, addr, 1.0, 1_700_000_000_004),
     ];
 
     let engine = spawn_engine(conn.clone(), pool).await;
@@ -320,7 +324,7 @@ async fn pplns_touch_uses_share_time_not_consume_time() {
     let addr = "bc1qtsreplay";
     // A deliberately old accept time; consume happens "now" (~1.7e12+).
     let old_ts: i64 = 1_600_000_000_000;
-    let shares = vec![mk_share("r:0", MiningMode::Pplns, addr, 1.0, old_ts)];
+    let shares = vec![mk_share("r:0", MiningModeResult::Pplns, addr, 1.0, old_ts)];
 
     let engine = spawn_engine(conn.clone(), pool).await;
     let sink: Arc<dyn SharedAcceptedShareSink> =

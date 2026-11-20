@@ -21,7 +21,7 @@ fn share<'a>(
         session_id,
         reason,
         difficulty,
-        group_id: None,
+        group_solo_group: None,
     }
 }
 
@@ -170,8 +170,7 @@ async fn accepted_share_with_unusable_difficulty_is_silently_discarded() {
             hash_rate: 0.0,
             ts_ms: 0,
             share_id: "",
-            mode: bp_share_hook::MiningMode::Solo,
-            group_id: None,
+            mode: bp_share_hook::MiningModeResult::Solo,
         })
         .await;
     }

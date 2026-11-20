@@ -33,3 +33,4 @@ tokio-util = { workspace = true }
 # concurrent tests from FLUSHDB-ing each other.
 bp-test-support = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+uuid = { workspace = true }
