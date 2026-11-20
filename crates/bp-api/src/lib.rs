@@ -33,7 +33,7 @@ pub fn build_router(state: SharedState) -> Router {
     Router::new()
         .merge(controllers::info::routes())
         .merge(controllers::pplns::routes())
-        .merge(controllers::groups::routes(state.clone()))
+        .merge(controllers::groups::routes())
         .merge(controllers::address_access::routes())
         .merge(controllers::address_ownership::routes())
         .merge(controllers::custom_extranonce::routes())

@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `/api/pplns/groups/*`. Admin-only routes sit behind
-//! [`crate::middleware::admin_auth::require_admin`], with the service check
-//! kept as defence-in-depth; where the token only shapes the response, the
-//! handler checks it inline.
+//! `/api/pplns/groups/*`. An admin route hands the `x-admin-token` header to
+//! its service method, which checks it; where the token only shapes the
+//! response, the handler checks it inline.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -12,7 +11,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::Json,
     routing::{delete, get, patch, post},
-    Extension, Router,
+    Router,
 };
 use bp_common::AddressId;
 use bp_db::PatchField;
@@ -23,15 +22,12 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::middleware::admin_auth::{require_admin, AdminAuth};
 use crate::middleware::{rate_limit, require_address_token};
 use crate::response_cache::{JsonBytes, TtlKind};
 use crate::state::SharedState;
 use crate::utils::{build_member_labels, member_id};
 
-pub(crate) fn routes(state: SharedState) -> Router<SharedState> {
-    // `route_layer` applies only to routes registered before it, so every
-    // admin route must be added above the layer call.
+pub(crate) fn routes() -> Router<SharedState> {
     let admin_routes = Router::new()
         // ─── admin writers ───────────────────────────────────────
         .route("/api/pplns/groups/{id}/transfer", post(transfer))
@@ -57,8 +53,7 @@ pub(crate) fn routes(state: SharedState) -> Router<SharedState> {
         .route(
             "/api/pplns/groups/{id}/join-requests/{req_id}/reject",
             post(reject_join_request),
-        )
-        .route_layer(axum::middleware::from_fn_with_state(state, require_admin));
+        );
 
     let public_routes = Router::new()
         .route("/api/pplns/groups/public", get(list_public))
@@ -231,12 +226,12 @@ struct TransferResponse {
 async fn transfer(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
-    Extension(auth): Extension<AdminAuth>,
+    headers: HeaderMap,
     Json(body): Json<TransferBody>,
 ) -> Result<Json<TransferResponse>, ApiError> {
     let svc = require_group_service(&state)?;
     let res = svc
-        .transfer_creator(id, &body.to_address, Some(&auth.admin_token))
+        .transfer_creator(id, &body.to_address, admin_token(&headers))
         .await?;
     invalidate_group_cache(&state, id).await;
     if let Ok(addr) = AddressId::new(body.to_address.clone()) {
@@ -295,7 +290,7 @@ fn lift_patch<T: Clone, R>(field: &Option<Option<T>>, map: impl Fn(&T) -> R) -> 
 async fn update_settings(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
-    Extension(auth): Extension<AdminAuth>,
+    headers: HeaderMap,
     Json(body): Json<UpdateSettingsBody>,
 ) -> Result<Json<GroupSummary>, ApiError> {
     let svc = require_group_service(&state)?;
@@ -336,7 +331,7 @@ async fn update_settings(
         },
     };
     let row = svc
-        .update_round_reset_config(id, settings, Some(&auth.admin_token))
+        .update_round_reset_config(id, settings, admin_token(&headers))
         .await?;
     invalidate_group_cache(&state, id).await;
     Ok(Json(GroupSummary::from(row)))
@@ -392,10 +387,10 @@ struct DissolveResponse {
 async fn dissolve(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
-    Extension(auth): Extension<AdminAuth>,
+    headers: HeaderMap,
 ) -> Result<Json<DissolveResponse>, ApiError> {
     let svc = require_group_service(&state)?;
-    svc.dissolve_group(id, Some(&auth.admin_token)).await?;
+    svc.dissolve_group(id, admin_token(&headers)).await?;
     invalidate_group_cache(&state, id).await;
     Ok(Json(DissolveResponse { dissolved: true }))
 }
@@ -421,7 +416,7 @@ struct CreateOpenInviteResponse {
 async fn create_open_invite(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
-    Extension(auth): Extension<AdminAuth>,
+    headers: HeaderMap,
     Json(body): Json<CreateOpenInviteBody>,
 ) -> Result<(StatusCode, Json<CreateOpenInviteResponse>), ApiError> {
     let inv_svc = require_invitation_service(&state)?;
@@ -430,7 +425,7 @@ async fn create_open_invite(
         status: StatusCode::BAD_REQUEST,
     })?;
     let created = inv_svc
-        .create_open_invite(id, ttl, Some(&auth.admin_token), body.approval_required)
+        .create_open_invite(id, ttl, admin_token(&headers), body.approval_required)
         .await
         .map_err(crate::controllers::invitation::invitation_to_api_error)?;
     invalidate_group_cache(&state, id).await;
@@ -459,11 +454,11 @@ struct OpenInviteRevokedResponse {
 async fn revoke_open_invite(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
-    Extension(auth): Extension<AdminAuth>,
+    headers: HeaderMap,
 ) -> Result<Json<OpenInviteRevokedResponse>, ApiError> {
     let inv_svc = require_invitation_service(&state)?;
     inv_svc
-        .revoke_open_invite(id, Some(&auth.admin_token))
+        .revoke_open_invite(id, admin_token(&headers))
         .await
         .map_err(crate::controllers::invitation::invitation_to_api_error)?;
     invalidate_group_cache(&state, id).await;
@@ -479,10 +474,10 @@ struct RemovedResponse {
 async fn remove_member(
     State(state): State<SharedState>,
     Path((id, address)): Path<(Uuid, String)>,
-    Extension(auth): Extension<AdminAuth>,
+    headers: HeaderMap,
 ) -> Result<Json<RemovedResponse>, ApiError> {
     let svc = require_group_service(&state)?;
-    svc.remove_member(id, &address, Some(&auth.admin_token))
+    svc.remove_member(id, &address, admin_token(&headers))
         .await?;
     invalidate_group_cache(&state, id).await;
     if let Ok(addr) = AddressId::new(address) {
@@ -505,11 +500,11 @@ struct RejectedResponse {
 async fn approve_join_request(
     State(state): State<SharedState>,
     Path((id, req_id)): Path<(Uuid, Uuid)>,
-    Extension(auth): Extension<AdminAuth>,
+    headers: HeaderMap,
 ) -> Result<Json<ApprovedResponse>, ApiError> {
     let jr_svc = require_join_request_service(&state)?;
     jr_svc
-        .approve_request(id, req_id, Some(&auth.admin_token))
+        .approve_request(id, req_id, admin_token(&headers))
         .await
         .map_err(jr_to_api_error)?;
     invalidate_group_cache(&state, id).await;
@@ -524,11 +519,11 @@ async fn approve_join_request(
 async fn reject_join_request(
     State(state): State<SharedState>,
     Path((id, req_id)): Path<(Uuid, Uuid)>,
-    Extension(auth): Extension<AdminAuth>,
+    headers: HeaderMap,
 ) -> Result<Json<RejectedResponse>, ApiError> {
     let jr_svc = require_join_request_service(&state)?;
     jr_svc
-        .reject_request(id, req_id, Some(&auth.admin_token))
+        .reject_request(id, req_id, admin_token(&headers))
         .await
         .map_err(jr_to_api_error)?;
     invalidate_group_cache(&state, id).await;
