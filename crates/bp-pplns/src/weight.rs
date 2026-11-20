@@ -86,15 +86,11 @@ pub fn output_weight_for_address(address: &str) -> u32 {
 }
 
 /// Worst-case miner outputs a budget can hold, assuming every output is the
-/// heaviest type; at least 1. The pool output is reserved at every fee, as
-/// the blockspace cut does: one slot too many would let `GroupService` admit
-/// a member the coinbase cannot pay, whose share then goes to the pool.
+/// heaviest type. The pool output is reserved at every fee, as the blockspace
+/// cut does: one slot too many would let `GroupService` admit a member the
+/// coinbase cannot pay, whose share then goes to the pool.
 pub fn max_coinbase_outputs(budget: u32) -> u64 {
-    let fixed = budget_for_outputs(0);
-    if budget <= fixed {
-        return 1;
-    }
-    ((budget - fixed) / COINBASE_OUTPUT_WEIGHT) as u64
+    (budget.saturating_sub(budget_for_outputs(0)) / COINBASE_OUTPUT_WEIGHT) as u64
 }
 
 /// Validation error for the fee / min-payout / coinbase-budget knobs shared
@@ -250,16 +246,17 @@ mod tests {
             COINBASE_BASE_WEIGHT + BUDGET_SAFETY_MARGIN_WU + COINBASE_WITNESS_COMMITMENT_WEIGHT;
         // One worst-case output of headroom above the non-pool overhead
         // still fits NO member: that slot is the pool's.
-        assert_eq!(max_coinbase_outputs(fixed + COINBASE_OUTPUT_WEIGHT), 1);
+        assert_eq!(max_coinbase_outputs(fixed + COINBASE_OUTPUT_WEIGHT), 0);
         // Two, and exactly one member fits.
         assert_eq!(max_coinbase_outputs(fixed + 2 * COINBASE_OUTPUT_WEIGHT), 1);
         assert_eq!(max_coinbase_outputs(fixed + 3 * COINBASE_OUTPUT_WEIGHT), 2);
     }
 
+    /// Below what the cut reserves, no output fits.
     #[test]
-    fn max_outputs_degenerate_budget_returns_at_least_one() {
-        assert_eq!(max_coinbase_outputs(0), 1);
-        assert_eq!(max_coinbase_outputs(COINBASE_BASE_WEIGHT), 1);
+    fn a_budget_below_the_reserve_holds_no_output() {
+        assert_eq!(max_coinbase_outputs(0), 0);
+        assert_eq!(max_coinbase_outputs(COINBASE_BASE_WEIGHT), 0);
     }
 
     /// Budget and output count are exact inverses, so a party or team sized by
@@ -269,11 +266,7 @@ mod tests {
         for n in 1..=2_000u32 {
             let budget = budget_for_outputs(n);
             assert_eq!(max_coinbase_outputs(budget), u64::from(n), "n = {n}");
-            // One WU short holds one output less; below the minimum budget,
-            // which boot refuses, the count is not defined.
-            if n > 1 {
-                assert_eq!(max_coinbase_outputs(budget - 1), u64::from(n - 1));
-            }
+            assert_eq!(max_coinbase_outputs(budget - 1), u64::from(n - 1));
         }
     }
 
