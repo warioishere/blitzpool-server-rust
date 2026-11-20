@@ -684,7 +684,7 @@ async fn run_mining_connection(
                                 &channel_session,
                                 address.as_str(),
                                 &worker,
-                                Some(session_user_agent(state.user_agent.as_deref())),
+                                Some(state.user_agent.as_str()),
                             )
                             .await;
                         if state.stream.is_pplns() {
@@ -1018,12 +1018,6 @@ fn open_channel_refusal(outbound: &[OutboundFrame]) -> Option<&str> {
         OutboundFrame::OpenMiningChannelError { error_code, .. } => Some(error_code.as_str()),
         _ => None,
     })
-}
-
-/// The session's user agent, with an empty vendor recorded as the
-/// `jd-client/sv2` placeholder.
-fn session_user_agent(user_agent: Option<&str>) -> &str {
-    user_agent.unwrap_or("jd-client/sv2")
 }
 
 // ── Dispatch + Outbound write helpers ───────────────────────────────
@@ -1494,7 +1488,7 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                         address.as_str(),
                         &worker,
                         &session_id,
-                        Some(session_user_agent(state.user_agent.as_deref())),
+                        Some(state.user_agent.as_str()),
                         true,
                     )
                     .await;
@@ -1509,7 +1503,7 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                             address_str,
                             &worker,
                             &session_id,
-                            Some(session_user_agent(state.user_agent.as_deref())),
+                            Some(state.user_agent.as_str()),
                             false,
                         )
                         .await;
@@ -1567,7 +1561,7 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                         address_str,
                         effective_worker,
                         &channel.session_id,
-                        state.user_agent.as_deref(),
+                        Some(state.user_agent.as_str()),
                         &accept,
                         state
                             .vardiff
@@ -2512,40 +2506,45 @@ mod tests {
 
     // ── User agent ────────────────────────────────────────────────
 
-    /// An empty vendor becomes the `jd-client/sv2` placeholder on the session row.
+    /// A vendor is recorded as `{vendor}/sv2`, work selection or not. Without
+    /// one (empty, or nothing left after normalising) a work-selecting
+    /// connection is `jd-client/sv2`, as SRI's jd-client sends no vendor, and
+    /// any other is `unknown`, the user agent SV1 records for a nameless miner.
     #[test]
     fn user_agent_from_vendor() {
         use crate::mining::client::vendor_user_agent;
-        assert_eq!(vendor_user_agent("bitaxe").as_deref(), Some("bitaxe/sv2"));
-        assert_eq!(vendor_user_agent(""), None);
-        assert_eq!(session_user_agent(Some("bitaxe/sv2")), "bitaxe/sv2");
-        assert_eq!(session_user_agent(None), "jd-client/sv2");
+        assert_eq!(vendor_user_agent("bitaxe", false), "bitaxe/sv2");
+        assert_eq!(vendor_user_agent("bitaxe", true), "bitaxe/sv2");
+        assert_eq!(vendor_user_agent("", true), "jd-client/sv2");
+        assert_eq!(vendor_user_agent("/x", true), "jd-client/sv2");
+        assert_eq!(vendor_user_agent("", false), "unknown");
+        assert_eq!(vendor_user_agent("/x", false), "unknown");
+        assert_eq!(
+            vendor_user_agent("", false),
+            bp_common::recorded_user_agent(None),
+            "SV1 and SV2 record a nameless miner alike"
+        );
     }
 
     /// The vendor is normalised like an SV1 user agent before `/sv2` is appended.
     #[test]
     fn user_agent_normalises_vendor_like_sv1() {
         use crate::mining::client::vendor_user_agent;
+        assert_eq!(vendor_user_agent("cgminer/4.11.1", false), "cgminer/sv2");
         assert_eq!(
-            vendor_user_agent("cgminer/4.11.1").as_deref(),
-            Some("cgminer/sv2")
-        );
-        assert_eq!(
-            vendor_user_agent("bosminer-plus-tuner x").as_deref(),
-            Some("Braiins OS/sv2")
+            vendor_user_agent("bosminer-plus-tuner x", false),
+            "Braiins OS/sv2"
         );
     }
 
-    /// SetupConnection records the session's user agent from its vendor.
-    #[test]
-    fn setup_connection_records_the_vendor_user_agent() {
+    fn setup_with(vendor: &str, flags: u32) -> MiningSessionState<Arc<TestClock>> {
         let mut s = fresh_test_session();
         let setup = InboundMiningFrame::SetupConnection(SetupConnectionInput {
             protocol: PROTOCOL_MINING,
             min_version: 2,
             max_version: 2,
-            flags: FLAG_REQUIRES_VERSION_ROLLING,
-            vendor: "cgminer/4.11.1".to_string(),
+            flags,
+            vendor: vendor.to_string(),
         });
         let _ = dispatch_inbound_frame(
             &mut s,
@@ -2555,7 +2554,24 @@ mod tests {
             &crate::hooks::NoOpHooks,
             0,
         );
-        assert_eq!(s.user_agent.as_deref(), Some("cgminer/sv2"));
+        assert!(s.setup_complete, "precondition: setup succeeded");
+        s
+    }
+
+    /// SetupConnection records the session's user agent from its vendor and,
+    /// without one, from its work-selection flag: SRI's jd-client sends an
+    /// empty vendor with `REQUIRES_WORK_SELECTION | REQUIRES_VERSION_ROLLING`.
+    #[test]
+    fn setup_connection_records_the_vendor_user_agent() {
+        let s = setup_with("cgminer/4.11.1", FLAG_REQUIRES_VERSION_ROLLING);
+        assert_eq!(s.user_agent, "cgminer/sv2");
+        let s = setup_with(
+            "",
+            FLAG_REQUIRES_WORK_SELECTION | FLAG_REQUIRES_VERSION_ROLLING,
+        );
+        assert_eq!(s.user_agent, "jd-client/sv2");
+        let s = setup_with("", FLAG_REQUIRES_VERSION_ROLLING);
+        assert_eq!(s.user_agent, "unknown");
     }
 
     // ── ServerConfig defaults ─────────────────────────────────────

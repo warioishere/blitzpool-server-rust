@@ -110,8 +110,9 @@ pub struct SubscribeRequest {
     pub id: RpcId,
     /// `None` when the client sent `params: []` (Braiins-style probe).
     pub raw_user_agent: Option<String>,
-    /// Normalised label for behaviour dispatch and stats; `"unknown"` when
-    /// `raw_user_agent` is absent.
+    /// Normalised label for behaviour dispatch and stats, see
+    /// [`bp_common::recorded_user_agent`]; `"unknown"` when `raw_user_agent`
+    /// is absent or normalises to nothing.
     pub user_agent: String,
 }
 
@@ -462,10 +463,7 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
             // params[0] is optional: marketplace probers send `params: []`.
             let arr = params.unwrap().as_array().unwrap();
             let raw_ua = arr.first().and_then(|v| v.as_str()).map(String::from);
-            let user_agent = raw_ua
-                .as_deref()
-                .map(bp_common::normalize_user_agent)
-                .unwrap_or_else(|| "unknown".to_string());
+            let user_agent = bp_common::recorded_user_agent(raw_ua.as_deref());
             Ok(SV1Request::Subscribe(SubscribeRequest {
                 id,
                 raw_user_agent: raw_ua,
@@ -746,6 +744,22 @@ mod tests {
                 assert_eq!(s.user_agent, "unknown");
             }
             other => panic!("expected Subscribe, got {:?}", other),
+        }
+    }
+
+    /// A user agent with nothing left after normalising is recorded as
+    /// `unknown`, as an absent one is, never as an empty string.
+    #[test]
+    fn parse_subscribe_with_a_nameless_user_agent() {
+        for ua in ["", "/1.0"] {
+            let line = format!(r#"{{"id":1,"method":"mining.subscribe","params":["{ua}"]}}"#);
+            match parse_request(&line).expect("ok") {
+                SV1Request::Subscribe(s) => {
+                    assert_eq!(s.raw_user_agent.as_deref(), Some(ua));
+                    assert_eq!(s.user_agent, "unknown", "raw {ua:?}");
+                }
+                other => panic!("expected Subscribe, got {:?}", other),
+            }
         }
     }
 

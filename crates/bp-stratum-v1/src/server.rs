@@ -558,15 +558,13 @@ async fn run_connection(
                                 // instead of its success, and the connection closes.
                                 refuse_authorize(&mut state, &mut outcome, refusal);
                             } else {
-                                let user_agent =
-                                    state.subscription.as_ref().map(|s| s.user_agent.clone());
                                 hooks
                                     .session_persistence
                                     .register_session(
                                         &state.session_id_hex,
                                         address.as_str(),
                                         &worker,
-                                        user_agent.as_deref(),
+                                        Some(state.recorded_user_agent()),
                                     )
                                     .await;
                                 if state.stream.is_pplns() {
@@ -851,7 +849,7 @@ pub(crate) async fn process_event<C: bp_vardiff::Clock>(
         SessionEvent::Authorized { address, worker } => {
             // `register_session` runs in the connection loop before stream
             // routing; here it would be too late and double the gate refcount.
-            let user_agent = state.subscription.as_ref().map(|s| s.user_agent.as_str());
+            let user_agent = Some(state.recorded_user_agent());
             hooks
                 .device_status_sink
                 .on_device_event(
@@ -876,7 +874,7 @@ pub(crate) async fn process_event<C: bp_vardiff::Clock>(
                     address,
                     worker,
                     &state.session_id_hex,
-                    state.subscription.as_ref().map(|s| s.user_agent.as_str()),
+                    Some(state.recorded_user_agent()),
                     &accept,
                     state.hash_rate,
                 ))
@@ -917,7 +915,7 @@ pub(crate) async fn process_event<C: bp_vardiff::Clock>(
                         auth.address.as_str(),
                         auth.worker.as_str(),
                         &state.session_id_hex,
-                        state.subscription.as_ref().map(|s| s.user_agent.as_str()),
+                        Some(state.recorded_user_agent()),
                         false,
                     )
                     .await;

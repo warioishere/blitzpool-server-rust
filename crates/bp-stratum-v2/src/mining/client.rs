@@ -445,9 +445,9 @@ pub struct MiningSessionState<C: Clock> {
     pub session_id: u32,
     pub network: Network,
     pub address: Option<AddressId>,
-    /// User agent derived from the SetupConnection `vendor`; `None` when the
-    /// vendor normalises to nothing.
-    pub user_agent: Option<String>,
+    /// User agent derived from the SetupConnection `vendor`, see
+    /// `vendor_user_agent`. Every channel opens after SetupConnection.
+    pub user_agent: String,
     /// TDP template stream, fixed at OpenChannel so the block-submit handle
     /// always matches the template the job was built on; see
     /// [`Self::accounting_stream`].
@@ -535,7 +535,7 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             session_id,
             network: port.network,
             address: None,
-            user_agent: None,
+            user_agent: bp_common::UNKNOWN_USER_AGENT.to_string(),
             stream: StreamKind::Pplns,
             accounting_stream: StreamKind::Pplns,
             current_template: None,
@@ -630,13 +630,23 @@ fn setup_rejected(error_code: &str, reason: String) -> HandlerOutcome {
     outcome
 }
 
+/// The user agent of a work-selecting connection that names no vendor: a
+/// connection with `REQUIRES_WORK_SELECTION` is a Job Declarator Client, and
+/// SRI's jd-client sends an empty vendor.
+const JD_CLIENT_USER_AGENT: &str = "jd-client/sv2";
+
 /// `"{vendor}/sv2"`: the user agent a connection's SetupConnection `vendor`
 /// is recorded under (`bitaxe/sv2`, `NerdQAxe++/sv2`), with the vendor
 /// normalised the way SV1 normalises its user agent
-/// ([`bp_common::normalize_user_agent`]); `None` when that leaves nothing.
-pub(crate) fn vendor_user_agent(vendor: &str) -> Option<String> {
-    let normalized = bp_common::normalize_user_agent(vendor);
-    (!normalized.is_empty()).then(|| format!("{normalized}/sv2"))
+/// ([`bp_common::normalize_user_agent`]). When that leaves nothing:
+/// [`JD_CLIENT_USER_AGENT`] for a work-selecting connection, else
+/// [`bp_common::UNKNOWN_USER_AGENT`] as on SV1.
+pub(crate) fn vendor_user_agent(vendor: &str, work_selection: bool) -> String {
+    match bp_common::named_user_agent(vendor) {
+        Some(name) => format!("{name}/sv2"),
+        None if work_selection => JD_CLIENT_USER_AGENT.to_string(),
+        None => bp_common::UNKNOWN_USER_AGENT.to_string(),
+    }
 }
 
 /// Handle `SetupConnection`: a version range without a common version or an
@@ -673,9 +683,9 @@ pub fn handle_setup_connection<C: Clock>(
     }
 
     state.setup_complete = true;
-    state.user_agent = vendor_user_agent(&input.vendor);
     state.requires_standard_jobs = (input.flags & FLAG_REQUIRES_STANDARD_JOBS) != 0;
     state.work_selection = (input.flags & FLAG_REQUIRES_WORK_SELECTION) != 0;
+    state.user_agent = vendor_user_agent(&input.vendor, state.work_selection);
 
     // Build `Success.flags` fresh, NEVER echo `input.flags`: an echo would map
     // REQUIRES_STANDARD_JOBS onto REQUIRES_FIXED_VERSION. A work-selection

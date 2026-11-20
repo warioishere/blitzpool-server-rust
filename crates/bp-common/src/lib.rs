@@ -35,7 +35,9 @@ pub mod live_client_key;
 pub mod pool_ui;
 pub use pool_ui::pool_ui_link;
 pub mod user_agent;
-pub use user_agent::normalize_user_agent;
+pub use user_agent::{
+    named_user_agent, normalize_user_agent, recorded_user_agent, UNKNOWN_USER_AGENT,
+};
 
 #[cfg(feature = "sqlx")]
 mod sqlx_impls;

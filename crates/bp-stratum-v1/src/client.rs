@@ -82,6 +82,15 @@ pub(crate) struct SessionState<C: Clock> {
 }
 
 impl<C: Clock> SessionState<C> {
+    /// The user agent this session is recorded under: the subscription's, or
+    /// [`bp_common::UNKNOWN_USER_AGENT`] when the miner authorizes before it
+    /// subscribes.
+    pub(crate) fn recorded_user_agent(&self) -> &str {
+        self.subscription
+            .as_ref()
+            .map_or(bp_common::UNKNOWN_USER_AGENT, |s| s.user_agent.as_str())
+    }
+
     /// `extranonce1` is seeded from `session_id_hex` for tests that run
     /// without an allocator; the server overwrites it with a pool-wide
     /// collision-free prefix (`server::SharedExtranonce`) so two sessions
@@ -854,9 +863,7 @@ mod tests {
     /// Normalizes the raw UA as the parser does, so the `== "cpuminer"`
     /// check fires as it would in production.
     fn subscribe_req(raw_ua: Option<&str>) -> SubscribeRequest {
-        let refined = raw_ua
-            .map(bp_common::normalize_user_agent)
-            .unwrap_or_else(|| "unknown".to_string());
+        let refined = bp_common::recorded_user_agent(raw_ua);
         SubscribeRequest {
             id: RpcId::from(1),
             raw_user_agent: raw_ua.map(String::from),
@@ -879,6 +886,17 @@ mod tests {
             address: addr.to_string(),
             sats: 5_000_000_000,
         }])
+    }
+
+    /// A session that authorizes before subscribing is recorded as `unknown`,
+    /// as a nameless subscription is; after subscribing, under its user agent.
+    #[test]
+    fn recorded_user_agent_before_and_after_subscribe() {
+        let port = solo_port(1.0);
+        let mut state = fresh_state(TestClock::new(0), &port);
+        assert_eq!(state.recorded_user_agent(), "unknown");
+        state.subscription = Some(subscribe_req(Some("bitaxe/2.1")));
+        assert_eq!(state.recorded_user_agent(), "bitaxe");
     }
 
     // ── 2 cpuminer-fallback spec cases ──────────────────────────────
