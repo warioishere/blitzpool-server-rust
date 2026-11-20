@@ -106,7 +106,6 @@ fn ext_submission(nonce: u32) -> SubmitSharesExtendedInput {
 fn run_validate(channel: &mut ChannelState, sub: &SubmitSharesExtendedInput, job: &ExtendedJob) {
     let job_target = channel.target_for(job.difficulty);
     let view = ExtendedChannelView {
-        kind: channel.kind,
         extranonce_size: channel.extranonce_size,
         job_target,
         job_lifecycle: *channel.standard_jobs.lifecycle(),

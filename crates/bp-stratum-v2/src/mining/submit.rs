@@ -17,7 +17,6 @@ use smallvec::SmallVec;
 /// sizes without a heap allocation per share.
 pub type ExtranonceBytes = SmallVec<[u8; 16]>;
 
-use super::channel::{ChannelKind, ChannelState};
 use super::jobs::{classify_extended_job, ExtendedJob};
 use bp_jobs_lifecycle::{LifecycleConfig, SeenShareRefusal, SeenShares};
 
@@ -187,7 +186,8 @@ pub struct SubmitSharesExtendedInput {
 /// the validator stays pure.
 #[derive(Clone, Copy, Debug)]
 pub struct StandardJobContext<'a> {
-    pub template_version: i32,
+    /// The template's `nVersion`; bounds which bits the share may roll.
+    pub version: u32,
     pub prev_hash: [u8; 32],
     /// Encodes the network target the block-found gate checks.
     pub n_bits: u32,
@@ -205,77 +205,152 @@ pub struct StandardJobContext<'a> {
     pub coinbase_tx_value_remaining: u64,
 }
 
-// ── Standard validation ──────────────────────────────────────────────
+// ── Shared header judgement ──────────────────────────────────────────
 
-/// The caller resolves the channel and the job from
-/// [`crate::mining::jobs::StandardJobMaps`]. Duplicates are judged by the
-/// header hash (see [`SeenShares`]), and only an accepted share is recorded.
-pub fn validate_submit_standard(
-    channel: &mut ChannelState,
-    submission: &SubmitSharesStandardInput,
-    job_difficulty: Difficulty,
-    stored_merkle_root: &[u8; 32],
-    job_ctx: &StandardJobContext<'_>,
-) -> ShareValidation {
-    if channel.kind != ChannelKind::Standard {
-        // A call-site error, not a wire-protocol one; rejecting keeps the
-        // connection running.
-        return ShareValidation::Rejected(RejectReason::InvalidJobId.into());
+/// The submitted fields both share kinds carry into the header.
+#[derive(Clone, Copy, Debug)]
+struct SubmittedHeader {
+    channel_id: u32,
+    job_id: u32,
+    nonce: u32,
+    version: u32,
+    ntime: u32,
+}
+
+/// What a job pinned at send time that a submitted header is checked and
+/// built against.
+#[derive(Clone, Copy, Debug)]
+struct PinnedHeader<'a> {
+    prev_hash: &'a [u8; 32],
+    /// The job's own: the hashed header commits to it, not to the latest
+    /// template.
+    n_bits: u32,
+    min_ntime: u32,
+    version: u32,
+}
+
+/// A header that passed every check [`judge_header`] runs.
+struct JudgedHeader {
+    header: [u8; 80],
+    pow: bp_share::ShareValidation,
+    is_block_candidate: bool,
+}
+
+/// The checks a share of either kind passes once its job is resolved and not
+/// stale, in this order: the `ntime` window, the rollable version bits, the
+/// duplicate guard, the job target. The header is built with `merkle_root`;
+/// `on_below_target` sees one that misses `job_target` before it is rejected,
+/// and an accepted one is recorded in `seen_shares`. `job_target` is the
+/// caller's: the lower of the job's send-time difficulty (SV2
+/// Mining/SubmitShares.Error) and the channel's current one. The network
+/// target is the job's own `n_bits`, so a block change between send and
+/// submit cannot make a block candidate of the share or take it away.
+fn judge_header(
+    seen_shares: &mut SeenShares,
+    submitted: SubmittedHeader,
+    pinned: PinnedHeader<'_>,
+    merkle_root: &[u8; 32],
+    job_target: Target,
+    on_below_target: impl FnOnce(&[u8; 80], &bp_share::ShareValidation),
+) -> Result<JudgedHeader, ShareValidation> {
+    if !ntime_in_window(submitted.ntime, pinned.min_ntime) {
+        return Err(reject_ntime(
+            submitted.channel_id,
+            submitted.job_id,
+            submitted.ntime,
+            pinned.min_ntime,
+        ));
     }
 
-    if job_ctx.classification == JobClassification::StaleRejected {
-        return ShareValidation::Rejected(RejectReason::StaleShare.into());
-    }
-
-    if !ntime_in_window(submission.ntime, job_ctx.ntime_start) {
-        return reject_ntime(
-            submission.channel_id,
-            submission.job_id,
-            submission.ntime,
-            job_ctx.ntime_start,
-        );
-    }
-
-    let job_version = job_ctx.template_version as u32;
-    if !rolls_only_general_purpose_bits(submission.version, job_version) {
-        return reject_version(
-            submission.channel_id,
-            submission.job_id,
-            submission.version,
-            job_version,
-        );
+    if !rolls_only_general_purpose_bits(submitted.version, pinned.version) {
+        return Err(reject_version(
+            submitted.channel_id,
+            submitted.job_id,
+            submitted.version,
+            pinned.version,
+        ));
     }
 
     // SV2 submits the "Full nVersion field", so it goes into the header as-is.
     let header = build_block_header(
-        submission.version as i32,
-        &job_ctx.prev_hash,
-        stored_merkle_root,
-        submission.ntime,
-        job_ctx.n_bits,
-        submission.nonce,
+        submitted.version as i32,
+        pinned.prev_hash,
+        merkle_root,
+        submitted.ntime,
+        pinned.n_bits,
+        submitted.nonce,
     );
 
     let pow = calculate_difficulty(&header);
-    if let Err(refusal) = channel
-        .seen_shares
-        .check(&job_ctx.prev_hash, &pow.submission_hash)
-    {
-        return refuse_seen_share(refusal, submission.channel_id, submission.job_id);
+    if let Err(refusal) = seen_shares.check(pinned.prev_hash, &pow.submission_hash) {
+        return Err(refuse_seen_share(
+            refusal,
+            submitted.channel_id,
+            submitted.job_id,
+        ));
     }
-    let job_target = channel.target_for(job_difficulty);
     if !job_target.is_met_by_le(&pow.submission_hash) {
-        return ShareValidation::Rejected(RejectReason::DifficultyTooLow.into());
+        on_below_target(&header, &pow);
+        return Err(ShareValidation::Rejected(
+            RejectReason::DifficultyTooLow.into(),
+        ));
     }
 
-    channel
-        .seen_shares
-        .record(job_ctx.prev_hash, pow.submission_hash);
+    seen_shares.record(*pinned.prev_hash, pow.submission_hash);
 
-    let is_block_candidate = meets_network_target(&pow.submission_hash, job_ctx.n_bits);
+    let is_block_candidate = meets_network_target(&pow.submission_hash, pinned.n_bits);
+    Ok(JudgedHeader {
+        header,
+        pow,
+        is_block_candidate,
+    })
+}
+
+// ── Standard validation ──────────────────────────────────────────────
+
+/// The caller resolves the channel and the job from
+/// [`crate::mining::jobs::StandardJobMaps`] and precomputes `job_target` via
+/// [`ChannelState::target_for`](crate::mining::channel::ChannelState::target_for), so the job is borrowed from the channel and
+/// only its [`SeenShares`] lent mutably. Duplicates are judged by the header
+/// hash (see [`SeenShares`]), and only an accepted share is recorded.
+pub fn validate_submit_standard(
+    seen_shares: &mut SeenShares,
+    submission: &SubmitSharesStandardInput,
+    job_difficulty: Difficulty,
+    job_target: Target,
+    stored_merkle_root: &[u8; 32],
+    job_ctx: &StandardJobContext<'_>,
+) -> ShareValidation {
+    if job_ctx.classification == JobClassification::StaleRejected {
+        return ShareValidation::Rejected(RejectReason::StaleShare.into());
+    }
+
+    let judged = match judge_header(
+        seen_shares,
+        SubmittedHeader {
+            channel_id: submission.channel_id,
+            job_id: submission.job_id,
+            nonce: submission.nonce,
+            version: submission.version,
+            ntime: submission.ntime,
+        },
+        PinnedHeader {
+            prev_hash: &job_ctx.prev_hash,
+            n_bits: job_ctx.n_bits,
+            min_ntime: job_ctx.ntime_start,
+            version: job_ctx.version,
+        },
+        stored_merkle_root,
+        job_target,
+        |_, _| {},
+    ) {
+        Ok(judged) => judged,
+        Err(rejected) => return rejected,
+    };
+
     // An empty `coinbase_stratum` (a `SetCustomMiningJob` job) yields no
     // coinbase rather than malformed bytes for bitcoind.
-    let witness_coinbase = if is_block_candidate && !job_ctx.coinbase_stratum.is_empty() {
+    let witness_coinbase = if judged.is_block_candidate && !job_ctx.coinbase_stratum.is_empty() {
         assemble_witness_coinbase(job_ctx.coinbase_stratum)
     } else {
         Vec::new()
@@ -283,10 +358,10 @@ pub fn validate_submit_standard(
     ShareValidation::Accepted(Box::new(ShareAccept {
         classification: job_ctx.classification,
         effective_difficulty: job_difficulty,
-        submission_difficulty: pow.submission_difficulty,
-        header,
-        hash: pow.submission_hash,
-        is_block_candidate,
+        submission_difficulty: judged.pow.submission_difficulty,
+        header: judged.header,
+        hash: judged.pow.submission_hash,
+        is_block_candidate: judged.is_block_candidate,
         template_id: job_ctx.template_id,
         jdp_claims_the_block: false,
         payouts_fingerprint: job_ctx.payouts_fingerprint,
@@ -304,18 +379,16 @@ pub fn validate_submit_standard(
 /// channel, so the job is not cloned per share.
 #[derive(Clone, Copy, Debug)]
 pub struct ExtendedChannelView {
-    pub kind: ChannelKind,
     pub extranonce_size: u8,
-    /// Precomputed via [`ChannelState::target_for`], so the validator needs
+    /// Precomputed via [`ChannelState::target_for`](crate::mining::channel::ChannelState::target_for), so the validator needs
     /// no `&mut` access to the channel's memo.
     pub job_target: Target,
     pub job_lifecycle: LifecycleConfig,
 }
 
 /// Validates against the resolved [`ExtendedJob`] by rebuilding the coinbase
-/// and walking the merkle path. Both the share target and the network target
-/// come from the job as pinned at send-time (SV2 Mining/SubmitShares.Error),
-/// so a block change between send and submit cannot reclassify the share.
+/// and walking the merkle path, then judges the header like a Standard share
+/// (`judge_header`).
 #[allow(clippy::too_many_arguments)]
 pub fn validate_submit_extended(
     seen_shares: &mut SeenShares,
@@ -327,15 +400,6 @@ pub fn validate_submit_extended(
     ext_0x0002_negotiated: bool,
     debug_share_logs: bool,
 ) -> ShareValidation {
-    if view.kind != ChannelKind::Extended {
-        tracing::warn!(
-            channel_id = submission.channel_id,
-            "❌ Extended share rejected: invalid-channel-id {}",
-            submission.channel_id
-        );
-        return ShareValidation::Rejected(RejectReason::InvalidJobId.into());
-    }
-
     let classification = classify_extended_job(ext_job, now_ms, &view.job_lifecycle);
     if classification == JobClassification::StaleRejected {
         let retired_ago_ms = ext_job
@@ -365,24 +429,6 @@ pub fn validate_submit_extended(
         return ShareValidation::Rejected(RejectReason::BadExtranonceSize.into());
     }
 
-    if !ntime_in_window(submission.ntime, ext_job.min_ntime) {
-        return reject_ntime(
-            submission.channel_id,
-            submission.job_id,
-            submission.ntime,
-            ext_job.min_ntime,
-        );
-    }
-
-    if !rolls_only_general_purpose_bits(submission.version, ext_job.version) {
-        return reject_version(
-            submission.channel_id,
-            submission.job_id,
-            submission.version,
-            ext_job.version,
-        );
-    }
-
     // The extranonce prefix is read off the JOB, never off the channel:
     // SV2 Mining/SetExtranoncePrefix is effective only from the next job on,
     // so a share for an older job was built with that job's prefix.
@@ -399,81 +445,84 @@ pub fn validate_submit_extended(
 
     let merkle_root = merkle_root_from_coinbase(&coinbase_txid, &ext_job.merkle_path);
 
-    // SV2 submits the full nVersion, so it goes in verbatim.
-    let header = build_block_header(
-        submission.version as i32,
-        &ext_job.prev_hash,
-        &merkle_root,
-        submission.ntime,
-        ext_job.n_bits,
-        submission.nonce,
-    );
-
-    let pow = calculate_difficulty(&header);
-    if let Err(refusal) = seen_shares.check(&ext_job.prev_hash, &pow.submission_hash) {
-        return refuse_seen_share(refusal, submission.channel_id, submission.job_id);
-    }
-    let job_target = view.job_target;
-
     // Needs both `stratum_share_logs` and `RUST_LOG=...,bp_stratum_v2=debug`.
-    if debug_share_logs {
-        tracing::debug!(
-            channel_id = submission.channel_id,
-            job_id = submission.job_id,
-            "🎯 Extended share difficulty: {:.2} (target: {:.2})",
-            pow.submission_difficulty.as_f64(),
-            job_difficulty.as_f64()
-        );
-    }
+    let log_share_difficulty = |pow: &bp_share::ShareValidation| {
+        if debug_share_logs {
+            tracing::debug!(
+                channel_id = submission.channel_id,
+                job_id = submission.job_id,
+                "🎯 Extended share difficulty: {:.2} (target: {:.2})",
+                pow.submission_difficulty.as_f64(),
+                job_difficulty.as_f64()
+            );
+        }
+    };
 
-    if !job_target.is_met_by_le(&pow.submission_hash) {
-        // Full byte dump (coinbase, merkle root, header) so the hashed bytes
-        // can be compared with what the miner built from the
-        // NewExtendedMiningJob frame without instrumenting the miner.
-        let to_hex = |b: &[u8]| -> String {
-            let mut s = String::with_capacity(b.len() * 2);
-            for x in b {
-                s.push_str(&format!("{x:02x}"));
-            }
-            s
-        };
-        let hash_prefix = to_hex(&pow.submission_hash[..8]);
-        let coinbase_hex = to_hex(&coinbase_parts.concat());
-        let merkle_root_hex = to_hex(&merkle_root);
-        let header_hex = to_hex(&header);
-        let prefix_hex = to_hex(&ext_job.coinbase_prefix);
-        let suffix_hex = to_hex(&ext_job.coinbase_suffix);
-        let ext_hex = to_hex(submission.extranonce.as_slice());
-        tracing::warn!(
-            channel_id = submission.channel_id,
-            job_id = submission.job_id,
-            nonce = format_args!("0x{:08x}", submission.nonce),
-            ntime = submission.ntime,
-            version = format_args!("0x{:08x}", submission.version),
-            ext_job_version = format_args!("0x{:08x}", ext_job.version),
-            extranonce = %ext_hex,
-            hash_prefix_be = %hash_prefix,
-            ext_job_prefix_len = ext_job.coinbase_prefix.len(),
-            ext_job_suffix_len = ext_job.coinbase_suffix.len(),
-            ext_job_merkle_path_len = ext_job.merkle_path.len(),
-            ext_job_prefix_hex = %prefix_hex,
-            ext_job_suffix_hex = %suffix_hex,
-            coinbase_hex = %coinbase_hex,
-            merkle_root_hex = %merkle_root_hex,
-            header_hex = %header_hex,
-            "❌ Extended share rejected: difficulty-too-low ({:.6} < {:.2})",
-            pow.submission_difficulty.as_f64(),
-            job_difficulty.as_f64()
-        );
-        return ShareValidation::Rejected(RejectReason::DifficultyTooLow.into());
-    }
+    let judged = match judge_header(
+        seen_shares,
+        SubmittedHeader {
+            channel_id: submission.channel_id,
+            job_id: submission.job_id,
+            nonce: submission.nonce,
+            version: submission.version,
+            ntime: submission.ntime,
+        },
+        PinnedHeader {
+            prev_hash: &ext_job.prev_hash,
+            n_bits: ext_job.n_bits,
+            min_ntime: ext_job.min_ntime,
+            version: ext_job.version,
+        },
+        &merkle_root,
+        view.job_target,
+        |header, pow| {
+            log_share_difficulty(pow);
+            // Full byte dump (coinbase, merkle root, header) so the hashed
+            // bytes can be compared with what the miner built from the
+            // NewExtendedMiningJob frame without instrumenting the miner.
+            let to_hex = |b: &[u8]| -> String {
+                let mut s = String::with_capacity(b.len() * 2);
+                for x in b {
+                    s.push_str(&format!("{x:02x}"));
+                }
+                s
+            };
+            let hash_prefix = to_hex(&pow.submission_hash[..8]);
+            let coinbase_hex = to_hex(&coinbase_parts.concat());
+            let merkle_root_hex = to_hex(&merkle_root);
+            let header_hex = to_hex(header);
+            let prefix_hex = to_hex(&ext_job.coinbase_prefix);
+            let suffix_hex = to_hex(&ext_job.coinbase_suffix);
+            let ext_hex = to_hex(submission.extranonce.as_slice());
+            tracing::warn!(
+                channel_id = submission.channel_id,
+                job_id = submission.job_id,
+                nonce = format_args!("0x{:08x}", submission.nonce),
+                ntime = submission.ntime,
+                version = format_args!("0x{:08x}", submission.version),
+                ext_job_version = format_args!("0x{:08x}", ext_job.version),
+                extranonce = %ext_hex,
+                hash_prefix_be = %hash_prefix,
+                ext_job_prefix_len = ext_job.coinbase_prefix.len(),
+                ext_job_suffix_len = ext_job.coinbase_suffix.len(),
+                ext_job_merkle_path_len = ext_job.merkle_path.len(),
+                ext_job_prefix_hex = %prefix_hex,
+                ext_job_suffix_hex = %suffix_hex,
+                coinbase_hex = %coinbase_hex,
+                merkle_root_hex = %merkle_root_hex,
+                header_hex = %header_hex,
+                "❌ Extended share rejected: difficulty-too-low ({:.6} < {:.2})",
+                pow.submission_difficulty.as_f64(),
+                job_difficulty.as_f64()
+            );
+        },
+    ) {
+        Ok(judged) => judged,
+        Err(rejected) => return rejected,
+    };
+    log_share_difficulty(&judged.pow);
 
-    seen_shares.record(ext_job.prev_hash, pow.submission_hash);
-
-    // The job's own n_bits: the hashed header commits to it, not to the
-    // latest template.
-    let is_block_candidate = meets_network_target(&pow.submission_hash, ext_job.n_bits);
-    let witness_coinbase = if is_block_candidate {
+    let witness_coinbase = if judged.is_block_candidate {
         assemble_witness_coinbase(&coinbase_parts.concat())
     } else {
         Vec::new()
@@ -486,10 +535,10 @@ pub fn validate_submit_extended(
     ShareValidation::Accepted(Box::new(ShareAccept {
         classification,
         effective_difficulty: job_difficulty,
-        submission_difficulty: pow.submission_difficulty,
-        header,
-        hash: pow.submission_hash,
-        is_block_candidate,
+        submission_difficulty: judged.pow.submission_difficulty,
+        header: judged.header,
+        hash: judged.pow.submission_hash,
+        is_block_candidate: judged.is_block_candidate,
         template_id: ext_job.template_id,
         jdp_claims_the_block: ext_job.jdp_claims_the_block,
         payouts_fingerprint: ext_job.payouts_fingerprint,
@@ -608,7 +657,7 @@ mod tests {
     fn std_ctx(class: JobClassification) -> StandardJobContext<'static> {
         StandardJobContext {
             payouts_fingerprint: [0u8; 32],
-            template_version: 0x2000_0000,
+            version: 0x2000_0000,
             prev_hash: [0xCC; 32],
             n_bits: 0x1d00_ffff,
             ntime_start: 0x6500_0000,
@@ -643,6 +692,26 @@ mod tests {
         }
     }
 
+    /// Test shim: precomputes the job target and lends `&mut seen_shares`, as
+    /// the handler does.
+    fn std_validate(
+        ch: &mut ChannelState,
+        sub: &SubmitSharesStandardInput,
+        job_difficulty: Difficulty,
+        merkle_root: &[u8; 32],
+        ctx: &StandardJobContext<'_>,
+    ) -> ShareValidation {
+        let job_target = ch.target_for(job_difficulty);
+        validate_submit_standard(
+            &mut ch.seen_shares,
+            sub,
+            job_difficulty,
+            job_target,
+            merkle_root,
+            ctx,
+        )
+    }
+
     /// Test shim: projects the channel into the `ExtendedChannelView` and
     /// `&mut seen_shares` the validator takes.
     fn validate_ext(
@@ -656,7 +725,6 @@ mod tests {
     ) -> ShareValidation {
         let job_target = ch.target_for(job_difficulty);
         let view = ExtendedChannelView {
-            kind: ch.kind,
             extranonce_size: ch.extranonce_size,
             job_target,
             job_lifecycle: *ch.standard_jobs.lifecycle(),
@@ -703,7 +771,7 @@ mod tests {
     fn standard_accepts_easy_share_with_max_target() {
         let mut ch = std_channel();
         let stored_merkle = [0xDD; 32];
-        let out = validate_submit_standard(
+        let out = std_validate(
             &mut ch,
             &std_submission(),
             easy_diff(),
@@ -727,14 +795,14 @@ mod tests {
         let mut ch = std_channel();
         let merkle = [0xDD; 32];
         let sub = std_submission();
-        let _ = validate_submit_standard(
+        let _ = std_validate(
             &mut ch,
             &sub,
             easy_diff(),
             &merkle,
             &std_ctx(JobClassification::Active),
         );
-        let out = validate_submit_standard(
+        let out = std_validate(
             &mut ch,
             &sub,
             easy_diff(),
@@ -757,7 +825,7 @@ mod tests {
         let mut ch = std_channel();
         let merkle = [0xDD; 32];
         let mut sub = std_submission();
-        let _ = validate_submit_standard(
+        let _ = std_validate(
             &mut ch,
             &sub,
             easy_diff(),
@@ -765,7 +833,7 @@ mod tests {
             &std_ctx(JobClassification::Active),
         );
         sub.nonce ^= 1;
-        let out = validate_submit_standard(
+        let out = std_validate(
             &mut ch,
             &sub,
             easy_diff(),
@@ -784,7 +852,7 @@ mod tests {
         let merkle = [0xDD; 32];
         let sub = std_submission();
         let mut ch = std_channel();
-        let first = validate_submit_standard(
+        let first = std_validate(
             &mut ch,
             &sub,
             easy_diff(),
@@ -795,7 +863,7 @@ mod tests {
 
         ch.seen_shares
             .on_tip(&[0xEE; 32], 2_000, &LifecycleConfig::DEFAULT);
-        let replay = validate_submit_standard(
+        let replay = std_validate(
             &mut ch,
             &sub,
             easy_diff(),
@@ -807,7 +875,7 @@ mod tests {
             ShareValidation::Accepted(_) => panic!("replayed share credited twice"),
         }
 
-        let control = validate_submit_standard(
+        let control = std_validate(
             &mut std_channel(),
             &sub,
             easy_diff(),
@@ -822,7 +890,7 @@ mod tests {
     fn standard_stale_rejected_classification_emits_stale_share() {
         let mut ch = std_channel();
         let merkle = [0xDD; 32];
-        let out = validate_submit_standard(
+        let out = std_validate(
             &mut ch,
             &std_submission(),
             easy_diff(),
@@ -843,7 +911,7 @@ mod tests {
     fn standard_stale_creditable_still_validates() {
         let mut ch = std_channel();
         let merkle = [0xDD; 32];
-        let out = validate_submit_standard(
+        let out = std_validate(
             &mut ch,
             &std_submission(),
             easy_diff(),
@@ -863,7 +931,7 @@ mod tests {
     fn standard_rejects_below_job_target() {
         let mut ch = std_channel();
         let merkle = [0xDD; 32];
-        let out = validate_submit_standard(
+        let out = std_validate(
             &mut ch,
             &std_submission(),
             Difficulty(1e20), // impossible job target
@@ -884,7 +952,7 @@ mod tests {
     fn standard_header_version_is_the_submitted_version_verbatim() {
         // A template that already sets general-purpose bit 13.
         let ctx = StandardJobContext {
-            template_version: 0x2000_2000,
+            version: 0x2000_2000,
             ..std_ctx(JobClassification::Active)
         };
         let merkle = [0xDD; 32];
@@ -893,7 +961,7 @@ mod tests {
         let mut ch = std_channel();
         let mut sub = std_submission();
         sub.version = 0x2000_2100;
-        let accept = match validate_submit_standard(&mut ch, &sub, easy_diff(), &merkle, &ctx) {
+        let accept = match std_validate(&mut ch, &sub, easy_diff(), &merkle, &ctx) {
             ShareValidation::Accepted(a) => a,
             other => panic!("expected Accept, got {other:?}"),
         };
@@ -906,7 +974,7 @@ mod tests {
         let mut ch = std_channel();
         let mut sub = std_submission();
         sub.version = 0x2000_0000;
-        let accept = match validate_submit_standard(&mut ch, &sub, easy_diff(), &merkle, &ctx) {
+        let accept = match std_validate(&mut ch, &sub, easy_diff(), &merkle, &ctx) {
             ShareValidation::Accepted(a) => a,
             other => panic!("expected Accept, got {other:?}"),
         };
@@ -932,7 +1000,7 @@ mod tests {
             (0x0000_0000, false),
             (0x6000_0000, false),
         ] {
-            let std_out = validate_submit_standard(
+            let std_out = std_validate(
                 &mut std_channel(),
                 &SubmitSharesStandardInput {
                     version,
@@ -977,7 +1045,7 @@ mod tests {
         let merkle = [0xDD; 32];
         let mut ctx = std_ctx(JobClassification::Active);
         ctx.n_bits = TRIVIAL_N_BITS;
-        let out = validate_submit_standard(&mut ch, &std_submission(), easy_diff(), &merkle, &ctx);
+        let out = std_validate(&mut ch, &std_submission(), easy_diff(), &merkle, &ctx);
         match out {
             ShareValidation::Accepted(a) => assert!(a.is_block_candidate),
             _ => panic!("expected Accept"),
@@ -1103,49 +1171,6 @@ mod tests {
             _ => panic!("expected BadExtranonceSize reject"),
         }
         assert_eq!(ch.seen_shares.len(), 0, "no dedup write on reject");
-    }
-
-    /// A wrong channel kind is rejected rather than panicking.
-    #[test]
-    fn standard_validator_rejects_extended_channel() {
-        let mut ch = ext_channel();
-        let merkle = [0xDD; 32];
-        let out = validate_submit_standard(
-            &mut ch,
-            &std_submission(),
-            easy_diff(),
-            &merkle,
-            &std_ctx(JobClassification::Active),
-        );
-        assert!(matches!(
-            out,
-            ShareValidation::Rejected(ShareReject {
-                reason: RejectReason::InvalidJobId,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn extended_validator_rejects_standard_channel() {
-        let mut ch = std_channel();
-        let job = ext_job([0xCC; 32], 0x1d00_ffff);
-        let out = validate_ext(
-            &mut ch,
-            &ext_submission(),
-            &job,
-            easy_diff(),
-            0,
-            false,
-            false,
-        );
-        assert!(matches!(
-            out,
-            ShareValidation::Rejected(ShareReject {
-                reason: RejectReason::InvalidJobId,
-                ..
-            })
-        ));
     }
 
     // ── ext 0x0002 Worker-ID TLV resolution in validate_submit_extended ──
@@ -1318,7 +1343,7 @@ mod tests {
                 ntime,
                 ..std_submission()
             };
-            let out = validate_submit_standard(
+            let out = std_validate(
                 &mut std_channel(),
                 &sub,
                 easy_diff(),
@@ -1360,6 +1385,150 @@ mod tests {
                 }
                 (other, _) => panic!("ntime {ntime:#x}: unexpected {other:?}"),
             }
+        }
+    }
+
+    // ── Reject precedence and what a reject leaves behind ─────────
+
+    fn reason(out: &ShareValidation) -> RejectReason {
+        match out {
+            ShareValidation::Rejected(r) => r.reason,
+            ShareValidation::Accepted(_) => panic!("expected a reject, got Accepted"),
+        }
+    }
+
+    /// Where several checks would refuse a Standard share, the earlier one
+    /// wins: stale before ntime, ntime before version, version before the
+    /// duplicate guard.
+    #[test]
+    fn standard_reject_precedence() {
+        let merkle = [0xDD; 32];
+        let bad_ntime = SubmitSharesStandardInput {
+            ntime: std_ctx(JobClassification::Active).ntime_start - 1,
+            ..std_submission()
+        };
+        let bad_both = SubmitSharesStandardInput {
+            version: 0x0000_0001,
+            ..bad_ntime
+        };
+        let bad_version = SubmitSharesStandardInput {
+            version: 0x0000_0001,
+            ..std_submission()
+        };
+
+        let stale = std_ctx(JobClassification::StaleRejected);
+        let out = std_validate(&mut std_channel(), &bad_both, easy_diff(), &merkle, &stale);
+        assert_eq!(reason(&out), RejectReason::StaleShare);
+
+        let active = std_ctx(JobClassification::Active);
+        let out = std_validate(&mut std_channel(), &bad_both, easy_diff(), &merkle, &active);
+        assert_eq!(reason(&out), RejectReason::NtimeOutOfRange);
+
+        // A share already credited, resent with a bad version: the version
+        // check refuses it before the duplicate guard sees it.
+        let mut ch = std_channel();
+        let first = std_validate(&mut ch, &std_submission(), easy_diff(), &merkle, &active);
+        assert!(
+            matches!(first, ShareValidation::Accepted(_)),
+            "precondition"
+        );
+        let out = std_validate(&mut ch, &bad_version, easy_diff(), &merkle, &active);
+        assert_eq!(reason(&out), RejectReason::NonRollableVersionBit);
+        let out = std_validate(&mut ch, &std_submission(), easy_diff(), &merkle, &active);
+        assert_eq!(reason(&out), RejectReason::DuplicateShare, "control");
+    }
+
+    /// The Extended order: stale before the extranonce size, the size before
+    /// ntime.
+    #[test]
+    fn extended_reject_precedence() {
+        let mut job = ext_job([0xCC; 32], 0x1d00_ffff);
+        let bad_size_and_ntime = SubmitSharesExtendedInput {
+            ntime: job.min_ntime - 1,
+            extranonce: SmallVec::from_slice(&[0x11; 7]),
+            ..ext_submission()
+        };
+
+        let out = validate_ext(
+            &mut ext_channel(),
+            &bad_size_and_ntime,
+            &job,
+            easy_diff(),
+            0,
+            false,
+            false,
+        );
+        assert_eq!(reason(&out), RejectReason::BadExtranonceSize);
+
+        job.retired_at = Some(0);
+        let out = validate_ext(
+            &mut ext_channel(),
+            &bad_size_and_ntime,
+            &job,
+            easy_diff(),
+            1_000_000,
+            false,
+            false,
+        );
+        assert_eq!(reason(&out), RejectReason::StaleShare);
+    }
+
+    /// A hash missing the job target is rejected on the Extended path too,
+    /// without a dedup write.
+    #[test]
+    fn extended_rejects_below_job_target() {
+        let mut ch = ext_channel();
+        let job = ext_job([0xCC; 32], 0x1d00_ffff);
+        let out = validate_ext(
+            &mut ch,
+            &ext_submission(),
+            &job,
+            Difficulty(1e20), // impossible job target
+            0,
+            false,
+            false,
+        );
+        assert_eq!(reason(&out), RejectReason::DifficultyTooLow);
+        assert_eq!(ch.seen_shares.len(), 0, "no dedup write on reject");
+    }
+
+    /// An ntime or version reject leaves the duplicate guard untouched, on
+    /// both paths.
+    #[test]
+    fn ntime_and_version_rejects_record_nothing() {
+        let merkle = [0xDD; 32];
+        let active = std_ctx(JobClassification::Active);
+        let mut ch = std_channel();
+        for bad in [
+            SubmitSharesStandardInput {
+                ntime: active.ntime_start - 1,
+                ..std_submission()
+            },
+            SubmitSharesStandardInput {
+                version: 0x0000_0001,
+                ..std_submission()
+            },
+        ] {
+            let out = std_validate(&mut ch, &bad, easy_diff(), &merkle, &active);
+            assert!(matches!(out, ShareValidation::Rejected(_)), "precondition");
+            assert_eq!(ch.seen_shares.len(), 0);
+        }
+
+        let job = ext_job([0xCC; 32], 0x1d00_ffff);
+        let mut ch = ext_channel();
+        for bad in [
+            SubmitSharesExtendedInput {
+                ntime: job.min_ntime - 1,
+                ..ext_submission()
+            },
+            SubmitSharesExtendedInput {
+                version: 0x0000_0001,
+                ..ext_submission()
+            },
+        ] {
+            let out = validate_ext(&mut ch, &bad, &job, easy_diff(), 0, false, false);
+            assert!(matches!(out, ShareValidation::Rejected(_)), "precondition");
+            assert_eq!(ch.seen_shares.len(), 0);
         }
     }
 }

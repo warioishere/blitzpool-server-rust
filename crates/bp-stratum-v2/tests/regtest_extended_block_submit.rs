@@ -214,7 +214,6 @@ async fn run_block_submit_case(miner_extranonce_size: u8, rolled_version_bits: u
     };
     let job_target = channel.target_for(job_difficulty);
     let view = ExtendedChannelView {
-        kind: channel.kind,
         extranonce_size: channel.extranonce_size,
         job_target,
         job_lifecycle: *channel.standard_jobs.lifecycle(),

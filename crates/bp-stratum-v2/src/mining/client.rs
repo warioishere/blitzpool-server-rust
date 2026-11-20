@@ -1073,15 +1073,21 @@ pub fn handle_submit_shares_standard<C: Clock>(
         return submit_error_with_event(submission.channel_id, submission.sequence_number, reject);
     };
 
-    // The clone lets the validator borrow the channel mutably.
+    let frozen_difficulty = channel
+        .standard_jobs
+        .difficulty_of(submission.job_id)
+        .expect("classify Some => difficulty_of Some");
+    let graced = graced_validation_difficulty(frozen_difficulty, channel.session_difficulty);
+    // Target first, while `channel` is unborrowed, so the validator gets
+    // disjoint borrows and no per-share job clone is needed.
+    let job_target = channel.target_for(graced);
     let entry = channel
         .standard_jobs
         .entry_of(submission.job_id)
-        .cloned()
         .expect("classify Some => entry_of Some");
 
     let job_ctx = StandardJobContext {
-        template_version: entry.template_snapshot.version as i32,
+        version: entry.template_snapshot.version,
         prev_hash: entry.template_snapshot.prev_hash,
         n_bits: entry.template_snapshot.n_bits,
         ntime_start: entry.template_snapshot.ntime_start,
@@ -1092,9 +1098,14 @@ pub fn handle_submit_shares_standard<C: Clock>(
         coinbase_tx_value_remaining: entry.template_snapshot.coinbase_tx_value_remaining,
     };
 
-    let graced = graced_validation_difficulty(entry.difficulty, channel.session_difficulty);
-    let validation =
-        validate_submit_standard(channel, submission, graced, &entry.merkle_root, &job_ctx);
+    let validation = validate_submit_standard(
+        &mut channel.seen_shares,
+        submission,
+        graced,
+        job_target,
+        &entry.merkle_root,
+        &job_ctx,
+    );
     feed_vardiff(state, submission.channel_id, &validation);
     finalize_submit(
         submission.channel_id,
@@ -1148,7 +1159,6 @@ pub fn handle_submit_shares_extended<C: Clock>(
     // The prefix comes off `ext_job`, not the channel: a new prefix only applies
     // from the next job on (SV2 Mining/SetExtranoncePrefix).
     let view = ExtendedChannelView {
-        kind: channel.kind,
         extranonce_size: channel.extranonce_size,
         job_target,
         job_lifecycle: *channel.standard_jobs.lifecycle(),
@@ -2323,7 +2333,6 @@ pub(crate) mod tests {
     ) -> ShareValidation {
         let job_target = ch.target_for(job_difficulty);
         let view = ExtendedChannelView {
-            kind: ch.kind,
             extranonce_size: ch.extranonce_size,
             job_target,
             job_lifecycle: *ch.standard_jobs.lifecycle(),
@@ -3965,6 +3974,68 @@ pub(crate) mod tests {
                 .iter()
                 .any(|f| matches!(f, OutboundFrame::SetTarget { .. })),
             "stale rejects at the usual cadence must hold the channel"
+        );
+    }
+
+    /// A submit for the other channel kind is refused as `invalid-job-id`
+    /// before any validation, on either handler.
+    #[test]
+    fn a_submit_for_the_other_channel_kind_is_invalid_job_id() {
+        let clock = Arc::new(TestClock::new(0));
+        // No `ShareRejected` event: the share never reaches the job lookup,
+        // whose unknown-job refusal would emit one.
+        let refused_as_invalid_job = |out: &HandlerOutcome| {
+            matches!(
+                &out.outbound[..],
+                [OutboundFrame::SubmitSharesError { error_code, .. }]
+                    if error_code == ERR_INVALID_JOB_ID
+            ) && out.events.is_empty()
+        };
+
+        let mut s = MiningSessionState::new(clock.clone(), 1, port_cfg());
+        handle_setup_connection(&mut s, &good_setup());
+        let _ = handle_open_standard_mining_channel(
+            &mut s,
+            &open_std(1, &format!("{}.w", REGTEST_ADDR)),
+            vec![0; 4],
+        );
+        let standard = s.primary_channel.unwrap();
+        let extended_submit = SubmitSharesExtendedInput {
+            channel_id: standard,
+            sequence_number: 1,
+            job_id: 1,
+            nonce: 0x1234_5678,
+            version: 0x2000_0000,
+            ntime: 0x6500_0001,
+            extranonce: ExtranonceBytes::from_slice(&[0x11; 4]),
+            tlvs: Vec::new(),
+        };
+        let out = handle_submit_shares_extended(&mut s, &extended_submit, clock.now_ms());
+        assert!(
+            refused_as_invalid_job(&out),
+            "Extended submit on a Standard channel"
+        );
+
+        let mut s = MiningSessionState::new(clock.clone(), 1, port_cfg());
+        handle_setup_connection(&mut s, &good_setup());
+        let _ = handle_open_extended_mining_channel(
+            &mut s,
+            &open_ext(1, &format!("{}.w", REGTEST_ADDR)),
+            vec![0; 4],
+        );
+        let extended = s.primary_channel.unwrap();
+        let standard_submit = SubmitSharesStandardInput {
+            channel_id: extended,
+            sequence_number: 1,
+            job_id: 1,
+            nonce: 0x1234_5678,
+            version: 0x2000_0000,
+            ntime: 0x6500_0001,
+        };
+        let out = handle_submit_shares_standard(&mut s, &standard_submit, clock.now_ms());
+        assert!(
+            refused_as_invalid_job(&out),
+            "Standard submit on an Extended channel"
         );
     }
 
