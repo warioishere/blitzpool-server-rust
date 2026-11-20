@@ -137,7 +137,7 @@ fn build_app_state(
         start_time: chrono::Utc::now(),
         network: crate::boot::bitcoin_network(cfg.network),
         pool_identifier: cfg.pool_identifier.clone(),
-        solo_fee: crate::payout_resolver::solo_fee_config(cfg),
+        solo_fee: engines.solo_fee.clone(),
         cache,
         address_auth,
     };

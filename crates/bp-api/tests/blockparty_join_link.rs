@@ -86,7 +86,10 @@ async fn the_join_link_is_the_url_on_the_pool_ui() {
             BlockpartyPayouts::new(
                 pool.clone(),
                 BlockpartyPayoutConfig {
-                    fee_address: None,
+                    fee_address: bp_common::AddressId::new(
+                        "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq".to_string(),
+                    )
+                    .unwrap(),
                     fee_percent: 2.0,
                     min_payout_sats: Sats(5_000),
                 },

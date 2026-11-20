@@ -493,7 +493,7 @@ pub struct PplnsConfig {
     /// VarDiff floor for the PPLNS port (sub-ASIC hardware gate).
     pub min_difficulty: u64,
     /// Minimum on-chain payout in sats; smaller amounts stay as pending
-    /// ledger credit. Clamped up to the dust limit by the engine.
+    /// ledger credit. Boot refuses less than the 546-sat dust limit.
     pub min_payout_sats: i64,
     /// Daily PPLNS dust-sweep cron (pair-cancels abandoned credit against
     /// abandoned debit). Manual admin sweeps work regardless.
@@ -629,10 +629,11 @@ impl CoinbaseAutoscaleConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SoloConfig {
-    /// Optional pool fee on Solo blocks. Empty/absent = no fee output (every
-    /// sat goes to the finder).
+    /// Optional pool fee on Solo blocks; must parse for `network`.
+    /// Empty/absent = no fee output (every sat goes to the finder).
     #[serde(default)]
     pub fee_address: Option<String>,
+    /// In `[0.0, 100.0]`; absent = 0.
     #[serde(default)]
     pub fee_percent: Option<f64>,
     /// Coinbase weight reservation (WU) for the Solo template stream. Solo
@@ -695,7 +696,7 @@ pub struct BlockpartyConfig {
     pub fee_address: String,
     pub fee_percent: f64,
     /// Minimum on-chain payout per member. Sub-min splits roll into
-    /// the pool-fee output. Clamped at runtime to ≥ Bitcoin dust limit.
+    /// the pool-fee output. Boot refuses less than the 546-sat dust limit.
     #[serde(default = "default_blockparty_min_payout_sats")]
     pub min_payout_sats: i64,
     /// Coinbase weight reservation (WU) for the Blockparty template stream;

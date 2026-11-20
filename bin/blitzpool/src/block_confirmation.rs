@@ -1920,7 +1920,7 @@ mod blockparty_settlement {
         let payouts = BlockpartyPayouts::new(
             pg.clone(),
             BlockpartyPayoutConfig {
-                fee_address: Some(AddressId::new(fee).unwrap()),
+                fee_address: AddressId::new(fee).unwrap(),
                 fee_percent: 2.0,
                 min_payout_sats: Sats(5_000),
             },

@@ -96,22 +96,6 @@ mod tests {
         );
     }
 
-    /// A shape-valid but unparseable fee address is refused.
-    #[test]
-    fn a_typo_in_the_fee_address_is_refused() {
-        let typo = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLX";
-        let cfg = GroupSoloEngineConfig {
-            fee_address: Some(AddressId::new(typo).expect("shape ok")),
-            ..GroupSoloEngineConfig::default()
-        };
-        assert_eq!(
-            cfg.try_new().unwrap_err(),
-            ConfigError::FeePayoutBudget(FeePayoutBudgetError::InvalidFeeAddress {
-                value: typo.to_string()
-            })
-        );
-    }
-
     #[test]
     fn default_validates_clean() {
         valid().try_new().expect("default ok");

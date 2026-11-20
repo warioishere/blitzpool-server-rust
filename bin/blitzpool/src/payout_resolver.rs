@@ -24,15 +24,6 @@ use uuid::Uuid;
 
 use crate::engines::BlitzpoolModeGate;
 
-/// The Solo fee from `[solo]`, the one source for the Stratum, JDP and API
-/// resolvers so a preview and a real coinbase cannot disagree.
-pub(crate) fn solo_fee_config(cfg: &bp_config::AppConfig) -> SoloFeeConfig {
-    SoloFeeConfig {
-        dev_fee_address: cfg.solo.fee_address.clone(),
-        dev_fee_percent: cfg.solo.fee_percent.unwrap_or(0.0),
-    }
-}
-
 /// The production `PayoutResolver` for SV1 and SV2.
 #[derive(Clone)]
 pub(crate) struct ProductionPayoutResolver {
@@ -653,107 +644,5 @@ mod tests {
             paid.iter().any(|(a, s)| a == DEV && *s == sats),
             "the fee output is the one the coinbase pays"
         );
-
-        // `[solo].fee_address` is not trimmed by the config; the coinbase pays
-        // the trimmed address, so that is the fee output.
-        let padded = SoloFeeConfig {
-            dev_fee_address: Some(format!(" {DEV} ")),
-            dev_fee_percent: 1.0,
-        };
-        let paid = entries(&padded);
-        assert!(
-            paid.iter().any(|(a, _)| a == DEV),
-            "precondition: the coinbase pays the trimmed address"
-        );
-        assert_eq!(
-            solo_fee_output(&paid, &padded).map(|(a, _)| a).as_deref(),
-            Some(DEV)
-        );
-    }
-
-    #[test]
-    fn solo_payouts_empty_address_yields_empty() {
-        let r = solo_payouts("", &SoloFeeConfig::default(), TEST_REWARD);
-        assert!(r.is_empty());
-    }
-
-    #[test]
-    fn solo_payouts_no_dev_fee_yields_single_100_pct() {
-        let r = solo_payouts(
-            "bc1qabc",
-            &SoloFeeConfig {
-                dev_fee_address: None,
-                dev_fee_percent: 0.0,
-            },
-            TEST_REWARD,
-        );
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].address, "bc1qabc");
-        assert_eq!(r[0].sats, TEST_REWARD);
-    }
-
-    #[test]
-    fn solo_payouts_with_dev_fee_splits() {
-        let r = solo_payouts(
-            "bc1qminer",
-            &SoloFeeConfig {
-                dev_fee_address: Some("bc1qdev".into()),
-                dev_fee_percent: 1.5,
-            },
-            TEST_REWARD,
-        );
-        assert_eq!(r.len(), 2);
-        assert_eq!(r[0].address, "bc1qdev");
-        assert_eq!(r[0].sats, 75_000_000); // floor(1.5% × 5e9)
-        assert_eq!(r[1].address, "bc1qminer");
-        assert_eq!(r[1].sats, TEST_REWARD - 75_000_000); // miner takes the remainder
-        assert_eq!(r[0].sats + r[1].sats, TEST_REWARD);
-    }
-
-    #[test]
-    fn solo_payouts_with_dev_fee_empty_address_is_ignored() {
-        // Trim treats whitespace-only as empty.
-        let r = solo_payouts(
-            "bc1qminer",
-            &SoloFeeConfig {
-                dev_fee_address: Some("   ".into()),
-                dev_fee_percent: 1.5,
-            },
-            TEST_REWARD,
-        );
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].address, "bc1qminer");
-        assert_eq!(r[0].sats, TEST_REWARD);
-    }
-
-    #[test]
-    fn solo_payouts_rejects_out_of_range_fee_percent() {
-        let r = solo_payouts(
-            "bc1qminer",
-            &SoloFeeConfig {
-                dev_fee_address: Some("bc1qdev".into()),
-                dev_fee_percent: 150.0,
-            },
-            TEST_REWARD,
-        );
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].address, "bc1qminer");
-        assert_eq!(r[0].sats, TEST_REWARD);
-    }
-
-    #[test]
-    fn solo_payouts_zero_percent_dev_fee_pays_miner_only() {
-        // Dev address set but percent 0.0: no zero-value dev output.
-        let r = solo_payouts(
-            "bc1qminer",
-            &SoloFeeConfig {
-                dev_fee_address: Some("bc1qdev".into()),
-                dev_fee_percent: 0.0,
-            },
-            TEST_REWARD,
-        );
-        assert_eq!(r.len(), 1, "no zero-value dev output");
-        assert_eq!(r[0].address, "bc1qminer");
-        assert_eq!(r[0].sats, TEST_REWARD);
     }
 }

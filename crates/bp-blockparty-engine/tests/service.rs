@@ -70,7 +70,7 @@ impl CoinbaseReservation for RecordingReservation {
 
 fn config() -> BlockpartyPayoutConfig {
     BlockpartyPayoutConfig {
-        fee_address: Some(addr("bc1qfeexxxx")),
+        fee_address: addr("bc1qfeexxxx"),
         fee_percent: 2.0,
         min_payout_sats: Sats(5_000),
     }

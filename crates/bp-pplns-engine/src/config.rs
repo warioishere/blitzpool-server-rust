@@ -165,22 +165,6 @@ mod tests {
         );
     }
 
-    /// A typo passes `AddressId` but must still be refused.
-    #[test]
-    fn a_typo_in_the_fee_address_is_refused() {
-        let typo = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLX";
-        let cfg = PplnsEngineConfig {
-            fee_address: Some(AddressId::new(typo).expect("shape ok")),
-            ..PplnsEngineConfig::default()
-        };
-        assert_eq!(
-            cfg.try_new().unwrap_err(),
-            ConfigError::FeePayoutBudget(FeePayoutBudgetError::InvalidFeeAddress {
-                value: typo.to_string()
-            })
-        );
-    }
-
     #[test]
     fn default_validates_clean() {
         valid().try_new().expect("default ok");

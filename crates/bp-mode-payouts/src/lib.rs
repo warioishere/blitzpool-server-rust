@@ -369,7 +369,14 @@ mod tests {
     fn blockparty_payouts_on(pool: sqlx::PgPool) -> BlockpartyPayouts {
         BlockpartyPayouts::new(
             pool,
-            bp_blockparty_engine::BlockpartyPayoutConfig::default(),
+            bp_blockparty_engine::BlockpartyPayoutConfig {
+                fee_address: bp_common::AddressId::new(
+                    "bcrt1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq".to_string(),
+                )
+                .unwrap(),
+                fee_percent: 2.0,
+                min_payout_sats: bp_common::Sats(5_000),
+            },
         )
     }
 

@@ -206,7 +206,7 @@ async fn service(pg: &PgPool, fee_address: &str) -> Arc<BlockpartyService> {
             BlockpartyPayouts::new(
                 pg.clone(),
                 BlockpartyPayoutConfig {
-                    fee_address: Some(AddressId::new(fee_address.to_string()).expect("fee addr")),
+                    fee_address: AddressId::new(fee_address.to_string()).expect("fee addr"),
                     fee_percent: 2.0,
                     min_payout_sats: Sats(5_000),
                 },

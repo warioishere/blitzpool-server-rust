@@ -14,7 +14,6 @@ workspace = true
 bp-common = { workspace = true }
 bp-share = { workspace = true }
 bp-template-distribution = { workspace = true }
-tracing = { workspace = true }
 bitcoin = { workspace = true }
 thiserror = { workspace = true }
 hex = { workspace = true }

@@ -508,7 +508,7 @@ async fn main() -> ExitCode {
             engines.mode_gate.clone(),
             engines.pplns.clone(),
             engines.group_solo.clone(),
-            crate::payout_resolver::solo_fee_config(&cfg),
+            engines.solo_fee.clone(),
             m.blockparty_service(),
             Some(m.coinbase_tags.clone()),
         ))
@@ -1209,9 +1209,8 @@ fn print_stratum_error_help(err: &StratumSpawnError) {
         StratumSpawnError::Sv1(stratum_v1::StratumV1SpawnError::ServerConfig(_)) => {
             eprintln!(
                 "hint: the server-wide SV1 config failed validation. \
-                 Check `[solo] fee_address` + `fee_percent` \
-                 (percent must be in [0, 100]; address must be \
-                 non-empty when set)."
+                 Check `[stratum] job_retention_ms` (at least the stale-grace \
+                 window) and `difficulty_check_interval_ms` (> 0)."
             );
         }
         StratumSpawnError::Sv2(stratum_v2::StratumV2SpawnError::PrivkeyMissing) => {
@@ -1414,11 +1413,25 @@ fn print_engine_error_help(err: &EngineError) {
                  database error, check the `[database]` connection."
             );
         }
-        EngineError::InvalidAddress(_, _) => {
+        EngineError::InvalidFeeAddress { section, .. } => {
             eprintln!(
-                "hint: a configured bitcoin address didn't parse against \
-                 the active `network`. Confirm prefix matches mainnet vs \
-                 testnet vs regtest in your config."
+                "hint: `[{section}] fee_address` must be an address of the \
+                 configured `network`: check it for typos and that its prefix \
+                 matches mainnet vs testnet vs regtest."
+            );
+        }
+        EngineError::BlockpartyConfig(_) => {
+            eprintln!(
+                "hint: check `[blockparty]`: `fee_percent` in [0.0, 100.0], \
+                 `min_payout_sats` ≥ 546, `coinbase_weight_budget` above the \
+                 minimum in the error. Remove `[blockparty]` to run without \
+                 Blockparty."
+            );
+        }
+        EngineError::SoloFeePercent(_) => {
+            eprintln!(
+                "hint: `[solo] fee_percent` must be in [0.0, 100.0]; leave it \
+                 out for no Solo fee."
             );
         }
         EngineError::CoreEpoch(_) => {

@@ -141,7 +141,10 @@ async fn dissolving_a_blockparty_drops_its_admins_cached_mode() {
             BlockpartyPayouts::new(
                 pool.clone(),
                 BlockpartyPayoutConfig {
-                    fee_address: None,
+                    fee_address: bp_common::AddressId::new(
+                        "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq".to_string(),
+                    )
+                    .unwrap(),
                     fee_percent: 0.0,
                     min_payout_sats: bp_common::Sats(5_000),
                 },

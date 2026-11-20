@@ -16,24 +16,14 @@ use uuid::Uuid;
 
 use crate::error::BlockpartyServiceError;
 
-/// Fee address and percent are resolved by the boot layer and passed in.
+/// The `[blockparty]` fee settings, validated by the boot layer
+/// (`validate_fee_payout_budget`) and passed in.
 #[derive(Clone, Debug)]
 pub struct BlockpartyPayoutConfig {
-    pub fee_address: Option<AddressId>,
+    pub fee_address: AddressId,
     pub fee_percent: f64,
-    /// Dust floor per member output; clamped to at least
-    /// `bp_blockparty::DUST_LIMIT_SATS`.
+    /// Smallest member output, at least `DUST_LIMIT_SATS`.
     pub min_payout_sats: bp_common::Sats,
-}
-
-impl Default for BlockpartyPayoutConfig {
-    fn default() -> Self {
-        Self {
-            fee_address: None,
-            fee_percent: 2.0,
-            min_payout_sats: bp_common::Sats(5_000),
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -69,7 +59,7 @@ impl BlockpartyPayouts {
         let result = build_blockparty_distribution(BlockpartyDistributionInput {
             members: &member_inputs(&members),
             block_reward_sats,
-            pool_fee_address: self.config.fee_address.as_ref(),
+            pool_fee_address: &self.config.fee_address,
             pool_fee_percent: self.config.fee_percent,
             min_payout_sats: self.config.min_payout_sats,
         });

@@ -16,6 +16,7 @@ use bp_config::{AppConfig, PplnsConfig as TomlPplnsConfig, Role};
 use bp_group_solo_engine::config::GroupSoloEngineConfig;
 use bp_group_solo_engine::engine::GroupSoloEngine;
 use bp_group_solo_engine::hooks::{GroupSoloAcceptedShareSink, GroupSoloRejectedShareSink};
+use bp_mining_job::SoloFeeConfig;
 use bp_mining_mode::MiningModeResult;
 use bp_pplns_engine::config::PplnsEngineConfig;
 use bp_pplns_engine::engine::PplnsEngine;
@@ -55,6 +56,9 @@ pub(crate) struct EngineHandles {
     /// Blockparty is configured. The cache-carrying service is front/API
     /// only, see [`crate::membership::Membership`].
     pub(crate) blockparty_payouts: Option<BlockpartyPayouts>,
+    /// The `[solo]` fee, validated once here for the Stratum, JDP and API
+    /// resolvers so a preview and a real coinbase cannot disagree.
+    pub(crate) solo_fee: SoloFeeConfig,
 }
 
 #[derive(Debug, Error)]
@@ -77,8 +81,15 @@ pub(crate) enum EngineError {
     LiveGroupCheck(#[from] bp_db::DbError),
     #[error("session-persistence engine spawn failed: {0}")]
     SessionPersistence(#[from] bp_session_persistence::error::SessionPersistenceError),
-    #[error("invalid bitcoin address {0:?}: {1}")]
-    InvalidAddress(String, bp_common::InvalidAddressError),
+    #[error("[{section}] fee_address {value:?} is not an address of the configured network")]
+    InvalidFeeAddress {
+        section: &'static str,
+        value: String,
+    },
+    #[error("blockparty config invalid: {0}")]
+    BlockpartyConfig(bp_pplns::FeePayoutBudgetError),
+    #[error("[solo] fee_percent must be in [0.0, 100.0] and finite, got {0}")]
+    SoloFeePercent(f64),
     #[error("core epoch fetch (INCR core:epoch) failed: {0}")]
     CoreEpoch(#[from] redis::RedisError),
 }
@@ -102,6 +113,7 @@ pub(crate) async fn spawn(
     handles: &FoundationHandles,
 ) -> Result<EngineHandles, EngineError> {
     let read_only = !cfg.has_role(Role::Payout);
+    let solo_fee = solo_fee(cfg)?;
     let mode_gate = Arc::new(BlitzpoolModeGate::new());
     let pplns = spawn_pplns(cfg, handles, read_only).await?;
     let group_solo = spawn_group_solo(cfg, handles, read_only).await?;
@@ -135,6 +147,30 @@ pub(crate) async fn spawn(
         rejected_sink,
         session_persistence_hook,
         blockparty_payouts,
+        solo_fee,
+    })
+}
+
+// ─── Solo fee ────────────────────────────────────────────────────
+
+/// The `[solo]` fee: an address of the configured network when one is set,
+/// and a percent in `[0, 100]`. A blank address means no fee.
+fn solo_fee(cfg: &AppConfig) -> Result<SoloFeeConfig, EngineError> {
+    let fee_address = match cfg.solo.fee_address.as_deref().map(str::trim) {
+        Some(raw) if !raw.is_empty() => Some(
+            mode_fee_address("solo", raw, cfg.network)?
+                .as_str()
+                .to_string(),
+        ),
+        _ => None,
+    };
+    let fee_percent = cfg.solo.fee_percent.unwrap_or(0.0);
+    if !fee_percent.is_finite() || !(0.0..=100.0).contains(&fee_percent) {
+        return Err(EngineError::SoloFeePercent(fee_percent));
+    }
+    Ok(SoloFeeConfig {
+        dev_fee_address: fee_address,
+        dev_fee_percent: fee_percent,
     })
 }
 
@@ -186,13 +222,11 @@ fn to_pplns_engine_config(
     cfg: &TomlPplnsConfig,
     network: bp_config::Network,
 ) -> Result<PplnsEngineConfig, EngineError> {
+    // Blank falls through to the validator's `MissingFeeAddress`.
     let fee_address = if cfg.fee_address.trim().is_empty() {
         None
     } else {
-        Some(
-            AddressId::new(cfg.fee_address.trim().to_string())
-                .map_err(|e| EngineError::InvalidAddress(cfg.fee_address.clone(), e))?,
-        )
+        Some(mode_fee_address("pplns", &cfg.fee_address, network)?)
     };
     let base = PplnsEngineConfig {
         fee_address,
@@ -265,7 +299,7 @@ fn to_group_solo_engine_config(
     network: bp_config::Network,
 ) -> Result<GroupSoloEngineConfig, EngineError> {
     let base = GroupSoloEngineConfig {
-        fee_address: Some(mode_fee_address(&cfg.fee_address)?),
+        fee_address: Some(mode_fee_address("group_solo", &cfg.fee_address, network)?),
         fee_percent: cfg.fee_percent,
         // Must equal the budget boot reserves on the Group-Solo TDP stream, or
         // the coinbase outgrows Core's reservation and the block is rejected.
@@ -277,10 +311,19 @@ fn to_group_solo_engine_config(
     Ok(validated)
 }
 
-/// A mode section's required fee address.
-fn mode_fee_address(raw: &str) -> Result<AddressId, EngineError> {
-    AddressId::new(raw.trim().to_string())
-        .map_err(|e| EngineError::InvalidAddress(raw.to_string(), e))
+/// A mode section's fee address, which must be an address of `network`: the
+/// coinbase builder refuses any other one on every job.
+fn mode_fee_address(
+    section: &'static str,
+    raw: &str,
+    network: bp_config::Network,
+) -> Result<AddressId, EngineError> {
+    bp_mining_job::parse_pool_address(crate::boot::bitcoin_network(network), raw).ok_or_else(|| {
+        EngineError::InvalidFeeAddress {
+            section,
+            value: raw.to_string(),
+        }
+    })
 }
 
 // ─── Blockparty payouts ──────────────────────────────────────────
@@ -302,10 +345,19 @@ async fn blockparty_payouts(
         info!("blockparty: feature disabled (no `[blockparty]` config block)");
         return Ok(None);
     };
+    let fee_address = mode_fee_address("blockparty", &bp_cfg.fee_address, cfg.network)?;
+    // The same checks the PPLNS and Group-Solo engines run on their sections.
+    bp_pplns::validate_fee_payout_budget(
+        Some(fee_address.as_str()),
+        bp_cfg.fee_percent,
+        bp_cfg.min_payout_sats,
+        bp_cfg.coinbase_weight_budget,
+    )
+    .map_err(EngineError::BlockpartyConfig)?;
     Ok(Some(BlockpartyPayouts::new(
         pool.clone(),
         BlockpartyPayoutConfig {
-            fee_address: Some(mode_fee_address(&bp_cfg.fee_address)?),
+            fee_address,
             fee_percent: bp_cfg.fee_percent,
             min_payout_sats: Sats(bp_cfg.min_payout_sats),
         },
@@ -715,6 +767,173 @@ mod tests {
         assert_eq!(built.fee_percent, 1.0);
         assert_eq!(built.coinbase_weight_budget, 12_000);
         assert_eq!(built.min_payout_sats, Sats(7_000));
+    }
+
+    /// BIP-173 testnet vector: valid, but not on mainnet.
+    const TESTNET_ADDR: &str = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+    const MAINNET_ADDR: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+
+    fn parse_cfg(toml_src: &str) -> bp_config::AppConfig {
+        toml::from_str(toml_src).expect("parse config")
+    }
+
+    fn pplns_section(fee_address: &str) -> String {
+        format!(
+            "[pplns]\nport = 3340\nhigh_diff_port = 3349\nstart_difficulty = 5000\n\
+             target_shares_per_minute = 12\nfee_address = \"{fee_address}\"\n\
+             fee_percent = 1.5\ncoinbase_weight_budget = 35000\nmin_difficulty = 500\n\
+             min_payout_sats = 5000\n"
+        )
+    }
+
+    fn blockparty_section(fee_address: &str, fee_percent: f64, min_payout_sats: i64) -> String {
+        format!(
+            "[blockparty]\nfee_address = \"{fee_address}\"\nfee_percent = {fee_percent:?}\n\
+             min_payout_sats = {min_payout_sats}\n"
+        )
+    }
+
+    /// The config-on path reads no row, so a pool that never connects does.
+    fn unconnected_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://postgres@127.0.0.1:1/none")
+            .expect("lazy pool")
+    }
+
+    /// Each mode refuses a fee address of another network at boot, and takes
+    /// one of the configured network.
+    #[tokio::test]
+    async fn every_mode_refuses_a_fee_address_of_another_network() {
+        let refused = |r: Result<(), EngineError>, mode: &str| match r {
+            Err(EngineError::InvalidFeeAddress { section, value }) => {
+                assert_eq!(section, mode);
+                assert_eq!(value, TESTNET_ADDR);
+            }
+            other => panic!("{mode}: expected InvalidFeeAddress, got {other:?}"),
+        };
+
+        let ok = parse_cfg(&format!("{NO_PPLNS_CFG}\n{}", pplns_section(MAINNET_ADDR)));
+        to_pplns_engine_config(ok.pplns.as_ref().unwrap(), ok.network).expect("pplns: mainnet");
+        let bad = parse_cfg(&format!("{NO_PPLNS_CFG}\n{}", pplns_section(TESTNET_ADDR)));
+        refused(
+            to_pplns_engine_config(bad.pplns.as_ref().unwrap(), bad.network).map(|_| ()),
+            "pplns",
+        );
+
+        let ok = parse_cfg(NO_PPLNS_CFG);
+        to_group_solo_engine_config(ok.group_solo.as_ref().unwrap(), ok.network)
+            .expect("group_solo: mainnet");
+        // A checksum typo of a mainnet address: `AddressId` takes it, the
+        // network parse does not.
+        let typo = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLX";
+        assert!(AddressId::new(typo).is_ok(), "precondition: shape-valid");
+        match to_group_solo_engine_config(
+            parse_cfg(&NO_PPLNS_CFG.replace("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", typo))
+                .group_solo
+                .as_ref()
+                .unwrap(),
+            ok.network,
+        ) {
+            Err(EngineError::InvalidFeeAddress { value, .. }) => assert_eq!(value, typo),
+            other => panic!(
+                "typo: expected InvalidFeeAddress, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+        let bad = parse_cfg(
+            &NO_PPLNS_CFG.replace("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", TESTNET_ADDR),
+        );
+        refused(
+            to_group_solo_engine_config(bad.group_solo.as_ref().unwrap(), bad.network).map(|_| ()),
+            "group_solo",
+        );
+
+        let ok = parse_cfg(&format!(
+            "{NO_PPLNS_CFG}\n{}",
+            blockparty_section(MAINNET_ADDR, 1.5, 5_000)
+        ));
+        assert!(blockparty_payouts(&ok, &unconnected_pool())
+            .await
+            .expect("blockparty: mainnet")
+            .is_some());
+        let bad = parse_cfg(&format!(
+            "{NO_PPLNS_CFG}\n{}",
+            blockparty_section(TESTNET_ADDR, 1.5, 5_000)
+        ));
+        refused(
+            blockparty_payouts(&bad, &unconnected_pool())
+                .await
+                .map(|_| ()),
+            "blockparty",
+        );
+
+        let ok = parse_cfg(&format!(
+            "{NO_PPLNS_CFG}\n[solo]\nfee_address = \"{MAINNET_ADDR}\"\nfee_percent = 1.0\n"
+        ));
+        solo_fee(&ok).expect("solo: mainnet");
+        let bad = parse_cfg(&format!(
+            "{NO_PPLNS_CFG}\n[solo]\nfee_address = \"{TESTNET_ADDR}\"\nfee_percent = 1.0\n"
+        ));
+        refused(solo_fee(&bad).map(|_| ()), "solo");
+    }
+
+    /// `[blockparty]` runs the checks the PPLNS and Group-Solo sections run.
+    #[tokio::test]
+    async fn blockparty_refuses_a_fee_or_min_payout_the_other_modes_refuse() {
+        let build = |fee_percent: f64, min_payout_sats: i64| {
+            parse_cfg(&format!(
+                "{NO_PPLNS_CFG}\n{}",
+                blockparty_section(MAINNET_ADDR, fee_percent, min_payout_sats)
+            ))
+        };
+        let built = blockparty_payouts(&build(1.5, 5_000), &unconnected_pool())
+            .await
+            .expect("sane values boot")
+            .expect("configured");
+        assert_eq!(built.fee_percent(), 1.5);
+
+        match blockparty_payouts(&build(-1.0, 5_000), &unconnected_pool()).await {
+            Err(EngineError::BlockpartyConfig(
+                bp_pplns::FeePayoutBudgetError::InvalidFeePercent { .. },
+            )) => {}
+            other => panic!("expected InvalidFeePercent, got {:?}", other.map(|_| ())),
+        }
+        match blockparty_payouts(&build(1.5, 100), &unconnected_pool()).await {
+            Err(EngineError::BlockpartyConfig(
+                bp_pplns::FeePayoutBudgetError::MinPayoutBelowDust { value: 100, .. },
+            )) => {}
+            other => panic!("expected MinPayoutBelowDust, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// A padded `[solo]` address reaches the coinbase trimmed, a blank one
+    /// means no fee, and a percent outside `[0, 100]` refuses the boot.
+    #[test]
+    fn solo_fee_trims_the_address_and_refuses_an_out_of_range_percent() {
+        let solo = |section: &str| solo_fee(&parse_cfg(&format!("{NO_PPLNS_CFG}\n{section}")));
+
+        let padded = solo(&format!(
+            "[solo]\nfee_address = \" {MAINNET_ADDR} \"\nfee_percent = 1.0\n"
+        ))
+        .expect("padded address");
+        assert_eq!(padded.fee_address(), Some(MAINNET_ADDR));
+        assert_eq!(padded.dev_fee_percent, 1.0);
+
+        let blank = solo("[solo]\nfee_address = \"   \"\nfee_percent = 1.0\n").expect("blank");
+        assert_eq!(blank.fee_address(), None);
+
+        let absent = solo("").expect("no [solo] section");
+        assert_eq!(absent.fee_address(), None);
+        assert_eq!(absent.dev_fee_percent, 0.0);
+
+        for bad in [150.0, -1.0] {
+            match solo(&format!(
+                "[solo]\nfee_address = \"{MAINNET_ADDR}\"\nfee_percent = {bad:?}\n"
+            )) {
+                Err(EngineError::SoloFeePercent(p)) => assert_eq!(p, bad),
+                other => panic!("{bad}: expected SoloFeePercent, got {other:?}"),
+            }
+        }
     }
 
     /// Without `[blockparty]` a live party refuses the boot: its admin would

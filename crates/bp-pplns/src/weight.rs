@@ -104,13 +104,6 @@ pub enum FeePayoutBudgetError {
          falls back to a solo coinbase paying 100 % to one miner"
     )]
     MissingFeeAddress,
-    /// Configured but not a usable payout address; `AddressId` only checks
-    /// the shape, so a typo gets this far.
-    #[error(
-        "fee_address {value:?} is not a usable payout address — same effect as \
-         none at all: every block falls back to a solo coinbase"
-    )]
-    InvalidFeeAddress { value: String },
     /// `fee_percent` was non-finite or outside `[0.0, 100.0]`.
     #[error("fee_percent must be in [0.0, 100.0] and finite, got {value}")]
     InvalidFeePercent { value: f64 },
@@ -123,26 +116,21 @@ pub enum FeePayoutBudgetError {
     WeightBudgetTooLow { value: u32, min: u32 },
 }
 
-/// Validate the fee/payout/budget invariants both payout engines share.
+/// Validate the fee/payout/budget invariants the PPLNS, Group-Solo and
+/// Blockparty sections share.
 /// The fee address comes first because it is structural: without the §4
 /// pool output no distribution exists, and the solo fallback pays 100 % of
-/// the block to whichever miner connected, with nothing booked.
+/// the block to whichever miner connected, with nothing booked. Whether it
+/// is an address of the pool's network is checked where the network is
+/// known, when boot reads the section.
 pub fn validate_fee_payout_budget(
     fee_address: Option<&str>,
     fee_percent: f64,
     min_payout_sats: i64,
     coinbase_weight_budget: u32,
 ) -> Result<(), FeePayoutBudgetError> {
-    let address = fee_address
-        .map(str::trim)
-        .filter(|a| !a.is_empty())
-        .ok_or(FeePayoutBudgetError::MissingFeeAddress)?;
-    // `AddressId` accepts any short ASCII string; a typo would fail later in
-    // the coinbase builder with the same 100 %-to-one-miner outcome.
-    if !is_valid_payout_address(address) {
-        return Err(FeePayoutBudgetError::InvalidFeeAddress {
-            value: address.to_string(),
-        });
+    if fee_address.map(str::trim).is_none_or(str::is_empty) {
+        return Err(FeePayoutBudgetError::MissingFeeAddress);
     }
     if !fee_percent.is_finite() || !(0.0..=100.0).contains(&fee_percent) {
         return Err(FeePayoutBudgetError::InvalidFeePercent { value: fee_percent });
@@ -294,7 +282,7 @@ mod tests {
         );
     }
 
-    /// Pins that a missing or unparseable fee address is refused at construction.
+    /// Pins that a missing fee address is refused at construction.
     #[test]
     fn a_pool_without_a_usable_fee_address_is_refused() {
         // Absent, empty and whitespace-only are the same operator mistake.
@@ -305,19 +293,6 @@ mod tests {
                 "{missing:?} must be refused"
             );
         }
-        // Shape-valid for `AddressId`, but not a payout address.
-        let typo = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLX";
-        assert!(
-            bp_common::AddressId::new(typo).is_ok(),
-            "precondition: the shape check passes it, which is why this \
-             check has to exist"
-        );
-        assert_eq!(
-            validate_fee_payout_budget(Some(typo), 1.5, 5_000, 50_000),
-            Err(FeePayoutBudgetError::InvalidFeeAddress {
-                value: typo.to_string()
-            })
-        );
     }
 
     #[test]

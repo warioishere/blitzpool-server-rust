@@ -5,7 +5,6 @@
 
 use bitcoin::Network;
 use bp_share::sha256d_from_parts;
-use tracing::warn;
 
 use crate::address;
 
@@ -580,23 +579,21 @@ fn encode_varint(buf: &mut Vec<u8>, n: u64) {
     }
 }
 
-/// Solo-mode dev-fee settings, the inputs of `solo_payouts`.
+/// Solo-mode dev-fee settings, the inputs of `solo_payouts`, validated at
+/// boot from `[solo]`.
 #[derive(Clone, Debug)]
 pub struct SoloFeeConfig {
-    /// Bitcoin address that receives the dev fee on solo payouts.
-    /// `None` disables dev fee — full reward to miner.
+    /// Address of the pool's network that receives the dev fee on solo
+    /// payouts. `None` disables dev fee — full reward to miner.
     pub dev_fee_address: Option<String>,
     /// Dev fee in `[0.0, 100.0]`. Ignored when `dev_fee_address` is `None`.
     pub dev_fee_percent: f64,
 }
 
 impl SoloFeeConfig {
-    /// The fee address as the coinbase pays it: trimmed, `None` when blank.
+    /// The fee address the coinbase pays, `None` without a fee.
     pub fn fee_address(&self) -> Option<&str> {
-        self.dev_fee_address
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
+        self.dev_fee_address.as_deref()
     }
 }
 
@@ -628,13 +625,6 @@ pub fn solo_payouts(
     match (miner_address.is_empty(), dev_addr) {
         (true, _) => vec![],
         (false, None) => full_to_miner(),
-        (false, Some(_dev)) if !(0.0..=100.0).contains(&percent) => {
-            warn!(
-                percent,
-                "solo dev_fee_percent out of [0,100]; ignoring fee + paying 100% to miner"
-            );
-            full_to_miner()
-        }
         (false, Some(_dev)) if percent <= 0.0 => {
             // No zero-value dev output.
             full_to_miner()
@@ -1627,41 +1617,19 @@ mod solo_split_tests {
         assert_eq!(out[0].sats, REWARD);
     }
 
-    /// A configured fee splits, and the two outputs sum to exactly the reward.
+    /// A configured fee splits, fee first and floored, and the two outputs
+    /// sum to exactly the reward.
     #[test]
     fn a_configured_dev_fee_splits_and_conserves_every_satoshi() {
-        let out = solo_payouts("bc1qminer", &fee(Some("bc1qdev"), 1.0), REWARD);
+        let out = solo_payouts("bc1qminer", &fee(Some("bc1qdev"), 1.5), REWARD);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].address, "bc1qdev");
+        assert_eq!(out[0].sats, 75_000_000, "floor(1.5 % × 5e9)");
         assert_eq!(out[1].address, "bc1qminer");
         assert_eq!(
             out[0].sats + out[1].sats,
             REWARD,
             "the split must conserve the reward exactly"
-        );
-    }
-
-    #[test]
-    fn an_empty_or_whitespace_dev_address_is_ignored() {
-        assert_eq!(
-            solo_payouts("bc1qminer", &fee(Some(""), 1.0), REWARD).len(),
-            1
-        );
-        assert_eq!(
-            solo_payouts("bc1qminer", &fee(Some("   "), 1.0), REWARD).len(),
-            1
-        );
-    }
-
-    #[test]
-    fn an_out_of_range_percent_falls_back_to_the_miner() {
-        assert_eq!(
-            solo_payouts("bc1qminer", &fee(Some("bc1qdev"), 101.0), REWARD).len(),
-            1
-        );
-        assert_eq!(
-            solo_payouts("bc1qminer", &fee(Some("bc1qdev"), -1.0), REWARD).len(),
-            1
         );
     }
 

@@ -167,10 +167,6 @@ pub enum WeightBuildError {
     /// `reference_revenue_sats == 0` — boosts have no projection base.
     #[error("reference revenue is zero")]
     ZeroReferenceRevenue,
-    /// `pay_P` is structural (§4), so a bad fee address fails the build
-    /// rather than the coinbase assembly, which would stop jobs for everyone.
-    #[error("fee address is not a valid payout address: {0}")]
-    InvalidFeeAddress(String),
     /// Nobody holds a share: building anyway would pay the whole block to the
     /// pool output while settlement books nothing. Not "nothing published"
     /// (a 100 % fee does that on purpose). A caller that knows the asking miner
@@ -207,11 +203,6 @@ pub fn build_weight_distribution(
 ) -> Result<WeightDistribution, WeightBuildError> {
     if input.reference_revenue_sats == 0 {
         return Err(WeightBuildError::ZeroReferenceRevenue);
-    }
-    if !is_valid_payout_address(input.fee_address.as_str()) {
-        return Err(WeightBuildError::InvalidFeeAddress(
-            input.fee_address.as_str().to_string(),
-        ));
     }
     let t_ref = input.reference_revenue_sats;
 
@@ -722,19 +713,6 @@ mod tests {
             (finder_pct - 0.6).abs() < 1e-6,
             "expected the finder at 60 % of the score space, got {finder_pct}"
         );
-    }
-
-    /// An unusable fee address fails the build, not the coinbase assembly.
-    #[test]
-    fn unusable_fee_address_fails_the_build() {
-        let shares = HashMap::from([(addr(A1), 1.0)]);
-        let balances = HashMap::new();
-        // Well-formed enough for `AddressId`, not a payable script.
-        let bad = addr("bc1qtypo");
-        assert!(matches!(
-            build_weight_distribution(base_input(&shares, &balances, &bad)),
-            Err(WeightBuildError::InvalidFeeAddress(_))
-        ));
     }
 
     /// A bonus past [`MAX_FINDER_BONUS_PPM`] is clamped and leaves the others paid.
