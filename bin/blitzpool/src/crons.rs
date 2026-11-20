@@ -13,14 +13,10 @@ use bp_cron_utils::SystemClock;
 use bp_group_mgmt_engine::cron::{spawn_invitation_expiry_cron, spawn_join_request_expiry_cron};
 use bp_group_solo_engine::round::GroupRoundStore;
 use bp_notifications::adapter::{NtfyAdapter, TelegramAdapter};
-use bp_notifications::cron::best_difficulty::{
-    spawn_best_difficulty_cron, BestDifficultyCronConfig,
-};
-use bp_notifications::cron::hourly_stats::{spawn_hourly_stats_cron, HourlyStatsCronConfig};
-use bp_notifications::cron::network_difficulty::{
-    spawn_network_difficulty_cron, NetworkDifficultyCronConfig,
-};
-use bp_notifications::cron::team_best::{spawn_team_best_cron, TeamBestCronConfig};
+use bp_notifications::cron::best_difficulty::spawn_best_difficulty_cron;
+use bp_notifications::cron::hourly_stats::spawn_hourly_stats_cron;
+use bp_notifications::cron::network_difficulty::spawn_network_difficulty_cron;
+use bp_notifications::cron::team_best::spawn_team_best_cron;
 use bp_notifications::dispatcher::NotificationDispatcher;
 use chrono::Utc;
 use sqlx::PgPool;
@@ -242,10 +238,7 @@ pub(crate) fn spawn(
             );
         }
         Some(spawn_network_difficulty_cron(
-            NetworkDifficultyCronConfig {
-                startup_offset: offsets::NETWORK_DIFFICULTY,
-                ..NetworkDifficultyCronConfig::default()
-            },
+            offsets::NETWORK_DIFFICULTY,
             pool.clone(),
             foundation.bitcoin_rpc.clone(),
             hooks.fcm.clone(),
@@ -265,10 +258,7 @@ pub(crate) fn spawn(
         (run_notifications, listeners.chat_languages())
     {
         Some(spawn_hourly_stats_cron(
-            HourlyStatsCronConfig {
-                startup_offset: offsets::HOURLY_STATS,
-                ..HourlyStatsCronConfig::default()
-            },
+            offsets::HOURLY_STATS,
             pool.clone(),
             Some(foundation.redis.clone()),
             telegram_adapter,
@@ -285,18 +275,12 @@ pub(crate) fn spawn(
     let (best_difficulty_shutdown, team_best_shutdown) = match (run_notifications, dispatcher) {
         (true, Some(dispatcher)) => (
             Some(spawn_best_difficulty_cron(
-                BestDifficultyCronConfig {
-                    startup_offset: offsets::BEST_DIFFICULTY,
-                    ..BestDifficultyCronConfig::default()
-                },
+                offsets::BEST_DIFFICULTY,
                 pool.clone(),
                 Arc::clone(&dispatcher),
             )),
             Some(spawn_team_best_cron(
-                TeamBestCronConfig {
-                    startup_offset: offsets::TEAM_BEST,
-                    ..TeamBestCronConfig::default()
-                },
+                offsets::TEAM_BEST,
                 pool.clone(),
                 GroupRoundStore::new(foundation.redis.clone()),
                 dispatcher,

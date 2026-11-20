@@ -9,6 +9,39 @@ pub mod hourly_stats;
 pub mod network_difficulty;
 pub mod team_best;
 
+/// Runs `tick` every `interval`, the first time `interval + startup_offset`
+/// after the spawn so crons of the same period do not line up, until `true`
+/// is sent on the returned channel. A tick that overruns skips the missed
+/// ones rather than catching up.
+pub(crate) fn spawn_periodic<F, Fut>(
+    name: &'static str,
+    interval: std::time::Duration,
+    startup_offset: std::time::Duration,
+    mut tick: F,
+) -> tokio::sync::watch::Sender<bool>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        let start = tokio::time::Instant::now() + interval + startup_offset;
+        let mut ticker = tokio::time::interval_at(start, interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tracing::info!(cron = name, "cron started");
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() { break; }
+                }
+                _ = ticker.tick() => tick().await,
+            }
+        }
+        tracing::info!(cron = name, "cron stopped");
+    });
+    shutdown_tx
+}
+
 /// What one best-versus-baseline comparison resolves to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TrackerAction {

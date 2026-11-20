@@ -11,8 +11,7 @@ use bp_db::{
 };
 use sqlx::PgPool;
 use tokio::sync::watch;
-use tokio::time::MissedTickBehavior;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::adapter::{NtfyAdapter, TelegramAdapter};
 use crate::command::read::{build_show_workers, build_stats};
@@ -20,52 +19,37 @@ use crate::command::ChatLanguages;
 use crate::dispatcher::settle_telegram_push;
 use crate::format::Language;
 
-#[derive(Debug, Clone)]
-pub struct HourlyStatsCronConfig {
-    pub tick_interval: Duration,
-    /// Phase offset applied to the first tick so this cron doesn't
-    /// align with other periodic jobs of the same period.
-    pub startup_offset: Duration,
-}
-
-impl Default for HourlyStatsCronConfig {
-    fn default() -> Self {
-        Self {
-            tick_interval: Duration::from_secs(3600),
-            startup_offset: Duration::ZERO,
-        }
-    }
-}
+const TICK: Duration = Duration::from_secs(3600);
 
 /// Spawn the cron loop. Either or both adapters may be `None`; in
 /// that case the corresponding subscription set is skipped each tick.
 pub fn spawn_hourly_stats_cron(
-    config: HourlyStatsCronConfig,
+    startup_offset: Duration,
     pool: PgPool,
     redis: Option<redis::aio::ConnectionManager>,
     telegram: Option<Arc<TelegramAdapter>>,
     ntfy: Option<Arc<NtfyAdapter>>,
     chat_languages: ChatLanguages,
 ) -> watch::Sender<bool> {
-    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-    tokio::spawn(async move {
-        let start = tokio::time::Instant::now() + config.tick_interval + config.startup_offset;
-        let mut ticker = tokio::time::interval_at(start, config.tick_interval);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        info!(target: "bp_notifications::cron::hourly_stats", "cron started");
-        loop {
-            tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() { break; }
-                }
-                _ = ticker.tick() => {
-                    run_once(&pool, redis.as_ref(), telegram.as_deref(), ntfy.as_deref(), &chat_languages).await;
-                }
-            }
+    super::spawn_periodic("hourly_stats", TICK, startup_offset, move || {
+        let (pool, redis, telegram, ntfy, chat_languages) = (
+            pool.clone(),
+            redis.clone(),
+            telegram.clone(),
+            ntfy.clone(),
+            chat_languages.clone(),
+        );
+        async move {
+            run_once(
+                &pool,
+                redis.as_ref(),
+                telegram.as_deref(),
+                ntfy.as_deref(),
+                &chat_languages,
+            )
+            .await;
         }
-        info!(target: "bp_notifications::cron::hourly_stats", "cron stopped");
-    });
-    shutdown_tx
+    })
 }
 
 async fn run_once(

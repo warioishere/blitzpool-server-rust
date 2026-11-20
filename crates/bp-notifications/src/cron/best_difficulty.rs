@@ -16,30 +16,12 @@ use bp_db::{
 };
 use sqlx::PgPool;
 use tokio::sync::watch;
-use tokio::time::MissedTickBehavior;
-use tracing::{info, warn};
+use tracing::warn;
 
 use super::classify;
 use crate::dispatcher::NotificationDispatcher;
 
-/// Configuration for the best-diff cron. Default tick is 60 s;
-/// integration tests can dial it down.
-#[derive(Debug, Clone)]
-pub struct BestDifficultyCronConfig {
-    pub tick_interval: Duration,
-    /// Phase offset applied to the first tick so this cron doesn't
-    /// align with other periodic jobs of the same period.
-    pub startup_offset: Duration,
-}
-
-impl Default for BestDifficultyCronConfig {
-    fn default() -> Self {
-        Self {
-            tick_interval: Duration::from_secs(60),
-            startup_offset: Duration::ZERO,
-        }
-    }
-}
+const TICK: Duration = Duration::from_secs(60);
 
 fn now_epoch_ms() -> i64 {
     SystemTime::now()
@@ -50,31 +32,18 @@ fn now_epoch_ms() -> i64 {
 
 /// Spawn the cron loop.
 pub fn spawn_best_difficulty_cron(
-    config: BestDifficultyCronConfig,
+    startup_offset: Duration,
     pool: PgPool,
     dispatcher: Arc<NotificationDispatcher>,
 ) -> watch::Sender<bool> {
-    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-    tokio::spawn(async move {
-        let start = tokio::time::Instant::now() + config.tick_interval + config.startup_offset;
-        let mut ticker = tokio::time::interval_at(start, config.tick_interval);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        info!(target: "bp_notifications::cron::best_difficulty", "cron started");
-        loop {
-            tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() { break; }
-                }
-                _ = ticker.tick() => {
-                    if let Err(e) = run_once(&pool, &dispatcher).await {
-                        warn!(target: "bp_notifications::cron::best_difficulty", error = %e, "tick failed");
-                    }
-                }
+    super::spawn_periodic("best_difficulty", TICK, startup_offset, move || {
+        let (pool, dispatcher) = (pool.clone(), dispatcher.clone());
+        async move {
+            if let Err(e) = run_once(&pool, &dispatcher).await {
+                warn!(target: "bp_notifications::cron::best_difficulty", error = %e, "tick failed");
             }
         }
-        info!(target: "bp_notifications::cron::best_difficulty", "cron stopped");
-    });
-    shutdown_tx
+    })
 }
 
 async fn run_once(pool: &PgPool, dispatcher: &NotificationDispatcher) -> Result<(), String> {

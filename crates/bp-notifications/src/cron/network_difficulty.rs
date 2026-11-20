@@ -17,8 +17,7 @@ use bp_db::{
 use chrono::Utc;
 use sqlx::PgPool;
 use tokio::sync::watch;
-use tokio::time::MissedTickBehavior;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::adapter::{FcmAdapter, PushKind, PushPayload, WebPushAdapter};
 use crate::dispatcher::push_one;
@@ -26,57 +25,23 @@ use crate::dispatcher::push_one;
 // 0.01% relative threshold — only notify when difficulty shifts meaningfully.
 const DIFF_CHANGE_THRESHOLD: f64 = 0.0001;
 
-/// Configuration for the network-difficulty cron. Default tick is
-/// 10 min; an integration-test caller can drop it to a few seconds.
-#[derive(Debug, Clone)]
-pub struct NetworkDifficultyCronConfig {
-    pub tick_interval: Duration,
-    /// Phase offset applied to the first tick so this cron doesn't
-    /// align with other periodic jobs of the same period.
-    pub startup_offset: Duration,
-}
+const TICK: Duration = Duration::from_secs(600);
 
-impl Default for NetworkDifficultyCronConfig {
-    fn default() -> Self {
-        Self {
-            tick_interval: Duration::from_secs(600),
-            startup_offset: Duration::ZERO,
-        }
-    }
-}
-
-/// Spawn the cron loop. Returns a shutdown handle (drop or send `true`
-/// to stop the loop after the next tick). Without any push adapter the
-/// tracker row is still kept fresh for other readers; only the pushes
-/// are skipped.
 pub fn spawn_network_difficulty_cron(
-    config: NetworkDifficultyCronConfig,
+    startup_offset: Duration,
     pool: PgPool,
     rpc: BitcoinRpc,
     fcm: Option<Arc<FcmAdapter>>,
     web_push: Option<Arc<WebPushAdapter>>,
 ) -> watch::Sender<bool> {
-    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-    tokio::spawn(async move {
-        let start = tokio::time::Instant::now() + config.tick_interval + config.startup_offset;
-        let mut ticker = tokio::time::interval_at(start, config.tick_interval);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        info!(target: "bp_notifications::cron::network_difficulty", "cron started");
-        loop {
-            tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() { break; }
-                }
-                _ = ticker.tick() => {
-                    if let Err(e) = run_once(&rpc, &pool, fcm.as_deref(), web_push.as_deref()).await {
-                        warn!(target: "bp_notifications::cron::network_difficulty", error = %e, "tick failed");
-                    }
-                }
+    super::spawn_periodic("network_difficulty", TICK, startup_offset, move || {
+        let (pool, rpc, fcm, web_push) = (pool.clone(), rpc.clone(), fcm.clone(), web_push.clone());
+        async move {
+            if let Err(e) = run_once(&rpc, &pool, fcm.as_deref(), web_push.as_deref()).await {
+                warn!(target: "bp_notifications::cron::network_difficulty", error = %e, "tick failed");
             }
         }
-        info!(target: "bp_notifications::cron::network_difficulty", "cron stopped");
-    });
-    shutdown_tx
+    })
 }
 
 async fn run_once(
