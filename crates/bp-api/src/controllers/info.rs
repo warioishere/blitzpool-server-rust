@@ -415,9 +415,13 @@ async fn client_block_template(
                     blockparty: s.blockparty.as_deref().map(|bp| bp.payouts()),
                     solo_fee: &s.solo_fee,
                 };
-                let payouts: Vec<PayoutInfoEntry> = engines
-                    .payouts_at(resolved, &job_for, reward_sats)
-                    .await
+                let built = engines.payouts_at(resolved, &job_for, reward_sats).await;
+                // The identifier the job writes into its scriptSig, group tag
+                // included.
+                let tag = coinbase_tag_for(&s.pool, resolved).await?;
+                let built = built.with_coinbase_tag(tag);
+                let identifier = built.coinbase_identifier(&s.pool_identifier);
+                let payouts: Vec<PayoutInfoEntry> = built
                     .entries
                     .into_iter()
                     .map(|p| PayoutInfoEntry::of_reward(p.address, p.sats, reward_sats))
@@ -426,7 +430,7 @@ async fn client_block_template(
                 let (coinbase_tx_hex, block_hex) = if payouts.is_empty() {
                     (String::new(), String::new())
                 } else {
-                    assemble_block_preview(&template, &payouts, s.network, &s.pool_identifier)
+                    assemble_block_preview(&template, &payouts, s.network, &identifier)
                         .unwrap_or_else(|_| (String::new(), String::new()))
                 };
                 Ok(ClientBlockTemplateResponse {
@@ -466,6 +470,22 @@ fn preview_finder(
         .unwrap_or_else(|| requester.clone())
 }
 
+/// The tag `mode`'s coinbase carries, from the rows the Front's coinbase tag
+/// cache is built from.
+async fn coinbase_tag_for(
+    pool: &sqlx::PgPool,
+    mode: MiningModeResult,
+) -> Result<Option<bp_common::CoinbaseTag>, ApiError> {
+    let Some(group_id) = mode.coinbase_tag_group() else {
+        return Ok(None);
+    };
+    Ok(bp_db::list_group_coinbase_tags(pool)
+        .await?
+        .into_iter()
+        .find(|(g, _)| *g == group_id)
+        .and_then(|(_, tag)| bp_common::CoinbaseTag::parse(&tag).ok().flatten()))
+}
+
 /// Preview coinbase + full block from the payout list and a
 /// `getblocktemplate` response. Zero extranonces and a zero nonce keep the
 /// preview byte-stable across renders; it is never submitted.
@@ -473,7 +493,7 @@ fn assemble_block_preview(
     template: &serde_json::Value,
     payouts: &[PayoutInfoEntry],
     network: bitcoin::Network,
-    pool_identifier: &str,
+    coinbase_identifier: &str,
 ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
     use bitcoin::hashes::Hash;
     use bitcoin::{
@@ -519,7 +539,7 @@ fn assemble_block_preview(
         network,
         &payout_entries,
         &cb_template,
-        pool_identifier,
+        coinbase_identifier,
         EXTRANONCE_SLOT_LEN,
         // A preview is never submitted, so no settlement hangs off it.
         [0u8; 32],
@@ -1529,6 +1549,47 @@ mod tests {
     }
 
     use super::*;
+
+    /// A Team's preview writes the tag its real job writes; Solo writes none.
+    #[tokio::test]
+    async fn a_team_preview_carries_the_teams_coinbase_tag() {
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let gid = uuid::Uuid::new_v4();
+        bp_db::insert_pplns_group(
+            &pool,
+            gid,
+            &format!("preview-tag-{gid}"),
+            &bp_common::AddressId::new("bc1qpreviewtagcreator").unwrap(),
+            "h",
+            false,
+            bp_group_mgmt::group::PayoutMode::Prop,
+            1,
+        )
+        .await
+        .expect("insert team");
+        sqlx::query(r#"UPDATE pplns_group SET "coinbaseTag" = 'teamtag' WHERE id = $1"#)
+            .bind(gid)
+            .execute(&pool)
+            .await
+            .expect("set tag");
+
+        let team = coinbase_tag_for(&pool, MiningModeResult::GroupSolo(gid))
+            .await
+            .expect("tag read");
+        let solo = coinbase_tag_for(&pool, MiningModeResult::Solo)
+            .await
+            .expect("tag read");
+        sqlx::query("DELETE FROM pplns_group WHERE id = $1")
+            .bind(gid)
+            .execute(&pool)
+            .await
+            .ok();
+
+        assert_eq!(team.map(|t| t.as_str().to_string()), Some("teamtag".into()));
+        assert!(solo.is_none());
+    }
 
     /// A preview row's percent is its share of the reward; a zero reward
     /// shows 0 % instead of dividing by zero.

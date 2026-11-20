@@ -14,7 +14,6 @@ use bp_common::{AddressId, MiningMode};
 use bp_group_solo_engine::engine::GroupSoloEngine;
 use bp_mining_job::SoloFeeConfig;
 use bp_mining_job::{PayoutResolver, ResolvedPayouts};
-use bp_mining_mode::MiningModeResult;
 use bp_mode_payouts::{ModeBuild, ModeEngines};
 use bp_pplns_engine::engine::PplnsEngine;
 use bp_stratum_v2::bridge::DistributionAccounting;
@@ -77,14 +76,9 @@ impl ProductionPayoutResolver {
     /// lands, its connection mines Solo.
     async fn resolve_internal(&self, miner: &AddressId, reward_sats: u64) -> ResolvedPayouts {
         let mode = self.mode_gate.lookup_mode(miner.as_str());
-        // A Team or Blockparty mines its own coinbase, so it may tag it;
-        // Solo and the pool-wide PPLNS coinbase carry the pool's alone.
-        let tag = match mode {
-            MiningModeResult::GroupSolo(group_id) | MiningModeResult::Blockparty(group_id) => {
-                self.coinbase_tag(group_id)
-            }
-            MiningModeResult::Solo | MiningModeResult::Pplns => None,
-        };
+        let tag = mode
+            .coinbase_tag_group()
+            .and_then(|group_id| self.coinbase_tag(group_id));
         let resolved = self.engines().payouts_at(mode, miner, reward_sats).await;
         if resolved.is_none() {
             error!(
@@ -413,6 +407,7 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
 mod tests {
     use super::*;
     use bp_mining_job::solo_payouts;
+    use bp_mining_mode::MiningModeResult;
 
     const TEST_REWARD: u64 = 5_000_000_000;
 

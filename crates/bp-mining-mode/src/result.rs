@@ -32,6 +32,16 @@ impl MiningModeResult {
         }
     }
 
+    /// The group whose coinbase tag this mode's coinbase carries: a Team or
+    /// a Blockparty mines its own coinbase, so it may tag it; Solo and the
+    /// pool-wide PPLNS coinbase carry the pool's identifier alone.
+    pub fn coinbase_tag_group(self) -> Option<Uuid> {
+        match self {
+            Self::GroupSolo(g) | Self::Blockparty(g) => Some(g),
+            Self::Solo | Self::Pplns => None,
+        }
+    }
+
     /// The inverse of [`Self::mode`] + [`Self::group_id`]: how a stream entry
     /// carries the mode. A group mode without its group, which no producer
     /// writes, fails the decode.
