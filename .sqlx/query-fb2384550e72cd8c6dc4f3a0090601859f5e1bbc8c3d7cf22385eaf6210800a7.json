@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM address_challenge WHERE address = $1 AND purpose = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fb2384550e72cd8c6dc4f3a0090601859f5e1bbc8c3d7cf22385eaf6210800a7"
+}

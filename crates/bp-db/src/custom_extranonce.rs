@@ -10,15 +10,6 @@ use sqlx::postgres::PgPool;
 
 use crate::DbError;
 
-/// A pending token-issuance challenge (address-scoped, nonced, expiring).
-#[derive(Clone, Debug)]
-pub struct ExtranonceChallengeRow {
-    pub address: AddressId,
-    pub message: String,
-    pub created_at: i64,
-    pub expires_at: i64,
-}
-
 /// The issued token's hash for an address.
 #[derive(Clone, Debug)]
 pub struct ExtranonceTokenRow {
@@ -42,86 +33,6 @@ pub struct CustomExtranonceRow {
 /// a row can't hold a value this would truncate.
 fn prefix_to_u32(v: i64) -> u32 {
     v as u32
-}
-
-// ── Token-issuance challenge ─────────────────────────────────────────
-
-/// INSERT-or-replace the pending challenge for an address. PK address, so a
-/// re-request overwrites the old one — only the most recent is ever valid.
-pub async fn upsert_extranonce_challenge(
-    pool: &PgPool,
-    address: &AddressId,
-    message: &str,
-    created_at_ms: i64,
-    expires_at_ms: i64,
-) -> Result<ExtranonceChallengeRow, DbError> {
-    let r = sqlx::query!(
-        r#"INSERT INTO pplns_extranonce_challenge
-             (address, message, "createdAt", "expiresAt")
-           VALUES ($1, $2, $3, $4)
-           ON CONFLICT (address) DO UPDATE SET
-             message = EXCLUDED.message,
-             "createdAt" = EXCLUDED."createdAt",
-             "expiresAt" = EXCLUDED."expiresAt"
-           RETURNING
-            address AS "address!: AddressId",
-            message AS "message!",
-            "createdAt" AS "created_at!",
-            "expiresAt" AS "expires_at!""#,
-        address.as_str(),
-        message,
-        created_at_ms,
-        expires_at_ms,
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(DbError::from)?;
-    Ok(ExtranonceChallengeRow {
-        address: r.address,
-        message: r.message,
-        created_at: r.created_at,
-        expires_at: r.expires_at,
-    })
-}
-
-pub async fn find_extranonce_challenge(
-    pool: &PgPool,
-    address: &AddressId,
-) -> Result<Option<ExtranonceChallengeRow>, DbError> {
-    let r = sqlx::query!(
-        r#"SELECT
-            address AS "address!: AddressId",
-            message AS "message!",
-            "createdAt" AS "created_at!",
-            "expiresAt" AS "expires_at!"
-           FROM pplns_extranonce_challenge WHERE address = $1 LIMIT 1"#,
-        address.as_str()
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(DbError::from)?;
-    Ok(r.map(|r| ExtranonceChallengeRow {
-        address: r.address,
-        message: r.message,
-        created_at: r.created_at,
-        expires_at: r.expires_at,
-    }))
-}
-
-/// DELETE the pending challenge for an address. Called after a token is issued
-/// (consume it) or when it has expired.
-pub async fn delete_extranonce_challenge(
-    pool: &PgPool,
-    address: &AddressId,
-) -> Result<u64, DbError> {
-    let result = sqlx::query!(
-        r#"DELETE FROM pplns_extranonce_challenge WHERE address = $1"#,
-        address.as_str(),
-    )
-    .execute(pool)
-    .await
-    .map_err(DbError::from)?;
-    Ok(result.rows_affected())
 }
 
 // ── Bearer token ─────────────────────────────────────────────────────

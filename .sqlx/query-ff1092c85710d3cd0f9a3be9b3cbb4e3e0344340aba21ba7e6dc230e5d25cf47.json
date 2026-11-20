@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            message AS \"message!\",\n            \"expiresAt\" AS \"expires_at!\"\n           FROM address_challenge WHERE address = $1 AND purpose = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "message!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "address_challenge",
+            "name": "message"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "expires_at!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "address_challenge",
+            "name": "expiresAt"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "ff1092c85710d3cd0f9a3be9b3cbb4e3e0344340aba21ba7e6dc230e5d25cf47"
+}

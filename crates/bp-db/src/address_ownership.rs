@@ -1,23 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! BTC address-ownership proof via a signed, short-lived challenge (only the
-//! most recent one is valid). Gates group-invite eligibility (as an
-//! alternative to a verified email) and custom-extranonce overrides.
+//! BTC address-ownership proof, the binding a redeemed
+//! [`ChallengePurpose::Ownership`](crate::ChallengePurpose::Ownership)
+//! challenge leaves. Gates Team and Blockparty onboarding, as an alternative
+//! to a verified email.
 
 use bp_common::AddressId;
 use sqlx::{postgres::PgPool, FromRow};
 
 use crate::DbError;
-
-#[derive(Clone, Debug, FromRow)]
-pub struct OwnershipChallengeRow {
-    pub address: AddressId,
-    pub message: String,
-    #[sqlx(rename = "createdAt")]
-    pub created_at: i64,
-    #[sqlx(rename = "expiresAt")]
-    pub expires_at: i64,
-}
 
 #[derive(Clone, Debug, FromRow)]
 pub struct AddressOwnershipRow {
@@ -33,74 +24,6 @@ pub struct AddressOwnershipRow {
     pub created_at: i64,
     #[sqlx(rename = "updatedAt")]
     pub updated_at: i64,
-}
-
-/// INSERT-or-replace the pending challenge for an address. PK address, so a
-/// re-request overwrites the old one — only the most recent is ever valid.
-pub async fn upsert_ownership_challenge(
-    pool: &PgPool,
-    address: &AddressId,
-    message: &str,
-    created_at_ms: i64,
-    expires_at_ms: i64,
-) -> Result<OwnershipChallengeRow, DbError> {
-    sqlx::query_as!(
-        OwnershipChallengeRow,
-        r#"INSERT INTO pplns_ownership_challenge
-             (address, message, "createdAt", "expiresAt")
-           VALUES ($1, $2, $3, $4)
-           ON CONFLICT (address) DO UPDATE SET
-             message = EXCLUDED.message,
-             "createdAt" = EXCLUDED."createdAt",
-             "expiresAt" = EXCLUDED."expiresAt"
-           RETURNING
-            address AS "address!: AddressId",
-            message AS "message!",
-            "createdAt" AS "created_at!",
-            "expiresAt" AS "expires_at!""#,
-        address.as_str(),
-        message,
-        created_at_ms,
-        expires_at_ms,
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(DbError::from)
-}
-
-pub async fn find_ownership_challenge(
-    pool: &PgPool,
-    address: &AddressId,
-) -> Result<Option<OwnershipChallengeRow>, DbError> {
-    sqlx::query_as!(
-        OwnershipChallengeRow,
-        r#"SELECT
-            address AS "address!: AddressId",
-            message AS "message!",
-            "createdAt" AS "created_at!",
-            "expiresAt" AS "expires_at!"
-           FROM pplns_ownership_challenge WHERE address = $1 LIMIT 1"#,
-        address.as_str()
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(DbError::from)
-}
-
-/// DELETE the pending challenge for an address. Called after a successful verify
-/// (consume it) or when it has expired.
-pub async fn delete_ownership_challenge(
-    pool: &PgPool,
-    address: &AddressId,
-) -> Result<u64, DbError> {
-    let result = sqlx::query!(
-        r#"DELETE FROM pplns_ownership_challenge WHERE address = $1"#,
-        address.as_str(),
-    )
-    .execute(pool)
-    .await
-    .map_err(DbError::from)?;
-    Ok(result.rows_affected())
 }
 
 /// INSERT-or-update the verified ownership binding for an address.
@@ -159,8 +82,7 @@ pub async fn find_address_ownership(
     .map_err(DbError::from)
 }
 
-/// True when the address has a verified ownership binding. The shared read used
-/// by both consumers (group-invite eligibility, custom-extranonce auth gate).
+/// True when the address has a verified ownership binding.
 pub async fn is_address_ownership_verified(
     pool: &PgPool,
     address: &AddressId,

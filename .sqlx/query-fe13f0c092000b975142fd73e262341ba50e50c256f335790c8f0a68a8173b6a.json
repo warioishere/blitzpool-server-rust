@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO address_challenge\n             (address, purpose, message, \"createdAt\", \"expiresAt\")\n           VALUES ($1, $2, $3, $4, $5)\n           ON CONFLICT (address, purpose) DO UPDATE SET\n             message = EXCLUDED.message,\n             \"createdAt\" = EXCLUDED.\"createdAt\",\n             \"expiresAt\" = EXCLUDED.\"expiresAt\"",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fe13f0c092000b975142fd73e262341ba50e50c256f335790c8f0a68a8173b6a"
+}

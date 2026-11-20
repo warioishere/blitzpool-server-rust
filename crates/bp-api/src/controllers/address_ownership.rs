@@ -23,13 +23,12 @@ use bitcoin::{
     Address, CompressedPublicKey, Network,
 };
 use bp_common::AddressId;
+use bp_db::ChallengePurpose;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 use crate::middleware::{issue_address_token, rate_limit};
 use crate::state::SharedState;
-
-const CHALLENGE_TTL_MINUTES: i64 = 15;
 
 pub(crate) fn routes() -> Router<SharedState> {
     Router::new()
@@ -48,56 +47,15 @@ pub(crate) fn routes() -> Router<SharedState> {
 
 // ─── POST /api/address/ownership/challenge ───────────────────────
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ChallengeBody {
-    address: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ChallengeResponse {
-    /// The exact UTF-8 message the wallet must sign.
-    message: String,
-    expires_at: i64,
-}
-
 async fn challenge(
     State(state): State<SharedState>,
     Json(body): Json<ChallengeBody>,
 ) -> Result<Json<ChallengeResponse>, ApiError> {
     let address = parse_supported_address(&body.address, state.network)?;
-    let addr_str = address.as_str().to_string();
-
-    let now = bp_common::now_ms();
-    let expires_at = now + CHALLENGE_TTL_MINUTES * 60 * 1000;
-    let nonce = random_nonce();
-    // Human-readable + bound to the address, a nonce and an expiry so a captured
-    // signature can't be replayed for a different address or after expiry.
-    let message = format!(
-        "Blitzpool address-ownership verification\n\
-         Address: {addr_str}\n\
-         Nonce: {nonce}\n\
-         Issued(ms): {now}\n\
-         Expires(ms): {expires_at}"
-    );
-    bp_db::upsert_ownership_challenge(&state.pool, &address, &message, now, expires_at).await?;
-    Ok(Json(ChallengeResponse {
-        message,
-        expires_at,
-    }))
+    issue_challenge(&state, &address, ChallengePurpose::Ownership).await
 }
 
 // ─── POST /api/address/ownership/verify ──────────────────────────
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct VerifyBody {
-    address: String,
-    /// The signature over the challenge message. Base64 for the recoverable
-    /// (Electrum/BIP-137) formats, or the BIP-322 encoded signature.
-    signature: String,
-}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -114,41 +72,19 @@ struct VerifyResponse {
 
 async fn verify(
     State(state): State<SharedState>,
-    Json(body): Json<VerifyBody>,
+    Json(body): Json<SignedChallengeBody>,
 ) -> Result<Json<VerifyResponse>, ApiError> {
-    let address = parse_supported_address(&body.address, state.network)?;
-    let signature = body.signature.trim();
-    if signature.is_empty() {
-        return Err(ownership_error(
-            "missing-signature",
-            StatusCode::BAD_REQUEST,
-        ));
-    }
-
-    let pending = bp_db::find_ownership_challenge(&state.pool, &address)
-        .await?
-        .ok_or_else(|| ownership_error("no-challenge", StatusCode::NOT_FOUND))?;
-    let now = bp_common::now_ms();
-    if pending.expires_at < now {
-        bp_db::delete_ownership_challenge(&state.pool, &address).await?;
-        return Err(ownership_error("challenge-expired", StatusCode::GONE));
-    }
-
-    // Verify against the STORED challenge message — never a client-supplied one.
-    let Some((method, script_type)) =
-        verify_message_signature(address.as_str(), &pending.message, signature, state.network)
-    else {
-        return Err(ownership_error(
-            "invalid-signature",
-            StatusCode::BAD_REQUEST,
-        ));
-    };
-
-    let saved =
-        bp_db::upsert_address_ownership_verified(&state.pool, &address, &method, &script_type, now)
-            .await?;
-    // Consume the challenge.
-    bp_db::delete_ownership_challenge(&state.pool, &address).await?;
+    let signed = check_signed_challenge(&state, ChallengePurpose::Ownership, &body).await?;
+    let saved = bp_db::upsert_address_ownership_verified(
+        &state.pool,
+        &signed.address,
+        &signed.method,
+        &signed.script_type,
+        bp_common::now_ms(),
+    )
+    .await?;
+    bp_db::delete_address_challenge(&state.pool, &signed.address, ChallengePurpose::Ownership)
+        .await?;
     Ok(Json(VerifyResponse {
         address_token: issue_address_token(&state, saved.address.as_str()),
         address: saved.address.as_str().to_string(),
@@ -232,14 +168,125 @@ async fn verified_status(
     }))
 }
 
+// ─── signed challenge, shared with the custom-extranonce controller ─
+
+const CHALLENGE_TTL_MINUTES: i64 = 15;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChallengeBody {
+    pub(crate) address: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChallengeResponse {
+    /// The exact UTF-8 message the wallet must sign.
+    message: String,
+    expires_at: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SignedChallengeBody {
+    address: String,
+    /// The signature over the challenge message. Base64 for the recoverable
+    /// (Electrum/BIP-137) formats, or the BIP-322 encoded signature.
+    signature: String,
+}
+
+/// An address whose signature over its pending challenge verified.
+pub(crate) struct SignedChallenge {
+    pub(crate) address: AddressId,
+    /// Signature family that verified: `bip322` | `bip137`.
+    pub(crate) method: String,
+    pub(crate) script_type: String,
+}
+
+/// Store a fresh challenge of `purpose` for `address`, replacing a pending one.
+pub(crate) async fn issue_challenge(
+    state: &SharedState,
+    address: &AddressId,
+    purpose: ChallengePurpose,
+) -> Result<Json<ChallengeResponse>, ApiError> {
+    let now = bp_common::now_ms();
+    let expires_at = now + CHALLENGE_TTL_MINUTES * 60 * 1000;
+    let message = challenge_message(purpose, address.as_str(), &random_nonce(), now, expires_at);
+    bp_db::upsert_address_challenge(&state.pool, address, purpose, &message, now, expires_at)
+        .await?;
+    Ok(Json(ChallengeResponse {
+        message,
+        expires_at,
+    }))
+}
+
+/// Check `body`'s signature against the STORED challenge of `purpose`, never a
+/// client-supplied message. The challenge stays: the caller deletes it once it
+/// has acted, so a replay of the signature finds nothing.
+pub(crate) async fn check_signed_challenge(
+    state: &SharedState,
+    purpose: ChallengePurpose,
+    body: &SignedChallengeBody,
+) -> Result<SignedChallenge, ApiError> {
+    let address = parse_supported_address(&body.address, state.network)?;
+    let signature = body.signature.trim();
+    if signature.is_empty() {
+        return Err(ownership_error(
+            "missing-signature",
+            StatusCode::BAD_REQUEST,
+        ));
+    }
+    let pending = bp_db::find_address_challenge(&state.pool, &address, purpose)
+        .await?
+        .ok_or_else(|| ownership_error("no-challenge", StatusCode::NOT_FOUND))?;
+    if pending.expires_at < bp_common::now_ms() {
+        bp_db::delete_address_challenge(&state.pool, &address, purpose).await?;
+        return Err(ownership_error("challenge-expired", StatusCode::GONE));
+    }
+    let Some((method, script_type)) =
+        verify_message_signature(address.as_str(), &pending.message, signature, state.network)
+    else {
+        return Err(ownership_error(
+            "invalid-signature",
+            StatusCode::BAD_REQUEST,
+        ));
+    };
+    Ok(SignedChallenge {
+        address,
+        method,
+        script_type,
+    })
+}
+
+/// Human-readable and bound to the purpose, the address, a nonce and an
+/// expiry, so a captured signature redeems nothing else and nothing later.
+pub(crate) fn challenge_message(
+    purpose: ChallengePurpose,
+    address: &str,
+    nonce: &str,
+    now: i64,
+    expires_at: i64,
+) -> String {
+    let title = match purpose {
+        ChallengePurpose::Ownership => "Blitzpool address-ownership verification",
+        ChallengePurpose::Extranonce => "Blitzpool extranonce token request",
+    };
+    format!(
+        "{title}\n\
+         Address: {address}\n\
+         Nonce: {nonce}\n\
+         Issued(ms): {now}\n\
+         Expires(ms): {expires_at}"
+    )
+}
+
 // ─── signature verification ──────────────────────────────────────
 
 /// `(method, script_type)` when `signature` signs `message` for `address`.
 /// BIP-322 first (the only route for taproot), then BIP-137 recoverable,
 /// where segwit is checked by recovering the key and re-deriving the address.
-/// Shared with the custom-extranonce controller.
 #[allow(clippy::collapsible_match)]
-pub(crate) fn verify_message_signature(
+fn verify_message_signature(
     address: &str,
     message: &str,
     signature: &str,
@@ -320,7 +367,7 @@ fn ownership_error(code: &'static str, status: StatusCode) -> ApiError {
     ApiError::GroupService { code, status }
 }
 
-pub(crate) fn random_nonce() -> String {
+fn random_nonce() -> String {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("OS CSPRNG");
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -459,6 +506,25 @@ mod tests {
             verify_message_signature(&other_addr, "the real challenge", &sig, Network::Bitcoin),
             None
         );
+    }
+
+    /// A signature verifies only the challenge it was made over: not one with
+    /// another nonce, not the same challenge for the other purpose.
+    #[test]
+    fn a_challenge_signature_redeems_only_its_own_challenge() {
+        let (sk, _pk, cpk) = test_key();
+        let addr = Address::p2wpkh(&cpk, Network::Bitcoin).to_string();
+        let msg = challenge_message(ChallengePurpose::Extranonce, &addr, "nonce123", 1000, 2000);
+        let sig = sign_recoverable(&sk, &msg);
+        assert!(verify_message_signature(&addr, &msg, &sig, Network::Bitcoin).is_some());
+
+        let other_nonce =
+            challenge_message(ChallengePurpose::Extranonce, &addr, "nonce456", 1000, 2000);
+        let other_purpose =
+            challenge_message(ChallengePurpose::Ownership, &addr, "nonce123", 1000, 2000);
+        for other in [other_nonce, other_purpose] {
+            assert!(verify_message_signature(&addr, &other, &sig, Network::Bitcoin).is_none());
+        }
     }
 
     #[test]

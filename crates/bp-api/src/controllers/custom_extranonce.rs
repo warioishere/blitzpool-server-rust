@@ -18,12 +18,14 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::collections::HashSet;
 
-use super::address_ownership::{parse_supported_address, random_nonce, verify_message_signature};
+use super::address_ownership::{
+    check_signed_challenge, issue_challenge, parse_supported_address, ChallengeBody,
+    ChallengeResponse, SignedChallengeBody,
+};
 use crate::error::ApiError;
 use crate::middleware::rate_limit;
 use crate::state::SharedState;
-
-const CHALLENGE_TTL_MINUTES: i64 = 15;
+use bp_db::ChallengePurpose;
 
 /// Highest top byte an allocator owns; a new allocator must widen it. The DB
 /// check `pplns_custom_extranonce_prefix_unreserved` carries the same bound,
@@ -54,20 +56,6 @@ pub(crate) fn routes() -> Router<SharedState> {
 
 // ─── POST /api/address/extranonce/challenge ──────────────────────
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ChallengeBody {
-    address: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ChallengeResponse {
-    /// The exact UTF-8 message the wallet must sign.
-    message: String,
-    expires_at: i64,
-}
-
 async fn challenge(
     State(state): State<SharedState>,
     Json(body): Json<ChallengeBody>,
@@ -75,27 +63,10 @@ async fn challenge(
     let address = parse_supported_address(&body.address, state.network)?;
     // Up front, so no one signs for a token that could never set an override.
     ensure_solo_eligible(&state.pool, state.pplns.as_deref(), &address).await?;
-
-    let now = bp_common::now_ms();
-    let expires_at = now + CHALLENGE_TTL_MINUTES * 60 * 1000;
-    let message = challenge_message(address.as_str(), &random_nonce(), now, expires_at);
-    bp_db::upsert_extranonce_challenge(&state.pool, &address, &message, now, expires_at).await?;
-    Ok(Json(ChallengeResponse {
-        message,
-        expires_at,
-    }))
+    issue_challenge(&state, &address, ChallengePurpose::Extranonce).await
 }
 
 // ─── POST /api/address/extranonce/token ──────────────────────────
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TokenBody {
-    address: String,
-    /// Signature over the challenge message. Base64 for the recoverable
-    /// (Electrum/BIP-137) formats, or the BIP-322 encoded signature.
-    signature: String,
-}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -108,37 +79,17 @@ struct TokenResponse {
 
 async fn token(
     State(state): State<SharedState>,
-    Json(body): Json<TokenBody>,
+    Json(body): Json<SignedChallengeBody>,
 ) -> Result<Json<TokenResponse>, ApiError> {
-    let address = parse_supported_address(&body.address, state.network)?;
-    let signature = body.signature.trim();
-    if signature.is_empty() {
-        return Err(en_error("missing-signature", StatusCode::BAD_REQUEST));
-    }
-
-    let pending = bp_db::find_extranonce_challenge(&state.pool, &address)
-        .await?
-        .ok_or_else(|| en_error("no-challenge", StatusCode::NOT_FOUND))?;
-    let now = bp_common::now_ms();
-    if pending.expires_at < now {
-        bp_db::delete_extranonce_challenge(&state.pool, &address).await?;
-        return Err(en_error("challenge-expired", StatusCode::GONE));
-    }
-
-    // Verify against the STORED message — never a client-supplied one.
-    if verify_message_signature(address.as_str(), &pending.message, signature, state.network)
-        .is_none()
-    {
-        return Err(en_error("invalid-signature", StatusCode::BAD_REQUEST));
-    }
-
-    // Overwrites (revokes) any prior token; consuming the challenge stops a
-    // replay of the signature.
+    let signed = check_signed_challenge(&state, ChallengePurpose::Extranonce, &body).await?;
+    // Overwrites (revokes) any prior token.
     let token = random_token();
-    bp_db::upsert_extranonce_token(&state.pool, &address, &sha256_hex(&token), now).await?;
-    bp_db::delete_extranonce_challenge(&state.pool, &address).await?;
+    let now = bp_common::now_ms();
+    bp_db::upsert_extranonce_token(&state.pool, &signed.address, &sha256_hex(&token), now).await?;
+    bp_db::delete_address_challenge(&state.pool, &signed.address, ChallengePurpose::Extranonce)
+        .await?;
     Ok(Json(TokenResponse {
-        address: address.as_str().to_string(),
+        address: signed.address.as_str().to_string(),
         token,
         created_at: now,
     }))
@@ -248,18 +199,6 @@ async fn set(
 }
 
 // ─── helpers ─────────────────────────────────────────────────────
-
-fn challenge_message(address: &str, nonce: &str, now: i64, expires_at: i64) -> String {
-    // Address-bound and one-time, so the signature never becomes a reusable
-    // credential; that is the token's job.
-    format!(
-        "Blitzpool extranonce token request\n\
-         Address: {address}\n\
-         Nonce: {nonce}\n\
-         Issued(ms): {now}\n\
-         Expires(ms): {expires_at}"
-    )
-}
 
 fn random_token() -> String {
     let mut bytes = [0u8; 32];
@@ -375,18 +314,6 @@ fn en_error(code: &'static str, status: StatusCode) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::hashes::Hash;
-    use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
-    use bitcoin::sign_message::{signed_msg_hash, MessageSignature};
-    use bitcoin::{Address, CompressedPublicKey, Network};
-
-    fn sign_recoverable(sk: &SecretKey, message: &str) -> String {
-        let secp = Secp256k1::new();
-        let hash = signed_msg_hash(message);
-        let msg = Message::from_digest(hash.to_byte_array());
-        let rec = secp.sign_ecdsa_recoverable(&msg, sk);
-        MessageSignature::new(rec, true).to_base64()
-    }
 
     /// Only live window shares block; a balance-only past PPLNS miner passes.
     #[test]
@@ -445,22 +372,6 @@ mod tests {
                 "{raw} must be rejected as malformed"
             );
         }
-    }
-
-    /// The challenge message verifies with a genuine signature, and only its own.
-    #[test]
-    fn signed_challenge_message_verifies() {
-        let sk = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
-        let cpk = CompressedPublicKey(sk.public_key(&Secp256k1::new()));
-        let addr = Address::p2wpkh(&cpk, Network::Bitcoin).to_string();
-
-        let msg = challenge_message(&addr, "nonce123", 1000, 2000);
-        let sig = sign_recoverable(&sk, &msg);
-        assert!(verify_message_signature(&addr, &msg, &sig, Network::Bitcoin).is_some());
-        // A signature over a different message must not verify.
-        let other = challenge_message(&addr, "different-nonce", 1000, 2000);
-        let other_sig = sign_recoverable(&sk, &other);
-        assert!(verify_message_signature(&addr, &msg, &other_sig, Network::Bitcoin).is_none());
     }
 
     /// A token hashes stably, a wrong token does not match, tokens are 64 hex.

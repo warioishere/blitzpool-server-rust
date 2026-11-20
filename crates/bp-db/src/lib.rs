@@ -6,6 +6,7 @@
 //! Queries are added when a call site needs them, never speculatively.
 
 mod address;
+mod address_challenge;
 mod address_ownership;
 mod address_token;
 mod block;
@@ -36,11 +37,14 @@ pub use address::{
     reset_address_settings_best_difficulty, upsert_best_difficulty_trackers, AddressSettingsRow,
     BestDifficultyTrackerRow, HighScoreRow,
 };
+pub use address_challenge::{
+    delete_address_challenge, find_address_challenge, upsert_address_challenge,
+    AddressChallengeRow, ChallengePurpose,
+};
 pub use address_ownership::{
-    addresses_with_ownership_proof, delete_ownership_challenge, find_address_ownership,
-    find_address_verification, find_ownership_challenge, is_address_ownership_verified,
-    upsert_address_ownership_verified, upsert_ownership_challenge, AddressOwnershipRow,
-    AddressVerification, OwnershipChallengeRow,
+    addresses_with_ownership_proof, find_address_ownership, find_address_verification,
+    is_address_ownership_verified, upsert_address_ownership_verified, AddressOwnershipRow,
+    AddressVerification,
 };
 pub use address_token::{find_token_revoked_before, raise_token_revoked_before};
 pub use block::{
@@ -75,10 +79,9 @@ pub use client::{
     DeviceFirstSeenRow, PoolWorkerCounts, WorkerSharesRow,
 };
 pub use custom_extranonce::{
-    all_custom_extranonces, delete_extranonce_challenge, find_custom_extranonces_for_address,
-    find_extranonce_challenge, find_extranonce_token, upsert_custom_extranonces_batch,
-    upsert_extranonce_challenge, upsert_extranonce_token, CustomExtranonceRow,
-    ExtranonceChallengeRow, ExtranonceTokenRow,
+    all_custom_extranonces, find_custom_extranonces_for_address, find_extranonce_token,
+    upsert_custom_extranonces_batch, upsert_extranonce_token, CustomExtranonceRow,
+    ExtranonceTokenRow,
 };
 pub use email::{
     delete_email_verification_by_token, delete_email_verifications_for_address,

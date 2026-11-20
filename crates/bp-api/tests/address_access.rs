@@ -246,3 +246,58 @@ async fn a_verified_signature_answers_with_the_addresss_token() {
 
     bp_test_support::delete_signature_ownership(&pool, &address).await;
 }
+
+/// A redeemed challenge is consumed, and the two purposes keep separate
+/// pending challenges: issuing one leaves the other in place, and a signature
+/// over one redeems nothing of the other.
+#[tokio::test]
+async fn a_challenge_is_redeemed_once_and_only_for_its_purpose() {
+    let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+        return;
+    };
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_slice(&[0x5au8; 32]).unwrap();
+    let pk = CompressedPublicKey(sk.public_key(&secp));
+    let address = Address::p2wpkh(&pk, Network::Bitcoin).to_string();
+    let app = app(
+        pool.clone(),
+        AddressAuth::Off(None),
+        Arc::new(CapturingHooks::default()),
+    );
+    let challenge = |uri: &'static str| {
+        let app = app.clone();
+        let address = address.clone();
+        async move {
+            let (status, body) = post(&app, uri, json!({ "address": address })).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            body["message"].as_str().unwrap().to_string()
+        }
+    };
+    let ownership = challenge("/api/address/ownership/challenge").await;
+    let extranonce = challenge("/api/address/extranonce/challenge").await;
+    let redeem = |uri: &'static str, message: &str| {
+        let body = json!({ "address": address, "signature": sign(&sk, &address, message) });
+        let app = app.clone();
+        async move { post(&app, uri, body).await }
+    };
+
+    let (status, body) = redeem("/api/address/ownership/verify", &extranonce).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid-signature");
+
+    let (status, body) = redeem("/api/address/ownership/verify", &ownership).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = redeem("/api/address/ownership/verify", &ownership).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], "no-challenge");
+
+    let (status, body) = redeem("/api/address/extranonce/token", &extranonce).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["token"].is_string(), "{body}");
+
+    bp_test_support::delete_signature_ownership(&pool, &address).await;
+    let _ = sqlx::query("DELETE FROM pplns_extranonce_token WHERE address = $1")
+        .bind(&address)
+        .execute(&pool)
+        .await;
+}
