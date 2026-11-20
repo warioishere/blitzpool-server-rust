@@ -59,6 +59,8 @@ pub(crate) struct EngineHandles {
     /// The `[solo]` fee, validated once here for the Stratum, JDP and API
     /// resolvers so a preview and a real coinbase cannot disagree.
     pub(crate) solo_fee: SoloFeeConfig,
+    /// The network's halving schedule, for the settlement subsidy gate.
+    pub(crate) subsidy_halving_interval: u32,
 }
 
 #[derive(Debug, Error)]
@@ -148,6 +150,9 @@ pub(crate) async fn spawn(
         session_persistence_hook,
         blockparty_payouts,
         solo_fee,
+        subsidy_halving_interval: bp_mining_job::subsidy_halving_interval(
+            crate::boot::bitcoin_network(cfg.network),
+        ),
     })
 }
 
@@ -206,18 +211,6 @@ async fn spawn_pplns(
     Ok(Some(engine))
 }
 
-/// Must be the network's real schedule: settlement refuses a coinbase paying
-/// less than the block's subsidy, so a wrong interval makes regtest blocks
-/// past height 150 look underpaid.
-fn subsidy_halving_interval(network: bp_config::Network) -> u32 {
-    match network {
-        bp_config::Network::Regtest => bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL,
-        bp_config::Network::Mainnet
-        | bp_config::Network::Testnet
-        | bp_config::Network::Testnet4 => bp_share::SUBSIDY_HALVING_INTERVAL,
-    }
-}
-
 fn to_pplns_engine_config(
     cfg: &TomlPplnsConfig,
     network: bp_config::Network,
@@ -230,7 +223,6 @@ fn to_pplns_engine_config(
         dust_sweep_enabled: cfg.dust_sweep_enabled,
         abandoned_balance_days: cfg.abandoned_balance_days,
         bucket_shares: cfg.bucket_shares,
-        subsidy_halving_interval: subsidy_halving_interval(network),
         ..PplnsEngineConfig::new(mode_fee_address("pplns", &cfg.fee_address, network)?)
     };
     let validated = base.try_new()?;
@@ -297,7 +289,6 @@ fn to_group_solo_engine_config(
         // Must equal the budget boot reserves on the Group-Solo TDP stream, or
         // the coinbase outgrows Core's reservation and the block is rejected.
         coinbase_weight_budget: cfg.coinbase_weight_budget,
-        subsidy_halving_interval: subsidy_halving_interval(network),
         min_payout_sats: Sats(cfg.min_payout_sats),
     };
     let validated = base.try_new()?;
@@ -640,56 +631,6 @@ mod tests {
     use bp_common::MiningMode;
     use bp_share_stream::StreamConsumer;
     use bp_test_support::{connect_redis_in_range_or_skip, redis_db};
-
-    /// Pins regtest's own halving schedule, without which regtest blocks past
-    /// height 150 would be refused as underpaid.
-    #[test]
-    fn regtest_gets_its_own_halving_schedule() {
-        assert_eq!(
-            subsidy_halving_interval(bp_config::Network::Regtest),
-            bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL
-        );
-        for net in [
-            bp_config::Network::Mainnet,
-            bp_config::Network::Testnet,
-            bp_config::Network::Testnet4,
-        ] {
-            assert_eq!(
-                subsidy_halving_interval(net),
-                bp_share::SUBSIDY_HALVING_INTERVAL,
-                "{net:?} shares the mainnet schedule"
-            );
-        }
-        let regtest = bp_share::block_subsidy_sats(
-            500,
-            subsidy_halving_interval(bp_config::Network::Regtest),
-        );
-        assert_eq!(regtest, 625_000_000, "3 halvings in on regtest");
-        assert!(
-            regtest
-                < bp_share::block_subsidy_sats(
-                    500,
-                    subsidy_halving_interval(bp_config::Network::Mainnet)
-                ),
-            "the mainnet schedule would over-state it and gate the block"
-        );
-    }
-
-    /// Pins that both engines default to the same halving schedule.
-    #[test]
-    fn both_engine_configs_default_to_the_mainnet_schedule() {
-        assert_eq!(
-            PplnsEngineConfig::new(AddressId::new(MAINNET_ADDR).unwrap()).subsidy_halving_interval,
-            bp_share::SUBSIDY_HALVING_INTERVAL
-        );
-        assert_eq!(
-            bp_group_solo_engine::config::GroupSoloEngineConfig::new(
-                AddressId::new(MAINNET_ADDR).unwrap()
-            )
-            .subsidy_halving_interval,
-            bp_share::SUBSIDY_HALVING_INTERVAL
-        );
-    }
 
     /// Deliberately without `[pplns]`: that is the shape under test.
     const NO_PPLNS_CFG: &str = r#"

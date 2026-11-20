@@ -11,6 +11,7 @@ mod coinbase;
 mod header;
 mod merkle;
 mod reservation;
+mod subsidy;
 
 pub use address::{address_to_script, parse_pool_address, AddressError};
 pub use bip54::{
@@ -29,3 +30,4 @@ pub use header::{
 };
 pub use merkle::{coinbase_merkle_branch, merkle_root_from_coinbase};
 pub use reservation::{coinbase_constraints_for_budget, COINBASE_SIZE_HEADROOM_BYTES};
+pub use subsidy::subsidy_halving_interval;

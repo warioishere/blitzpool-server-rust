@@ -42,6 +42,11 @@ impl BlockpartyPayouts {
         self.config.fee_percent
     }
 
+    /// The address every Blockparty coinbase pays the pool fee to.
+    pub fn fee_address(&self) -> &AddressId {
+        &self.config.fee_address
+    }
+
     /// Coinbase distribution over the current roster; `Ok(None)` when the
     /// group does not exist.
     pub async fn build_payouts(

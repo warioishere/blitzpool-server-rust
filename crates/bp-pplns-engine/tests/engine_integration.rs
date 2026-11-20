@@ -1292,9 +1292,7 @@ async fn a_block_frozen_before_an_earlier_apply_still_books_correctly() {
     drop_harness(h).await;
 }
 
-// ── The settlement gate: subsidy, not the reference revenue ────────
-// Heights sit in subsidy epoch 4, so the gate is really exercised and not
-// passed on a height whose subsidy has decayed to 0.
+// ── Settlement books the real revenue, not the reference ───────────
 
 /// A block paying far off the reference revenue is still booked.
 #[tokio::test]
@@ -1307,7 +1305,7 @@ async fn a_block_far_off_the_reference_revenue_is_still_booked() {
     const BIG: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
     const TINY: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
     const T_REF: u64 = 3_000_000_000;
-    // 1.6 × the projection base, still well above the block subsidy.
+    // 1.6 × the projection base.
     const T_ACTUAL: u64 = 4_800_000_000;
     let h1: i32 = 840_601;
     let h2: i32 = 840_602;
@@ -1392,71 +1390,6 @@ async fn a_block_far_off_the_reference_revenue_is_still_booked() {
 
     cleanup_addr(&h.pool, BIG, &[h1, h2]).await;
     cleanup_addr(&h.pool, TINY, &[h1, h2]).await;
-    drop_harness(h).await;
-}
-
-/// A coinbase paying less than the block's own subsidy is refused as terminal.
-#[tokio::test]
-async fn a_coinbase_below_the_block_subsidy_is_refused() {
-    let _serial = balance_table_lock().lock().await;
-    let h = match spawn_or_skip(10, "test_burn_").await {
-        Some(h) => h,
-        None => return,
-    };
-    const MINER: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
-    const T_REF: u64 = 3_000_000_000;
-    // Height 840 701 is 4 halvings in: the subsidy is 312 500 000 sats.
-    let height: i32 = 840_701;
-    let subsidy = bp_share::block_subsidy_sats(height, bp_share::SUBSIDY_HALVING_INTERVAL);
-    assert_eq!(subsidy, 312_500_000, "fixture height must be in epoch 4");
-    cleanup_addr(&h.pool, MINER, &[height]).await;
-
-    h.engine
-        .record_share(None, MINER, 1_000.0, ts(1))
-        .await
-        .unwrap();
-    let d = h.engine.build_distribution(T_REF).await.expect("build");
-
-    // §4-consistent, it just forfeits most of the block.
-    let burned = actual_paying_exactly(&d, subsidy - 1);
-    let err = h
-        .engine
-        .on_block_found(
-            height,
-            &burned,
-            snapshot_for(&h.engine, &d.payouts_fingerprint()).await,
-        )
-        .await
-        .expect_err("a coinbase below the subsidy must not book");
-    assert!(
-        matches!(
-            err,
-            bp_pplns_engine::engine::EngineError::RevenueBelowSubsidy { .. }
-        ),
-        "expected RevenueBelowSubsidy, got {err}"
-    );
-    assert!(err.is_terminal(), "the watcher must not retry this forever");
-
-    let booked: (i64,) =
-        sqlx::query_as(r#"SELECT count(*) FROM pplns_payout_history WHERE "blockHeight" = $1"#)
-            .bind(height)
-            .fetch_one(&h.pool)
-            .await
-            .unwrap();
-    assert_eq!(booked.0, 0, "nothing may be booked for a burned block");
-
-    // One satoshi more books: the gate is exactly the subsidy.
-    let honest = actual_paying_exactly(&d, subsidy);
-    h.engine
-        .on_block_found(
-            height,
-            &honest,
-            snapshot_for(&h.engine, &d.payouts_fingerprint()).await,
-        )
-        .await
-        .expect("a coinbase paying exactly the subsidy books");
-
-    cleanup_addr(&h.pool, MINER, &[height]).await;
     drop_harness(h).await;
 }
 

@@ -27,7 +27,7 @@ use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use thiserror::Error;
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::config::{ConfigError, PplnsEngineConfig};
 use crate::distribution::{
@@ -58,16 +58,6 @@ pub enum EngineError {
     Ledger(#[from] LedgerError),
     #[error("distribution: {0}")]
     Distribution(Arc<DistributionError>),
-    #[error(
-        "block {block_height} coinbase pays {actual_reward} sats, less than the \
-         {subsidy} sat subsidy the block was entitled to — it forfeited money, so \
-         nothing about it is trustworthy enough to book unattended"
-    )]
-    RevenueBelowSubsidy {
-        block_height: i32,
-        actual_reward: u64,
-        subsidy: u64,
-    },
     #[error("invalid address in snapshot: {0}")]
     Address(#[from] InvalidAddressError),
 }
@@ -77,9 +67,7 @@ impl EngineError {
     /// re-applying and leave the block to the operator reprocess.
     pub fn is_terminal(&self) -> bool {
         match self {
-            EngineError::Config(_)
-            | EngineError::RevenueBelowSubsidy { .. }
-            | EngineError::Address(_) => true,
+            EngineError::Config(_) | EngineError::Address(_) => true,
             // `LedgerError` decides, so this engine and Group-Solo cannot disagree.
             EngineError::Ledger(e) => e.is_terminal(),
             EngineError::Redis(_)
@@ -282,21 +270,6 @@ impl PplnsEngine {
         actual: &ActualCoinbase,
         snapshot: StoredWeightSnapshot,
     ) -> Result<ApplyDistributionResult, EngineError> {
-        if let Err(subsidy) =
-            actual.check_subsidy(block_height, self.inner.config.subsidy_halving_interval)
-        {
-            error!(
-                subsidy,
-                actual_reward = actual.total_value_sats,
-                block_height,
-                "PPLNS block coinbase pays less than the block subsidy — refusing to book"
-            );
-            return Err(EngineError::RevenueBelowSubsidy {
-                block_height,
-                actual_reward: actual.total_value_sats,
-                subsidy,
-            });
-        }
         // The balance write is absolute, so `current` MUST be read `FOR UPDATE`
         // in the writing transaction, or a dust sweep committing in between is
         // undone; the settlement lock covers what `FOR UPDATE` cannot, the rows

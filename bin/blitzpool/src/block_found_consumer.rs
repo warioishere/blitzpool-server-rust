@@ -131,7 +131,15 @@ mod tests {
     /// `notify_block_found` without a dispatcher is a no-op.
     #[tokio::test]
     async fn notify_is_noop_without_dispatcher() {
-        let ledger = BlockFoundApplier::new(None, None, None, None, None, None);
+        let ledger = BlockFoundApplier::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            bp_share::SUBSIDY_HALVING_INTERVAL,
+        );
         // Must return cleanly (no panic, no dispatcher access).
         ledger.notify_block_found(&solo_event()).await;
     }
@@ -192,6 +200,7 @@ mod tests {
             Some(no_adapter_dispatcher(pg)),
             None,
             None,
+            bp_share::SUBSIDY_HALVING_INTERVAL,
         );
         let notify_consumer: StreamConsumer<BlockFoundEvent> = StreamConsumer::new(
             redis.clone(),
@@ -210,7 +219,15 @@ mod tests {
         assert_eq!(acked, 1);
 
         // Ledger group: no dispatcher, no engines → Solo branch logs, no notify.
-        let ledger_applier = BlockFoundApplier::new(None, None, None, None, None, None);
+        let ledger_applier = BlockFoundApplier::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            bp_share::SUBSIDY_HALVING_INTERVAL,
+        );
         let ledger_consumer: StreamConsumer<BlockFoundEvent> = StreamConsumer::new(
             redis,
             BLOCK_FOUND_STREAM_KEY,

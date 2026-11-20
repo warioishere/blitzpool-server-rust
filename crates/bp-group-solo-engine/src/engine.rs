@@ -15,7 +15,7 @@ use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use thiserror::Error;
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::{ConfigError, GroupSoloEngineConfig};
@@ -45,17 +45,6 @@ pub enum EngineError {
     Distribution(Arc<DistributionError>),
     #[error("group {0} does not exist")]
     GroupNotFound(Uuid),
-    #[error(
-        "group {group_id} block {block_height} coinbase pays {actual_reward} sats, less than \
-         the {subsidy} sat subsidy the block was entitled to — it forfeited money, so nothing \
-         about it is trustworthy enough to book unattended"
-    )]
-    RevenueBelowSubsidy {
-        group_id: Uuid,
-        block_height: i32,
-        actual_reward: u64,
-        subsidy: u64,
-    },
 }
 
 impl EngineError {
@@ -64,9 +53,7 @@ impl EngineError {
     /// is not lost: the operator reprocess books it from its own coinbase.
     pub fn is_terminal(&self) -> bool {
         match self {
-            EngineError::Config(_)
-            | EngineError::RevenueBelowSubsidy { .. }
-            | EngineError::GroupNotFound(_) => true,
+            EngineError::Config(_) | EngineError::GroupNotFound(_) => true,
             // Infrastructure: these clear on their own.
             EngineError::Redis(_)
             | EngineError::Round(_)
@@ -456,23 +443,6 @@ impl GroupSoloEngine {
         let group_key = group_id.to_string();
         let block_height = block.height;
 
-        if let Err(subsidy) =
-            actual.check_subsidy(block_height, self.inner.config.subsidy_halving_interval)
-        {
-            error!(
-                %group_id,
-                subsidy,
-                actual_reward = actual.total_value_sats,
-                block_height,
-                "group-solo block coinbase pays less than the block subsidy — refusing to book"
-            );
-            return Err(EngineError::RevenueBelowSubsidy {
-                group_id,
-                block_height,
-                actual_reward: actual.total_value_sats,
-                subsidy,
-            });
-        }
         // 2. Mode + reset gate. A dissolved group still gets its history, but
         //    no round state is written back for it.
         let now_ms = chrono::Utc::now().timestamp_millis();

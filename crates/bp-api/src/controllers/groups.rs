@@ -341,14 +341,14 @@ async fn update_settings(
     Ok(Json(GroupSummary::from(row)))
 }
 
-/// Delegates to [`bp_share::block_subsidy_sats`], the function settlement
-/// gates on, so there is one halving rule. Heights beyond `i32` clamp.
+/// The schedule and the function settlement gates on
+/// ([`bp_mining_job::subsidy_halving_interval`], [`bp_share::block_subsidy_sats`]),
+/// so there is one halving rule. Heights beyond `i32` clamp.
 pub(crate) fn block_subsidy_sats(height: u64, network: bitcoin::Network) -> u64 {
-    let interval = match network {
-        bitcoin::Network::Regtest => bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL,
-        _ => bp_share::SUBSIDY_HALVING_INTERVAL,
-    };
-    bp_share::block_subsidy_sats(height.min(i32::MAX as u64) as i32, interval)
+    bp_share::block_subsidy_sats(
+        height.min(i32::MAX as u64) as i32,
+        bp_mining_job::subsidy_halving_interval(network),
+    )
 }
 
 #[derive(Serialize)]

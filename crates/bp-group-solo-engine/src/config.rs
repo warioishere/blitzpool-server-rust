@@ -29,29 +29,22 @@ pub struct GroupSoloEngineConfig {
     /// Coinbase weight budget (WU), handed to bitcoin-core over the TDP IPC
     /// stream so no `bitcoin.conf` knob needs to match.
     pub coinbase_weight_budget: u32,
-
-    /// Blocks between subsidy halvings, the input to the settlement gate's
-    /// floor. Derived from the network at boot, not an operator knob: regtest
-    /// halves every 150 blocks, and the mainnet value would make later regtest
-    /// blocks look like they burned subsidy.
-    pub subsidy_halving_interval: u32,
 }
 
 impl GroupSoloEngineConfig {
-    /// The defaults around a fee address, which has none.
+    /// Every knob at its default; the fee address has none, so it is given.
     pub fn new(fee_address: AddressId) -> Self {
         Self {
             fee_address,
             fee_percent: 0.0,
             min_payout_sats: Sats(DEFAULT_MIN_PAYOUT_SATS as i64),
             coinbase_weight_budget: DEFAULT_COINBASE_WEIGHT_BUDGET,
-            subsidy_halving_interval: bp_share::SUBSIDY_HALVING_INTERVAL,
         }
     }
 
     /// Validate field-level invariants.
     pub fn try_new(self) -> Result<Self, ConfigError> {
-        // Shared with the PPLNS engine so both refuse the same configs.
+        // Shared with PPLNS and Blockparty so all refuse the same configs.
         validate_fee_payout_budget(
             self.fee_percent,
             self.min_payout_sats.0,
@@ -63,8 +56,8 @@ impl GroupSoloEngineConfig {
 
 #[derive(thiserror::Error, Debug, PartialEq)]
 pub enum ConfigError {
-    /// The fee / min-payout / coinbase-budget checks shared with the other
-    /// payout engine; see [`FeePayoutBudgetError`].
+    /// The fee / min-payout / coinbase-budget checks every pool-fee mode
+    /// shares; see [`FeePayoutBudgetError`].
     #[error(transparent)]
     FeePayoutBudget(#[from] FeePayoutBudgetError),
 }

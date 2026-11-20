@@ -69,14 +69,10 @@ pub(crate) struct PoolMarkers {
 }
 
 impl PoolMarkers {
-    /// `None` when no marker address is configured — the caller logs and skips
-    /// the task.
+    /// `None` when no mode pays a fee address — the caller logs and skips the
+    /// task.
     pub(crate) fn new(addresses: impl IntoIterator<Item = String>) -> Option<Self> {
-        let addresses: HashSet<String> = addresses
-            .into_iter()
-            .map(|a| a.trim().to_string())
-            .filter(|a| !a.is_empty())
-            .collect();
+        let addresses: HashSet<String> = addresses.into_iter().collect();
         if addresses.is_empty() {
             return None;
         }
@@ -480,7 +476,6 @@ mod tests {
     #[test]
     fn pool_markers_refuses_an_empty_configuration() {
         assert!(PoolMarkers::new(Vec::<String>::new()).is_none());
-        assert!(PoolMarkers::new(["".to_string(), "   ".to_string()]).is_none());
     }
 
     #[test]

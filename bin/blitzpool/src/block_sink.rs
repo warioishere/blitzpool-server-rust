@@ -165,7 +165,7 @@ pub(crate) struct TdpBlockSubmissionSink {
 /// The relocatable half of block-found handling: per-mode ledger writes,
 /// the PPLNS pending store and notifications. Reads only the Core-stamped
 /// [`BlockFoundEvent`], so it runs on a Satellite from the stream.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub(crate) struct BlockFoundApplier {
     pplns: Option<PplnsEngine>,
     group_solo: Option<GroupSoloEngine>,
@@ -178,6 +178,8 @@ pub(crate) struct BlockFoundApplier {
     /// published distribution, whose weights encode pre-settlement balances a
     /// JDC would otherwise pay twice. See [`crate::settlement`].
     settle: Option<crate::settlement::SettlementSignal>,
+    /// The network's schedule, for the settlement subsidy gate.
+    subsidy_halving_interval: u32,
 }
 
 impl TdpBlockSubmissionSink {
@@ -193,7 +195,15 @@ impl TdpBlockSubmissionSink {
             mode_gate,
             bitcoin_rpc,
             pool,
-            applier: BlockFoundApplier::default(),
+            applier: BlockFoundApplier::new(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                bp_mining_job::subsidy_halving_interval(bitcoin::Network::Bitcoin),
+            ),
             block_found_producer: None,
             network: bitcoin::Network::Bitcoin,
         }
@@ -226,6 +236,7 @@ impl TdpBlockSubmissionSink {
 
     pub(crate) fn with_network(mut self, network: bitcoin::Network) -> Self {
         self.network = network;
+        self.applier.subsidy_halving_interval = bp_mining_job::subsidy_halving_interval(network);
         self
     }
 
@@ -534,6 +545,7 @@ impl BlockFoundApplier {
         dispatcher: Option<Arc<NotificationDispatcher>>,
         redis: Option<ConnectionManager>,
         settle: Option<crate::settlement::SettlementSignal>,
+        subsidy_halving_interval: u32,
     ) -> Self {
         Self {
             pplns,
@@ -542,6 +554,7 @@ impl BlockFoundApplier {
             dispatcher,
             redis,
             settle,
+            subsidy_halving_interval,
         }
     }
 
@@ -652,6 +665,7 @@ impl BlockFoundApplier {
             pplns: self.pplns.as_ref(),
             group_solo: self.group_solo.as_ref(),
             blockparty: self.blockparty.as_ref(),
+            subsidy_halving_interval: self.subsidy_halving_interval,
         };
         let applied = settle_block(&settlers, pending).await;
         match applied {
@@ -685,6 +699,13 @@ impl BlockFoundApplier {
                 mode = label,
                 "block-found: settlement inputs not resolved at found-time and the block \
                  could not be parked; NOT booked and NOT kept anywhere"
+            ),
+            Err(err @ SettleFailure::RevenueBelowSubsidy { .. }) => error!(
+                %err,
+                address = address_str,
+                height,
+                mode = label,
+                "block-found: NOT booked and could not be parked"
             ),
             Err(SettleFailure::Engine(err)) => warn!(
                 %err, address = address_str, height,
@@ -1218,10 +1239,15 @@ mod tests {
         let signal = crate::settlement::SettlementSignal::local_only();
         let _ = signal.registry_slot().set(server.distribution_handle());
 
-        let applier = BlockFoundApplier {
-            settle: Some(signal),
-            ..Default::default()
-        };
+        let applier = BlockFoundApplier::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(signal),
+            bp_share::SUBSIDY_HALVING_INTERVAL,
+        );
         applier.settle_distributions().await;
 
         assert!(
@@ -1272,7 +1298,15 @@ mod tests {
     /// Pins that settling without a JDP server is a no-op, not a panic.
     #[tokio::test(flavor = "current_thread")]
     async fn settling_without_a_jdp_server_is_a_no_op() {
-        let applier = BlockFoundApplier::default();
+        let applier = BlockFoundApplier::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            bp_share::SUBSIDY_HALVING_INTERVAL,
+        );
         assert!(applier.settle.is_none());
         applier.settle_distributions().await;
     }
@@ -1433,10 +1467,15 @@ mod tests {
         else {
             return;
         };
-        let applier = BlockFoundApplier {
-            redis: Some(conn.clone()),
-            ..Default::default()
-        };
+        let applier = BlockFoundApplier::new(
+            None,
+            None,
+            None,
+            None,
+            Some(conn.clone()),
+            None,
+            bp_share::SUBSIDY_HALVING_INTERVAL,
+        );
         let actual = ActualCoinbase {
             paid_by_address: Default::default(),
             output_zero: None,

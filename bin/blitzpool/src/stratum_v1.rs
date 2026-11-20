@@ -122,8 +122,8 @@ pub(crate) fn build_server_config(cfg: &AppConfig) -> ServerConfig {
     let network = crate::boot::bitcoin_network(cfg.network);
     let mut sc = ServerConfig::defaults_for(network);
     sc.pool_identifier = cfg.pool_identifier.clone();
-    // Solo dev-fee is applied by `ProductionPayoutResolver` (reads
-    // `cfg.solo` directly); `ServerConfig` carries no fee fields.
+    // The Solo dev-fee is applied by `ProductionPayoutResolver` from the
+    // boot-validated `EngineHandles::solo_fee`; `ServerConfig` carries no fee.
     sc.lifecycle.retention_ms = cfg.stratum.job_retention_ms;
     sc.difficulty_check_interval_ms = cfg.stratum.difficulty_check_interval_ms;
     sc.protocol_debug = cfg.debug.stratum_wire_logs;

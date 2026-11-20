@@ -56,14 +56,10 @@ pub struct PplnsEngineConfig {
     /// PPLNS-port vardiff floor, mirrored here so `/api/pplns/fees` can show
     /// it without depending on bp-stratum-v1.
     pub min_difficulty: u64,
-
-    /// Derived from the network at boot, not an operator knob: regtest halves
-    /// every 150 blocks, and the settlement gate's subsidy floor needs that.
-    pub subsidy_halving_interval: u32,
 }
 
 impl PplnsEngineConfig {
-    /// The defaults around a fee address, which has none.
+    /// Every knob at its default; the fee address has none, so it is given.
     pub fn new(fee_address: AddressId) -> Self {
         Self {
             fee_address,
@@ -77,13 +73,13 @@ impl PplnsEngineConfig {
             dust_sweep_enabled: true,
             abandoned_balance_days: 90,
             min_difficulty: 500,
-            subsidy_halving_interval: bp_share::SUBSIDY_HALVING_INTERVAL,
         }
     }
 
     /// Return the config or its first violation, in struct field order.
     pub fn try_new(self) -> Result<Self, ConfigError> {
-        // Fee, min-payout and budget checks are shared with Group-Solo.
+        // Fee, min-payout and budget checks are shared with Group-Solo and
+        // Blockparty.
         validate_fee_payout_budget(
             self.fee_percent,
             self.min_payout_sats.0,
@@ -121,8 +117,8 @@ impl PplnsEngineConfig {
 /// Field-level validation errors for [`PplnsEngineConfig::try_new`].
 #[derive(thiserror::Error, Debug, PartialEq)]
 pub enum ConfigError {
-    /// The fee / min-payout / coinbase-budget checks shared with the other
-    /// payout engine; see [`FeePayoutBudgetError`].
+    /// The fee / min-payout / coinbase-budget checks every pool-fee mode
+    /// shares; see [`FeePayoutBudgetError`].
     #[error(transparent)]
     FeePayoutBudget(#[from] FeePayoutBudgetError),
     #[error("window_factor must be > 0.0 and finite, got {value}")]

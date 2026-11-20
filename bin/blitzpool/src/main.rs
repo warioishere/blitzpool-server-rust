@@ -590,6 +590,7 @@ async fn main() -> ExitCode {
             engines.pplns.clone(),
             engines.group_solo.clone(),
             engines.blockparty_payouts.clone(),
+            engines.subsidy_halving_interval,
             depth,
             Some(settle_signal.clone()),
         ))
@@ -640,22 +641,28 @@ async fn main() -> ExitCode {
     // Reports pool blocks on chain the ledger has no record of. Report only:
     // the chain does not carry the distribution behind a coinbase.
     let _block_reconcile = if cfg.has_role(Role::Payout) {
-        // Every mode's fee address, since each mode pays its own.
-        let markers = crate::block_reconcile::PoolMarkers::new([
-            cfg.pplns
-                .as_ref()
-                .map(|p| p.fee_address.clone())
-                .unwrap_or_default(),
-            cfg.solo.fee_address.clone().unwrap_or_default(),
-            cfg.group_solo
-                .as_ref()
-                .map(|g| g.fee_address.clone())
-                .unwrap_or_default(),
-            cfg.blockparty
-                .as_ref()
-                .map(|b| b.fee_address.clone())
-                .unwrap_or_default(),
-        ]);
+        // Every mode's fee address, since each mode pays its own: the values
+        // boot validated and normalized, so they read as the coinbase pays them.
+        let markers = crate::block_reconcile::PoolMarkers::new(
+            [
+                engines
+                    .pplns
+                    .as_ref()
+                    .map(|e| e.config().fee_address.as_str()),
+                engines.solo_fee.fee_address(),
+                engines
+                    .group_solo
+                    .as_ref()
+                    .map(|g| g.config().fee_address.as_str()),
+                engines
+                    .blockparty_payouts
+                    .as_ref()
+                    .map(|b| b.fee_address().as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            .map(str::to_string),
+        );
         match markers {
             Some(markers) => Some(crate::block_reconcile::spawn_reconcile_task(
                 handles.bitcoin_rpc.clone(),
@@ -710,6 +717,7 @@ async fn main() -> ExitCode {
             None,
             Some(handles.redis.clone()),
             Some(settle_signal.clone()),
+            engines.subsidy_halving_interval,
         );
         let bf_redis = handles
             .dedicated_redis(&cfg.redis, "block-found-ledger")
@@ -738,6 +746,7 @@ async fn main() -> ExitCode {
                     Some(d),
                     None,
                     None,
+                    engines.subsidy_halving_interval,
                 );
                 Some(crate::block_found_consumer::spawn(
                     bf_notify_redis,

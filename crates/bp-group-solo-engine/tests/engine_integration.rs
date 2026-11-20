@@ -1529,8 +1529,7 @@ async fn a_grown_window_keeps_its_bucket_through_the_record_path_trim() {
     drop_harness(h).await;
 }
 
-// ── The settlement gate: subsidy, not the reference revenue ────────
-// Heights sit in subsidy epoch 4 so the gate is genuinely exercised.
+// ── Settlement books the real revenue, not the reference ───────────
 
 /// A block paying far off the reference revenue still books each member
 /// at their exact share of the real coinbase.
@@ -1543,7 +1542,6 @@ async fn a_group_block_far_off_the_reference_is_still_booked() {
     let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
     let other = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
     const T_REF: u64 = 312_500_000;
-    // Well above the subsidy, so the gate stays out of the way.
     const T_ACTUAL: u64 = 500_000_000;
     let height: i32 = 840_801;
     const _: () = assert!(
@@ -1605,71 +1603,6 @@ async fn a_group_block_far_off_the_reference_is_still_booked() {
             who.as_str()
         );
     }
-
-    drop_harness(h).await;
-}
-
-/// A coinbase below the block subsidy is refused with a terminal error.
-#[tokio::test]
-async fn a_group_coinbase_below_the_block_subsidy_is_refused() {
-    let h = match spawn_or_skip(4, None).await {
-        Some(h) => h,
-        None => return,
-    };
-    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
-    const T_REF: u64 = 312_500_000;
-    let height: i32 = 840_802;
-    let subsidy = bp_share::block_subsidy_sats(height, bp_share::SUBSIDY_HALVING_INTERVAL);
-    assert_eq!(subsidy, 312_500_000, "fixture height must be in epoch 4");
-
-    h.engine
-        .record_share(
-            None,
-            h.group_id,
-            finder.as_str(),
-            100.0,
-            100.0,
-            1_700_000_000_001,
-        )
-        .await
-        .unwrap();
-    let result = h
-        .engine
-        .build_distribution(h.group_id, T_REF, &finder)
-        .await
-        .expect("build");
-
-    let err = h
-        .engine
-        .on_block_found(
-            h.group_id,
-            found(&h.engine, h.group_id, height).await,
-            &actual_paying_exactly(&result, subsidy - 1),
-        )
-        .await
-        .expect_err("a coinbase below the subsidy must not book");
-    assert!(
-        matches!(
-            err,
-            bp_group_solo_engine::engine::EngineError::RevenueBelowSubsidy { .. }
-        ),
-        "expected RevenueBelowSubsidy, got {err}"
-    );
-    assert!(
-        err.is_terminal(),
-        "the confirmation watcher must drop this rather than retry it every tick"
-    );
-
-    let booked: i64 = sqlx::query_scalar(
-        r#"SELECT count(*) FROM pplns_group_block_history
-           WHERE "groupId" = $1 AND "blockHeight" = $2"#,
-    )
-    .bind(h.group_id)
-    .bind(height)
-    .fetch_one(&h.pool)
-    .await
-    .expect("count");
-    assert_eq!(booked, 0, "nothing may be booked for a burned block");
 
     drop_harness(h).await;
 }

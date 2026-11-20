@@ -53,6 +53,7 @@ pub(crate) fn spawn(
     pplns: Option<PplnsEngine>,
     group_solo: Option<GroupSoloEngine>,
     blockparty: Option<BlockpartyPayouts>,
+    subsidy_halving_interval: u32,
     confirmation_depth: u32,
     // ext 0x0003/Implementation Notes settlement: a gated apply IS a
     // settlement, so the published distributions must be invalidated with it
@@ -85,6 +86,7 @@ pub(crate) fn spawn(
             pplns: pplns.as_ref(),
             group_solo: group_solo.as_ref(),
             blockparty: blockparty.as_ref(),
+            subsidy_halving_interval,
         };
 
         loop {
@@ -292,6 +294,8 @@ pub(crate) struct Settlers<'a> {
     pub(crate) pplns: Option<&'a PplnsEngine>,
     pub(crate) group_solo: Option<&'a GroupSoloEngine>,
     pub(crate) blockparty: Option<&'a BlockpartyPayouts>,
+    /// The network's schedule, for the subsidy gate every mode passes.
+    pub(crate) subsidy_halving_interval: u32,
 }
 
 /// Book one parked block into its mode's engine. Both the watcher and the
@@ -304,6 +308,22 @@ pub(crate) async fn settle_block(
 ) -> Result<u64, SettleFailure> {
     let height = pb.block_height;
     let actual = &pb.actual_coinbase;
+    // The one hard gate, before any mode books: a coinbase paying less than
+    // its own subsidy forfeited money no healthy template would.
+    if let Err(subsidy) = actual.check_subsidy(height, settlers.subsidy_halving_interval) {
+        error!(
+            subsidy,
+            actual_reward = actual.total_value_sats,
+            block_height = height,
+            mode = pb.settlement.label(),
+            "block coinbase pays less than the block subsidy — refusing to book"
+        );
+        return Err(SettleFailure::RevenueBelowSubsidy {
+            block_height: height,
+            actual_reward: actual.total_value_sats,
+            subsidy,
+        });
+    }
     match &pb.settlement {
         PendingSettlement::GroupSolo {
             group_id,
@@ -373,19 +393,31 @@ pub(crate) enum SettleFailure {
     /// (PPLNS's weight snapshot, Group-Solo's round); they are gone by now.
     #[error("settlement inputs were not resolved at found-time")]
     FoundTimeInputsMissing,
+    #[error(
+        "block {block_height} coinbase pays {actual_reward} sats, less than the \
+         {subsidy} sat subsidy the block was entitled to — it forfeited money, so \
+         nothing about it is trustworthy enough to book unattended"
+    )]
+    RevenueBelowSubsidy {
+        block_height: i32,
+        actual_reward: u64,
+        subsidy: u64,
+    },
     #[error(transparent)]
     Engine(SettleError),
 }
 
 impl SettleFailure {
-    /// Will a retry fail the same way? A deleted group stays deleted and
-    /// inputs not resolved at found-time are gone, so both are terminal like
-    /// the engines' own verdicts. A missing engine is not: another process
-    /// may own the block.
+    /// Will a retry fail the same way? A deleted group stays deleted, inputs
+    /// not resolved at found-time are gone and a coinbase does not change,
+    /// so those are terminal like the engines' own verdicts. A missing engine
+    /// is not: another process may own the block.
     pub(crate) fn is_terminal(&self) -> bool {
         match self {
             SettleFailure::NoEngine => false,
-            SettleFailure::UnusableGroup | SettleFailure::FoundTimeInputsMissing => true,
+            SettleFailure::UnusableGroup
+            | SettleFailure::FoundTimeInputsMissing
+            | SettleFailure::RevenueBelowSubsidy { .. } => true,
             SettleFailure::Engine(e) => e.is_terminal(),
         }
     }
@@ -469,10 +501,6 @@ mod declared_block_booking_regtest {
             touch_flush_interval_secs: 3_600,
             fee_percent: 1.5,
             min_payout_sats: Sats(DEFAULT_MIN_PAYOUT_SATS as i64),
-            // Regtest halves every 150 blocks. At the mainnet default the
-            // engine expects 50 BTC past height 150 where regtest pays 25, and
-            // its "coinbase pays less than the subsidy" guard refuses to book.
-            subsidy_halving_interval: bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL,
             ..PplnsEngineConfig::new(AddressId::new(fee_addr.to_string()).expect("fee addr"))
         }
     }
@@ -571,8 +599,6 @@ mod declared_block_booking_regtest {
             // for a PPLNS block: it is the dispatch target for the other mode.
             let group_solo = bp_group_solo_engine::engine::GroupSoloEngine::spawn(
                 bp_group_solo_engine::config::GroupSoloEngineConfig {
-                    // Regtest halves every 150 blocks — see `engine_config`.
-                    subsidy_halving_interval: bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL,
                     ..bp_group_solo_engine::config::GroupSoloEngineConfig::new(
                         AddressId::new(fee_addr.clone()).expect("fee addr"),
                     )
@@ -819,6 +845,9 @@ mod declared_block_booking_regtest {
                 &self.node.bitcoin_rpc().expect("regtest BitcoinRpc"),
                 &self.redis,
                 &super::Settlers {
+                    // Regtest halves every 150 blocks; the mainnet schedule
+                    // would gate these blocks as underpaid.
+                    subsidy_halving_interval: bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL,
                     pplns: Some(&self.pplns),
                     group_solo: Some(&self.group_solo),
                     blockparty: None,
@@ -1316,8 +1345,6 @@ mod declared_block_booking_regtest {
             .expect("PplnsEngine::spawn");
             let group_solo = bp_group_solo_engine::engine::GroupSoloEngine::spawn(
                 bp_group_solo_engine::config::GroupSoloEngineConfig {
-                    // Regtest halves every 150 blocks — see `engine_config`.
-                    subsidy_halving_interval: bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL,
                     ..bp_group_solo_engine::config::GroupSoloEngineConfig::new(
                         AddressId::new(fee_addr.clone()).expect("fee addr"),
                     )
@@ -1517,6 +1544,9 @@ mod declared_block_booking_regtest {
                 &self.node.bitcoin_rpc().expect("regtest BitcoinRpc"),
                 &self.redis,
                 &super::Settlers {
+                    // Regtest halves every 150 blocks; the mainnet schedule
+                    // would gate these blocks as underpaid.
+                    subsidy_halving_interval: bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL,
                     pplns: Some(&self.pplns),
                     group_solo: Some(&self.group_solo),
                     blockparty: None,
@@ -1848,6 +1878,7 @@ mod group_solo_settlement {
         };
 
         let without = Settlers {
+            subsidy_halving_interval: bp_share::SUBSIDY_HALVING_INTERVAL,
             pplns: None,
             group_solo: None,
             blockparty: None,
@@ -1856,6 +1887,7 @@ mod group_solo_settlement {
         assert!(matches!(parked, Err(SettleFailure::NoEngine)), "{parked:?}");
 
         let with = Settlers {
+            subsidy_halving_interval: bp_share::SUBSIDY_HALVING_INTERVAL,
             pplns: None,
             group_solo: Some(&engine),
             blockparty: None,
@@ -1944,6 +1976,7 @@ mod blockparty_settlement {
         };
 
         let without = Settlers {
+            subsidy_halving_interval: bp_share::SUBSIDY_HALVING_INTERVAL,
             pplns: None,
             group_solo: None,
             blockparty: None,
@@ -1955,6 +1988,7 @@ mod blockparty_settlement {
         );
 
         let with = Settlers {
+            subsidy_halving_interval: bp_share::SUBSIDY_HALVING_INTERVAL,
             pplns: None,
             group_solo: None,
             blockparty: Some(&payouts),
@@ -1993,6 +2027,99 @@ mod blockparty_settlement {
         );
 
         bp_test_support::cleanup_blockparty_rows(&pg, &[&admin, &member]).await;
+    }
+
+    /// The subsidy gate holds for Blockparty as for the other modes: a
+    /// coinbase one sat short of its subsidy is refused for good and books
+    /// nothing, while the same block paying the subsidy books.
+    #[tokio::test]
+    async fn a_blockparty_block_below_its_subsidy_is_refused_for_good() {
+        let Some(pg) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let admin = bp_test_support::deterministic_p2wpkh_regtest([0xB4; 32]);
+        let fee = bp_test_support::deterministic_p2wpkh_regtest([0xB5; 32]);
+        bp_test_support::cleanup_blockparty_rows(&pg, &[&admin]).await;
+
+        let group_id = uuid::Uuid::new_v4();
+        let admin_id = AddressId::new(admin.clone()).unwrap();
+        bp_db::insert_blockparty_group(
+            &pg,
+            group_id,
+            &format!("bp-subsidy-{group_id}"),
+            &admin_id,
+            "hash",
+            "active",
+            1,
+        )
+        .await
+        .expect("insert group");
+        bp_db::insert_blockparty_member(&pg, group_id, &admin_id, "", 10_000, "admin", Some(1), 1)
+            .await
+            .expect("insert admin");
+        let payouts = BlockpartyPayouts::new(
+            pg.clone(),
+            BlockpartyPayoutConfig {
+                fee_address: AddressId::new(fee).unwrap(),
+                fee_percent: 2.0,
+                min_payout_sats: Sats(5_000),
+            },
+        );
+        let settlers = Settlers {
+            subsidy_halving_interval: bp_share::SUBSIDY_HALVING_INTERVAL,
+            pplns: None,
+            group_solo: None,
+            blockparty: Some(&payouts),
+        };
+        let height = 900_000;
+        let subsidy = bp_share::block_subsidy_sats(height, bp_share::SUBSIDY_HALVING_INTERVAL);
+        assert_eq!(
+            subsidy, REWARD,
+            "precondition: height 900 000 is in epoch 4"
+        );
+        let block = |value: u64, hash_salt: u128| PendingBlock {
+            block_hash: format!("{:064x}", group_id.as_u128() ^ hash_salt),
+            found_at_ms: FOUND_AT_MS,
+            block_height: height,
+            actual_coinbase: ActualCoinbase {
+                paid_by_address: HashMap::new(),
+                output_zero: Some((admin.clone(), value)),
+                total_value_sats: value,
+            },
+            settlement: PendingSettlement::Blockparty { group_id },
+        };
+
+        let short = settle_block(&settlers, &block(subsidy - 1, 1)).await;
+        match &short {
+            Err(
+                err @ SettleFailure::RevenueBelowSubsidy {
+                    actual_reward,
+                    subsidy: owed,
+                    ..
+                },
+            ) => {
+                assert_eq!(*actual_reward, subsidy - 1);
+                assert_eq!(*owed, subsidy);
+                assert!(err.is_terminal(), "the watcher must not retry it forever");
+            }
+            other => panic!("expected RevenueBelowSubsidy, got {other:?}"),
+        }
+        assert!(
+            bp_db::list_blockparty_block_history(&pg, group_id)
+                .await
+                .expect("history")
+                .is_empty(),
+            "a refused block books nothing"
+        );
+
+        assert_eq!(
+            settle_block(&settlers, &block(subsidy, 2))
+                .await
+                .expect("the subsidy itself books"),
+            1
+        );
+
+        bp_test_support::cleanup_blockparty_rows(&pg, &[&admin]).await;
     }
 }
 

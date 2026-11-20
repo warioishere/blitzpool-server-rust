@@ -71,10 +71,10 @@ impl ActualCoinbase {
         paid
     }
 
-    /// The one hard settlement gate, shared by every engine that books from
-    /// a coinbase: one paying less than its own subsidy forfeited money no
-    /// healthy template would, so it is not booked unattended. `Err` carries
-    /// the subsidy it fell short of.
+    /// The one hard settlement gate, run once for every mode before it books:
+    /// a coinbase paying less than its own subsidy forfeited money no healthy
+    /// template would, so it is not booked unattended. `Err` carries the
+    /// subsidy it fell short of.
     pub fn check_subsidy(&self, block_height: i32, halving_interval: u32) -> Result<(), u64> {
         let subsidy = bp_share::block_subsidy_sats(block_height, halving_interval);
         if self.total_value_sats < subsidy {
