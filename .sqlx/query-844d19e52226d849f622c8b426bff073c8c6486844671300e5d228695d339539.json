@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO pplns_group\n             (id, name, \"creatorAddress\", \"adminTokenHash\", active,\n              \"createdAt\", \"updatedAt\", \"isPublic\", \"payoutMode\")\n           VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8)\n           RETURNING\n            id AS \"id!\",\n            name AS \"name!\",\n            \"creatorAddress\" AS \"creator_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            active AS \"active!\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"roundResetIntervalDays\" AS \"round_reset_interval_days?\",\n            \"roundResetTimezone\" AS \"round_reset_timezone?\",\n            \"lastRoundResetAt\" AS \"last_round_reset_at?\",\n            \"finderBonusPpm\" AS \"finder_bonus_ppm?\",\n            \"roundResetPreset\" AS \"round_reset_preset?\",\n            \"isPublic\" AS \"is_public!\",\n            \"resetRoundOnBlock\" AS \"reset_round_on_block!\",\n            \"maxMembers\" AS \"max_members?\",\n            \"payoutMode\" AS \"payout_mode!: PayoutMode\",\n            \"coinbaseTag\" AS \"coinbase_tag?\"",
+  "query": "UPDATE pplns_group\n           SET\n             \"roundResetPreset\"       = CASE WHEN $2  THEN (CASE WHEN $3  THEN NULL::varchar  ELSE $4::varchar  END) ELSE \"roundResetPreset\"       END,\n             \"roundResetIntervalDays\" = CASE WHEN $5  THEN (CASE WHEN $6  THEN NULL::int      ELSE $7::int      END) ELSE \"roundResetIntervalDays\" END,\n             \"roundResetTimezone\"     = CASE WHEN $8  THEN (CASE WHEN $9  THEN NULL::varchar  ELSE $10::varchar END) ELSE \"roundResetTimezone\"     END,\n             \"finderBonusPpm\"         = CASE WHEN $11 THEN (CASE WHEN $12 THEN NULL::int      ELSE $13::int     END) ELSE \"finderBonusPpm\"         END,\n             \"isPublic\"               = CASE WHEN $14 THEN $15 ELSE \"isPublic\" END,\n             \"resetRoundOnBlock\"      = CASE WHEN $16 THEN $17 ELSE \"resetRoundOnBlock\" END,\n             \"maxMembers\"             = CASE WHEN $18 THEN (CASE WHEN $19 THEN NULL::int ELSE $20::int END) ELSE \"maxMembers\" END,\n             \"coinbaseTag\"            = CASE WHEN $22 THEN (CASE WHEN $23 THEN NULL::varchar ELSE $24::varchar END) ELSE \"coinbaseTag\" END,\n             \"updatedAt\"              = $21\n           WHERE id = $1\n           RETURNING\n            id AS \"id!\",\n            name AS \"name!\",\n            \"creatorAddress\" AS \"creator_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"roundResetIntervalDays\" AS \"round_reset_interval_days?\",\n            \"roundResetTimezone\" AS \"round_reset_timezone?\",\n            \"lastRoundResetAt\" AS \"last_round_reset_at?\",\n            \"finderBonusPpm\" AS \"finder_bonus_ppm?\",\n            \"roundResetPreset\" AS \"round_reset_preset?\",\n            \"isPublic\" AS \"is_public!\",\n            \"resetRoundOnBlock\" AS \"reset_round_on_block!\",\n            \"maxMembers\" AS \"max_members?\",\n            \"payoutMode\" AS \"payout_mode!: PayoutMode\",\n            \"coinbaseTag\" AS \"coinbase_tag?\"",
   "describe": {
     "columns": [
       {
@@ -49,17 +49,6 @@
       },
       {
         "ordinal": 4,
-        "name": "active!",
-        "type_info": "Bool",
-        "origin": {
-          "Table": {
-            "table": "pplns_group",
-            "name": "active"
-          }
-        }
-      },
-      {
-        "ordinal": 5,
         "name": "created_at!",
         "type_info": "Int8",
         "origin": {
@@ -70,7 +59,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 5,
         "name": "updated_at!",
         "type_info": "Int8",
         "origin": {
@@ -81,7 +70,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 6,
         "name": "dissolved_at?",
         "type_info": "Int8",
         "origin": {
@@ -92,7 +81,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 7,
         "name": "round_reset_interval_days?",
         "type_info": "Int4",
         "origin": {
@@ -103,7 +92,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 8,
         "name": "round_reset_timezone?",
         "type_info": "Varchar",
         "origin": {
@@ -114,7 +103,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 9,
         "name": "last_round_reset_at?",
         "type_info": "Int8",
         "origin": {
@@ -125,7 +114,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 10,
         "name": "finder_bonus_ppm?",
         "type_info": "Int4",
         "origin": {
@@ -136,7 +125,7 @@
         }
       },
       {
-        "ordinal": 12,
+        "ordinal": 11,
         "name": "round_reset_preset?",
         "type_info": "Varchar",
         "origin": {
@@ -147,7 +136,7 @@
         }
       },
       {
-        "ordinal": 13,
+        "ordinal": 12,
         "name": "is_public!",
         "type_info": "Bool",
         "origin": {
@@ -158,7 +147,7 @@
         }
       },
       {
-        "ordinal": 14,
+        "ordinal": 13,
         "name": "reset_round_on_block!",
         "type_info": "Bool",
         "origin": {
@@ -169,7 +158,7 @@
         }
       },
       {
-        "ordinal": 15,
+        "ordinal": 14,
         "name": "max_members?",
         "type_info": "Int4",
         "origin": {
@@ -180,7 +169,7 @@
         }
       },
       {
-        "ordinal": 16,
+        "ordinal": 15,
         "name": "payout_mode!: PayoutMode",
         "type_info": "Varchar",
         "origin": {
@@ -191,7 +180,7 @@
         }
       },
       {
-        "ordinal": 17,
+        "ordinal": 16,
         "name": "coinbase_tag?",
         "type_info": "Varchar",
         "origin": {
@@ -205,17 +194,32 @@
     "parameters": {
       "Left": [
         "Uuid",
-        "Varchar",
-        "Varchar",
+        "Bool",
+        "Bool",
         "Varchar",
         "Bool",
+        "Bool",
+        "Int4",
+        "Bool",
+        "Bool",
+        "Varchar",
+        "Bool",
+        "Bool",
+        "Int4",
+        "Bool",
+        "Bool",
+        "Bool",
+        "Bool",
+        "Bool",
+        "Bool",
+        "Int4",
         "Int8",
+        "Bool",
         "Bool",
         "Varchar"
       ]
     },
     "nullable": [
-      false,
       false,
       false,
       false,
@@ -235,5 +239,5 @@
       true
     ]
   },
-  "hash": "778a2a806086f4e753c12b3de01d701a74eef6b23d14ed0162c929ef62b171a3"
+  "hash": "844d19e52226d849f622c8b426bff073c8c6486844671300e5d228695d339539"
 }

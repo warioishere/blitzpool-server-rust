@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Activation, kick and expiry thresholds for groups and join requests.
-
-/// Members at or above which a group is active; the stratum layer refuses
-/// Group-Solo connections for inactive groups. `1` lets a group mine with
-/// just its creator.
-pub const MIN_MEMBERS_ACTIVE: u32 = 1;
+//! Kick and expiry thresholds for groups and join requests.
 
 /// An admin can only remove a member idle for this many days. Must stay in
 /// step with `blitzpool`'s hardcoded `group_service::KICK_INACTIVITY_DAYS`.

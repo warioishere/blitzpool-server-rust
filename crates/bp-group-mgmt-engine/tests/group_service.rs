@@ -121,8 +121,7 @@ async fn create_group_happy_path_returns_token_and_seeds_creator() {
     let result = svc.create_group(&name, &creator).await.expect("create");
     assert!(result.admin_token.starts_with("GRP-"));
     assert_eq!(result.group.name, name);
-    // Active from creation: the creator alone meets MIN_MEMBERS_ACTIVE (== 1).
-    assert!(result.group.active);
+    assert!(result.group.dissolved_at.is_none());
     let members = svc.list_members(result.group.id).await.expect("members");
     assert_eq!(members.len(), 1);
     assert_eq!(members[0].role, bp_group_mgmt::group::MemberRole::Creator);
@@ -325,10 +324,16 @@ async fn create_group_rejects_address_already_in_group() {
     cleanup_group(&pool, g1.group.id).await;
 }
 
+/// The group an address routes to.
+async fn routes(svc: &GroupService, address: &str) -> Option<Uuid> {
+    svc.get_group_for_address(&AddressId::new(address.to_string()).unwrap())
+        .await
+}
+
 // ─── add_member ───────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn group_active_from_creation_and_stays_after_add() {
+async fn a_group_routes_its_members_from_creation_on() {
     let pool = match connect_or_skip().await {
         Some(p) => p,
         None => return,
@@ -348,18 +353,15 @@ async fn group_active_from_creation_and_stays_after_add() {
         .create_group(&format!("a-{}", Uuid::new_v4()), &creator)
         .await
         .expect("g");
-    // Active already with just the creator (MIN_MEMBERS_ACTIVE == 1) …
-    assert!(g.group.active);
+    // The creator alone already routes to the group …
+    assert_eq!(routes(&svc, &creator).await, Some(g.group.id));
+    assert_eq!(routes(&svc, &new_member).await, None);
     svc.add_member(g.group.id, &new_member, Some(&g.admin_token))
         .await
         .expect("add");
-    let group = svc
-        .get_group(g.group.id)
-        .await
-        .expect("get")
-        .expect("present");
-    // … and still active after a second member joins.
-    assert!(group.active);
+    // … and a joined member does too.
+    assert_eq!(routes(&svc, &creator).await, Some(g.group.id));
+    assert_eq!(routes(&svc, &new_member).await, Some(g.group.id));
     cleanup_group(&pool, g.group.id).await;
 }
 
@@ -532,7 +534,7 @@ async fn remove_member_inactivity_guard_then_kick_succeeds() {
 }
 
 #[tokio::test]
-async fn remove_member_keeps_group_active_down_to_creator() {
+async fn the_creator_still_routes_after_the_last_member_is_removed() {
     let pool = match connect_or_skip().await {
         Some(p) => p,
         None => return,
@@ -552,16 +554,13 @@ async fn remove_member_keeps_group_active_down_to_creator() {
     svc.add_member(g.group.id, &member, Some(&g.admin_token))
         .await
         .expect("add");
-    // After add: 2 members → active.
-    let before = svc.get_group(g.group.id).await.expect("get").expect("row");
-    assert!(before.active);
+    assert_eq!(routes(&svc, &member).await, Some(g.group.id));
 
     svc.remove_member(g.group.id, &member, Some(&g.admin_token))
         .await
         .expect("remove");
-    // After remove: 1 member (the creator) still meets the floor → stays active.
-    let after = svc.get_group(g.group.id).await.expect("get").expect("row");
-    assert!(after.active);
+    assert_eq!(routes(&svc, &creator).await, Some(g.group.id));
+    assert_eq!(routes(&svc, &member).await, None);
 
     cleanup_group(&pool, g.group.id).await;
 }
@@ -865,7 +864,6 @@ async fn dissolve_group_removes_members_and_marks_row() {
         .expect("find")
         .expect("present");
     assert!(row.dissolved_at.is_some());
-    assert!(!row.active);
     let members = svc.list_members(g.group.id).await.expect("list");
     assert!(members.is_empty());
     let snap = hooks.snapshot();
@@ -900,10 +898,9 @@ async fn address_cache_reflects_membership_changes() {
         .get_group_for_address(&cache_addr)
         .await
         .expect("cached");
-    assert_eq!(entry.group_id, g.group.id);
-    assert!(entry.active); // single member (creator) already mines
+    assert_eq!(entry, g.group.id);
 
-    // Add a member → still active
+    // Add a member → the creator still routes
     let m = format!("bc1qccm{}", Uuid::new_v4().simple());
     svc.add_member(g.group.id, &m, Some(&g.admin_token))
         .await
@@ -912,7 +909,7 @@ async fn address_cache_reflects_membership_changes() {
         .get_group_for_address(&cache_addr)
         .await
         .expect("cached2");
-    assert!(entry2.active);
+    assert_eq!(entry2, g.group.id);
 
     // Dissolve → cache empty for this address
     svc.dissolve_group(g.group.id, Some(&g.admin_token))
@@ -967,7 +964,7 @@ async fn address_cache_rebuild_skips_invalid_address_member() {
         .get_group_for_address(&good_addr)
         .await
         .expect("good member cached");
-    assert_eq!(entry.group_id, g.group.id);
+    assert_eq!(entry, g.group.id);
 
     // Sanity: the bad row really is in the DB, so rebuild had to skip it.
     let cnt: i64 =

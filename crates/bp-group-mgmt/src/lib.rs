@@ -14,11 +14,11 @@ pub mod token;
 pub use constants::{
     DEFAULT_KICK_INACTIVITY_DAYS, JOIN_REQUEST_PENDING_EXPIRY_DAYS, MAX_FINDER_BONUS_PPM,
     MAX_GROUP_NAME_LEN, MAX_JOIN_REQUEST_MESSAGE_LEN, MAX_RESET_INTERVAL_DAYS, MIN_GROUP_NAME_LEN,
-    MIN_MEMBERS_ACTIVE, MS_PER_DAY,
+    MS_PER_DAY,
 };
 pub use group::{
-    is_active, kick_eligibility, validate_round_reset, GroupName, GroupNameError, KickEligibility,
-    MemberRole, RoundResetConfig, RoundResetError, RoundResetPreset,
+    kick_eligibility, validate_round_reset, GroupName, GroupNameError, KickEligibility, MemberRole,
+    RoundResetConfig, RoundResetError, RoundResetPreset,
 };
 pub use invitation::OPEN_INVITE_TYPE;
 pub use join_request::{

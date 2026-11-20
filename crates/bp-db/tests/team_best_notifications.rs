@@ -89,7 +89,6 @@ async fn team(pool: &PgPool, members: &[&str]) -> Uuid {
         &format!("{NAME_PREFIX}{id}"),
         &addr(members[0]),
         "hash",
-        true,
         false,
         bp_group_mgmt::group::PayoutMode::Prop,
         now,

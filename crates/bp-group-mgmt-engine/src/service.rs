@@ -10,8 +10,8 @@ use std::sync::Arc;
 use bp_common::AddressId;
 use bp_db::{PatchField, PplnsGroupMemberRow, PplnsGroupRow, RoundResetConfigPatch};
 use bp_group_mgmt::{
-    constants::{MIN_MEMBERS_ACTIVE, MS_PER_DAY},
-    group::{is_active, GroupName, MemberRole, PayoutMode, RoundResetConfig, RoundResetPreset},
+    constants::MS_PER_DAY,
+    group::{GroupName, MemberRole, PayoutMode, RoundResetConfig, RoundResetPreset},
     token::{AdminToken, TokenHash},
 };
 use sqlx::PgPool;
@@ -190,12 +190,9 @@ impl GroupService {
 
     // ── Lookup ────────────────────────────────────────────────────
 
-    /// Cache-only lookup — `None` if the address isn't in any active
-    /// group. Stratum + PPLNS engines call this on every share.
-    pub async fn get_group_for_address(
-        &self,
-        address: &AddressId,
-    ) -> Option<crate::cache::GroupCacheEntry> {
+    /// Cache-only lookup — `None` if the address is in no group that is
+    /// not dissolved. Stratum + PPLNS engines call this on every share.
+    pub async fn get_group_for_address(&self, address: &AddressId) -> Option<Uuid> {
         self.address_cache.get(address).await
     }
 
@@ -294,11 +291,6 @@ impl GroupService {
             validated_name.as_str(),
             &normalized_address,
             admin_hash.as_str(),
-            // The creator is added as the sole member just below, so the group
-            // starts active whenever a single member already meets the floor
-            // (MIN_MEMBERS_ACTIVE == 1) — it can mine immediately.
-            /* active = */
-            is_active(1),
             /* is_public = */ false,
             mode,
             now,
@@ -364,9 +356,6 @@ impl GroupService {
         );
 
         let now = now_ms();
-        // Insert member + recompute active in one TX, like `remove_member`:
-        // a failure in between would leave `active` stale, and a retry hits
-        // AlreadyMember and cannot repair the flag.
         let mut tx = self.pool.begin().await.map_err(bp_db::DbError::from)?;
         // Count inside the TX so a concurrent add can't slip past the cap.
         let current = bp_db::count_pplns_group_members_for_group(&mut *tx, group_id).await?;
@@ -381,9 +370,6 @@ impl GroupService {
             now,
         )
         .await?;
-        let count = bp_db::count_pplns_group_members_for_group(&mut *tx, group_id).await?;
-        let should_be_active = count as u32 >= MIN_MEMBERS_ACTIVE;
-        bp_db::update_pplns_group_active(&mut *tx, group_id, should_be_active, now).await?;
         tx.commit().await.map_err(bp_db::DbError::from)?;
 
         self.rebuild_and_notify().await?;
@@ -392,7 +378,7 @@ impl GroupService {
 
     /// Admin path to remove a non-creator member. Enforces the
     /// kick-inactivity window (`kick_inactivity_days`) and runs Redis
-    /// cleanup AFTER the DB transaction commits so a Redis failure
+    /// cleanup AFTER the member row is deleted so a Redis failure
     /// cannot leave the DB state inconsistent.
     pub async fn remove_member(
         &self,
@@ -432,14 +418,7 @@ impl GroupService {
             .map(|m| m.address.clone())
             .collect();
 
-        // DB-side atomic: delete member + recompute active in one TX.
-        // update_pplns_group_active guards against dissolved groups in SQL.
-        let mut tx = self.pool.begin().await.map_err(bp_db::DbError::from)?;
-        bp_db::delete_pplns_group_member(&mut *tx, group_id, &normalized).await?;
-        let count = bp_db::count_pplns_group_members_for_group(&mut *tx, group_id).await?;
-        let should_be_active = count as u32 >= MIN_MEMBERS_ACTIVE;
-        bp_db::update_pplns_group_active(&mut *tx, group_id, should_be_active, now).await?;
-        tx.commit().await.map_err(bp_db::DbError::from)?;
+        bp_db::delete_pplns_group_member(&self.pool, group_id, &normalized).await?;
 
         // Best-effort Redis cleanup (swallows errors + logs).
         self.hooks

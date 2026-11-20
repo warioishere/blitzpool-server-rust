@@ -90,7 +90,6 @@ mod tests {
                 &format!("tag-test-{id}"),
                 &address("team"),
                 "h",
-                true,
                 false,
                 bp_group_mgmt::group::PayoutMode::Prop,
                 1,

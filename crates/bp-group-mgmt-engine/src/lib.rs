@@ -15,7 +15,7 @@ pub mod join_request;
 pub mod service;
 mod util;
 
-pub use cache::{AddressCache, GroupCacheEntry};
+pub use cache::AddressCache;
 pub use cron::{
     expire_invitations_once, expire_join_requests_once, spawn_invitation_expiry_cron,
     spawn_join_request_expiry_cron,

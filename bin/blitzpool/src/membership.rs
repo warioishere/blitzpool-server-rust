@@ -63,23 +63,19 @@ impl MinerAdmission for BlockpartyAdmission {
 
 // ─── GroupLookup trait (group_id resolution) ──────────────────────
 
-/// Address → active-group-id lookup, a trait so unit tests need no
+/// Address → group-id lookup, a trait so unit tests need no
 /// `PgPool`.
 #[async_trait]
 pub(crate) trait GroupLookup: Send + Sync {
     /// Cache-only lookup. Returns `Some(group_id)` only when the
-    /// address is in an **active** group; inactive groups + missing
-    /// addresses both yield `None`.
+    /// address is in a group that is not dissolved.
     async fn group_for_address(&self, address: &AddressId) -> Option<Uuid>;
 }
 
 #[async_trait]
 impl GroupLookup for GroupService {
     async fn group_for_address(&self, address: &AddressId) -> Option<Uuid> {
-        self.get_group_for_address(address)
-            .await
-            .filter(|e| e.active)
-            .map(|e| e.group_id)
+        self.get_group_for_address(address).await
     }
 }
 
@@ -103,8 +99,8 @@ impl BlockpartyAdminLookup for BlockpartyService {
     }
 }
 
-/// The mode an address's memberships give it, port aside: an active team
-/// (Group-Solo) wins, then being the admin of a routable (Ready/Active)
+/// The mode an address's memberships give it, port aside: a team that is not
+/// dissolved (Group-Solo) wins, then being the admin of a routable (Ready/Active)
 /// Blockparty, where only the admin hashes and the coinbase splits to the
 /// members. `None` leaves the port's mode. Session registration and the
 /// cache-sync kick check both read a membership through this.

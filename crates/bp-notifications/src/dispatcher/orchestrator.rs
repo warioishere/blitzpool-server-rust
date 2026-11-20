@@ -1687,7 +1687,6 @@ mod tests {
             &format!("bp-test-blockmembers-{team}"),
             &team_finder,
             "hash",
-            true,
             false,
             bp_group_mgmt::group::PayoutMode::Prop,
             now,

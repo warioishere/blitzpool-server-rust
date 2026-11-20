@@ -617,7 +617,6 @@ mod tests {
             name: "g".to_string(),
             creator_address: bp_common::AddressId::new("creator".to_string()).unwrap(),
             admin_token_hash: "hash".to_string(),
-            active: dissolved_at.is_none(),
             created_at: 0,
             updated_at: 0,
             dissolved_at,

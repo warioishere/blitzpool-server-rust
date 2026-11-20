@@ -23,7 +23,6 @@ pub struct PplnsGroupRow {
     /// once at group creation time.
     #[sqlx(rename = "adminTokenHash")]
     pub admin_token_hash: String,
-    pub active: bool,
     #[sqlx(rename = "createdAt")]
     pub created_at: i64,
     #[sqlx(rename = "updatedAt")]
@@ -73,7 +72,6 @@ pub async fn find_group(pool: &PgPool, id: Uuid) -> Result<Option<PplnsGroupRow>
             name AS "name!",
             "creatorAddress" AS "creator_address!: AddressId",
             "adminTokenHash" AS "admin_token_hash!",
-            active AS "active!",
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
             "dissolvedAt" AS "dissolved_at?",
@@ -439,8 +437,9 @@ pub struct PplnsGroupJoinRequestRow {
 // ── Group-mgmt service-layer writes ─────────────────────────────────
 
 /// INSERT a new `pplns_group` row and return it read back. The caller sets
-/// `active` and `isPublic`: a new group starts private, and active when its
-/// creator alone meets `MIN_MEMBERS_ACTIVE`.
+/// `isPublic`; a new group starts private. `active` is written for the
+/// binaries that still route on it: a group is routable while it is not
+/// dissolved.
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_pplns_group<'e, E>(
     executor: E,
@@ -448,7 +447,6 @@ pub async fn insert_pplns_group<'e, E>(
     name: &str,
     creator_address: &AddressId,
     admin_token_hash: &str,
-    active: bool,
     is_public: bool,
     payout_mode: PayoutMode,
     now_ms: i64,
@@ -461,13 +459,12 @@ where
         r#"INSERT INTO pplns_group
              (id, name, "creatorAddress", "adminTokenHash", active,
               "createdAt", "updatedAt", "isPublic", "payoutMode")
-           VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8)
+           VALUES ($1, $2, $3, $4, true, $5, $5, $6, $7)
            RETURNING
             id AS "id!",
             name AS "name!",
             "creatorAddress" AS "creator_address!: AddressId",
             "adminTokenHash" AS "admin_token_hash!",
-            active AS "active!",
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
             "dissolvedAt" AS "dissolved_at?",
@@ -485,7 +482,6 @@ where
         name,
         creator_address.as_str(),
         admin_token_hash,
-        active,
         now_ms,
         is_public,
         payout_mode.as_str(),
@@ -510,7 +506,6 @@ pub async fn find_pplns_group_by_name_not_dissolved(
             name AS "name!",
             "creatorAddress" AS "creator_address!: AddressId",
             "adminTokenHash" AS "admin_token_hash!",
-            active AS "active!",
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
             "dissolvedAt" AS "dissolved_at?",
@@ -544,7 +539,6 @@ pub async fn list_active_pplns_groups(pool: &PgPool) -> Result<Vec<PplnsGroupRow
             name AS "name!",
             "creatorAddress" AS "creator_address!: AddressId",
             "adminTokenHash" AS "admin_token_hash!",
-            active AS "active!",
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
             "dissolvedAt" AS "dissolved_at?",
@@ -567,8 +561,7 @@ pub async fn list_active_pplns_groups(pool: &PgPool) -> Result<Vec<PplnsGroupRow
     .map_err(DbError::from)
 }
 
-/// Count rows in `pplns_group_member` for one group. A group is active once
-/// `count >= MIN_MEMBERS_ACTIVE` (= 1: active as soon as the creator joins).
+/// Count rows in `pplns_group_member` for one group.
 pub async fn count_pplns_group_members_for_group<'e, E>(
     executor: E,
     group_id: Uuid,
@@ -584,30 +577,6 @@ where
     .await
     .map_err(DbError::from)?;
     Ok(row.count)
-}
-
-/// Single-column UPDATE of `pplns_group.active`. Idempotent. Returns
-/// row count (0 or 1). `updatedAt` is also bumped so the row reflects
-/// the activity change.
-pub async fn update_pplns_group_active<'e, E>(
-    executor: E,
-    group_id: Uuid,
-    active: bool,
-    now_ms: i64,
-) -> Result<u64, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    let result = sqlx::query!(
-        r#"UPDATE pplns_group SET active = $1, "updatedAt" = $2 WHERE id = $3 AND "dissolvedAt" IS NULL"#,
-        active,
-        now_ms,
-        group_id,
-    )
-    .execute(executor)
-    .await
-    .map_err(DbError::from)?;
-    Ok(result.rows_affected())
 }
 
 /// Apply a creator-transfer to the group row: rotate the admin-token
@@ -703,7 +672,6 @@ pub async fn update_pplns_group_round_reset_config(
             name AS "name!",
             "creatorAddress" AS "creator_address!: AddressId",
             "adminTokenHash" AS "admin_token_hash!",
-            active AS "active!",
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
             "dissolvedAt" AS "dissolved_at?",
@@ -770,9 +738,10 @@ fn patch_triple_bool(f: &PatchField<bool>) -> (bool, bool, bool) {
     }
 }
 
-/// Mark a group dissolved: stamp `dissolvedAt = now`, force `active =
-/// false`, bump `updatedAt`. Idempotent — a second call is a no-op
-/// because the WHERE clause guards against already-dissolved rows.
+/// Mark a group dissolved: stamp `dissolvedAt = now`, bump `updatedAt`, and
+/// clear `active` for the binaries that still route on it. Idempotent — a
+/// second call is a no-op because the WHERE clause guards against
+/// already-dissolved rows.
 pub async fn update_pplns_group_dissolved<'e, E>(
     executor: E,
     group_id: Uuid,
@@ -948,7 +917,7 @@ pub async fn find_pplns_group_creator_member(
 /// Lenient member list for the boot-time routing-cache rebuild: returns raw
 /// address STRINGS (not `AddressId`), so one malformed address can't fail
 /// the whole decode and stop boot. The caller parses each + skips the
-/// invalid ones. Pairs with [`list_active_pplns_group_flags`].
+/// invalid ones. Pairs with [`list_live_pplns_group_ids`].
 pub async fn find_all_pplns_group_member_addresses(
     pool: &PgPool,
 ) -> Result<Vec<(uuid::Uuid, String)>, DbError> {
@@ -961,20 +930,18 @@ pub async fn find_all_pplns_group_member_addresses(
     Ok(rows.into_iter().map(|r| (r.group_id, r.address)).collect())
 }
 
-/// Lenient `(group_id, active)` flags for non-dissolved groups — selects no
-/// address column, so a bad `creatorAddress` can't fail the boot-time cache
-/// rebuild. Mirrors [`list_active_pplns_groups`]'s `WHERE`.
-pub async fn list_active_pplns_group_flags(
-    pool: &PgPool,
-) -> Result<Vec<(uuid::Uuid, bool)>, DbError> {
+/// Ids of the groups that are not dissolved — selects no address column, so
+/// a bad `creatorAddress` can't fail the boot-time cache rebuild. Mirrors
+/// [`list_active_pplns_groups`]'s `WHERE`.
+pub async fn list_live_pplns_group_ids(pool: &PgPool) -> Result<Vec<uuid::Uuid>, DbError> {
     let rows = sqlx::query!(
-        r#"SELECT id AS "id!", active AS "active!"
+        r#"SELECT id AS "id!"
            FROM pplns_group
            WHERE "dissolvedAt" IS NULL"#,
     )
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().map(|r| (r.id, r.active)).collect())
+    Ok(rows.into_iter().map(|r| r.id).collect())
 }
 
 // ── Invitations ─────────────────────────────────────────────────────

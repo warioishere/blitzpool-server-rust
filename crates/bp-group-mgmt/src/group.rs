@@ -4,7 +4,7 @@
 
 use crate::constants::{
     MAX_FINDER_BONUS_PPM, MAX_GROUP_NAME_LEN, MAX_RESET_INTERVAL_DAYS, MIN_GROUP_NAME_LEN,
-    MIN_MEMBERS_ACTIVE, MS_PER_DAY,
+    MS_PER_DAY,
 };
 
 // ─── Group name ─────────────────────────────────────────────────────────────
@@ -48,7 +48,7 @@ fn is_control_char(c: char) -> bool {
     matches!(c, '\u{0000}'..='\u{001F}' | '\u{007F}')
 }
 
-// ─── Member role + active threshold ─────────────────────────────────────────
+// ─── Member role ────────────────────────────────────────────────────────────
 
 /// Membership role. Matches the `pplns_group_member.role` column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -84,13 +84,6 @@ impl std::str::FromStr for MemberRole {
 
 #[cfg(feature = "sqlx")]
 bp_common::impl_pg_text_enum!(MemberRole);
-
-/// A group is **active** iff its member count meets [`MIN_MEMBERS_ACTIVE`].
-/// The stratum layer refuses Group-Solo connections for addresses in
-/// inactive groups, so this predicate gates real money flow.
-pub fn is_active(member_count: u32) -> bool {
-    member_count >= MIN_MEMBERS_ACTIVE
-}
 
 // ─── Kick-eligibility ───────────────────────────────────────────────────────
 
@@ -328,18 +321,6 @@ mod tests {
     fn name_accepts_unicode() {
         let n = GroupName::new("Pool 🦀 Group").expect("valid");
         assert_eq!(n.as_str(), "Pool 🦀 Group");
-    }
-
-    // ── Active threshold ─────────────────────────────────────────────
-
-    #[test]
-    fn active_threshold_is_one() {
-        // A group mines as soon as it has its creator; only an empty group is
-        // inactive (MIN_MEMBERS_ACTIVE == 1).
-        assert!(!is_active(0));
-        assert!(is_active(1));
-        assert!(is_active(2));
-        assert!(is_active(100));
     }
 
     // ── Kick eligibility ─────────────────────────────────────────────

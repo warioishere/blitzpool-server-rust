@@ -1734,7 +1734,6 @@ mod tests {
                 &format!("bp-test-teamstatus-{team}"),
                 address,
                 "hash",
-                true,
                 false,
                 bp_group_mgmt::group::PayoutMode::Prop,
                 now,

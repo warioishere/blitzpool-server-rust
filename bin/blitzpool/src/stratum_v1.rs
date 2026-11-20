@@ -2,7 +2,7 @@
 
 //! SV1 server composition: one [`StratumV1Server`] per port, because a
 //! server clones one [`ServerHooks`] into every connection and the fallback
-//! mode for a non-group address is per-port state. Mode at authorize: active
+//! mode for a non-group address is per-port state. Mode at authorize: a
 //! Group-Solo membership wins, then Blockparty admin, else the port's mode.
 
 use std::collections::HashMap;
@@ -603,7 +603,7 @@ mod tests {
         let inner = RecordingInner::new();
         let gid = Uuid::new_v4();
         let lookup: Arc<dyn GroupLookup> = Arc::new(StubLookup::with("bcrt1qgs", gid));
-        // Port is Solo, but the address is in an active group → group_solo wins.
+        // Port is Solo, but the address is in a group → group_solo wins.
         let wrapper = ModeGatePopulatingPersistence::new(
             PortMode::Solo,
             gate.clone(),

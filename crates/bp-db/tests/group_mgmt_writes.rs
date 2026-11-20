@@ -17,10 +17,10 @@ use bp_db::{
     insert_pplns_group, insert_pplns_group_invitation, insert_pplns_group_join_request,
     insert_pplns_group_member, list_active_pplns_groups, list_pplns_group_join_requests_for_group,
     list_pplns_group_join_requests_pending_for_address, revoke_pending_open_invites_for_group,
-    update_pplns_group_active, update_pplns_group_creator_and_admin_token,
-    update_pplns_group_dissolved, update_pplns_group_invitation_status_by_token,
-    update_pplns_group_join_request_decision, update_pplns_group_member_role,
-    update_pplns_group_round_reset_config, PatchField, RoundResetConfigPatch,
+    update_pplns_group_creator_and_admin_token, update_pplns_group_dissolved,
+    update_pplns_group_invitation_status_by_token, update_pplns_group_join_request_decision,
+    update_pplns_group_member_role, update_pplns_group_round_reset_config, PatchField,
+    RoundResetConfigPatch,
 };
 use bp_group_mgmt::group::PayoutMode;
 use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -73,7 +73,6 @@ async fn an_unknown_payout_mode_fails_the_read() {
         &addr("mode_decode_c"),
         "h",
         false,
-        false,
         PayoutMode::Window,
         1,
     )
@@ -120,12 +119,18 @@ async fn insert_group_returns_row_with_defaults() {
         &addr("test_creator_a"),
         "hash-a",
         false,
-        false,
         PayoutMode::Prop,
         1_700_000_000_000,
     )
     .await
     .expect("insert");
+    // A binary that still routes on `active` must see a new group as live.
+    let (active,): (bool,) = sqlx::query_as("SELECT active FROM pplns_group WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("read active");
+    assert!(active);
     // The helper writes on its own pool connection, outside `tx`, so the row
     // is cleaned up by hand.
     sqlx::query("DELETE FROM pplns_group WHERE id = $1")
@@ -143,7 +148,6 @@ async fn insert_group_returns_row_with_defaults() {
 
     assert_eq!(row.id, id);
     assert_eq!(row.name, "test-group-A");
-    assert!(!row.active);
     assert!(!row.is_public);
     assert_eq!(row.created_at, 1_700_000_000_000);
     assert_eq!(row.updated_at, 1_700_000_000_000);
@@ -165,7 +169,6 @@ async fn find_group_by_name_filters_dissolved() {
         &unique_name,
         &addr("dup_creator"),
         "h",
-        false,
         false,
         PayoutMode::Prop,
         1,
@@ -211,7 +214,6 @@ async fn list_active_groups_omits_dissolved() {
         &addr("alive_c"),
         "h1",
         false,
-        false,
         PayoutMode::Prop,
         1,
     )
@@ -223,7 +225,6 @@ async fn list_active_groups_omits_dissolved() {
         &dead_name,
         &addr("dead_c"),
         "h2",
-        false,
         false,
         PayoutMode::Prop,
         1,
@@ -248,7 +249,7 @@ async fn list_active_groups_omits_dissolved() {
 }
 
 #[tokio::test]
-async fn active_toggle_and_count_members() {
+async fn count_members_for_group() {
     let pool = match connect_or_skip().await {
         Some(p) => p,
         None => return,
@@ -261,7 +262,6 @@ async fn active_toggle_and_count_members() {
         &name,
         &addr("act_creator"),
         "h",
-        false,
         false,
         PayoutMode::Prop,
         1,
@@ -294,15 +294,6 @@ async fn active_toggle_and_count_members() {
         .await
         .expect("count2");
     assert_eq!(count2, 2);
-    update_pplns_group_active(&pool, gid, true, 10)
-        .await
-        .expect("active-true");
-    let group = find_group(&pool, gid)
-        .await
-        .expect("find")
-        .expect("present");
-    assert!(group.active);
-    assert_eq!(group.updated_at, 10);
 
     // Cleanup
     delete_pplns_group_members_for_group(&pool, gid)
@@ -329,7 +320,6 @@ async fn transfer_creator_swaps_admin_token_and_creator_address() {
         &name,
         &addr("old_creator"),
         "old_hash",
-        false,
         false,
         PayoutMode::Prop,
         1,
@@ -406,7 +396,6 @@ async fn round_reset_config_patch_applies_per_field() {
         &name,
         &addr("rr_creator"),
         "h",
-        false,
         false,
         PayoutMode::Prop,
         1,
@@ -508,7 +497,6 @@ async fn dissolve_is_idempotent() {
         &name,
         &addr("d_creator"),
         "h",
-        true,
         false,
         PayoutMode::Prop,
         1,
@@ -525,7 +513,13 @@ async fn dissolve_is_idempotent() {
     assert_eq!(n2, 0); // already dissolved, WHERE clause guards
     let g = find_group(&pool, gid).await.expect("g").expect("present");
     assert_eq!(g.dissolved_at, Some(100));
-    assert!(!g.active);
+    // A binary that still routes on `active` must see the group as gone.
+    let (active,): (bool,) = sqlx::query_as("SELECT active FROM pplns_group WHERE id = $1")
+        .bind(gid)
+        .fetch_one(&pool)
+        .await
+        .expect("read active");
+    assert!(!active);
 
     sqlx::query("DELETE FROM pplns_group WHERE id = $1")
         .bind(gid)
@@ -550,7 +544,6 @@ async fn insert_member_and_delete_roundtrip() {
         &name,
         &addr("m_creator"),
         "h",
-        false,
         false,
         PayoutMode::Prop,
         1,
@@ -618,7 +611,6 @@ async fn invitation_status_update_by_token() {
         &addr("inv_c"),
         "h",
         false,
-        false,
         PayoutMode::Prop,
         1,
     )
@@ -667,7 +659,6 @@ async fn open_invite_revoke_replaces_atomically() {
         &n,
         &addr("open_c"),
         "h",
-        false,
         false,
         PayoutMode::Prop,
         1,
@@ -723,7 +714,6 @@ async fn expire_invitations_only_flips_past_due() {
         &addr("ei_c"),
         "h",
         false,
-        false,
         PayoutMode::Prop,
         1,
     )
@@ -774,7 +764,6 @@ async fn join_request_lifecycle() {
         &n,
         &addr("jr_c"),
         "h",
-        false,
         true,
         PayoutMode::Prop,
         1,
@@ -864,7 +853,6 @@ async fn expire_join_requests_flips_old_pending() {
         &n,
         &addr("ejr_c"),
         "h",
-        false,
         true,
         PayoutMode::Prop,
         1,
@@ -903,48 +891,6 @@ async fn expire_join_requests_flips_old_pending() {
         .execute(&pool)
         .await
         .ok();
-    sqlx::query("DELETE FROM pplns_group WHERE id = $1")
-        .bind(gid)
-        .execute(&pool)
-        .await
-        .ok();
-}
-
-#[tokio::test]
-async fn update_active_ignores_dissolved_group() {
-    let pool = match connect_or_skip().await {
-        Some(p) => p,
-        None => return,
-    };
-    let gid = Uuid::new_v4();
-    let name = format!("diss-active-{}", gid);
-    insert_pplns_group(
-        &pool,
-        gid,
-        &name,
-        &addr("da_creator"),
-        "h",
-        false,
-        false,
-        PayoutMode::Prop,
-        1,
-    )
-    .await
-    .expect("g");
-    update_pplns_group_dissolved(&pool, gid, 50)
-        .await
-        .expect("dissolve");
-
-    // Attempting to flip active on a dissolved group must affect 0 rows.
-    let n = update_pplns_group_active(&pool, gid, true, 99)
-        .await
-        .expect("update");
-    assert_eq!(n, 0, "dissolved group must not be touched by update_active");
-
-    let g = find_group(&pool, gid).await.expect("f").expect("present");
-    assert!(!g.active, "active must still be false");
-    assert_eq!(g.dissolved_at, Some(50), "dissolved_at must be unchanged");
-
     sqlx::query("DELETE FROM pplns_group WHERE id = $1")
         .bind(gid)
         .execute(&pool)
